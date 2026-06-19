@@ -7,14 +7,14 @@
 //! field access, and array operations — enough to test most native methods
 //! without pulling in the full VM.
 
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // FIX(test-isolation): ROOT-CAUSE fix for parallel-test flakiness.
 //
@@ -124,7 +124,10 @@ fn alloc_class_block() -> u32 {
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const i8) -> *mut std::ffi::c_void;
-    fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const i8) -> *mut std::ffi::c_void;
+    fn GetProcAddress(
+        hModule: *mut std::ffi::c_void,
+        lpProcName: *const i8,
+    ) -> *mut std::ffi::c_void;
 }
 
 #[cfg(target_os = "windows")]
@@ -313,8 +316,7 @@ pub(crate) struct MockNativeContext {
     /// `last_define_full_opts()` reads it. Used by NESTMATE-propagation
     /// tests to assert exactly which `nest_host_class_name` reached the
     /// backend.
-    pub(crate) last_define_full_opts:
-        UnsafeCell<Option<cratonvm_native_api::DefineClassFull>>,
+    pub(crate) last_define_full_opts: UnsafeCell<Option<cratonvm_native_api::DefineClassFull>>,
     /// CGLIB-η: snapshot of the most recent `define_class_full` call's
     /// `loader_id` argument, so loader-inheritance tests can assert the
     /// new class lands in the lookup class's loader namespace rather
@@ -385,8 +387,7 @@ impl MockNativeContext {
     pub(crate) fn set_loader_id_override(&self, class_id: ClassId, raw_loader: i32) {
         // SAFETY: single-threaded test code.
         unsafe {
-            (*self.loader_id_override.get())
-                .insert(class_id.as_u32(), raw_loader);
+            (*self.loader_id_override.get()).insert(class_id.as_u32(), raw_loader);
         }
     }
 
@@ -404,17 +405,14 @@ impl MockNativeContext {
     pub(crate) fn set_nest_host_override(&self, child_id: ClassId, host: &str) {
         // SAFETY: single-threaded test code.
         unsafe {
-            (*self.nest_host_override.get())
-                .insert(child_id.as_u32(), host.to_string());
+            (*self.nest_host_override.get()).insert(child_id.as_u32(), host.to_string());
         }
     }
 
     /// WP8.11.5: read the most recent `DefineClassFull` options passed
     /// through `define_class_full`. `None` if no call has been made yet.
     #[allow(dead_code)]
-    pub(crate) fn last_define_full_opts(
-        &self,
-    ) -> Option<cratonvm_native_api::DefineClassFull> {
+    pub(crate) fn last_define_full_opts(&self) -> Option<cratonvm_native_api::DefineClassFull> {
         // SAFETY: single-threaded test code.
         unsafe { (*self.last_define_full_opts.get()).clone() }
     }
@@ -506,7 +504,9 @@ impl MockNativeContext {
     #[allow(dead_code)]
     pub(crate) fn set_interrupted(&self, v: bool) {
         // SAFETY: single-threaded test code; no aliasing.
-        unsafe { *self.interrupted_flag.get() = v; }
+        unsafe {
+            *self.interrupted_flag.get() = v;
+        }
     }
 
     fn heap_mut(&self) -> &mut Vec<HeapEntry> {
@@ -540,7 +540,10 @@ impl MockNativeContext {
 
     fn entry_index(&self, obj: ObjectRef) -> usize {
         let ptr_val = obj.as_ptr() as usize;
-        *self.ptr_map_ref().get(&ptr_val).expect("invalid ObjectRef in mock heap")
+        *self
+            .ptr_map_ref()
+            .get(&ptr_val)
+            .expect("invalid ObjectRef in mock heap")
     }
 
     /// Allocate a bare heap object and return its `ObjectRef`. Used by tests
@@ -629,9 +632,7 @@ impl NativeContext for MockNativeContext {
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let idx = self.entry_index(obj);
         match &self.heap_ref()[idx] {
-            HeapEntry::Object { fields, .. } => {
-                fields.get(index).copied().unwrap_or(Value::Int(0))
-            }
+            HeapEntry::Object { fields, .. } => fields.get(index).copied().unwrap_or(Value::Int(0)),
             _ => Value::Int(0),
         }
     }
@@ -803,8 +804,7 @@ impl NativeContext for MockNativeContext {
     }
 
     fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
-        self.properties
-            .insert(key.to_string(), value.to_string())
+        self.properties.insert(key.to_string(), value.to_string())
     }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
@@ -814,10 +814,7 @@ impl NativeContext for MockNativeContext {
         })
     }
 
-    fn ensure_class_initialized(
-        &mut self,
-        name: &str,
-    ) -> Result<ClassId, MethodCallFailed> {
+    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
         if let Some(&id) = self.name_to_id.get(name) {
             return Ok(ClassId::new(id));
         }
@@ -918,11 +915,7 @@ impl NativeContext for MockNativeContext {
         1
     }
 
-    fn monitor_wait(
-        &mut self,
-        _obj: ObjectRef,
-        _timeout_ms: Option<u64>,
-    ) -> MethodCallResult {
+    fn monitor_wait(&mut self, _obj: ObjectRef, _timeout_ms: Option<u64>) -> MethodCallResult {
         Ok(None)
     }
 
@@ -952,12 +945,7 @@ impl NativeContext for MockNativeContext {
 
     fn thread_interrupt(&mut self, _thread_obj: ObjectRef) {}
 
-    fn register_native_thread(
-        &mut self,
-        name: &str,
-        daemon: bool,
-        join_handle_ptr: usize,
-    ) -> u64 {
+    fn register_native_thread(&mut self, name: &str, daemon: bool, join_handle_ptr: usize) -> u64 {
         // Drop the JoinHandle if one was passed — the mock context
         // doesn't model a real registry that can `.join()` on it,
         // and leaking it would prevent the OS thread from being
@@ -965,8 +953,7 @@ impl NativeContext for MockNativeContext {
         if join_handle_ptr != 0 {
             // SAFETY: caller built this via Box::into_raw; we
             // reconstruct and drop it.
-            let _ =
-                unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
+            let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
         }
         // SAFETY: single-threaded test code.
         let next = unsafe { &mut *self.next_native_tid.get() };
@@ -974,8 +961,7 @@ impl NativeContext for MockNativeContext {
         *next += 1;
         // SAFETY: same.
         unsafe {
-            (*self.registered_native_threads.get())
-                .push((name.to_string(), daemon, true));
+            (*self.registered_native_threads.get()).push((name.to_string(), daemon, true));
         }
         tid
     }
@@ -1010,8 +996,7 @@ impl NativeContext for MockNativeContext {
         }
         // SAFETY: caller built via Box::into_raw; we drop the box
         // (mock doesn't model joining).
-        let _ =
-            unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
+        let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
         // FIX(test-isolation): base-relative index (see native_tid_slot).
         let idx = match self.native_tid_slot(thread_id) {
             Some(i) => i,
@@ -1024,11 +1009,7 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn set_native_thread_java_obj(
-        &mut self,
-        thread_id: u64,
-        java_thread_obj: ObjectRef,
-    ) -> bool {
+    fn set_native_thread_java_obj(&mut self, thread_id: u64, java_thread_obj: ObjectRef) -> bool {
         if thread_id == 0 {
             return false;
         }
@@ -1099,7 +1080,10 @@ impl NativeContext for MockNativeContext {
 
     fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
         let overrides = unsafe { &*self.interfaces_override.get() };
-        overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn class_access_flags(&self, class_id: ClassId) -> u16 {
@@ -1231,7 +1215,9 @@ impl NativeContext for MockNativeContext {
 
     fn pop_scoped_value(&mut self) {}
 
-    fn scoped_value_depth(&self) -> usize { 0 }
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
 
     fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
         let align = align.max(1);
@@ -1256,10 +1242,7 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn load_native_library(
-        &mut self,
-        _path: &str,
-    ) -> Result<i64, MethodCallFailed> {
+    fn load_native_library(&mut self, _path: &str) -> Result<i64, MethodCallFailed> {
         Ok(0)
     }
 
@@ -1272,9 +1255,7 @@ impl NativeContext for MockNativeContext {
             // Try msvcrt first, then ucrtbase
             let libs = ["msvcrt.dll\0", "ucrtbase.dll\0"];
             for lib in &libs {
-                let handle = unsafe {
-                    winapi_GetModuleHandleA(lib.as_ptr() as *const i8)
-                };
+                let handle = unsafe { winapi_GetModuleHandleA(lib.as_ptr() as *const i8) };
                 if !handle.is_null() {
                     let addr = unsafe { winapi_GetProcAddress(handle, c_name.as_ptr()) };
                     if !addr.is_null() {
@@ -1289,7 +1270,11 @@ impl NativeContext for MockNativeContext {
             use std::ffi::CString;
             let c_name = CString::new(name).ok()?;
             let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
-            if addr.is_null() { None } else { Some(addr as usize) }
+            if addr.is_null() {
+                None
+            } else {
+                Some(addr as usize)
+            }
         }
     }
 
@@ -1302,7 +1287,9 @@ impl NativeContext for MockNativeContext {
 
     fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
         let entries = unsafe { &*self.upcall_entries.get() };
-        entries.get(slot).map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
+        entries
+            .get(slot)
+            .map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
     }
 
     fn module_name_of_class(&self, _class_id: ClassId) -> Option<String> {
@@ -1333,11 +1320,7 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn define_class_from_bytes(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-    ) -> Option<ClassId> {
+    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
         // NEW-8 mock: remember the name so tests can inspect it, then
         // mint a fresh ClassId. A bytes slice starting with the magic
         // CAFEBABE is accepted; anything else returns None so error
@@ -1413,7 +1396,8 @@ impl NativeContext for MockNativeContext {
         _reference_obj: ObjectRef,
         _referent: ObjectRef,
         _queue: Option<ObjectRef>,
-    ) {}
+    ) {
+    }
 
     fn monitor_enter(&mut self, _obj: ObjectRef) {}
     fn monitor_exit(&mut self, _obj: ObjectRef) {}
@@ -1457,11 +1441,21 @@ impl NativeContext for MockNativeContext {
 
     fn force_gc(&mut self) {}
 
-    fn method_parameter_annotations(&self, _: ClassId, _: &str, _: &str) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
+    fn method_parameter_annotations(
+        &self,
+        _: ClassId,
+        _: &str,
+        _: &str,
+    ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
         Vec::new()
     }
 
-    fn method_annotation_default(&self, _: ClassId, _: &str, _: &str) -> Option<cratonvm_native_api::AnnotationElementValue> {
+    fn method_annotation_default(
+        &self,
+        _: ClassId,
+        _: &str,
+        _: &str,
+    ) -> Option<cratonvm_native_api::AnnotationElementValue> {
         None
     }
 
@@ -1469,7 +1463,12 @@ impl NativeContext for MockNativeContext {
         None
     }
 
-    fn method_signature(&self, _class_id: ClassId, _method_name: &str, _method_desc: &str) -> Option<String> {
+    fn method_signature(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Option<String> {
         None
     }
 
@@ -1488,19 +1487,17 @@ impl NativeContext for MockNativeContext {
     /// defaults to empty (unsigned class).
     fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
         let overrides = unsafe { &*self.code_source_certs_override.get() };
-        overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn is_package_exported_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
         true
     }
 
-    fn is_package_exported_to(
-        &self,
-        _module_name: &str,
-        _pkg: &str,
-        _to_module: &str,
-    ) -> bool {
+    fn is_package_exported_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
         true
     }
 
@@ -1508,12 +1505,7 @@ impl NativeContext for MockNativeContext {
         true
     }
 
-    fn is_package_open_to(
-        &self,
-        _module_name: &str,
-        _pkg: &str,
-        _to_module: &str,
-    ) -> bool {
+    fn is_package_open_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
         true
     }
 

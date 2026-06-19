@@ -38,9 +38,9 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::elliptic_curve::ff::PrimeField;
 use p256::elliptic_curve::group::prime::PrimeCurveAffine;
+use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 
 const EC_OPS: &str = "sun/security/ec/ECOperations";
 
@@ -67,7 +67,10 @@ fn obj(v: Option<Value>) -> Option<ObjectRef> {
 }
 
 fn internal_err(msg: &str) -> MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: msg.to_string() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: msg.to_string(),
+    }
+    .into()
 }
 
 /// Invoke an instance method whose concrete class is taken from `receiver`'s
@@ -138,7 +141,11 @@ fn read_bigint_be(
     }
     // toByteArray is signed big-endian two's complement; coordinates are
     // positive, so strip any leading 0x00 sign byte, then left-pad to `len`.
-    let start = if signed.len() > 1 && signed[0] == 0 { 1 } else { 0 };
+    let start = if signed.len() > 1 && signed[0] == 0 {
+        1
+    } else {
+        0
+    };
     let mag = &signed[start..];
     if mag.len() > len {
         return Err(internal_err("coordinate exceeds field byte length"));
@@ -149,7 +156,10 @@ fn read_bigint_be(
 }
 
 /// Build a Java `byte[]` from `bytes`.
-fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+fn make_byte_array(
+    ctx: &mut dyn NativeContext,
+    bytes: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
@@ -192,7 +202,9 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // field = ecOps.getField()
     let field = {
         let cid = ctx.class_id_of_object(ec_ops);
-        let cls = ctx.class_name_of_id(cid).ok_or_else(|| internal_err("no ecOps class"))?;
+        let cls = ctx
+            .class_name_of_id(cid)
+            .ok_or_else(|| internal_err("no ecOps class"))?;
         let r = ctx.invoke(
             &cls,
             "getField",
@@ -221,14 +233,24 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     // Read base point coordinates via the public asBigInteger() accessor.
     let affine_p = ctx.read_native_pin(p_affine, affine_p);
-    let ex = invoke_virtual_obj(ctx, affine_p, "getX", "()Lsun/security/util/math/ImmutableIntegerModuloP;")?
-        .ok_or_else(|| internal_err("getX null"))?;
+    let ex = invoke_virtual_obj(
+        ctx,
+        affine_p,
+        "getX",
+        "()Lsun/security/util/math/ImmutableIntegerModuloP;",
+    )?
+    .ok_or_else(|| internal_err("getX null"))?;
     let bx_bi = invoke_virtual_obj(ctx, ex, "asBigInteger", "()Ljava/math/BigInteger;")?
         .ok_or_else(|| internal_err("x.asBigInteger null"))?;
     let bx = read_bigint_be(ctx, bx_bi, n)?;
     let affine_p = ctx.read_native_pin(p_affine, affine_p);
-    let ey = invoke_virtual_obj(ctx, affine_p, "getY", "()Lsun/security/util/math/ImmutableIntegerModuloP;")?
-        .ok_or_else(|| internal_err("getY null"))?;
+    let ey = invoke_virtual_obj(
+        ctx,
+        affine_p,
+        "getY",
+        "()Lsun/security/util/math/ImmutableIntegerModuloP;",
+    )?
+    .ok_or_else(|| internal_err("getY null"))?;
     let by_bi = invoke_virtual_obj(ctx, ey, "asBigInteger", "()Ljava/math/BigInteger;")?
         .ok_or_else(|| internal_err("y.asBigInteger null"))?;
     let by = read_bigint_be(ctx, by_bi, n)?;
@@ -287,7 +309,10 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             "sun/security/ec/point/ProjectivePoint$Mutable",
             "setValue",
             "(Lsun/security/ec/point/AffinePoint;)Lsun/security/ec/point/ProjectivePoint$Mutable;",
-            &[Value::Object(Some(ctx.read_native_pin(p_res, result))), Value::Object(Some(ctx.read_native_pin(p_aff, affine)))],
+            &[
+                Value::Object(Some(ctx.read_native_pin(p_res, result))),
+                Value::Object(Some(ctx.read_native_pin(p_aff, affine))),
+            ],
         )?;
     }
 
@@ -321,7 +346,11 @@ macro_rules! impl_curve_scalar_mul {
                 false,
             );
             let affine = AffinePoint::from_encoded_point(&ep);
-            let affine = if affine.is_some().into() { affine.unwrap() } else { return None };
+            let affine = if affine.is_some().into() {
+                affine.unwrap()
+            } else {
+                return None;
+            };
 
             // scalar: little-endian → big-endian (n bytes).
             let mut be = [0u8; $nbytes];

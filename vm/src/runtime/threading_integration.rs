@@ -171,7 +171,12 @@ impl VirtualThreadScheduler {
     }
 
     /// Unmount a running task from `carrier_id` for the given reason.
-    pub fn unmount(&mut self, carrier_id: usize, mut task: VirtualThreadTask, reason: UnmountReason) {
+    pub fn unmount(
+        &mut self,
+        carrier_id: usize,
+        mut task: VirtualThreadTask,
+        reason: UnmountReason,
+    ) {
         if carrier_id < self.carrier_threads.len() {
             self.carrier_threads[carrier_id].mounted_task = None;
             self.carrier_threads[carrier_id].tasks_executed += 1;
@@ -367,7 +372,12 @@ impl MonitorManager {
     }
 
     /// Object.wait() — release the monitor and place thread in wait set.
-    pub fn wait(&mut self, obj_addr: usize, thread_id: u64, _timeout_ms: Option<u64>) -> MonitorResult {
+    pub fn wait(
+        &mut self,
+        obj_addr: usize,
+        thread_id: u64,
+        _timeout_ms: Option<u64>,
+    ) -> MonitorResult {
         let monitor = self.get_or_create(obj_addr);
         match monitor.owner {
             Some(owner) if owner == thread_id => {
@@ -419,7 +429,12 @@ impl MonitorManager {
     /// Aggregate contention statistics.
     pub fn get_contention_stats(&self) -> ContentionStats {
         let total_contentions = self.monitors.values().map(|m| m.contention_count).sum();
-        let max_wait_set = self.monitors.values().map(|m| m.wait_set.len()).max().unwrap_or(0);
+        let max_wait_set = self
+            .monitors
+            .values()
+            .map(|m| m.wait_set.len())
+            .max()
+            .unwrap_or(0);
         let currently_blocked: usize = self.monitors.values().map(|m| m.entry_set.len()).sum();
         ContentionStats {
             total_monitors: self.monitors.len(),
@@ -556,7 +571,12 @@ impl CasManager {
 
     /// CAS for i32. Compares `current` with `expected`; if equal, returns
     /// success with `new_val` as witness, otherwise returns the current value.
-    pub fn compare_and_swap_i32(&mut self, current: i32, expected: i32, new_val: i32) -> CasResult<i32> {
+    pub fn compare_and_swap_i32(
+        &mut self,
+        current: i32,
+        expected: i32,
+        new_val: i32,
+    ) -> CasResult<i32> {
         self.attempts += 1;
         if current == expected {
             self.successes += 1;
@@ -573,7 +593,12 @@ impl CasManager {
     }
 
     /// CAS for i64.
-    pub fn compare_and_swap_i64(&mut self, current: i64, expected: i64, new_val: i64) -> CasResult<i64> {
+    pub fn compare_and_swap_i64(
+        &mut self,
+        current: i64,
+        expected: i64,
+        new_val: i64,
+    ) -> CasResult<i64> {
         self.attempts += 1;
         if current == expected {
             self.successes += 1;
@@ -590,7 +615,12 @@ impl CasManager {
     }
 
     /// CAS for reference (usize).
-    pub fn compare_and_swap_ref(&mut self, current: usize, expected: usize, new_val: usize) -> CasResult<usize> {
+    pub fn compare_and_swap_ref(
+        &mut self,
+        current: usize,
+        expected: usize,
+        new_val: usize,
+    ) -> CasResult<usize> {
         self.attempts += 1;
         if current == expected {
             self.successes += 1;

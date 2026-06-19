@@ -97,7 +97,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -171,7 +175,10 @@ fn run_probe_with_env(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    eprintln!("[wave2_bc] BcProbe still running after {:?} — killing", timeout);
+                    eprintln!(
+                        "[wave2_bc] BcProbe still running after {:?} — killing",
+                        timeout
+                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -285,29 +292,23 @@ fn bc_probe_reaches_provider_init_without_segfault() {
 /// underlying JIT codegen issue is root-caused.
 #[test]
 fn bc_probe_reaches_first_println_with_jit_disabled() {
-    let (stdout, _stderr, rc) = match run_probe_with_env(
-        Duration::from_secs(45),
-        &[("CRATONVM_DISABLE_JIT", "1")],
-    ) {
-        Some(o) => o,
-        None => {
-            eprintln!(
-                "[wave2_bc] skipping JIT-disabled path — binary, BcProbe.class, or bcprov \
+    let (stdout, _stderr, rc) =
+        match run_probe_with_env(Duration::from_secs(45), &[("CRATONVM_DISABLE_JIT", "1")]) {
+            Some(o) => o,
+            None => {
+                eprintln!(
+                    "[wave2_bc] skipping JIT-disabled path — binary, BcProbe.class, or bcprov \
                  JAR missing."
-            );
-            return;
-        }
-    };
+                );
+                return;
+            }
+        };
 
     // The probe must NOT segfault under the JIT-disabled path. If it
     // does, that's a real regression — the interpreter-only path is
     // supposed to be the safety net.
-    let is_segfault_exit_code = matches!(
-        rc,
-        Some(139)
-        | Some(-1_073_741_819)
-        | Some(-1_073_740_791)
-    );
+    let is_segfault_exit_code =
+        matches!(rc, Some(139) | Some(-1_073_741_819) | Some(-1_073_740_791));
     assert!(
         !is_segfault_exit_code,
         "wave2_bc: BcProbe segfaulted even with CRATONVM_DISABLE_JIT=1 \

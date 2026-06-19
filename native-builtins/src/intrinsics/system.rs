@@ -15,8 +15,8 @@
 //! `FxHashMap` probe) — it never changes observable behavior.
 
 use cratonvm_native_api::NativeContext;
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 /// `java/lang/System.arraycopy (Ljava/lang/Object;ILjava/lang/Object;II)V`
 ///
@@ -30,10 +30,7 @@ use cratonvm_types::error::MethodCallResult;
 /// (roadmap §7) is automatic: `NullPointerException`, `ArrayStoreException` and
 /// `ArrayIndexOutOfBoundsException` are thrown identically with intrinsics on
 /// or off.
-pub fn intrinsic_system_arraycopy(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_system::native_system_arraycopy(ctx, args)
 }
 

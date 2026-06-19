@@ -1224,9 +1224,7 @@ impl CompactValue {
                 // sibling b'D'/SUB_INT and b'J'/SUB_INT branches already
                 // do numeric conversion; `f32::from_bits` here would have
                 // turned e.g. Int(1) into a denormal 1.4e-45 instead of 1.0.
-                SUB_INT => Value::Float(
-                    (self.0 & PAYLOAD_MASK) as u32 as i32 as f32,
-                ),
+                SUB_INT => Value::Float((self.0 & PAYLOAD_MASK) as u32 as i32 as f32),
                 SUB_NULL | SUB_UNINIT => Value::Float(0.0),
                 _ => self.to_value(),
             },
@@ -1245,8 +1243,9 @@ impl CompactValue {
                 // reference either, and routing them through `to_value()`
                 // would leak `Value::ReturnAddress` / `Value::Uninitialized`
                 // into a reference slot — inconsistent with the numeric arms.
-                SUB_INT | SUB_FLOAT | SUB_LONG_LO | SUB_LONG_HI
-                | SUB_RETADDR | SUB_UNINIT => Value::Object(None),
+                SUB_INT | SUB_FLOAT | SUB_LONG_LO | SUB_LONG_HI | SUB_RETADDR | SUB_UNINIT => {
+                    Value::Object(None)
+                }
                 _ => self.to_value(),
             },
             // Unknown descriptor: keep legacy behavior.
@@ -1283,7 +1282,11 @@ impl fmt::Debug for CompactValue {
             // Untagged — could be Double or Long depending on context.
             let dval = f64::from_bits(self.0);
             let lval = self.0 as i64;
-            return write!(f, "CompactValue(raw={:#018x}, as_double={}, as_long={})", self.0, dval, lval);
+            return write!(
+                f,
+                "CompactValue(raw={:#018x}, as_double={}, as_long={})",
+                self.0, dval, lval
+            );
         }
         match (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK {
             SUB_INT => {
@@ -1440,7 +1443,16 @@ mod tests {
     /// `as_long()`.
     #[test]
     fn as_long_agrees_with_to_value_for_long_collisions() {
-        for v in [i64::MIN, -1, 0, 1, i64::MAX, -42, i64::MIN + 1, i64::MAX - 1] {
+        for v in [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            i64::MAX,
+            -42,
+            i64::MIN + 1,
+            i64::MAX - 1,
+        ] {
             let cv = CompactValue::long(v);
             match cv.to_value() {
                 Value::Long(x) => assert_eq!(
@@ -1626,7 +1638,11 @@ mod tests {
         const NANBOX: u64 = 0xFFFC_0000_0000_0000;
         // Genuine ints: payload < 2^32 → None (kept as int).
         for n in [0i32, 1, -1, 42, i32::MIN, i32::MAX] {
-            assert_eq!(CompactValue::int(n).int_tag_collision_long(), None, "int {n}");
+            assert_eq!(
+                CompactValue::int(n).int_tag_collision_long(),
+                None,
+                "int {n}"
+            );
         }
         // SUB_INT-pattern longs with payload bits 32-46 set → Some(raw bits).
         for &bits in &[
@@ -1648,7 +1664,10 @@ mod tests {
         assert_eq!(CompactValue::null().int_tag_collision_long(), None);
         // Residual ambiguous case: payload < 2^32 with SUB_INT pattern is
         // indistinguishable from a real int → None (documented limitation).
-        assert_eq!(CompactValue::long(NANBOX as i64).int_tag_collision_long(), None);
+        assert_eq!(
+            CompactValue::long(NANBOX as i64).int_tag_collision_long(),
+            None
+        );
     }
 
     /// MEDIUM (2026-06-17): `to_value()` / `as_int()` SUB_INT/SUB_FLOAT
@@ -1666,14 +1685,23 @@ mod tests {
             assert_eq!(cv.as_int(), Some(n), "as_int real int {n}");
         }
         for f in [0.0f32, 1.5, -3.25, f32::MAX] {
-            assert_eq!(CompactValue::float(f).to_value(), Value::Float(f), "real float {f}");
+            assert_eq!(
+                CompactValue::float(f).to_value(),
+                Value::Float(f),
+                "real float {f}"
+            );
         }
 
         // Colliding longs: SUB_INT / SUB_FLOAT sub-tag with payload bits
         // 32..46 set. These cannot be real int/float slots, so to_value()
         // must preserve the full i64 bit pattern (not truncate to 32 bits),
         // and as_int() must return None for the SUB_INT case.
-        for &low in &[1u64 << 32, 0x7FFF_FFFF_FFFF, 0x1_ABCD_1234, 0x5555_5555_5555] {
+        for &low in &[
+            1u64 << 32,
+            0x7FFF_FFFF_FFFF,
+            0x1_ABCD_1234,
+            0x5555_5555_5555,
+        ] {
             if low >> 32 == 0 {
                 continue; // not actually a collision payload
             }
@@ -1871,8 +1899,14 @@ mod tests {
         assert_eq!(CompactValue::double(0.0).tag(), CompactTag::Double);
         assert_eq!(CompactValue::object(0x1000).tag(), CompactTag::Object);
         assert_eq!(CompactValue::null().tag(), CompactTag::Null);
-        assert_eq!(CompactValue::uninitialized().tag(), CompactTag::Uninitialized);
-        assert_eq!(CompactValue::return_address(0).tag(), CompactTag::ReturnAddress);
+        assert_eq!(
+            CompactValue::uninitialized().tag(),
+            CompactTag::Uninitialized
+        );
+        assert_eq!(
+            CompactValue::return_address(0).tag(),
+            CompactTag::ReturnAddress
+        );
         // Long is untagged — tag() returns Double for untagged values.
         // The caller must know from JVM context that it is a Long.
         // We verify as_long_unchecked works correctly instead.
@@ -2105,7 +2139,8 @@ mod tests {
         let mut cv = CompactValue::object(0x0000_1000);
         // Maximum-magnitude in-range pointer.
         let new_ptr: u64 = 0x0000_7FFF_FFFF_FFF8;
-        cv.update_object_ptr(new_ptr).expect("47-bit pointer must succeed");
+        cv.update_object_ptr(new_ptr)
+            .expect("47-bit pointer must succeed");
         assert_eq!(cv.as_object_ptr(), Some(new_ptr));
         assert!(cv.is_object());
         assert_eq!(cv.tag(), CompactTag::Object);
@@ -2183,8 +2218,14 @@ mod tests {
     fn repr_transparent_layout_matches_u64() {
         // Critical for the Vec<CompactValue> ↔ Vec<u64> transmute used by
         // the operand-stack pool integration.
-        assert_eq!(std::mem::size_of::<CompactValue>(), std::mem::size_of::<u64>());
-        assert_eq!(std::mem::align_of::<CompactValue>(), std::mem::align_of::<u64>());
+        assert_eq!(
+            std::mem::size_of::<CompactValue>(),
+            std::mem::size_of::<u64>()
+        );
+        assert_eq!(
+            std::mem::align_of::<CompactValue>(),
+            std::mem::align_of::<u64>()
+        );
     }
 
     #[test]
@@ -2396,7 +2437,9 @@ mod tests {
         // Control: raw to_value() still returns Double for untagged.
         match cv.to_value() {
             Value::Double(_) => {}
-            other => panic!("expected untagged long to decode as Double via to_value; got {other:?}"),
+            other => {
+                panic!("expected untagged long to decode as Double via to_value; got {other:?}")
+            }
         }
         // Descriptor-aware decode picks the correct type.
         assert_eq!(cv.decode_by_descriptor(b'J'), Value::Long(5));
@@ -2431,7 +2474,14 @@ mod tests {
     fn decode_by_descriptor_d_preserves_doubles() {
         // Doubles must decode as Value::Double, never as Long — symmetric
         // to the long path.
-        for val in [0.0f64, 1.0, -1.0, std::f64::consts::PI, f64::INFINITY, f64::NEG_INFINITY] {
+        for val in [
+            0.0f64,
+            1.0,
+            -1.0,
+            std::f64::consts::PI,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             let cv = CompactValue::double(val);
             match cv.decode_by_descriptor(b'D') {
                 Value::Double(d) => assert_eq!(d, val),
@@ -2471,16 +2521,21 @@ mod tests {
         for v in [0i32, 1, -1, 42, -42, 100, i16::MAX as i32, -12345] {
             let cv = CompactValue::int(v);
             match cv.decode_by_descriptor(b'F') {
-                Value::Float(f) => assert_eq!(
-                    f, v as f32,
-                    "i2f numeric conversion expected for Int({v})",
-                ),
+                Value::Float(f) => {
+                    assert_eq!(f, v as f32, "i2f numeric conversion expected for Int({v})",)
+                }
                 other => panic!("expected Float({}), got {other:?}", v as f32),
             }
         }
         // Mirror the sibling descriptors to confirm consistent semantics.
-        assert_eq!(CompactValue::int(7).decode_by_descriptor(b'D'), Value::Double(7.0));
-        assert_eq!(CompactValue::int(7).decode_by_descriptor(b'F'), Value::Float(7.0));
+        assert_eq!(
+            CompactValue::int(7).decode_by_descriptor(b'D'),
+            Value::Double(7.0)
+        );
+        assert_eq!(
+            CompactValue::int(7).decode_by_descriptor(b'F'),
+            Value::Float(7.0)
+        );
     }
 
     #[test]
@@ -2598,7 +2653,9 @@ mod tests {
     /// the degradation. This is the core of the HIGH finding.
     #[test]
     fn to_value_checked_degrades_fabricated_pointer_to_long() {
-        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DEGRADE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Aligned (multiple of 8), non-null payload inside a SUB_OBJECT slot.
         let aligned = 0x1234_5678_ABC0u64; // % 8 == 0, non-zero
         let raw = make_tagged(SUB_OBJECT, aligned);
@@ -2625,7 +2682,9 @@ mod tests {
     /// count a degradation.
     #[test]
     fn to_value_checked_keeps_live_object() {
-        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DEGRADE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let aligned = 0x1234_5678_ABC0u64;
         let cv = CompactValue::object(aligned);
         reset_object_degradation_count();
@@ -2647,8 +2706,8 @@ mod tests {
             CompactValue::null(),
             CompactValue::uninitialized(),
             CompactValue::return_address(7),
-            CompactValue::long(5),       // untagged → Double
-            CompactValue::long(-1),      // SUB_LONG_HI collision
+            CompactValue::long(5),  // untagged → Double
+            CompactValue::long(-1), // SUB_LONG_HI collision
             CompactValue::long(i64::MIN),
         ];
         for cv in samples {
@@ -2662,7 +2721,9 @@ mod tests {
     /// counts a degradation when a SUB_OBJECT slot fails heap validation.
     #[test]
     fn is_object_checked_validates_against_heap() {
-        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DEGRADE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let aligned = 0x4000u64;
         let real = CompactValue::object(aligned);
         assert!(real.is_object()); // unchecked pattern test
@@ -2683,7 +2744,9 @@ mod tests {
     /// countable rather than invisible.
     #[test]
     fn to_value_unchecked_degrade_increments_counter() {
-        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DEGRADE_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_object_degradation_count();
         // Null payload SUB_OBJECT → Long, counted.
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0)).to_value();

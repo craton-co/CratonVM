@@ -16,16 +16,16 @@ pub mod intern;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
-pub use intern::{intern, intern_arc, StringPool};
+pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use heap_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
-    HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK,
-    MARK_THIN_LOCKED, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK,
-    THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
+    HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK, MARK_THIN_LOCKED,
+    MARK_WORD_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
+    THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
-pub use compact_value::{CompactTag, CompactValue, CompactValueError};
+pub use intern::{intern, intern_arc, StringPool};
 pub use value::{
     decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr, ObjectRef, Value,
     VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR,

@@ -73,8 +73,7 @@ fn cratonvm_binary() -> Option<PathBuf> {
 /// test can skip cleanly on machines without the JDK 25 dependency.
 fn real_java_home() -> Option<String> {
     if let Ok(jh) = std::env::var("JAVA_HOME") {
-        if Path::new(&jh).join("bin/java.exe").exists()
-            || Path::new(&jh).join("bin/java").exists()
+        if Path::new(&jh).join("bin/java.exe").exists() || Path::new(&jh).join("bin/java").exists()
         {
             return Some(jh);
         }
@@ -130,7 +129,11 @@ public class EnumLookup {{
     // when javac isn't on PATH instead of failing CI on an unrelated
     // tooling gap.
     let out = Command::new("javac")
-        .args(["-d", fixture_dir.to_str().unwrap(), src_path.to_str().unwrap()])
+        .args([
+            "-d",
+            fixture_dir.to_str().unwrap(),
+            src_path.to_str().unwrap(),
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -144,8 +147,8 @@ public class EnumLookup {{
     let jar_path = dir.path().join("rslf4j1-resources.jar");
     let f = std::fs::File::create(&jar_path).ok()?;
     let mut zip = ZipWriter::new(f);
-    let opts: SimpleFileOptions = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts: SimpleFileOptions =
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip.start_file(RESOURCE_NAME, opts).ok()?;
     zip.write_all(b"cratonvm.foo.svc.DummyProvider\n").ok()?;
     zip.finish().ok()?;

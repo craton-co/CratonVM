@@ -38,7 +38,11 @@ fn string_contains_charsequence_is_registered() {
     assert!(
         shared
             .native_methods
-            .find("java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")
+            .find(
+                "java/lang/String",
+                "contains",
+                "(Ljava/lang/CharSequence;)Z"
+            )
             .is_some(),
         "WP8.10.9 regression: String.contains(CharSequence) MUST be \
          registered in `register_essential_natives` so synthetic-jdk \
@@ -70,7 +74,11 @@ fn string_contains_true_via_dispatch() {
     let cb = vm
         .shared
         .native_methods
-        .find("java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")
+        .find(
+            "java/lang/String",
+            "contains",
+            "(Ljava/lang/CharSequence;)Z",
+        )
         .expect("contains(CharSequence) must be registered");
     let mut ctx = NativeContextImpl {
         shared: &vm.shared,
@@ -81,7 +89,11 @@ fn string_contains_true_via_dispatch() {
         &[Value::Object(Some(haystack)), Value::Object(Some(needle))],
     )
     .expect("contains call should not error");
-    assert_eq!(r, Some(Value::Int(1)), "\"...Module\".contains(\"Module\") must be true");
+    assert_eq!(
+        r,
+        Some(Value::Int(1)),
+        "\"...Module\".contains(\"Module\") must be true"
+    );
 }
 
 #[test]
@@ -93,7 +105,11 @@ fn string_contains_false_via_dispatch() {
     let cb = vm
         .shared
         .native_methods
-        .find("java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")
+        .find(
+            "java/lang/String",
+            "contains",
+            "(Ljava/lang/CharSequence;)Z",
+        )
         .expect("contains(CharSequence) must be registered");
     let mut ctx = NativeContextImpl {
         shared: &vm.shared,
@@ -104,7 +120,11 @@ fn string_contains_false_via_dispatch() {
         &[Value::Object(Some(haystack)), Value::Object(Some(needle))],
     )
     .expect("contains call should not error");
-    assert_eq!(r, Some(Value::Int(0)), "\"hello world\".contains(\"xyz\") must be false");
+    assert_eq!(
+        r,
+        Some(Value::Int(0)),
+        "\"hello world\".contains(\"xyz\") must be false"
+    );
 }
 
 #[test]
@@ -117,7 +137,11 @@ fn string_contains_empty_needle_is_true() {
     let cb = vm
         .shared
         .native_methods
-        .find("java/lang/String", "contains", "(Ljava/lang/CharSequence;)Z")
+        .find(
+            "java/lang/String",
+            "contains",
+            "(Ljava/lang/CharSequence;)Z",
+        )
         .expect("contains(CharSequence) must be registered");
     let mut ctx = NativeContextImpl {
         shared: &vm.shared,

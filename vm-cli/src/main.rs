@@ -46,7 +46,12 @@ struct Args {
     // testsuite fork with `-Xmx512m` twice (surefire memory args + jvm.args);
     // without this clap aborts with "cannot be used multiple times" (exit 2),
     // which Surefire reports as "forked VM terminated without saying goodbye".
-    #[arg(short = 'c', long = "classpath", alias = "cp", overrides_with = "classpath")]
+    #[arg(
+        short = 'c',
+        long = "classpath",
+        alias = "cp",
+        overrides_with = "classpath"
+    )]
     classpath: Option<String>,
 
     /// Maximum heap size (e.g., 256m, 1g).
@@ -194,7 +199,6 @@ struct Args {
     // -----------------------------------------------------------------------
     // JPMS module system flags
     // -----------------------------------------------------------------------
-
     /// Module path: directories and modular JARs to search for modules.
     /// Format: path1;path2 (Windows) or path1:path2 (Unix).
     #[arg(long = "module-path", alias = "p", value_name = "PATH")]
@@ -252,7 +256,6 @@ struct Args {
     // and the CPU execution path is byte-identical to before the GPU
     // work landed.
     // -----------------------------------------------------------------------
-
     /// Enable GPU offload of eligible static methods. Requires the
     /// CLI to be built with `--features gpu` and a CUDA driver. With
     /// no driver, the flag is honoured but no methods are offloaded.
@@ -434,9 +437,7 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
                 continue;
             }
         };
-        let matched = AGGREGATES
-            .iter()
-            .find(|(name, _)| file_name == *name);
+        let matched = AGGREGATES.iter().find(|(name, _)| file_name == *name);
         let Some((_, split_prefix)) = matched else {
             out.push(entry);
             continue;
@@ -615,7 +616,9 @@ fn tokenize_argfile(content: &str) -> Vec<String> {
                     tokens.push(std::mem::take(&mut current));
                 }
                 for ch2 in chars.by_ref() {
-                    if ch2 == '\n' { break; }
+                    if ch2 == '\n' {
+                        break;
+                    }
                 }
             }
             '"' | '\'' => {
@@ -1034,8 +1037,7 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
                 eprintln!("[cratonvm] ignoring assertion flag: {a}");
             }
             i += 1;
-        }
-        else {
+        } else {
             out.push(args[i].clone());
             i += 1;
         }
@@ -1190,9 +1192,7 @@ fn run() -> Result<()> {
     // sufficient.
     cratonvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
         if std::env::var("CRATONVM_DBG_EXIT").ok().as_deref() == Some("1") {
-            eprintln!(
-                "=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ==="
-            );
+            eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
     });
@@ -1410,9 +1410,7 @@ fn run() -> Result<()> {
                             break;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            tmp = dir.join(format!(
-                                "cratonvm-{pid}-{now_ms}-{attempt}-{stem}.jar"
-                            ));
+                            tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{attempt}-{stem}.jar"));
                         }
                         Err(e) => {
                             return Err(anyhow::Error::new(e).context(format!(
@@ -1476,8 +1474,8 @@ fn run() -> Result<()> {
         // always ship one of these signature artifacts, so their behaviour
         // is unchanged.
         if quarkus_signature_present(jar_path) {
-            let canon_jar = std::fs::canonicalize(jar_path)
-                .unwrap_or_else(|_| jar_path.to_path_buf());
+            let canon_jar =
+                std::fs::canonicalize(jar_path).unwrap_or_else(|_| jar_path.to_path_buf());
             let jar_dir = canon_jar.parent().map(|p| p.to_path_buf());
             let mut roots = Vec::new();
             if let Some(d) = jar_dir.as_ref() {
@@ -1509,9 +1507,9 @@ fn run() -> Result<()> {
             }
         }
 
-        let main_class = manifest
-            .main_class
-            .ok_or_else(|| anyhow::anyhow!("no main manifest attribute, in {}", jar_path.display()))?;
+        let main_class = manifest.main_class.ok_or_else(|| {
+            anyhow::anyhow!("no main manifest attribute, in {}", jar_path.display())
+        })?;
 
         if args.classpath.is_some() {
             eprintln!("Warning: -cp/-classpath is ignored when --jar is used");
@@ -1720,7 +1718,9 @@ fn run() -> Result<()> {
         if let Some(tuple) = VmConfig::parse_add_exports(s) {
             config.add_exports.push(tuple);
         } else {
-            eprintln!("Warning: invalid --add-exports format: {s} (expected module/package=target)");
+            eprintln!(
+                "Warning: invalid --add-exports format: {s} (expected module/package=target)"
+            );
         }
     }
     for s in &args.add_opens {
@@ -1851,7 +1851,9 @@ fn run() -> Result<()> {
         Some(s) if s > 0 => Some(s),
         Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
         None => {
-            if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG").ok().as_deref()
+            if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG")
+                .ok()
+                .as_deref()
                 == Some("1")
             {
                 None
@@ -2080,9 +2082,7 @@ fn run() -> Result<()> {
         _watchdog_completion_guard = Some(WatchdogCompletionGuard {
             flag: std::sync::Arc::clone(&watchdog_completed),
         });
-        eprintln!(
-            "[cratonvm] stack-dump watchdog armed: will dump + abort after {secs}s"
-        );
+        eprintln!("[cratonvm] stack-dump watchdog armed: will dump + abort after {secs}s");
     }
 
     // T14: Run System.initPhase1() when booting from real JDK classes
@@ -2113,11 +2113,16 @@ fn run() -> Result<()> {
                 // synthetic System.in/out/err so stdout/stderr still work.
                 if let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                     let exc_class_id = vm.shared.heap.class_id_of(*exc_ref);
-                    let exc_class_name = vm.shared.class_manager.read()
+                    let exc_class_name = vm
+                        .shared
+                        .class_manager
+                        .read()
                         .get_class(exc_class_id)
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("unknown({})", exc_class_id));
-                    tracing::info!("System.initPhase1() fell back to synthetic streams ({exc_class_name})");
+                    tracing::info!(
+                        "System.initPhase1() fell back to synthetic streams ({exc_class_name})"
+                    );
                 } else {
                     tracing::info!("System.initPhase1() fell back to synthetic streams");
                     tracing::debug!("initPhase1 details: {e:?}");
@@ -2242,7 +2247,9 @@ fn run() -> Result<()> {
         vm.shared
             .heap
             .set_array_element(args_array, i, val)
-            .map_err(|idx| anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)"))?;
+            .map_err(|idx| {
+                anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)")
+            })?;
     }
 
     // WP2.4-C — run every `-javaagent:` agent's `premain(String,
@@ -2276,7 +2283,9 @@ fn run() -> Result<()> {
     let result = match result {
         Ok(r) => r,
         Err(panic) => {
-            let msg = panic.downcast_ref::<&str>().map(|s| s.to_string())
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".into());
             bail!("main() panicked: {msg}");
@@ -2292,9 +2301,7 @@ fn run() -> Result<()> {
         match vm.shared.dump_missing_natives_json(path) {
             Ok(()) => {
                 let count = vm.shared.get_missing_natives().len();
-                eprintln!(
-                    "[cratonvm] wrote {count} missing-native entries to {path}"
-                );
+                eprintln!("[cratonvm] wrote {count} missing-native entries to {path}");
             }
             Err(e) => {
                 eprintln!(
@@ -2347,7 +2354,10 @@ fn run() -> Result<()> {
     // the steady-state intrinsic-dispatch hit count on shutdown — the
     // counter that verifies acceptance criterion §9 of
     // docs/feature_roadmap_interpreter_intrinsic_table.md.
-    if matches!(std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(), Ok("1")) {
+    if matches!(
+        std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(),
+        Ok("1")
+    ) {
         eprintln!(
             "[cratonvm] interpreter intrinsic dispatches: {}",
             cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
@@ -2436,14 +2446,9 @@ fn run() -> Result<()> {
                  to bound execution."
             );
         }
-        let joined = vm
-            .shared
-            .thread_registry
-            .wait_for_non_daemon_threads(None);
+        let joined = vm.shared.thread_registry.wait_for_non_daemon_threads(None);
         if joined > 0 {
-            tracing::info!(
-                "cratonvm: joined {joined} non-daemon thread(s) after main() returned"
-            );
+            tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");
         }
     }
 
@@ -2536,7 +2541,9 @@ fn run() -> Result<()> {
                                 }
                             }
                             walk = cls.superclass;
-                        } else { break; }
+                        } else {
+                            break;
+                        }
                     }
                     (cname, msg_i, cause_i, stack_i, target_i)
                 };
@@ -2544,8 +2551,12 @@ fn run() -> Result<()> {
                     let v = vm.shared.heap.get_field(cur, i);
                     if let Value::Object(Some(s)) = v {
                         cratonvm_vm::vm::read_java_string(&vm.shared.heap, s).unwrap_or_default()
-                    } else { String::new() }
-                } else { String::new() };
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 let line = if message.is_empty() {
                     format!("{prefix} {cname}")
                 } else {
@@ -2570,9 +2581,14 @@ fn run() -> Result<()> {
                             // from the first non-null element's class.
                             let mut ste_idx: Option<(usize, usize, usize, usize)> = None;
                             for i in 0..len {
-                                let elem = vm.shared.heap.get_array_element(arr, i)
-                                    .ok()
-                                    .and_then(|v| if let Value::Object(Some(o)) = v { Some(o) } else { None });
+                                let elem =
+                                    vm.shared.heap.get_array_element(arr, i).ok().and_then(|v| {
+                                        if let Value::Object(Some(o)) = v {
+                                            Some(o)
+                                        } else {
+                                            None
+                                        }
+                                    });
                                 let Some(elem_ref) = elem else { continue };
                                 if ste_idx.is_none() {
                                     let ecid = vm.shared.heap.class_id_of(elem_ref);
@@ -2589,23 +2605,36 @@ fn run() -> Result<()> {
                                                 if !f.is_static() {
                                                     let abs = cls.first_field_index + inst;
                                                     match &*f.name {
-                                                        "declaringClass" if dc.is_none() => dc = Some(abs),
-                                                        "methodName" if mn.is_none() => mn = Some(abs),
-                                                        "fileName" if fn_.is_none() => fn_ = Some(abs),
-                                                        "lineNumber" if ln.is_none() => ln = Some(abs),
+                                                        "declaringClass" if dc.is_none() => {
+                                                            dc = Some(abs)
+                                                        }
+                                                        "methodName" if mn.is_none() => {
+                                                            mn = Some(abs)
+                                                        }
+                                                        "fileName" if fn_.is_none() => {
+                                                            fn_ = Some(abs)
+                                                        }
+                                                        "lineNumber" if ln.is_none() => {
+                                                            ln = Some(abs)
+                                                        }
                                                         _ => {}
                                                     }
                                                     inst += 1;
                                                 }
                                             }
                                             walk = cls.superclass;
-                                        } else { break; }
+                                        } else {
+                                            break;
+                                        }
                                     }
-                                    if let (Some(a), Some(b), Some(c), Some(d)) = (dc, mn, fn_, ln) {
+                                    if let (Some(a), Some(b), Some(c), Some(d)) = (dc, mn, fn_, ln)
+                                    {
                                         ste_idx = Some((a, b, c, d));
                                     }
                                 }
-                                let Some((dc, mn, fn_, ln)) = ste_idx else { continue };
+                                let Some((dc, mn, fn_, ln)) = ste_idx else {
+                                    continue;
+                                };
                                 let read_str = |idx: usize| -> Option<String> {
                                     match vm.shared.heap.get_field(elem_ref, idx) {
                                         Value::Object(Some(s)) => {
@@ -2614,8 +2643,10 @@ fn run() -> Result<()> {
                                         _ => None,
                                     }
                                 };
-                                let class_name = read_str(dc).unwrap_or_else(|| "<unknown>".to_string());
-                                let method_name = read_str(mn).unwrap_or_else(|| "<unknown>".to_string());
+                                let class_name =
+                                    read_str(dc).unwrap_or_else(|| "<unknown>".to_string());
+                                let method_name =
+                                    read_str(mn).unwrap_or_else(|| "<unknown>".to_string());
                                 let file_name = read_str(fn_);
                                 let line_no = match vm.shared.heap.get_field(elem_ref, ln) {
                                     Value::Int(i) => i,
@@ -2669,13 +2700,17 @@ fn run() -> Result<()> {
                     let mut next = None;
                     if let Some(i) = cause_idx {
                         if let Value::Object(Some(c)) = vm.shared.heap.get_field(cur, i) {
-                            if c != cur { next = Some(c); }
+                            if c != cur {
+                                next = Some(c);
+                            }
                         }
                     }
                     if next.is_none() {
                         if let Some(i) = target_idx {
                             if let Value::Object(Some(t)) = vm.shared.heap.get_field(cur, i) {
-                                if t != cur { next = Some(t); }
+                                if t != cur {
+                                    next = Some(t);
+                                }
                             }
                         }
                     }
@@ -2749,14 +2784,17 @@ fn run() -> Result<()> {
                                 for f in &cls.fields {
                                     if !f.is_static() {
                                         let abs = cls.first_field_index + inst;
-                                        if &*f.name == "propertyAccessExceptions" && found.is_none() {
+                                        if &*f.name == "propertyAccessExceptions" && found.is_none()
+                                        {
                                             found = Some(abs);
                                         }
                                         inst += 1;
                                     }
                                 }
                                 walk = cls.superclass;
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         found
                     };
@@ -2791,22 +2829,38 @@ fn run() -> Result<()> {
                                                         if !f.is_static() {
                                                             let abs = cls.first_field_index + inst;
                                                             match &*f.name {
-                                                                "detailMessage" if mi.is_none() => mi = Some(abs),
-                                                                "cause" if ci.is_none() => ci = Some(abs),
-                                                                "propertyName" if pn.is_none() => pn = Some(abs),
+                                                                "detailMessage" if mi.is_none() => {
+                                                                    mi = Some(abs)
+                                                                }
+                                                                "cause" if ci.is_none() => {
+                                                                    ci = Some(abs)
+                                                                }
+                                                                "propertyName" if pn.is_none() => {
+                                                                    pn = Some(abs)
+                                                                }
                                                                 _ => {}
                                                             }
                                                             inst += 1;
                                                         }
                                                     }
                                                     walk = cls.superclass;
-                                                } else { break; }
+                                                } else {
+                                                    break;
+                                                }
                                             }
                                             let read_s = |idx: Option<usize>| -> String {
-                                                idx.and_then(|i| match vm.shared.heap.get_field(eref, i) {
-                                                    Value::Object(Some(s)) => cratonvm_vm::vm::read_java_string(&vm.shared.heap, s),
-                                                    _ => None,
-                                                }).unwrap_or_default()
+                                                idx.and_then(|i| {
+                                                    match vm.shared.heap.get_field(eref, i) {
+                                                        Value::Object(Some(s)) => {
+                                                            cratonvm_vm::vm::read_java_string(
+                                                                &vm.shared.heap,
+                                                                s,
+                                                            )
+                                                        }
+                                                        _ => None,
+                                                    }
+                                                })
+                                                .unwrap_or_default()
                                             };
                                             (ename, read_s(mi), ci, read_s(pn))
                                         };
@@ -2815,23 +2869,44 @@ fn run() -> Result<()> {
                                         ));
                                         if let Some(frames) = vm.throwable_stack_for(eref) {
                                             if !frames.is_empty() {
-                                                lines.push(format!("[cratonvm-cli]       ({} captured frames)", frames.len()));
+                                                lines.push(format!(
+                                                    "[cratonvm-cli]       ({} captured frames)",
+                                                    frames.len()
+                                                ));
                                                 for frame in frames.iter().take(12) {
-                                                    let loc = match (frame.file.as_deref(), frame.line) {
-                                                        (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
-                                                        (Some(f), _) if !f.is_empty() => f.to_string(),
-                                                        _ => "Unknown Source".to_string(),
-                                                    };
-                                                    lines.push(format!("\t\tat {}.{}({})", frame.class, frame.method, loc));
+                                                    let loc =
+                                                        match (frame.file.as_deref(), frame.line) {
+                                                            (Some(f), n)
+                                                                if !f.is_empty() && n >= 0 =>
+                                                            {
+                                                                format!("{f}:{n}")
+                                                            }
+                                                            (Some(f), _) if !f.is_empty() => {
+                                                                f.to_string()
+                                                            }
+                                                            _ => "Unknown Source".to_string(),
+                                                        };
+                                                    lines.push(format!(
+                                                        "\t\tat {}.{}({})",
+                                                        frame.class, frame.method, loc
+                                                    ));
                                                 }
                                             }
                                         }
                                         // Follow cause(s) for this sub-exception (one level deep,
                                         // up to 6 deep just in case).
                                         let mut sub_cur = scause.and_then(|ci| {
-                                            if let Value::Object(Some(c)) = vm.shared.heap.get_field(eref, ci) {
-                                                if c != eref { Some(c) } else { None }
-                                            } else { None }
+                                            if let Value::Object(Some(c)) =
+                                                vm.shared.heap.get_field(eref, ci)
+                                            {
+                                                if c != eref {
+                                                    Some(c)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
                                         });
                                         for _d in 0..6 {
                                             let Some(sc) = sub_cur else { break };
@@ -2852,22 +2927,40 @@ fn run() -> Result<()> {
                                                         let mut inst = 0usize;
                                                         for f in &cls.fields {
                                                             if !f.is_static() {
-                                                                let abs = cls.first_field_index + inst;
+                                                                let abs =
+                                                                    cls.first_field_index + inst;
                                                                 match &*f.name {
-                                                                    "detailMessage" if mi.is_none() => mi = Some(abs),
-                                                                    "cause" if ci.is_none() => ci = Some(abs),
+                                                                    "detailMessage"
+                                                                        if mi.is_none() =>
+                                                                    {
+                                                                        mi = Some(abs)
+                                                                    }
+                                                                    "cause" if ci.is_none() => {
+                                                                        ci = Some(abs)
+                                                                    }
                                                                     _ => {}
                                                                 }
                                                                 inst += 1;
                                                             }
                                                         }
                                                         walk = cls.superclass;
-                                                    } else { break; }
+                                                    } else {
+                                                        break;
+                                                    }
                                                 }
-                                                let m = mi.and_then(|i| match vm.shared.heap.get_field(sc, i) {
-                                                    Value::Object(Some(s)) => cratonvm_vm::vm::read_java_string(&vm.shared.heap, s),
-                                                    _ => None,
-                                                }).unwrap_or_default();
+                                                let m = mi
+                                                    .and_then(|i| {
+                                                        match vm.shared.heap.get_field(sc, i) {
+                                                            Value::Object(Some(s)) => {
+                                                                cratonvm_vm::vm::read_java_string(
+                                                                    &vm.shared.heap,
+                                                                    s,
+                                                                )
+                                                            }
+                                                            _ => None,
+                                                        }
+                                                    })
+                                                    .unwrap_or_default();
                                                 (sc_name, m, ci)
                                             };
                                             lines.push(format!("[cratonvm-cli]       Caused by: {sc_name}: {sc_msg}"));
@@ -2875,19 +2968,39 @@ fn run() -> Result<()> {
                                                 if !frames.is_empty() {
                                                     lines.push(format!("[cratonvm-cli]         ({} captured frames)", frames.len()));
                                                     for frame in frames.iter().take(16) {
-                                                        let loc = match (frame.file.as_deref(), frame.line) {
-                                                            (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
-                                                            (Some(f), _) if !f.is_empty() => f.to_string(),
+                                                        let loc = match (
+                                                            frame.file.as_deref(),
+                                                            frame.line,
+                                                        ) {
+                                                            (Some(f), n)
+                                                                if !f.is_empty() && n >= 0 =>
+                                                            {
+                                                                format!("{f}:{n}")
+                                                            }
+                                                            (Some(f), _) if !f.is_empty() => {
+                                                                f.to_string()
+                                                            }
                                                             _ => "Unknown Source".to_string(),
                                                         };
-                                                        lines.push(format!("\t\t\tat {}.{}({})", frame.class, frame.method, loc));
+                                                        lines.push(format!(
+                                                            "\t\t\tat {}.{}({})",
+                                                            frame.class, frame.method, loc
+                                                        ));
                                                     }
                                                 }
                                             }
                                             sub_cur = sc_cause_idx.and_then(|ci| {
-                                                if let Value::Object(Some(c)) = vm.shared.heap.get_field(sc, ci) {
-                                                    if c != sc { Some(c) } else { None }
-                                                } else { None }
+                                                if let Value::Object(Some(c)) =
+                                                    vm.shared.heap.get_field(sc, ci)
+                                                {
+                                                    if c != sc {
+                                                        Some(c)
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                }
                                             });
                                         }
                                     } else {
@@ -2909,9 +3022,7 @@ fn run() -> Result<()> {
                     // `c` would never be rendered — emit a marker so deeply
                     // wrapped exceptions are not silently cut off.
                     if depth + 1 >= MAX_CAUSE_DEPTH {
-                        lines.push(
-                            "\t... (deeper causes truncated)".to_string(),
-                        );
+                        lines.push("\t... (deeper causes truncated)".to_string());
                         break;
                     }
                     cur = c;
@@ -3089,7 +3200,10 @@ fn main() {
     let _default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         use std::io::Write;
-        let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string())
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<panic payload was not a string>".to_string());
         let thread = std::thread::current();
@@ -3109,9 +3223,8 @@ fn main() {
         // failure mode where 19 caught NPEs corrupt picocli state and
         // `parseAndRun` returns without ever calling `start-dev`.
         let in_bootstrap = cratonvm_native_api::init_level::get_init_level() < 4;
-        let is_known_bootstrap_quiet = (msg.contains("unaligned pointer")
-            || msg.contains("null pointer"))
-            && in_bootstrap;
+        let is_known_bootstrap_quiet =
+            (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap;
 
         if is_known_bootstrap_quiet {
             if let Some(loc) = info.location() {
@@ -3142,7 +3255,9 @@ fn main() {
             let _ = writeln!(
                 stderr,
                 "thread '{thread_name}' panicked at {}:{}:{}:\n{msg}",
-                loc.file(), loc.line(), loc.column(),
+                loc.file(),
+                loc.line(),
+                loc.column(),
             );
         } else {
             let _ = writeln!(stderr, "thread '{thread_name}' panicked:\n{msg}");
@@ -3196,16 +3311,18 @@ fn main() {
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
         .stack_size(128 * 1024 * 1024);
-    let handler = builder.spawn(|| {
-        // DBG (CRATONVM_DBG_HANGWALK=<secs>): arm the native-stack-walk
-        // watchdog on THIS (main-vm) thread — the one that runs the
-        // interpreter — not the launcher thread that just joins it.
-        cratonvm_vm::runtime::stwhang_watch::arm_from_env();
-        if let Err(e) = run() {
-            eprintln!("{e:#}");
-            std::process::exit(1);
-        }
-    }).expect("failed to spawn main-vm thread");
+    let handler = builder
+        .spawn(|| {
+            // DBG (CRATONVM_DBG_HANGWALK=<secs>): arm the native-stack-walk
+            // watchdog on THIS (main-vm) thread — the one that runs the
+            // interpreter — not the launcher thread that just joins it.
+            cratonvm_vm::runtime::stwhang_watch::arm_from_env();
+            if let Err(e) = run() {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        })
+        .expect("failed to spawn main-vm thread");
     handler.join().unwrap_or_else(|e| {
         eprintln!("main-vm thread panicked: {:?}", e);
         std::process::exit(1);
@@ -3294,7 +3411,11 @@ fn physical_ram_bytes() -> Option<u64> {
             .args(["-n", "hw.memsize"])
             .output()
             .ok()?;
-        String::from_utf8(out.stdout).ok()?.trim().parse::<u64>().ok()
+        String::from_utf8(out.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
@@ -3417,20 +3538,14 @@ mod tests {
     #[test]
     fn sep_value_token_not_mistaken_for_main_class() {
         // The classpath string after `-cp` is a value, not the main class.
-        let out = insert_program_args_separator(argv(&[
-            "java", "-cp", "lib.jar", "Main", "arg1",
-        ]));
-        assert_eq!(
-            out,
-            argv(&["java", "-cp", "lib.jar", "Main", "--", "arg1"])
-        );
+        let out = insert_program_args_separator(argv(&["java", "-cp", "lib.jar", "Main", "arg1"]));
+        assert_eq!(out, argv(&["java", "-cp", "lib.jar", "Main", "--", "arg1"]));
     }
 
     #[test]
     fn sep_inline_jar_value() {
         // `--jar=foo.jar` inline form: `--version` after it is a program arg.
-        let out =
-            insert_program_args_separator(argv(&["java", "--jar=foo.jar", "--version"]));
+        let out = insert_program_args_separator(argv(&["java", "--jar=foo.jar", "--version"]));
         assert_eq!(out, argv(&["java", "--jar=foo.jar", "--", "--version"]));
     }
 
@@ -3556,10 +3671,13 @@ mod tests {
         ];
         let (filtered, props) = extract_system_properties(raw);
         assert_eq!(filtered, vec!["cratonvm", "com.example.Main"]);
-        assert_eq!(props, vec![
-            ("jboss.home.dir".to_string(), "C:/craton/kc16".to_string()),
-            ("my.flag".to_string(), String::new()),
-        ]);
+        assert_eq!(
+            props,
+            vec![
+                ("jboss.home.dir".to_string(), "C:/craton/kc16".to_string()),
+                ("my.flag".to_string(), String::new()),
+            ]
+        );
     }
 
     #[test]
@@ -3707,9 +3825,18 @@ mod tests {
             "missing aggregate jar must be stripped, got {expanded:?}"
         );
         let has = |n: &str| expanded.iter().any(|e| e.to_ascii_lowercase().ends_with(n));
-        assert!(has("netty-common.jar"), "missing netty-common: {expanded:?}");
-        assert!(has("netty-transport.jar"), "missing netty-transport: {expanded:?}");
-        assert!(!has("other.jar"), "unexpected 'other.jar' in result: {expanded:?}");
+        assert!(
+            has("netty-common.jar"),
+            "missing netty-common: {expanded:?}"
+        );
+        assert!(
+            has("netty-transport.jar"),
+            "missing netty-transport: {expanded:?}"
+        );
+        assert!(
+            !has("other.jar"),
+            "unexpected 'other.jar' in result: {expanded:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3804,7 +3931,10 @@ mod tests {
     #[test]
     fn expand_ignores_non_aggregate_names() {
         let dir = unique_temp_dir("no-match");
-        let missing = dir.join("does-not-exist.jar").to_string_lossy().into_owned();
+        let missing = dir
+            .join("does-not-exist.jar")
+            .to_string_lossy()
+            .into_owned();
         let expanded = expand_aggregate_jars(vec![missing.clone()]);
         assert_eq!(expanded, vec![missing]);
         let _ = std::fs::remove_dir_all(dir);
@@ -3864,14 +3994,21 @@ mod tests {
         // with the separate-token `-Xms 512m` form must parse end-to-end with
         // `Main` resolved as the main class (not the heap-size value `512m`).
         let argv0: Vec<String> = argv(&[
-            "java", "-Xms", "512m", "-Xmx", "256m", "-classpath", "x", "Main",
+            "java",
+            "-Xms",
+            "512m",
+            "-Xmx",
+            "256m",
+            "-classpath",
+            "x",
+            "Main",
         ]);
         let stage1 = insert_program_args_separator(argv0);
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
         let (stage4, _hot) = extract_hotspot_flags(stage3);
-        let parsed = Args::try_parse_from(stage4)
-            .expect("clap must accept HotSpot separate-token -Xms");
+        let parsed =
+            Args::try_parse_from(stage4).expect("clap must accept HotSpot separate-token -Xms");
         assert_eq!(parsed.max_heap.as_deref(), Some("256m"));
         assert_eq!(parsed.classpath.as_deref(), Some("x"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
@@ -3921,10 +4058,7 @@ mod tests {
 
         let raw = argv(&["java", "-Xbootclasspath/p:/opt/pre", "Main"]);
         let out = normalize_java_launcher_argv(raw);
-        assert_eq!(
-            out,
-            argv(&["java", "--Xbootclasspath", "/opt/pre", "Main"])
-        );
+        assert_eq!(out, argv(&["java", "--Xbootclasspath", "/opt/pre", "Main"]));
     }
 
     #[test]
@@ -3958,9 +4092,12 @@ mod tests {
             out,
             argv(&[
                 "java",
-                "--XX:AOTMode", "training",
-                "--XX:AOTCache", "in.aot",
-                "--XX:AOTCacheOutput", "out.aot",
+                "--XX:AOTMode",
+                "training",
+                "--XX:AOTCache",
+                "in.aot",
+                "--XX:AOTCacheOutput",
+                "out.aot",
                 "Main",
             ])
         );
@@ -3969,38 +4106,19 @@ mod tests {
     #[test]
     fn hotspot_xx_use_container_support_toggle() {
         // `-XX:-UseContainerSupport` -> clap long form.
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:-UseContainerSupport",
-            "Main",
-        ]));
-        assert_eq!(
-            out,
-            argv(&["java", "--XX:-UseContainerSupport", "Main"])
-        );
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:-UseContainerSupport", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:-UseContainerSupport", "Main"]));
         // `-XX:+UseContainerSupport` is the default; gets dropped.
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:+UseContainerSupport",
-            "Main",
-        ]));
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseContainerSupport", "Main"]));
         assert_eq!(out, argv(&["java", "Main"]));
     }
 
     #[test]
     fn hotspot_xx_audit_missing_natives_toggle() {
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:+AuditMissingNatives",
-            "Main",
-        ]));
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+AuditMissingNatives", "Main"]));
         assert_eq!(out, argv(&["java", "--XX:AuditMissingNatives", "Main"]));
         // Disabled form drops the flag (default is off).
-        let out = normalize_java_launcher_argv(argv(&[
-            "java",
-            "-XX:-AuditMissingNatives",
-            "Main",
-        ]));
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:-AuditMissingNatives", "Main"]));
         assert_eq!(out, argv(&["java", "Main"]));
     }
 
@@ -4081,9 +4199,7 @@ mod tests {
         // Other no-value `-X` knobs HotSpot accepts: `-Xint`, `-Xbatch`,
         // `-Xrs`, `-XshowSettings`, `-Xnoclassgc`. All drop out, leaving the
         // class name (and any later args) intact.
-        let raw = argv(&[
-            "java", "-Xint", "-Xbatch", "-Xrs", "-Xnoclassgc", "Main",
-        ]);
+        let raw = argv(&["java", "-Xint", "-Xbatch", "-Xrs", "-Xnoclassgc", "Main"]);
         let out = normalize_java_launcher_argv(raw);
         assert_eq!(out, argv(&["java", "Main"]));
     }
@@ -4132,8 +4248,15 @@ mod tests {
         // Regression guard for cli_main_args integration test.
         // `cratonvm --classpath <dir> PrintArgs alpha beta gamma` must produce
         // class_name=PrintArgs and args=["alpha","beta","gamma"].
-        let argv0: Vec<String> =
-            argv(&["cratonvm", "--classpath", "/tmp/dir", "PrintArgs", "alpha", "beta", "gamma"]);
+        let argv0: Vec<String> = argv(&[
+            "cratonvm",
+            "--classpath",
+            "/tmp/dir",
+            "PrintArgs",
+            "alpha",
+            "beta",
+            "gamma",
+        ]);
         let stage1 = insert_program_args_separator(argv0);
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
@@ -4211,11 +4334,13 @@ mod tests {
         // `--Xlog -Dgc` — `-Dgc` is the VALUE of `--Xlog`, not a system
         // property. It must be passed through to clap (as `--Xlog`'s operand)
         // and must NOT appear in the extracted props list.
-        let (filtered, props) = extract_system_properties(argv(&[
-            "java", "--Xlog", "-Dgc", "Main",
-        ]));
+        let (filtered, props) =
+            extract_system_properties(argv(&["java", "--Xlog", "-Dgc", "Main"]));
         assert_eq!(filtered, argv(&["java", "--Xlog", "-Dgc", "Main"]));
-        assert!(props.is_empty(), "value token must not be parsed as -D prop");
+        assert!(
+            props.is_empty(),
+            "value token must not be parsed as -D prop"
+        );
     }
 
     #[test]
@@ -4223,9 +4348,8 @@ mod tests {
         // A genuine `-Dkey=value` in an OPTION position (not following a
         // value-taking option) is still extracted — the fix only protects the
         // value slot, it doesn't disable `-D` handling.
-        let (filtered, props) = extract_system_properties(argv(&[
-            "java", "-Dfoo=bar", "--classpath", "x", "Main",
-        ]));
+        let (filtered, props) =
+            extract_system_properties(argv(&["java", "-Dfoo=bar", "--classpath", "x", "Main"]));
         // `-Dfoo=bar` removed; `--classpath x Main` survive (x is the value of
         // --classpath and is not a -D candidate anyway).
         assert_eq!(filtered, argv(&["java", "--classpath", "x", "Main"]));
@@ -4237,9 +4361,8 @@ mod tests {
         // Pathological but legal: a classpath entry literally starting with
         // `-D` (e.g. a directory named `-Dweird`). It is `--classpath`'s value
         // and must survive as-is, not become a fabricated system property.
-        let (filtered, props) = extract_system_properties(argv(&[
-            "java", "--classpath", "-Dweird", "Main",
-        ]));
+        let (filtered, props) =
+            extract_system_properties(argv(&["java", "--classpath", "-Dweird", "Main"]));
         assert_eq!(filtered, argv(&["java", "--classpath", "-Dweird", "Main"]));
         assert!(props.is_empty());
     }
@@ -4248,9 +4371,8 @@ mod tests {
     fn dminus_after_separator_is_program_arg_not_property() {
         // Unchanged behaviour guard: `-Dfoo=bar` after `--` belongs to the
         // program (jboss-modules style) and is never extracted.
-        let (filtered, props) = extract_system_properties(argv(&[
-            "java", "Main", "--", "-Dfoo=bar",
-        ]));
+        let (filtered, props) =
+            extract_system_properties(argv(&["java", "Main", "--", "-Dfoo=bar"]));
         assert_eq!(filtered, argv(&["java", "Main", "--", "-Dfoo=bar"]));
         assert!(props.is_empty());
     }
@@ -4279,8 +4401,8 @@ mod tests {
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
         let (stage4, _hot) = extract_hotspot_flags(stage3);
-        let parsed = Args::try_parse_from(stage4)
-            .expect("clap must accept unknown -X before main class");
+        let parsed =
+            Args::try_parse_from(stage4).expect("clap must accept unknown -X before main class");
         assert_eq!(parsed.classpath.as_deref(), Some("x"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
@@ -4294,8 +4416,7 @@ mod tests {
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
         let (stage4, _hot) = extract_hotspot_flags(stage3);
-        let parsed = Args::try_parse_from(stage4)
-            .expect("clap must accept `-Xint Main`");
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept `-Xint Main`");
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
 }

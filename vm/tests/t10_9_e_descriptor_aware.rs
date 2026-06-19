@@ -135,10 +135,7 @@ fn t10_9_e_2_negative_longs_all_roundtrip() {
 
 #[test]
 fn t10_9_e_3_coerce_j_from_double_reinterprets_bits() {
-    let c = coerce_field_value_by_descriptor(
-        Value::Double(f64::from_bits(0x7F_u64)),
-        b'J',
-    );
+    let c = coerce_field_value_by_descriptor(Value::Double(f64::from_bits(0x7F_u64)), b'J');
     assert_eq!(c, Value::Long(0x7F));
 }
 

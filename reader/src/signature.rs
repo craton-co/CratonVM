@@ -433,14 +433,22 @@ impl<'a> SigParser<'a> {
 pub fn parse_class_signature(sig: &str) -> Option<ClassSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_class_sig();
-    if p.depth_exceeded { None } else { r }
+    if p.depth_exceeded {
+        None
+    } else {
+        r
+    }
 }
 
 /// Parse a method signature string.
 pub fn parse_method_signature(sig: &str) -> Option<MethodSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_method_sig();
-    if p.depth_exceeded { None } else { r }
+    if p.depth_exceeded {
+        None
+    } else {
+        r
+    }
 }
 
 /// Parse a field signature string (a single reference type signature).
@@ -454,7 +462,11 @@ pub fn parse_method_signature(sig: &str) -> Option<MethodSig> {
 pub fn parse_field_signature(sig: &str) -> Option<TypeSig> {
     let mut p = SigParser::new(sig);
     let r = p.parse_type_sig();
-    if p.depth_exceeded { None } else { r }
+    if p.depth_exceeded {
+        None
+    } else {
+        r
+    }
 }
 
 // ---------------------------------------------------------------------------

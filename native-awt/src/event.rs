@@ -102,10 +102,10 @@ pub mod vk {
 
 /// Input modifier mask bits (match `java.awt.event.InputEvent`).
 pub mod modifiers {
-    pub const SHIFT_DOWN_MASK: i32 = 1 << 6;   // 64
-    pub const CTRL_DOWN_MASK: i32 = 1 << 7;    // 128
-    pub const META_DOWN_MASK: i32 = 1 << 8;    // 256
-    pub const ALT_DOWN_MASK: i32 = 1 << 9;     // 512
+    pub const SHIFT_DOWN_MASK: i32 = 1 << 6; // 64
+    pub const CTRL_DOWN_MASK: i32 = 1 << 7; // 128
+    pub const META_DOWN_MASK: i32 = 1 << 8; // 256
+    pub const ALT_DOWN_MASK: i32 = 1 << 9; // 512
     pub const BUTTON1_DOWN_MASK: i32 = 1 << 10; // 1024
     pub const BUTTON2_DOWN_MASK: i32 = 1 << 11; // 2048
     pub const BUTTON3_DOWN_MASK: i32 = 1 << 12; // 4096
@@ -419,14 +419,7 @@ mod tests {
 
     #[test]
     fn key_event_creation() {
-        let evt = AwtEvent::key(
-            event_id::KEY_PRESSED,
-            PeerId(1),
-            500,
-            vk::VK_A,
-            'a',
-            0,
-        );
+        let evt = AwtEvent::key(event_id::KEY_PRESSED, PeerId(1), 500, vk::VK_A, 'a', 0);
         assert_eq!(evt.id, event_id::KEY_PRESSED);
         if let AwtEventData::Key {
             key_code,

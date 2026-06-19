@@ -325,8 +325,7 @@ fn dgram_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let local = arg_obj(args, 1)
         .and_then(|o| decode_isa(ctx, o))
         .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-    let new_sock =
-        UdpSocket::bind(local).map_err(|e| io_error(format!("bind {local}: {e}")))?;
+    let new_sock = UdpSocket::bind(local).map_err(|e| io_error(format!("bind {local}: {e}")))?;
     let port = new_sock.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     if let Some(old_id) = dc_id(ctx, this) {
         dgram_remove(old_id);
@@ -510,16 +509,11 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         },
     };
     let _ = match (group, interface_ip) {
-        (IpAddr::V4(g), IpAddr::V4(i)) => {
-            dgram_with(id, |s| s.sock.leave_multicast_v4(&g, &i))
-        }
+        (IpAddr::V4(g), IpAddr::V4(i)) => dgram_with(id, |s| s.sock.leave_multicast_v4(&g, &i)),
         (IpAddr::V6(g), _) => dgram_with(id, |s| s.sock.leave_multicast_v6(&g, 0)),
         _ => None,
     };
-    dgram_with_mut(id, |s| {
-        s.groups
-            .retain(|(g, _)| *g != group)
-    });
+    dgram_with_mut(id, |s| s.groups.retain(|(g, _)| *g != group));
     if ctx.object_num_fields(mk) >= 4 {
         ctx.set_field(mk, 3, Value::Int(0)); // invalidate
     }
@@ -620,7 +614,12 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
 
     // open / bind — these use OUR registry; existing t16_dc_* in
     // nio_native.rs use a different registry (see module docs).
-    r.register(dci, "open0", "()Ljava/nio/channels/DatagramChannel;", dgram_open0);
+    r.register(
+        dci,
+        "open0",
+        "()Ljava/nio/channels/DatagramChannel;",
+        dgram_open0,
+    );
     r.register(
         dci,
         "bind0",
@@ -769,7 +768,9 @@ mod tests {
     fn wp37_set_get_broadcast_via_registry() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let id = dgram_register(sock);
-        dgram_with(id, |s| s.sock.set_broadcast(true)).unwrap().unwrap();
+        dgram_with(id, |s| s.sock.set_broadcast(true))
+            .unwrap()
+            .unwrap();
         let on = dgram_with(id, |s| s.sock.broadcast()).unwrap().unwrap();
         assert!(on);
         dgram_remove(id);
@@ -787,8 +788,7 @@ mod tests {
         let joined = dgram_with(id, |s| s.sock.join_multicast_v4(&group, &iface));
         if let Some(Ok(())) = joined {
             // Only assert leave if the join actually succeeded.
-            let left = dgram_with(id, |s| s.sock.leave_multicast_v4(&group, &iface))
-                .unwrap();
+            let left = dgram_with(id, |s| s.sock.leave_multicast_v4(&group, &iface)).unwrap();
             assert!(left.is_ok(), "leave_multicast_v4 failed: {left:?}");
         }
         dgram_remove(id);

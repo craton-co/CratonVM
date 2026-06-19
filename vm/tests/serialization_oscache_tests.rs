@@ -57,9 +57,7 @@ fn oscache_lookup_is_identity_stable() {
     let cache = OscCache::new();
     let cid = ClassId::new(42);
     let a = cache.get_or_insert_with(cid, || fake_ref(1));
-    let b = cache.get_or_insert_with(cid, || {
-        panic!("builder should not run on second lookup")
-    });
+    let b = cache.get_or_insert_with(cid, || panic!("builder should not run on second lookup"));
     assert_eq!(a, b);
     assert_eq!(cache.len(), 1);
 }
@@ -162,8 +160,7 @@ fn sharedvm_oscache_is_independent_per_vm() {
     // Two VMs each keep their own cache.
     let v1 = Arc::new(SharedVm::new(VmConfig::default()));
     let v2 = Arc::new(SharedVm::new(VmConfig::default()));
-    v1.osc_cache
-        .insert_if_absent(ClassId::new(1), fake_ref(1));
+    v1.osc_cache.insert_if_absent(ClassId::new(1), fake_ref(1));
     assert_eq!(v1.osc_cache.len(), 1);
     assert_eq!(v2.osc_cache.len(), 0);
 }

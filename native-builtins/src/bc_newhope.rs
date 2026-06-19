@@ -92,8 +92,7 @@ fn core(a: &mut [i16; N], omega: &[i16; 512]) {
                 let w = omega[j_twiddle] as i32; // int w = omega[jTwiddle++]
                 j_twiddle += 1;
                 a[j as usize] = (u + v) as i16; // (short)(u + v) — lazy
-                a[(j + distance) as usize] =
-                    montgomery(w.wrapping_mul(u + 3 * Q - v));
+                a[(j + distance) as usize] = montgomery(w.wrapping_mul(u + 3 * Q - v));
                 j += 2 * distance;
             }
             start += 1;
@@ -111,8 +110,7 @@ fn core(a: &mut [i16; N], omega: &[i16; 512]) {
                 let w = omega[j_twiddle] as i32;
                 j_twiddle += 1;
                 a[j as usize] = barrett((u + v) as i16);
-                a[(j + distance) as usize] =
-                    montgomery(w.wrapping_mul(u + 3 * Q - v));
+                a[(j + distance) as usize] = montgomery(w.wrapping_mul(u + 3 * Q - v));
                 j += 2 * distance;
             }
             start += 1;
@@ -185,7 +183,10 @@ mod tests {
         assert_eq!(barrett(0), 0);
         // barrett(a) for a in [0, Q) is the identity (no reduction needed):
         for a in [1i16, 100, 12288] {
-            assert_eq!(((barrett(a) as i32).rem_euclid(Q)), (a as i32).rem_euclid(Q));
+            assert_eq!(
+                ((barrett(a) as i32).rem_euclid(Q)),
+                (a as i32).rem_euclid(Q)
+            );
         }
         // barrett of a value >= Q reduces it into range mod Q.
         let big = 24577i32; // 2*Q - 1

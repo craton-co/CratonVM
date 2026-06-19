@@ -48,10 +48,7 @@ fn test_resources_dir() -> String {
 }
 
 fn fixture_compiled() -> bool {
-    let path = format!(
-        "{}/cratonvm/Wp21FieldSurface.class",
-        test_resources_dir()
-    );
+    let path = format!("{}/cratonvm/Wp21FieldSurface.class", test_resources_dir());
     std::path::Path::new(&path).exists()
 }
 
@@ -189,7 +186,9 @@ fn int_getter_setter_round_trips() {
 
 #[test]
 fn plain_long_round_trips_diag() {
-    if !fixture_compiled() { return; }
+    if !fixture_compiled() {
+        return;
+    }
     let r = run_probe("plainLongGetterSetterRoundTripsDiag")
         .expect("WP2.1-field: plain long diag must invoke");
     assert_eq!(r, 1, "plain long setLong: returned {r}");
@@ -198,9 +197,7 @@ fn plain_long_round_trips_diag() {
 #[test]
 fn volatile_long_round_trips() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping volatile_long_round_trips: fixture not staged"
-        );
+        eprintln!("Skipping volatile_long_round_trips: fixture not staged");
         return;
     }
     let r = run_probe("volatileLongGetterSetterRoundTrips")
@@ -240,8 +237,7 @@ fn boxing_round_trips() {
         eprintln!("Skipping boxing_round_trips: fixture not staged");
         return;
     }
-    let r = run_probe("boxingRoundTrips")
-        .expect("WP2.1-field: boxing probe must invoke cleanly");
+    let r = run_probe("boxingRoundTrips").expect("WP2.1-field: boxing probe must invoke cleanly");
     assert_eq!(
         r, 1,
         "WP2.1-field: Field.get on int must return Integer; \
@@ -259,8 +255,8 @@ fn metadata_round_trips() {
         eprintln!("Skipping metadata_round_trips: fixture not staged");
         return;
     }
-    let r = run_probe("metadataRoundTrips")
-        .expect("WP2.1-field: metadata probe must invoke cleanly");
+    let r =
+        run_probe("metadataRoundTrips").expect("WP2.1-field: metadata probe must invoke cleanly");
     assert_eq!(
         r, 1,
         "WP2.1-field: getName/getType/getModifiers/getDeclaringClass must \
@@ -271,9 +267,7 @@ fn metadata_round_trips() {
 #[test]
 fn reference_and_array_round_trips() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping reference_and_array_round_trips: fixture not staged"
-        );
+        eprintln!("Skipping reference_and_array_round_trips: fixture not staged");
         return;
     }
     let r = run_probe("referenceAndArrayRoundTrips")
@@ -292,8 +286,8 @@ fn all_field_probes_pass() {
         eprintln!("Skipping all_field_probes_pass: fixture not staged");
         return;
     }
-    let r = run_probe("allFieldProbesPass")
-        .expect("WP2.1-field: composite probe must invoke cleanly");
+    let r =
+        run_probe("allFieldProbesPass").expect("WP2.1-field: composite probe must invoke cleanly");
     assert_eq!(
         r, 1,
         "WP2.1-field acceptance failed: at least one of the probe methods \
@@ -308,14 +302,8 @@ fn all_field_probes_pass() {
 
 #[test]
 fn fixture_class_file_is_staged() {
-    let java = format!(
-        "{}/cratonvm/Wp21FieldSurface.java",
-        test_resources_dir()
-    );
-    let class = format!(
-        "{}/cratonvm/Wp21FieldSurface.class",
-        test_resources_dir()
-    );
+    let java = format!("{}/cratonvm/Wp21FieldSurface.java", test_resources_dir());
+    let class = format!("{}/cratonvm/Wp21FieldSurface.class", test_resources_dir());
     assert!(
         std::path::Path::new(&java).exists(),
         "Wp21FieldSurface.java fixture must exist at {java}"

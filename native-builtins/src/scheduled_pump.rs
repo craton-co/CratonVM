@@ -159,11 +159,11 @@ impl ScheduledRegistry {
                 continue;
             }
             let to_fire = (due - fired).min(64); // safety cap per pump
-            // Reconstruct the runnable ObjectRef from the stored raw
-            // pointer. SAFETY: the `ScheduledThreadPoolExecutor` holds
-            // a strong reference to the runnable, and the pump runs
-            // inside the same Java thread that submitted, so the GC
-            // cannot have moved or freed the object.
+                                                 // Reconstruct the runnable ObjectRef from the stored raw
+                                                 // pointer. SAFETY: the `ScheduledThreadPoolExecutor` holds
+                                                 // a strong reference to the runnable, and the pump runs
+                                                 // inside the same Java thread that submitted, so the GC
+                                                 // cannot have moved or freed the object.
             let runnable_ptr = task.runnable_ptr as *mut u8;
             if runnable_ptr.is_null() {
                 continue;
@@ -342,14 +342,22 @@ mod tests {
             }));
         }
         // Confirm pre-state by id.
-        let live_before: Vec<u64> = reg.tasks.lock().iter()
+        let live_before: Vec<u64> = reg
+            .tasks
+            .lock()
+            .iter()
             .filter(|t| !t.is_cancelled() && t.id >= 200)
-            .map(|t| t.id).collect();
+            .map(|t| t.id)
+            .collect();
         assert_eq!(live_before.len(), 3);
         reg.cancel_all();
-        let live_after: Vec<u64> = reg.tasks.lock().iter()
+        let live_after: Vec<u64> = reg
+            .tasks
+            .lock()
+            .iter()
             .filter(|t| !t.is_cancelled() && t.id >= 200)
-            .map(|t| t.id).collect();
+            .map(|t| t.id)
+            .collect();
         assert_eq!(live_after.len(), 0);
     }
 }

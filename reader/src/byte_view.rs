@@ -91,10 +91,7 @@ impl ByteView {
     /// Unknown attribute data) uses this constructor so a malformed
     /// class file produces an error instead of aborting the process.
     #[inline]
-    pub fn try_new(
-        source: Arc<[u8]>,
-        range: Range<usize>,
-    ) -> Result<Self, ClassReaderError> {
+    pub fn try_new(source: Arc<[u8]>, range: Range<usize>) -> Result<Self, ClassReaderError> {
         if range.start > range.end || range.end > source.len() {
             return Err(ClassReaderError::InvalidClassData {
                 message: format!(
@@ -290,8 +287,7 @@ mod tests {
     fn new_view_shares_parent_arc() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
         let strong_before = Arc::strong_count(&parent);
-        let view = ByteView::try_new(Arc::clone(&parent), 2..6)
-            .expect("in-bounds range");
+        let view = ByteView::try_new(Arc::clone(&parent), 2..6).expect("in-bounds range");
         assert_eq!(Arc::strong_count(&parent), strong_before + 1);
         assert_eq!(view.as_bytes(), &[3u8, 4, 5, 6][..]);
         assert_eq!(view.len(), 4);
@@ -331,8 +327,7 @@ mod tests {
     #[test]
     fn to_arc_returns_independent_arc() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
-        let view = ByteView::try_new(Arc::clone(&parent), 1..3)
-            .expect("in-bounds range");
+        let view = ByteView::try_new(Arc::clone(&parent), 1..3).expect("in-bounds range");
         let owned: Arc<[u8]> = view.to_arc();
         assert_eq!(&*owned, &[2u8, 3][..]);
         // owned is decoupled from parent.
@@ -368,8 +363,7 @@ mod tests {
         // Inverted range.
         assert!(ByteView::try_new(Arc::clone(&parent), 3..1).is_err());
         // Valid range succeeds and yields the expected slice.
-        let v = ByteView::try_new(Arc::clone(&parent), 1..3)
-            .expect("in-bounds range");
+        let v = ByteView::try_new(Arc::clone(&parent), 1..3).expect("in-bounds range");
         assert_eq!(v.as_bytes(), &[2u8, 3][..]);
         // Whole-buffer and empty-at-end ranges are valid.
         assert!(ByteView::try_new(Arc::clone(&parent), 0..4).is_ok());

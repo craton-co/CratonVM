@@ -23,7 +23,9 @@ mod common;
 
 use std::io::Read;
 
-fn run_helloworld_with_classpath(cp: &std::path::Path) -> (std::process::ExitStatus, String, String) {
+fn run_helloworld_with_classpath(
+    cp: &std::path::Path,
+) -> (std::process::ExitStatus, String, String) {
     let mut cmd = common::cratonvm_cmd();
     cmd.arg("--classpath")
         .arg(cp)

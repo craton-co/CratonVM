@@ -177,7 +177,9 @@ impl OptionMap {
     }
 
     pub fn resolved_task_threads(&self) -> usize {
-        let raw = self.worker_task_core_threads.unwrap_or(DEFAULT_TASK_THREADS);
+        let raw = self
+            .worker_task_core_threads
+            .unwrap_or(DEFAULT_TASK_THREADS);
         raw.clamp(MIN_TASK_THREADS, MAX_TASK_THREADS)
     }
 }
@@ -338,8 +340,7 @@ impl XnioWorker {
 
     /// Round-robin pick the next I/O thread handle.
     pub fn get_io_thread(&self) -> Arc<IoThreadHandle> {
-        let idx = self.io_dispatch_counter.fetch_add(1, Ordering::Relaxed)
-            % self.io_threads.len();
+        let idx = self.io_dispatch_counter.fetch_add(1, Ordering::Relaxed) % self.io_threads.len();
         self.io_threads[idx].clone()
     }
 
@@ -699,18 +700,12 @@ fn reflect_worker_state(ctx: &dyn NativeContext, this: ObjectRef, worker: &Arc<X
 
 // --- Xnio.getInstance / getInstance(String) ---
 
-fn native_xnio_get_instance(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_xnio_get_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = Xnio::get_instance(); // force singleton init.
     Ok(Some(Value::Object(Some(alloc_xnio_mirror(ctx)))))
 }
 
-fn native_xnio_get_instance_named(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_xnio_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let _name = match args.first().copied() {
         Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_else(|| "nio".to_string()),
         _ => "nio".to_string(),
@@ -721,10 +716,7 @@ fn native_xnio_get_instance_named(
 
 // --- Xnio.createWorker(OptionMap) ---
 
-fn native_xnio_create_worker(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_xnio_create_worker(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // The Java-facing `OptionMap` is the T19.7.e territory; we accept
     // any opaque object and read defaults for now.  When T19.7.e lands
     // it will populate `worker_io_threads` / `worker_task_core_threads`
@@ -739,10 +731,7 @@ fn native_xnio_create_worker(
 
 // --- XnioWorker.getIoThread / getIoThreads ---
 
-fn native_worker_get_io_thread(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let worker = read_worker(ctx, this)
         .ok_or_else(|| mcf_runtime("XnioWorker.getIoThread: not registered"))?;
@@ -755,10 +744,7 @@ fn native_worker_get_io_thread(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-fn native_worker_get_io_threads(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let worker = read_worker(ctx, this)
         .ok_or_else(|| mcf_runtime("XnioWorker.getIoThreads: not registered"))?;
@@ -775,13 +761,10 @@ fn native_worker_get_io_threads(
 
 // --- XnioWorker.execute(Runnable) ---
 
-fn native_worker_execute(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let worker = read_worker(ctx, this)
-        .ok_or_else(|| mcf_runtime("XnioWorker.execute: not registered"))?;
+    let worker =
+        read_worker(ctx, this).ok_or_else(|| mcf_runtime("XnioWorker.execute: not registered"))?;
     // We can't capture the bytecode Runnable across threads in the
     // synthetic path (no JvmThread handle here).  Instead submit a
     // no-op and let the bytecode layer post-process the result.  The
@@ -800,10 +783,7 @@ fn native_worker_execute(
 
 // --- XnioWorker.shutdown / shutdownNow ---
 
-fn native_worker_shutdown(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(worker) = read_worker(ctx, this) {
         worker.shutdown();
@@ -812,10 +792,7 @@ fn native_worker_shutdown(
     Ok(None)
 }
 
-fn native_worker_shutdown_now(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(worker) = read_worker(ctx, this) {
         worker.shutdown_now();
@@ -850,19 +827,13 @@ fn native_worker_await_termination(
 
 // --- XnioWorker.isShutdown / isTerminated ---
 
-fn native_worker_is_shutdown(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = read_worker(ctx, this).map_or(false, |w| w.is_shutdown());
     Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
-fn native_worker_is_terminated(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_worker_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = read_worker(ctx, this).map_or(false, |w| w.is_terminated());
     Ok(Some(Value::Int(if v { 1 } else { 0 })))
@@ -870,10 +841,7 @@ fn native_worker_is_terminated(
 
 // --- XnioWorker.getMXBean() — JMX not exposed here, return null. ---
 
-fn native_worker_get_mxbean(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_worker_get_mxbean(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(None)))
 }
 
@@ -927,12 +895,7 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)V",
         native_worker_execute,
     );
-    r.register(
-        CLS_XNIO_WORKER,
-        "shutdown",
-        "()V",
-        native_worker_shutdown,
-    );
+    r.register(CLS_XNIO_WORKER, "shutdown", "()V", native_worker_shutdown);
     r.register(
         CLS_XNIO_WORKER,
         "shutdownNow",
@@ -1287,7 +1250,11 @@ mod tests {
             .is_some());
         assert!(r.find(CLS_XNIO_WORKER, "isShutdown", "()Z").is_some());
         assert!(r
-            .find(CLS_NIO_XNIO_WORKER, "getIoThread", "()Lorg/xnio/XnioIoThread;")
+            .find(
+                CLS_NIO_XNIO_WORKER,
+                "getIoThread",
+                "()Lorg/xnio/XnioIoThread;"
+            )
             .is_some());
     }
 

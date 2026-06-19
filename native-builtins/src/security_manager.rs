@@ -129,14 +129,18 @@ static SHARED_PERMISSION_COLLECTION: Mutex<Option<ObjectRef>> = Mutex::new(None)
 
 /// Read the currently-installed Java `Policy` object, if any.
 fn get_policy_object() -> Option<ObjectRef> {
-    *ACTIVE_POLICY_OBJECT.lock().unwrap_or_else(|e| e.into_inner())
+    *ACTIVE_POLICY_OBJECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Store a new Java `Policy` reference (or clear with `None`). This matches
 /// `Policy.setPolicy(Policy)` semantics: `null` is accepted and results in
 /// a future `getPolicy()` call lazily allocating the synthetic default.
 fn set_policy_object(p: Option<ObjectRef>) {
-    *ACTIVE_POLICY_OBJECT.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    *ACTIVE_POLICY_OBJECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = p;
 }
 
 /// Lazily allocate the synthetic default Policy used when no caller has
@@ -149,7 +153,9 @@ fn set_policy_object(p: Option<ObjectRef>) {
 /// `pdMapping` field, but we deliberately leave it null because none of
 /// our overridden natives read it.
 fn ensure_default_policy_object(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mut g = ACTIVE_POLICY_OBJECT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = ACTIVE_POLICY_OBJECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(p) = *g {
         return p;
     }
@@ -385,11 +391,7 @@ pub fn privileged_stack_depth() -> usize {
 
 /// Read the `name` field (field 0) from a Permission synthetic object and
 /// return it as a Rust String, or empty if unavailable.
-fn read_string_field(
-    ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
-    field_idx: usize,
-) -> String {
+fn read_string_field(ctx: &mut dyn NativeContext, obj: ObjectRef, field_idx: usize) -> String {
     match ctx.get_field(obj, field_idx) {
         Value::Object(Some(sref)) => ctx.read_string(sref).unwrap_or_default(),
         _ => String::new(),
@@ -445,10 +447,7 @@ fn throw_access_control_exception(
 /// currently-active privileged frame's code base (if any) to disambiguate
 /// `codeBase "..."` grants. A denial throws
 /// `java.security.AccessControlException`.
-fn check_permission_impl(
-    ctx: &mut dyn NativeContext,
-    perm: ObjectRef,
-) -> MethodCallResult {
+fn check_permission_impl(ctx: &mut dyn NativeContext, perm: ObjectRef) -> MethodCallResult {
     let class_id = ctx.class_id_of_object(perm);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
 
@@ -559,81 +558,56 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
     );
 
     // checkRead(String)V — delegates to checkPermission with FilePermission("read")
-    r.register(
-        sm,
-        "checkRead",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let _file = obj_arg(args, 1)?;
-            // Create a synthetic FilePermission for the read action
-            let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
-            // field 0 = path (the file string), field 1 = actions
-            ctx.set_field(perm, 0, args[1]);
-            let actions = ctx.create_string("read");
-            ctx.set_field(perm, 1, Value::Object(Some(actions)));
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkRead", "(Ljava/lang/String;)V", |ctx, args| {
+        let _file = obj_arg(args, 1)?;
+        // Create a synthetic FilePermission for the read action
+        let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
+        // field 0 = path (the file string), field 1 = actions
+        ctx.set_field(perm, 0, args[1]);
+        let actions = ctx.create_string("read");
+        ctx.set_field(perm, 1, Value::Object(Some(actions)));
+        check_permission_impl(ctx, perm)
+    });
 
     // checkWrite(String)V — delegates to checkPermission with FilePermission("write")
-    r.register(
-        sm,
-        "checkWrite",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let _file = obj_arg(args, 1)?;
-            let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
-            ctx.set_field(perm, 0, args[1]);
-            let actions = ctx.create_string("write");
-            ctx.set_field(perm, 1, Value::Object(Some(actions)));
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkWrite", "(Ljava/lang/String;)V", |ctx, args| {
+        let _file = obj_arg(args, 1)?;
+        let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
+        ctx.set_field(perm, 0, args[1]);
+        let actions = ctx.create_string("write");
+        ctx.set_field(perm, 1, Value::Object(Some(actions)));
+        check_permission_impl(ctx, perm)
+    });
 
     // checkConnect(String, int)V — delegates to checkPermission with SocketPermission
-    r.register(
-        sm,
-        "checkConnect",
-        "(Ljava/lang/String;I)V",
-        |ctx, args| {
-            let _host = obj_arg(args, 1)?;
-            let perm = alloc_concurrent_synthetic(ctx, "java/net/SocketPermission", 2);
-            ctx.set_field(perm, 0, args[1]); // host string
-            let actions = ctx.create_string("connect");
-            ctx.set_field(perm, 1, Value::Object(Some(actions)));
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkConnect", "(Ljava/lang/String;I)V", |ctx, args| {
+        let _host = obj_arg(args, 1)?;
+        let perm = alloc_concurrent_synthetic(ctx, "java/net/SocketPermission", 2);
+        ctx.set_field(perm, 0, args[1]); // host string
+        let actions = ctx.create_string("connect");
+        ctx.set_field(perm, 1, Value::Object(Some(actions)));
+        check_permission_impl(ctx, perm)
+    });
 
     // checkExec(String)V — delegates to checkPermission with FilePermission("execute")
-    r.register(
-        sm,
-        "checkExec",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let _cmd = obj_arg(args, 1)?;
-            let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
-            ctx.set_field(perm, 0, args[1]);
-            let actions = ctx.create_string("execute");
-            ctx.set_field(perm, 1, Value::Object(Some(actions)));
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkExec", "(Ljava/lang/String;)V", |ctx, args| {
+        let _cmd = obj_arg(args, 1)?;
+        let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
+        ctx.set_field(perm, 0, args[1]);
+        let actions = ctx.create_string("execute");
+        ctx.set_field(perm, 1, Value::Object(Some(actions)));
+        check_permission_impl(ctx, perm)
+    });
 
     // checkDelete(String)V — delegates to checkPermission with FilePermission("delete")
-    r.register(
-        sm,
-        "checkDelete",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let _file = obj_arg(args, 1)?;
-            let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
-            ctx.set_field(perm, 0, args[1]);
-            let actions = ctx.create_string("delete");
-            ctx.set_field(perm, 1, Value::Object(Some(actions)));
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkDelete", "(Ljava/lang/String;)V", |ctx, args| {
+        let _file = obj_arg(args, 1)?;
+        let perm = alloc_concurrent_synthetic(ctx, "java/io/FilePermission", 2);
+        ctx.set_field(perm, 0, args[1]);
+        let actions = ctx.create_string("delete");
+        ctx.set_field(perm, 1, Value::Object(Some(actions)));
+        check_permission_impl(ctx, perm)
+    });
 
     // checkPropertyAccess(String)V — delegates to checkPermission with PropertyPermission
     r.register(
@@ -642,8 +616,7 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)V",
         |ctx, args| {
             let _prop = obj_arg(args, 1)?;
-            let perm =
-                alloc_concurrent_synthetic(ctx, "java/util/PropertyPermission", 2);
+            let perm = alloc_concurrent_synthetic(ctx, "java/util/PropertyPermission", 2);
             ctx.set_field(perm, 0, args[1]); // property name
             let actions = ctx.create_string("read");
             ctx.set_field(perm, 1, Value::Object(Some(actions)));
@@ -657,20 +630,14 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
     // which meant a restrictive java.policy could never constrain thread
     // access. Route through check_permission_impl like the other checkXxx
     // handlers; under the default (no policy) the impl still allows.
-    r.register(
-        sm,
-        "checkAccess",
-        "(Ljava/lang/Thread;)V",
-        |ctx, args| {
-            let _thread = obj_arg(args, 1)?;
-            let perm =
-                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
-            let name = ctx.create_string("modifyThread");
-            ctx.set_field(perm, 0, Value::Object(Some(name)));
-            ctx.set_field(perm, 1, Value::Object(None)); // no actions
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkAccess", "(Ljava/lang/Thread;)V", |ctx, args| {
+        let _thread = obj_arg(args, 1)?;
+        let perm = alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+        let name = ctx.create_string("modifyThread");
+        ctx.set_field(perm, 0, Value::Object(Some(name)));
+        ctx.set_field(perm, 1, Value::Object(None)); // no actions
+        check_permission_impl(ctx, perm)
+    });
 
     // checkAccess(ThreadGroup)V — delegates to checkPermission with
     // RuntimePermission("modifyThreadGroup") so a loaded policy can deny it.
@@ -681,8 +648,7 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ThreadGroup;)V",
         |ctx, args| {
             let _group = obj_arg(args, 1)?;
-            let perm =
-                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+            let perm = alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
             let name = ctx.create_string("modifyThreadGroup");
             ctx.set_field(perm, 0, Value::Object(Some(name)));
             ctx.set_field(perm, 1, Value::Object(None)); // no actions
@@ -691,39 +657,27 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
     );
 
     // checkCreateClassLoader()V — delegates to checkPermission with RuntimePermission
-    r.register(
-        sm,
-        "checkCreateClassLoader",
-        "()V",
-        |ctx, args| {
-            let perm =
-                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
-            let name = ctx.create_string("createClassLoader");
-            ctx.set_field(perm, 0, Value::Object(Some(name)));
-            ctx.set_field(perm, 1, Value::Object(None)); // no actions
-            let _this = obj_arg(args, 0)?;
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkCreateClassLoader", "()V", |ctx, args| {
+        let perm = alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+        let name = ctx.create_string("createClassLoader");
+        ctx.set_field(perm, 0, Value::Object(Some(name)));
+        ctx.set_field(perm, 1, Value::Object(None)); // no actions
+        let _this = obj_arg(args, 0)?;
+        check_permission_impl(ctx, perm)
+    });
 
     // checkExit(int)V — delegates to checkPermission with RuntimePermission("exitVM.<code>")
-    r.register(
-        sm,
-        "checkExit",
-        "(I)V",
-        |ctx, args| {
-            let code = match args.get(1) {
-                Some(Value::Int(i)) => *i,
-                _ => 0,
-            };
-            let perm =
-                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
-            let name = ctx.create_string(&format!("exitVM.{}", code));
-            ctx.set_field(perm, 0, Value::Object(Some(name)));
-            ctx.set_field(perm, 1, Value::Object(None)); // no actions
-            check_permission_impl(ctx, perm)
-        },
-    );
+    r.register(sm, "checkExit", "(I)V", |ctx, args| {
+        let code = match args.get(1) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let perm = alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+        let name = ctx.create_string(&format!("exitVM.{}", code));
+        ctx.set_field(perm, 0, Value::Object(Some(name)));
+        ctx.set_field(perm, 1, Value::Object(None)); // no actions
+        check_permission_impl(ctx, perm)
+    });
 
     // getSecurityContext()Ljava/lang/Object; — returns a synthetic AccessControlContext
     r.register(
@@ -731,8 +685,7 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
         "getSecurityContext",
         "()Ljava/lang/Object;",
         |ctx, _args| {
-            let acc =
-                alloc_concurrent_synthetic(ctx, "java/security/AccessControlContext", 1);
+            let acc = alloc_concurrent_synthetic(ctx, "java/security/AccessControlContext", 1);
             // field 0 = protection domains (null = no restriction)
             ctx.set_field(acc, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(acc))))
@@ -789,8 +742,9 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
 /// the `Option<Arc<str>>` value type — so unknown classes don't keep
 /// re-querying the class manager.  Cert digests don't change at runtime
 /// so no invalidation is needed.
-static CLASS_CODE_BASE_CACHE: OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u32, Option<Arc<str>>>>> =
-    OnceLock::new();
+static CLASS_CODE_BASE_CACHE: OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u32, Option<Arc<str>>>>,
+> = OnceLock::new();
 
 /// Per-ClassId memoisation of [`action_cert_digests`].
 ///
@@ -800,16 +754,14 @@ static CLASS_CODE_BASE_CACHE: OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap
 /// as `Arc<[Arc<str>]>` so the doPrivileged push reduces to two
 /// refcount bumps (`Arc::clone` on the slice header + Arc tokens reused
 /// by-reference).
-static SIGNER_TOKENS_CACHE: OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u32, Arc<[Arc<str>]>>>> =
-    OnceLock::new();
+static SIGNER_TOKENS_CACHE: OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u32, Arc<[Arc<str>]>>>,
+> = OnceLock::new();
 
 /// Cached form of [`action_code_base`] keyed by ClassId.  Returns the
 /// same `Arc<str>` on every hit so the doPrivileged push is a refcount
 /// bump.  See [`CLASS_CODE_BASE_CACHE`] for the rationale.
-fn cached_action_code_base(
-    ctx: &mut dyn NativeContext,
-    class_id: ClassId,
-) -> Option<Arc<str>> {
+fn cached_action_code_base(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<Arc<str>> {
     let cache = CLASS_CODE_BASE_CACHE
         .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
     if let Some(slot) = cache.read().get(&class_id.as_u32()) {
@@ -823,9 +775,7 @@ fn cached_action_code_base(
             .map(|name| Arc::from(format!("class:{name}")))
     };
     // Insert (clone the Arc, not the str body).
-    cache
-        .write()
-        .insert(class_id.as_u32(), computed.clone());
+    cache.write().insert(class_id.as_u32(), computed.clone());
     computed
 }
 
@@ -833,10 +783,7 @@ fn cached_action_code_base(
 /// PKCS#7 DER walk in [`x509::parse_signer_dn`] runs at most once per
 /// class for the lifetime of the JVM; subsequent doPrivileged calls
 /// reuse the same `Arc<[Arc<str>]>`.
-fn cached_signer_tokens(
-    ctx: &mut dyn NativeContext,
-    class_id: ClassId,
-) -> Arc<[Arc<str>]> {
+fn cached_signer_tokens(ctx: &mut dyn NativeContext, class_id: ClassId) -> Arc<[Arc<str>]> {
     let cache = SIGNER_TOKENS_CACHE
         .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
     if let Some(arc) = cache.read().get(&class_id.as_u32()).cloned() {
@@ -854,9 +801,7 @@ fn cached_signer_tokens(
         }
     }
     let arc: Arc<[Arc<str>]> = tokens.into();
-    cache
-        .write()
-        .insert(class_id.as_u32(), Arc::clone(&arc));
+    cache.write().insert(class_id.as_u32(), Arc::clone(&arc));
     arc
 }
 
@@ -876,10 +821,7 @@ fn cached_signer_tokens(
 ///
 /// Tests still call this directly — production doPrivileged uses
 /// [`cached_action_code_base`] which is hot-path-optimised.
-fn action_code_base(
-    ctx: &mut dyn NativeContext,
-    action: ObjectRef,
-) -> Option<String> {
+fn action_code_base(ctx: &mut dyn NativeContext, action: ObjectRef) -> Option<String> {
     let cid = ctx.class_id_of_object(action);
     cached_action_code_base(ctx, cid).map(|a| a.to_string())
 }
@@ -899,10 +841,7 @@ fn action_code_base(
 /// Production callers go through [`cached_signer_tokens`]; this helper
 /// remains for any non-hot caller that wants the `Vec<String>` shape.
 #[allow(dead_code)]
-fn action_cert_digests(
-    ctx: &mut dyn NativeContext,
-    action: ObjectRef,
-) -> Vec<String> {
+fn action_cert_digests(ctx: &mut dyn NativeContext, action: ObjectRef) -> Vec<String> {
     let cid = ctx.class_id_of_object(action);
     cached_signer_tokens(ctx, cid)
         .iter()
@@ -989,8 +928,7 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
         "getContext",
         "()Ljava/security/AccessControlContext;",
         |ctx, _args| {
-            let acc =
-                alloc_concurrent_synthetic(ctx, "java/security/AccessControlContext", 1);
+            let acc = alloc_concurrent_synthetic(ctx, "java/security/AccessControlContext", 1);
             ctx.set_field(acc, 0, Value::Object(None)); // no protection domains
             Ok(Some(Value::Object(Some(acc))))
         },
@@ -1187,13 +1125,18 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
     // getPolicyNoCheck()Ljava/security/Policy; — internal JDK entry that
     // skips the SecurityManager check; for our lenient model this is
     // identical to `getPolicy`.
-    r.register(p, "getPolicyNoCheck", "()Ljava/security/Policy;", |ctx, _args| {
-        if let Some(existing) = get_policy_object() {
-            return Ok(Some(Value::Object(Some(existing))));
-        }
-        let p = ensure_default_policy_object(ctx);
-        Ok(Some(Value::Object(Some(p))))
-    });
+    r.register(
+        p,
+        "getPolicyNoCheck",
+        "()Ljava/security/Policy;",
+        |ctx, _args| {
+            if let Some(existing) = get_policy_object() {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            let p = ensure_default_policy_object(ctx);
+            Ok(Some(Value::Object(Some(p))))
+        },
+    );
 
     // isSet()Z — returns true if a Policy has been explicitly installed.
     // We treat the default-singleton path as "set" once it has been
@@ -1342,8 +1285,11 @@ mod tests {
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "<init>", "()V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "<init>",
+            "()V",
             &[Value::Object(Some(sm_obj))],
         );
         assert!(result.is_ok());
@@ -1362,8 +1308,11 @@ mod tests {
         let perm = alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkPermission", "(Ljava/security/Permission;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkPermission",
+            "(Ljava/security/Permission;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(perm))],
         );
         assert!(result.is_ok());
@@ -1383,8 +1332,11 @@ mod tests {
         let file_str = ctx.create_string("/etc/passwd");
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkRead", "(Ljava/lang/String;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkRead",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(file_str))],
         );
         assert!(result.is_ok());
@@ -1403,9 +1355,16 @@ mod tests {
         let host = ctx.create_string("example.com");
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkConnect", "(Ljava/lang/String;I)V",
-            &[Value::Object(Some(sm_obj)), Value::Object(Some(host)), Value::Int(80)],
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkConnect",
+            "(Ljava/lang/String;I)V",
+            &[
+                Value::Object(Some(sm_obj)),
+                Value::Object(Some(host)),
+                Value::Int(80),
+            ],
         );
         assert!(result.is_ok());
         clear_policy_and_stack();
@@ -1422,8 +1381,11 @@ mod tests {
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkExit", "(I)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkExit",
+            "(I)V",
             &[Value::Object(Some(sm_obj)), Value::Int(0)],
         );
         assert!(result.is_ok());
@@ -1439,8 +1401,11 @@ mod tests {
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "getSecurityContext", "()Ljava/lang/Object;",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "getSecurityContext",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(sm_obj))],
         );
         assert!(result.is_ok());
@@ -1464,7 +1429,11 @@ mod tests {
 
         // getSecurityManager() should return null initially
         let get_sm = registry
-            .find("java/lang/System", "getSecurityManager", "()Ljava/lang/SecurityManager;")
+            .find(
+                "java/lang/System",
+                "getSecurityManager",
+                "()Ljava/lang/SecurityManager;",
+            )
             .expect("getSecurityManager should be registered");
 
         let result = get_sm(&mut ctx, &[]);
@@ -1474,7 +1443,11 @@ mod tests {
         // Set a SecurityManager
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let set_sm = registry
-            .find("java/lang/System", "setSecurityManager", "(Ljava/lang/SecurityManager;)V")
+            .find(
+                "java/lang/System",
+                "setSecurityManager",
+                "(Ljava/lang/SecurityManager;)V",
+            )
             .expect("setSecurityManager should be registered");
 
         let result = set_sm(&mut ctx, &[Value::Object(Some(sm_obj))]);
@@ -1514,8 +1487,10 @@ mod tests {
         }
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/security/AccessController", "doPrivileged",
+            &registry,
+            &mut ctx,
+            "java/security/AccessController",
+            "doPrivileged",
             "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;",
             &[Value::Object(Some(action))],
         );
@@ -1543,8 +1518,10 @@ mod tests {
         }
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/security/AccessController", "doPrivileged",
+            &registry,
+            &mut ctx,
+            "java/security/AccessController",
+            "doPrivileged",
             "(Ljava/security/PrivilegedExceptionAction;)Ljava/lang/Object;",
             &[Value::Object(Some(action))],
         );
@@ -1565,8 +1542,7 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         let action = alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedAction", 0);
-        let acc =
-            alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1);
+        let acc = alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1);
 
         // Pre-arm
         unsafe {
@@ -1590,8 +1566,10 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/security/AccessController", "getContext",
+            &registry,
+            &mut ctx,
+            "java/security/AccessController",
+            "getContext",
             "()Ljava/security/AccessControlContext;",
             &[],
         );
@@ -1612,13 +1590,14 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let acc =
-            alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1);
+        let acc = alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1);
         let perm = alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/security/AccessControlContext", "checkPermission",
+            &registry,
+            &mut ctx,
+            "java/security/AccessControlContext",
+            "checkPermission",
             "(Ljava/security/Permission;)V",
             &[Value::Object(Some(acc)), Value::Object(Some(perm))],
         );
@@ -1637,8 +1616,11 @@ mod tests {
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkCreateClassLoader", "()V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkCreateClassLoader",
+            "()V",
             &[Value::Object(Some(sm_obj))],
         );
         assert!(result.is_ok());
@@ -1658,16 +1640,22 @@ mod tests {
 
         // checkWrite
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkWrite", "(Ljava/lang/String;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkWrite",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(file_str))],
         );
         assert!(result.is_ok());
 
         // checkDelete
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkDelete", "(Ljava/lang/String;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkDelete",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(file_str))],
         );
         assert!(result.is_ok());
@@ -1686,8 +1674,11 @@ mod tests {
         let cmd = ctx.create_string("/usr/bin/ls");
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkExec", "(Ljava/lang/String;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkExec",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(cmd))],
         );
         assert!(result.is_ok());
@@ -1706,8 +1697,11 @@ mod tests {
         let prop = ctx.create_string("java.home");
 
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkPropertyAccess", "(Ljava/lang/String;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkPropertyAccess",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(prop))],
         );
         assert!(result.is_ok());
@@ -1726,16 +1720,22 @@ mod tests {
 
         // checkAccess(Thread)
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkAccess", "(Ljava/lang/Thread;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkAccess",
+            "(Ljava/lang/Thread;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(thread))],
         );
         assert!(result.is_ok());
 
         // checkAccess(ThreadGroup)
         let result = call_native(
-            &registry, &mut ctx,
-            "java/lang/SecurityManager", "checkAccess", "(Ljava/lang/ThreadGroup;)V",
+            &registry,
+            &mut ctx,
+            "java/lang/SecurityManager",
+            "checkAccess",
+            "(Ljava/lang/ThreadGroup;)V",
             &[Value::Object(Some(sm_obj)), Value::Object(Some(group))],
         );
         assert!(result.is_ok());
@@ -1769,7 +1769,9 @@ mod tests {
     fn policy_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reset global state between policy-sensitive tests.
@@ -2054,7 +2056,7 @@ mod tests {
         // confirm that define_class() attaches a CodeSource with the
         // right URL; the security_manager-side behavior is covered by
         // the SM trait method (see `t11_action_code_base_reads_real_url`).
-        use cratonvm_classloading::{ClassManager, ClassLoaderId};
+        use cratonvm_classloading::{ClassLoaderId, ClassManager};
         use std::io::Write as _;
 
         // Build a minimal JAR with one fake .class entry.
@@ -2082,7 +2084,10 @@ mod tests {
             .find_class_code_source("com/acme/Foo")
             .expect("JAR-hosted class should have a real CodeSource");
         let url = cs.url.expect("URL should be present");
-        assert!(url.starts_with("file:/"), "URL should use file: scheme, got {url}");
+        assert!(
+            url.starts_with("file:/"),
+            "URL should use file: scheme, got {url}"
+        );
         assert!(
             url.to_lowercase().ends_with("app.jar"),
             "URL should end with the JAR name, got {url}"
@@ -2424,8 +2429,7 @@ mod tests {
     fn count_meta_inf_signer_blocks(jar_path: &std::path::Path) -> usize {
         use std::io::Read as _;
         let bytes = std::fs::read(jar_path).expect("read jar");
-        let mut archive =
-            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open jar");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open jar");
 
         // Collect entry names once.
         let names: Vec<String> = (0..archive.len())
@@ -2450,9 +2454,8 @@ mod tests {
             if !upper.starts_with("META-INF/") {
                 continue;
             }
-            let is_block = upper.ends_with(".RSA")
-                || upper.ends_with(".DSA")
-                || upper.ends_with(".EC");
+            let is_block =
+                upper.ends_with(".RSA") || upper.ends_with(".DSA") || upper.ends_with(".EC");
             if !is_block {
                 continue;
             }
@@ -2483,8 +2486,7 @@ mod tests {
 
     /// Sequence counter so each `t11_jar_signer_blocks_are_hashed` run (and
     /// any parallel invocation) gets a unique temp JAR path.
-    static SIGNED_JAR_SEQ: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static SIGNED_JAR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     #[test]
     fn test_load_policy_file_end_to_end() {
@@ -2703,7 +2705,11 @@ mod tests {
 
         // setPolicy(p)
         let set_p = registry
-            .find("java/security/Policy", "setPolicy", "(Ljava/security/Policy;)V")
+            .find(
+                "java/security/Policy",
+                "setPolicy",
+                "(Ljava/security/Policy;)V",
+            )
             .expect("setPolicy should be registered");
         let result = set_p(&mut ctx, &[Value::Object(Some(policy_obj))]);
         assert!(result.is_ok());
@@ -2711,7 +2717,11 @@ mod tests {
 
         // getPolicy() should return exactly the same reference
         let get_p = registry
-            .find("java/security/Policy", "getPolicy", "()Ljava/security/Policy;")
+            .find(
+                "java/security/Policy",
+                "getPolicy",
+                "()Ljava/security/Policy;",
+            )
             .expect("getPolicy should be registered");
         let result = get_p(&mut ctx, &[]);
         assert!(result.is_ok());
@@ -2731,7 +2741,11 @@ mod tests {
         // First install a real Policy so we can verify null clears it.
         let policy_obj = alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1);
         let set_p = registry
-            .find("java/security/Policy", "setPolicy", "(Ljava/security/Policy;)V")
+            .find(
+                "java/security/Policy",
+                "setPolicy",
+                "(Ljava/security/Policy;)V",
+            )
             .unwrap();
         let _ = set_p(&mut ctx, &[Value::Object(Some(policy_obj))]);
         assert_eq!(get_policy_object(), Some(policy_obj));
@@ -2744,7 +2758,11 @@ mod tests {
         assert_eq!(get_policy_object(), None);
 
         let get_p = registry
-            .find("java/security/Policy", "getPolicy", "()Ljava/security/Policy;")
+            .find(
+                "java/security/Policy",
+                "getPolicy",
+                "()Ljava/security/Policy;",
+            )
             .unwrap();
         let result = get_p(&mut ctx, &[]);
         assert!(result.is_ok());
@@ -2766,7 +2784,11 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         let get_p = registry
-            .find("java/security/Policy", "getPolicy", "()Ljava/security/Policy;")
+            .find(
+                "java/security/Policy",
+                "getPolicy",
+                "()Ljava/security/Policy;",
+            )
             .unwrap();
 
         // First call: lazy-allocate default.
@@ -2792,15 +2814,27 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let policy_obj = alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1);
         let set_p = registry
-            .find("java/security/Policy", "setPolicy", "(Ljava/security/Policy;)V")
+            .find(
+                "java/security/Policy",
+                "setPolicy",
+                "(Ljava/security/Policy;)V",
+            )
             .unwrap();
         let _ = set_p(&mut ctx, &[Value::Object(Some(policy_obj))]);
 
         let get_p = registry
-            .find("java/security/Policy", "getPolicy", "()Ljava/security/Policy;")
+            .find(
+                "java/security/Policy",
+                "getPolicy",
+                "()Ljava/security/Policy;",
+            )
             .unwrap();
         let get_p_no_check = registry
-            .find("java/security/Policy", "getPolicyNoCheck", "()Ljava/security/Policy;")
+            .find(
+                "java/security/Policy",
+                "getPolicyNoCheck",
+                "()Ljava/security/Policy;",
+            )
             .unwrap();
         let r1 = get_p(&mut ctx, &[]).unwrap();
         let r2 = get_p_no_check(&mut ctx, &[]).unwrap();
@@ -2828,7 +2862,11 @@ mod tests {
         // After install: true.
         let policy_obj = alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1);
         let set_p = registry
-            .find("java/security/Policy", "setPolicy", "(Ljava/security/Policy;)V")
+            .find(
+                "java/security/Policy",
+                "setPolicy",
+                "(Ljava/security/Policy;)V",
+            )
             .unwrap();
         let _ = set_p(&mut ctx, &[Value::Object(Some(policy_obj))]);
         let r = is_set(&mut ctx, &[]).unwrap();
@@ -3004,7 +3042,11 @@ mod tests {
             Some(Value::Object(Some(perms))) => {
                 // Slot 1 holds the read-only flag; verify it was set on creation.
                 let read_only = ctx.get_field(perms, 1);
-                assert_eq!(read_only, Value::Int(1), "permissive collection must be read-only");
+                assert_eq!(
+                    read_only,
+                    Value::Int(1),
+                    "permissive collection must be read-only"
+                );
                 // Slot 0 holds the AllPermission entry; non-null.
                 match ctx.get_field(perms, 0) {
                     Value::Object(Some(_)) => {}
@@ -3066,7 +3108,10 @@ mod tests {
             .unwrap();
         let r1 = get_perms(&mut ctx, &[Value::Object(Some(pd))]).unwrap();
         let r2 = get_perms(&mut ctx, &[Value::Object(Some(pd))]).unwrap();
-        assert_eq!(r1, r2, "getPermissions must return the same shared collection");
+        assert_eq!(
+            r1, r2,
+            "getPermissions must return the same shared collection"
+        );
 
         clear_policy_and_stack();
     }
@@ -3087,7 +3132,11 @@ mod tests {
         let policy_obj = alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1);
 
         let set_p = registry
-            .find("java/security/Policy", "setPolicy", "(Ljava/security/Policy;)V")
+            .find(
+                "java/security/Policy",
+                "setPolicy",
+                "(Ljava/security/Policy;)V",
+            )
             .unwrap();
 
         assert!(set_p(&mut ctx, &[Value::Object(Some(policy_obj))]).is_ok());

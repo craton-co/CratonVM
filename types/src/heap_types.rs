@@ -214,7 +214,10 @@ pub fn array_data_size_checked(length: usize, element_type: ArrayElementType) ->
 /// Returns `Err` on integer overflow instead of panicking. Callers receiving
 /// untrusted input (e.g. from bytecode) should propagate or handle the error.
 #[inline]
-pub fn array_data_size(length: usize, element_type: ArrayElementType) -> Result<usize, &'static str> {
+pub fn array_data_size(
+    length: usize,
+    element_type: ArrayElementType,
+) -> Result<usize, &'static str> {
     array_data_size_checked(length, element_type)
         .ok_or("array data size overflow: length * element_size exceeds usize")
 }
@@ -465,17 +468,22 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(tag, 0, "Int discriminant must be 0 at FIELD_CELL_TAG_OFFSET");
+        assert_eq!(
+            tag, 0,
+            "Int discriminant must be 0 at FIELD_CELL_TAG_OFFSET"
+        );
         let p32 = i32::from_le_bytes(
             cell[FIELD_CELL_PAYLOAD32_OFFSET..FIELD_CELL_PAYLOAD32_OFFSET + 4]
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(p32, 0x1234_5678, "Int payload at FIELD_CELL_PAYLOAD32_OFFSET");
+        assert_eq!(
+            p32, 0x1234_5678,
+            "Int payload at FIELD_CELL_PAYLOAD32_OFFSET"
+        );
 
         // An 8-byte (`Long`) payload lives at FIELD_CELL_PAYLOAD64_OFFSET.
-        let cell: [u8; 16] =
-            unsafe { std::mem::transmute(Value::Long(0x0102_0304_0506_0708_i64)) };
+        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Long(0x0102_0304_0506_0708_i64)) };
         let tag = u32::from_le_bytes(
             cell[FIELD_CELL_TAG_OFFSET..FIELD_CELL_TAG_OFFSET + 4]
                 .try_into()
@@ -501,16 +509,17 @@ mod tests {
         // A non-null `Object` stores its raw pointer at FIELD_CELL_PAYLOAD64_OFFSET.
         let backing = Box::leak(Box::new(0u64));
         let raw = backing as *mut u64 as usize as u64;
-        let oref = unsafe {
-            crate::ObjectRef::from_raw(backing as *mut u64 as *mut u8)
-        };
+        let oref = unsafe { crate::ObjectRef::from_raw(backing as *mut u64 as *mut u8) };
         let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Object(Some(oref))) };
         let p64 = u64::from_le_bytes(
             cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(p64, raw, "Object(Some) payload word must be the raw pointer");
+        assert_eq!(
+            p64, raw,
+            "Object(Some) payload word must be the raw pointer"
+        );
         // SAFETY: reclaim the leaked allocation.
         unsafe { drop(Box::from_raw(backing)) };
     }
@@ -567,7 +576,10 @@ mod tests {
 
     #[test]
     fn element_byte_size_reference() {
-        assert_eq!(element_byte_size(ArrayElementType::Reference), REF_ELEMENT_SIZE);
+        assert_eq!(
+            element_byte_size(ArrayElementType::Reference),
+            REF_ELEMENT_SIZE
+        );
     }
 
     // -- array_data_size / array_data_size_checked --

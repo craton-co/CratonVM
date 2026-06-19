@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ClassId, ObjectRef, Value};
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::obj_arg;
 
@@ -328,7 +328,10 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// initializer ourselves; without it, the sentinel stays null and the
 /// real-JDK `initCause` bytecode (which still runs because we don't
 /// shadow it on every dispatch path) treats the field as already-set.
-pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_exc_init_message(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Some(msg) = args.get(1) {
             write_throwable_detail_message(ctx, *this, *msg);
@@ -341,7 +344,10 @@ pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value
 }
 
 /// Exception <init>(Ljava/lang/String;Ljava/lang/Throwable;)V
-pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_exc_init_message_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Some(msg) = args.get(1) {
             write_throwable_detail_message(ctx, *this, *msg);
@@ -374,18 +380,16 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
 /// — the canonical Spring Boot `throw new IllegalStateException(cause)`
 /// rewrap path. Mirroring the JDK initializer here keeps `detailMessage`
 /// a real `String`.
-pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_exc_init_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
         write_throwable_cause(ctx, *this, *cause);
         // detailMessage = (cause == null ? null : cause.toString())
         let detail_msg: Value = match cause {
             Value::Object(Some(cause_ref)) => {
-                match ctx.invoke_virtual(
-                    *cause_ref,
-                    "toString",
-                    "()Ljava/lang/String;",
-                    &[],
-                ) {
+                match ctx.invoke_virtual(*cause_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(v @ Value::Object(Some(_)))) => v,
                     // toString returned null / non-object, or dispatch failed:
                     // leave detailMessage null rather than smuggle a bad value.
@@ -402,7 +406,10 @@ pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value])
 
 /// Exception <init>()V — no message, no cause. Mirrors the JDK
 /// `cause = this` sentinel so later `initCause()` calls succeed.
-pub(crate) fn native_exc_init_noargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_exc_init_noargs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
         capture_throwable_trace(ctx, *this);
@@ -458,25 +465,33 @@ pub(crate) fn native_init_stack_trace_elements(
 
     let hash = ctx.identity_hash_code(backtrace);
     // Clone trace data to release the immutable borrow before allocating.
-    let trace_data: Vec<(std::sync::Arc<str>, std::sync::Arc<str>, Option<std::sync::Arc<str>>, i32)> =
-        ctx.get_stack_trace(hash)
-            .map(|t| {
-                t.iter()
-                    .map(|e| {
-                        (
-                            std::sync::Arc::clone(&e.class_name),
-                            std::sync::Arc::clone(&e.method_name),
-                            e.source_file.as_ref().map(std::sync::Arc::clone),
-                            e.line_number,
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    let trace_data: Vec<(
+        std::sync::Arc<str>,
+        std::sync::Arc<str>,
+        Option<std::sync::Arc<str>>,
+        i32,
+    )> = ctx
+        .get_stack_trace(hash)
+        .map(|t| {
+            t.iter()
+                .map(|e| {
+                    (
+                        std::sync::Arc::clone(&e.class_name),
+                        std::sync::Arc::clone(&e.method_name),
+                        e.source_file.as_ref().map(std::sync::Arc::clone),
+                        e.line_number,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let cap = ctx.array_length(elements);
     if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
-        eprintln!("[STTRACE init] cap={cap} trace_data.len={}", trace_data.len());
+        eprintln!(
+            "[STTRACE init] cap={cap} trace_data.len={}",
+            trace_data.len()
+        );
         for (i, (c, m, _, _)) in trace_data.iter().rev().take(cap).enumerate() {
             eprintln!("[STTRACE init]   [{i}] {c}.{m}");
         }
@@ -641,7 +656,10 @@ pub(crate) fn native_throwable_get_stack_trace_element(
     }
 }
 
-pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_throwable_get_message(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -684,9 +702,7 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
         // exception class. Gate the fallback on the slot actually being a String.
         _ => match ctx.get_field(this, 0) {
             v @ Value::Object(Some(o))
-                if ctx
-                    .class_name_of_id(ctx.class_id_of_object(o))
-                    .as_deref()
+                if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
                     == Some("java/lang/String") =>
             {
                 v
@@ -728,7 +744,10 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
 /// drive Spring Boot's `getExitCodeFromExitCodeGeneratorException`
 /// recursion into a `StackOverflowError`. Map the sentinel to `null` per
 /// the JDK contract.
-pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_throwable_get_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -765,7 +784,10 @@ pub(crate) fn native_throwable_get_cause(ctx: &mut dyn NativeContext, args: &[Va
 }
 
 /// initCause(Throwable) — set the cause field, return this.
-pub(crate) fn native_throwable_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_throwable_init_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -776,7 +798,10 @@ pub(crate) fn native_throwable_init_cause(ctx: &mut dyn NativeContext, args: &[V
 }
 
 /// toString() — build "ClassName: message" or just "ClassName"
-pub(crate) fn native_throwable_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_throwable_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -839,7 +864,9 @@ fn throwable_header_line(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
 fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
     let by_name = ctx.get_field_by_name(t, "cause");
     if let Value::Object(Some(c)) = by_name {
-        if c == t { return None; }
+        if c == t {
+            return None;
+        }
         return Some(c);
     }
     None
@@ -888,7 +915,13 @@ fn emit_stack_line(ctx: &mut dyn NativeContext, line: String) {
     ctx.record_printed_line(line.clone());
     let sep = ctx
         .get_system_property("line.separator")
-        .unwrap_or_else(|| if cfg!(windows) { "\r\n".to_string() } else { "\n".to_string() });
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "\r\n".to_string()
+            } else {
+                "\n".to_string()
+            }
+        });
     let _ = ctx.fd_table().write_string(2, &line);
     let _ = ctx.fd_table().write_string(2, &sep);
 }
@@ -1176,7 +1209,10 @@ pub(crate) fn native_enum_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// Enum.compareTo(Enum other) — this.ordinal - other.ordinal
-pub(crate) fn native_enum_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_enum_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
@@ -1214,7 +1250,10 @@ pub(crate) fn native_enum_equals(_ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 /// Enum.hashCode() — identity hash code
-pub(crate) fn native_enum_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_enum_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
@@ -1298,20 +1337,36 @@ pub(crate) fn native_ste_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
-pub(crate) fn native_ste_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_ste_get_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ste_read_field(ctx, this, "declaringClass", STE_FIELD_CLASS)))
+    Ok(Some(ste_read_field(
+        ctx,
+        this,
+        "declaringClass",
+        STE_FIELD_CLASS,
+    )))
 }
 
-pub(crate) fn native_ste_get_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_ste_get_method(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ste_read_field(ctx, this, "methodName", STE_FIELD_METHOD)))
+    Ok(Some(ste_read_field(
+        ctx,
+        this,
+        "methodName",
+        STE_FIELD_METHOD,
+    )))
 }
 
 pub(crate) fn native_ste_get_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1327,10 +1382,18 @@ pub(crate) fn native_ste_get_line(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    Ok(Some(ste_read_field(ctx, this, "lineNumber", STE_FIELD_LINE)))
+    Ok(Some(ste_read_field(
+        ctx,
+        this,
+        "lineNumber",
+        STE_FIELD_LINE,
+    )))
 }
 
-pub(crate) fn native_ste_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_ste_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1373,9 +1436,7 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
     // the caller record's `<init>` frame — for compact-canonical records
     // with a validation body, this can shift max_stack and cause the
     // throw branch to be skipped or mis-dispatched. See WP2.6.
-    r.register(rec, "<init>", "()V", |_ctx, _args| {
-        Ok(None)
-    });
+    r.register(rec, "<init>", "()V", |_ctx, _args| Ok(None));
     r.register(rec, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(other)) = &args[1] {
@@ -1723,4 +1784,3 @@ pub(crate) fn native_throwable_print_stack_trace_to_stream(
 ) -> MethodCallResult {
     native_throwable_print_stack_trace(ctx, args)
 }
-

@@ -30,8 +30,8 @@
 //!   * WP6.5 — BouncyCastle loading
 //!   * WP6.7 — `java.security.SecureRandom`
 
-pub mod provider_chain;
 pub mod message_digest;
+pub mod provider_chain;
 // WP6.3 Cipher class-init shim — landed alongside provider_chain to keep the
 // JCA namespace self-contained.
 pub mod cipher;

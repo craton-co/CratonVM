@@ -129,7 +129,11 @@ mod tests {
         sched.release();
         sched.release();
         sched.release();
-        assert_eq!(sched.available(), 2, "available must clamp to carrier_count");
+        assert_eq!(
+            sched.available(),
+            2,
+            "available must clamp to carrier_count"
+        );
 
         // The bound is still enforced: exactly two acquires drain the pool.
         sched.acquire();
@@ -139,7 +143,11 @@ mod tests {
         // One release restores one permit, not more even after extra releases.
         sched.release();
         sched.release();
-        assert_eq!(sched.available(), 1, "double release adds at most one permit");
+        assert_eq!(
+            sched.available(),
+            1,
+            "double release adds at most one permit"
+        );
     }
 
     #[test]

@@ -80,7 +80,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target = PathBuf::from(manifest_dir).parent()?.join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -136,11 +140,10 @@ fn stage_probe() -> Option<PathBuf> {
 }
 
 fn run_hotspot(java_home: &str, classes: &Path) -> String {
-    let java = Path::new(java_home).join("bin").join(if cfg!(windows) {
-        "java.exe"
-    } else {
-        "java"
-    });
+    let java =
+        Path::new(java_home)
+            .join("bin")
+            .join(if cfg!(windows) { "java.exe" } else { "java" });
     let out = Command::new(java)
         .args(["-cp", classes.to_str().unwrap(), "SubListProbe"])
         .output()
@@ -155,7 +158,13 @@ fn run_hotspot(java_home: &str, classes: &Path) -> String {
 }
 
 /// Run the probe under CratonVM and assert clean exit + stdout == HotSpot.
-fn run_cratonvm_and_assert(bin: &Path, java_home: &str, classes: &Path, expected: &str, extra: &[&str]) {
+fn run_cratonvm_and_assert(
+    bin: &Path,
+    java_home: &str,
+    classes: &Path,
+    expected: &str,
+    extra: &[&str],
+) {
     let mut cmd = Command::new(bin);
     cmd.args(["--java-home", java_home, "-c", classes.to_str().unwrap()]);
     for a in extra {
@@ -165,7 +174,11 @@ fn run_cratonvm_and_assert(bin: &Path, java_home: &str, classes: &Path, expected
     let out = cmd.output().expect("must spawn cratonvm");
     let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let mode = if extra.is_empty() { "default" } else { "--nojit" };
+    let mode = if extra.is_empty() {
+        "default"
+    } else {
+        "--nojit"
+    };
     assert!(
         out.status.success(),
         "[{mode}] cratonvm exited non-zero (SIGSEGV regression?). \
@@ -210,9 +223,18 @@ fn sublist_view_toarray_and_copy_match_hotspot() {
 
     // Sanity: HotSpot itself must produce the shape we expect, so a future
     // probe edit can't silently make both sides agree on garbage.
-    assert!(expected.contains("copy.size=3"), "HotSpot baseline wrong:\n{expected}");
-    assert!(expected.contains("copy.identity=true"), "HotSpot baseline wrong:\n{expected}");
-    assert!(expected.contains("toArrayTyped.len=3"), "HotSpot baseline wrong:\n{expected}");
+    assert!(
+        expected.contains("copy.size=3"),
+        "HotSpot baseline wrong:\n{expected}"
+    );
+    assert!(
+        expected.contains("copy.identity=true"),
+        "HotSpot baseline wrong:\n{expected}"
+    );
+    assert!(
+        expected.contains("toArrayTyped.len=3"),
+        "HotSpot baseline wrong:\n{expected}"
+    );
 
     // Default (JIT-enabled) and --nojit (HOLE #2 reproduces without JIT).
     run_cratonvm_and_assert(&bin, &java_home, &classes, &expected, &[]);

@@ -34,10 +34,10 @@
 //!
 //! All public surface is registered via `register_async_socket_real`.
 
-use parking_lot::{Mutex, RwLock};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -160,11 +160,8 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                     CompletionKind::AcceptedChannel(new_id) => {
                         // Wrap the registry entry into a synthetic
                         // AsynchronousSocketChannel Java object.
-                        let ch = alloc_obj(
-                            ctx,
-                            "java/nio/channels/AsynchronousSocketChannel",
-                            N_FIELDS,
-                        );
+                        let ch =
+                            alloc_obj(ctx, "java/nio/channels/AsynchronousSocketChannel", N_FIELDS);
                         ctx.set_field(ch, F_OPEN, Value::Int(1));
                         ctx.set_field(ch, F_CONNECTED, Value::Int(1));
                         ctx.set_field(ch, F_REG_ID, Value::Int(new_id));
@@ -422,20 +419,14 @@ fn handle_job(job: Job) -> Result<(), String> {
                         // SAFETY: caller-allocated direct buffer; the
                         // address is valid for `len` bytes.
                         unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                buf.as_ptr(),
-                                bb_addr as *mut u8,
-                                n,
-                            );
+                            std::ptr::copy_nonoverlapping(buf.as_ptr(), bb_addr as *mut u8, n);
                         }
                     } else if let Some(arr) = bb_arr {
-                        pending_array_writes()
-                            .lock()
-                            .push(PendingArrayWrite {
-                                arr,
-                                offset: bb_offset,
-                                bytes: buf[..n].to_vec(),
-                            });
+                        pending_array_writes().lock().push(PendingArrayWrite {
+                            arr,
+                            offset: bb_offset,
+                            bytes: buf[..n].to_vec(),
+                        });
                     }
                     if let Some(h) = handler {
                         completion_queue().lock().push_back(Completion {
@@ -488,8 +479,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 while written < total {
                     match w.write(&data[written..]) {
                         Ok(0) => {
-                            e_outer =
-                                Some(std::io::Error::from(ErrorKind::WriteZero));
+                            e_outer = Some(std::io::Error::from(ErrorKind::WriteZero));
                             break;
                         }
                         Ok(n) => written += n,
@@ -553,8 +543,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             };
             match res {
                 Ok((stream, _peer)) => {
-                    let new_id =
-                        aio_register(AioHandle::Stream(Arc::new(Mutex::new(stream))));
+                    let new_id = aio_register(AioHandle::Stream(Arc::new(Mutex::new(stream))));
                     if let Some(h) = handler {
                         completion_queue().lock().push_back(Completion {
                             handler: h,
@@ -733,7 +722,10 @@ fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
 // ---------------------------------------------------------------------------
 
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 fn obj_or_none(args: &[Value], idx: usize) -> Option<ObjectRef> {
@@ -976,10 +968,7 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 /// Decode a ByteBuffer into the parameters needed for a worker-thread copy.
 /// Returns (direct_addr, heap_arr, heap_offset, length).
-fn decode_buffer(
-    ctx: &mut dyn NativeContext,
-    bb: ObjectRef,
-) -> (i64, Option<ObjectRef>, i32, i32) {
+fn decode_buffer(ctx: &mut dyn NativeContext, bb: ObjectRef) -> (i64, Option<ObjectRef>, i32, i32) {
     let position = match ctx.get_field_by_name(bb, "position") {
         Value::Int(v) if v >= 0 => v,
         _ => 0,
@@ -1007,10 +996,7 @@ fn decode_buffer(
     (0, None, 0, length)
 }
 
-fn read_buffer_bytes(
-    ctx: &mut dyn NativeContext,
-    bb: ObjectRef,
-) -> Vec<u8> {
+fn read_buffer_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
     let (addr, arr, off, len) = decode_buffer(ctx, bb);
     if len <= 0 {
         return Vec::new();
@@ -1136,7 +1122,11 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
-    let ch = alloc_obj(ctx, "java/nio/channels/AsynchronousServerSocketChannel", N_FIELDS);
+    let ch = alloc_obj(
+        ctx,
+        "java/nio/channels/AsynchronousServerSocketChannel",
+        N_FIELDS,
+    );
     ctx.set_field(ch, F_OPEN, Value::Int(1));
     ctx.set_field(ch, F_CONNECTED, Value::Int(0));
     ctx.set_field(ch, F_REG_ID, Value::Int(-1));
@@ -1158,8 +1148,8 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         None => return Err(ioex("bind: null SocketAddress")),
     };
     let bind_text = decode_addr(ctx, sa).unwrap_or_else(|_| "0.0.0.0:0".to_string());
-    let listener = TcpListener::bind(&bind_text)
-        .map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
+    let listener =
+        TcpListener::bind(&bind_text).map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
     let id = aio_register(AioHandle::Listener(Arc::new(Mutex::new(listener))));
     if ctx.object_num_fields(this) > F_REG_ID {
         ctx.set_field(this, F_REG_ID, Value::Int(id));
@@ -1232,7 +1222,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     let acg = "java/nio/channels/AsynchronousChannelGroup";
 
     // -- AsynchronousSocketChannel --
-    r.register(asc, "open", "()Ljava/nio/channels/AsynchronousSocketChannel;", aio_asc_open);
+    r.register(
+        asc,
+        "open",
+        "()Ljava/nio/channels/AsynchronousSocketChannel;",
+        aio_asc_open,
+    );
     r.register(
         asc,
         "open",
@@ -1319,7 +1314,11 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     );
 
     // -- IOCP facade (Windows) / EPollPort (Linux) — minimal port surface --
-    for cls in ["sun/nio/ch/Iocp", "sun/nio/ch/EPollPort", "sun/nio/ch/KQueuePort"] {
+    for cls in [
+        "sun/nio/ch/Iocp",
+        "sun/nio/ch/EPollPort",
+        "sun/nio/ch/KQueuePort",
+    ] {
         r.register(cls, "open", &format!("()L{cls};"), iocp_open);
         r.register(cls, "close", "()V", iocp_close);
         // Both real platforms expose a `drain`/`poll` entry the JDK calls

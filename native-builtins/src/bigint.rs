@@ -31,7 +31,10 @@ pub(crate) struct BigInt {
 
 impl BigInt {
     pub(crate) fn zero() -> Self {
-        BigInt { neg: false, mag: Vec::new() }
+        BigInt {
+            neg: false,
+            mag: Vec::new(),
+        }
     }
 
     pub(crate) fn is_zero(&self) -> bool {
@@ -298,7 +301,10 @@ impl BigInt {
         if self.is_zero() {
             BigInt::zero()
         } else {
-            BigInt { neg: !self.neg, mag: self.mag.clone() }
+            BigInt {
+                neg: !self.neg,
+                mag: self.mag.clone(),
+            }
         }
     }
 
@@ -308,12 +314,8 @@ impl BigInt {
         } else {
             match Self::cmp_mag(&self.mag, &o.mag) {
                 Ordering::Equal => BigInt::zero(),
-                Ordering::Greater => {
-                    Self::normalize(Self::sub_mag(&self.mag, &o.mag), self.neg)
-                }
-                Ordering::Less => {
-                    Self::normalize(Self::sub_mag(&o.mag, &self.mag), o.neg)
-                }
+                Ordering::Greater => Self::normalize(Self::sub_mag(&self.mag, &o.mag), self.neg),
+                Ordering::Less => Self::normalize(Self::sub_mag(&o.mag, &self.mag), o.neg),
             }
         }
     }
@@ -417,7 +419,11 @@ impl BigInt {
             while q.last() == Some(&0) {
                 q.pop();
             }
-            let r = if rem == 0 { Vec::new() } else { vec![rem as u32] };
+            let r = if rem == 0 {
+                Vec::new()
+            } else {
+                vec![rem as u32]
+            };
             return (q, r);
         }
 
@@ -436,8 +442,7 @@ impl BigInt {
             let mut qhat = num / (vn[n - 1] as u64);
             let mut rhat = num % (vn[n - 1] as u64);
             // Correct the estimate so qhat is exact or 1 too high.
-            while qhat >= BASE
-                || qhat * (vn[n - 2] as u64) > (rhat << 32) | (un[j + n - 2] as u64)
+            while qhat >= BASE || qhat * (vn[n - 2] as u64) > (rhat << 32) | (un[j + n - 2] as u64)
             {
                 qhat -= 1;
                 rhat += vn[n - 1] as u64;
@@ -535,7 +540,10 @@ impl BigInt {
         if v == 0 {
             BigInt::zero()
         } else {
-            BigInt { neg: false, mag: vec![v] }
+            BigInt {
+                neg: false,
+                mag: vec![v],
+            }
         }
     }
 
@@ -797,9 +805,21 @@ mod tests {
 
     fn edge_cases() -> Vec<String> {
         vec![
-            "0", "1", "-1", "2", "-2", "7", "-7", "10", "-10",
-            "4294967295", "4294967296", "4294967297", "-4294967296",
-            "18446744073709551615", "18446744073709551616",
+            "0",
+            "1",
+            "-1",
+            "2",
+            "-2",
+            "7",
+            "-7",
+            "10",
+            "-10",
+            "4294967295",
+            "4294967296",
+            "4294967297",
+            "-4294967296",
+            "18446744073709551615",
+            "18446744073709551616",
             "340282366920938463463374607431768211456", // 2^128
             "115792089237316195423570985008687907853269984665640564039457584007913129639936", // 2^256
             "-115792089237316195423570985008687907853269984665640564039457584007913129639936",
@@ -855,11 +875,7 @@ mod tests {
                 assert_eq!(ba.add(&bc).to_decimal(), bi_add_str(a, c), "add {a}+{c}");
                 assert_eq!(ba.sub(&bc).to_decimal(), bi_sub_str(a, c), "sub {a}-{c}");
                 assert_eq!(ba.mul(&bc).to_decimal(), bi_mul_str(a, c), "mul {a}*{c}");
-                assert_eq!(
-                    ba.cmp(&bc),
-                    bi_compare(a, c).cmp(&0),
-                    "cmp {a} ? {c}"
-                );
+                assert_eq!(ba.cmp(&bc), bi_compare(a, c).cmp(&0), "cmp {a} ? {c}");
             }
         }
     }
@@ -911,7 +927,11 @@ mod tests {
                     let c_abs = c.trim_start_matches('-');
                     let rr = bi_mod_str(a, c_abs);
                     if let Some(stripped) = rr.strip_prefix('-') {
-                        if stripped == "0" { "0".to_string() } else { bi_add_str(&rr, c_abs) }
+                        if stripped == "0" {
+                            "0".to_string()
+                        } else {
+                            bi_add_str(&rr, c_abs)
+                        }
                     } else {
                         rr
                     }
@@ -925,13 +945,26 @@ mod tests {
     fn modpow_matches_decimal() {
         let mut state = 0xa5a5_5a5a_dead_0001u64;
         // non-negative exponents, positive moduli > 1
-        let bases = ["0", "1", "2", "7", "255", "4294967297",
+        let bases = [
+            "0",
+            "1",
+            "2",
+            "7",
+            "255",
+            "4294967297",
             "123456789012345678901234567890",
-            "115792089237316195423570985008687907853269984665640564039457584007913129639747"];
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+        ];
         let exps = ["0", "1", "2", "3", "17", "65537", "1000003"];
-        let mods = ["2", "3", "97", "65537", "1000000007",
+        let mods = [
+            "2",
+            "3",
+            "97",
+            "65537",
+            "1000000007",
             "987654321098765432109876543211",
-            "115792089237316195423570985008687907853269984665640564039457584007913129639747"];
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+        ];
         for ba in bases {
             for e in exps {
                 for m in mods {
@@ -947,7 +980,11 @@ mod tests {
             let e = rand_decimal(&mut state).trim_start_matches('-').to_string();
             let m = {
                 let s = rand_decimal(&mut state).trim_start_matches('-').to_string();
-                if s == "0" || s == "1" { "1000000007".to_string() } else { s }
+                if s == "0" || s == "1" {
+                    "1000000007".to_string()
+                } else {
+                    s
+                }
             };
             assert_eq!(
                 b(&ba).modpow(&b(&e), &b(&m)).to_decimal(),
@@ -960,7 +997,12 @@ mod tests {
     #[test]
     fn is_probable_prime_matches_decimal() {
         let primes = [
-            "2", "3", "5", "7", "97", "65537",
+            "2",
+            "3",
+            "5",
+            "7",
+            "97",
+            "65537",
             "32416190071", // 10-digit prime
             "115792089237316195423570985008687907853269984665640564039457584007913129639747",
         ];
@@ -1033,7 +1075,12 @@ mod tests {
         }
         for x in &vals {
             // ~x == -(x+1); x ^ -1 == ~x; x ^ 0 == x; x & 0 == 0; x | 0 == x.
-            assert_eq!(x.not(), x.add(&one).neg_value(), "~x for {}", x.to_decimal());
+            assert_eq!(
+                x.not(),
+                x.add(&one).neg_value(),
+                "~x for {}",
+                x.to_decimal()
+            );
             assert_eq!(x.xor(&neg_one), x.not(), "x^-1 for {}", x.to_decimal());
             assert_eq!(x.xor(&zero), *x);
             assert_eq!(x.and(&zero), zero);
@@ -1046,7 +1093,12 @@ mod tests {
             // shifting instead: bit i of x == ((x >> i) is odd).
             for i in [0u32, 1, 5, 31, 32, 33, 64] {
                 let shifted_odd = x.shr(i).and(&one) == one;
-                assert_eq!(x.test_bit(i), shifted_odd, "testBit {} bit {i}", x.to_decimal());
+                assert_eq!(
+                    x.test_bit(i),
+                    shifted_odd,
+                    "testBit {} bit {i}",
+                    x.to_decimal()
+                );
             }
         }
         // Cross-identity: (a&b) | (a^b) == a|b; De Morgan ~(a&b)==(~a)|(~b).
@@ -1072,12 +1124,32 @@ mod tests {
         }
         for a in &pos {
             // bitLength / bitCount vs decimal ref.
-            assert_eq!(b(a).bit_length(), crate::bi_bit_length_str(a) as u32, "bitLen {a}");
-            assert_eq!(b(a).bit_count(), crate::bi_bit_count_str(a) as u32, "bitCnt {a}");
+            assert_eq!(
+                b(a).bit_length(),
+                crate::bi_bit_length_str(a) as u32,
+                "bitLen {a}"
+            );
+            assert_eq!(
+                b(a).bit_count(),
+                crate::bi_bit_count_str(a) as u32,
+                "bitCnt {a}"
+            );
             for c in pos.iter().take(25) {
-                assert_eq!(b(a).and(&b(c)).to_decimal(), bi_bitwise_and(a, c), "and {a}&{c}");
-                assert_eq!(b(a).or(&b(c)).to_decimal(), bi_bitwise_or(a, c), "or {a}|{c}");
-                assert_eq!(b(a).xor(&b(c)).to_decimal(), bi_bitwise_xor(a, c), "xor {a}^{c}");
+                assert_eq!(
+                    b(a).and(&b(c)).to_decimal(),
+                    bi_bitwise_and(a, c),
+                    "and {a}&{c}"
+                );
+                assert_eq!(
+                    b(a).or(&b(c)).to_decimal(),
+                    bi_bitwise_or(a, c),
+                    "or {a}|{c}"
+                );
+                assert_eq!(
+                    b(a).xor(&b(c)).to_decimal(),
+                    bi_bitwise_xor(a, c),
+                    "xor {a}^{c}"
+                );
             }
         }
     }

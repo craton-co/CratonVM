@@ -9,7 +9,7 @@
 //! read-modify-write atomic operations.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering, fence};
+use std::sync::atomic::{fence, AtomicI32, AtomicI64, Ordering};
 
 // ---------------------------------------------------------------------------
 // AccessMode
@@ -66,16 +66,37 @@ impl AccessMode {
     pub fn all() -> &'static [AccessMode] {
         use AccessMode::*;
         &[
-            Get, GetVolatile, GetAcquire, GetOpaque,
-            Set, SetVolatile, SetRelease, SetOpaque,
+            Get,
+            GetVolatile,
+            GetAcquire,
+            GetOpaque,
+            Set,
+            SetVolatile,
+            SetRelease,
+            SetOpaque,
             CompareAndSet,
-            CompareAndExchangeVolatile, CompareAndExchangeAcquire, CompareAndExchangeRelease,
-            WeakCompareAndSetPlain, WeakCompareAndSet, WeakCompareAndSetAcquire, WeakCompareAndSetRelease,
-            GetAndSet, GetAndSetAcquire, GetAndSetRelease,
-            GetAndAdd, GetAndAddAcquire, GetAndAddRelease,
-            GetAndBitwiseOr, GetAndBitwiseOrAcquire, GetAndBitwiseOrRelease,
-            GetAndBitwiseAnd, GetAndBitwiseAndAcquire, GetAndBitwiseAndRelease,
-            GetAndBitwiseXor, GetAndBitwiseXorAcquire, GetAndBitwiseXorRelease,
+            CompareAndExchangeVolatile,
+            CompareAndExchangeAcquire,
+            CompareAndExchangeRelease,
+            WeakCompareAndSetPlain,
+            WeakCompareAndSet,
+            WeakCompareAndSetAcquire,
+            WeakCompareAndSetRelease,
+            GetAndSet,
+            GetAndSetAcquire,
+            GetAndSetRelease,
+            GetAndAdd,
+            GetAndAddAcquire,
+            GetAndAddRelease,
+            GetAndBitwiseOr,
+            GetAndBitwiseOrAcquire,
+            GetAndBitwiseOrRelease,
+            GetAndBitwiseAnd,
+            GetAndBitwiseAndAcquire,
+            GetAndBitwiseAndRelease,
+            GetAndBitwiseXor,
+            GetAndBitwiseXorAcquire,
+            GetAndBitwiseXorRelease,
         ]
     }
 }
@@ -107,12 +128,18 @@ impl VarType {
 
     /// Whether this type is numeric (supports GetAndAdd).
     pub fn is_numeric(&self) -> bool {
-        matches!(self, VarType::Int | VarType::Long | VarType::Float | VarType::Double)
+        matches!(
+            self,
+            VarType::Int | VarType::Long | VarType::Float | VarType::Double
+        )
     }
 
     /// Whether this type is an integer type (supports bitwise ops).
     pub fn is_integer(&self) -> bool {
-        matches!(self, VarType::Int | VarType::Long | VarType::Byte | VarType::Short | VarType::Char)
+        matches!(
+            self,
+            VarType::Int | VarType::Long | VarType::Byte | VarType::Short | VarType::Char
+        )
     }
 }
 
@@ -136,13 +163,9 @@ pub enum VarHandleKind {
         field_index: usize,
     },
     /// Array element: `arr[i]`
-    ArrayElement {
-        element_type: VarType,
-    },
+    ArrayElement { element_type: VarType },
     /// ByteBuffer view: `buf.getInt(offset)`
-    ByteBufferView {
-        element_type: VarType,
-    },
+    ByteBufferView { element_type: VarType },
 }
 
 // ---------------------------------------------------------------------------
@@ -164,28 +187,41 @@ impl VarHandle {
 
         // All types support basic read/write modes.
         let mut modes = vec![
-            Get, GetVolatile, GetAcquire, GetOpaque,
-            Set, SetVolatile, SetRelease, SetOpaque,
+            Get,
+            GetVolatile,
+            GetAcquire,
+            GetOpaque,
+            Set,
+            SetVolatile,
+            SetRelease,
+            SetOpaque,
         ];
 
         let cas_modes: &[AccessMode] = &[
             CompareAndSet,
-            CompareAndExchangeVolatile, CompareAndExchangeAcquire, CompareAndExchangeRelease,
-            WeakCompareAndSetPlain, WeakCompareAndSet, WeakCompareAndSetAcquire, WeakCompareAndSetRelease,
+            CompareAndExchangeVolatile,
+            CompareAndExchangeAcquire,
+            CompareAndExchangeRelease,
+            WeakCompareAndSetPlain,
+            WeakCompareAndSet,
+            WeakCompareAndSetAcquire,
+            WeakCompareAndSetRelease,
         ];
 
-        let get_and_set_modes: &[AccessMode] = &[
-            GetAndSet, GetAndSetAcquire, GetAndSetRelease,
-        ];
+        let get_and_set_modes: &[AccessMode] = &[GetAndSet, GetAndSetAcquire, GetAndSetRelease];
 
-        let get_and_add_modes: &[AccessMode] = &[
-            GetAndAdd, GetAndAddAcquire, GetAndAddRelease,
-        ];
+        let get_and_add_modes: &[AccessMode] = &[GetAndAdd, GetAndAddAcquire, GetAndAddRelease];
 
         let bitwise_modes: &[AccessMode] = &[
-            GetAndBitwiseOr, GetAndBitwiseOrAcquire, GetAndBitwiseOrRelease,
-            GetAndBitwiseAnd, GetAndBitwiseAndAcquire, GetAndBitwiseAndRelease,
-            GetAndBitwiseXor, GetAndBitwiseXorAcquire, GetAndBitwiseXorRelease,
+            GetAndBitwiseOr,
+            GetAndBitwiseOrAcquire,
+            GetAndBitwiseOrRelease,
+            GetAndBitwiseAnd,
+            GetAndBitwiseAndAcquire,
+            GetAndBitwiseAndRelease,
+            GetAndBitwiseXor,
+            GetAndBitwiseXorAcquire,
+            GetAndBitwiseXorRelease,
         ];
 
         match var_type {
@@ -273,22 +309,36 @@ impl MemoryOrdering {
             GetOpaque | SetOpaque => Self::opaque(),
 
             // Acquire
-            GetAcquire | CompareAndExchangeAcquire
-            | WeakCompareAndSetAcquire | GetAndSetAcquire
-            | GetAndAddAcquire | GetAndBitwiseOrAcquire
-            | GetAndBitwiseAndAcquire | GetAndBitwiseXorAcquire => Self::acquire(),
+            GetAcquire
+            | CompareAndExchangeAcquire
+            | WeakCompareAndSetAcquire
+            | GetAndSetAcquire
+            | GetAndAddAcquire
+            | GetAndBitwiseOrAcquire
+            | GetAndBitwiseAndAcquire
+            | GetAndBitwiseXorAcquire => Self::acquire(),
 
             // Release
-            SetRelease | CompareAndExchangeRelease
-            | WeakCompareAndSetRelease | GetAndSetRelease
-            | GetAndAddRelease | GetAndBitwiseOrRelease
-            | GetAndBitwiseAndRelease | GetAndBitwiseXorRelease => Self::release(),
+            SetRelease
+            | CompareAndExchangeRelease
+            | WeakCompareAndSetRelease
+            | GetAndSetRelease
+            | GetAndAddRelease
+            | GetAndBitwiseOrRelease
+            | GetAndBitwiseAndRelease
+            | GetAndBitwiseXorRelease => Self::release(),
 
             // Volatile (SeqCst)
-            GetVolatile | SetVolatile | CompareAndSet
-            | CompareAndExchangeVolatile | WeakCompareAndSet
-            | GetAndSet | GetAndAdd
-            | GetAndBitwiseOr | GetAndBitwiseAnd | GetAndBitwiseXor => Self::volatile(),
+            GetVolatile
+            | SetVolatile
+            | CompareAndSet
+            | CompareAndExchangeVolatile
+            | WeakCompareAndSet
+            | GetAndSet
+            | GetAndAdd
+            | GetAndBitwiseOr
+            | GetAndBitwiseAnd
+            | GetAndBitwiseXor => Self::volatile(),
         }
     }
 }
@@ -746,7 +796,12 @@ mod tests {
             field_name: "out".into(),
             field_index: 2,
         };
-        if let VarHandleKind::StaticField { class_name, field_name, field_index } = &kind {
+        if let VarHandleKind::StaticField {
+            class_name,
+            field_name,
+            field_index,
+        } = &kind
+        {
             assert_eq!(class_name, "java/lang/System");
             assert_eq!(field_name, "out");
             assert_eq!(*field_index, 2);
@@ -757,14 +812,28 @@ mod tests {
 
     #[test]
     fn varhandle_kind_array_element() {
-        let kind = VarHandleKind::ArrayElement { element_type: VarType::Int };
-        assert_eq!(kind, VarHandleKind::ArrayElement { element_type: VarType::Int });
+        let kind = VarHandleKind::ArrayElement {
+            element_type: VarType::Int,
+        };
+        assert_eq!(
+            kind,
+            VarHandleKind::ArrayElement {
+                element_type: VarType::Int
+            }
+        );
     }
 
     #[test]
     fn varhandle_kind_byte_buffer_view() {
-        let kind = VarHandleKind::ByteBufferView { element_type: VarType::Long };
-        assert_eq!(kind, VarHandleKind::ByteBufferView { element_type: VarType::Long });
+        let kind = VarHandleKind::ByteBufferView {
+            element_type: VarType::Long,
+        };
+        assert_eq!(
+            kind,
+            VarHandleKind::ByteBufferView {
+                element_type: VarType::Long
+            }
+        );
     }
 
     // -- MemoryOrdering --
@@ -796,27 +865,54 @@ mod tests {
 
     #[test]
     fn memory_ordering_for_access_mode_plain() {
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::Get), Ordering::Relaxed);
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::Set), Ordering::Relaxed);
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::Get),
+            Ordering::Relaxed
+        );
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::Set),
+            Ordering::Relaxed
+        );
     }
 
     #[test]
     fn memory_ordering_for_access_mode_acquire() {
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::GetAcquire), Ordering::Acquire);
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::CompareAndExchangeAcquire), Ordering::Acquire);
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::GetAcquire),
+            Ordering::Acquire
+        );
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::CompareAndExchangeAcquire),
+            Ordering::Acquire
+        );
     }
 
     #[test]
     fn memory_ordering_for_access_mode_release() {
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::SetRelease), Ordering::Release);
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::GetAndSetRelease), Ordering::Release);
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::SetRelease),
+            Ordering::Release
+        );
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::GetAndSetRelease),
+            Ordering::Release
+        );
     }
 
     #[test]
     fn memory_ordering_for_access_mode_volatile() {
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::GetVolatile), Ordering::SeqCst);
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::CompareAndSet), Ordering::SeqCst);
-        assert_eq!(MemoryOrdering::for_access_mode(AccessMode::GetAndAdd), Ordering::SeqCst);
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::GetVolatile),
+            Ordering::SeqCst
+        );
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::CompareAndSet),
+            Ordering::SeqCst
+        );
+        assert_eq!(
+            MemoryOrdering::for_access_mode(AccessMode::GetAndAdd),
+            Ordering::SeqCst
+        );
     }
 
     // -- FenceOperations --
@@ -865,7 +961,11 @@ mod tests {
     #[test]
     fn atomic_compare_and_exchange_int() {
         let prev = AtomicOperations::compare_and_exchange_int(
-            42, 42, 99, Ordering::SeqCst, Ordering::Relaxed,
+            42,
+            42,
+            99,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
         );
         assert_eq!(prev, 42);
     }
@@ -873,7 +973,11 @@ mod tests {
     #[test]
     fn atomic_compare_and_exchange_int_fail() {
         let prev = AtomicOperations::compare_and_exchange_int(
-            42, 10, 99, Ordering::SeqCst, Ordering::Relaxed,
+            42,
+            10,
+            99,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
         );
         assert_eq!(prev, 42); // witness is old value, not new
     }
@@ -945,7 +1049,12 @@ mod tests {
         assert!(id > 0);
         let h = reg.get(id).unwrap();
         assert_eq!(h.var_type, VarType::Int);
-        if let VarHandleKind::InstanceField { class_name, field_name, field_index } = &h.kind {
+        if let VarHandleKind::InstanceField {
+            class_name,
+            field_name,
+            field_index,
+        } = &h.kind
+        {
             assert_eq!(class_name, "Foo");
             assert_eq!(field_name, "bar");
             assert_eq!(*field_index, 0);
@@ -1059,12 +1168,36 @@ mod tests {
             let modes = VarHandle::supported_modes_for(*vt);
             assert!(modes.contains(&AccessMode::Get), "{:?} missing Get", vt);
             assert!(modes.contains(&AccessMode::Set), "{:?} missing Set", vt);
-            assert!(modes.contains(&AccessMode::GetVolatile), "{:?} missing GetVolatile", vt);
-            assert!(modes.contains(&AccessMode::SetVolatile), "{:?} missing SetVolatile", vt);
-            assert!(modes.contains(&AccessMode::GetAcquire), "{:?} missing GetAcquire", vt);
-            assert!(modes.contains(&AccessMode::SetRelease), "{:?} missing SetRelease", vt);
-            assert!(modes.contains(&AccessMode::GetOpaque), "{:?} missing GetOpaque", vt);
-            assert!(modes.contains(&AccessMode::SetOpaque), "{:?} missing SetOpaque", vt);
+            assert!(
+                modes.contains(&AccessMode::GetVolatile),
+                "{:?} missing GetVolatile",
+                vt
+            );
+            assert!(
+                modes.contains(&AccessMode::SetVolatile),
+                "{:?} missing SetVolatile",
+                vt
+            );
+            assert!(
+                modes.contains(&AccessMode::GetAcquire),
+                "{:?} missing GetAcquire",
+                vt
+            );
+            assert!(
+                modes.contains(&AccessMode::SetRelease),
+                "{:?} missing SetRelease",
+                vt
+            );
+            assert!(
+                modes.contains(&AccessMode::GetOpaque),
+                "{:?} missing GetOpaque",
+                vt
+            );
+            assert!(
+                modes.contains(&AccessMode::SetOpaque),
+                "{:?} missing SetOpaque",
+                vt
+            );
         }
     }
 

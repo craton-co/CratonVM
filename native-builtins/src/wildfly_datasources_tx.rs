@@ -152,7 +152,11 @@ struct JndiStore {
 
 fn jndi_store() -> &'static Mutex<JndiStore> {
     static S: OnceLock<Mutex<JndiStore>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(JndiStore { entries: HashMap::new() }))
+    S.get_or_init(|| {
+        Mutex::new(JndiStore {
+            entries: HashMap::new(),
+        })
+    })
 }
 
 /// Bind `pool_handle` at the given JNDI name.
@@ -160,7 +164,10 @@ fn jndi_store() -> &'static Mutex<JndiStore> {
 /// When T19.2.b lands this becomes a delegation to
 /// `wildfly_naming::bind_handle(name, pool_handle)`.
 fn jndi_bind(name: &str, pool_handle: i32) {
-    jndi_store().lock().entries.insert(name.to_string(), pool_handle);
+    jndi_store()
+        .lock()
+        .entries
+        .insert(name.to_string(), pool_handle);
     tracing::debug!(target: "wildfly_datasources_tx",
         name = %name, pool_handle, "JNDI: bound datasource");
 }
@@ -345,9 +352,7 @@ pub fn tx_commit() -> Result<(), String> {
         // ---- 1PC fast path ----
         tx.set_status(STATUS_COMMITTING);
         let r = &resources[0];
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            commit_resource_inner(r)
-        }));
+        let result = catch_unwind(AssertUnwindSafe(|| commit_resource_inner(r)));
         match result {
             Ok(Ok(())) => {
                 tx.set_status(STATUS_COMMITTED);
@@ -424,7 +429,10 @@ pub fn tx_commit() -> Result<(), String> {
             tracing::error!(target: "wildfly_datasources_tx", tx_id = tx.id,
                 errs = ?commit_errs,
                 "TX 2PC commit phase mixed outcome");
-            Err(format!("HeuristicMixedException: {}", commit_errs.join("; ")))
+            Err(format!(
+                "HeuristicMixedException: {}",
+                commit_errs.join("; ")
+            ))
         }
     }
 }
@@ -489,7 +497,11 @@ fn rollback_resource_inner(r: &EnlistedResource) -> Result<(), String> {
 
 /// Set the per-thread TX timeout (in seconds). 0 restores the default.
 pub fn tx_set_timeout(seconds: u64) {
-    let v = if seconds == 0 { DEFAULT_TX_TIMEOUT_SECS } else { seconds };
+    let v = if seconds == 0 {
+        DEFAULT_TX_TIMEOUT_SECS
+    } else {
+        seconds
+    };
     TX_TIMEOUT_SECS.with(|c| *c.borrow_mut() = v);
 }
 
@@ -558,7 +570,8 @@ fn native_ds_service_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this = obj_arg_or_null(args, 0)
         .ok_or_else(|| throw_npe("DataSourceService.start: this == null"))?;
     let name = match ctx.get_field(this, DS_FIELD_JNDI_NAME) {
-        Value::Object(Some(s)) => ctx.read_string(s)
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
             .unwrap_or_else(|| "java:jboss/datasources/KeycloakDS".to_string()),
         _ => "java:jboss/datasources/KeycloakDS".to_string(),
     };
@@ -709,7 +722,10 @@ fn native_tm_set_rollback_only(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
     }
 }
 
-fn native_tm_set_transaction_timeout(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_tm_set_transaction_timeout(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let secs = match args.get(1) {
         Some(Value::Int(v)) => (*v).max(0) as u64,
         _ => 0,
@@ -749,8 +765,7 @@ fn native_narayana_tm_singleton(ctx: &mut dyn NativeContext, _args: &[Value]) ->
 
 /// Manufacture a fresh Xid with a unique global id + branch qualifier 0.
 fn native_xid_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg_or_null(args, 0)
-        .ok_or_else(|| throw_npe("Xid.<init>: this == null"))?;
+    let this = obj_arg_or_null(args, 0).ok_or_else(|| throw_npe("Xid.<init>: this == null"))?;
     let gid = next_xid_global();
     ctx.set_field(this, XID_FIELD_FORMAT_ID, Value::Int(0x1EE7));
     ctx.set_field(this, XID_FIELD_GLOBAL_TX_ID, Value::Long(gid as i64));
@@ -761,14 +776,16 @@ fn native_xid_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `XAResource.start(Xid, int flags)` — enlist this resource on the
 /// current TX. Returns XAER_PROTO if no TX, XAER_DUPID on duplicate Xid.
 fn native_xa_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg_or_null(args, 0)
-        .ok_or_else(|| throw_npe("XAResource.start: this == null"))?;
-    let xid = obj_arg_or_null(args, 1)
-        .ok_or_else(|| throw_npe("XAResource.start: xid == null"))?;
+    let this =
+        obj_arg_or_null(args, 0).ok_or_else(|| throw_npe("XAResource.start: this == null"))?;
+    let xid = obj_arg_or_null(args, 1).ok_or_else(|| throw_npe("XAResource.start: xid == null"))?;
     let tx = match current_tx() {
         Some(t) => t,
         None => {
-            return Err(throw_ise(format!("XAException({}): no active transaction", XAER_PROTO)));
+            return Err(throw_ise(format!(
+                "XAException({}): no active transaction",
+                XAER_PROTO
+            )));
         }
     };
     let gid = match ctx.get_field(xid, XID_FIELD_GLOBAL_TX_ID) {
@@ -824,7 +841,12 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DataSourceService
-    registry.register(CLS_DS_SERVICE, "<init>", "(Ljava/lang/String;)V", native_ds_service_init);
+    registry.register(
+        CLS_DS_SERVICE,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_ds_service_init,
+    );
     registry.register(
         CLS_DS_SERVICE,
         "start",
@@ -845,15 +867,30 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
     );
 
     // javax.sql.DataSource — delegate through the service's pool handle.
-    registry.register(CLS_DS, "getConnection", "()Ljava/sql/Connection;", native_ds_get_connection);
+    registry.register(
+        CLS_DS,
+        "getConnection",
+        "()Ljava/sql/Connection;",
+        native_ds_get_connection,
+    );
     registry.register(
         CLS_DS,
         "getConnection",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/sql/Connection;",
         native_ds_get_connection_auth,
     );
-    registry.register(CLS_DS, "getLoginTimeout", "()I", native_ds_get_login_timeout);
-    registry.register(CLS_DS, "setLoginTimeout", "(I)V", native_ds_set_login_timeout);
+    registry.register(
+        CLS_DS,
+        "getLoginTimeout",
+        "()I",
+        native_ds_get_login_timeout,
+    );
+    registry.register(
+        CLS_DS,
+        "setLoginTimeout",
+        "(I)V",
+        native_ds_set_login_timeout,
+    );
     // Also register on the service so the synthetic-type lookup hits it
     // when Java code does a direct `getConnection()` on the service ref.
     registry.register(
@@ -880,16 +917,36 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
         "()Ljavax/transaction/Transaction;",
         native_tm_get_transaction,
     );
-    registry.register(CLS_TM, "setRollbackOnly", "()V", native_tm_set_rollback_only);
-    registry.register(CLS_TM, "setTransactionTimeout", "(I)V", native_tm_set_transaction_timeout);
+    registry.register(
+        CLS_TM,
+        "setRollbackOnly",
+        "()V",
+        native_tm_set_rollback_only,
+    );
+    registry.register(
+        CLS_TM,
+        "setTransactionTimeout",
+        "(I)V",
+        native_tm_set_transaction_timeout,
+    );
 
     // UserTransaction shares semantics with TransactionManager.
     registry.register(CLS_USER_TX, "begin", "()V", native_tm_begin);
     registry.register(CLS_USER_TX, "commit", "()V", native_tm_commit);
     registry.register(CLS_USER_TX, "rollback", "()V", native_tm_rollback);
     registry.register(CLS_USER_TX, "getStatus", "()I", native_tm_get_status);
-    registry.register(CLS_USER_TX, "setRollbackOnly", "()V", native_tm_set_rollback_only);
-    registry.register(CLS_USER_TX, "setTransactionTimeout", "(I)V", native_tm_set_transaction_timeout);
+    registry.register(
+        CLS_USER_TX,
+        "setRollbackOnly",
+        "()V",
+        native_tm_set_rollback_only,
+    );
+    registry.register(
+        CLS_USER_TX,
+        "setTransactionTimeout",
+        "(I)V",
+        native_tm_set_transaction_timeout,
+    );
 
     // Narayana singletons.
     //
@@ -905,11 +962,36 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
 
     // Xid + XAResource
     registry.register(CLS_XID, "<init>", "()V", native_xid_init);
-    registry.register(CLS_XA_RES, "start", "(Ljavax/transaction/xa/Xid;I)V", native_xa_start);
-    registry.register(CLS_XA_RES, "end", "(Ljavax/transaction/xa/Xid;I)V", native_xa_end);
-    registry.register(CLS_XA_RES, "prepare", "(Ljavax/transaction/xa/Xid;)I", native_xa_prepare);
-    registry.register(CLS_XA_RES, "commit", "(Ljavax/transaction/xa/Xid;Z)V", native_xa_commit);
-    registry.register(CLS_XA_RES, "rollback", "(Ljavax/transaction/xa/Xid;)V", native_xa_rollback);
+    registry.register(
+        CLS_XA_RES,
+        "start",
+        "(Ljavax/transaction/xa/Xid;I)V",
+        native_xa_start,
+    );
+    registry.register(
+        CLS_XA_RES,
+        "end",
+        "(Ljavax/transaction/xa/Xid;I)V",
+        native_xa_end,
+    );
+    registry.register(
+        CLS_XA_RES,
+        "prepare",
+        "(Ljavax/transaction/xa/Xid;)I",
+        native_xa_prepare,
+    );
+    registry.register(
+        CLS_XA_RES,
+        "commit",
+        "(Ljavax/transaction/xa/Xid;Z)V",
+        native_xa_commit,
+    );
+    registry.register(
+        CLS_XA_RES,
+        "rollback",
+        "(Ljavax/transaction/xa/Xid;)V",
+        native_xa_rollback,
+    );
     registry.set_category(__prev_cat);
 }
 
@@ -920,7 +1002,7 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agroal_pool::{create_pool, pool_stats, PoolConfig, test_lock};
+    use crate::agroal_pool::{create_pool, pool_stats, test_lock, PoolConfig};
     use crate::ironjacamar_pool::bind_pool;
     use crate::test_utils::mock_ctx;
 
@@ -972,7 +1054,7 @@ mod tests {
         let cfg = PoolConfig::new("jdbc:h2:mem:t19_2_e-delegate".to_string());
         let pool_id = create_pool(cfg).unwrap();
         bind_pool(svc, pool_id); // T19.8 binding path
-        // Acquire via the DataSource native.
+                                 // Acquire via the DataSource native.
         let ret = native_ds_get_connection(&mut ctx, &[Value::Object(Some(svc))]).unwrap();
         let conn = match ret {
             Some(Value::Object(Some(c))) => c,
@@ -1167,7 +1249,10 @@ mod tests {
         assert_eq!(s, Some(Value::Int(STATUS_MARKED_ROLLBACK)));
         // commit() fails with RollbackException.
         let err = native_tm_commit(&mut ctx, &[]);
-        assert!(err.is_err(), "expected RollbackException on commit after setRollbackOnly");
+        assert!(
+            err.is_err(),
+            "expected RollbackException on commit after setRollbackOnly"
+        );
         // And thread-local TX was cleared.
         assert!(current_tx().is_none());
     }
@@ -1245,7 +1330,11 @@ mod tests {
         let pass = ctx.create_string("s3cret!"); // must not appear in logs
         let ret = native_ds_get_connection_auth(
             &mut ctx,
-            &[Value::Object(Some(svc)), Value::Object(Some(user)), Value::Object(Some(pass))],
+            &[
+                Value::Object(Some(svc)),
+                Value::Object(Some(user)),
+                Value::Object(Some(pass)),
+            ],
         )
         .unwrap();
         match ret {

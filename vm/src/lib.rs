@@ -32,11 +32,11 @@
 
 pub mod classloading;
 pub mod config;
-pub mod dispatch_trace;
-pub mod jck_capture;
 #[cfg(feature = "experimental-debug")]
 pub mod debug;
+pub mod dispatch_trace;
 pub mod error;
+pub mod jck_capture;
 pub mod jit;
 #[cfg(feature = "experimental-debug")]
 pub mod jvmti;
@@ -47,7 +47,9 @@ pub mod threading;
 pub mod types;
 pub mod vm;
 
-pub use classloading::{Class, ClassId, ClassLoaderId, ClassPath, ClassState, ClassStore, ManifestInfo};
+pub use classloading::{
+    Class, ClassId, ClassLoaderId, ClassPath, ClassState, ClassStore, ManifestInfo,
+};
 pub use config::VmConfig;
 pub use error::{MethodCallFailed, MethodCallResult, VmError};
 pub use threading::{JvmThread, ThreadId};
@@ -209,7 +211,11 @@ pub mod harness_exit_shim {
     /// "a real failure was in flight when the teardown hit us".
     pub fn exit_code() -> u32 {
         let observed = PANIC_COUNT.load(Ordering::SeqCst);
-        if observed > EXPECTED_PANIC_COUNT { 1 } else { 0 }
+        if observed > EXPECTED_PANIC_COUNT {
+            1
+        } else {
+            0
+        }
     }
 
     extern "C" fn on_exit() {
@@ -296,7 +302,9 @@ pub mod harness_exit_shim {
     pub fn install() {}
     /// No-op mirror of the Windows helper; always returns `true` so
     /// cross-platform regression tests can assert symmetry.
-    pub fn ctor_ran() -> bool { true }
+    pub fn ctor_ran() -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

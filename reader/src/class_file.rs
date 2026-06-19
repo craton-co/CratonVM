@@ -138,7 +138,9 @@ mod tests {
     fn source_file_present() {
         let mut cf = make_class_file(ClassAccessFlags::PUBLIC);
         cf.attributes
-            .push(LazyAttribute::new_decoded(Attribute::SourceFile(Arc::from("Test.java"))));
+            .push(LazyAttribute::new_decoded(Attribute::SourceFile(
+                Arc::from("Test.java"),
+            )));
         assert_eq!(cf.source_file(), Some("Test.java"));
     }
 

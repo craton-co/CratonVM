@@ -125,9 +125,7 @@ mod tests {
     #[test]
     fn combined_flags() {
         let m = make_method(
-            MethodAccessFlags::PUBLIC
-                | MethodAccessFlags::STATIC
-                | MethodAccessFlags::SYNCHRONIZED,
+            MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC | MethodAccessFlags::SYNCHRONIZED,
         );
         assert!(m.is_static());
         assert!(m.is_synchronized());

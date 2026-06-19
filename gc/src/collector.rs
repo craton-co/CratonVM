@@ -309,13 +309,7 @@ pub trait GarbageCollector: Send + Sync {
     }
 
     /// Volatile descriptor-aware write.
-    fn set_field_volatile_as(
-        &self,
-        obj: ObjectRef,
-        index: usize,
-        value: Value,
-        desc_byte: u8,
-    ) {
+    fn set_field_volatile_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
         let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
         self.set_field_volatile(obj, index, coerced);
     }

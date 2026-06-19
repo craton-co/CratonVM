@@ -215,12 +215,7 @@ impl Vtable {
     }
 
     /// Override an existing entry at the given slot index.
-    pub fn override_method(
-        &mut self,
-        slot: usize,
-        declaring_class_id: u64,
-        method_index: u32,
-    ) {
+    pub fn override_method(&mut self, slot: usize, declaring_class_id: u64, method_index: u32) {
         if let Some(Some(entry)) = self.entries.get_mut(slot) {
             entry.declaring_class_id = declaring_class_id;
             entry.method_index = method_index;
@@ -343,9 +338,10 @@ impl Itable {
         let bucket = self.entries.entry(key).or_default();
         // Replace if the same name/descriptor already lives in this
         // bucket (re-register), otherwise append.
-        if let Some(existing) = bucket.iter_mut().find(|e| {
-            &*e.method_name == method_name && &*e.descriptor == descriptor
-        }) {
+        if let Some(existing) = bucket
+            .iter_mut()
+            .find(|e| &*e.method_name == method_name && &*e.descriptor == descriptor)
+        {
             existing.vtable_slot = vtable_slot;
         } else {
             bucket.push(ItableEntry {
@@ -422,11 +418,7 @@ impl VtableManager {
 
     /// Create a vtable for a class, optionally inheriting from a parent.
     /// Returns a mutable reference to the newly created vtable.
-    pub fn create_vtable(
-        &mut self,
-        class_id: u64,
-        parent_class_id: Option<u64>,
-    ) -> &mut Vtable {
+    pub fn create_vtable(&mut self, class_id: u64, parent_class_id: Option<u64>) -> &mut Vtable {
         let vtable = match parent_class_id {
             Some(pid) => {
                 // Clone the parent vtable entries so we can insert without borrow conflict.
@@ -862,7 +854,9 @@ pub fn vtable_override_adapter(super_class_id: u32, slot: usize) {
         Some(m) => m,
         None => return,
     };
-    manager.write().invalidate_for_override(super_class_id as u64, slot);
+    manager
+        .write()
+        .invalidate_for_override(super_class_id as u64, slot);
 }
 
 #[cfg(test)]
@@ -908,7 +902,10 @@ mod tests {
 
         let child = Vtable::from_parent(2, &parent);
         assert_eq!(child.len(), 2);
-        assert_eq!(child.lookup_slot("toString", "()Ljava/lang/String;"), Some(0));
+        assert_eq!(
+            child.lookup_slot("toString", "()Ljava/lang/String;"),
+            Some(0)
+        );
         let entry = child.get(0).unwrap();
         assert_eq!(entry.declaring_class_id, 1); // still declared by parent
     }
@@ -1028,7 +1025,7 @@ mod tests {
 
         let vt2 = mgr.get_vtable(2).unwrap();
         assert!(!vt2.get(0).unwrap().resolved); // foo inherited from class 1
-        assert!(vt2.get(1).unwrap().resolved);  // bar overridden by class 2
+        assert!(vt2.get(1).unwrap().resolved); // bar overridden by class 2
     }
 
     #[test]
@@ -1050,13 +1047,17 @@ mod tests {
         vt.add_method("compare", "(Ljava/lang/Object;Ljava/lang/Object;)I", 10, 2);
 
         let it = mgr.create_itable(10);
-        it.register(50, "run", "()V", 0);                    // Runnable
-        it.register(51, "call", "()Ljava/lang/Object;", 1);  // Callable
+        it.register(50, "run", "()V", 0); // Runnable
+        it.register(51, "call", "()Ljava/lang/Object;", 1); // Callable
         it.register(52, "compare", "(Ljava/lang/Object;Ljava/lang/Object;)I", 2); // Comparator
 
         assert!(mgr.resolve_interface(10, 50, "run", "()V").is_some());
-        assert!(mgr.resolve_interface(10, 51, "call", "()Ljava/lang/Object;").is_some());
-        assert!(mgr.resolve_interface(10, 52, "compare", "(Ljava/lang/Object;Ljava/lang/Object;)I").is_some());
+        assert!(mgr
+            .resolve_interface(10, 51, "call", "()Ljava/lang/Object;")
+            .is_some());
+        assert!(mgr
+            .resolve_interface(10, 52, "compare", "(Ljava/lang/Object;Ljava/lang/Object;)I")
+            .is_some());
         assert!(mgr.resolve_interface(10, 99, "run", "()V").is_none());
     }
 
@@ -1321,7 +1322,9 @@ mod tests {
         })];
         mgr.install_vtable(5, entries);
 
-        let eref = mgr.vtable_entry_ref(5, 0).expect("slot should be populated");
+        let eref = mgr
+            .vtable_entry_ref(5, 0)
+            .expect("slot should be populated");
         assert_eq!(eref.method_index, 3);
         assert_eq!(eref.declaring_class_id, 5);
 
@@ -1578,7 +1581,11 @@ mod tests {
         // Before the override, Animal's slot 0 resolves.
         assert!(mgr.resolve_virtual_slot(1, 0).is_some());
         // And carries a dispatch snapshot.
-        assert!(mgr.resolve_virtual_slot(1, 0).unwrap().resolved_method.is_some());
+        assert!(mgr
+            .resolve_virtual_slot(1, 0)
+            .unwrap()
+            .resolved_method
+            .is_some());
 
         // Subclass Dog overrides speak() — the link-time hook calls
         // `vtable_override_adapter(1, 0)` which hits this API.
@@ -1743,10 +1750,9 @@ mod tests {
             })],
         );
         assert!(mgr.resolve_virtual_slot_method(88, 0).is_none());
-        assert!(
-            mgr.resolve_virtual_method(88, "getClass", "()Ljava/lang/Class;")
-                .is_none(),
-        );
+        assert!(mgr
+            .resolve_virtual_method(88, "getClass", "()Ljava/lang/Class;")
+            .is_none(),);
         // The full-entry variant still returns Some(..) because the
         // slot is resolved — callers that need to detect the native
         // case rely on `is_native` from the full entry.

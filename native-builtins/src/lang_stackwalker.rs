@@ -34,8 +34,8 @@
 //! real `AbstractStackWalker.Decoder` ring-buffer protocol.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 use crate::alloc_concurrent_synthetic;
 
@@ -396,21 +396,16 @@ pub(crate) fn native_fetch_stack_frames(
             break;
         }
         let sfi = populate_sfi(ctx, entry);
-        ctx.set_array_element(
-            buffer,
-            start + written,
-            Value::Object(Some(sfi)),
-        );
+        ctx.set_array_element(buffer, start + written, Value::Object(Some(sfi)));
         written += 1;
         new_cursor += 1;
     }
     // Persist the new cursor back into `this.anchor` so a subsequent
     // `fetchStackFrames` call resumes from the next trace frame.
     if let Some(Value::Object(Some(this_ref))) = args.first() {
-        if let Some(idx) = ctx.resolve_field_index(
-            "java/lang/StackStreamFactory$AbstractStackWalker",
-            "anchor",
-        ) {
+        if let Some(idx) =
+            ctx.resolve_field_index("java/lang/StackStreamFactory$AbstractStackWalker", "anchor")
+        {
             ctx.set_field(*this_ref, idx, Value::Long(new_cursor as i64));
         }
     }
@@ -736,10 +731,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 "java/lang/invoke/MethodType",
                 "fromMethodDescriptorString",
                 "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;",
-                &[
-                    Value::Object(Some(desc_str)),
-                    Value::Object(None),
-                ],
+                &[Value::Object(Some(desc_str)), Value::Object(None)],
             )
         },
     );
@@ -785,7 +777,8 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         }
         // Fall back: real-JDK layout has `classOrMemberName` at the
         // first ClassFrameInfo slot. Resolve by name and read it.
-        if let Some(idx) = ctx.resolve_field_index("java/lang/ClassFrameInfo", "classOrMemberName") {
+        if let Some(idx) = ctx.resolve_field_index("java/lang/ClassFrameInfo", "classOrMemberName")
+        {
             let v = ctx.get_field(this, idx);
             if let Value::Object(Some(_)) = v {
                 return Ok(Some(v));
@@ -838,9 +831,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // expandStackFrameInfo is a private native on StackFrameInfo that
     // populates `name`/`type`/`bci` from a HotSpot intrinsic. We
     // pre-populate everything our getters need, so this is a no-op.
-    registry.register(sfi, "expandStackFrameInfo", "()V", |_ctx, _args| {
-        Ok(None)
-    });
+    registry.register(sfi, "expandStackFrameInfo", "()V", |_ctx, _args| Ok(None));
     // ensureRetainClassRefEnabled is package-private on ClassFrameInfo
     // and asserts the walker had RETAIN_CLASS_REFERENCE. We always
     // populate the class mirror, so this is also a no-op.

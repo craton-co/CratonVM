@@ -414,12 +414,7 @@ fn bits_to_value(bits: i64, tag: u8) -> Value {
 /// rendezvous signalling (`has_item`/`tag`) and, for primitives, the
 /// payload bits. `ctx` writes the mirror field; `state` is the locked
 /// slot guard. Callers must hold the slot lock before calling.
-fn deposit_item(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    state: &mut SqSlot,
-    item: Value,
-) {
+fn deposit_item(ctx: &mut dyn NativeContext, this: ObjectRef, state: &mut SqSlot, item: Value) {
     let (bits, tag) = value_to_bits(item);
     state.tag = tag;
     state.has_item = true;
@@ -441,11 +436,7 @@ fn deposit_item(
 /// For an Object item the live (post-GC, remapped) reference is read back
 /// from field 0 of `this`; the raw `item_bits` is never dereferenced
 /// (bug nb-concurrent-extras). Caller must hold the slot lock.
-fn consume_item(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    state: &mut SqSlot,
-) -> Value {
+fn consume_item(ctx: &mut dyn NativeContext, this: ObjectRef, state: &mut SqSlot) -> Value {
     let result = if state.tag == 1 {
         // Object item: read the forwarded reference from the GC-tracked
         // mirror field rather than the (never-stored) slot pointer.
@@ -742,9 +733,11 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         } else {
             true
         };
-        Ok(Some(Value::Int(
-            if empty_in_slot && empty_in_mirror { 1 } else { 0 },
-        )))
+        Ok(Some(Value::Int(if empty_in_slot && empty_in_mirror {
+            1
+        } else {
+            0
+        })))
     });
     r.set_category(__prev_cat);
 }
@@ -906,10 +899,7 @@ mod tests {
         deposit_item(&mut ctx, this, &mut slot, Value::Object(None));
         assert_eq!(slot.tag, 1);
         assert_eq!(slot.item_bits, 0, "null Object stores no pointer bits");
-        assert_eq!(
-            consume_item(&mut ctx, this, &mut slot),
-            Value::Object(None),
-        );
+        assert_eq!(consume_item(&mut ctx, this, &mut slot), Value::Object(None),);
         assert!(!slot.has_item);
     }
 }

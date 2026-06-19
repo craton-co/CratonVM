@@ -97,9 +97,9 @@ impl CrashInfo {
             Some("(non-string panic payload)".to_string())
         };
 
-        let location = info.location().map(|loc| {
-            format!("{}:{}", loc.file(), loc.line())
-        });
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}", loc.file(), loc.line()));
 
         let thread_name = std::thread::current().name().map(String::from);
 
@@ -157,21 +157,27 @@ impl<'a> CrashReport<'a> {
         let ts = format_timestamp(self.info.timestamp);
         let sig_hex = format!("{:#x}", self.info.signal);
 
-        let _ = writeln!(buf,
-            "# A fatal error has been detected by the CratonVM Runtime Environment:");
+        let _ = writeln!(
+            buf,
+            "# A fatal error has been detected by the CratonVM Runtime Environment:"
+        );
         let _ = writeln!(buf, "#");
         if self.info.signal == 0 {
             // Rust panic
             let msg = self.info.panic_message.as_deref().unwrap_or("unknown");
             let loc = self.info.panic_location.as_deref().unwrap_or("unknown");
-            let _ = writeln!(buf,
+            let _ = writeln!(
+                buf,
                 "#  RUST_PANIC at {}, pid={}, tid={}",
-                loc, self.info.pid, self.info.tid);
+                loc, self.info.pid, self.info.tid
+            );
             let _ = writeln!(buf, "#  Message: {}", msg);
         } else {
-            let _ = writeln!(buf,
+            let _ = writeln!(
+                buf,
                 "#  {} ({}) at pc=0x0, pid={}, tid={}",
-                self.info.signal_name, sig_hex, self.info.pid, self.info.tid);
+                self.info.signal_name, sig_hex, self.info.pid, self.info.tid
+            );
         }
         let _ = writeln!(buf, "#");
         let _ = writeln!(buf, "# JRE version: CratonVM 25.0");
@@ -181,21 +187,24 @@ impl<'a> CrashReport<'a> {
 
         let _ = writeln!(buf, "# OS: {}", get_os_info());
         let _ = writeln!(buf, "#");
-        let _ = writeln!(buf,
-            "# If you would like to submit a bug report, please include this file.");
+        let _ = writeln!(
+            buf,
+            "# If you would like to submit a bug report, please include this file."
+        );
         let _ = writeln!(buf, "# Crash timestamp: {}", ts);
         let _ = writeln!(buf);
     }
 
     fn write_thread_section(&self, buf: &mut String) {
-        let _ = writeln!(buf,
-            "---------------  T H R E A D  ---------------");
+        let _ = writeln!(buf, "---------------  T H R E A D  ---------------");
         let _ = writeln!(buf);
 
         let tname = self.info.thread_name.as_deref().unwrap_or("<unnamed>");
-        let _ = writeln!(buf,
+        let _ = writeln!(
+            buf,
             "Current thread (0x{:x}): \"{}\" tid=0x{:x}",
-            self.info.tid, tname, self.info.tid);
+            self.info.tid, tname, self.info.tid
+        );
 
         if let Some(ref msg) = self.info.panic_message {
             let _ = writeln!(buf, "Panic message: {}", msg);
@@ -225,8 +234,7 @@ impl<'a> CrashReport<'a> {
     }
 
     fn write_process_section(&self, buf: &mut String) {
-        let _ = writeln!(buf,
-            "---------------  P R O C E S S  ---------------");
+        let _ = writeln!(buf, "---------------  P R O C E S S  ---------------");
         let _ = writeln!(buf);
 
         let _ = writeln!(buf, "VM state: {}", get_vm_state());
@@ -238,8 +246,7 @@ impl<'a> CrashReport<'a> {
     }
 
     fn write_system_section(&self, buf: &mut String) {
-        let _ = writeln!(buf,
-            "---------------  S Y S T E M  ---------------");
+        let _ = writeln!(buf, "---------------  S Y S T E M  ---------------");
         let _ = writeln!(buf);
         let _ = writeln!(buf, "OS:     {}", get_os_info());
         let _ = writeln!(buf, "CPU:    {}", get_cpu_info());
@@ -306,8 +313,7 @@ mod windows_fault {
         context_record: *mut core::ffi::c_void,
     }
 
-    type VectoredHandler =
-        unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+    type VectoredHandler = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
 
     extern "system" {
         fn AddVectoredExceptionHandler(
@@ -323,7 +329,8 @@ mod windows_fault {
         fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
         fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn GetLastError() -> u32;
-        fn GetModuleFileNameW(module: *mut core::ffi::c_void, filename: *mut u16, size: u32) -> u32;
+        fn GetModuleFileNameW(module: *mut core::ffi::c_void, filename: *mut u16, size: u32)
+            -> u32;
         fn VirtualQuery(
             address: *const core::ffi::c_void,
             buffer: *mut MemoryBasicInformation,
@@ -533,9 +540,7 @@ mod windows_fault {
         )
     }
 
-    unsafe extern "system" fn vectored_handler(
-        info: *mut ExceptionPointers,
-    ) -> i32 {
+    unsafe extern "system" fn vectored_handler(info: *mut ExceptionPointers) -> i32 {
         if info.is_null() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -618,8 +623,7 @@ mod windows_fault {
         let fault_addr = (*rec).exception_address as usize;
         // For an access violation, exception_information[0] is the access type
         // (0=read, 1=write, 8=execute) and [1] is the faulting data address.
-        let (op, data_addr) = if code == EXCEPTION_ACCESS_VIOLATION
-            && (*rec).number_parameters >= 2
+        let (op, data_addr) = if code == EXCEPTION_ACCESS_VIOLATION && (*rec).number_parameters >= 2
         {
             let op = match (*rec).exception_information[0] {
                 0 => "read",
@@ -661,9 +665,8 @@ mod windows_fault {
         let n = if code == EXCEPTION_STACK_OVERFLOW {
             0
         } else {
-            let captured = unsafe {
-                RtlCaptureStackBackTrace(0, 62, raw.as_mut_ptr(), core::ptr::null_mut())
-            };
+            let captured =
+                unsafe { RtlCaptureStackBackTrace(0, 62, raw.as_mut_ptr(), core::ptr::null_mut()) };
             captured as usize
         };
 
@@ -705,7 +708,13 @@ mod windows_fault {
         for (i, &a) in raw.iter().take(n).enumerate() {
             let a = a as usize;
             if module_base != 0 && a >= module_base && a < module_base + 0x8000_0000 {
-                let _ = writeln!(report, "  {:2}: 0x{:016X}  (exe+0x{:X})", i, a, a - module_base);
+                let _ = writeln!(
+                    report,
+                    "  {:2}: 0x{:016X}  (exe+0x{:X})",
+                    i,
+                    a,
+                    a - module_base
+                );
             } else if let Some(name) = cratonvm_jit::lookup_jit_method_name(a) {
                 // spring-bug-11: name the JIT method whose code range contains
                 // this return address (requires CRATONVM_DBG_JIT_NAMES=1).
@@ -729,10 +738,22 @@ mod windows_fault {
             let _ = writeln!(report, "Registers:");
             // x86-64 CONTEXT integer-register byte offsets (winnt.h).
             let names_offs: [(&str, usize); 17] = [
-                ("rax", 0x78), ("rcx", 0x80), ("rdx", 0x88), ("rbx", 0x90),
-                ("rsp", 0x98), ("rbp", 0xA0), ("rsi", 0xA8), ("rdi", 0xB0),
-                ("r8", 0xB8), ("r9", 0xC0), ("r10", 0xC8), ("r11", 0xD0),
-                ("r12", 0xD8), ("r13", 0xE0), ("r14", 0xE8), ("r15", 0xF0),
+                ("rax", 0x78),
+                ("rcx", 0x80),
+                ("rdx", 0x88),
+                ("rbx", 0x90),
+                ("rsp", 0x98),
+                ("rbp", 0xA0),
+                ("rsi", 0xA8),
+                ("rdi", 0xB0),
+                ("r8", 0xB8),
+                ("r9", 0xC0),
+                ("r10", 0xC8),
+                ("r11", 0xD0),
+                ("r12", 0xD8),
+                ("r13", 0xE0),
+                ("r14", 0xE8),
+                ("r15", 0xF0),
                 ("rip", 0xF8),
             ];
             for chunk in names_offs.chunks(4) {
@@ -772,7 +793,11 @@ mod windows_fault {
             for b in bytes {
                 let _ = write!(hex, "{:02X} ", b);
             }
-            let _ = writeln!(report, "  [{}] bytes [RA-0x{:X}..RA] @0x{:016X}:\n    {}", label, PRE, start, hex);
+            let _ = writeln!(
+                report,
+                "  [{}] bytes [RA-0x{:X}..RA] @0x{:016X}:\n    {}",
+                label, PRE, start, hex
+            );
         };
         if n >= 2 {
             let _ = writeln!(report, "Code bytes preceding JIT return addresses:");
@@ -810,7 +835,11 @@ mod windows_fault {
             let ss = r10.wrapping_add(0x1B8);
             if r10 != 0 && unsafe { is_readable(ss, 0x18) } {
                 let qs = unsafe { core::slice::from_raw_parts(ss as *const u64, 3) };
-                let _ = writeln!(report, "ShadowStack @ R10+0x1B8: top=0x{:016X} end=0x{:016X} base=0x{:016X}", qs[0], qs[1], qs[2]);
+                let _ = writeln!(
+                    report,
+                    "ShadowStack @ R10+0x1B8: top=0x{:016X} end=0x{:016X} base=0x{:016X}",
+                    qs[0], qs[1], qs[2]
+                );
             }
         }
 
@@ -921,7 +950,10 @@ mod windows_fault {
                 let dir = String::from_utf16_lossy(&exe_path[..dir_end]);
                 eprintln!(
                     "[sym] SymInitialize ok={} base=0x{:X} dir={} err={}",
-                    ok, module_base, dir, GetLastError()
+                    ok,
+                    module_base,
+                    dir,
+                    GetLastError()
                 );
             }
             // Explicitly load the exe's own module + PDB so SymFromAddr can
@@ -960,11 +992,9 @@ mod windows_fault {
                 let abs = module_base.wrapping_add(rva);
                 let r = unsafe { symbolize(process, abs) };
                 if verbose && r.is_none() {
-                    eprintln!(
-                        "[sym] SymFromAddr 0x{:X} failed err={}",
-                        abs,
-                        unsafe { GetLastError() }
-                    );
+                    eprintln!("[sym] SymFromAddr 0x{:X} failed err={}", abs, unsafe {
+                        GetLastError()
+                    });
                 }
                 (rva, r)
             })
@@ -1046,7 +1076,10 @@ pub fn install_crash_handler() {
                 eprintln!("#");
             }
             Err(e) => {
-                eprintln!("# CratonVM crash handler: failed to write {}: {}", filename, e);
+                eprintln!(
+                    "# CratonVM crash handler: failed to write {}: {}",
+                    filename, e
+                );
             }
         }
 
@@ -1254,7 +1287,8 @@ fn install_signal_handlers() {
 
     // Pre-allocated constant strings used by the signal handler. Storing them
     // as `&'static [u8]` means no allocation is needed to reference them.
-    const HDR: &[u8] = b"\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n#  ";
+    const HDR: &[u8] =
+        b"\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n#  ";
     const AT_PC: &[u8] = b" at pc=0x0, pid=";
     const TID_LBL: &[u8] = b", tid=";
     const NL_REPORT: &[u8] = b"\n#  Error report saved to: ";
@@ -1264,8 +1298,7 @@ fn install_signal_handlers() {
 
     // Cache the pid in normal context so the handler doesn't need libc::getpid
     // (which is technically signal-safe, but we minimize syscalls).
-    async_signal_safe::CACHED_PID
-        .store(std::process::id() as i32, Ordering::Relaxed);
+    async_signal_safe::CACHED_PID.store(std::process::id() as i32, Ordering::Relaxed);
 
     // Prime TLS on the installing thread (each VM-spawned thread should also
     // call `prime_signal_tls` itself at startup).
@@ -1306,11 +1339,7 @@ fn install_signal_handlers() {
 
         // Build "hs_err_pid<pid>.log\0" into `filename` without allocating.
         let mut fpos = 0usize;
-        let parts: [&[u8]; 3] = [
-            FILE_PREFIX,
-            &pid_buf[..pid_len],
-            FILE_SUFFIX,
-        ];
+        let parts: [&[u8]; 3] = [FILE_PREFIX, &pid_buf[..pid_len], FILE_SUFFIX];
         for part in parts.iter() {
             for &b in part.iter() {
                 if fpos + 1 < filename.len() {
@@ -1329,21 +1358,12 @@ fn install_signal_handlers() {
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, HDR);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, sig_name);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, AT_PC);
-        async_signal_safe::write_all(
-            async_signal_safe::STDERR_FD,
-            &pid_buf[..pid_len],
-        );
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &pid_buf[..pid_len]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, TID_LBL);
-        async_signal_safe::write_all(
-            async_signal_safe::STDERR_FD,
-            &tid_buf[..tid_len],
-        );
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &tid_buf[..tid_len]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, NL_REPORT);
         // Write filename without the trailing NUL.
-        async_signal_safe::write_all(
-            async_signal_safe::STDERR_FD,
-            &filename[..fpos],
-        );
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &filename[..fpos]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, FOOTER);
 
         // ── Write a minimal hs_err_pid file via raw open/write/close ──────
@@ -1444,8 +1464,10 @@ fn format_timestamp(t: SystemTime) -> String {
 
             // Days since epoch to Y-M-D (simplified Gregorian).
             let (year, month, day) = days_to_ymd(days);
-            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                year, month, day, hours, minutes, seconds)
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                year, month, day, hours, minutes, seconds
+            )
         }
         Err(_) => "unknown".to_string(),
     }
@@ -1495,9 +1517,14 @@ fn get_os_info_linux() -> String {
     let distro = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|content| {
-            content.lines()
+            content
+                .lines()
                 .find(|l| l.starts_with("PRETTY_NAME="))
-                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+                .map(|l| {
+                    l.trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string()
+                })
         })
         .unwrap_or_else(|| "Linux".to_string());
 
@@ -1553,9 +1580,12 @@ pub fn get_cpu_info() -> String {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        format!("{} cores", std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1))
+        format!(
+            "{} cores",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        )
     }
 }
 
@@ -1564,7 +1594,8 @@ fn get_cpu_info_linux() -> String {
     let model = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|content| {
-            content.lines()
+            content
+                .lines()
                 .find(|l| l.starts_with("model name"))
                 .and_then(|l| l.split(':').nth(1))
                 .map(|s| s.trim().to_string())
@@ -1655,8 +1686,11 @@ fn get_memory_info_linux() -> String {
                     avail_kb = parse_meminfo_kb(line);
                 }
             }
-            format!("total={} MB, available={} MB",
-                total_kb / 1024, avail_kb / 1024)
+            format!(
+                "total={} MB, available={} MB",
+                total_kb / 1024,
+                avail_kb / 1024
+            )
         }
         Err(_) => "unknown".to_string(),
     }
@@ -1769,9 +1803,14 @@ mod tests {
         assert_eq!(info.pid, 12345);
         assert_eq!(info.tid, 67890);
         assert_eq!(info.thread_name.as_deref(), Some("main"));
-        assert_eq!(info.panic_message.as_deref(), Some("null pointer dereference"));
-        assert_eq!(info.panic_location.as_deref(),
-            Some("vm/src/runtime/interpreter.rs:42"));
+        assert_eq!(
+            info.panic_message.as_deref(),
+            Some("null pointer dereference")
+        );
+        assert_eq!(
+            info.panic_location.as_deref(),
+            Some("vm/src/runtime/interpreter.rs:42")
+        );
     }
 
     #[test]
@@ -1798,7 +1837,9 @@ mod tests {
     fn crash_report_contains_header() {
         let info = sample_crash_info();
         let report = generate_crash_report(&info);
-        assert!(report.contains("A fatal error has been detected by the CratonVM Runtime Environment"));
+        assert!(
+            report.contains("A fatal error has been detected by the CratonVM Runtime Environment")
+        );
         assert!(report.contains("SIGSEGV"));
         assert!(report.contains("pid=12345"));
         assert!(report.contains("tid=67890"));
@@ -1886,8 +1927,11 @@ mod tests {
     fn cpu_info_non_empty() {
         let info = get_cpu_info();
         assert!(!info.is_empty(), "CPU info should not be empty");
-        assert!(info.contains("core") || info.contains("thread") || info.contains("unknown"),
-            "CPU info should mention cores/threads: {}", info);
+        assert!(
+            info.contains("core") || info.contains("thread") || info.contains("unknown"),
+            "CPU info should mention cores/threads: {}",
+            info
+        );
     }
 
     #[test]

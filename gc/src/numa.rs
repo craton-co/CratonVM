@@ -55,7 +55,6 @@ pub struct NumaTopology {
     pub is_numa_available: bool,
 
     // ---- Cross-crate contract surface (used by other agents/crates) -------
-
     /// Number of NUMA nodes (alias for `total_nodes`; always >= 1).
     pub num_nodes: usize,
     /// Per-node CPU lists (CPU indices, as `u32`).
@@ -487,10 +486,12 @@ impl NumaAllocator {
 
     /// Gather allocation statistics.
     pub fn get_stats(&self) -> NumaStats {
-        let per_node_allocated: Vec<u64> =
-            self.per_node_arenas.iter().map(|a| a.allocated_bytes).collect();
-        let per_node_peak: Vec<u64> =
-            self.per_node_arenas.iter().map(|a| a.peak_bytes).collect();
+        let per_node_allocated: Vec<u64> = self
+            .per_node_arenas
+            .iter()
+            .map(|a| a.allocated_bytes)
+            .collect();
+        let per_node_peak: Vec<u64> = self.per_node_arenas.iter().map(|a| a.peak_bytes).collect();
         let total_allocated: u64 = per_node_allocated.iter().sum();
         let total = self.local_allocations + self.cross_node_accesses;
         let local_ratio = if total > 0 {
@@ -741,7 +742,10 @@ mod tests {
         assert!(!topo.node_cpus.is_empty());
         // Across all nodes, at least one CPU must be visible somewhere.
         let total_cpus: usize = topo.node_cpus.iter().map(|c| c.len()).sum();
-        assert!(total_cpus >= 1, "expected at least one CPU across all nodes");
+        assert!(
+            total_cpus >= 1,
+            "expected at least one CPU across all nodes"
+        );
     }
 
     #[test]
@@ -840,10 +844,7 @@ Node 0 MemUsed:         4431538 kB
 
     /// Synthetic 2-node topology used by several tests below.
     fn synthetic_two_node() -> NumaTopology {
-        NumaTopology::from_parts(
-            vec![vec![0, 1], vec![2, 3]],
-            vec![4 << 30, 4 << 30],
-        )
+        NumaTopology::from_parts(vec![vec![0, 1], vec![2, 3]], vec![4 << 30, 4 << 30])
     }
 
     #[test]
@@ -1015,12 +1016,7 @@ Node 0 MemUsed:         4431538 kB
         let hash = fnv1a_hash(b"hello");
         dd.deduplicate(hash, b"hello");
         let result = dd.deduplicate(hash, b"hello");
-        assert_eq!(
-            result,
-            DeduplicationResult::Deduped {
-                saved_bytes: 5
-            }
-        );
+        assert_eq!(result, DeduplicationResult::Deduped { saved_bytes: 5 });
     }
 
     #[test]
@@ -1222,7 +1218,10 @@ Node 0 MemUsed:         4431538 kB
 
     #[test]
     fn test_dedup_result_variants() {
-        assert_ne!(DeduplicationResult::New, DeduplicationResult::AlreadyDeduped);
+        assert_ne!(
+            DeduplicationResult::New,
+            DeduplicationResult::AlreadyDeduped
+        );
         assert_ne!(DeduplicationResult::New, DeduplicationResult::Skipped);
         assert_eq!(
             DeduplicationResult::Deduped { saved_bytes: 10 },
@@ -1232,8 +1231,16 @@ Node 0 MemUsed:         4431538 kB
 
     #[test]
     fn test_numa_allocation_equality() {
-        let a1 = NumaAllocation { address: 0x1000, size: 64, node_id: 0 };
-        let a2 = NumaAllocation { address: 0x1000, size: 64, node_id: 0 };
+        let a1 = NumaAllocation {
+            address: 0x1000,
+            size: 64,
+            node_id: 0,
+        };
+        let a2 = NumaAllocation {
+            address: 0x1000,
+            size: 64,
+            node_id: 0,
+        };
         assert_eq!(a1, a2);
     }
 

@@ -49,7 +49,10 @@ fn push_utf8(out: &mut Vec<u8>, s: &[u8]) {
 /// (`Utf8` with a unique short content) so the declared count actually
 /// matches the parsed entries.
 fn build_constant_pool(cp_count: u16) -> Vec<u8> {
-    assert!(cp_count >= 7, "test wants at least the 6 fixed entries + slot 0");
+    assert!(
+        cp_count >= 7,
+        "test wants at least the 6 fixed entries + slot 0"
+    );
     let mut out = Vec::with_capacity(cp_count as usize * 8);
     push_u16(&mut out, cp_count);
 
@@ -102,7 +105,7 @@ fn build_method_with_max_code() -> Vec<u8> {
     // code = (CODE_LENGTH - 1) * `nop` + 1 * `return`
     out.extend(std::iter::repeat(0x00u8).take(CODE_LENGTH as usize - 1));
     out.push(0xB1); // return
-    // exception_table_length, attributes_count both zero.
+                    // exception_table_length, attributes_count both zero.
     push_u16(&mut out, 0);
     push_u16(&mut out, 0);
 
@@ -153,8 +156,7 @@ fn reader_handles_constant_pool_near_u16_max() {
     // pre-alloc panic on a near-max CP", not exact-equals-u16::MAX.
     let cp_count: u16 = 60_000;
     let bytes = build_large_class(cp_count, 0);
-    let class_file =
-        read_class(&bytes).expect("near-max constant pool must parse successfully");
+    let class_file = read_class(&bytes).expect("near-max constant pool must parse successfully");
     // entries.len() == cp_count (0-th sentinel + cp_count-1 real entries).
     assert_eq!(
         class_file.constant_pool.len(),
@@ -169,8 +171,7 @@ fn reader_accepts_code_length_at_jvms_cap() {
     // must accept it and the produced bytecode view must report the
     // right length.
     let bytes = build_large_class(7, 0);
-    let mut class_file =
-        read_class(&bytes).expect("class with max-legal code_length must parse");
+    let mut class_file = read_class(&bytes).expect("class with max-legal code_length must parse");
     assert_eq!(class_file.methods.len(), 1);
     // Split borrow: `methods` and `constant_pool` are independent fields, so
     // `force_decode_all` over the method's attributes can take `&mut` while
@@ -196,8 +197,7 @@ fn reader_handles_max_class_level_attributes() {
     // Deprecated attribute, so the parse cost is bounded.
     let class_attr_count: u16 = 65_535;
     let bytes = build_large_class(7, class_attr_count);
-    let class_file =
-        read_class(&bytes).expect("class with 65535 attributes must parse");
+    let class_file = read_class(&bytes).expect("class with 65535 attributes must parse");
     assert_eq!(
         class_file.attributes.len(),
         class_attr_count as usize,

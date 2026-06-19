@@ -24,7 +24,7 @@ use cratonvm_reader::instruction::Instruction;
 fn build_tableswitch_at(pc: usize) -> (Vec<u8>, usize) {
     let mut code = vec![0x00u8; pc]; // pre-pad with `nop` so the opcode lands at `pc`
     code.push(0xaa); // tableswitch opcode
-    // Pad to the next 4-aligned offset from (pc + 1).
+                     // Pad to the next 4-aligned offset from (pc + 1).
     let after_opcode = pc + 1;
     let mut next = after_opcode;
     while next % 4 != 0 {

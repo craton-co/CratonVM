@@ -103,7 +103,10 @@ pub struct PrincipalEntry {
 pub enum PolicyError {
     Io(std::io::Error),
     /// Syntax/semantic error; `line` is 1-based.
-    Parse { line: usize, message: String },
+    Parse {
+        line: usize,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -334,7 +337,10 @@ fn target_matches(grant_target: Option<&str>, request_target: &str) -> bool {
         return request_target.starts_with(stem);
     }
     if let Some(stem) = pattern.strip_suffix("/*") {
-        if let Some(rest) = request_target.strip_prefix(stem).and_then(|r| r.strip_prefix('/')) {
+        if let Some(rest) = request_target
+            .strip_prefix(stem)
+            .and_then(|r| r.strip_prefix('/'))
+        {
             return !rest.contains('/');
         }
         return false;
@@ -451,8 +457,16 @@ fn socket_port_matches(pat_port: &str, req_port: &str) -> bool {
     };
     // Pattern can be a single port or a range `lo-hi`.
     if let Some((lo, hi)) = pat_port.split_once('-') {
-        let lo_n: u32 = if lo.is_empty() { 0 } else { lo.parse().unwrap_or(u32::MAX) };
-        let hi_n: u32 = if hi.is_empty() { 65535 } else { hi.parse().unwrap_or(0) };
+        let lo_n: u32 = if lo.is_empty() {
+            0
+        } else {
+            lo.parse().unwrap_or(u32::MAX)
+        };
+        let hi_n: u32 = if hi.is_empty() {
+            65535
+        } else {
+            hi.parse().unwrap_or(0)
+        };
         return lo_n <= req && req <= hi_n;
     }
     match pat_port.parse::<u32>() {
@@ -520,7 +534,10 @@ fn socket_host_matches(pattern: &str, request: &str) -> bool {
         return req_str.eq_ignore_ascii_case("localhost")
             || req_str == "127.0.0.1"
             || req_str == "::1"
-            || req_str.parse::<Ipv6Addr>().map(|a| a == Ipv6Addr::LOCALHOST).unwrap_or(false);
+            || req_str
+                .parse::<Ipv6Addr>()
+                .map(|a| a == Ipv6Addr::LOCALHOST)
+                .unwrap_or(false);
     }
 
     // Raw IPv6 literal match: accept both bracketed and unbracketed forms.
@@ -614,7 +631,11 @@ fn ipv4_cidr_contains(base: u32, prefix: u32, addr: u32) -> bool {
     if prefix == 0 {
         return true;
     }
-    let mask = if prefix == 32 { u32::MAX } else { !((1u32 << (32 - prefix)) - 1) };
+    let mask = if prefix == 32 {
+        u32::MAX
+    } else {
+        !((1u32 << (32 - prefix)) - 1)
+    };
     (base & mask) == (addr & mask)
 }
 
@@ -647,12 +668,10 @@ fn signed_by_matches<S: AsRef<str>>(grant_signed_by: Option<&str>, cert_digests:
     }
 
     if is_sha256_hex(alias) {
-        return cert_digests
-            .iter()
-            .any(|d| {
-                let d = d.as_ref();
-                is_sha256_hex(d) && d.eq_ignore_ascii_case(alias)
-            });
+        return cert_digests.iter().any(|d| {
+            let d = d.as_ref();
+            is_sha256_hex(d) && d.eq_ignore_ascii_case(alias)
+        });
     }
 
     // DN substring match — case-sensitive because RFC 4514 DNs are
@@ -684,11 +703,19 @@ fn is_sha256_hex(s: &str) -> bool {
 /// Used by the `${...}` substituter to walk the input string in
 /// character-aligned chunks without splitting a multibyte character.
 fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 { 1 }
-    else if b < 0xC0 { 1 }      // continuation byte (caller guarantees aligned)
-    else if b < 0xE0 { 2 }
-    else if b < 0xF0 { 3 }
-    else { 4 }
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        1
+    }
+    // continuation byte (caller guarantees aligned)
+    else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 /// WP6.8 — resolve a `${name}` token from a policy string.  Tries
@@ -790,8 +817,8 @@ fn principals_match(
         let mut matched = false;
         for (subj_class, subj_name) in subject_principals {
             let subj_class_norm = normalize_class(subj_class);
-            let class_ok = required_class_ref == "*"
-                || required_class_ref == subj_class_norm.as_ref();
+            let class_ok =
+                required_class_ref == "*" || required_class_ref == subj_class_norm.as_ref();
             let name_ok = required_name == "*" || required_name == subj_name;
             if class_ok && name_ok {
                 matched = true;
@@ -808,14 +835,22 @@ fn principals_match(
 fn actions_match(grant_actions: Option<&str>, request_actions: &str) -> bool {
     let grant_list: Vec<&str> = match grant_actions {
         None | Some("") => return request_actions.trim().is_empty(),
-        Some(s) => s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect(),
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect(),
     };
     if request_actions.trim().is_empty() {
         // An empty request is implied by any non-empty grant.
         return true;
     }
     // Every requested action must be present in the grant list.
-    for req in request_actions.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+    for req in request_actions
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
         if !grant_list.iter().any(|g| g.eq_ignore_ascii_case(req)) {
             return false;
         }
@@ -1317,7 +1352,10 @@ mod tests {
         let p = Policy::parse(src).unwrap();
         assert_eq!(p.grants.len(), 2);
         assert!(p.grants[0].code_base.is_none());
-        assert_eq!(p.grants[0].permissions[0].class_name, "java.security.AllPermission");
+        assert_eq!(
+            p.grants[0].permissions[0].class_name,
+            "java.security.AllPermission"
+        );
         assert_eq!(p.grants[1].code_base.as_deref(), Some("file:/plugins/-"));
     }
 
@@ -1333,7 +1371,10 @@ mod tests {
         "#;
         let p = Policy::parse(src).unwrap();
         assert_eq!(p.grants.len(), 1);
-        assert_eq!(p.grants[0].permissions[0].target.as_deref(), Some("createClassLoader"));
+        assert_eq!(
+            p.grants[0].permissions[0].target.as_deref(),
+            Some("createClassLoader")
+        );
     }
 
     #[test]
@@ -1427,7 +1468,12 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies("java.io.FilePermission", "/var/log/app/info.txt", "read", None));
+        assert!(p.implies(
+            "java.io.FilePermission",
+            "/var/log/app/info.txt",
+            "read",
+            None
+        ));
         assert!(p.implies("java.io.FilePermission", "/var/log/x", "read", None));
         assert!(!p.implies("java.io.FilePermission", "/etc/x", "read", None));
     }
@@ -1441,9 +1487,19 @@ mod tests {
         "#;
         let p = Policy::parse(src).unwrap();
         // Matches when codeBase is within /home/app.
-        assert!(p.implies("java.io.FilePermission", "/tmp/x", "read", Some("file:/home/app/lib/x.jar")));
+        assert!(p.implies(
+            "java.io.FilePermission",
+            "/tmp/x",
+            "read",
+            Some("file:/home/app/lib/x.jar")
+        ));
         // Does not match when codeBase is elsewhere.
-        assert!(!p.implies("java.io.FilePermission", "/tmp/x", "read", Some("file:/opt/other/y.jar")));
+        assert!(!p.implies(
+            "java.io.FilePermission",
+            "/tmp/x",
+            "read",
+            Some("file:/opt/other/y.jar")
+        ));
         // Does not match when no codeBase is in scope.
         assert!(!p.implies("java.io.FilePermission", "/tmp/x", "read", None));
     }
@@ -1456,8 +1512,18 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies("java.net.SocketPermission", "example.com:80", "connect", None));
-        assert!(!p.implies("java.net.SocketPermission", "example.com:443", "connect", None));
+        assert!(p.implies(
+            "java.net.SocketPermission",
+            "example.com:80",
+            "connect",
+            None
+        ));
+        assert!(!p.implies(
+            "java.net.SocketPermission",
+            "example.com:443",
+            "connect",
+            None
+        ));
     }
 
     #[test]
@@ -1512,9 +1578,19 @@ mod tests {
         "#;
         let p = Policy::parse(src).unwrap();
         // Direct child only.
-        assert!(p.implies("java.io.FilePermission", "/x", "read", Some("file:/apps/foo")));
+        assert!(p.implies(
+            "java.io.FilePermission",
+            "/x",
+            "read",
+            Some("file:/apps/foo")
+        ));
         // Not recursive.
-        assert!(!p.implies("java.io.FilePermission", "/x", "read", Some("file:/apps/foo/bar")));
+        assert!(!p.implies(
+            "java.io.FilePermission",
+            "/x",
+            "read",
+            Some("file:/apps/foo/bar")
+        ));
     }
 
     #[test]
@@ -1525,7 +1601,12 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies("java.lang.RuntimePermission", "getProtectionDomain", "", None));
+        assert!(p.implies(
+            "java.lang.RuntimePermission",
+            "getProtectionDomain",
+            "",
+            None
+        ));
     }
 
     #[test]
@@ -1648,31 +1729,16 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "10.1.2.3:80",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "10.1.2.3:80", "connect", None));
         assert!(p.implies(
             "java.net.SocketPermission",
             "10.255.255.255:80",
             "connect",
             None
         ));
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "11.0.0.1:80",
-            "connect",
-            None
-        ));
+        assert!(!p.implies("java.net.SocketPermission", "11.0.0.1:80", "connect", None));
         // Port mismatch still denies.
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "10.1.2.3:443",
-            "connect",
-            None
-        ));
+        assert!(!p.implies("java.net.SocketPermission", "10.1.2.3:443", "connect", None));
     }
 
     #[test]
@@ -1696,12 +1762,7 @@ mod tests {
             "connect",
             None
         ));
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "10.0.0.1:22",
-            "connect",
-            None
-        ));
+        assert!(!p.implies("java.net.SocketPermission", "10.0.0.1:22", "connect", None));
     }
 
     #[test]
@@ -1724,12 +1785,7 @@ mod tests {
             "connect",
             None
         ));
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "::1:8080",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "::1:8080", "connect", None));
         assert!(!p.implies(
             "java.net.SocketPermission",
             "example.com:8080",
@@ -1818,24 +1874,9 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "host:80",
-            "connect",
-            None
-        ));
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "host:1024",
-            "connect",
-            None
-        ));
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "host:65535",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "host:80", "connect", None));
+        assert!(p.implies("java.net.SocketPermission", "host:1024", "connect", None));
+        assert!(p.implies("java.net.SocketPermission", "host:65535", "connect", None));
     }
 
     // -----------------------------------------------------------------------
@@ -1869,13 +1910,7 @@ mod tests {
         let pkcs7 = make_pkcs7_with_cn("Acme Corp");
         let dn = dn_of(&pkcs7);
         assert_eq!(dn, "CN=Acme Corp");
-        assert!(p.implies_full(
-            "java.io.FilePermission",
-            "/opt/a",
-            "read",
-            None,
-            &[dn],
-        ));
+        assert!(p.implies_full("java.io.FilePermission", "/opt/a", "read", None, &[dn],));
     }
 
     #[test]
@@ -1889,13 +1924,7 @@ mod tests {
         let p = Policy::parse(src).unwrap();
         let pkcs7 = make_pkcs7_with_cn("Acme Corp");
         let dn = dn_of(&pkcs7);
-        assert!(p.implies_full(
-            "java.io.FilePermission",
-            "/opt/a",
-            "read",
-            None,
-            &[dn],
-        ));
+        assert!(p.implies_full("java.io.FilePermission", "/opt/a", "read", None, &[dn],));
     }
 
     #[test]
@@ -1910,13 +1939,7 @@ mod tests {
         let p = Policy::parse(src).unwrap();
         let pkcs7 = make_pkcs7_with_cn("Acme");
         let dn = dn_of(&pkcs7);
-        assert!(!p.implies_full(
-            "java.io.FilePermission",
-            "/opt/a",
-            "read",
-            None,
-            &[dn],
-        ));
+        assert!(!p.implies_full("java.io.FilePermission", "/opt/a", "read", None, &[dn],));
     }
 
     #[test]
@@ -1940,12 +1963,7 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "[::1]:443",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "[::1]:443", "connect", None));
         // Non-loopback must not match a /128.
         assert!(!p.implies(
             "java.net.SocketPermission",
@@ -1963,12 +1981,7 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "[fe80::1]:80",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "[fe80::1]:80", "connect", None));
         // Another link-local address in the block.
         assert!(p.implies(
             "java.net.SocketPermission",
@@ -1993,18 +2006,8 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "[::1]:8085",
-            "connect",
-            None
-        ));
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "[::1]:9000",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "[::1]:8085", "connect", None));
+        assert!(!p.implies("java.net.SocketPermission", "[::1]:9000", "connect", None));
     }
 
     #[test]
@@ -2016,18 +2019,8 @@ mod tests {
             };
         "#;
         let p = Policy::parse(src).unwrap();
-        assert!(p.implies(
-            "java.net.SocketPermission",
-            "10.1.2.3:80",
-            "connect",
-            None
-        ));
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "11.0.0.1:80",
-            "connect",
-            None
-        ));
+        assert!(p.implies("java.net.SocketPermission", "10.1.2.3:80", "connect", None));
+        assert!(!p.implies("java.net.SocketPermission", "11.0.0.1:80", "connect", None));
     }
 
     #[test]
@@ -2064,18 +2057,8 @@ mod tests {
         let p = Policy::parse(src).unwrap();
         // Triple-colon and double-compression are invalid per RFC 4291;
         // std::net::Ipv6Addr rejects them, so matching returns false.
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "[:::1]:443",
-            "connect",
-            None
-        ));
-        assert!(!p.implies(
-            "java.net.SocketPermission",
-            "[::1::]:443",
-            "connect",
-            None
-        ));
+        assert!(!p.implies("java.net.SocketPermission", "[:::1]:443", "connect", None));
+        assert!(!p.implies("java.net.SocketPermission", "[::1::]:443", "connect", None));
     }
 
     #[test]
@@ -2149,7 +2132,10 @@ mod tests {
         "#;
         let p = Policy::parse(src).unwrap();
         assert_eq!(p.grants.len(), 2);
-        assert!(p.grants[0].disabled, "grant with unset ${{...}} must be disabled");
+        assert!(
+            p.grants[0].disabled,
+            "grant with unset ${{...}} must be disabled"
+        );
         assert!(!p.grants[1].disabled, "second grant must be unaffected");
         // The disabled grant cannot be used to satisfy a permission.
         assert!(!p.implies(
@@ -2208,12 +2194,7 @@ mod tests {
         assert!(p.grants[0].disabled);
         // Negative implication: the grant is dead, so even an exact
         // literal target must not match.
-        assert!(!p.implies(
-            "java.io.FilePermission",
-            "${wp68.unset.var}",
-            "read",
-            None,
-        ));
+        assert!(!p.implies("java.io.FilePermission", "${wp68.unset.var}", "read", None,));
     }
 
     #[test]

@@ -357,9 +357,7 @@ pub fn parse_http_request_head(bytes: &[u8]) -> Result<(ParsedRequest, usize), H
         }
         let hline = &bytes[pos..hend];
         let hline_str = std::str::from_utf8(hline).map_err(|_| HttpParseError::InvalidAscii)?;
-        let colon = hline_str
-            .find(':')
-            .ok_or(HttpParseError::MalformedHeader)?;
+        let colon = hline_str.find(':').ok_or(HttpParseError::MalformedHeader)?;
         let name = hline_str[..colon].trim();
         let value = hline_str[colon + 1..].trim();
         if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
@@ -536,10 +534,7 @@ fn native_builder_set_worker_threads(
     Ok(Some(Value::Object(Some(this))))
 }
 
-fn native_builder_set_io_threads(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_builder_set_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(2);
     ctx.set_field(this, UND_FIELD_IO_THREADS, Value::Int(n.max(1)));
@@ -567,17 +562,20 @@ fn native_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let wt_n = wt.as_int().unwrap_or(16).max(1) as u32;
     let it_n = it.as_int().unwrap_or(2).max(1) as u32;
-    undertow_instances().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        id,
-        UndertowInstance {
+    undertow_instances()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
             id,
-            listeners: Vec::new(),
-            handler_obj_raw: handler_raw,
-            worker_threads: wt_n,
-            io_threads: it_n,
-            running: false,
-        },
-    );
+            UndertowInstance {
+                id,
+                listeners: Vec::new(),
+                handler_obj_raw: handler_raw,
+                worker_threads: wt_n,
+                io_threads: it_n,
+                running: false,
+            },
+        );
     Ok(Some(Value::Object(Some(undertow))))
 }
 
@@ -615,7 +613,9 @@ fn native_undertow_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let bound = listener.local_addr().ok();
 
     {
-        let mut map = undertow_instances().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = undertow_instances()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(inst) = map.get_mut(&id) {
             inst.listeners.push(Listener {
                 id: next_id(),
@@ -637,7 +637,9 @@ fn native_undertow_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Long(l) => l as u64,
         _ => return Ok(None),
     };
-    let mut map = undertow_instances().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = undertow_instances()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(inst) = map.get_mut(&id) {
         inst.stop();
     }
@@ -730,7 +732,10 @@ fn native_exchange_get_request_method(
     Ok(Some(ctx.get_field(this, EX_FIELD_METHOD)))
 }
 
-fn native_exchange_get_request_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_exchange_get_request_uri(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field(this, EX_FIELD_URI)))
 }
@@ -799,10 +804,7 @@ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // Natives — UndertowService / ListenerService (WildFly MSC-facing)
 // ---------------------------------------------------------------------------
 
-fn native_undertow_service_start(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_undertow_service_start(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     _ctx.set_field(this, US_FIELD_STATE, Value::Int(1)); // 1 = started
     Ok(None)
@@ -1208,7 +1210,10 @@ mod tests {
         let mut ctx = mock_ctx();
         let undertow = build_and_configure(&mut ctx, 0); // ephemeral
         native_undertow_start(&mut ctx, &[Value::Object(Some(undertow))]).unwrap();
-        let id = ctx.get_field(undertow, UND_FIELD_BOUND_FDS).as_long().unwrap();
+        let id = ctx
+            .get_field(undertow, UND_FIELD_BOUND_FDS)
+            .as_long()
+            .unwrap();
         let map = undertow_instances().lock().unwrap();
         let inst = map.get(&(id as u64)).expect("instance");
         assert!(inst.running, "instance must be running after start");
@@ -1223,11 +1228,17 @@ mod tests {
         let mut ctx = mock_ctx();
         let undertow = build_and_configure(&mut ctx, 0);
         native_undertow_start(&mut ctx, &[Value::Object(Some(undertow))]).unwrap();
-        let id = ctx.get_field(undertow, UND_FIELD_BOUND_FDS).as_long().unwrap() as u64;
+        let id = ctx
+            .get_field(undertow, UND_FIELD_BOUND_FDS)
+            .as_long()
+            .unwrap() as u64;
         // Grab the bound port before stop so we can re-bind on it.
         let saved_port = {
             let map = undertow_instances().lock().unwrap();
-            map.get(&id).unwrap().listeners[0].bound_addr.unwrap().port()
+            map.get(&id).unwrap().listeners[0]
+                .bound_addr
+                .unwrap()
+                .port()
         };
         native_undertow_stop(&mut ctx, &[Value::Object(Some(undertow))]).unwrap();
         // After stop, listener slot is None.
@@ -1263,12 +1274,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let got = native_header_map_get(
-            &mut ctx,
-            &[Value::Object(Some(hm)), Value::Object(Some(k))],
-        )
-        .unwrap()
-        .unwrap();
+        let got =
+            native_header_map_get(&mut ctx, &[Value::Object(Some(hm)), Value::Object(Some(k))])
+                .unwrap()
+                .unwrap();
         let got_s = match got {
             Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
             other => panic!("expected string, got {other:?}"),
@@ -1305,12 +1314,9 @@ mod tests {
         ctx.set_field(ex, EX_FIELD_METHOD, Value::Object(Some(method)));
         ctx.set_field(ex, EX_FIELD_URI, Value::Object(Some(uri)));
 
-        let got_method = native_exchange_get_request_method(
-            &mut ctx,
-            &[Value::Object(Some(ex))],
-        )
-        .unwrap()
-        .unwrap();
+        let got_method = native_exchange_get_request_method(&mut ctx, &[Value::Object(Some(ex))])
+            .unwrap()
+            .unwrap();
         match got_method {
             Value::Object(Some(o)) => assert_eq!(o, method),
             other => panic!("unexpected method: {other:?}"),
@@ -1327,27 +1333,18 @@ mod tests {
         }
 
         // setStatusCode records on the exchange.
-        native_exchange_set_status_code(
-            &mut ctx,
-            &[Value::Object(Some(ex)), Value::Int(204)],
-        )
-        .unwrap();
-        assert_eq!(
-            ctx.get_field(ex, EX_FIELD_RESPONSE_STATUS),
-            Value::Int(204)
-        );
+        native_exchange_set_status_code(&mut ctx, &[Value::Object(Some(ex)), Value::Int(204)])
+            .unwrap();
+        assert_eq!(ctx.get_field(ex, EX_FIELD_RESPONSE_STATUS), Value::Int(204));
     }
 
     #[test]
     fn t19_2_d_response_sender_send_writes_body() {
         let mut ctx = mock_ctx();
         let ex = alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS);
-        let sender_v = native_exchange_get_response_sender(
-            &mut ctx,
-            &[Value::Object(Some(ex))],
-        )
-        .unwrap()
-        .unwrap();
+        let sender_v = native_exchange_get_response_sender(&mut ctx, &[Value::Object(Some(ex))])
+            .unwrap()
+            .unwrap();
         let sender = match sender_v {
             Value::Object(Some(o)) => o,
             _ => panic!("sender"),
@@ -1392,12 +1389,9 @@ mod tests {
         let addr_str = ctx.create_string("127.0.0.1:8080");
         ctx.set_field(ls, LS_FIELD_BOUND_ADDRESS, Value::Object(Some(addr_str)));
 
-        let got = native_listener_service_get_bound_address(
-            &mut ctx,
-            &[Value::Object(Some(ls))],
-        )
-        .unwrap()
-        .unwrap();
+        let got = native_listener_service_get_bound_address(&mut ctx, &[Value::Object(Some(ls))])
+            .unwrap()
+            .unwrap();
         match got {
             Value::Object(Some(o)) => {
                 let s = ctx.read_string(o).unwrap_or_default();
@@ -1420,10 +1414,7 @@ mod tests {
         ctx.set_field(ex, EX_FIELD_RESPONSE_STATUS, Value::Int(0));
         // Simulate what dispatch_handler does on panic:
         ctx.set_field(ex, EX_FIELD_RESPONSE_STATUS, Value::Int(500));
-        assert_eq!(
-            ctx.get_field(ex, EX_FIELD_RESPONSE_STATUS),
-            Value::Int(500)
-        );
+        assert_eq!(ctx.get_field(ex, EX_FIELD_RESPONSE_STATUS), Value::Int(500));
     }
 
     #[test]
@@ -1431,7 +1422,9 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_undertow_natives(&mut r);
         // Spot-check entries across each sub-class.
-        assert!(r.find(CLS_UNDERTOW, "builder", "()Lio/undertow/Undertow$Builder;").is_some());
+        assert!(r
+            .find(CLS_UNDERTOW, "builder", "()Lio/undertow/Undertow$Builder;")
+            .is_some());
         assert!(r
             .find(
                 CLS_UNDERTOW_BUILDER,
@@ -1448,7 +1441,9 @@ mod tests {
                 "()Lio/undertow/util/HttpString;"
             )
             .is_some());
-        assert!(r.find(CLS_SENDER, "send", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(CLS_SENDER, "send", "(Ljava/lang/String;)V")
+            .is_some());
         assert!(r
             .find(
                 CLS_LISTENER_SVC,

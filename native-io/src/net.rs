@@ -17,15 +17,15 @@
 //! Layouts:
 //!   MulticastSocket = 5 fields (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
 
-use parking_lot::{Mutex, RwLock};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::{Mutex, RwLock};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 // Net socket-id and (fd, level, opt) keys are all internal monotonic / small
@@ -48,12 +48,18 @@ use rustc_hash::FxHashMap;
 fn socket_capture_prefix() -> Option<&'static str> {
     static PREFIX: OnceLock<Option<String>> = OnceLock::new();
     PREFIX
-        .get_or_init(|| std::env::var("CRATONVM_SOCKET_CAPTURE").ok().filter(|s| !s.is_empty()))
+        .get_or_init(|| {
+            std::env::var("CRATONVM_SOCKET_CAPTURE")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .as_deref()
 }
 
 pub(crate) fn socket_capture(dir: char, fd: i32, data: &[u8]) {
-    let Some(prefix) = socket_capture_prefix() else { return };
+    let Some(prefix) = socket_capture_prefix() else {
+        return;
+    };
     if data.is_empty() {
         return;
     }
@@ -64,12 +70,20 @@ pub(crate) fn socket_capture(dir: char, fd: i32, data: &[u8]) {
     let _g = CAP_LOCK.lock();
     // Raw per-fd, per-direction stream (concatenated, replayable).
     let raw_path = format!("{prefix}.{dir}.{fd}");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&raw_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&raw_path)
+    {
         let _ = f.write_all(data);
     }
     // Textual index of op order (direction/fd/length + first 16 bytes hex).
     let idx_path = format!("{prefix}.idx");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&idx_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&idx_path)
+    {
         let head: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect();
         let _ = writeln!(f, "{dir} fd={fd} len={} {head}", data.len());
     }
@@ -97,12 +111,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         };
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let bind_addr = format!("0.0.0.0:{port}");
-        let fd_id = ctx
-            .fd_table()
-            .open_udp(Some(&bind_addr))
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("MulticastSocket bind failed: {e}"),
-            })?;
+        let fd_id =
+            ctx.fd_table()
+                .open_udp(Some(&bind_addr))
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("MulticastSocket bind failed: {e}"),
+                })?;
         let nfields = ctx.object_num_fields(this);
         if nfields >= 5 {
             ctx.set_field(this, 0, Value::Int(port));
@@ -129,12 +143,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let fd_id = ctx
-            .fd_table()
-            .open_udp(Some("0.0.0.0:0"))
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("MulticastSocket bind failed: {e}"),
-            })?;
+        let fd_id =
+            ctx.fd_table()
+                .open_udp(Some("0.0.0.0:0"))
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("MulticastSocket bind failed: {e}"),
+                })?;
         let nfields = ctx.object_num_fields(this);
         if nfields >= 5 {
             ctx.set_field(this, 0, Value::Int(0));
@@ -150,13 +164,11 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
 
     // `getTimeToLive()` — null-tolerant: if called with `&[]` or `Object(None)`,
     // return the default TTL of 1 (matches JDK constructor default).
-    r.register(ms, "getTimeToLive", "()I", |ctx, args| {
-        match args.first() {
-            Some(Value::Object(Some(o))) if ctx.object_num_fields(*o) >= 5 => {
-                Ok(Some(ctx.get_field(*o, 4)))
-            }
-            _ => Ok(Some(Value::Int(1))),
+    r.register(ms, "getTimeToLive", "()I", |ctx, args| match args.first() {
+        Some(Value::Object(Some(o))) if ctx.object_num_fields(*o) >= 5 => {
+            Ok(Some(ctx.get_field(*o, 4)))
         }
+        _ => Ok(Some(Value::Int(1))),
     });
 
     // `close()` — null-tolerant.
@@ -256,7 +268,9 @@ fn net_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
             format!("SocketTimeoutException: {ctx}: {e}")
         }
         ErrorKind::AddrInUse => format!("BindException: Address already in use: {ctx}: {e}"),
-        ErrorKind::AddrNotAvailable => format!("BindException: Cannot assign requested address: {ctx}: {e}"),
+        ErrorKind::AddrNotAvailable => {
+            format!("BindException: Cannot assign requested address: {ctx}: {e}")
+        }
         ErrorKind::PermissionDenied => format!("BindException: Permission denied: {ctx}: {e}"),
         ErrorKind::NotConnected => format!("SocketException: Not connected: {ctx}: {e}"),
         _ => format!("SocketException: {ctx}: {e}"),
@@ -265,7 +279,10 @@ fn net_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
 }
 
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 /// Temporary diagnostic gate: `CRATONVM_DBG_NET=1` prints each Net native as
@@ -302,7 +319,9 @@ fn validate_native_range(ctx: &str, address: i64, len: i32) -> Result<usize, Met
         return Err(ioex(format!("{ctx}: non-positive length {len}")));
     }
     if (len as i64) > NET_MAX_TRANSFER {
-        return Err(ioex(format!("{ctx}: length {len} exceeds maximum transfer size")));
+        return Err(ioex(format!(
+            "{ctx}: length {len} exceeds maximum transfer size"
+        )));
     }
     Ok(len as usize)
 }
@@ -490,9 +509,10 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // port.
 
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    net_sockets()
-        .write()
-        .insert(fd, NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
+    net_sockets().write().insert(
+        fd,
+        NetSocketHandle::Listener(Arc::new(Mutex::new(listener))),
+    );
     dbgnet!("bind0 OK fd={fd:#x} bound_port={bound_port}");
     Ok(None)
 }
@@ -613,9 +633,7 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     let stream = match crate::outbound_policy::policy_connect(&conn_addr) {
         Ok(s) => s,
         Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
-            return Err(ioex(format!(
-                "connect denied by outbound policy: {reason}"
-            )));
+            return Err(ioex(format!("connect denied by outbound policy: {reason}")));
         }
         Err(crate::outbound_policy::PolicyConnectError::Io(e)) => {
             return Err(net_err(&conn_addr, e));
@@ -791,7 +809,9 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // arena handle lands in the off-heap store instead of being dereferenced
     // raw (which SIGSEGVs on the synthetic 2^36-based handle).
     if !ctx.copy_to_native_memory(addr, &buf[..n]) {
-        return Err(ioex(format!("read0: invalid destination address {addr:#x}")));
+        return Err(ioex(format!(
+            "read0: invalid destination address {addr:#x}"
+        )));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -908,7 +928,8 @@ fn net_set_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let s = handle.lock();
         match (level, opt) {
             (IPPROTO_TCP, TCP_NODELAY) => {
-                s.set_nodelay(val != 0).map_err(|e| net_err("TCP_NODELAY", e))?;
+                s.set_nodelay(val != 0)
+                    .map_err(|e| net_err("TCP_NODELAY", e))?;
             }
             (SOL_SOCKET, SO_KEEPALIVE) => {
                 // CONTRACT-DRIFT (documented 2026-05-24): the JDK
@@ -1125,7 +1146,10 @@ fn net_can_ipv6_join_ipv4_group(_ctx: &mut dyn NativeContext, _args: &[Value]) -
 }
 
 /// `isExclusiveBindAvailable() -> int` — Windows-only advisory; return 0.
-fn net_is_exclusive_bind_available(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn net_is_exclusive_bind_available(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Int(0)))
 }
 
@@ -1163,7 +1187,12 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         "(ZLjava/io/FileDescriptor;Ljava/net/InetAddress;I)I",
         net_connect0,
     );
-    r.register(net, "shutdown", "(Ljava/io/FileDescriptor;I)V", net_shutdown);
+    r.register(
+        net,
+        "shutdown",
+        "(Ljava/io/FileDescriptor;I)V",
+        net_shutdown,
+    );
     r.register(net, "close", "(Ljava/io/FileDescriptor;)V", net_close);
 
     // I/O delegates (also mirror on ServerSocketChannelImpl / SocketChannelImpl
@@ -1172,7 +1201,12 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     r.register(net, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     // DF04: bytes-readable query (ioctl FIONREAD). NioSocketImpl.available()
     // → Socket.getInputStream().available() dispatches here.
-    r.register(net, "available", "(Ljava/io/FileDescriptor;)I", net_available);
+    r.register(
+        net,
+        "available",
+        "(Ljava/io/FileDescriptor;)I",
+        net_available,
+    );
     // NIO-SERVER-SOCKET: the blocking `NioSocketImpl` read/write path goes
     // through `sun/nio/ch/SocketDispatcher.read0/write0` (nd.read/nd.write),
     // NOT `Net.read0`. Wire those to the same handlers so a real
@@ -1219,18 +1253,33 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         "(Ljava/io/FileDescriptor;)Ljava/net/InetAddress;",
         net_local_inet_address,
     );
-    r.register(net, "localPort", "(Ljava/io/FileDescriptor;)I", net_local_port);
+    r.register(
+        net,
+        "localPort",
+        "(Ljava/io/FileDescriptor;)I",
+        net_local_port,
+    );
     r.register(
         net,
         "remoteInetAddress",
         "(Ljava/io/FileDescriptor;)Ljava/net/InetAddress;",
         net_remote_inet_address,
     );
-    r.register(net, "remotePort", "(Ljava/io/FileDescriptor;)I", net_remote_port);
+    r.register(
+        net,
+        "remotePort",
+        "(Ljava/io/FileDescriptor;)I",
+        net_remote_port,
+    );
 
     // Capability flags
     r.register(net, "isIPv6Available0", "()Z", net_is_ipv6_available);
-    r.register(net, "isReusePortAvailable0", "()Z", net_is_reuse_port_available);
+    r.register(
+        net,
+        "isReusePortAvailable0",
+        "()Z",
+        net_is_reuse_port_available,
+    );
     r.register(
         net,
         "canIPv6SocketJoinIPv4Group0",
@@ -1276,8 +1325,12 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // pair returns safe defaults.
     {
         let wso = "jdk/net/WindowsSocketOptions";
-        r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| Ok(Some(Value::Int(0))));
-        r.register(wso, "getIpDontFragment0", "(IZ)Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(wso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
         r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
         for (name, desc) in [
             ("getTcpKeepAliveProbes0", "(I)I"),
@@ -1315,9 +1368,15 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     r.register(net, "pollinValue", "()S", |_c, _a| Ok(Some(Value::Int(1))));
     r.register(net, "polloutValue", "()S", |_c, _a| Ok(Some(Value::Int(4))));
     r.register(net, "pollerrValue", "()S", |_c, _a| Ok(Some(Value::Int(8))));
-    r.register(net, "pollhupValue", "()S", |_c, _a| Ok(Some(Value::Int(16))));
-    r.register(net, "pollnvalValue", "()S", |_c, _a| Ok(Some(Value::Int(32))));
-    r.register(net, "pollconnValue", "()S", |_c, _a| Ok(Some(Value::Int(4))));
+    r.register(net, "pollhupValue", "()S", |_c, _a| {
+        Ok(Some(Value::Int(16)))
+    });
+    r.register(net, "pollnvalValue", "()S", |_c, _a| {
+        Ok(Some(Value::Int(32)))
+    });
+    r.register(net, "pollconnValue", "()S", |_c, _a| {
+        Ok(Some(Value::Int(4)))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -1496,16 +1555,18 @@ mod tests {
     fn t19_5_setIntOption_so_reuseaddr_accepts_both_sides() {
         // Register a dummy fd, then set/get SO_REUSEADDR through the opt map.
         let fd = make_fd_with_id(0x5000_0001);
-        net_opts()
-            .write()
-            .insert((fd, SOL_SOCKET, SO_REUSEADDR), 1);
-        let v = net_opts().read().get(&(fd, SOL_SOCKET, SO_REUSEADDR)).copied();
+        net_opts().write().insert((fd, SOL_SOCKET, SO_REUSEADDR), 1);
+        let v = net_opts()
+            .read()
+            .get(&(fd, SOL_SOCKET, SO_REUSEADDR))
+            .copied();
         assert_eq!(v, Some(1));
         // Also set to 0 to confirm toggling.
-        net_opts()
-            .write()
-            .insert((fd, SOL_SOCKET, SO_REUSEADDR), 0);
-        let v2 = net_opts().read().get(&(fd, SOL_SOCKET, SO_REUSEADDR)).copied();
+        net_opts().write().insert((fd, SOL_SOCKET, SO_REUSEADDR), 0);
+        let v2 = net_opts()
+            .read()
+            .get(&(fd, SOL_SOCKET, SO_REUSEADDR))
+            .copied();
         assert_eq!(v2, Some(0));
         remove_fd(fd);
         net_opts().write().remove(&(fd, SOL_SOCKET, SO_REUSEADDR));
@@ -1515,9 +1576,7 @@ mod tests {
     fn t19_5_getIntOption_returns_same_value_after_set() {
         let fd = make_fd_with_id(0x5000_0002);
         // Simulate setIntOption0 writing directly to the opts map.
-        net_opts()
-            .write()
-            .insert((fd, IPPROTO_TCP, TCP_NODELAY), 1);
+        net_opts().write().insert((fd, IPPROTO_TCP, TCP_NODELAY), 1);
         let out = net_opts()
             .read()
             .get(&(fd, IPPROTO_TCP, TCP_NODELAY))
@@ -1613,7 +1672,9 @@ mod tests {
     fn t19_5_is_reuse_port_and_ipv6_join_v4_are_false() {
         let mut ctx = MockNativeContext::new();
         let r1 = net_is_reuse_port_available(&mut ctx, &[]).unwrap().unwrap();
-        let r2 = net_can_ipv6_join_ipv4_group(&mut ctx, &[]).unwrap().unwrap();
+        let r2 = net_can_ipv6_join_ipv4_group(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
         match (r1, r2) {
             (Value::Int(a), Value::Int(b)) => {
                 assert_eq!(a, 0);
@@ -1622,5 +1683,4 @@ mod tests {
             _ => panic!("expected Int results"),
         }
     }
-
 }

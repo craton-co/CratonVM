@@ -448,10 +448,7 @@ pub fn verify_instruction(
         Instruction::Swap => {
             let val1 = frame.pop()?;
             let val2 = frame.pop()?;
-            if val1 == VType::Top
-                || val2 == VType::Top
-                || is_cat2_upper_half(frame, &val2)
-            {
+            if val1 == VType::Top || val2 == VType::Top || is_cat2_upper_half(frame, &val2) {
                 return Err(verify_err("swap: cannot swap category-2 values"));
             }
             frame.push(val1)?;
@@ -938,8 +935,7 @@ pub fn verify_instruction(
         }
 
         Instruction::Invokespecial(index) => {
-            let (method_name, method_desc) =
-                resolve_method_or_imethod_name_and_type(cp, *index)?;
+            let (method_name, method_desc) = resolve_method_or_imethod_name_and_type(cp, *index)?;
             // Pop arguments in reverse order
             let param_types = super::vtype::param_types_from_descriptor(&method_desc);
             for param in param_types.iter().rev() {
@@ -984,8 +980,7 @@ pub fn verify_instruction(
                         // subclass of the owner (i.e. owner is an ancestor —
                         // for a well-formed class the `super()` target is the
                         // direct superclass).
-                        if let Some((owner, _, _)) =
-                            resolve_method_owner_name_and_type(cp, *index)
+                        if let Some((owner, _, _)) = resolve_method_owner_name_and_type(cp, *index)
                         {
                             let ok = owner == current_class_name
                                 || hierarchy.is_subclass(current_class_name, &owner);
@@ -997,15 +992,14 @@ pub fn verify_instruction(
                                 )));
                             }
                         }
-                        let replacement =
-                            VType::ObjectRef(Arc::from(current_class_name));
+                        let replacement = VType::ObjectRef(Arc::from(current_class_name));
                         replace_vtype_in_frame(frame, &receiver, &replacement);
                     }
                     VType::Uninitialized(_) => {
                         // The initialized type is the constructor's declaring
                         // class (which the bytecode's `new` site created).
-                        let owner = resolve_method_owner_name_and_type(cp, *index)
-                            .map(|(o, _, _)| o);
+                        let owner =
+                            resolve_method_owner_name_and_type(cp, *index).map(|(o, _, _)| o);
                         let cls: Arc<str> = match owner {
                             Some(o) => Arc::from(o.as_str()),
                             None => {
@@ -1121,9 +1115,7 @@ pub fn verify_instruction(
             // referenced type (the leading `[` bracket count of the
             // descriptor). HotSpot raises a VerifyError for both.
             if *dimensions == 0 {
-                return Err(verify_err(
-                    "multianewarray: dimensions must be >= 1",
-                ));
+                return Err(verify_err("multianewarray: dimensions must be >= 1"));
             }
             let class_name = cp.get_class_name_arc(*index).ok_or_else(|| {
                 verify_err(&format!("multianewarray: invalid class index {index}"))
@@ -1165,8 +1157,7 @@ pub fn verify_instruction(
             // outcome — accept it. `UninitializedThis` / `Uninitialized`
             // are rejected by the assignability check below (an
             // uninitialized object is not assignable to Throwable).
-            let ok = matches!(value, VType::Null)
-                || value.is_assignable_to(&throwable, hierarchy);
+            let ok = matches!(value, VType::Null) || value.is_assignable_to(&throwable, hierarchy);
             if !ok {
                 return Err(verify_err(&format!(
                     "athrow: operand {value:?} is not assignable to java/lang/Throwable"
@@ -1250,11 +1241,9 @@ pub fn verify_instruction(
             // use in pre-Java-7 classes, propagating the recorded
             // return pc as a branch target is sufficient to trace the
             // subroutine body back to the call site.
-            let local = frame.local_load(*index as u16).map_err(|_| {
-                verify_err(&format!(
-                    "ret: local variable {index} out of range"
-                ))
-            })?;
+            let local = frame
+                .local_load(*index as u16)
+                .map_err(|_| verify_err(&format!("ret: local variable {index} out of range")))?;
             match local {
                 VType::ReturnAddress(ret_pc) => Ok(InsnVerifyResult {
                     falls_through: false,
@@ -1377,11 +1366,7 @@ fn pop_array_ref(
 /// `popped` has been removed from the stack, this checks whether `popped`
 /// was that upper half.
 fn is_cat2_upper_half(frame: &VerificationFrame, popped: &VType) -> bool {
-    *popped == VType::Top
-        && matches!(
-            frame.stack.last(),
-            Some(VType::Long) | Some(VType::Double)
-        )
+    *popped == VType::Top && matches!(frame.stack.last(), Some(VType::Long) | Some(VType::Double))
 }
 
 /// Pop exactly `n` slots off the operand stack, returning them in
@@ -1703,17 +1688,17 @@ mod tests {
 
     fn simple_cp() -> ConstantPool {
         ConstantPool::new(vec![
-            ConstantPoolEntry::Tombstone,                            // 0
-            ConstantPoolEntry::Integer(42),                          // 1
-            ConstantPoolEntry::Float(3.125),                         // 2
-            ConstantPoolEntry::Long(100),                            // 3
-            ConstantPoolEntry::Tombstone,                            // 4 (second slot of long)
-            ConstantPoolEntry::Double(2.75),                         // 5
-            ConstantPoolEntry::Tombstone,                            // 6 (second slot of double)
-            ConstantPoolEntry::Utf8("java/lang/Object".into()), // 7
-            ConstantPoolEntry::ClassReference { name_index: 7 },     // 8
-            ConstantPoolEntry::Utf8("value".into()),            // 9
-            ConstantPoolEntry::Utf8("I".into()),                // 10
+            ConstantPoolEntry::Tombstone,                        // 0
+            ConstantPoolEntry::Integer(42),                      // 1
+            ConstantPoolEntry::Float(3.125),                     // 2
+            ConstantPoolEntry::Long(100),                        // 3
+            ConstantPoolEntry::Tombstone,                        // 4 (second slot of long)
+            ConstantPoolEntry::Double(2.75),                     // 5
+            ConstantPoolEntry::Tombstone,                        // 6 (second slot of double)
+            ConstantPoolEntry::Utf8("java/lang/Object".into()),  // 7
+            ConstantPoolEntry::ClassReference { name_index: 7 }, // 8
+            ConstantPoolEntry::Utf8("value".into()),             // 9
+            ConstantPoolEntry::Utf8("I".into()),                 // 10
             ConstantPoolEntry::NameAndType {
                 name_index: 9,
                 descriptor_index: 10,
@@ -1722,7 +1707,7 @@ mod tests {
                 class_index: 8,
                 name_and_type_index: 11,
             }, // 12
-            ConstantPoolEntry::Utf8("toString".into()),         // 13
+            ConstantPoolEntry::Utf8("toString".into()),          // 13
             ConstantPoolEntry::Utf8("()Ljava/lang/String;".into()), // 14
             ConstantPoolEntry::NameAndType {
                 name_index: 13,
@@ -1732,7 +1717,7 @@ mod tests {
                 class_index: 8,
                 name_and_type_index: 15,
             }, // 16
-            ConstantPoolEntry::StringReference { string_index: 7 },  // 17
+            ConstantPoolEntry::StringReference { string_index: 7 }, // 17
         ])
     }
 
@@ -1773,7 +1758,17 @@ mod tests {
         frame.push(VType::Int).unwrap();
         frame.push(VType::Int).unwrap();
 
-        verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
+        verify_instruction(
+            &Instruction::Iadd,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
 
         assert_eq!(frame.stack_depth(), 1);
         assert_eq!(frame.pop().unwrap(), VType::Int);
@@ -1789,7 +1784,16 @@ mod tests {
         frame.push(VType::Int).unwrap();
 
         // Second pop expects Int but finds Float
-        let result = verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", "()V", &h);
+        let result = verify_instruction(
+            &Instruction::Iadd,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
         assert!(result.is_err());
     }
 
@@ -1799,7 +1803,17 @@ mod tests {
         let h = MockHierarchy;
         let mut frame = make_frame(1, 4);
 
-        verify_instruction(&Instruction::Ldc(1), 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
+        verify_instruction(
+            &Instruction::Ldc(1),
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
 
         assert_eq!(frame.pop().unwrap(), VType::Int);
     }
@@ -1902,9 +1916,17 @@ mod tests {
         let h = MockHierarchy;
         let mut frame = make_frame(1, 4);
 
-        let result =
-            verify_instruction(&Instruction::Return, 0, &mut frame, &cp, "Test", "test", "()V", &h)
-                .unwrap();
+        let result = verify_instruction(
+            &Instruction::Return,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
 
         assert!(!result.falls_through);
     }
@@ -1959,7 +1981,17 @@ mod tests {
         let mut frame = make_frame(1, 4);
         frame.push(VType::Int).unwrap();
 
-        verify_instruction(&Instruction::Dup, 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
+        verify_instruction(
+            &Instruction::Dup,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
 
         assert_eq!(frame.stack_depth(), 2);
     }
@@ -1973,9 +2005,17 @@ mod tests {
             .push(VType::ObjectRef(Arc::from("java/lang/Exception")))
             .unwrap();
 
-        let result =
-            verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h)
-                .unwrap();
+        let result = verify_instruction(
+            &Instruction::Athrow,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
 
         assert!(!result.falls_through);
     }
@@ -1993,8 +2033,16 @@ mod tests {
             .push(VType::ObjectRef(Arc::from("java/lang/String")))
             .unwrap();
 
-        let result =
-            verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h);
+        let result = verify_instruction(
+            &Instruction::Athrow,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
         assert!(result.is_err(), "athrow of a non-Throwable must fail");
     }
 
@@ -2006,8 +2054,17 @@ mod tests {
         let mut frame = make_frame(1, 4);
         frame.push(VType::Null).unwrap();
 
-        verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h)
-            .unwrap();
+        verify_instruction(
+            &Instruction::Athrow,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2068,8 +2125,16 @@ mod tests {
         let mut frame = make_frame(1, 4);
         frame.push(VType::Null).unwrap();
 
-        let result =
-            verify_instruction(&Instruction::Areturn, 0, &mut frame, &cp, "Test", "test", "()V", &h);
+        let result = verify_instruction(
+            &Instruction::Areturn,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()V",
+            &h,
+        );
         assert!(result.is_err(), "areturn in a void method must fail");
     }
 
@@ -2077,11 +2142,11 @@ mod tests {
     /// `java/lang/Object.<init>()V`, for `invokespecial <init>` tests.
     fn init_cp() -> ConstantPool {
         ConstantPool::new(vec![
-            ConstantPoolEntry::Tombstone,                            // 0
-            ConstantPoolEntry::Utf8("java/lang/Object".into()),      // 1
-            ConstantPoolEntry::ClassReference { name_index: 1 },     // 2
-            ConstantPoolEntry::Utf8("<init>".into()),                // 3
-            ConstantPoolEntry::Utf8("()V".into()),                   // 4
+            ConstantPoolEntry::Tombstone,                        // 0
+            ConstantPoolEntry::Utf8("java/lang/Object".into()),  // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
+            ConstantPoolEntry::Utf8("<init>".into()),            // 3
+            ConstantPoolEntry::Utf8("()V".into()),               // 4
             ConstantPoolEntry::NameAndType {
                 name_index: 3,
                 descriptor_index: 4,

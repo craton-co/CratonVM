@@ -230,7 +230,9 @@ fn compile_equals() -> impl Fn(i64, i64) -> i64 {
         Some(string_layout()),
     )
     .expect("equals wrapper compilation failed");
-    move |this: i64, other: i64| unsafe { compiled.try_call(&[this, other]).expect("test JIT call") }
+    move |this: i64, other: i64| unsafe {
+        compiled.try_call(&[this, other]).expect("test JIT call")
+    }
 }
 
 /// Build a String object for `s` plus its backing array; return both so the
@@ -257,24 +259,17 @@ fn string_equals_registered_only_with_a_layout() {
         "equals must register when a StringFieldLayout is present",
     );
     assert!(
-        try_resolve_string_intrinsic(
-            "java/lang/String",
-            "equals",
-            "(Ljava/lang/Object;)Z",
-            None,
-        )
-        .is_none(),
+        try_resolve_string_intrinsic("java/lang/String", "equals", "(Ljava/lang/Object;)Z", None,)
+            .is_none(),
         "equals must NOT register without a layout",
     );
     // The 3-arg layout-free matcher never registers a String method.
-    assert!(
-        cratonvm_jit::try_resolve_intrinsic(
-            "java/lang/String",
-            "equals",
-            "(Ljava/lang/Object;)Z",
-        )
-        .is_none(),
-    );
+    assert!(cratonvm_jit::try_resolve_intrinsic(
+        "java/lang/String",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    )
+    .is_none(),);
 }
 
 #[test]
@@ -287,13 +282,8 @@ fn string_search_compare_and_index_of_register_with_a_layout() {
         ("indexOf", "(Ljava/lang/String;)I"),
     ] {
         assert!(
-            try_resolve_string_intrinsic(
-                "java/lang/String",
-                name,
-                desc,
-                Some(string_layout()),
-            )
-            .is_some(),
+            try_resolve_string_intrinsic("java/lang/String", name, desc, Some(string_layout()),)
+                .is_some(),
             "{name}{desc} must register with a StringFieldLayout",
         );
         assert!(
@@ -301,9 +291,7 @@ fn string_search_compare_and_index_of_register_with_a_layout() {
             "{name}{desc} must NOT register without a layout",
         );
         // The 3-arg layout-free matcher never registers a String method.
-        assert!(
-            cratonvm_jit::try_resolve_intrinsic("java/lang/String", name, desc).is_none(),
-        );
+        assert!(cratonvm_jit::try_resolve_intrinsic("java/lang/String", name, desc).is_none(),);
     }
 }
 
@@ -311,14 +299,10 @@ fn string_search_compare_and_index_of_register_with_a_layout() {
 /// `aload_0; aload_1; invokevirtual <name>; ireturn` — used for the
 /// `compareTo` / `indexOf(String)` object-argument intrinsics.
 fn compile_obj_arg(name: &str, descriptor: &str) -> impl Fn(i64, i64) -> i64 {
-    let entry = try_resolve_string_intrinsic(
-        "java/lang/String",
-        name,
-        descriptor,
-        Some(string_layout()),
-    )
-    .expect("intrinsic must register with a layout")
-    .0;
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", name, descriptor, Some(string_layout()))
+            .expect("intrinsic must register with a layout")
+            .0;
     // aload_0 (2a), aload_1 (2b), invokevirtual (b6 00 01), ireturn (ac).
     let code: Vec<u8> = vec![0x2a, 0x2b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
     let compiled = compile(
@@ -356,20 +340,18 @@ fn compile_obj_arg(name: &str, descriptor: &str) -> impl Fn(i64, i64) -> i64 {
         Some(string_layout()),
     )
     .expect("object-arg wrapper compilation failed");
-    move |this: i64, other: i64| unsafe { compiled.try_call(&[this, other]).expect("test JIT call") }
+    move |this: i64, other: i64| unsafe {
+        compiled.try_call(&[this, other]).expect("test JIT call")
+    }
 }
 
 /// JIT-compile `int f(String this, int ch)` whose body is
 /// `aload_0; iload_1; invokevirtual indexOf; ireturn` — for `indexOf(I)`.
 fn compile_index_of_char() -> impl Fn(i64, i64) -> i64 {
-    let entry = try_resolve_string_intrinsic(
-        "java/lang/String",
-        "indexOf",
-        "(I)I",
-        Some(string_layout()),
-    )
-    .expect("indexOf(I) must register with a layout")
-    .0;
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", "indexOf", "(I)I", Some(string_layout()))
+            .expect("indexOf(I) must register with a layout")
+            .0;
     // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac).
     let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
     let compiled = compile(
@@ -459,12 +441,12 @@ fn string_compare_to_differential() {
         ("abc", "ab"),
         ("ab", "abc"),
         ("hello", "world"),
-        ("caf\u{e9}", "caf\u{e9}"),       // both UTF-16-free LATIN1
-        ("A\u{4e2d}Z", "A\u{4e2d}Z"),     // both UTF-16
-        ("A\u{4e2d}Z", "A\u{4e2e}Z"),     // UTF-16, differ at index 1
-        ("abc", "A\u{4e2d}c"),            // mixed: LATIN1 vs UTF-16
-        ("A\u{4e2d}c", "abc"),            // mixed, reversed
-        ("\u{ff}", "\u{100}"),            // LATIN1 0xFF vs UTF-16 0x100
+        ("caf\u{e9}", "caf\u{e9}"),   // both UTF-16-free LATIN1
+        ("A\u{4e2d}Z", "A\u{4e2d}Z"), // both UTF-16
+        ("A\u{4e2d}Z", "A\u{4e2e}Z"), // UTF-16, differ at index 1
+        ("abc", "A\u{4e2d}c"),        // mixed: LATIN1 vs UTF-16
+        ("A\u{4e2d}c", "abc"),        // mixed, reversed
+        ("\u{ff}", "\u{100}"),        // LATIN1 0xFF vs UTF-16 0x100
     ];
     for (a, b) in cases {
         let (sa, _aa) = string_of(a);
@@ -497,7 +479,14 @@ fn string_compare_to_null_argument_deopts() {
 #[test]
 fn string_index_of_char_differential() {
     let f = compile_index_of_char();
-    let haystacks = ["", "a", "hello", "banana", "caf\u{e9}", "A\u{4e2d}Z\u{4e2d}"];
+    let haystacks = [
+        "",
+        "a",
+        "hello",
+        "banana",
+        "caf\u{e9}",
+        "A\u{4e2d}Z\u{4e2d}",
+    ];
     // Code-unit needles: present, absent, first/last char, supplementary
     // (masked to its low half by both the native oracle and the JIT).
     let needles: [i32; 8] = [
@@ -540,22 +529,22 @@ fn string_index_of_char_null_receiver_deopts() {
 fn string_index_of_str_differential() {
     let f = compile_obj_arg("indexOf", "(Ljava/lang/String;)I");
     let cases = [
-        ("", ""),                       // empty needle → 0
-        ("hello", ""),                  // empty needle → 0
-        ("", "x"),                      // needle longer than haystack → -1
-        ("hello", "hello"),             // whole-string match
-        ("hello", "he"),                // prefix
-        ("hello", "lo"),                // suffix
-        ("hello", "ell"),               // interior
-        ("hello", "xyz"),               // no match
-        ("hello", "hellox"),            // needle longer → -1
-        ("banana", "ana"),              // multi-occurrence → first index
-        ("aaaa", "aa"),                 // overlapping occurrences → 0
-        ("abcabc", "bc"),               // repeated
+        ("", ""),                             // empty needle → 0
+        ("hello", ""),                        // empty needle → 0
+        ("", "x"),                            // needle longer than haystack → -1
+        ("hello", "hello"),                   // whole-string match
+        ("hello", "he"),                      // prefix
+        ("hello", "lo"),                      // suffix
+        ("hello", "ell"),                     // interior
+        ("hello", "xyz"),                     // no match
+        ("hello", "hellox"),                  // needle longer → -1
+        ("banana", "ana"),                    // multi-occurrence → first index
+        ("aaaa", "aa"),                       // overlapping occurrences → 0
+        ("abcabc", "bc"),                     // repeated
         ("A\u{4e2d}B\u{4e2d}C", "\u{4e2d}B"), // UTF-16 haystack + needle
-        ("caf\u{e9} bar", "\u{e9} b"),  // LATIN1 both
-        ("abcdef", "A\u{4e2d}"),        // mixed coder, no match
-        ("A\u{4e2d}cdef", "cd"),        // UTF-16 haystack, LATIN1 needle
+        ("caf\u{e9} bar", "\u{e9} b"),        // LATIN1 both
+        ("abcdef", "A\u{4e2d}"),              // mixed coder, no match
+        ("A\u{4e2d}cdef", "cd"),              // UTF-16 haystack, LATIN1 needle
     ];
     for (h, n) in cases {
         let (sh, _hh) = string_of(h);
@@ -571,7 +560,14 @@ fn string_index_of_str_differential() {
 #[test]
 fn string_equals_equal_strings() {
     let f = compile_equals();
-    for s in ["", "a", "hello", "The quick brown fox", "caf\u{e9}", "A\u{4e2d}Z"] {
+    for s in [
+        "",
+        "a",
+        "hello",
+        "The quick brown fox",
+        "caf\u{e9}",
+        "A\u{4e2d}Z",
+    ] {
         let (a, _a_arr) = string_of(s);
         let (b, _b_arr) = string_of(s);
         assert_eq!(f(a.ptr(), b.ptr()), 1, "equals({s:?}, copy) must be true");
@@ -618,7 +614,11 @@ fn string_equals_utf16_strings() {
     let s = "A\u{4e2d}\u{00e9}Z";
     let (a, _aa) = string_of(s);
     let (b, _bb) = string_of(s);
-    assert_eq!(f(a.ptr(), b.ptr()), 1, "UTF-16 equal strings must compare equal");
+    assert_eq!(
+        f(a.ptr(), b.ptr()),
+        1,
+        "UTF-16 equal strings must compare equal"
+    );
     // A genuinely different UTF-16 string of the same length.
     let (c, _cc) = string_of("A\u{4e2d}\u{00e8}Z");
     assert_eq!(f(a.ptr(), c.ptr()), 0);
@@ -638,7 +638,11 @@ fn string_equals_non_string_argument_deopts() {
     let other = make_object(OTHER_CLASS_ID, arr.ptr(), coder, 0);
     let before = TRAP_COUNT.load(Ordering::SeqCst);
     let r = f(a.ptr(), other.ptr());
-    assert_eq!(r, i64::MIN, "non-String argument must return the deopt sentinel");
+    assert_eq!(
+        r,
+        i64::MIN,
+        "non-String argument must return the deopt sentinel"
+    );
     assert_eq!(
         TRAP_COUNT.load(Ordering::SeqCst),
         before + 1,

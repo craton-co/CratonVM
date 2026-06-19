@@ -26,9 +26,9 @@
 
 #![cfg(not(feature = "synthetic-jdk"))]
 
+use cratonvm_types::Value;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::vm::Vm;
-use cratonvm_types::Value;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -52,9 +52,8 @@ fn java_home() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let default = std::path::PathBuf::from(
-        "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot",
-    );
+    let default =
+        std::path::PathBuf::from("C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot");
     if default.join("lib").join("modules").exists() {
         return Some(default);
     }
@@ -94,9 +93,7 @@ fn interface_non_constant_static_final_is_initialized_on_first_access() {
 
     let value = match result {
         Ok(Some(Value::Int(v))) => v,
-        other => panic!(
-            "probeInterfaceStaticFinal() did not return an int: {other:?}"
-        ),
+        other => panic!("probeInterfaceStaticFinal() did not return an int: {other:?}"),
     };
 
     assert_eq!(

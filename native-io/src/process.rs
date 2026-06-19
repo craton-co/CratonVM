@@ -599,10 +599,7 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 ///
 /// Signature: `(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;[JZ)J`
 /// — we accept whatever the caller sends and do a best-effort match.
-fn native_process_impl_create(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = cmd string (pipe-joined on Windows, or a single arg),
     // args[1] = envblock (String[] of KEY=VALUE),
     // args[2] = working dir (String, nullable),
@@ -629,7 +626,10 @@ fn native_process_impl_create(
             let raw = read_string_array(ctx, *arr);
             Some(
                 raw.iter()
-                    .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                    .filter_map(|s| {
+                        s.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
                     .collect(),
             )
         }
@@ -667,10 +667,7 @@ fn native_process_impl_create(
 /// Linux/macOS equivalent of `ProcessImpl.create`.  Returns a pid.
 /// Same behavior as the Windows variant — we route through `spawn_and_wrap`.
 #[cfg(target_os = "linux")]
-fn native_unix_fork_and_exec(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unix_fork_and_exec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // UNIXProcess encodes the argv as a null-separated byte block.
     // args[2] = prog (byte[]), args[3] = argBlock (byte[]),
     // args[5] = envBlock (byte[] — can be null).
@@ -716,7 +713,8 @@ fn native_unix_fork_and_exec(
             .filter(|s| !s.is_empty())
             .filter_map(|s| {
                 let text = String::from_utf8_lossy(s);
-                text.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                text.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect()
     });
@@ -765,10 +763,7 @@ fn native_proc_handle_current_pid0(
 /// Returns the start-time of the process (or 0 if dead) in HotSpot's
 /// spec; our simplified implementation returns 1 if alive, 0 if dead.
 /// JDK code checks `> 0`.
-fn native_proc_handle_is_alive0(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let handle = match args.first() {
         Some(Value::Long(h)) => *h,
         _ => return Ok(Some(Value::Long(0))),
@@ -811,10 +806,7 @@ fn native_proc_handle_destroy_process0(
 }
 
 /// `java.lang.Process.waitFor()I` on our synthetic Process object.
-fn native_process_wait_for(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_wait_for(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
@@ -834,10 +826,7 @@ fn native_process_wait_for(
 ///
 /// Throws `IllegalThreadStateException` if the process is still running
 /// (matches HotSpot behavior).
-fn native_process_exit_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_exit_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
@@ -859,10 +848,7 @@ fn native_process_exit_value(
 }
 
 /// `java.lang.Process.isAlive()Z`
-fn native_process_is_alive(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_is_alive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -876,10 +862,7 @@ fn native_process_is_alive(
 }
 
 /// `java.lang.Process.destroy()V`
-fn native_process_destroy(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_destroy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -908,10 +891,7 @@ fn native_process_destroy_forcibly(
 }
 
 /// `java.lang.Process.pid()J`
-fn native_process_pid(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(-1))),
@@ -1189,10 +1169,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 /// Reads the command + directory + env map fields that the
 /// ProcessBuilder synthetic lays out in phases_late, then spawns the
 /// child via `spawn_and_wrap`.
-fn native_process_builder_start(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1293,7 +1270,15 @@ fn native_process_builder_start(
         ctx.get_field_by_name(this, "redirectErrorStream"),
         Value::Int(v) if v != 0
     );
-    spawn_and_wrap(ctx, &program, &rest, work_dir.as_deref(), None, false, redirect_err)
+    spawn_and_wrap(
+        ctx,
+        &program,
+        &rest,
+        work_dir.as_deref(),
+        None,
+        false,
+        redirect_err,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,7 +1455,10 @@ mod tests {
         let argv = tokenize_command_line(r#""C:\Program Files\Java\bin\java.exe" -version"#);
         assert_eq!(
             argv,
-            vec![r"C:\Program Files\Java\bin\java.exe".to_string(), "-version".to_string()]
+            vec![
+                r"C:\Program Files\Java\bin\java.exe".to_string(),
+                "-version".to_string()
+            ]
         );
     }
 
@@ -1478,7 +1466,12 @@ mod tests {
     fn tokenize_plain_and_quoted_args() {
         assert_eq!(
             tokenize_command_line("prog -cp \"a b\" Main"),
-            vec!["prog".to_string(), "-cp".to_string(), "a b".to_string(), "Main".to_string()]
+            vec![
+                "prog".to_string(),
+                "-cp".to_string(),
+                "a b".to_string(),
+                "Main".to_string()
+            ]
         );
         // Embedded "" inside a quoted section -> literal quote.
         assert_eq!(

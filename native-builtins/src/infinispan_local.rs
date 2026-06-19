@@ -217,9 +217,7 @@ impl StoredValue {
                     // SAFETY: the bits were originally produced by
                     // `ObjectRef::as_ptr() as usize`. Callers must keep
                     // the referenced object alive (we do not pin it).
-                    unsafe {
-                        Value::Object(Some(ObjectRef::from_raw(*bits as *mut u8)))
-                    }
+                    unsafe { Value::Object(Some(ObjectRef::from_raw(*bits as *mut u8))) }
                 }
             }
             StoredValue::Str(s) => Value::Object(Some(ctx.create_string(s))),
@@ -615,11 +613,7 @@ impl DefaultCacheManagerInner {
     /// calls consume this config. If a cache under the same name already
     /// exists with a DIFFERENT effective config, returns Err; calling with
     /// the same config is a no-op (idempotent).
-    pub fn define_configuration(
-        &self,
-        name: &str,
-        config: PendingConfig,
-    ) -> Result<(), String> {
+    pub fn define_configuration(&self, name: &str, config: PendingConfig) -> Result<(), String> {
         validate_cache_name(name)?;
         // If a cache is already live, disallow re-define with different
         // numbers. Matches Infinispan's `CacheConfigurationException`
@@ -633,7 +627,9 @@ impl DefaultCacheManagerInner {
                 ));
             }
         }
-        self.pending_configs.write().insert(name.to_string(), config);
+        self.pending_configs
+            .write()
+            .insert(name.to_string(), config);
         Ok(())
     }
 
@@ -868,10 +864,7 @@ fn native_dcm_get_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cache = match global_manager().get_cache(&name) {
         Ok(c) => c,
         Err(e) => {
-            return Err(RuntimeError::IllegalStateException {
-                message: e,
-            }
-            .into());
+            return Err(RuntimeError::IllegalStateException { message: e }.into());
         }
     };
     // Allocate a Java-side Cache object. Tuck the Rust Arc pointer in
@@ -940,7 +933,11 @@ fn native_dcm_define_configuration(
         return Err(RuntimeError::IllegalStateException { message: e }.into());
     }
     // Infinispan returns the Configuration object; we echo the input.
-    Ok(Some(config.map(|o| Value::Object(Some(o))).unwrap_or(Value::Object(None))))
+    Ok(Some(
+        config
+            .map(|o| Value::Object(Some(o)))
+            .unwrap_or(Value::Object(None)),
+    ))
 }
 
 /// `DefaultCacheManager.start()` / `stop()`.
@@ -1193,9 +1190,7 @@ fn native_cache_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     {
         let store = cache.store.read();
         if let Some(existing) = store.entries.get(&key) {
-            let expired = existing
-                .expires_at
-                .is_some_and(|d| Instant::now() >= d);
+            let expired = existing.expires_at.is_some_and(|d| Instant::now() >= d);
             if !expired {
                 return Ok(Some(existing.value.clone().to_value(ctx)));
             }
@@ -1352,12 +1347,7 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(cls, "size", "()I", native_cache_size);
         registry.register(cls, "clear", "()V", native_cache_clear);
-        registry.register(
-            cls,
-            "evict",
-            "(Ljava/lang/Object;)V",
-            native_cache_evict,
-        );
+        registry.register(cls, "evict", "(Ljava/lang/Object;)V", native_cache_evict);
         registry.register(
             cls,
             "addListener",
@@ -1472,8 +1462,12 @@ mod tests {
         assert_eq!(cache.size(), 3);
         let (_, _, _, evictions) = cache.stats();
         assert!(evictions >= 2, "expected >=2 evictions, got {evictions}");
-        assert!(cache.get(&CacheKey::from_bytes(&0i32.to_le_bytes())).is_none());
-        assert!(cache.get(&CacheKey::from_bytes(&4i32.to_le_bytes())).is_some());
+        assert!(cache
+            .get(&CacheKey::from_bytes(&0i32.to_le_bytes()))
+            .is_none());
+        assert!(cache
+            .get(&CacheKey::from_bytes(&4i32.to_le_bytes()))
+            .is_some());
     }
 
     #[test]
@@ -1490,7 +1484,10 @@ mod tests {
         );
         assert!(cache.get(&CacheKey::from_str("k")).is_some());
         std::thread::sleep(Duration::from_millis(70));
-        assert!(cache.get(&CacheKey::from_str("k")).is_none(), "TTL should have expired");
+        assert!(
+            cache.get(&CacheKey::from_str("k")).is_none(),
+            "TTL should have expired"
+        );
         // Expiry path must also have incremented eviction counter.
         let (_, _, _, evictions) = cache.stats();
         assert!(evictions >= 1);
@@ -1708,7 +1705,10 @@ mod tests {
             StoredValue::Primitive(Value::Int(4)),
         );
         assert!(cache.get(&CacheKey::from_str("a")).is_some());
-        assert!(cache.get(&CacheKey::from_str("b")).is_none(), "b should have been evicted");
+        assert!(
+            cache.get(&CacheKey::from_str("b")).is_none(),
+            "b should have been evicted"
+        );
         assert!(cache.get(&CacheKey::from_str("c")).is_some());
         assert!(cache.get(&CacheKey::from_str("d")).is_some());
     }
@@ -1731,9 +1731,7 @@ mod tests {
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
             )
             .is_some());
-        assert!(r
-            .find(CLS_CACHE, "size", "()I")
-            .is_some());
+        assert!(r.find(CLS_CACHE, "size", "()I").is_some());
         assert!(r
             .find(CLS_CACHE, "addListener", "(Ljava/lang/Object;)V")
             .is_some());
@@ -1812,6 +1810,9 @@ mod tests {
         global_manager().get_cache("c").unwrap();
         let mut names = global_manager().cache_names();
         names.sort();
-        assert_eq!(names, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            names,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

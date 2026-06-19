@@ -47,7 +47,9 @@ use cratonvm_gc::safepoint::SafepointToken;
 use cratonvm_gc::VmHeap;
 use cratonvm_types::{ArrayElementType, ObjectKind, ObjectRef, Value};
 
-pub use cuda_bridge::{DeviceBuffer, DeviceContext, DeviceElem, DeviceError, Result as DeviceResult};
+pub use cuda_bridge::{
+    DeviceBuffer, DeviceContext, DeviceElem, DeviceError, Result as DeviceResult,
+};
 
 // ── Host views (heap → packed Vec<T>) ────────────────────────────────────
 
@@ -58,13 +60,13 @@ pub use cuda_bridge::{DeviceBuffer, DeviceContext, DeviceElem, DeviceError, Resu
 /// Panics if `obj` is not a heap-allocated `int[]`. This is an internal
 /// invariant — Part D's analyzer + Part E's caller verify the array shape
 /// before reaching this point.
-pub fn host_view_i32(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<i32> {
+pub fn host_view_i32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i32> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_i32: not an array");
+    assert_eq!(
+        header.kind,
+        ObjectKind::Array,
+        "host_view_i32: not an array"
+    );
     assert_eq!(
         header.element_type,
         ArrayElementType::Int,
@@ -88,11 +90,7 @@ pub fn host_view_i32(
                 // Source (heap arena) and destination (fresh Vec) do not
                 // overlap. The GC is paused (token held), so `src` stays valid.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src,
-                        out.as_mut_ptr() as *mut u8,
-                        len * 4,
-                    );
+                    std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 4);
                 }
             }
             // G1 humongous `int[]`: payload spans non-contiguous regions, so
@@ -115,13 +113,13 @@ pub fn host_view_i32(
 }
 
 /// Copy a Java `long[]` into a packed host `Vec<i64>`.
-pub fn host_view_i64(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<i64> {
+pub fn host_view_i64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i64> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_i64: not an array");
+    assert_eq!(
+        header.kind,
+        ObjectKind::Array,
+        "host_view_i64: not an array"
+    );
     assert_eq!(
         header.element_type,
         ArrayElementType::Long,
@@ -159,13 +157,13 @@ pub fn host_view_i64(
 }
 
 /// Copy a Java `float[]` into a packed host `Vec<f32>`.
-pub fn host_view_f32(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<f32> {
+pub fn host_view_f32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<f32> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_f32: not an array");
+    assert_eq!(
+        header.kind,
+        ObjectKind::Array,
+        "host_view_f32: not an array"
+    );
     assert_eq!(
         header.element_type,
         ArrayElementType::Float,
@@ -203,13 +201,13 @@ pub fn host_view_f32(
 }
 
 /// Copy a Java `double[]` into a packed host `Vec<f64>`.
-pub fn host_view_f64(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<f64> {
+pub fn host_view_f64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<f64> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_f64: not an array");
+    assert_eq!(
+        header.kind,
+        ObjectKind::Array,
+        "host_view_f64: not an array"
+    );
     assert_eq!(
         header.element_type,
         ArrayElementType::Double,
@@ -248,13 +246,13 @@ pub fn host_view_f64(
 
 /// Copy a Java `short[]` into a packed host `Vec<i16>`. Heap storage
 /// sign-extends to `Value::Int`; we truncate back to `i16` on the way out.
-pub fn host_view_i16(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<i16> {
+pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i16> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_i16: not an array");
+    assert_eq!(
+        header.kind,
+        ObjectKind::Array,
+        "host_view_i16: not an array"
+    );
     assert_eq!(
         header.element_type,
         ArrayElementType::Short,
@@ -276,11 +274,7 @@ pub fn host_view_i16(
 
 /// Copy a Java `byte[]` into a packed host `Vec<i8>`. Heap storage
 /// sign-extends to `Value::Int`; we truncate to `i8` on the way out.
-pub fn host_view_i8(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    _token: &SafepointToken<'_>,
-) -> Vec<i8> {
+pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i8> {
     let header = heap.get_header(obj);
     assert_eq!(header.kind, ObjectKind::Array, "host_view_i8: not an array");
     assert_eq!(
@@ -311,12 +305,7 @@ pub fn host_view_i8(
 /// - if `obj` is not an `int[]` on the heap;
 /// - if `src.len()` differs from the array's length. Callers (Part E) are
 ///   expected to enforce length equality before calling.
-pub fn write_back_i32(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[i32],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_i32(obj: ObjectRef, heap: &VmHeap, src: &[i32], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -348,11 +337,7 @@ pub fn write_back_i32(
                 // exactly `len` i32s. Heap arena and `src` slice do not
                 // overlap. GC is paused (token held), so `dst` stays valid.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src.as_ptr() as *const u8,
-                        dst,
-                        len * 4,
-                    );
+                    std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst, len * 4);
                 }
             }
             // G1 humongous `int[]`: region-safe per-element store.
@@ -367,12 +352,7 @@ pub fn write_back_i32(
 }
 
 /// Copy a packed host `&[i64]` into a JVM `long[]`.
-pub fn write_back_i64(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[i64],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_i64(obj: ObjectRef, heap: &VmHeap, src: &[i64], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -415,12 +395,7 @@ pub fn write_back_i64(
 }
 
 /// Copy a packed host `&[f32]` into a JVM `float[]`.
-pub fn write_back_f32(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[f32],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_f32(obj: ObjectRef, heap: &VmHeap, src: &[f32], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -463,12 +438,7 @@ pub fn write_back_f32(
 }
 
 /// Copy a packed host `&[f64]` into a JVM `double[]`.
-pub fn write_back_f64(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[f64],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_f64(obj: ObjectRef, heap: &VmHeap, src: &[f64], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -513,12 +483,7 @@ pub fn write_back_f64(
 /// Copy a packed host `&[i16]` into a JVM `short[]`. Short slots on the
 /// heap are 2 bytes; `set_array_element` truncates `Value::Int` to `i16`
 /// on write.
-pub fn write_back_i16(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[i16],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_i16(obj: ObjectRef, heap: &VmHeap, src: &[i16], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -547,12 +512,7 @@ pub fn write_back_i16(
 /// Copy a packed host `&[i8]` into a JVM `byte[]`. Byte slots on the
 /// heap are 1 byte; `set_array_element` truncates `Value::Int` to `u8`
 /// on write.
-pub fn write_back_i8(
-    obj: ObjectRef,
-    heap: &VmHeap,
-    src: &[i8],
-    _token: &SafepointToken<'_>,
-) {
+pub fn write_back_i8(obj: ObjectRef, heap: &VmHeap, src: &[i8], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
         header.kind,
@@ -670,10 +630,38 @@ macro_rules! direct_xfer {
     };
 }
 
-direct_xfer!(upload_obj_i32, download_obj_i32, i32, host_view_i32, write_back_i32, "int[]");
-direct_xfer!(upload_obj_i64, download_obj_i64, i64, host_view_i64, write_back_i64, "long[]");
-direct_xfer!(upload_obj_f32, download_obj_f32, f32, host_view_f32, write_back_f32, "float[]");
-direct_xfer!(upload_obj_f64, download_obj_f64, f64, host_view_f64, write_back_f64, "double[]");
+direct_xfer!(
+    upload_obj_i32,
+    download_obj_i32,
+    i32,
+    host_view_i32,
+    write_back_i32,
+    "int[]"
+);
+direct_xfer!(
+    upload_obj_i64,
+    download_obj_i64,
+    i64,
+    host_view_i64,
+    write_back_i64,
+    "long[]"
+);
+direct_xfer!(
+    upload_obj_f32,
+    download_obj_f32,
+    f32,
+    host_view_f32,
+    write_back_f32,
+    "float[]"
+);
+direct_xfer!(
+    upload_obj_f64,
+    download_obj_f64,
+    f64,
+    host_view_f64,
+    write_back_f64,
+    "double[]"
+);
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
@@ -729,7 +717,9 @@ mod tests {
         let n = 1024usize;
         let arr = heap.alloc_array(TEST_CID, ArrayElementType::Int, n);
         // Sequence: i * 7 - 3 — exercises sign and stride.
-        let src: Vec<i32> = (0..n as i32).map(|i| i.wrapping_mul(7).wrapping_sub(3)).collect();
+        let src: Vec<i32> = (0..n as i32)
+            .map(|i| i.wrapping_mul(7).wrapping_sub(3))
+            .collect();
         write_back_i32(arr, &heap, &src, &token);
         let view = host_view_i32(arr, &heap, &token);
         assert_eq!(view.len(), n);
@@ -739,7 +729,10 @@ mod tests {
         let mutated: Vec<i32> = view.iter().map(|x| !x).collect();
         write_back_i32(arr, &heap, &mutated, &token);
         for (i, expected) in mutated.iter().enumerate() {
-            assert_eq!(heap.get_array_element(arr, i).unwrap(), Value::Int(*expected));
+            assert_eq!(
+                heap.get_array_element(arr, i).unwrap(),
+                Value::Int(*expected)
+            );
         }
     }
 

@@ -126,16 +126,40 @@ fn jdk25_deprecated_api_checklist() -> Vec<(&'static str, &'static str, &'static
         ("java/lang/System", "runFinalization", "()V"),
         ("java/lang/System", "runFinalizersOnExit", "(Z)V"),
         ("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z"),
-        ("java/lang/Compiler", "compileClasses", "(Ljava/lang/String;)Z"),
+        (
+            "java/lang/Compiler",
+            "compileClasses",
+            "(Ljava/lang/String;)Z",
+        ),
         ("java/lang/Compiler", "enable", "()V"),
         ("java/lang/Compiler", "disable", "()V"),
-        ("java/lang/Compiler", "command", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+        (
+            "java/lang/Compiler",
+            "command",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        ),
         // SecurityManager
-        ("java/lang/SecurityManager", "checkPermission", "(Ljava/security/Permission;)V"),
-        ("java/lang/SecurityManager", "checkRead", "(Ljava/lang/String;)V"),
-        ("java/lang/SecurityManager", "checkWrite", "(Ljava/lang/String;)V"),
+        (
+            "java/lang/SecurityManager",
+            "checkPermission",
+            "(Ljava/security/Permission;)V",
+        ),
+        (
+            "java/lang/SecurityManager",
+            "checkRead",
+            "(Ljava/lang/String;)V",
+        ),
+        (
+            "java/lang/SecurityManager",
+            "checkWrite",
+            "(Ljava/lang/String;)V",
+        ),
         ("java/lang/SecurityManager", "checkExit", "(I)V"),
-        ("java/security/AccessController", "doPrivileged", "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;"),
+        (
+            "java/security/AccessController",
+            "doPrivileged",
+            "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;",
+        ),
         // java.util.Date
         ("java/util/Date", "getYear", "()I"),
         ("java/util/Date", "getMonth", "()I"),
@@ -150,16 +174,32 @@ fn jdk25_deprecated_api_checklist() -> Vec<(&'static str, &'static str, &'static
         // Class.newInstance
         ("java/lang/Class", "newInstance", "()Ljava/lang/Object;"),
         // URL encoding
-        ("java/net/URLDecoder", "decode", "(Ljava/lang/String;)Ljava/lang/String;"),
-        ("java/net/URLEncoder", "encode", "(Ljava/lang/String;)Ljava/lang/String;"),
+        (
+            "java/net/URLDecoder",
+            "decode",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        (
+            "java/net/URLEncoder",
+            "encode",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ),
         // sun.misc.Unsafe
         ("sun/misc/Unsafe", "allocateMemory", "(J)J"),
         ("sun/misc/Unsafe", "freeMemory", "(J)V"),
         ("sun/misc/Unsafe", "reallocateMemory", "(JJ)J"),
         // Signal
-        ("sun/misc/Signal", "handle", "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;"),
+        (
+            "sun/misc/Signal",
+            "handle",
+            "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;",
+        ),
         // Reflection
-        ("sun/reflect/Reflection", "getCallerClass", "(I)Ljava/lang/Class;"),
+        (
+            "sun/reflect/Reflection",
+            "getCallerClass",
+            "(I)Ljava/lang/Class;",
+        ),
     ]
 }
 
@@ -229,12 +269,10 @@ mod tests {
 
         // Verify every T8 sub-section is represented
         for expected in &[
-            "T8.1.1", "T8.1.2", "T8.1.3", "T8.1.4", "T8.1.6", "T8.1.7",
-            "T8.1.8", "T8.1.9", "T8.1.10",
-            "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6",
-            "T8.2.7", "T8.2.10", "T8.2.11", "T8.2.13", "T8.2.14",
-            "T8.3.1", "T8.3.2",
-            "T8.4.1", "T8.4.2", "T8.4.3", "T8.4.4",
+            "T8.1.1", "T8.1.2", "T8.1.3", "T8.1.4", "T8.1.6", "T8.1.7", "T8.1.8", "T8.1.9",
+            "T8.1.10", "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6", "T8.2.7",
+            "T8.2.10", "T8.2.11", "T8.2.13", "T8.2.14", "T8.3.1", "T8.3.2", "T8.4.1", "T8.4.2",
+            "T8.4.3", "T8.4.4",
         ] {
             assert!(
                 sections.contains(expected),
@@ -273,7 +311,9 @@ mod tests {
     #[test]
     fn t85_2_thread_count_stack_frames_throws() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Thread", "countStackFrames", "()I").unwrap();
+        let f = r
+            .find("java/lang/Thread", "countStackFrames", "()I")
+            .unwrap();
         let mut ctx = MockNativeContext::new();
         let result = f(&mut ctx, &[]);
         assert!(result.is_err(), "countStackFrames should throw");
@@ -282,7 +322,9 @@ mod tests {
     #[test]
     fn t85_2_compiler_compile_class_returns_false() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z").unwrap();
+        let f = r
+            .find("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z")
+            .unwrap();
         let mut ctx = MockNativeContext::new();
         let result = f(&mut ctx, &[cratonvm_types::Value::Object(None)]);
         match result {
@@ -294,7 +336,13 @@ mod tests {
     #[test]
     fn t85_2_compiler_command_returns_null() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Compiler", "command", "(Ljava/lang/Object;)Ljava/lang/Object;").unwrap();
+        let f = r
+            .find(
+                "java/lang/Compiler",
+                "command",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            .unwrap();
         let mut ctx = MockNativeContext::new();
         let result = f(&mut ctx, &[cratonvm_types::Value::Object(None)]);
         match result {
@@ -319,7 +367,9 @@ mod tests {
     #[test]
     fn t85_2_character_is_java_letter_underscore() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Character", "isJavaLetter", "(C)Z").unwrap();
+        let f = r
+            .find("java/lang/Character", "isJavaLetter", "(C)Z")
+            .unwrap();
         let mut ctx = MockNativeContext::new();
         // '_' = 95, should return true (valid Java identifier start)
         let result = f(&mut ctx, &[cratonvm_types::Value::Int(95)]);
@@ -332,7 +382,9 @@ mod tests {
     #[test]
     fn t85_2_character_is_java_letter_digit_rejected() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Character", "isJavaLetter", "(C)Z").unwrap();
+        let f = r
+            .find("java/lang/Character", "isJavaLetter", "(C)Z")
+            .unwrap();
         let mut ctx = MockNativeContext::new();
         // '5' = 53, should return false (not valid identifier start)
         let result = f(&mut ctx, &[cratonvm_types::Value::Int(53)]);
@@ -346,7 +398,12 @@ mod tests {
     fn t85_2_url_decoder_is_registered() {
         let r = build_deprecated_registry();
         assert!(
-            r.find("java/net/URLDecoder", "decode", "(Ljava/lang/String;)Ljava/lang/String;").is_some(),
+            r.find(
+                "java/net/URLDecoder",
+                "decode",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            )
+            .is_some(),
             "URLDecoder.decode(String) must be registered"
         );
     }
@@ -355,7 +412,12 @@ mod tests {
     fn t85_2_url_encoder_is_registered() {
         let r = build_deprecated_registry();
         assert!(
-            r.find("java/net/URLEncoder", "encode", "(Ljava/lang/String;)Ljava/lang/String;").is_some(),
+            r.find(
+                "java/net/URLEncoder",
+                "encode",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            )
+            .is_some(),
             "URLEncoder.encode(String) must be registered"
         );
     }
@@ -397,9 +459,7 @@ mod tests {
     fn t85_4_shim_generator_skips_existing() {
         let mut r = NativeMethodRegistry::new();
         // Register one method manually
-        r.register("java/lang/Thread", "stop", "()V", |_ctx, _args| {
-            Ok(None)
-        });
+        r.register("java/lang/Thread", "stop", "()V", |_ctx, _args| Ok(None));
         let count_before = r.len();
 
         register_missing_deprecated_shims(&mut r);

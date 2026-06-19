@@ -193,16 +193,13 @@ impl ThreadRegistry {
     /// caller therefore no longer needs to keep `throwable` independently
     /// reachable (it previously had to be frame- or static-reachable, which
     /// was not guaranteed for a freshly allocated `Thread.stop` throwable).
-    pub fn post_async_exception(
-        &self,
-        thread_id: ThreadId,
-        throwable: ObjectRef,
-    ) -> bool {
+    pub fn post_async_exception(&self, thread_id: ThreadId, throwable: ObjectRef) -> bool {
         let threads = self.threads.lock();
         if let Some(entry) = threads.get(&thread_id) {
-            entry
-                .async_exception_slot
-                .store(throwable.as_ptr() as usize, std::sync::atomic::Ordering::Release);
+            entry.async_exception_slot.store(
+                throwable.as_ptr() as usize,
+                std::sync::atomic::Ordering::Release,
+            );
             // Also unpark the target so a parked thread wakes and
             // hits its next safepoint promptly.
             entry.park_state.unpark();
@@ -669,10 +666,7 @@ impl ThreadRegistry {
     /// wake. While it still holds stale frame addresses the only consumers
     /// are this fold (keyed by those addresses) and the wake-side apply,
     /// so the chain stays consistent.
-    pub fn fold_pointer_map_into_blocked(
-        &self,
-        pointer_map: &HashMap<usize, usize>,
-    ) {
+    pub fn fold_pointer_map_into_blocked(&self, pointer_map: &HashMap<usize, usize>) {
         if pointer_map.is_empty() {
             return;
         }
@@ -695,8 +689,7 @@ impl ThreadRegistry {
             // snapshot holds the CUR value) — collected before composing so
             // the snapshot pass below can tell first moves apart from
             // already-chained objects.
-            let chained: rustc_hash::FxHashSet<usize> =
-                fixup.values().copied().collect();
+            let chained: rustc_hash::FxHashSet<usize> = fixup.values().copied().collect();
             let mut composed = 0usize;
             let mut seeded = 0usize;
             for cur in fixup.values_mut() {
@@ -774,9 +767,7 @@ impl ThreadRegistry {
             .lock()
             .iter()
             .filter(|(tid, e)| {
-                tid.0 != 0
-                    && e.alive.load(Ordering::Acquire)
-                    && !e.daemon.load(Ordering::Acquire)
+                tid.0 != 0 && e.alive.load(Ordering::Acquire) && !e.daemon.load(Ordering::Acquire)
             })
             .map(|(tid, _)| *tid)
             .collect()
@@ -815,10 +806,7 @@ impl ThreadRegistry {
     /// the number of `JoinHandle::join` calls that succeeded). `0` means
     /// no non-daemon threads existed when the call was made — the safe
     /// fast-path for `HelloWorld`-style programs.
-    pub fn wait_for_non_daemon_threads(
-        &self,
-        deadline: Option<std::time::Instant>,
-    ) -> usize {
+    pub fn wait_for_non_daemon_threads(&self, deadline: Option<std::time::Instant>) -> usize {
         let mut joined = 0usize;
         loop {
             let pending = self.alive_non_daemon_thread_ids();

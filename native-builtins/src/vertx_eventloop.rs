@@ -227,7 +227,9 @@ pub struct TimerHeap {
 
 impl TimerHeap {
     fn new() -> Self {
-        Self { inner: BinaryHeap::new() }
+        Self {
+            inner: BinaryHeap::new(),
+        }
     }
 
     fn len(&self) -> usize {
@@ -283,7 +285,9 @@ pub struct WakeableCondvar {
 }
 
 impl Default for WakeableCondvar {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WakeableCondvar {
@@ -303,7 +307,9 @@ impl WakeableCondvar {
             self.pending.store(false, Ordering::Release);
             return true;
         }
-        let (g, res) = self.cv.wait_timeout(guard, timeout)
+        let (g, res) = self
+            .cv
+            .wait_timeout(guard, timeout)
             .unwrap_or_else(|e| e.into_inner());
         let mut g = g;
         let woken = *g;
@@ -483,7 +489,9 @@ pub fn run_vertx_event_loop(el: Arc<VertxEventLoop>) {
             }
         }
 
-        if el.shutdown_requested.load(Ordering::Acquire) { break; }
+        if el.shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
 
         // --- phase 2 + 3: compute deadline and park ------------------------
         let now = Instant::now();
@@ -500,7 +508,9 @@ pub fn run_vertx_event_loop(el: Arc<VertxEventLoop>) {
             el.parker.park(park_dur);
         }
 
-        if el.shutdown_requested.load(Ordering::Acquire) { break; }
+        if el.shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
 
         // --- phase 4: channel events (no-op — Netty Java bytecode drives
         //              its own Selector.select() on this OS thread) ----------
@@ -515,7 +525,9 @@ pub fn run_vertx_event_loop(el: Arc<VertxEventLoop>) {
             match expired {
                 None => break,
                 Some(mut t) => {
-                    if t.cancelled.load(Ordering::Acquire) { continue; }
+                    if t.cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if let Some(task) = t.task.take() {
                         el.stats.timers_fired.fetch_add(1, Ordering::Relaxed);
                         run_el_task(&el, task);
@@ -545,7 +557,9 @@ pub fn run_vertx_event_loop(el: Arc<VertxEventLoop>) {
         }
     }
 
-    CURRENT_VERTX_LOOP.with(|slot| { *slot.borrow_mut() = None; });
+    CURRENT_VERTX_LOOP.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 fn run_el_task(el: &VertxEventLoop, task: ELTask) {
@@ -588,9 +602,7 @@ thread_local! {
 }
 
 pub fn current_vertx_loop() -> Option<Arc<VertxEventLoop>> {
-    CURRENT_VERTX_LOOP.with(|slot| {
-        slot.borrow().as_ref().and_then(|w| w.upgrade())
-    })
+    CURRENT_VERTX_LOOP.with(|slot| slot.borrow().as_ref().and_then(|w| w.upgrade()))
 }
 
 // ---------------------------------------------------------------------------
@@ -621,9 +633,7 @@ fn vertx_loop_join_handles() -> &'static Mutex<HashMap<u64, thread::JoinHandle<(
 /// (`native_vertx_init`, `native_nel_run`) should use
 /// [`spawn_vertx_event_loop_with_ctx`] instead so the VM holds the
 /// process alive past `main()` while the event loop is running.
-pub fn spawn_vertx_event_loop(
-    name: impl Into<String>,
-) -> Result<Arc<VertxEventLoop>, String> {
+pub fn spawn_vertx_event_loop(name: impl Into<String>) -> Result<Arc<VertxEventLoop>, String> {
     spawn_vertx_event_loop_inner(name, None)
 }
 
@@ -694,7 +704,11 @@ fn spawn_vertx_event_loop_inner(
         if vm_tid != 0 {
             let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), THREAD_MIRROR_SLOTS);
             let name_obj = ctx.create_string(&name);
-            ctx.set_field(mirror, THREAD_MIRROR_NAME_SLOT, Value::Object(Some(name_obj)));
+            ctx.set_field(
+                mirror,
+                THREAD_MIRROR_NAME_SLOT,
+                Value::Object(Some(name_obj)),
+            );
             // priority slot 1: leave at 0 (NORM_PRIORITY = 5 in the
             // JDK, but synthetic Thread default is 0; tests don't
             // rely on this).
@@ -864,7 +878,9 @@ pub fn lookup_vertx_loop(raw_id: i64) -> Option<Arc<VertxEventLoop>> {
 
 /// Shut down and join a loop, removing it from the registry.
 pub fn shutdown_vertx_loop(raw_id: i64) {
-    if raw_id <= 0 { return; }
+    if raw_id <= 0 {
+        return;
+    }
     let id = raw_id as u64;
     let el_opt = vertx_loop_registry()
         .lock()
@@ -1032,16 +1048,15 @@ fn native_nel_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             // Auto-allocate an event loop for this thread.
             // T19_K2 — register as NON-daemon so the VM holds the
             // process alive while the listener event loop is running.
-            let el =
-                spawn_vertx_event_loop_with_ctx(ctx, "netty-eventloop-auto", false).map_err(
-                    |e| {
-                        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                            RuntimeError::IllegalStateException {
-                                message: format!("NioEventLoop.run: spawn failed: {e}"),
-                            },
-                        ))
-                    },
-                )?;
+            let el = spawn_vertx_event_loop_with_ctx(ctx, "netty-eventloop-auto", false).map_err(
+                |e| {
+                    MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                        RuntimeError::IllegalStateException {
+                            message: format!("NioEventLoop.run: spawn failed: {e}"),
+                        },
+                    ))
+                },
+            )?;
             let id = el.id as i64;
             ctx.set_field(this, NEL_FIELD_EVENT_LOOP_ID, Value::Long(id));
             id
@@ -1223,7 +1238,11 @@ fn native_nel_await_termination(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Value::Int(v) => v,
         _ => STATE_NOT_STARTED,
     };
-    Ok(Some(Value::Int(if state == STATE_TERMINATED { 1 } else { 0 })))
+    Ok(Some(Value::Int(if state == STATE_TERMINATED {
+        1
+    } else {
+        0
+    })))
 }
 
 /// `*.submit(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;`
@@ -1244,14 +1263,22 @@ pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
     // VertxImpl
     registry.register(CLS_VERTX_IMPL, "init", "(I)V", native_vertx_init);
     registry.register(
-        CLS_VERTX_IMPL, "getEventLoopId", "()J", native_vertx_get_event_loop_id,
+        CLS_VERTX_IMPL,
+        "getEventLoopId",
+        "()J",
+        native_vertx_get_event_loop_id,
     );
     registry.register(CLS_VERTX_IMPL, "close", "()V", native_vertx_close);
 
     // NioEventLoop + DefaultEventLoop + SingleThreadEventExecutor share the same surface.
     for cls in [CLS_NIO_EVENT_LOOP, CLS_DEFAULT_EVENT_LOOP, CLS_STE] {
         registry.register(cls, "run", "()V", native_nel_run);
-        registry.register(cls, "execute", "(Ljava/lang/Runnable;)V", native_nel_execute);
+        registry.register(
+            cls,
+            "execute",
+            "(Ljava/lang/Runnable;)V",
+            native_nel_execute,
+        );
         registry.register(
             cls,
             "schedule",
@@ -1290,8 +1317,8 @@ pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicI32;
+    use std::sync::Barrier;
     use std::sync::{Mutex as StdMutex, MutexGuard};
 
     // FIX(test-isolation): The exit trampoline of every loop spawned via
@@ -1429,10 +1456,7 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
-        let result = native_vertx_init(
-            &mut ctx,
-            &[Value::Object(Some(mirror)), Value::Int(2)],
-        );
+        let result = native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(2)]);
         assert!(result.is_ok(), "init must succeed: {:?}", result.err());
         let eid = match ctx.get_field(mirror, VERTX_FIELD_EVENT_LOOP_ID) {
             Value::Long(v) => v,
@@ -1471,7 +1495,8 @@ mod tests {
             native_vertx_init(
                 &mut ctx,
                 &[Value::Object(Some(mirror)), Value::Int(MAX_POOL_SIZE + 1)]
-            ).is_err(),
+            )
+            .is_err(),
             "over-cap pool size must be rejected"
         );
     }
@@ -1551,20 +1576,22 @@ mod tests {
         let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
         // Arm the next invoke_virtual (the Runnable.run() call) to throw.
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                    RuntimeError::IllegalStateException {
-                        message: "task boom".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(RuntimeError::IllegalStateException {
+                    message: "task boom".to_string(),
+                }),
+            )));
         }
         let res = native_nel_execute(
             &mut ctx,
             &[Value::Object(Some(nel)), Value::Object(Some(runnable))],
         );
         // Fire-and-forget: a throwing task must not surface to the submitter.
-        assert!(res.is_ok(), "execute() must swallow task error, got {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "execute() must swallow task error, got {:?}",
+            res.err()
+        );
         // Proof the Runnable was actually invoked: the one-shot armed result
         // was consumed by `invoke_virtual`, so it is now None.
         let consumed = unsafe { (*ctx.invoke_virtual_result.get()).is_none() };
@@ -1586,13 +1613,11 @@ mod tests {
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
         let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                    RuntimeError::IllegalStateException {
-                        message: "task boom".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(RuntimeError::IllegalStateException {
+                    message: "task boom".to_string(),
+                }),
+            )));
         }
         let res = native_nel_submit(
             &mut ctx,
@@ -1670,15 +1695,27 @@ mod tests {
         ctx.set_field(nel, NEL_FIELD_STATE, Value::Int(STATE_STARTED));
         assert_eq!(
             native_nel_await_termination(
-                &mut ctx, &[Value::Object(Some(nel)), Value::Long(100), Value::Object(None)]
-            ).unwrap(),
+                &mut ctx,
+                &[
+                    Value::Object(Some(nel)),
+                    Value::Long(100),
+                    Value::Object(None)
+                ]
+            )
+            .unwrap(),
             Some(Value::Int(0))
         );
         ctx.set_field(nel, NEL_FIELD_STATE, Value::Int(STATE_TERMINATED));
         assert_eq!(
             native_nel_await_termination(
-                &mut ctx, &[Value::Object(Some(nel)), Value::Long(100), Value::Object(None)]
-            ).unwrap(),
+                &mut ctx,
+                &[
+                    Value::Object(Some(nel)),
+                    Value::Long(100),
+                    Value::Object(None)
+                ]
+            )
+            .unwrap(),
             Some(Value::Int(1))
         );
     }
@@ -1729,10 +1766,7 @@ mod tests {
     fn nel_execute_null_runnable_errors() {
         let mut ctx = mock_ctx();
         let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
-        let res = native_nel_execute(
-            &mut ctx,
-            &[Value::Object(Some(nel)), Value::Object(None)],
-        );
+        let res = native_nel_execute(&mut ctx, &[Value::Object(Some(nel)), Value::Object(None)]);
         assert!(res.is_err(), "null Runnable must error");
     }
 
@@ -1749,7 +1783,9 @@ mod tests {
 
         // Wait for the loop thread to record its id.
         for _ in 0..200 {
-            if el.loop_thread_id.load(Ordering::Acquire) != 0 { break; }
+            if el.loop_thread_id.load(Ordering::Acquire) != 0 {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
 
@@ -1760,7 +1796,8 @@ mod tests {
         el.schedule_task(Box::new(move || {
             r2.store(true, Ordering::Release);
             b2.wait();
-        })).unwrap_or_else(|_| panic!("schedule failed"));
+        }))
+        .unwrap_or_else(|_| panic!("schedule failed"));
         barrier.wait();
         assert!(ran.load(Ordering::Acquire), "task must run in loop thread");
 
@@ -1778,7 +1815,10 @@ mod tests {
         let _guard = isolated_vertx_test();
         assert!(lookup_vertx_loop(-1).is_none(), "negative id must be None");
         assert!(lookup_vertx_loop(0).is_none(), "zero id must be None");
-        assert!(lookup_vertx_loop(i64::MAX).is_none(), "huge id must be None");
+        assert!(
+            lookup_vertx_loop(i64::MAX).is_none(),
+            "huge id must be None"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1792,7 +1832,9 @@ mod tests {
         let el = spawn_vertx_event_loop("test-panic").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
-            if el.loop_thread_id.load(Ordering::Acquire) != 0 { break; }
+            if el.loop_thread_id.load(Ordering::Acquire) != 0 {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
 
@@ -1832,14 +1874,21 @@ mod tests {
         let el = spawn_vertx_event_loop("test-stats").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
-            if el.loop_thread_id.load(Ordering::Acquire) != 0 { break; }
+            if el.loop_thread_id.load(Ordering::Acquire) != 0 {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
 
         let barrier = Arc::new(Barrier::new(2));
         let b2 = Arc::clone(&barrier);
-        for _ in 0..4 { el.schedule_task(Box::new(|| {})).ok(); }
-        el.schedule_task(Box::new(move || { b2.wait(); })).ok();
+        for _ in 0..4 {
+            el.schedule_task(Box::new(|| {})).ok();
+        }
+        el.schedule_task(Box::new(move || {
+            b2.wait();
+        }))
+        .ok();
         barrier.wait();
 
         // FIX(test-isolation): `barrier.wait()` only proves the 5th task has
@@ -1880,7 +1929,9 @@ mod tests {
         let el = spawn_vertx_event_loop("test-concurrent").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
-            if el.loop_thread_id.load(Ordering::Acquire) != 0 { break; }
+            if el.loop_thread_id.load(Ordering::Acquire) != 0 {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
 
@@ -1901,13 +1952,18 @@ mod tests {
                 }
             }));
         }
-        for h in handles { h.join().expect("join"); }
+        for h in handles {
+            h.join().expect("join");
+        }
 
         let deadline = Instant::now() + Duration::from_millis(500);
         while counter.load(Ordering::Relaxed) < 200 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(counter.load(Ordering::Relaxed) > 0, "no concurrent tasks ran");
+        assert!(
+            counter.load(Ordering::Relaxed) > 0,
+            "no concurrent tasks ran"
+        );
 
         shutdown_vertx_loop(raw_id);
     }
@@ -1927,8 +1983,8 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-1", false)
-            .expect("spawn_with_ctx");
+        let el =
+            spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-1", false).expect("spawn_with_ctx");
         let after = ctx.registered_native_threads().len();
         assert_eq!(
             after - before,
@@ -1965,8 +2021,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-2", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-2", false).expect("spawn");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         assert_ne!(vm_tid, 0, "vm_thread_id must be assigned");
         shutdown_vertx_loop(el.id as i64);
@@ -1982,8 +2037,7 @@ mod tests {
         let _guard = dead_queue_guard();
 
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-3", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-3", false).expect("spawn");
         let expected_vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         assert_ne!(expected_vm_tid, 0);
 
@@ -2017,8 +2071,7 @@ mod tests {
         // dead-queue against its own ctx; serialize + reset.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-4", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-4", false).expect("spawn");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         assert_ne!(vm_tid, 0);
 
@@ -2068,11 +2121,8 @@ mod tests {
         // unregister a colliding id and flip a `[before..]` entry's `alive`
         // flag — see `reset_dead_queue_before_flush_native` for the mechanism.
         reset_dead_queue_before_flush_native();
-        native_vertx_init(
-            &mut ctx,
-            &[Value::Object(Some(mirror)), Value::Int(pool)],
-        )
-        .expect("init");
+        native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(pool)])
+            .expect("init");
         let after = ctx.registered_native_threads().len();
         assert_eq!(
             after - before,
@@ -2080,8 +2130,7 @@ mod tests {
             "init(N) must call register_native_thread N times"
         );
         // Each new entry must be non-daemon.
-        let new_entries =
-            ctx.registered_native_threads()[before..].to_vec();
+        let new_entries = ctx.registered_native_threads()[before..].to_vec();
         for (name, daemon, alive) in &new_entries {
             assert!(name.starts_with("vert.x-eventloop-"));
             assert!(!*daemon, "must be non-daemon");
@@ -2099,11 +2148,7 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
-        native_vertx_init(
-            &mut ctx,
-            &[Value::Object(Some(mirror)), Value::Int(2)],
-        )
-        .expect("init");
+        native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(2)]).expect("init");
         let before_close = ctx
             .registered_native_threads()
             .iter()
@@ -2111,8 +2156,7 @@ mod tests {
             .count();
         assert_eq!(before_close, 2, "two alive entries before close");
         // close shuts the loops down + flushes the dead queue.
-        native_vertx_close(&mut ctx, &[Value::Object(Some(mirror))])
-            .expect("close");
+        native_vertx_close(&mut ctx, &[Value::Object(Some(mirror))]).expect("close");
         // Wait for the OS threads to actually exit + close to flush.
         // close() calls flush once at the end; if exit races we might
         // need to flush a second time. Poll for up to 1 s.
@@ -2131,7 +2175,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(alive_after, 0, "all threads must be marked dead after close");
+        assert_eq!(
+            alive_after, 0,
+            "all threads must be marked dead after close"
+        );
     }
 
     /// **T19_K2-7** — `spawn_vertx_event_loop` (the legacy variant
@@ -2168,8 +2215,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-8", true)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-8", true).expect("spawn");
         let last = ctx.registered_native_threads().last().cloned().unwrap();
         assert_eq!(last.0, "k2-test-8");
         assert!(last.1, "daemon flag must be true");
@@ -2239,10 +2285,11 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-11", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-11", false).expect("spawn");
         for _ in 0..200 {
-            if el.loop_thread_id.load(Ordering::Acquire) != 0 { break; }
+            if el.loop_thread_id.load(Ordering::Acquire) != 0 {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
         let observed_id = Arc::new(AtomicU64::new(0));
@@ -2276,8 +2323,7 @@ mod tests {
         let _guard = dead_queue_guard();
         // Push synthetic ids by spawning + shutting down.
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-12", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-12", false).expect("spawn");
         shutdown_vertx_loop(el.id as i64);
         // Wait until the trampoline has run.
         let deadline = Instant::now() + Duration::from_millis(1_000);
@@ -2321,8 +2367,8 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-test-1", false)
-            .expect("spawn_with_ctx");
+        let el =
+            spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-test-1", false).expect("spawn_with_ctx");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         assert_ne!(vm_tid, 0, "vm_thread_id must be set");
         // The mock should have recorded the mirror pointer.
@@ -2347,8 +2393,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-name-test", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-name-test", false).expect("spawn");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         let mirror_ptr_usize = ctx.native_thread_java_obj_ptr(vm_tid);
         assert_ne!(mirror_ptr_usize, 0);
@@ -2358,7 +2403,10 @@ mod tests {
             other => panic!("name slot must hold a String ref, got {other:?}"),
         };
         let read = ctx.read_string(name_obj).expect("string");
-        assert_eq!(read, "k4-name-test", "Thread mirror name must equal the loop name");
+        assert_eq!(
+            read, "k4-name-test",
+            "Thread mirror name must equal the loop name"
+        );
         shutdown_vertx_loop(el.id as i64);
     }
 
@@ -2370,8 +2418,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-tid-test", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-tid-test", false).expect("spawn");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         assert_ne!(vm_tid, 0);
         let mirror_ptr = ctx.native_thread_java_obj_ptr(vm_tid);
@@ -2395,8 +2442,11 @@ mod tests {
         let mirror_obj = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let pool: i32 = 5;
         let before_thread_count = ctx.registered_native_threads().len();
-        native_vertx_init(&mut ctx, &[Value::Object(Some(mirror_obj)), Value::Int(pool)])
-            .expect("init");
+        native_vertx_init(
+            &mut ctx,
+            &[Value::Object(Some(mirror_obj)), Value::Int(pool)],
+        )
+        .expect("init");
         let after_thread_count = ctx.registered_native_threads().len();
         assert_eq!(after_thread_count - before_thread_count, pool as usize);
         // Collect the registered tids and assert each has a distinct mirror.
@@ -2447,8 +2497,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-non-daemon", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-non-daemon", false).expect("spawn");
         let entries = ctx.registered_native_threads();
         let last = entries.last().unwrap();
         assert_eq!(last.0, "k4-non-daemon");
@@ -2469,8 +2518,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-daemon-true", true)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-daemon-true", true).expect("spawn");
         let vm_tid = el.vm_thread_id.load(Ordering::Acquire);
         let ptr = ctx.native_thread_java_obj_ptr(vm_tid);
         assert_ne!(ptr, 0, "daemon=true must still attach a mirror");
@@ -2504,8 +2552,7 @@ mod tests {
         // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-stable-ptr", false)
-            .expect("spawn");
+        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-stable-ptr", false).expect("spawn");
         let initial = el.java_thread_mirror_ptr.load(Ordering::Acquire);
         assert_ne!(initial, 0);
         // Wait for loop to claim its thread id so the next checks
@@ -2551,7 +2598,12 @@ mod tests {
         }
         // All 4 must be distinct.
         let unique: std::collections::HashSet<_> = ptrs.iter().copied().collect();
-        assert_eq!(unique.len(), 4, "all 4 mirrors must be distinct: {:?}", ptrs);
+        assert_eq!(
+            unique.len(),
+            4,
+            "all 4 mirrors must be distinct: {:?}",
+            ptrs
+        );
         native_vertx_close(&mut ctx, &[Value::Object(Some(m_a))]).ok();
         native_vertx_close(&mut ctx, &[Value::Object(Some(m_b))]).ok();
     }
@@ -2568,8 +2620,8 @@ mod tests {
         // waiting for its own shutdown event; serialize + reset.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-shutdown-keep", false)
-            .expect("spawn");
+        let el =
+            spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-shutdown-keep", false).expect("spawn");
         let mirror_before = el.java_thread_mirror_ptr.load(Ordering::Acquire);
         assert_ne!(mirror_before, 0);
         shutdown_vertx_loop(el.id as i64);

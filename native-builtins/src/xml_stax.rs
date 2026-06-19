@@ -304,7 +304,13 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
     let mut events: Vec<StaxEvent> = Vec::new();
     // START_DOCUMENT sits at the very start of the source (line 1, col 1, offset 0).
     let (l0, c0) = line_col_of(bytes, 0);
-    events.push(StaxEvent { kind: START_DOCUMENT, line: l0, column: c0, char_offset: 0, ..Default::default() });
+    events.push(StaxEvent {
+        kind: START_DOCUMENT,
+        line: l0,
+        column: c0,
+        char_offset: 0,
+        ..Default::default()
+    });
     // Lexical namespace-scope stack (default + prefixed) maintained across the
     // whole document so descendant elements inherit ancestor xmlns decls.
     let mut scopes = NsScopes::default();
@@ -342,8 +348,7 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 // Self-closing: push the scope only for the duration of
                 // resolving this element, then pop immediately (no children).
                 scopes.push_from_attrs(e.attributes());
-                let start_ev =
-                    make_element_event(START_ELEMENT, &name, e.attributes(), &scopes);
+                let start_ev = make_element_event(START_ELEMENT, &name, e.attributes(), &scopes);
                 let ns = start_ev.namespace_uri.clone();
                 let prefix = start_ev.prefix.clone();
                 events.push(start_ev);
@@ -372,9 +377,10 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 scopes.pop();
             }
             Ok(QXmlEvent::Text(e)) => {
-                let raw = e.unescape().map(|c| c.into_owned()).unwrap_or_else(|_| {
-                    String::from_utf8_lossy(e.as_ref()).into_owned()
-                });
+                let raw = e
+                    .unescape()
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(e.as_ref()).into_owned());
                 // Suppress prolog/epilog whitespace — text that appears OUTSIDE
                 // the root element (scope stack empty). The JDK StAX reader does
                 // not report misc/epilog whitespace as a CHARACTERS event, so
@@ -385,16 +391,28 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 if scopes.frames.is_empty() && raw.trim().is_empty() {
                     // drop epilog/prolog whitespace
                 } else {
-                    events.push(StaxEvent { kind: CHARACTERS, text: raw, ..Default::default() });
+                    events.push(StaxEvent {
+                        kind: CHARACTERS,
+                        text: raw,
+                        ..Default::default()
+                    });
                 }
             }
             Ok(QXmlEvent::CData(e)) => {
                 let s = String::from_utf8_lossy(e.as_ref()).into_owned();
-                events.push(StaxEvent { kind: CDATA, text: s, ..Default::default() });
+                events.push(StaxEvent {
+                    kind: CDATA,
+                    text: s,
+                    ..Default::default()
+                });
             }
             Ok(QXmlEvent::Comment(e)) => {
                 let s = String::from_utf8_lossy(e.as_ref()).into_owned();
-                events.push(StaxEvent { kind: COMMENT, text: s, ..Default::default() });
+                events.push(StaxEvent {
+                    kind: COMMENT,
+                    text: s,
+                    ..Default::default()
+                });
             }
             Ok(QXmlEvent::PI(e)) => {
                 let s = String::from_utf8_lossy(e.as_ref()).into_owned();
@@ -409,7 +427,11 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
             }
             Ok(QXmlEvent::DocType(e)) => {
                 let s = String::from_utf8_lossy(e.as_ref()).into_owned();
-                events.push(StaxEvent { kind: DTD, text: s, ..Default::default() });
+                events.push(StaxEvent {
+                    kind: DTD,
+                    text: s,
+                    ..Default::default()
+                });
             }
             Ok(QXmlEvent::Eof) => break,
             Err(_) => break,
@@ -427,7 +449,13 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
 
     let end_off = bytes.len() as i32;
     let (le, ce) = line_col_of(bytes, bytes.len());
-    events.push(StaxEvent { kind: END_DOCUMENT, line: le, column: ce, char_offset: end_off, ..Default::default() });
+    events.push(StaxEvent {
+        kind: END_DOCUMENT,
+        line: le,
+        column: ce,
+        char_offset: end_off,
+        ..Default::default()
+    });
     events
 }
 
@@ -461,7 +489,8 @@ fn make_element_event(
             ev.namespaces.push((String::new(), val));
             continue;
         } else if let Some(p) = key.strip_prefix(b"xmlns:") {
-            ev.namespaces.push((String::from_utf8_lossy(p).into_owned(), val));
+            ev.namespaces
+                .push((String::from_utf8_lossy(p).into_owned(), val));
             continue;
         }
         // Per the Namespaces-in-XML spec, an UNPREFIXED attribute has NO
@@ -565,7 +594,10 @@ fn this_obj(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     }
 }
 
-fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_synthetic(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Ensure the class is loaded so `class_id_by_name` returns a hit.
     let _ = ctx.load_class(class_name)?;
     let cid = ctx.class_id_by_name(class_name).ok_or_else(|| {
@@ -725,7 +757,12 @@ fn make_cursor_reader(
 fn drain_reader_to_string(ctx: &mut dyn NativeContext, reader_in: ObjectRef) -> String {
     let mut text = String::new();
     loop {
-        let res = ctx.invoke("java/io/Reader", "read", "()I", &[Value::Object(Some(reader_in))]);
+        let res = ctx.invoke(
+            "java/io/Reader",
+            "read",
+            "()I",
+            &[Value::Object(Some(reader_in))],
+        );
         match res {
             Ok(Some(Value::Int(-1))) => break,
             Ok(Some(Value::Int(c))) => {
@@ -964,12 +1001,9 @@ fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) 
             {
                 let n = dom_int(ctx, attrs, "getLength");
                 for i in 0..n {
-                    if let Ok(Some(Value::Object(Some(attr)))) = ctx.invoke_virtual(
-                        attrs,
-                        "item",
-                        "(I)Lorg/w3c/dom/Node;",
-                        &[Value::Int(i)],
-                    ) {
+                    if let Ok(Some(Value::Object(Some(attr)))) =
+                        ctx.invoke_virtual(attrs, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
+                    {
                         let an = dom_str(ctx, attr, "getNodeName");
                         let av = dom_str(ctx, attr, "getNodeValue");
                         if !an.is_empty() {
@@ -989,12 +1023,9 @@ fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) 
             {
                 let cn = dom_int(ctx, nl, "getLength");
                 for i in 0..cn {
-                    if let Ok(Some(Value::Object(Some(child)))) = ctx.invoke_virtual(
-                        nl,
-                        "item",
-                        "(I)Lorg/w3c/dom/Node;",
-                        &[Value::Int(i)],
-                    ) {
+                    if let Ok(Some(Value::Object(Some(child)))) =
+                        ctx.invoke_virtual(nl, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
+                    {
                         inner.push_str(&serialize_dom_node(ctx, child, depth + 1));
                     }
                 }
@@ -1022,12 +1053,9 @@ fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) 
             {
                 let cn = dom_int(ctx, nl, "getLength");
                 for i in 0..cn {
-                    if let Ok(Some(Value::Object(Some(child)))) = ctx.invoke_virtual(
-                        nl,
-                        "item",
-                        "(I)Lorg/w3c/dom/Node;",
-                        &[Value::Int(i)],
-                    ) {
+                    if let Ok(Some(Value::Object(Some(child)))) =
+                        ctx.invoke_virtual(nl, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
+                    {
                         out.push_str(&serialize_dom_node(ctx, child, depth + 1));
                     }
                 }
@@ -1149,15 +1177,21 @@ fn native_is_attribute_specified(
 /// payload (we store the whole PI text in `local_name`).
 fn native_get_pi_target(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     current_string(ctx, args, |e| {
-        e.local_name.split_whitespace().next().unwrap_or("").to_string()
+        e.local_name
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
     })
 }
 
 /// `XMLStreamReader.getPIData()` — PI payload after the target token.
 fn native_get_pi_data(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    current_string(ctx, args, |e| match e.local_name.split_once(char::is_whitespace) {
-        Some((_, data)) => data.trim_start().to_string(),
-        None => String::new(),
+    current_string(ctx, args, |e| {
+        match e.local_name.split_once(char::is_whitespace) {
+            Some((_, data)) => data.trim_start().to_string(),
+            None => String::new(),
+        }
     })
 }
 
@@ -1186,8 +1220,10 @@ fn native_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn native_get_event_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let kind = with_state(ctx, this, |s| s.current().map(|e| e.kind).unwrap_or(START_DOCUMENT))
-        .unwrap_or(START_DOCUMENT);
+    let kind = with_state(ctx, this, |s| {
+        s.current().map(|e| e.kind).unwrap_or(START_DOCUMENT)
+    })
+    .unwrap_or(START_DOCUMENT);
     Ok(Some(Value::Int(kind)))
 }
 
@@ -1211,7 +1247,10 @@ fn native_get_text(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     current_string(ctx, args, |e| e.text.clone())
 }
 
-fn native_get_namespace_uri_noargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_namespace_uri_noargs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     current_string(ctx, args, |e| e.namespace_uri.clone())
 }
 
@@ -1234,9 +1273,7 @@ fn native_get_attribute_value_named(
         st.current().and_then(|e| {
             e.attributes
                 .iter()
-                .find(|a| {
-                    a.local_name == local && (ns.is_empty() || a.namespace_uri == ns)
-                })
+                .find(|a| a.local_name == local && (ns.is_empty() || a.namespace_uri == ns))
                 .map(|a| a.value.clone())
         })
     })
@@ -1311,8 +1348,10 @@ fn native_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 fn native_is_kind(ctx: &mut dyn NativeContext, args: &[Value], expected: i32) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let yes = with_state(ctx, this, |st| st.current().map(|e| e.kind == expected).unwrap_or(false))
-        .unwrap_or(false);
+    let yes = with_state(ctx, this, |st| {
+        st.current().map(|e| e.kind == expected).unwrap_or(false)
+    })
+    .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
 }
 
@@ -1723,9 +1762,24 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // and derive 1-based line/column from the source bytes. `getLocation()` stamps
     // the current event's (line, column, offset) into a side-table keyed by the
     // Location object, and these accessors read it back — real position data.
-    registry.register("javax/xml/stream/Location", "getLineNumber", "()I", native_loc_line);
-    registry.register("javax/xml/stream/Location", "getColumnNumber", "()I", native_loc_column);
-    registry.register("javax/xml/stream/Location", "getCharacterOffset", "()I", native_loc_offset);
+    registry.register(
+        "javax/xml/stream/Location",
+        "getLineNumber",
+        "()I",
+        native_loc_line,
+    );
+    registry.register(
+        "javax/xml/stream/Location",
+        "getColumnNumber",
+        "()I",
+        native_loc_column,
+    );
+    registry.register(
+        "javax/xml/stream/Location",
+        "getCharacterOffset",
+        "()I",
+        native_loc_offset,
+    );
     // FLAG: getPublicId/getSystemId remain null. quick-xml does NOT track a
     // public/system identifier for the source, and our reader is fed from raw
     // bytes / an InputStream with no associated SYSTEM URI, so there is no real
@@ -1733,8 +1787,18 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // id is permitted. Left as null deliberately (not a fabricated value).
     let null_str: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Object(None)));
-    registry.register("javax/xml/stream/Location", "getPublicId", "()Ljava/lang/String;", null_str);
-    registry.register("javax/xml/stream/Location", "getSystemId", "()Ljava/lang/String;", null_str);
+    registry.register(
+        "javax/xml/stream/Location",
+        "getPublicId",
+        "()Ljava/lang/String;",
+        null_str,
+    );
+    registry.register(
+        "javax/xml/stream/Location",
+        "getSystemId",
+        "()Ljava/lang/String;",
+        null_str,
+    );
     registry.set_category(__prev_cat);
 }
 
@@ -1828,11 +1892,9 @@ fn native_get_element_text(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_get_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let (local, ns) = with_state(ctx, this, |s| {
-        match s.current() {
-            Some(e) => (e.local_name.clone(), e.namespace_uri.clone()),
-            None => (String::new(), String::new()),
-        }
+    let (local, ns) = with_state(ctx, this, |s| match s.current() {
+        Some(e) => (e.local_name.clone(), e.namespace_uri.clone()),
+        None => (String::new(), String::new()),
     })
     .unwrap_or_default();
     let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
@@ -1848,18 +1910,23 @@ fn native_get_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn native_get_attr_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let idx = args.get(1).and_then(|v| match v {
-        Value::Int(n) => Some(*n as usize),
-        _ => None,
-    }).unwrap_or(0);
-    let (local, ns, prefix) = with_state(ctx, this, |s| {
-        match s.current() {
-            Some(e) if idx < e.attributes.len() => {
-                let a = &e.attributes[idx];
-                (a.local_name.clone(), a.namespace_uri.clone(), a.prefix.clone())
-            }
-            _ => (String::new(), String::new(), String::new()),
+    let idx = args
+        .get(1)
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let (local, ns, prefix) = with_state(ctx, this, |s| match s.current() {
+        Some(e) if idx < e.attributes.len() => {
+            let a = &e.attributes[idx];
+            (
+                a.local_name.clone(),
+                a.namespace_uri.clone(),
+                a.prefix.clone(),
+            )
         }
+        _ => (String::new(), String::new(), String::new()),
     })
     .unwrap_or_default();
     let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
@@ -1877,15 +1944,16 @@ fn native_get_attr_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_get_attr_namespace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let idx = args.get(1).and_then(|v| match v {
-        Value::Int(n) => Some(*n as usize),
-        _ => None,
-    }).unwrap_or(0);
-    let ns = with_state(ctx, this, |s| {
-        match s.current() {
-            Some(e) if idx < e.attributes.len() => e.attributes[idx].namespace_uri.clone(),
-            _ => String::new(),
-        }
+    let idx = args
+        .get(1)
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let ns = with_state(ctx, this, |s| match s.current() {
+        Some(e) if idx < e.attributes.len() => e.attributes[idx].namespace_uri.clone(),
+        _ => String::new(),
     })
     .unwrap_or_default();
     Ok(Some(Value::Object(Some(ctx.create_string(&ns)))))
@@ -1906,7 +1974,10 @@ fn native_get_namespace_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 /// `XMLStreamReader.getNamespaceURI(int)` — URI of the i-th namespace
 /// declaration on the current element.
-fn native_get_namespace_uri_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_namespace_uri_indexed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
     let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
@@ -1921,7 +1992,10 @@ fn native_get_namespace_uri_indexed(ctx: &mut dyn NativeContext, args: &[Value])
 /// `XMLStreamReader.getNamespacePrefix(int)` — prefix of the i-th namespace
 /// declaration on the current element. The default namespace (`xmlns="…"`) is
 /// reported as `""`; `fillNamespaceAttributes` treats `""`/null identically.
-fn native_get_namespace_prefix_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_namespace_prefix_indexed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
     let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
@@ -1937,7 +2011,10 @@ fn native_has_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = this_obj(args)?;
     require_state(ctx, this)?;
     let has = with_state(ctx, this, |s| {
-        matches!(s.current().map(|e| e.kind), Some(START_ELEMENT) | Some(END_ELEMENT))
+        matches!(
+            s.current().map(|e| e.kind),
+            Some(START_ELEMENT) | Some(END_ELEMENT)
+        )
     })
     .unwrap_or(false);
     Ok(Some(Value::Int(if has { 1 } else { 0 })))
@@ -1949,7 +2026,12 @@ fn native_has_text(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let has = with_state(ctx, this, |s| {
         matches!(
             s.current().map(|e| e.kind),
-            Some(CHARACTERS) | Some(CDATA) | Some(COMMENT) | Some(SPACE) | Some(DTD) | Some(ENTITY_REFERENCE)
+            Some(CHARACTERS)
+                | Some(CDATA)
+                | Some(COMMENT)
+                | Some(SPACE)
+                | Some(DTD)
+                | Some(ENTITY_REFERENCE)
         )
     })
     .unwrap_or(false);
@@ -1959,10 +2041,13 @@ fn native_has_text(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
     require_state(ctx, this)?;
-    let expected_type = args.get(1).and_then(|v| match v {
-        Value::Int(n) => Some(*n),
-        _ => None,
-    }).unwrap_or(-1);
+    let expected_type = args
+        .get(1)
+        .and_then(|v| match v {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(-1);
     let expected_ns = match args.get(2) {
         Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
         _ => None,
@@ -1971,12 +2056,11 @@ fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
         _ => None,
     };
-    let (cur_kind, cur_local, cur_ns) = with_state(ctx, this, |s| {
-        match s.current() {
-            Some(e) => (e.kind, e.local_name.clone(), e.namespace_uri.clone()),
-            None => (END_DOCUMENT, String::new(), String::new()),
-        }
-    }).unwrap_or((END_DOCUMENT, String::new(), String::new()));
+    let (cur_kind, cur_local, cur_ns) = with_state(ctx, this, |s| match s.current() {
+        Some(e) => (e.kind, e.local_name.clone(), e.namespace_uri.clone()),
+        None => (END_DOCUMENT, String::new(), String::new()),
+    })
+    .unwrap_or((END_DOCUMENT, String::new(), String::new()));
     let mismatched_type = expected_type >= 0 && cur_kind != expected_type;
     let mismatched_local = matches!(&expected_local, Some(l) if !l.is_empty() && *l != cur_local);
     let mismatched_ns = matches!(&expected_ns, Some(n) if !n.is_empty() && *n != cur_ns);
@@ -1991,10 +2075,9 @@ fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // surface as IllegalStateException so callers see a clear failure
         // (XMLStreamException is checked but WildFly's catch blocks wrap it
         // into ParseException anyway).
-        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-            message: msg,
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalStateException { message: msg }.into(),
+        );
     }
     Ok(None)
 }

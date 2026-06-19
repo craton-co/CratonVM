@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
+use crate::alloc_concurrent_synthetic;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::Value;
-use crate::alloc_concurrent_synthetic;
 
 // ===========================================================================
 // Handshake type constants (RFC 8446 Section 4)
@@ -225,16 +225,16 @@ pub struct CertificateEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsExtension {
-    ServerName(String),                          // type 0
-    MaxFragmentLength(u8),                       // type 1
-    SupportedGroups(Vec<NamedGroup>),            // type 10
+    ServerName(String),                           // type 0
+    MaxFragmentLength(u8),                        // type 1
+    SupportedGroups(Vec<NamedGroup>),             // type 10
     SignatureAlgorithms(Vec<SignatureAlgorithm>), // type 13
-    Alpn(Vec<String>),                           // type 16
-    PreSharedKey(Vec<PskIdentity>),              // type 41
-    EarlyData,                                   // type 42
-    SupportedVersions(Vec<u16>),                 // type 43
-    PskKeyExchangeModes(Vec<u8>),                // type 45
-    KeyShare(Vec<KeyShareEntry>),                // type 51
+    Alpn(Vec<String>),                            // type 16
+    PreSharedKey(Vec<PskIdentity>),               // type 41
+    EarlyData,                                    // type 42
+    SupportedVersions(Vec<u16>),                  // type 43
+    PskKeyExchangeModes(Vec<u8>),                 // type 45
+    KeyShare(Vec<KeyShareEntry>),                 // type 51
 }
 
 impl TlsExtension {
@@ -647,7 +647,11 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// HKDF-Extract using real HMAC-SHA256 (RFC 5869).
 fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
-    let salt = if salt.is_empty() { vec![0u8; 32] } else { salt.to_vec() };
+    let salt = if salt.is_empty() {
+        vec![0u8; 32]
+    } else {
+        salt.to_vec()
+    };
     hmac_sha256(&salt, ikm).to_vec()
 }
 
@@ -743,12 +747,7 @@ impl TlsKeySchedule {
     }
 
     /// Derive traffic keys (key + IV) from a traffic secret
-    pub fn derive_traffic_keys(
-        &self,
-        secret: &[u8],
-        key_len: usize,
-        iv_len: usize,
-    ) -> TrafficKeys {
+    pub fn derive_traffic_keys(&self, secret: &[u8], key_len: usize, iv_len: usize) -> TrafficKeys {
         let key = hkdf_expand(secret, b"key", key_len);
         let iv = hkdf_expand(secret, b"iv", iv_len);
         TrafficKeys { key, iv }
@@ -958,7 +957,12 @@ impl Tls13StateMachine {
     ) -> Result<Option<HandshakeMessage>, TlsError> {
         match (&self.state, &message) {
             // Start -> send ClientHello, move to WaitServerHello
-            (TlsState::Start, HandshakeMessage::ClientHello { random, session_id, .. }) => {
+            (
+                TlsState::Start,
+                HandshakeMessage::ClientHello {
+                    random, session_id, ..
+                },
+            ) => {
                 self.client_random = *random;
                 self.session_id = *session_id;
                 self.update_transcript(HT_CLIENT_HELLO);
@@ -966,7 +970,15 @@ impl Tls13StateMachine {
                 Ok(Some(message))
             }
             // WaitServerHello -> receive ServerHello
-            (TlsState::WaitServerHello, HandshakeMessage::ServerHello { random, session_id, cipher_suite, extensions }) => {
+            (
+                TlsState::WaitServerHello,
+                HandshakeMessage::ServerHello {
+                    random,
+                    session_id,
+                    cipher_suite,
+                    extensions,
+                },
+            ) => {
                 self.server_random = *random;
                 self.session_id = *session_id;
                 self.cipher_suite = *cipher_suite;
@@ -983,7 +995,10 @@ impl Tls13StateMachine {
                 Ok(None)
             }
             // WaitEncryptedExtensions -> receive EncryptedExtensions
-            (TlsState::WaitEncryptedExtensions, HandshakeMessage::EncryptedExtensions { extensions }) => {
+            (
+                TlsState::WaitEncryptedExtensions,
+                HandshakeMessage::EncryptedExtensions { extensions },
+            ) => {
                 // Process extensions (e.g., ALPN)
                 for ext in extensions {
                     if let TlsExtension::Alpn(protocols) = ext {
@@ -1018,9 +1033,7 @@ impl Tls13StateMachine {
                 }))
             }
             // Connected -> can receive NewSessionTicket
-            (TlsState::Connected, HandshakeMessage::NewSessionTicket { .. }) => {
-                Ok(None)
-            }
+            (TlsState::Connected, HandshakeMessage::NewSessionTicket { .. }) => Ok(None),
             // Connected -> can receive KeyUpdate
             (TlsState::Connected, HandshakeMessage::KeyUpdate { request_update }) => {
                 if *request_update {
@@ -1056,7 +1069,15 @@ impl Tls13StateMachine {
             // EncryptedExtensions, Certificate, CertificateVerify, server Finished)
             // in one conceptual flight, and wait for the client's Finished.
             // Per RFC 8446 §A.2: RECVD_CH → NEGOTIATED → WAIT_FLIGHT2 → WAIT_FINISHED.
-            (TlsState::Start, HandshakeMessage::ClientHello { random, session_id, cipher_suites, extensions }) => {
+            (
+                TlsState::Start,
+                HandshakeMessage::ClientHello {
+                    random,
+                    session_id,
+                    cipher_suites,
+                    extensions,
+                },
+            ) => {
                 self.client_random = *random;
                 self.session_id = *session_id;
                 // Select first mutually supported cipher suite
@@ -1133,12 +1154,13 @@ impl Tls13StateMachine {
 // Native method implementations
 // ===========================================================================
 
-use std::sync::Mutex;
 use std::collections::HashMap as TlsHashMap;
+use std::sync::Mutex;
 
 /// Global store of TLS state machines keyed by SSLEngine object address.
 fn tls_engines() -> &'static Mutex<TlsHashMap<usize, Tls13StateMachine>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<TlsHashMap<usize, Tls13StateMachine>>> = std::sync::OnceLock::new();
+    static INSTANCE: std::sync::OnceLock<Mutex<TlsHashMap<usize, Tls13StateMachine>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(TlsHashMap::new()))
 }
 
@@ -1151,7 +1173,9 @@ fn native_ssl_engine_do_handshake(
         _ => return Ok(Some(Value::Int(0))),
     };
     let mut engines = tls_engines().lock().unwrap();
-    let engine = engines.entry(addr).or_insert_with(Tls13StateMachine::new_client);
+    let engine = engines
+        .entry(addr)
+        .or_insert_with(Tls13StateMachine::new_client);
     // If already connected, return 0 (success); if in Start, initiate handshake
     match &engine.state {
         TlsState::Connected => Ok(Some(Value::Int(0))),
@@ -1381,10 +1405,22 @@ mod tests {
 
     #[test]
     fn test_cipher_suite_from_code_valid() {
-        assert_eq!(CipherSuite::from_code(0x1301), Some(CipherSuite::TlsAes128GcmSha256));
-        assert_eq!(CipherSuite::from_code(0x1302), Some(CipherSuite::TlsAes256GcmSha384));
-        assert_eq!(CipherSuite::from_code(0x1303), Some(CipherSuite::TlsChacha20Poly1305Sha256));
-        assert_eq!(CipherSuite::from_code(0x1304), Some(CipherSuite::TlsAes128CcmSha256));
+        assert_eq!(
+            CipherSuite::from_code(0x1301),
+            Some(CipherSuite::TlsAes128GcmSha256)
+        );
+        assert_eq!(
+            CipherSuite::from_code(0x1302),
+            Some(CipherSuite::TlsAes256GcmSha384)
+        );
+        assert_eq!(
+            CipherSuite::from_code(0x1303),
+            Some(CipherSuite::TlsChacha20Poly1305Sha256)
+        );
+        assert_eq!(
+            CipherSuite::from_code(0x1304),
+            Some(CipherSuite::TlsAes128CcmSha256)
+        );
     }
 
     #[test]
@@ -1395,8 +1431,14 @@ mod tests {
 
     #[test]
     fn test_cipher_suite_name() {
-        assert_eq!(CipherSuite::TlsAes128GcmSha256.name(), "TLS_AES_128_GCM_SHA256");
-        assert_eq!(CipherSuite::TlsAes256GcmSha384.name(), "TLS_AES_256_GCM_SHA384");
+        assert_eq!(
+            CipherSuite::TlsAes128GcmSha256.name(),
+            "TLS_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            CipherSuite::TlsAes256GcmSha384.name(),
+            "TLS_AES_256_GCM_SHA384"
+        );
     }
 
     #[test]
@@ -1446,7 +1488,12 @@ mod tests {
 
     #[test]
     fn test_named_group_roundtrip() {
-        for &ng in &[NamedGroup::X25519, NamedGroup::Secp256r1, NamedGroup::Secp384r1, NamedGroup::X448] {
+        for &ng in &[
+            NamedGroup::X25519,
+            NamedGroup::Secp256r1,
+            NamedGroup::Secp384r1,
+            NamedGroup::X448,
+        ] {
             assert_eq!(NamedGroup::from_code(ng.code()), Some(ng));
         }
     }
@@ -1463,7 +1510,10 @@ mod tests {
 
     #[test]
     fn test_sig_alg_from_code() {
-        assert_eq!(SignatureAlgorithm::from_code(0x0401), Some(SignatureAlgorithm::RsaPkcs1Sha256));
+        assert_eq!(
+            SignatureAlgorithm::from_code(0x0401),
+            Some(SignatureAlgorithm::RsaPkcs1Sha256)
+        );
         assert_eq!(SignatureAlgorithm::from_code(0x0000), None);
     }
 
@@ -1511,10 +1561,16 @@ mod tests {
     fn test_extension_type_all_variants() {
         assert_eq!(TlsExtension::MaxFragmentLength(1).extension_type(), 1);
         assert_eq!(TlsExtension::SupportedGroups(vec![]).extension_type(), 10);
-        assert_eq!(TlsExtension::SignatureAlgorithms(vec![]).extension_type(), 13);
+        assert_eq!(
+            TlsExtension::SignatureAlgorithms(vec![]).extension_type(),
+            13
+        );
         assert_eq!(TlsExtension::PreSharedKey(vec![]).extension_type(), 41);
         assert_eq!(TlsExtension::EarlyData.extension_type(), 42);
-        assert_eq!(TlsExtension::PskKeyExchangeModes(vec![]).extension_type(), 45);
+        assert_eq!(
+            TlsExtension::PskKeyExchangeModes(vec![]).extension_type(),
+            45
+        );
     }
 
     // --- ContentType tests ---
@@ -1553,7 +1609,9 @@ mod tests {
         };
         assert_eq!(sh.msg_type(), HT_SERVER_HELLO);
 
-        let fin = HandshakeMessage::Finished { verify_data: vec![] };
+        let fin = HandshakeMessage::Finished {
+            verify_data: vec![],
+        };
         assert_eq!(fin.msg_type(), HT_FINISHED);
     }
 
@@ -1576,11 +1634,18 @@ mod tests {
             HT_CERTIFICATE_VERIFY
         );
         assert_eq!(
-            HandshakeMessage::NewSessionTicket { lifetime: 0, ticket: vec![] }.msg_type(),
+            HandshakeMessage::NewSessionTicket {
+                lifetime: 0,
+                ticket: vec![]
+            }
+            .msg_type(),
             HT_NEW_SESSION_TICKET
         );
         assert_eq!(
-            HandshakeMessage::KeyUpdate { request_update: false }.msg_type(),
+            HandshakeMessage::KeyUpdate {
+                request_update: false
+            }
+            .msg_type(),
             HT_KEY_UPDATE
         );
     }
@@ -1612,8 +1677,14 @@ mod tests {
 
     #[test]
     fn test_alert_desc_from_code() {
-        assert_eq!(AlertDescription::from_code(0), Some(AlertDescription::CloseNotify));
-        assert_eq!(AlertDescription::from_code(40), Some(AlertDescription::HandshakeFailure));
+        assert_eq!(
+            AlertDescription::from_code(0),
+            Some(AlertDescription::CloseNotify)
+        );
+        assert_eq!(
+            AlertDescription::from_code(40),
+            Some(AlertDescription::HandshakeFailure)
+        );
         assert_eq!(AlertDescription::from_code(255), None);
     }
 
@@ -1915,41 +1986,53 @@ mod tests {
     fn test_session_cache_count() {
         let mut cache = SessionCache::new();
         assert_eq!(cache.count(), 0);
-        cache.store(vec![1], SessionTicket {
-            cipher_suite: CipherSuite::TlsAes128GcmSha256,
-            resumption_secret: vec![],
-            lifetime: 100,
-            created_at: 0,
-            sni: None,
-        });
+        cache.store(
+            vec![1],
+            SessionTicket {
+                cipher_suite: CipherSuite::TlsAes128GcmSha256,
+                resumption_secret: vec![],
+                lifetime: 100,
+                created_at: 0,
+                sni: None,
+            },
+        );
         assert_eq!(cache.count(), 1);
-        cache.store(vec![2], SessionTicket {
-            cipher_suite: CipherSuite::TlsAes128GcmSha256,
-            resumption_secret: vec![],
-            lifetime: 100,
-            created_at: 0,
-            sni: None,
-        });
+        cache.store(
+            vec![2],
+            SessionTicket {
+                cipher_suite: CipherSuite::TlsAes128GcmSha256,
+                resumption_secret: vec![],
+                lifetime: 100,
+                created_at: 0,
+                sni: None,
+            },
+        );
         assert_eq!(cache.count(), 2);
     }
 
     #[test]
     fn test_session_cache_cleanup_expired() {
         let mut cache = SessionCache::new();
-        cache.store(vec![1], SessionTicket {
-            cipher_suite: CipherSuite::TlsAes128GcmSha256,
-            resumption_secret: vec![],
-            lifetime: 100,
-            created_at: 1000,
-            sni: None,
-        });
-        cache.store(vec![2], SessionTicket {
-            cipher_suite: CipherSuite::TlsAes128GcmSha256,
-            resumption_secret: vec![],
-            lifetime: 100,
-            created_at: 5000,
-            sni: None,
-        });
+        cache.store(
+            vec![1],
+            SessionTicket {
+                cipher_suite: CipherSuite::TlsAes128GcmSha256,
+                resumption_secret: vec![],
+                lifetime: 100,
+                created_at: 1000,
+                sni: None,
+            },
+        );
+        cache.store(
+            vec![2],
+            SessionTicket {
+                cipher_suite: CipherSuite::TlsAes128GcmSha256,
+                resumption_secret: vec![],
+                lifetime: 100,
+                created_at: 5000,
+                sni: None,
+            },
+        );
         // At time 2000, ticket 1 (expires at 1100) is expired, ticket 2 (expires at 5100) is not
         let removed = cache.cleanup_expired(2000);
         assert_eq!(removed, 1);
@@ -1960,13 +2043,16 @@ mod tests {
     fn test_session_cache_max_entries_eviction() {
         let mut cache = SessionCache::with_capacity(2);
         for i in 0..3u8 {
-            cache.store(vec![i], SessionTicket {
-                cipher_suite: CipherSuite::TlsAes128GcmSha256,
-                resumption_secret: vec![i],
-                lifetime: 100,
-                created_at: 0,
-                sni: None,
-            });
+            cache.store(
+                vec![i],
+                SessionTicket {
+                    cipher_suite: CipherSuite::TlsAes128GcmSha256,
+                    resumption_secret: vec![i],
+                    lifetime: 100,
+                    created_at: 0,
+                    sni: None,
+                },
+            );
         }
         assert_eq!(cache.count(), 2);
     }
@@ -2062,10 +2148,8 @@ mod tests {
         assert_eq!(*sm.get_state(), TlsState::WaitEncryptedExtensions);
 
         // 3. Receive EncryptedExtensions
-        sm.advance(HandshakeMessage::EncryptedExtensions {
-            extensions: vec![],
-        })
-        .unwrap();
+        sm.advance(HandshakeMessage::EncryptedExtensions { extensions: vec![] })
+            .unwrap();
         assert_eq!(*sm.get_state(), TlsState::WaitCertificate);
 
         // 4. Receive Certificate
@@ -2128,7 +2212,12 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(resp, Some(HandshakeMessage::KeyUpdate { request_update: false })),
+            matches!(
+                resp,
+                Some(HandshakeMessage::KeyUpdate {
+                    request_update: false
+                })
+            ),
             "Expected KeyUpdate response with request_update=false, got {resp:?}"
         );
     }
@@ -2273,8 +2362,10 @@ mod tests {
             extensions: vec![],
         })
         .unwrap();
-        sm.advance(HandshakeMessage::Finished { verify_data: vec![] })
-            .unwrap();
+        sm.advance(HandshakeMessage::Finished {
+            verify_data: vec![],
+        })
+        .unwrap();
         assert!(sm.is_connected());
         let resp = sm
             .advance(HandshakeMessage::KeyUpdate {
@@ -2381,14 +2472,10 @@ mod tests {
             extensions: vec![],
         })
         .unwrap();
-        sm.advance(HandshakeMessage::EncryptedExtensions {
-            extensions: vec![],
-        })
-        .unwrap();
-        sm.advance(HandshakeMessage::Certificate {
-            cert_chain: vec![],
-        })
-        .unwrap();
+        sm.advance(HandshakeMessage::EncryptedExtensions { extensions: vec![] })
+            .unwrap();
+        sm.advance(HandshakeMessage::Certificate { cert_chain: vec![] })
+            .unwrap();
         sm.advance(HandshakeMessage::CertificateVerify {
             algorithm: SignatureAlgorithm::Ed25519,
             signature: vec![],
@@ -2419,7 +2506,9 @@ mod tests {
         assert!(resp.is_some()); // ServerHello (head of server flight)
         assert_eq!(server.state, TlsState::WaitFinished);
         // Client Finished
-        let fin = HandshakeMessage::Finished { verify_data: vec![0x02] };
+        let fin = HandshakeMessage::Finished {
+            verify_data: vec![0x02],
+        };
         let resp = server.advance(fin).unwrap();
         assert!(resp.is_some()); // Server Finished
         assert_eq!(server.state, TlsState::Connected);
@@ -2503,7 +2592,9 @@ mod tests {
         })
         .unwrap();
         let resp = sm
-            .advance(HandshakeMessage::Finished { verify_data: vec![] })
+            .advance(HandshakeMessage::Finished {
+                verify_data: vec![],
+            })
             .unwrap();
         assert!(resp.is_some());
         assert_eq!(*sm.get_state(), TlsState::Connected);
@@ -2565,10 +2656,14 @@ mod tests {
             extensions: vec![],
         })
         .unwrap();
-        sm.advance(HandshakeMessage::Finished { verify_data: vec![] })
-            .unwrap();
+        sm.advance(HandshakeMessage::Finished {
+            verify_data: vec![],
+        })
+        .unwrap();
         let resp = sm
-            .advance(HandshakeMessage::KeyUpdate { request_update: false })
+            .advance(HandshakeMessage::KeyUpdate {
+                request_update: false,
+            })
             .unwrap();
         // When request_update is false, no reply is required.
         assert!(resp.is_none());
@@ -2591,7 +2686,9 @@ mod tests {
 
     #[test]
     fn t19_9_mti_allowlist_accepts_chacha20() {
-        assert!(super::is_mti_cipher_suite(CipherSuite::TlsChacha20Poly1305Sha256));
+        assert!(super::is_mti_cipher_suite(
+            CipherSuite::TlsChacha20Poly1305Sha256
+        ));
     }
 
     #[test]
@@ -2606,8 +2703,7 @@ mod tests {
         // with_cipher_suite must transparently swap a non-MTI suite for the
         // default AES-128-GCM to prevent downgrade attacks at machine
         // construction time.
-        let sm = Tls13StateMachine::new_client()
-            .with_cipher_suite(CipherSuite::TlsAes128CcmSha256);
+        let sm = Tls13StateMachine::new_client().with_cipher_suite(CipherSuite::TlsAes128CcmSha256);
         assert_eq!(sm.cipher_suite, CipherSuite::TlsAes128GcmSha256);
     }
 
@@ -2627,8 +2723,20 @@ mod tests {
         use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         super::register_tls_impl_natives(&mut r);
-        assert!(r.find("javax/net/ssl/SSLContext", "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;").is_none());
-        assert!(r.find("javax/net/ssl/SSLContext", "createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;").is_none());
+        assert!(r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "createSSLEngine",
+                "()Ljavax/net/ssl/SSLEngine;"
+            )
+            .is_none());
+        assert!(r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "createSSLEngine",
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"
+            )
+            .is_none());
     }
 
     #[test]
@@ -2640,9 +2748,25 @@ mod tests {
         use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         super::register_tls_impl_natives(&mut r);
-        assert!(r.find("javax/net/ssl/SSLEngine", "doHandshake", "()I").is_some());
-        assert!(r.find("javax/net/ssl/SSLEngine", "getHandshakeStatus", "()I").is_some());
-        assert!(r.find("javax/net/ssl/SSLEngine", "getSelectedProtocol", "()Ljava/lang/String;").is_some());
-        assert!(r.find("javax/net/ssl/SSLEngine", "getSelectedCipher", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find("javax/net/ssl/SSLEngine", "doHandshake", "()I")
+            .is_some());
+        assert!(r
+            .find("javax/net/ssl/SSLEngine", "getHandshakeStatus", "()I")
+            .is_some());
+        assert!(r
+            .find(
+                "javax/net/ssl/SSLEngine",
+                "getSelectedProtocol",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "javax/net/ssl/SSLEngine",
+                "getSelectedCipher",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 }

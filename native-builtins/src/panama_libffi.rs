@@ -33,8 +33,8 @@
 //! caller can throw a proper Java exception on any classification
 //! failure rather than panicking.
 
-use libffi::middle::{Type as FfiType, Cif};
-use libffi::low::{ffi_cif, ffi_type, prep_cif_var, ffi_abi_FFI_DEFAULT_ABI};
+use libffi::low::{ffi_abi_FFI_DEFAULT_ABI, ffi_cif, ffi_type, prep_cif_var};
+use libffi::middle::{Cif, Type as FfiType};
 
 use cratonvm_native_api::{
     ffi::{

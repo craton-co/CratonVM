@@ -221,10 +221,7 @@ impl ZgcConcurrentMarkController {
     /// - On exit, `should_stop` was observed `true` AND the worker
     ///   performed one final drain pass so any straggler the coordinator
     ///   pushed between the last step and the stop signal is processed.
-    fn worker_loop(
-        collector: Arc<Mutex<ZgcCollector>>,
-        state: Arc<ZgcConcurrentMarkState>,
-    ) {
+    fn worker_loop(collector: Arc<Mutex<ZgcCollector>>, state: Arc<ZgcConcurrentMarkState>) {
         loop {
             // Drain under the budget. Take the lock for the step duration
             // only — release between steps so mutators / coordinator can
@@ -345,8 +342,7 @@ mod tests {
             assert_eq!(c.phase, ZgcPhase::PauseMarkStart);
         }
 
-        let controller =
-            ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
+        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
         assert!(controller.is_running(), "worker thread must be alive");
 
         // Let the worker step at least once.
@@ -374,8 +370,7 @@ mod tests {
             c.pause_mark_start();
         }
 
-        let controller =
-            ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
+        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
 
         // Give the worker time to drain + park.
         std::thread::sleep(Duration::from_millis(20));
@@ -454,8 +449,7 @@ mod tests {
         }
 
         // ── Phase 2: spawn worker, let it drive concurrent mark.
-        let controller =
-            ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
+        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
         // Poll until the worker has at least one step under its belt
         // (the small seeded root set drains in a single budget'd step).
         for _ in 0..50 {

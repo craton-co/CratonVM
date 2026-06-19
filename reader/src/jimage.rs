@@ -301,19 +301,9 @@ impl Header {
         };
         let read_u32 = |off: usize| -> u32 {
             if little_endian {
-                u32::from_le_bytes([
-                    bytes[off],
-                    bytes[off + 1],
-                    bytes[off + 2],
-                    bytes[off + 3],
-                ])
+                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
             } else {
-                u32::from_be_bytes([
-                    bytes[off],
-                    bytes[off + 1],
-                    bytes[off + 2],
-                    bytes[off + 3],
-                ])
+                u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
             }
         };
 
@@ -439,8 +429,7 @@ fn read_string(strings: &[u8], offset: u64) -> Result<&str, JImageError> {
         .iter()
         .position(|&b| b == 0)
         .ok_or(JImageError::BadStringOffset(off))?;
-    std::str::from_utf8(&remainder[..end])
-        .map_err(|_| JImageError::BadStringOffset(off))
+    std::str::from_utf8(&remainder[..end]).map_err(|_| JImageError::BadStringOffset(off))
 }
 
 // ---------------------------------------------------------------------------
@@ -805,18 +794,19 @@ pub mod test_builder {
     /// a negative redirect value, so the re-hash path is never exercised
     /// by the primary test. A second helper below forces the two-level
     /// path to exercise it independently.
-    pub fn build_simple(
-        resources: &[(&str, &str, &str, &str, &[u8])],
-    ) -> Vec<u8> {
-        build_with_options(resources, BuildOptions { force_rehash: false })
+    pub fn build_simple(resources: &[(&str, &str, &str, &str, &[u8])]) -> Vec<u8> {
+        build_with_options(
+            resources,
+            BuildOptions {
+                force_rehash: false,
+            },
+        )
     }
 
     /// As [`build_simple`], but forces every lookup to exercise the
     /// two-level re-hash path. Used to test that jimage_hash + the
     /// redirect-value seed agree with the C implementation.
-    pub fn build_with_rehash(
-        resources: &[(&str, &str, &str, &str, &[u8])],
-    ) -> Vec<u8> {
+    pub fn build_with_rehash(resources: &[(&str, &str, &str, &str, &[u8])]) -> Vec<u8> {
         build_with_options(resources, BuildOptions { force_rehash: true })
     }
 
@@ -839,9 +829,7 @@ pub mod test_builder {
             let needle = s.as_bytes();
             let mut i = 0;
             while i + needle.len() < strings.len() {
-                if strings[i + needle.len()] == 0
-                    && &strings[i..i + needle.len()] == needle
-                {
+                if strings[i + needle.len()] == 0 && &strings[i..i + needle.len()] == needle {
                     return i as u64;
                 }
                 // Skip to the next null-terminated entry.
@@ -957,8 +945,7 @@ pub mod test_builder {
                 offset_table[slot] = entries[entry_idx].1 as u32;
             }
             for (primary, members) in multis {
-                let (seed, slots) =
-                    find_group_seed(&entries, &members, &used, table_len);
+                let (seed, slots) = find_group_seed(&entries, &members, &used, table_len);
                 redirect[primary] = seed;
                 for (member_idx, slot) in members.iter().zip(slots.iter()) {
                     used[*slot] = true;
@@ -970,8 +957,7 @@ pub mod test_builder {
             // single-entry groups. This exercises the reader's seeded
             // re-hash branch even when there are no real collisions.
             for (primary, members) in groups {
-                let (seed, slots) =
-                    find_group_seed(&entries, &members, &used, table_len);
+                let (seed, slots) = find_group_seed(&entries, &members, &used, table_len);
                 redirect[primary] = seed;
                 for (member_idx, slot) in members.iter().zip(slots.iter()) {
                     used[*slot] = true;
@@ -983,11 +969,7 @@ pub mod test_builder {
         // 4. Assemble the file: header, redirect, offsets, locations,
         //    strings, resources.
         let mut out = Vec::with_capacity(
-            HEADER_SIZE
-                + table_len * 8
-                + locations.len()
-                + strings.len()
-                + rdata.len(),
+            HEADER_SIZE + table_len * 8 + locations.len() + strings.len() + rdata.len(),
         );
         // Header (little-endian).
         out.extend_from_slice(&JIMAGE_MAGIC.to_le_bytes());
@@ -1081,8 +1063,13 @@ pub mod test_builder {
 mod tests {
     use super::*;
 
-    fn sample_resources() -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static [u8])>
-    {
+    fn sample_resources() -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+    )> {
         vec![
             (
                 "java.base",
@@ -1148,7 +1135,10 @@ mod tests {
     #[test]
     fn header_parse_bad_magic() {
         let bytes = vec![0u8; HEADER_SIZE];
-        assert!(matches!(Header::parse(&bytes), Err(JImageError::BadMagic(_))));
+        assert!(matches!(
+            Header::parse(&bytes),
+            Err(JImageError::BadMagic(_))
+        ));
     }
 
     #[test]
@@ -1187,9 +1177,7 @@ mod tests {
             let got = reader
                 .find_class(module, &internal)
                 .expect("find_class error")
-                .unwrap_or_else(|| {
-                    panic!("missing resource /{module}/{internal}.class")
-                });
+                .unwrap_or_else(|| panic!("missing resource /{module}/{internal}.class"));
             assert_eq!(
                 got.as_slice(),
                 *bytes,

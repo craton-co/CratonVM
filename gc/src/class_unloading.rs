@@ -9,8 +9,8 @@
 //!
 //! System/bootstrap loaders are never unloaded.
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -157,7 +157,11 @@ impl ClassUnloader {
     /// Register a class loaded by a specific loader.
     pub fn register_class(&self, loader_addr: usize, class_info: ClassInfo) {
         let mut inner = self.inner.lock();
-        if let Some(loader) = inner.loaders.iter_mut().find(|l| l.loader_addr == loader_addr) {
+        if let Some(loader) = inner
+            .loaders
+            .iter_mut()
+            .find(|l| l.loader_addr == loader_addr)
+        {
             loader.metadata_bytes += class_info.metadata_bytes;
             let meta_bytes = class_info.metadata_bytes;
             loader.loaded_classes.push(class_info);
@@ -198,7 +202,11 @@ impl ClassUnloader {
     /// Mark a class loader as alive (called during GC marking phase).
     pub fn mark_loader_alive(&self, loader_addr: usize) {
         let mut inner = self.inner.lock();
-        if let Some(loader) = inner.loaders.iter_mut().find(|l| l.loader_addr == loader_addr) {
+        if let Some(loader) = inner
+            .loaders
+            .iter_mut()
+            .find(|l| l.loader_addr == loader_addr)
+        {
             loader.alive = true;
         }
     }
@@ -308,7 +316,9 @@ impl ClassUnloader {
         let classes_unloaded = classes.len();
 
         // Remove the unloaded loaders.
-        inner.loaders.retain(|l| !unreachable.contains(&l.loader_addr));
+        inner
+            .loaders
+            .retain(|l| !unreachable.contains(&l.loader_addr));
 
         // Update totals.
         inner.total_classes -= classes_unloaded;
@@ -362,7 +372,11 @@ impl ClassUnloader {
     /// Get a snapshot of a loader's data by address.
     pub fn get_loader(&self, addr: usize) -> Option<ClassLoaderData> {
         let inner = self.inner.lock();
-        inner.loaders.iter().find(|l| l.loader_addr == addr).cloned()
+        inner
+            .loaders
+            .iter()
+            .find(|l| l.loader_addr == addr)
+            .cloned()
     }
 
     /// Get all classes loaded by a specific loader.
@@ -564,7 +578,9 @@ mod tests {
     fn register_loader_and_verify() {
         let u = ClassUnloader::new();
         u.register_loader(0x100, "AppLoader", false);
-        let loader = u.get_loader(0x100).expect("class_unloading: expected loader at 0x100");
+        let loader = u
+            .get_loader(0x100)
+            .expect("class_unloading: expected loader at 0x100");
         assert_eq!(loader.name, "AppLoader");
         assert!(!loader.is_system_loader);
         assert_eq!(u.loader_count(), 1);
@@ -577,7 +593,9 @@ mod tests {
         u.register_class(0x100, make_class("com/example/Foo", 1, 512));
         assert_eq!(u.total_classes(), 1);
         assert_eq!(u.total_metadata_bytes(), 512);
-        let loader = u.get_loader(0x100).expect("class_unloading: expected loader at 0x100");
+        let loader = u
+            .get_loader(0x100)
+            .expect("class_unloading: expected loader at 0x100");
         assert_eq!(loader.metadata_bytes, 512);
         assert_eq!(loader.loaded_classes.len(), 1);
     }
@@ -679,7 +697,9 @@ mod tests {
         assert_eq!(cache[0].code_size, 2048);
         assert!(cache[0].valid);
         // Class should now be flagged as having JIT code.
-        let loader = u.get_loader(0x100).expect("class_unloading: expected loader at 0x100");
+        let loader = u
+            .get_loader(0x100)
+            .expect("class_unloading: expected loader at 0x100");
         assert!(loader.loaded_classes[0].has_jit_code);
     }
 
@@ -698,7 +718,9 @@ mod tests {
         // Only the plugin class JIT should be invalidated.
         assert_eq!(result.jit_entries_invalidated, 1);
         let cache = u.code_cache_snapshot();
-        let string_entry = cache.iter().find(|e| e.class_id == 1)
+        let string_entry = cache
+            .iter()
+            .find(|e| e.class_id == 1)
             .expect("class_unloading: expected code cache entry for class_id 1");
         assert!(string_entry.valid);
     }
@@ -726,12 +748,19 @@ mod tests {
         // shared class_id.
         assert_eq!(result.jit_entries_invalidated, 1);
         let cache = u.code_cache_snapshot();
-        let dead = cache.iter().find(|e| e.loader_addr == Some(0xA00))
+        let dead = cache
+            .iter()
+            .find(|e| e.loader_addr == Some(0xA00))
             .expect("class_unloading: expected code cache entry for dead loader 0xA00");
-        let live = cache.iter().find(|e| e.loader_addr == Some(0xB00))
+        let live = cache
+            .iter()
+            .find(|e| e.loader_addr == Some(0xB00))
             .expect("class_unloading: expected code cache entry for live loader 0xB00");
         assert!(!dead.valid, "dead loader's JIT code must be invalidated");
-        assert!(live.valid, "live loader's JIT code must survive (reused class_id)");
+        assert!(
+            live.valid,
+            "live loader's JIT code must survive (reused class_id)"
+        );
     }
 
     #[test]
@@ -794,7 +823,9 @@ mod tests {
         let result = u.unload_classes(&|addr| addr == 0xA00);
         assert_eq!(result.loaders_unloaded, 1);
         assert_eq!(result.classes_unloaded, 1);
-        assert!(result.unloaded_loader_names.contains(&"DeadPlugin".to_string()));
+        assert!(result
+            .unloaded_loader_names
+            .contains(&"DeadPlugin".to_string()));
         assert_eq!(u.loader_count(), 2); // bootstrap + ReachablePlugin
     }
 
@@ -853,7 +884,9 @@ mod tests {
         assert!(u.get_loader(0x1000).is_none());
         assert!(u.get_loader(0x2000).is_some());
         assert_eq!(
-            u.get_loader(0x2000).expect("class_unloading: expected loader at 0x2000").name,
+            u.get_loader(0x2000)
+                .expect("class_unloading: expected loader at 0x2000")
+                .name,
             "Moved"
         );
     }
@@ -867,11 +900,27 @@ mod tests {
         u.register_loader(0x200, "B", false);
         u.mark_loader_alive(0x100);
         u.mark_loader_alive(0x200);
-        assert!(u.get_loader(0x100).expect("class_unloading: expected loader at 0x100").alive);
-        assert!(u.get_loader(0x200).expect("class_unloading: expected loader at 0x200").alive);
+        assert!(
+            u.get_loader(0x100)
+                .expect("class_unloading: expected loader at 0x100")
+                .alive
+        );
+        assert!(
+            u.get_loader(0x200)
+                .expect("class_unloading: expected loader at 0x200")
+                .alive
+        );
         u.reset_alive_marks();
-        assert!(!u.get_loader(0x100).expect("class_unloading: expected loader at 0x100 after reset").alive);
-        assert!(!u.get_loader(0x200).expect("class_unloading: expected loader at 0x200 after reset").alive);
+        assert!(
+            !u.get_loader(0x100)
+                .expect("class_unloading: expected loader at 0x100 after reset")
+                .alive
+        );
+        assert!(
+            !u.get_loader(0x200)
+                .expect("class_unloading: expected loader at 0x200 after reset")
+                .alive
+        );
     }
 
     // -- statistics ---------------------------------------------------------
@@ -956,9 +1005,15 @@ mod tests {
         u.register_class(0x100, make_class("pkg/Beta", 2, 64));
         let result = u.unload_classes(&|_| false);
         assert_eq!(result.unloaded_class_names.len(), 2);
-        assert!(result.unloaded_class_names.contains(&"pkg/Alpha".to_string()));
-        assert!(result.unloaded_class_names.contains(&"pkg/Beta".to_string()));
-        assert!(result.unloaded_loader_names.contains(&"MyLoader".to_string()));
+        assert!(result
+            .unloaded_class_names
+            .contains(&"pkg/Alpha".to_string()));
+        assert!(result
+            .unloaded_class_names
+            .contains(&"pkg/Beta".to_string()));
+        assert!(result
+            .unloaded_loader_names
+            .contains(&"MyLoader".to_string()));
     }
 
     // -- classes_for_loader -------------------------------------------------

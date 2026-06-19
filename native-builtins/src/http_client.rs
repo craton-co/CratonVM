@@ -112,11 +112,17 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // ---------------------------------------------------------------------------
 
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IOException { message: message.into() }.into()
+    RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
 }
 
 fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: message.into() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
 }
 
 fn read_str_field(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Option<String> {
@@ -192,8 +198,17 @@ fn parse_uri(uri: &str) -> Result<ParsedUri, String> {
     if host.is_empty() {
         return Err(format!("empty host in {uri}"));
     }
-    let path = if path_q.is_empty() { "/".to_string() } else { path_q.to_string() };
-    Ok(ParsedUri { scheme, host, port, path })
+    let path = if path_q.is_empty() {
+        "/".to_string()
+    } else {
+        path_q.to_string()
+    };
+    Ok(ParsedUri {
+        scheme,
+        host,
+        port,
+        path,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +236,9 @@ struct ClientPool {
 
 impl ClientPool {
     fn new() -> Self {
-        Self { by_authority: HashMap::new() }
+        Self {
+            by_authority: HashMap::new(),
+        }
     }
 
     fn checkout(&mut self, key: &PoolKey) -> Option<PooledConn> {
@@ -695,7 +712,11 @@ fn http2_request(
     } else {
         encode_hpack_literal(&mut hpack, ":method", method);
     }
-    let scheme = if parsed.scheme == "https" { "https" } else { "http" };
+    let scheme = if parsed.scheme == "https" {
+        "https"
+    } else {
+        "http"
+    };
     if let Some(idx) = HpackStaticTable::find(":scheme", Some(scheme)) {
         encode_hpack_indexed(&mut hpack, idx);
     } else {
@@ -764,13 +785,12 @@ fn http2_request(
         }
         let mut hdr = [0u8; 9];
         if let Err(e) = stream.read_exact(&mut hdr) {
-            return Err(format!("h2 frame head: {e}"))
+            return Err(format!("h2 frame head: {e}"));
         }
         let length = ((hdr[0] as u32) << 16) | ((hdr[1] as u32) << 8) | (hdr[2] as u32);
         let f_type = hdr[3];
         let flags = hdr[4];
-        let stream_id =
-            u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
+        let stream_id = u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
         // Enforce SETTINGS_MAX_FRAME_SIZE before allocating: a misbehaving or
         // hostile server can set the 24-bit length up to 16 MiB and force a
         // large per-frame allocation. We never advertise a frame size larger
@@ -1064,7 +1084,13 @@ fn perform_request(
         let pooled = pool().lock().ok().and_then(|mut p| p.checkout(&key));
         let conn = match pooled {
             Some(c) => c,
-            None => open_connection(&parsed.scheme, &parsed.host, parsed.port, connect_timeout, prefer_h2)?,
+            None => open_connection(
+                &parsed.scheme,
+                &parsed.host,
+                parsed.port,
+                connect_timeout,
+                prefer_h2,
+            )?,
         };
         let mut conn = conn;
         let resp = match (&mut conn.kind, conn.is_http2) {
@@ -1105,10 +1131,7 @@ fn perform_request(
                     } else if let Some(rest) = loc.strip_prefix("//") {
                         format!("{}://{}", parsed.scheme, rest)
                     } else if loc.starts_with('/') {
-                        format!(
-                            "{}://{}:{}{}",
-                            parsed.scheme, parsed.host, parsed.port, loc
-                        )
+                        format!("{}://{}:{}{}", parsed.scheme, parsed.host, parsed.port, loc)
                     } else {
                         format!(
                             "{}://{}:{}/{}",
@@ -1158,8 +1181,17 @@ fn extract_request_headers(ctx: &dyn NativeContext, hdrs_val: Value) -> Vec<(Str
     out
 }
 
-fn alloc_response(ctx: &mut dyn NativeContext, resp: &WireResponse, request: ObjectRef, uri: &str) -> ObjectRef {
-    let out = alloc_concurrent_synthetic(ctx, "jdk/internal/net/http/HttpResponseImpl", HRS_NUM_FIELDS);
+fn alloc_response(
+    ctx: &mut dyn NativeContext,
+    resp: &WireResponse,
+    request: ObjectRef,
+    uri: &str,
+) -> ObjectRef {
+    let out = alloc_concurrent_synthetic(
+        ctx,
+        "jdk/internal/net/http/HttpResponseImpl",
+        HRS_NUM_FIELDS,
+    );
     ctx.set_field(out, HRS_STATUS, Value::Int(resp.status as i32));
     let body_arr = new_byte_array(ctx, &resp.body);
     ctx.set_field(out, HRS_BODY_BYTES, Value::Object(Some(body_arr)));
@@ -1172,7 +1204,11 @@ fn alloc_response(ctx: &mut dyn NativeContext, resp: &WireResponse, request: Obj
     ctx.set_field(
         out,
         HRS_VERSION,
-        Value::Int(if resp.version_h2 { HTTP_VERSION_2 } else { HTTP_VERSION_1_1 }),
+        Value::Int(if resp.version_h2 {
+            HTTP_VERSION_2
+        } else {
+            HTTP_VERSION_1_1
+        }),
     );
     let uri_str = ctx.create_string(uri);
     ctx.set_field(out, HRS_URI, Value::Object(Some(uri_str)));
@@ -1181,7 +1217,12 @@ fn alloc_response(ctx: &mut dyn NativeContext, resp: &WireResponse, request: Obj
     out
 }
 
-fn alloc_error_response(ctx: &mut dyn NativeContext, request: ObjectRef, uri: &str, msg: &str) -> ObjectRef {
+fn alloc_error_response(
+    ctx: &mut dyn NativeContext,
+    request: ObjectRef,
+    uri: &str,
+    msg: &str,
+) -> ObjectRef {
     let resp = WireResponse {
         status: 0,
         version_h2: false,
@@ -1228,11 +1269,7 @@ fn hci_send_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Ok(None) => Value::Object(None),
         Err(_) => Value::Object(None),
     };
-    let cf = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/CompletableFuture",
-        4,
-    );
+    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
     // Field 0 = result, field 1 = completion flag, field 2 = exception, field 3 = stage count.
     ctx.set_field(cf, 0, resp_val);
     ctx.set_field(cf, 1, Value::Int(1));
@@ -1322,10 +1359,15 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         ctx.set_field(uri_obj, 0, Value::Object(Some(uri_str)));
         Ok(Some(Value::Object(Some(uri_obj))))
     });
-    r.register(cls, "request", "()Ljava/net/http/HttpRequest;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, HRS_REQUEST)))
-    });
+    r.register(
+        cls,
+        "request",
+        "()Ljava/net/http/HttpRequest;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, HRS_REQUEST)))
+        },
+    );
     r.register(
         cls,
         "previousResponse",
@@ -1337,19 +1379,28 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(opt))))
         },
     );
-    r.register(cls, "version", "()Ljava/net/http/HttpClient$Version;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, HRS_VERSION)))
-    });
-    r.register(cls, "headers", "()Ljava/net/http/HttpHeaders;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let arr_val = ctx.get_field(this, HRS_HEADERS_ARR);
-        let headers_obj =
-            alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 2);
-        ctx.set_field(headers_obj, 0, arr_val);
-        ctx.set_field(headers_obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(headers_obj))))
-    });
+    r.register(
+        cls,
+        "version",
+        "()Ljava/net/http/HttpClient$Version;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, HRS_VERSION)))
+        },
+    );
+    r.register(
+        cls,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr_val = ctx.get_field(this, HRS_HEADERS_ARR);
+            let headers_obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 2);
+            ctx.set_field(headers_obj, 0, arr_val);
+            ctx.set_field(headers_obj, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(headers_obj))))
+        },
+    );
 }
 
 fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
@@ -1399,10 +1450,15 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
 
 fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
     let cls = "jdk/internal/net/http/HttpClientImpl";
-    r.register(cls, "version", "()Ljava/net/http/HttpClient$Version;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, HCI_VERSION)))
-    });
+    r.register(
+        cls,
+        "version",
+        "()Ljava/net/http/HttpClient$Version;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, HCI_VERSION)))
+        },
+    );
     r.register(
         cls,
         "followRedirects",
@@ -1424,59 +1480,83 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         ctx.set_field(opt, 0, ctx.get_field(this, HCI_PROXY));
         Ok(Some(Value::Object(Some(opt))))
     });
-    r.register(cls, "cookieHandler", "()Ljava/util/Optional;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-        ctx.set_field(opt, 0, ctx.get_field(this, HCI_COOKIE_HANDLER));
-        Ok(Some(Value::Object(Some(opt))))
-    });
-    r.register(cls, "connectTimeout", "()Ljava/util/Optional;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let timeout = ctx.get_field(this, HCI_CONNECT_TIMEOUT_MS);
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-        match timeout {
-            Value::Long(0) => ctx.set_field(opt, 0, Value::Object(None)),
-            Value::Long(ms) => {
-                let dur =
-                    alloc_concurrent_synthetic(ctx, "java/time/Duration", 2);
-                ctx.set_field(dur, 0, Value::Long(ms / 1000));
-                ctx.set_field(dur, 1, Value::Int(((ms % 1000) * 1_000_000) as i32));
-                ctx.set_field(opt, 0, Value::Object(Some(dur)));
+    r.register(
+        cls,
+        "cookieHandler",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            ctx.set_field(opt, 0, ctx.get_field(this, HCI_COOKIE_HANDLER));
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
+    r.register(
+        cls,
+        "connectTimeout",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let timeout = ctx.get_field(this, HCI_CONNECT_TIMEOUT_MS);
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            match timeout {
+                Value::Long(0) => ctx.set_field(opt, 0, Value::Object(None)),
+                Value::Long(ms) => {
+                    let dur = alloc_concurrent_synthetic(ctx, "java/time/Duration", 2);
+                    ctx.set_field(dur, 0, Value::Long(ms / 1000));
+                    ctx.set_field(dur, 1, Value::Int(((ms % 1000) * 1_000_000) as i32));
+                    ctx.set_field(opt, 0, Value::Object(Some(dur)));
+                }
+                _ => ctx.set_field(opt, 0, Value::Object(None)),
             }
-            _ => ctx.set_field(opt, 0, Value::Object(None)),
-        }
-        Ok(Some(Value::Object(Some(opt))))
-    });
-    r.register(cls, "authenticator", "()Ljava/util/Optional;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-        ctx.set_field(opt, 0, ctx.get_field(this, HCI_AUTHENTICATOR));
-        Ok(Some(Value::Object(Some(opt))))
-    });
-    r.register(cls, "sslContext", "()Ljavax/net/ssl/SSLContext;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, HCI_SSL_CONTEXT);
-        match v {
-            Value::Object(Some(_)) => Ok(Some(v)),
-            _ => {
-                // Default SSLContext.
-                let s = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 1);
-                Ok(Some(Value::Object(Some(s))))
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
+    r.register(
+        cls,
+        "authenticator",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            ctx.set_field(opt, 0, ctx.get_field(this, HCI_AUTHENTICATOR));
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
+    r.register(
+        cls,
+        "sslContext",
+        "()Ljavax/net/ssl/SSLContext;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let v = ctx.get_field(this, HCI_SSL_CONTEXT);
+            match v {
+                Value::Object(Some(_)) => Ok(Some(v)),
+                _ => {
+                    // Default SSLContext.
+                    let s = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 1);
+                    Ok(Some(Value::Object(Some(s))))
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn http2_client_orchestrator_register(r: &mut NativeMethodRegistry) {
     let cls = "jdk/internal/net/http/Http2ClientImpl";
     // <init>(HttpClientImpl)
-    r.register(cls, "<init>", "(Ljdk/internal/net/http/HttpClientImpl;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // field 0 = parent client, field 1 = open connection count.
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(None)
-    });
+    r.register(
+        cls,
+        "<init>",
+        "(Ljdk/internal/net/http/HttpClientImpl;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // field 0 = parent client, field 1 = open connection count.
+            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field(this, 1, Value::Int(0));
+            Ok(None)
+        },
+    );
     // sendHttp2(HttpRequest, BodyHandler) -> HttpResponse
     r.register(
         cls,
@@ -1501,20 +1581,15 @@ fn http2_client_orchestrator_register(r: &mut NativeMethodRegistry) {
 fn http1_exchange_register(r: &mut NativeMethodRegistry) {
     let cls = "jdk/internal/net/http/Http1Exchange";
     r.register(cls, "<init>", "()V", |_ctx, _args| Ok(None));
-    r.register(
-        cls,
-        "writeRequest",
-        "([B)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Simply stash the bytes on the exchange (field 0) so test code
-            // can read them back. A real exchange-level write lives inside
-            // the connection pool, but for reflection-driven dispatch we
-            // need a no-throw method here.
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-            Ok(None)
-        },
-    );
+    r.register(cls, "writeRequest", "([B)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Simply stash the bytes on the exchange (field 0) so test code
+        // can read them back. A real exchange-level write lives inside
+        // the connection pool, but for reflection-driven dispatch we
+        // need a no-throw method here.
+        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        Ok(None)
+    });
 
     // Http1HeaderParser parses a single `\r\n`-terminated header line.
     let cls = "jdk/internal/net/http/Http1HeaderParser";
@@ -1668,7 +1743,11 @@ mod http_client_tests {
         let mut r = NativeMethodRegistry::new();
         register_http_client_real(&mut r);
         assert!(r
-            .find("jdk/internal/net/http/HttpResponseImpl", "statusCode", "()I")
+            .find(
+                "jdk/internal/net/http/HttpResponseImpl",
+                "statusCode",
+                "()I"
+            )
             .is_some());
         assert!(r
             .find(
@@ -1861,7 +1940,10 @@ mod http_client_tests {
         };
         let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/");
         assert_eq!(ctx.get_field(obj, HRS_STATUS), Value::Int(200));
-        assert_eq!(ctx.get_field(obj, HRS_VERSION), Value::Int(HTTP_VERSION_1_1));
+        assert_eq!(
+            ctx.get_field(obj, HRS_VERSION),
+            Value::Int(HTTP_VERSION_1_1)
+        );
     }
 
     #[test]

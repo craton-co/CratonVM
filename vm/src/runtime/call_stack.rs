@@ -210,8 +210,12 @@ mod tests {
     #[test]
     fn test_push_pop() {
         let mut stack = CallStack::new(10);
-        stack.push(sample_frame("java/lang/Object", "init")).unwrap();
-        stack.push(sample_frame("com/example/Main", "main")).unwrap();
+        stack
+            .push(sample_frame("java/lang/Object", "init"))
+            .unwrap();
+        stack
+            .push(sample_frame("com/example/Main", "main"))
+            .unwrap();
         assert_eq!(stack.depth(), 2);
 
         let top = stack.pop().unwrap();
@@ -258,16 +262,20 @@ mod tests {
     #[test]
     fn test_stack_trace() {
         let mut stack = CallStack::new(10);
-        stack.push(sample_frame("java/lang/Object", "<init>")).unwrap();
-        stack.push(StackFrameEntry {
-            class_name: "com/example/Main".to_string(),
-            method_name: "main".to_string(),
-            descriptor: "([Ljava/lang/String;)V".to_string(),
-            source_file: Some("Main.java".to_string()),
-            pc: 5,
-            line_number: 42,
-            is_native: false,
-        }).unwrap();
+        stack
+            .push(sample_frame("java/lang/Object", "<init>"))
+            .unwrap();
+        stack
+            .push(StackFrameEntry {
+                class_name: "com/example/Main".to_string(),
+                method_name: "main".to_string(),
+                descriptor: "([Ljava/lang/String;)V".to_string(),
+                source_file: Some("Main.java".to_string()),
+                pc: 5,
+                line_number: 42,
+                is_native: false,
+            })
+            .unwrap();
 
         let trace = stack.stack_trace();
         assert!(trace.contains("com.example.Main.main(Main.java:42)"));
@@ -300,22 +308,27 @@ mod tests {
         stack.push(sample_frame("A", "a")).unwrap();
         stack.push(sample_frame("B", "b")).unwrap();
         stack.push(sample_frame("C", "c")).unwrap();
-        let names: Vec<&str> = stack.iter_top_down().map(|f| f.method_name.as_str()).collect();
+        let names: Vec<&str> = stack
+            .iter_top_down()
+            .map(|f| f.method_name.as_str())
+            .collect();
         assert_eq!(names, vec!["c", "b", "a"]);
     }
 
     #[test]
     fn test_native_method_in_trace() {
         let mut stack = CallStack::new(10);
-        stack.push(StackFrameEntry {
-            class_name: "java/lang/Thread".to_string(),
-            method_name: "sleep".to_string(),
-            descriptor: "(J)V".to_string(),
-            source_file: None,
-            pc: 0,
-            line_number: -1,
-            is_native: true,
-        }).unwrap();
+        stack
+            .push(StackFrameEntry {
+                class_name: "java/lang/Thread".to_string(),
+                method_name: "sleep".to_string(),
+                descriptor: "(J)V".to_string(),
+                source_file: None,
+                pc: 0,
+                line_number: -1,
+                is_native: true,
+            })
+            .unwrap();
         let trace = stack.stack_trace();
         assert!(trace.contains("Native Method"));
     }

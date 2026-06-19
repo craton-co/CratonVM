@@ -124,7 +124,7 @@ unsafe fn run_unary(intrinsic: JitIntrinsic, ret_type: u8, arg: i64) -> i64 {
                 needs_context: false,
                 num_params: 1,
                 return_type: ret_type,
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(),
@@ -173,7 +173,7 @@ unsafe fn run_binary(intrinsic: JitIntrinsic, ret_type: u8, x: i64, y: i64) -> i
                 needs_context: false,
                 num_params: 2,
                 return_type: ret_type,
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(),
@@ -285,7 +285,25 @@ fn long_compare_matches_reference() {
 /// Distances for the 64-bit rotate intrinsics: 0, sub-width, exactly width,
 /// > width (x86 masks CL & 0x3f), and negative. Passed as the int distance.
 fn long_rotate_distances() -> Vec<i32> {
-    vec![0, 1, 7, 31, 32, 33, 63, 64, 65, 127, 128, -1, -7, -64, -65, i32::MIN, i32::MAX]
+    vec![
+        0,
+        1,
+        7,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
+        127,
+        128,
+        -1,
+        -7,
+        -64,
+        -65,
+        i32::MIN,
+        i32::MAX,
+    ]
 }
 
 #[test]

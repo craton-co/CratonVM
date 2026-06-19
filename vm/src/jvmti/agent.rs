@@ -160,14 +160,14 @@ impl AgentRegistry {
                 // Look up and call the appropriate entry point.
                 let call_result: Option<i32> = match phase {
                     AgentPhase::OnLoad => unsafe {
-                        lib.get::<AgentOnLoadFn>(entry_name).ok().map(|f| {
-                            f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut())
-                        })
+                        lib.get::<AgentOnLoadFn>(entry_name)
+                            .ok()
+                            .map(|f| f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut()))
                     },
                     AgentPhase::Live => unsafe {
-                        lib.get::<AgentOnAttachFn>(entry_name).ok().map(|f| {
-                            f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut())
-                        })
+                        lib.get::<AgentOnAttachFn>(entry_name)
+                            .ok()
+                            .map(|f| f(vm_ptr, options_cstring.as_ptr(), std::ptr::null_mut()))
                     },
                 };
 

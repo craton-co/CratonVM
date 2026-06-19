@@ -100,10 +100,7 @@ fn throw_unsupported_encoding(
     .into()
 }
 
-fn resolve_name(
-    ctx: &dyn NativeContext,
-    charset: Option<ObjectRef>,
-) -> String {
+fn resolve_name(ctx: &dyn NativeContext, charset: Option<ObjectRef>) -> String {
     if let Some(cs) = charset {
         if let Value::Object(Some(s)) = ctx.get_field(cs, 0) {
             if let Some(n) = ctx.read_string(s) {
@@ -152,10 +149,7 @@ pub(crate) fn alloc_stream_encoder(
 /// The JDK factory declares `throws UnsupportedEncodingException`; an unknown
 /// or unsupported charset *name* must surface that exception rather than
 /// silently encoding the stream as UTF-8.
-fn native_se_for_osw_name(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_se_for_osw_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let os = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
@@ -175,10 +169,7 @@ fn native_se_for_osw_name(
 }
 
 /// `forOutputStreamWriter(OutputStream, Object, Charset) -> StreamEncoder`.
-fn native_se_for_osw_charset(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_se_for_osw_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let os = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
@@ -273,7 +264,11 @@ fn native_se_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let len = int_arg(args, 3) as usize;
     let chars: Vec<u16> = s.encode_utf16().collect();
     let end = off.saturating_add(len).min(chars.len());
-    let slice: Vec<u16> = chars.into_iter().skip(off).take(end - off.min(end)).collect();
+    let slice: Vec<u16> = chars
+        .into_iter()
+        .skip(off)
+        .take(end - off.min(end))
+        .collect();
     write_bytes(ctx, this, &slice)?;
     Ok(None)
 }
@@ -341,18 +336,13 @@ pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
     registry.register(se, "flush", "()V", native_se_flush);
     registry.register(se, "close", "()V", native_se_close);
     registry.register(se, "implClose", "()V", native_se_close);
-    registry.register(
-        se,
-        "getEncoding",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match obj_arg(args, 0) {
-                Some(o) => o,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            Ok(Some(ctx.get_field(this, SE_NAME)))
-        },
-    );
+    registry.register(se, "getEncoding", "()Ljava/lang/String;", |ctx, args| {
+        let this = match obj_arg(args, 0) {
+            Some(o) => o,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(ctx.get_field(this, SE_NAME)))
+    });
     registry.register(se, "isOpen", "()Z", |ctx, args| {
         let this = match obj_arg(args, 0) {
             Some(o) => o,

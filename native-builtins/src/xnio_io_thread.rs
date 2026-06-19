@@ -94,8 +94,8 @@
 
 #![allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 
-use std::collections::{BinaryHeap, VecDeque};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -205,7 +205,7 @@ pub struct SelectedKey {
 ///  * `selected_keys()` returns anything the test pre-seeded via
 ///    `push_ready`.
 pub struct MockSelector {
-    wakeup_mu: Mutex<bool>,     // true == wakeup pending
+    wakeup_mu: Mutex<bool>, // true == wakeup pending
     wakeup_cv: std::sync::Condvar,
     ready: Mutex<VecDeque<SelectedKey>>,
 }
@@ -338,7 +338,9 @@ impl Default for ScheduledHeap {
 
 impl ScheduledHeap {
     pub fn new() -> Self {
-        Self { heap: BinaryHeap::new() }
+        Self {
+            heap: BinaryHeap::new(),
+        }
     }
 
     /// Current number of entries (including cancelled).
@@ -493,11 +495,7 @@ impl IoThreadHandle {
         // Cross-thread? Fire a selector wakeup.
         let loop_tid = self.loop_thread_id.load(Ordering::Acquire);
         let my_tid = os_tid();
-        if loop_tid != my_tid
-            && !self
-                .pending_wakeup
-                .swap(true, Ordering::AcqRel)
-        {
+        if loop_tid != my_tid && !self.pending_wakeup.swap(true, Ordering::AcqRel) {
             self.selector.wakeup();
         }
         Ok(())
@@ -538,11 +536,7 @@ impl IoThreadHandle {
         // Scheduling could move the nearest-deadline sooner — wake.
         let loop_tid = self.loop_thread_id.load(Ordering::Acquire);
         let my_tid = os_tid();
-        if loop_tid != my_tid
-            && !self
-                .pending_wakeup
-                .swap(true, Ordering::AcqRel)
-        {
+        if loop_tid != my_tid && !self.pending_wakeup.swap(true, Ordering::AcqRel) {
             self.selector.wakeup();
         }
         Ok((task_id, cancelled))
@@ -620,10 +614,7 @@ pub fn run_io_loop(handle: Arc<IoThreadHandle>) {
         // ---- phase 1 — drain immediate tasks ----
         loop {
             let next = {
-                let mut q = handle
-                    .task_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut q = handle.task_queue.lock().unwrap_or_else(|e| e.into_inner());
                 let t = q.pop_front();
                 handle.pending_len.store(q.len(), Ordering::Release);
                 t
@@ -641,10 +632,7 @@ pub fn run_io_loop(handle: Arc<IoThreadHandle>) {
 
         // ---- phase 2 — compute select timeout from next timer ----
         let next_deadline_opt = {
-            let mut heap = handle
-                .scheduled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut heap = handle.scheduled.lock().unwrap_or_else(|e| e.into_inner());
             heap.peek_deadline_ms()
         };
         let now = now_ms();
@@ -686,10 +674,7 @@ pub fn run_io_loop(handle: Arc<IoThreadHandle>) {
         let now = now_ms();
         loop {
             let expired = {
-                let mut heap = handle
-                    .scheduled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut heap = handle.scheduled.lock().unwrap_or_else(|e| e.into_inner());
                 heap.pop_if_expired(now)
             };
             match expired {
@@ -758,9 +743,7 @@ thread_local! {
 /// Return the `IoThreadHandle` for the current OS thread, if that
 /// thread is running `run_io_loop`. `None` otherwise.
 pub fn current_io_thread() -> Option<Arc<IoThreadHandle>> {
-    CURRENT_IO_THREAD.with(|slot| {
-        slot.borrow().as_ref().and_then(|w| w.upgrade())
-    })
+    CURRENT_IO_THREAD.with(|slot| slot.borrow().as_ref().and_then(|w| w.upgrade()))
 }
 
 // ---------------------------------------------------------------------------
@@ -816,8 +799,8 @@ fn os_tid() -> u64 {
 // IOT_FIELD_SELECTOR_HANDLE; the actual Rust-side IoThreadHandle lives
 // here. T19.7.b populates this map when it spawns a thread.
 
-static IO_THREAD_REGISTRY: OnceLock<Mutex<std::collections::HashMap<u64, Arc<IoThreadHandle>>>>
-    = OnceLock::new();
+static IO_THREAD_REGISTRY: OnceLock<Mutex<std::collections::HashMap<u64, Arc<IoThreadHandle>>>> =
+    OnceLock::new();
 
 fn io_thread_registry() -> &'static Mutex<std::collections::HashMap<u64, Arc<IoThreadHandle>>> {
     IO_THREAD_REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -972,7 +955,8 @@ pub fn spawn_io_thread_with_ctx(
 /// mirror. Tests assert against this; production code may use it
 /// to ask "what's the Thread mirror for this carrier" without
 /// re-walking the VM registry.
-static IOT_JAVA_MIRROR_PTRS: OnceLock<Mutex<std::collections::HashMap<u64, usize>>> = OnceLock::new();
+static IOT_JAVA_MIRROR_PTRS: OnceLock<Mutex<std::collections::HashMap<u64, usize>>> =
+    OnceLock::new();
 
 fn iot_java_mirror_ptrs() -> &'static Mutex<std::collections::HashMap<u64, usize>> {
     IOT_JAVA_MIRROR_PTRS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -1174,10 +1158,7 @@ fn native_iot_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 /// `org.xnio.XnioIoThread.executeAfter(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Lorg/xnio/XnioExecutor$Key;`
-fn native_iot_execute_after(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_iot_execute_after(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let runnable = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
@@ -1225,10 +1206,7 @@ fn native_iot_execute_after(
 }
 
 /// `org.xnio.XnioIoThread.executeAtTime(Ljava/lang/Runnable;J)Lorg/xnio/XnioExecutor$Key;`
-fn native_iot_execute_at_time(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_iot_execute_at_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let runnable = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
@@ -1323,8 +1301,8 @@ fn native_key_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // can find the right AtomicBool without chasing through the heap.
 // ---------------------------------------------------------------------------
 
-static KEY_CANCEL_FLAGS: OnceLock<Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>
-    = OnceLock::new();
+static KEY_CANCEL_FLAGS: OnceLock<Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>> =
+    OnceLock::new();
 
 fn key_cancel_flags() -> &'static Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>> {
     KEY_CANCEL_FLAGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -1349,7 +1327,10 @@ fn cancel_flag_for(task_id: u64) -> Option<Arc<AtomicBool>> {
 // Key mirror allocation.
 // ---------------------------------------------------------------------------
 
-fn make_key_mirror(ctx: &mut dyn NativeContext, task_id: u64) -> Result<ObjectRef, MethodCallFailed> {
+fn make_key_mirror(
+    ctx: &mut dyn NativeContext,
+    task_id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let key = alloc_concurrent_synthetic(ctx, CLS_EXECUTOR_KEY, KEY_NUM_SLOTS);
     ctx.set_field(key, KEY_FIELD_TASK_ID, Value::Long(task_id as i64));
     ctx.set_field(key, KEY_FIELD_CANCELLED, Value::Int(0));
@@ -1418,8 +1399,18 @@ pub fn register_xnio_io_thread_natives(registry: &mut NativeMethodRegistry) {
     // XnioIoThread + NioIoThread share the same native table.
     for cls in [CLS_XNIO_IO_THREAD, CLS_NIO_IO_THREAD] {
         registry.register(cls, "getId", "()J", native_iot_get_id);
-        registry.register(cls, "getWorker", "()Lorg/xnio/XnioWorker;", native_iot_get_worker);
-        registry.register(cls, "execute", "(Ljava/lang/Runnable;)V", native_iot_execute);
+        registry.register(
+            cls,
+            "getWorker",
+            "()Lorg/xnio/XnioWorker;",
+            native_iot_get_worker,
+        );
+        registry.register(
+            cls,
+            "execute",
+            "(Ljava/lang/Runnable;)V",
+            native_iot_execute,
+        );
         registry.register(
             cls,
             "executeAfter",
@@ -1470,7 +1461,14 @@ mod tests {
     /// Spawn a worker thread running `run_io_loop` and return (handle,
     /// join-handle, mock-selector-ref). The returned `IoThreadHandle`
     /// is already registered in the process-wide registry.
-    fn spawn_test_loop(name: &str, id: u64) -> (Arc<IoThreadHandle>, thread::JoinHandle<()>, Arc<MockSelector>) {
+    fn spawn_test_loop(
+        name: &str,
+        id: u64,
+    ) -> (
+        Arc<IoThreadHandle>,
+        thread::JoinHandle<()>,
+        Arc<MockSelector>,
+    ) {
         let mock = Arc::new(MockSelector::new());
         let selector: Arc<dyn SelectorHandle> = mock.clone();
         let h = IoThreadHandle::new(id, 1, selector, name);
@@ -1911,8 +1909,7 @@ mod tests {
         let mock = Arc::new(MockSelector::new());
         let sel: Arc<dyn SelectorHandle> = mock.clone();
         let id = 9_001u64;
-        let h = spawn_io_thread_with_ctx(&mut ctx, "k4-xnio-1", id, 1, sel, false)
-            .expect("spawn");
+        let h = spawn_io_thread_with_ctx(&mut ctx, "k4-xnio-1", id, 1, sel, false).expect("spawn");
         // The mock should have recorded the mirror pointer.
         let vm_tid = lookup_vm_thread_id(h.id);
         assert_ne!(vm_tid, 0, "vm_tid must be assigned");
@@ -1936,8 +1933,8 @@ mod tests {
         let mock = Arc::new(MockSelector::new());
         let sel: Arc<dyn SelectorHandle> = mock.clone();
         let id = 9_002u64;
-        let h = spawn_io_thread_with_ctx(&mut ctx, "k4-xnio-name", id, 1, sel, false)
-            .expect("spawn");
+        let h =
+            spawn_io_thread_with_ctx(&mut ctx, "k4-xnio-name", id, 1, sel, false).expect("spawn");
         let vm_tid = lookup_vm_thread_id(h.id);
         let mirror_ptr = ctx.native_thread_java_obj_ptr(vm_tid);
         let mirror = unsafe { ObjectRef::from_raw(mirror_ptr as *mut u8) };

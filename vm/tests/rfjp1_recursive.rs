@@ -50,8 +50,7 @@ fn cratonvm_binary() -> Option<PathBuf> {
 /// test can skip cleanly on machines without the JDK 25 dependency.
 fn real_java_home() -> Option<String> {
     if let Ok(jh) = std::env::var("JAVA_HOME") {
-        if Path::new(&jh).join("bin/java.exe").exists()
-            || Path::new(&jh).join("bin/java").exists()
+        if Path::new(&jh).join("bin/java.exe").exists() || Path::new(&jh).join("bin/java").exists()
         {
             return Some(jh);
         }

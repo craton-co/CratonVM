@@ -21,14 +21,14 @@
 //! buffer).  A true lock-free epoch-per-slot ring is feasible but out
 //! of scope for this round.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SLOTS: usize = 256;
 
 #[derive(Clone, Default)]
 struct Slot {
-    kind: u8,      // 0=empty, 1=bytecode, 2=native, 3=note
+    kind: u8, // 0=empty, 1=bytecode, 2=native, 3=note
     thread_id: u32,
     seq: u64,
     cls: String,

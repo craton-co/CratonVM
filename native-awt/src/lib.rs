@@ -68,18 +68,18 @@
 
 #![allow(clippy::collapsible_if)]
 
+pub mod clipboard;
 pub mod color;
+pub mod edt;
 pub mod event;
 pub mod font;
 pub mod graphics2d;
 pub mod image;
-pub mod clipboard;
+pub mod natives;
 pub mod peer;
 pub mod platform;
 pub mod renderer;
 pub mod swing;
-pub mod edt;
-pub mod natives;
 
 use cratonvm_native_api::NativeMethodRegistry;
 

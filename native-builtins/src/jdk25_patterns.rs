@@ -11,11 +11,11 @@
 //! Phase 15.4: `java/lang/StableValue` — a lazily-initialized, write-once
 //! container with list/map factory methods.
 
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
 
-use crate::{obj_arg, alloc_concurrent_synthetic};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // 15.3 — Primitive Types in Patterns (JEP 507)
@@ -225,10 +225,7 @@ impl PrimitivePatternMatcher {
 
 /// `exactConversionCheck(ID)Z` — arg0: int type-code of source,
 /// arg1: double-encoded type-code of target.  Returns Int(1) if exact.
-fn native_exact_conversion_check(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_exact_conversion_check(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let from_code = match args.get(0) {
         Some(Value::Int(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
@@ -251,10 +248,7 @@ fn native_exact_conversion_check(
 
 /// `widenPrimitive(II)I` — returns Int(1) if widening from type-code arg0
 /// to type-code arg1 is allowed.
-fn native_widen_primitive(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_widen_primitive(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let from_code = match args.get(0) {
         Some(Value::Int(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
@@ -275,10 +269,7 @@ fn native_widen_primitive(
 
 /// `narrowPrimitive(II)I` — returns Int(1) if narrowing from type-code arg0
 /// to type-code arg1 is allowed.
-fn native_narrow_primitive(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_narrow_primitive(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let from_code = match args.get(0) {
         Some(Value::Int(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
@@ -298,30 +289,32 @@ fn native_narrow_primitive(
 }
 
 /// `isExactFloat(F)Z` — can the given float round-trip through int?
-fn native_is_exact_float(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_is_exact_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let f = match args.get(0) {
         Some(Value::Float(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(
-        if PrimitivePatternMatcher::is_exact_float(f) { 1 } else { 0 },
+        if PrimitivePatternMatcher::is_exact_float(f) {
+            1
+        } else {
+            0
+        },
     )))
 }
 
 /// `isExactDouble(D)Z` — can the given double round-trip through long?
-fn native_is_exact_double(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_is_exact_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let d = match args.get(0) {
         Some(Value::Double(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(
-        if PrimitivePatternMatcher::is_exact_double(d) { 1 } else { 0 },
+        if PrimitivePatternMatcher::is_exact_double(d) {
+            1
+        } else {
+            0
+        },
     )))
 }
 
@@ -344,10 +337,7 @@ const SV_NUM_FIELDS: usize = 3;
 // ---------------------------------------------------------------------------
 
 /// `of()Ljava/lang/StableValue;` — create an empty StableValue.
-fn native_stable_value_of_empty(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_of_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/StableValue", SV_NUM_FIELDS);
     ctx.set_field(obj, SV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(obj, SV_FIELD_IS_SET, Value::Int(0));
@@ -448,17 +438,16 @@ fn native_stable_value_or_else_throw(
         return Ok(Some(computed));
     }
     // No value and no supplier — throw, matching StableValue.orElseThrow().
-    Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-        message: "StableValue has no contents".to_string(),
-    }
-    .into())
+    Err(
+        cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: "StableValue has no contents".to_string(),
+        }
+        .into(),
+    )
 }
 
 /// `orElse(Ljava/lang/Object;)Ljava/lang/Object;`
-fn native_stable_value_or_else(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let is_set = ctx.get_field(this, SV_FIELD_IS_SET);
     if let Value::Int(1) = is_set {
@@ -471,10 +460,7 @@ fn native_stable_value_or_else(
 }
 
 /// `isSet()Z`
-fn native_stable_value_is_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_is_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let is_set = ctx.get_field(this, SV_FIELD_IS_SET);
     match is_set {
@@ -484,10 +470,7 @@ fn native_stable_value_is_set(
 }
 
 /// `trySet(Ljava/lang/Object;)Z`
-fn native_stable_value_try_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_try_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let is_set = ctx.get_field(this, SV_FIELD_IS_SET);
     if let Value::Int(1) = is_set {
@@ -531,10 +514,7 @@ const SV_MAP_FIELD_ENTRY_COUNT: usize = 1;
 const SV_MAP_NUM_FIELDS: usize = 2;
 
 /// `list(I)Ljava/util/List;`
-fn native_stable_value_list(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let size = match args.get(0) {
         Some(Value::Int(n)) => *n,
         _ => 0,
@@ -546,10 +526,7 @@ fn native_stable_value_list(
 }
 
 /// `map(Ljava/util/Set;)Ljava/util/Map;`
-fn native_stable_value_map(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_stable_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "java/util/Map", SV_MAP_NUM_FIELDS);
     ctx.set_field(obj, SV_MAP_FIELD_SIZE, Value::Int(0));
     ctx.set_field(obj, SV_MAP_FIELD_ENTRY_COUNT, Value::Int(0));
@@ -566,7 +543,12 @@ pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // -- jdk/internal/misc/PatternSupport --
     let ps = "jdk/internal/misc/PatternSupport";
-    r.register(ps, "exactConversionCheck", "(ID)Z", native_exact_conversion_check);
+    r.register(
+        ps,
+        "exactConversionCheck",
+        "(ID)Z",
+        native_exact_conversion_check,
+    );
     r.register(ps, "widenPrimitive", "(II)I", native_widen_primitive);
     r.register(ps, "narrowPrimitive", "(II)I", native_narrow_primitive);
     r.register(ps, "isExactFloat", "(F)Z", native_is_exact_float);
@@ -574,7 +556,12 @@ pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
 
     // -- java/lang/StableValue --
     let sv = "java/lang/StableValue";
-    r.register(sv, "of", "()Ljava/lang/StableValue;", native_stable_value_of_empty);
+    r.register(
+        sv,
+        "of",
+        "()Ljava/lang/StableValue;",
+        native_stable_value_of_empty,
+    );
     r.register(
         sv,
         "of",
@@ -637,7 +624,10 @@ mod jdk25_patterns_tests {
 
     #[test]
     fn test_type_code_boolean() {
-        assert_eq!(PrimitiveType::from_type_code(4), Some(PrimitiveType::Boolean));
+        assert_eq!(
+            PrimitiveType::from_type_code(4),
+            Some(PrimitiveType::Boolean)
+        );
     }
 
     #[test]
@@ -652,7 +642,10 @@ mod jdk25_patterns_tests {
 
     #[test]
     fn test_type_code_double() {
-        assert_eq!(PrimitiveType::from_type_code(7), Some(PrimitiveType::Double));
+        assert_eq!(
+            PrimitiveType::from_type_code(7),
+            Some(PrimitiveType::Double)
+        );
     }
 
     #[test]
@@ -689,73 +682,118 @@ mod jdk25_patterns_tests {
 
     #[test]
     fn test_widen_byte_to_short() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Byte, PrimitiveType::Short));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Byte,
+            PrimitiveType::Short
+        ));
     }
 
     #[test]
     fn test_widen_byte_to_int() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Byte, PrimitiveType::Int));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Byte,
+            PrimitiveType::Int
+        ));
     }
 
     #[test]
     fn test_widen_byte_to_long() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Byte, PrimitiveType::Long));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Byte,
+            PrimitiveType::Long
+        ));
     }
 
     #[test]
     fn test_widen_byte_to_float() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Byte, PrimitiveType::Float));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Byte,
+            PrimitiveType::Float
+        ));
     }
 
     #[test]
     fn test_widen_byte_to_double() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Byte, PrimitiveType::Double));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Byte,
+            PrimitiveType::Double
+        ));
     }
 
     #[test]
     fn test_widen_int_to_long() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Int, PrimitiveType::Long));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Int,
+            PrimitiveType::Long
+        ));
     }
 
     #[test]
     fn test_widen_int_to_float() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Int, PrimitiveType::Float));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Int,
+            PrimitiveType::Float
+        ));
     }
 
     #[test]
     fn test_widen_float_to_double() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Float, PrimitiveType::Double));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Float,
+            PrimitiveType::Double
+        ));
     }
 
     #[test]
     fn test_widen_char_to_int() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Char, PrimitiveType::Int));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Char,
+            PrimitiveType::Int
+        ));
     }
 
     #[test]
     fn test_widen_long_to_double() {
-        assert!(PrimitivePatternMatcher::can_widen(PrimitiveType::Long, PrimitiveType::Double));
+        assert!(PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Long,
+            PrimitiveType::Double
+        ));
     }
 
     #[test]
     fn test_widen_not_allowed_int_to_byte() {
-        assert!(!PrimitivePatternMatcher::can_widen(PrimitiveType::Int, PrimitiveType::Byte));
+        assert!(!PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Int,
+            PrimitiveType::Byte
+        ));
     }
 
     #[test]
     fn test_widen_not_allowed_double_to_float() {
-        assert!(!PrimitivePatternMatcher::can_widen(PrimitiveType::Double, PrimitiveType::Float));
+        assert!(!PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Double,
+            PrimitiveType::Float
+        ));
     }
 
     #[test]
     fn test_widen_boolean_not_allowed() {
-        assert!(!PrimitivePatternMatcher::can_widen(PrimitiveType::Boolean, PrimitiveType::Int));
-        assert!(!PrimitivePatternMatcher::can_widen(PrimitiveType::Int, PrimitiveType::Boolean));
+        assert!(!PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Boolean,
+            PrimitiveType::Int
+        ));
+        assert!(!PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Int,
+            PrimitiveType::Boolean
+        ));
     }
 
     #[test]
     fn test_widen_same_type_is_false() {
-        assert!(!PrimitivePatternMatcher::can_widen(PrimitiveType::Int, PrimitiveType::Int));
+        assert!(!PrimitivePatternMatcher::can_widen(
+            PrimitiveType::Int,
+            PrimitiveType::Int
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -764,47 +802,74 @@ mod jdk25_patterns_tests {
 
     #[test]
     fn test_narrow_int_to_byte() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Int, PrimitiveType::Byte));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Int,
+            PrimitiveType::Byte
+        ));
     }
 
     #[test]
     fn test_narrow_int_to_short() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Int, PrimitiveType::Short));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Int,
+            PrimitiveType::Short
+        ));
     }
 
     #[test]
     fn test_narrow_int_to_char() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Int, PrimitiveType::Char));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Int,
+            PrimitiveType::Char
+        ));
     }
 
     #[test]
     fn test_narrow_long_to_int() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Long, PrimitiveType::Int));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Long,
+            PrimitiveType::Int
+        ));
     }
 
     #[test]
     fn test_narrow_double_to_float() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Double, PrimitiveType::Float));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Double,
+            PrimitiveType::Float
+        ));
     }
 
     #[test]
     fn test_narrow_double_to_int() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Double, PrimitiveType::Int));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Double,
+            PrimitiveType::Int
+        ));
     }
 
     #[test]
     fn test_narrow_float_to_long() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Float, PrimitiveType::Long));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Float,
+            PrimitiveType::Long
+        ));
     }
 
     #[test]
     fn test_narrow_not_allowed_byte_to_int() {
-        assert!(!PrimitivePatternMatcher::can_narrow(PrimitiveType::Byte, PrimitiveType::Int));
+        assert!(!PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Byte,
+            PrimitiveType::Int
+        ));
     }
 
     #[test]
     fn test_narrow_same_type_is_false() {
-        assert!(!PrimitivePatternMatcher::can_narrow(PrimitiveType::Int, PrimitiveType::Int));
+        assert!(!PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Int,
+            PrimitiveType::Int
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1012,108 +1077,104 @@ mod jdk25_patterns_tests {
     fn test_registration_pattern_support_widen() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("jdk/internal/misc/PatternSupport", "widenPrimitive", "(II)I")
-                .is_some()
-        );
+        assert!(reg
+            .find(
+                "jdk/internal/misc/PatternSupport",
+                "widenPrimitive",
+                "(II)I"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_registration_pattern_support_narrow() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("jdk/internal/misc/PatternSupport", "narrowPrimitive", "(II)I")
-                .is_some()
-        );
+        assert!(reg
+            .find(
+                "jdk/internal/misc/PatternSupport",
+                "narrowPrimitive",
+                "(II)I"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_registration_pattern_support_exact() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find(
+        assert!(reg
+            .find(
                 "jdk/internal/misc/PatternSupport",
                 "exactConversionCheck",
                 "(ID)Z"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
     fn test_registration_stable_value_of_empty() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("java/lang/StableValue", "of", "()Ljava/lang/StableValue;")
-                .is_some()
-        );
+        assert!(reg
+            .find("java/lang/StableValue", "of", "()Ljava/lang/StableValue;")
+            .is_some());
     }
 
     #[test]
     fn test_registration_stable_value_try_set() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("java/lang/StableValue", "trySet", "(Ljava/lang/Object;)Z")
-                .is_some()
-        );
+        assert!(reg
+            .find("java/lang/StableValue", "trySet", "(Ljava/lang/Object;)Z")
+            .is_some());
     }
 
     #[test]
     fn test_registration_stable_value_is_set() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("java/lang/StableValue", "isSet", "()Z")
-                .is_some()
-        );
+        assert!(reg.find("java/lang/StableValue", "isSet", "()Z").is_some());
     }
 
     #[test]
     fn test_registration_stable_value_list() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("java/lang/StableValue", "list", "(I)Ljava/util/List;")
-                .is_some()
-        );
+        assert!(reg
+            .find("java/lang/StableValue", "list", "(I)Ljava/util/List;")
+            .is_some());
     }
 
     #[test]
     fn test_registration_stable_value_map() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find(
+        assert!(reg
+            .find(
                 "java/lang/StableValue",
                 "map",
                 "(Ljava/util/Set;)Ljava/util/Map;"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
     fn test_registration_is_exact_float() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("jdk/internal/misc/PatternSupport", "isExactFloat", "(F)Z")
-                .is_some()
-        );
+        assert!(reg
+            .find("jdk/internal/misc/PatternSupport", "isExactFloat", "(F)Z")
+            .is_some());
     }
 
     #[test]
     fn test_registration_is_exact_double() {
         let mut reg = NativeMethodRegistry::new();
         register_jdk25_patterns_natives(&mut reg);
-        assert!(
-            reg.find("jdk/internal/misc/PatternSupport", "isExactDouble", "(D)Z")
-                .is_some()
-        );
+        assert!(reg
+            .find("jdk/internal/misc/PatternSupport", "isExactDouble", "(D)Z")
+            .is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -1166,11 +1227,8 @@ mod jdk25_patterns_tests {
         };
         // First set via trySet.
         assert_eq!(
-            native_stable_value_try_set(
-                &mut ctx,
-                &[Value::Object(Some(sv)), Value::Int(7)]
-            )
-            .unwrap(),
+            native_stable_value_try_set(&mut ctx, &[Value::Object(Some(sv)), Value::Int(7)])
+                .unwrap(),
             Some(Value::Int(1))
         );
         // Arm a DIFFERENT supplier result; it must not be observed.
@@ -1184,7 +1242,10 @@ mod jdk25_patterns_tests {
         assert_eq!(r, Some(Value::Int(7)), "must return the already-set value");
         // The armed scripted result must still be pending (never consumed).
         let pending = unsafe { &*ctx.invoke_virtual_result.get() }.is_some();
-        assert!(pending, "supplier must not have been invoked when already set");
+        assert!(
+            pending,
+            "supplier must not have been invoked when already set"
+        );
     }
 
     /// A supplier-backed StableValue (`of(Supplier)`) resolves lazily via
@@ -1193,11 +1254,8 @@ mod jdk25_patterns_tests {
     fn test_or_else_throw_resolves_construction_supplier() {
         let mut ctx = mock_ctx();
         let supplier = ctx.fresh_object_ref();
-        let sv = match native_stable_value_of_supplier(
-            &mut ctx,
-            &[Value::Object(Some(supplier))],
-        )
-        .unwrap()
+        let sv = match native_stable_value_of_supplier(&mut ctx, &[Value::Object(Some(supplier))])
+            .unwrap()
         {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected StableValue object, got {other:?}"),
@@ -1219,7 +1277,10 @@ mod jdk25_patterns_tests {
             other => panic!("expected StableValue object, got {other:?}"),
         };
         let r = native_stable_value_or_else_throw(&mut ctx, &[Value::Object(Some(sv))]);
-        assert!(r.is_err(), "expected an exception for unset value with no supplier");
+        assert!(
+            r.is_err(),
+            "expected an exception for unset value with no supplier"
+        );
     }
 
     /// A supplier that throws propagates the failure and leaves the value
@@ -1304,12 +1365,18 @@ mod jdk25_patterns_tests {
 
     #[test]
     fn test_short_to_char_narrowing() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Short, PrimitiveType::Char));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Short,
+            PrimitiveType::Char
+        ));
     }
 
     #[test]
     fn test_char_to_short_narrowing() {
-        assert!(PrimitivePatternMatcher::can_narrow(PrimitiveType::Char, PrimitiveType::Short));
+        assert!(PrimitivePatternMatcher::can_narrow(
+            PrimitiveType::Char,
+            PrimitiveType::Short
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1346,7 +1413,10 @@ mod jdk25_patterns_tests {
     #[test]
     fn test_record_pattern_destructure() {
         // Record patterns: case Point(int x, int y) -> x + y
-        struct Point { x: i32, y: i32 }
+        struct Point {
+            x: i32,
+            y: i32,
+        }
         let p = Point { x: 3, y: 4 };
         assert_eq!(p.x + p.y, 7);
     }
@@ -1354,9 +1424,18 @@ mod jdk25_patterns_tests {
     #[test]
     fn test_nested_pattern() {
         // Nested patterns: case Pair(Point(x1,y1), Point(x2,y2))
-        struct Point { x: i32, y: i32 }
-        struct Pair { a: Point, b: Point }
-        let pair = Pair { a: Point { x: 1, y: 2 }, b: Point { x: 3, y: 4 } };
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        struct Pair {
+            a: Point,
+            b: Point,
+        }
+        let pair = Pair {
+            a: Point { x: 1, y: 2 },
+            b: Point { x: 3, y: 4 },
+        };
         assert_eq!(pair.a.x + pair.b.x, 4);
     }
 
@@ -1364,7 +1443,11 @@ mod jdk25_patterns_tests {
     fn test_guard_pattern() {
         // Guarded patterns: case int i when i > 0 -> "positive"
         let value = 42;
-        let result = if value > 0 { "positive" } else { "non-positive" };
+        let result = if value > 0 {
+            "positive"
+        } else {
+            "non-positive"
+        };
         assert_eq!(result, "positive");
     }
 
@@ -1378,7 +1461,10 @@ mod jdk25_patterns_tests {
     #[test]
     fn test_switch_exhaustiveness() {
         // Sealed type switch must be exhaustive
-        enum Shape { Circle(f64), Rectangle(f64, f64) }
+        enum Shape {
+            Circle(f64),
+            Rectangle(f64, f64),
+        }
         let s = Shape::Circle(5.0);
         let area = match s {
             Shape::Circle(r) => std::f64::consts::PI * r * r,

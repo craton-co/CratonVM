@@ -73,10 +73,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::RwLock;
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -168,10 +168,7 @@ impl Subject {
     /// last `.`-segment of the class name against the stored principal
     /// type (when recorded).
     pub fn get_principals_of(&self, class_name: &str) -> Vec<Arc<Principal>> {
-        let suffix = class_name
-            .rsplit('/')
-            .next()
-            .unwrap_or(class_name);
+        let suffix = class_name.rsplit('/').next().unwrap_or(class_name);
         self.principals
             .read()
             .iter()
@@ -194,9 +191,7 @@ impl Subject {
     /// bytes so structured-logging formatters don't accidentally ship
     /// the plaintext to stdout through a `Display` impl.
     pub fn add_private_credential(&self, cred: &[u8]) {
-        self.private_creds
-            .write()
-            .insert(Arc::<[u8]>::from(cred));
+        self.private_creds.write().insert(Arc::<[u8]>::from(cred));
     }
 
     /// Snapshot the private-credentials set.  Callers that log must
@@ -314,9 +309,8 @@ impl ControlFlag {
 /// `LoginModule` implementations wrap their Java-side `login()` call
 /// behind a closure of this shape so the JAAS state machine stays
 /// pure Rust.
-pub type ModuleLogin = Box<
-    dyn Fn(&Subject, &HashMap<String, String>) -> ModuleOutcome + Send + Sync + 'static,
->;
+pub type ModuleLogin =
+    Box<dyn Fn(&Subject, &HashMap<String, String>) -> ModuleOutcome + Send + Sync + 'static>;
 
 /// One entry in the login-module chain.
 pub struct LoginModuleEntry {
@@ -435,16 +429,13 @@ impl LoginContext {
                     any_non_optional_success = true;
                     sufficient_success = true;
                 }
-                (ControlFlag::Sufficient, ModuleOutcome::Failure)
-                | (ControlFlag::Optional, _) => {
+                (ControlFlag::Sufficient, ModuleOutcome::Failure) | (ControlFlag::Optional, _) => {
                     // Ignored — continue.
                 }
                 (_, ModuleOutcome::NotInvoked) => {
                     // A module's login_fn should not synthesize
                     // NotInvoked; treat as failure for safety.
-                    if entry.flag == ControlFlag::Required
-                        || entry.flag == ControlFlag::Requisite
-                    {
+                    if entry.flag == ControlFlag::Required || entry.flag == ControlFlag::Requisite {
                         any_required_failure = true;
                     }
                 }
@@ -619,7 +610,9 @@ fn domain_registry() -> &'static RwLock<HashMap<String, Arc<SecurityDomainServic
 /// finds it later.  Overwrites a prior registration under the same
 /// name — matches WildFly's "last deployer wins" semantics.
 pub fn register_security_domain(domain: Arc<SecurityDomainService>) {
-    domain_registry().write().insert(domain.name.clone(), domain);
+    domain_registry()
+        .write()
+        .insert(domain.name.clone(), domain);
 }
 
 /// Look up a previously-registered domain by name.  Returns `None`
@@ -651,7 +644,10 @@ pub struct SecurityIdentity {
 }
 
 impl SecurityIdentity {
-    pub fn new(principal: Arc<Principal>, roles: impl IntoIterator<Item = String>) -> Arc<SecurityIdentity> {
+    pub fn new(
+        principal: Arc<Principal>,
+        roles: impl IntoIterator<Item = String>,
+    ) -> Arc<SecurityIdentity> {
         Arc::new(SecurityIdentity {
             principal,
             roles: roles.into_iter().map(Arc::<str>::from).collect(),
@@ -786,10 +782,7 @@ fn subject_missing_err() -> MethodCallFailed {
     .into()
 }
 
-fn native_subject_get_principals(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_subject_get_principals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let Some(subject) = get_subject_from_this(ctx, this) else {
         return Err(subject_missing_err());
@@ -856,10 +849,7 @@ fn native_subject_do_as(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[])
 }
 
-fn native_login_context_init(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // <init>(String, Subject, CallbackHandler)V  — we only need the
     // string-name here; the module chain comes from the security
     // domain registry.
@@ -912,10 +902,7 @@ fn login_context_missing_err() -> MethodCallFailed {
     .into()
 }
 
-fn native_login_context_login(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_login_context_login(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let Some(lc) = get_login_context_from_this(ctx, this) else {
         return Err(login_context_missing_err());
@@ -930,10 +917,7 @@ fn native_login_context_login(
     Ok(None)
 }
 
-fn native_login_context_logout(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_login_context_logout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // `logout()` on an unknown LoginContext is left as a no-op so
     // shutdown paths that race with finalisation don't observe a
@@ -1032,8 +1016,7 @@ pub fn access_control_context_check_permission(
     target: &str,
     actions: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let allowed =
-        crate::security_manager::policy_allows(permission_class, target, actions, None);
+    let allowed = crate::security_manager::policy_allows(permission_class, target, actions, None);
     if allowed {
         tracing::trace!(
             permission_class = %permission_class,
@@ -1044,9 +1027,7 @@ pub fn access_control_context_check_permission(
         Ok(())
     } else {
         Err(RuntimeError::SecurityException {
-            message: format!(
-                "access denied (\"{permission_class}\" \"{target}\" \"{actions}\")"
-            ),
+            message: format!("access denied (\"{permission_class}\" \"{target}\" \"{actions}\")"),
         }
         .into())
     }
@@ -1125,7 +1106,12 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
     );
 
     let si = "org/wildfly/security/auth/server/SecurityIdentity";
-    r.register(si, "getRoles", "()Ljava/util/Set;", native_security_identity_get_roles);
+    r.register(
+        si,
+        "getRoles",
+        "()Ljava/util/Set;",
+        native_security_identity_get_roles,
+    );
     r.register(
         si,
         "runAs",
@@ -1261,10 +1247,7 @@ mod tests {
         let r = lc.login();
         assert!(r.success);
         assert_eq!(r.outcomes.len(), 2);
-        assert!(r
-            .outcomes
-            .iter()
-            .all(|o| *o == ModuleOutcome::Success));
+        assert!(r.outcomes.iter().all(|o| *o == ModuleOutcome::Success));
     }
 
     #[test]
@@ -1278,8 +1261,16 @@ mod tests {
             Subject::new(),
             vec![
                 always_fails(ControlFlag::Required, "dead"),
-                tracking_module(ControlFlag::Optional, counter.clone(), ModuleOutcome::Success),
-                tracking_module(ControlFlag::Optional, counter.clone(), ModuleOutcome::Success),
+                tracking_module(
+                    ControlFlag::Optional,
+                    counter.clone(),
+                    ModuleOutcome::Success,
+                ),
+                tracking_module(
+                    ControlFlag::Optional,
+                    counter.clone(),
+                    ModuleOutcome::Success,
+                ),
             ],
         );
         let r = lc.login();
@@ -1302,7 +1293,11 @@ mod tests {
             Subject::new(),
             vec![
                 always_fails(ControlFlag::Requisite, "abort"),
-                tracking_module(ControlFlag::Required, counter.clone(), ModuleOutcome::Success),
+                tracking_module(
+                    ControlFlag::Required,
+                    counter.clone(),
+                    ModuleOutcome::Success,
+                ),
             ],
         );
         let r = lc.login();
@@ -1325,7 +1320,11 @@ mod tests {
             Subject::new(),
             vec![
                 always_succeeds(ControlFlag::Sufficient, "win"),
-                tracking_module(ControlFlag::Required, counter.clone(), ModuleOutcome::Failure),
+                tracking_module(
+                    ControlFlag::Required,
+                    counter.clone(),
+                    ModuleOutcome::Failure,
+                ),
             ],
         );
         let r = lc.login();
@@ -1359,15 +1358,13 @@ mod tests {
         let _guard = domain_test_lock();
         clear_domain_registry();
 
-        let policy = ApplicationPolicy::new(vec![
-            always_succeeds(ControlFlag::Required, "a"),
-        ]);
+        let policy = ApplicationPolicy::new(vec![always_succeeds(ControlFlag::Required, "a")]);
         let sds = SecurityDomainService::new("keycloak", policy);
         register_security_domain(sds.clone());
 
         // Lookup by name returns the same Arc handle.
-        let found = lookup_security_domain("keycloak")
-            .expect("registered keycloak domain should resolve");
+        let found =
+            lookup_security_domain("keycloak").expect("registered keycloak domain should resolve");
         assert!(Arc::ptr_eq(&found, &sds));
 
         // AuthenticationManager is the same Rust-side object.
@@ -1551,10 +1548,7 @@ mod tests {
         let lc = LoginContext::new("mgmt", s.clone(), vec![m]);
         let r = lc.login();
         assert!(r.success);
-        assert!(s
-            .get_principals()
-            .iter()
-            .any(|p| p.name() == "internal"));
+        assert!(s.get_principals().iter().any(|p| p.name() == "internal"));
     }
 
     #[test]
@@ -1614,11 +1608,7 @@ mod tests {
             )
             .is_some());
         assert!(r
-            .find(
-                "javax/security/auth/login/LoginContext",
-                "login",
-                "()V"
-            )
+            .find("javax/security/auth/login/LoginContext", "login", "()V")
             .is_some());
         assert!(r
             .find(

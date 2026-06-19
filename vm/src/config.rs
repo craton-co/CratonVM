@@ -133,7 +133,6 @@ pub struct VmConfig {
     // -----------------------------------------------------------------------
     // JPMS module system flags (Phase B)
     // -----------------------------------------------------------------------
-
     /// Extra module-path directories/JARs (`--module-path`).
     pub module_path: Vec<String>,
 
@@ -155,7 +154,6 @@ pub struct VmConfig {
     // -----------------------------------------------------------------------
     // JIT flags
     // -----------------------------------------------------------------------
-
     /// Aggressive JIT compilation policy.
     ///
     /// When `false` (default), the JIT static skip list applies broad
@@ -859,9 +857,9 @@ fn detect_java_home_from_path() -> Option<PathBuf> {
 
     // Try the flag variants in order of specificity
     let flag_variants = [
-        "-XshowSettings:properties",  // JDK 25+
-        "-XshowSettings:property",    // JDK 9-24
-        "-XshowSettings:all",         // universal fallback
+        "-XshowSettings:properties", // JDK 25+
+        "-XshowSettings:property",   // JDK 9-24
+        "-XshowSettings:all",        // universal fallback
     ];
 
     for flag in &flag_variants {
@@ -1082,9 +1080,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn parse_classpath_normalizes_msys_paths() {
-        let entries = VmConfig::parse_classpath(
-            "/c/craton/bootstrap.jar;/c/craton/tomcat-juli.jar",
-        );
+        let entries =
+            VmConfig::parse_classpath("/c/craton/bootstrap.jar;/c/craton/tomcat-juli.jar");
         assert_eq!(
             entries,
             vec![
@@ -1097,9 +1094,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn parse_classpath_normalizes_cygdrive_paths() {
-        let entries = VmConfig::parse_classpath(
-            "/cygdrive/c/a.jar;/cygdrive/d/b.jar",
-        );
+        let entries = VmConfig::parse_classpath("/cygdrive/c/a.jar;/cygdrive/d/b.jar");
         assert_eq!(
             entries,
             vec!["C:/a.jar".to_string(), "D:/b.jar".to_string()]
@@ -1110,9 +1105,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn parse_classpath_preserves_native_windows_paths() {
-        let entries = VmConfig::parse_classpath(
-            "C:/foo/a.jar;lib/b.jar;.;C:\\bar\\c.jar",
-        );
+        let entries = VmConfig::parse_classpath("C:/foo/a.jar;lib/b.jar;.;C:\\bar\\c.jar");
         assert_eq!(
             entries,
             vec![
@@ -1135,10 +1128,7 @@ mod tests {
         let entries = VmConfig::parse_classpath("/etc/foo.jar;/usr/lib/bar.jar");
         assert_eq!(
             entries,
-            vec![
-                "/etc/foo.jar".to_string(),
-                "/usr/lib/bar.jar".to_string(),
-            ]
+            vec!["/etc/foo.jar".to_string(), "/usr/lib/bar.jar".to_string(),]
         );
     }
 
@@ -1209,7 +1199,10 @@ mod tests {
             .with_aot_cache_input("/tmp/cache.aot".to_string())
             .with_aot_cache_output("/tmp/cache_out.aot".to_string());
         assert_eq!(config.aot_cache_input.as_deref(), Some("/tmp/cache.aot"));
-        assert_eq!(config.aot_cache_output.as_deref(), Some("/tmp/cache_out.aot"));
+        assert_eq!(
+            config.aot_cache_output.as_deref(),
+            Some("/tmp/cache_out.aot")
+        );
     }
 
     #[test]
@@ -1260,7 +1253,11 @@ mod tests {
              Is Java installed and on the system PATH?"
         );
         let jdk = jdk.unwrap();
-        assert!(jdk.is_dir(), "java.home should be a directory: {}", jdk.display());
+        assert!(
+            jdk.is_dir(),
+            "java.home should be a directory: {}",
+            jdk.display()
+        );
         // JDK 9+ should have a jmods directory
         let jmods = jdk.join("jmods");
         assert!(
@@ -1303,7 +1300,9 @@ mod tests {
 
         eprintln!(
             "Discovered {} boot classpath entries ({} jmods) from {}",
-            entries.len(), jmod_count, jdk.display()
+            entries.len(),
+            jmod_count,
+            jdk.display()
         );
     }
 
@@ -1320,10 +1319,13 @@ mod tests {
     #[test]
     fn parse_add_reads_multiple_targets() {
         let result = VmConfig::parse_add_reads("modA=modB,modC");
-        assert_eq!(result, vec![
-            ("modA".to_string(), "modB".to_string()),
-            ("modA".to_string(), "modC".to_string()),
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                ("modA".to_string(), "modB".to_string()),
+                ("modA".to_string(), "modC".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1335,13 +1337,27 @@ mod tests {
     #[test]
     fn parse_add_exports_basic() {
         let result = VmConfig::parse_add_exports("modA/com.foo=modB");
-        assert_eq!(result, Some(("modA".to_string(), "com/foo".to_string(), "modB".to_string())));
+        assert_eq!(
+            result,
+            Some((
+                "modA".to_string(),
+                "com/foo".to_string(),
+                "modB".to_string()
+            ))
+        );
     }
 
     #[test]
     fn parse_add_exports_all_unnamed() {
         let result = VmConfig::parse_add_exports("java.base/java.lang=ALL-UNNAMED");
-        assert_eq!(result, Some(("java.base".to_string(), "java/lang".to_string(), String::new())));
+        assert_eq!(
+            result,
+            Some((
+                "java.base".to_string(),
+                "java/lang".to_string(),
+                String::new()
+            ))
+        );
     }
 
     #[test]
@@ -1401,17 +1417,21 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            with_env("JAVA_HOME", None, || {
-                let detected = detect_real_jdk();
-                assert!(
-                    detected.is_some(),
-                    "detect_real_jdk should find synthetic JDK at {}",
-                    tmp.path().display()
-                );
-                assert_eq!(detected.unwrap(), tmp.path());
-            });
-        });
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                with_env("JAVA_HOME", None, || {
+                    let detected = detect_real_jdk();
+                    assert!(
+                        detected.is_some(),
+                        "detect_real_jdk should find synthetic JDK at {}",
+                        tmp.path().display()
+                    );
+                    assert_eq!(detected.unwrap(), tmp.path());
+                });
+            },
+        );
     }
 
     #[test]
@@ -1419,15 +1439,19 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_lib_modules(tmp.path());
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            with_env("JAVA_HOME", None, || {
-                let detected = detect_real_jdk();
-                assert!(
-                    detected.is_some(),
-                    "detect_real_jdk should accept jlink-image layout"
-                );
-            });
-        });
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                with_env("JAVA_HOME", None, || {
+                    let detected = detect_real_jdk();
+                    assert!(
+                        detected.is_some(),
+                        "detect_real_jdk should accept jlink-image layout"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
@@ -1442,12 +1466,16 @@ mod tests {
         let lib = tmp.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            assert!(
-                detect_real_jdk().is_none(),
-                "rt.jar-only install must not satisfy detect_real_jdk"
-            );
-        });
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                assert!(
+                    detect_real_jdk().is_none(),
+                    "rt.jar-only install must not satisfy detect_real_jdk"
+                );
+            },
+        );
     }
 
     /// Boot-default decision: when `detect_real_jdk` returns `Some`,
@@ -1457,15 +1485,19 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            with_env("JAVA_HOME", None, || {
-                let cfg = VmConfig::with_host_jdk_default();
-                assert!(
-                    !cfg.use_synthetic_jdk,
-                    "with_host_jdk_default must prefer JMOD when JDK is present"
-                );
-            });
-        });
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                with_env("JAVA_HOME", None, || {
+                    let cfg = VmConfig::with_host_jdk_default();
+                    assert!(
+                        !cfg.use_synthetic_jdk,
+                        "with_host_jdk_default must prefer JMOD when JDK is present"
+                    );
+                });
+            },
+        );
     }
 
     /// Boot-default decision: when the resolved `JAVA_HOME` is a real
@@ -1485,16 +1517,20 @@ mod tests {
         // Bare directory: no `jmods/`, no `lib/modules`. `resolve_java_home`
         // will accept it (it's a real directory) but `detect_real_jdk`
         // must reject it because neither boot blob is present.
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            with_env("JAVA_HOME", None, || {
-                let cfg = VmConfig::with_host_jdk_default();
-                assert!(
-                    cfg.use_synthetic_jdk,
-                    "with_host_jdk_default must fall back to synthetic when the \
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                with_env("JAVA_HOME", None, || {
+                    let cfg = VmConfig::with_host_jdk_default();
+                    assert!(
+                        cfg.use_synthetic_jdk,
+                        "with_host_jdk_default must fall back to synthetic when the \
                      resolved JAVA_HOME contains no boot modules"
-                );
-            });
-        });
+                    );
+                });
+            },
+        );
     }
 
     /// Explicit `--synthetic-jdk` opt-in must beat detection: even with
@@ -1504,15 +1540,19 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
-            with_env("JAVA_HOME", None, || {
-                let cfg = VmConfig::with_host_jdk_default().with_synthetic_jdk(true);
-                assert!(
-                    cfg.use_synthetic_jdk,
-                    "Explicit --synthetic-jdk override must force synthetic mode"
-                );
-            });
-        });
+        with_env(
+            "CRATONVM_JAVA_HOME",
+            Some(tmp.path().to_str().unwrap()),
+            || {
+                with_env("JAVA_HOME", None, || {
+                    let cfg = VmConfig::with_host_jdk_default().with_synthetic_jdk(true);
+                    assert!(
+                        cfg.use_synthetic_jdk,
+                        "Explicit --synthetic-jdk override must force synthetic mode"
+                    );
+                });
+            },
+        );
     }
 
     /// `VmConfig::default()` must remain hermetic (synthetic) so library

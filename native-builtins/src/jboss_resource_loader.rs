@@ -154,10 +154,7 @@ pub fn native_create_resource_loader(
     Ok(loader)
 }
 
-fn path_from_string(
-    ctx: &mut dyn NativeContext,
-    s: &str,
-) -> Result<Value, MethodCallFailed> {
+fn path_from_string(ctx: &mut dyn NativeContext, s: &str) -> Result<Value, MethodCallFailed> {
     let js = ctx.create_string(s);
     // Paths.get(String, String...) — pass empty String[] for varargs.
     let empty = ctx.new_ref_array(

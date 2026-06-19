@@ -87,7 +87,11 @@ struct JcaMap {
 
 fn jca_map() -> &'static Mutex<JcaMap> {
     static M: OnceLock<Mutex<JcaMap>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(JcaMap { pool_ids: HashMap::new() }))
+    M.get_or_init(|| {
+        Mutex::new(JcaMap {
+            pool_ids: HashMap::new(),
+        })
+    })
 }
 
 /// Reset the IronJacamar state for tests.
@@ -159,7 +163,8 @@ fn native_abstract_pool_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Err(e) => {
             return Err(RuntimeError::IllegalStateException {
                 message: format!("SQLException: {}", e),
-            }.into());
+            }
+            .into());
         }
     };
 
@@ -188,7 +193,8 @@ fn native_pool_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         None => {
             return Err(RuntimeError::IllegalStateException {
                 message: "ResourceException: pool not initialised".to_string(),
-            }.into());
+            }
+            .into());
         }
     };
     let conn_id = match acquire(pool_id) {
@@ -196,12 +202,14 @@ fn native_pool_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Err(e) if e.starts_with("SQLTransientConnectionException") || e.contains("timeout") => {
             return Err(RuntimeError::IllegalStateException {
                 message: "ResourceException: pool exhausted".to_string(),
-            }.into());
+            }
+            .into());
         }
         Err(e) => {
             return Err(RuntimeError::IllegalStateException {
                 message: format!("ResourceException: {}", e),
-            }.into());
+            }
+            .into());
         }
     };
 
@@ -262,7 +270,9 @@ fn native_mcf_create_managed_connection(
     };
     // MCF slot 0: JDBC URL
     let jdbc_url = match ctx.get_field(this, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "jdbc:h2:mem:mcf".to_string()),
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .unwrap_or_else(|| "jdbc:h2:mem:mcf".to_string()),
         _ => "jdbc:h2:mem:mcf".to_string(),
     };
     // Opening a single off-pool connection. We reuse the Agroal path for
@@ -273,13 +283,19 @@ fn native_mcf_create_managed_connection(
     let pool_id = match create_pool(cfg) {
         Ok(id) => id,
         Err(e) => {
-            return Err(RuntimeError::IllegalStateException { message: format!("SQLException: {}", e) }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: format!("SQLException: {}", e),
+            }
+            .into());
         }
     };
     let conn_id = match acquire(pool_id) {
         Ok(id) => id,
         Err(e) => {
-            return Err(RuntimeError::IllegalStateException { message: format!("ResourceException: {}", e) }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: format!("ResourceException: {}", e),
+            }
+            .into());
         }
     };
     let mc = alloc_object_for(ctx, CLS_JDBC_LOCAL_MC, 4);
@@ -304,7 +320,8 @@ fn native_mc_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if validate_select_1(conn_id).is_err() {
         return Err(RuntimeError::IllegalStateException {
             message: "ResourceException: underlying connection is dead".to_string(),
-        }.into());
+        }
+        .into());
     }
     let conn = alloc_object_for(ctx, CLS_H2_CONNECTION, 4);
     ctx.set_field(conn, 0, Value::Long(conn_id));
@@ -359,12 +376,7 @@ pub fn register_ironjacamar_natives(registry: &mut NativeMethodRegistry) {
         "(Ljavax/resource/spi/ManagedConnection;Z)V",
         native_pool_return_connection,
     );
-    registry.register(
-        CLS_ABSTRACT_POOL,
-        "shutdown",
-        "()V",
-        native_pool_shutdown,
-    );
+    registry.register(CLS_ABSTRACT_POOL, "shutdown", "()V", native_pool_shutdown);
 
     // StrategyPool (concrete subclass of AbstractPool)
     registry.register(
@@ -453,12 +465,20 @@ mod tests {
         let pool = ctx.alloc_object(cid, AP_NUM_FIELDS);
         native_strategy_pool_init(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(Some(mcf)), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(Some(mcf)),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         let ret = native_pool_get_connection(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         let conn = match ret {
@@ -485,7 +505,11 @@ mod tests {
         let mcf = make_mcf(&mut ctx, "jdbc:h2:mem:mcf-real");
         let ret = native_mcf_create_managed_connection(
             &mut ctx,
-            &[Value::Object(Some(mcf)), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(Some(mcf)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         let mc = match ret {
@@ -517,7 +541,11 @@ mod tests {
         bind_pool(pool, pool_id);
         let _ = native_pool_get_connection(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .expect("first acquire");
         // Second acquire must block until timeout and return a
@@ -535,11 +563,12 @@ mod tests {
         // "ResourceException: pool exhausted".
         let err = "SQLTransientConnectionException: timeout foo".to_string();
         // This mirrors what `native_pool_get_connection` does on a timeout.
-        let mapped = if err.starts_with("SQLTransientConnectionException") || err.contains("timeout") {
-            "ResourceException: pool exhausted".to_string()
-        } else {
-            format!("ResourceException: {}", err)
-        };
+        let mapped =
+            if err.starts_with("SQLTransientConnectionException") || err.contains("timeout") {
+                "ResourceException: pool exhausted".to_string()
+            } else {
+                format!("ResourceException: {}", err)
+            };
         assert_eq!(mapped, "ResourceException: pool exhausted");
     }
 
@@ -553,18 +582,30 @@ mod tests {
         let pool = ctx.alloc_object(cid, AP_NUM_FIELDS);
         native_strategy_pool_init(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(Some(mcf)), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(Some(mcf)),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         // Acquire two connections.
         let _c1 = native_pool_get_connection(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         let _c2 = native_pool_get_connection(
             &mut ctx,
-            &[Value::Object(Some(pool)), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(Some(pool)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .unwrap();
         let pool_id = pool_id_for(pool).expect("bound");

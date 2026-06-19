@@ -123,9 +123,7 @@ fn proxy_module_descriptor_param_count() {
         1
     );
     assert_eq!(
-        count_descriptor_params(
-            "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/util/List;"
-        ),
+        count_descriptor_params("(Ljava/lang/String;[Ljava/lang/Object;)Ljava/util/List;"),
         2
     );
 }
@@ -289,9 +287,7 @@ fn run_proxy_main(class_name: &str) -> Result<(), String> {
             // Report linkage errors that we explicitly fixed; let
             // unrelated runtime exceptions through (the probe handles
             // them itself).
-            if msg.contains("no Code attribute")
-                || msg.contains("AbstractMethodError")
-            {
+            if msg.contains("no Code attribute") || msg.contains("AbstractMethodError") {
                 Err(format!("proxy dispatch regressed: {msg}"))
             } else {
                 Ok(())
@@ -450,7 +446,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -549,7 +549,10 @@ fn case_passed(output: &str, n: u32) -> bool {
 /// Look for the `fail-N …` line; useful for triage messages.
 fn fail_line(output: &str, n: u32) -> Option<String> {
     let needle = format!("fail-{n}");
-    output.lines().find(|l| l.contains(&needle)).map(str::to_string)
+    output
+        .lines()
+        .find(|l| l.contains(&needle))
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,9 +612,8 @@ fn proxy_probe_case_1_single_iface() {
         None => return,
     };
     if !case_passed(&output, 1) {
-        let line = fail_line(&output, 1).unwrap_or_else(|| {
-            "(no pass-1 or fail-1 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 1)
+            .unwrap_or_else(|| "(no pass-1 or fail-1 line found in probe output)".to_string());
         panic!("WP2.5 case 1 single-iface failed: {line}");
     }
 }
@@ -625,9 +627,8 @@ fn proxy_probe_case_2_is_proxy_class() {
         None => return,
     };
     if !case_passed(&output, 2) {
-        let line = fail_line(&output, 2).unwrap_or_else(|| {
-            "(no pass-2 or fail-2 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 2)
+            .unwrap_or_else(|| "(no pass-2 or fail-2 line found in probe output)".to_string());
         panic!("WP2.5 case 2 isProxyClass failed: {line}");
     }
 }
@@ -642,9 +643,8 @@ fn proxy_probe_case_3_get_interfaces() {
         None => return,
     };
     if !case_passed(&output, 3) {
-        let line = fail_line(&output, 3).unwrap_or_else(|| {
-            "(no pass-3 or fail-3 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 3)
+            .unwrap_or_else(|| "(no pass-3 or fail-3 line found in probe output)".to_string());
         panic!("WP2.5 case 3 getInterfaces failed: {line}");
     }
 }
@@ -658,9 +658,8 @@ fn proxy_probe_case_4_get_invocation_handler() {
         None => return,
     };
     if !case_passed(&output, 4) {
-        let line = fail_line(&output, 4).unwrap_or_else(|| {
-            "(no pass-4 or fail-4 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 4)
+            .unwrap_or_else(|| "(no pass-4 or fail-4 line found in probe output)".to_string());
         panic!("WP2.5 case 4 getInvocationHandler failed: {line}");
     }
 }
@@ -681,9 +680,8 @@ fn proxy_probe_case_5_multi_iface() {
         None => return,
     };
     if !case_passed(&output, 5) {
-        let line = fail_line(&output, 5).unwrap_or_else(|| {
-            "(no pass-5 or fail-5 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 5)
+            .unwrap_or_else(|| "(no pass-5 or fail-5 line found in probe output)".to_string());
         panic!("WP2.5 case 5 multi-iface failed (needs proxy.rs fix): {line}");
     }
 }
@@ -705,9 +703,8 @@ fn proxy_probe_case_6_default_method() {
         None => return,
     };
     if !case_passed(&output, 6) {
-        let line = fail_line(&output, 6).unwrap_or_else(|| {
-            "(no pass-6 or fail-6 line found in probe output)".to_string()
-        });
+        let line = fail_line(&output, 6)
+            .unwrap_or_else(|| "(no pass-6 or fail-6 line found in probe output)".to_string());
         panic!("WP2.5 case 6 default-method failed (needs proxy.rs fix): {line}");
     }
 }

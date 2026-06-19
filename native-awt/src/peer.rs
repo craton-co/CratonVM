@@ -62,18 +62,18 @@ pub struct ComponentPeer {
     pub enabled: bool,
     pub focusable: bool,
     pub has_focus: bool,
-    pub background: u32,  // ARGB
-    pub foreground: u32,  // ARGB
+    pub background: u32, // ARGB
+    pub foreground: u32, // ARGB
     pub font_family: String,
     pub font_style: i32,
     pub font_size: i32,
-    pub title: String,     // for Frame/Dialog
-    pub text: String,      // for Button/Label/TextField
-    pub window_id: Option<u64>,  // platform WindowId, only for Frame/Dialog
-    pub image_id: Option<u64>,   // backing BufferedImage for double-buffering
+    pub title: String,          // for Frame/Dialog
+    pub text: String,           // for Button/Label/TextField
+    pub window_id: Option<u64>, // platform WindowId, only for Frame/Dialog
+    pub image_id: Option<u64>,  // backing BufferedImage for double-buffering
     pub resizable: bool,
     pub opaque: bool,
-    pub cursor_type: i32,  // java.awt.Cursor.DEFAULT_CURSOR etc.
+    pub cursor_type: i32, // java.awt.Cursor.DEFAULT_CURSOR etc.
     pub minimum_size: (u32, u32),
     pub preferred_size: (u32, u32),
     pub maximum_size: (u32, u32),
@@ -138,7 +138,10 @@ impl ComponentPeer {
 
     /// Returns `true` if this peer represents a top-level window (Frame or Dialog).
     pub fn is_window(&self) -> bool {
-        matches!(self.component_type, ComponentType::Frame | ComponentType::Dialog)
+        matches!(
+            self.component_type,
+            ComponentType::Frame | ComponentType::Dialog
+        )
     }
 }
 

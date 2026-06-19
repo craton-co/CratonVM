@@ -90,13 +90,19 @@ fn subject_public_key_info_round_trip() {
     assert_eq!(bs[0], asn1::TAG_BIT_STRING);
     let (_, bhdr, bclen, _) = asn1::read_header(bs).expect("bs");
     let bs_content = &bs[bhdr..bhdr + bclen];
-    assert_eq!(bs_content[0], 0x00, "unused-bits MUST be 0 for byte-aligned keys");
+    assert_eq!(
+        bs_content[0], 0x00,
+        "unused-bits MUST be 0 for byte-aligned keys"
+    );
     assert_eq!(&bs_content[1..], fake_key_bits);
 
     // Round-trip through the typed decoder.
     let parsed = asn1::decode_subject_public_key_info(&spki).expect("decode");
     assert_eq!(parsed.algorithm_oid, asn1::OID_RSA_ENCRYPTION);
-    assert_eq!(parsed.algorithm_params.as_deref(), Some(null_params.as_slice()));
+    assert_eq!(
+        parsed.algorithm_params.as_deref(),
+        Some(null_params.as_slice())
+    );
     assert_eq!(parsed.subject_public_key, fake_key_bits);
 }
 
@@ -115,18 +121,24 @@ fn extensions_sequence_encoding_and_critical_default() {
     let ext_key_usage = asn1::Extension {
         oid: asn1::OID_EXT_KEY_USAGE.into(),
         critical: false,
-        value: vec![0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01],
+        value: vec![
+            0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+        ],
     };
 
     // Single-extension encode for the BOOLEAN-default check.
     let crit_der = asn1::encode_extension(&basic_constraints);
     assert!(
-        crit_der.windows(3).any(|w| w == [asn1::TAG_BOOLEAN, 0x01, 0xFF]),
+        crit_der
+            .windows(3)
+            .any(|w| w == [asn1::TAG_BOOLEAN, 0x01, 0xFF]),
         "critical=true MUST be encoded as 01 01 FF (DER §11.1)"
     );
     let nocrit_der = asn1::encode_extension(&ext_key_usage);
     assert!(
-        !nocrit_der.windows(2).any(|w| w == [asn1::TAG_BOOLEAN, 0x01]),
+        !nocrit_der
+            .windows(2)
+            .any(|w| w == [asn1::TAG_BOOLEAN, 0x01]),
         "critical=false MUST be omitted (DEFAULT FALSE) — found stray BOOLEAN tag"
     );
 
@@ -175,7 +187,11 @@ fn certification_request_info_structure_and_fixture() {
     // extensionRequest.
     let cri = asn1::encode_certification_request_info(0, &name_der, &spki, &[]);
 
-    assert_eq!(cri[0], asn1::TAG_SEQUENCE, "CertificationRequestInfo wrapper tag");
+    assert_eq!(
+        cri[0],
+        asn1::TAG_SEQUENCE,
+        "CertificationRequestInfo wrapper tag"
+    );
 
     // Walk the children.
     let (_, hdr, clen, _) = asn1::read_header(&cri).unwrap();
@@ -196,10 +212,18 @@ fn certification_request_info_structure_and_fixture() {
     p += t1;
     // [0] attributes
     let (t, _h, _c, t1) = asn1::read_header(&body[p..]).unwrap();
-    assert_eq!(t & 0xE0, 0xA0, "[0] context-specific tag class+constructed bits");
+    assert_eq!(
+        t & 0xE0,
+        0xA0,
+        "[0] context-specific tag class+constructed bits"
+    );
     assert_eq!(t & 0x1F, 0, "[0] tag number must be 0");
     p += t1;
-    assert_eq!(p, body.len(), "no trailing bytes inside CertificationRequestInfo");
+    assert_eq!(
+        p,
+        body.len(),
+        "no trailing bytes inside CertificationRequestInfo"
+    );
 
     // Re-encode is byte-stable.
     let cri2 = asn1::encode_certification_request_info(0, &name_der, &spki, &[]);
@@ -215,10 +239,7 @@ fn certification_request_info_structure_and_fixture() {
 #[test]
 fn tbs_certificate_v3_skeleton_outline() {
     let null_params = asn1::encode_null();
-    let alg = asn1::encode_algorithm_identifier(
-        asn1::OID_SHA256_WITH_RSA,
-        Some(&null_params),
-    );
+    let alg = asn1::encode_algorithm_identifier(asn1::OID_SHA256_WITH_RSA, Some(&null_params));
     // Stub-out issuer / subject as the same single-RDN Name.
     let cn_oid = asn1::encode_oid("2.5.4.3").unwrap();
     let cn_val = asn1::encode_directory_string("Issuer");
@@ -227,11 +248,8 @@ fn tbs_certificate_v3_skeleton_outline() {
     atv_inner.extend_from_slice(&cn_val);
     let name_der = asn1::encode_sequence(&asn1::encode_set(&asn1::encode_sequence(&atv_inner)));
 
-    let spki = asn1::encode_subject_public_key_info(
-        asn1::OID_RSA_ENCRYPTION,
-        Some(&null_params),
-        b"key",
-    );
+    let spki =
+        asn1::encode_subject_public_key_info(asn1::OID_RSA_ENCRYPTION, Some(&null_params), b"key");
 
     // Validity stub — two GeneralizedTime placeholders inside a SEQUENCE.
     let validity = asn1::encode_sequence(&[
@@ -265,7 +283,10 @@ fn tbs_certificate_v3_skeleton_outline() {
     let body = &tbs[hdr..hdr + clen];
 
     // First element MUST be [0] EXPLICIT version (0xA0 prefix).
-    assert_eq!(body[0], 0xA0, "TBSCertificate v3 first element is [0] EXPLICIT version");
+    assert_eq!(
+        body[0], 0xA0,
+        "TBSCertificate v3 first element is [0] EXPLICIT version"
+    );
     let (_, vhdr, vclen, vtot) = asn1::read_header(body).unwrap();
     let inner = &body[vhdr..vhdr + vclen];
     assert_eq!(inner[0], asn1::TAG_INTEGER, "[0] wraps INTEGER version");

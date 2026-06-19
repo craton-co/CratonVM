@@ -88,7 +88,11 @@ fn spring_boot_natives_are_registered() {
     assert!(
         shared
             .native_methods
-            .find("java/util/jar/JarFile", "getManifest", "()Ljava/util/jar/Manifest;")
+            .find(
+                "java/util/jar/JarFile",
+                "getManifest",
+                "()Ljava/util/jar/Manifest;"
+            )
             .is_some(),
         "Spring Boot fat-jar regression: JarFile.getManifest() MUST be \
          registered."
@@ -125,7 +129,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -233,7 +241,9 @@ fn spring_boot_fatjar_launcher_bypasses_archive_npe() {
     // execution advances to JarFileArchive (line 86) which is the next
     // blocker and an acceptable PARTIAL milestone.
     assert!(
-        !combined.contains("ExecutableArchiveLauncher.getClassPathUrls(ExecutableArchiveLauncher.java:102)"),
+        !combined.contains(
+            "ExecutableArchiveLauncher.getClassPathUrls(ExecutableArchiveLauncher.java:102)"
+        ),
         "Spring Boot fat-jar regression: ExecutableArchiveLauncher.\
          getClassPathUrls:102 NPE has reappeared. The synthetic Archive's \
          URL/URI/File round-trip must keep working so `archive` is \

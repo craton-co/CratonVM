@@ -241,11 +241,7 @@ mod tests {
     #[test]
     fn set_and_get_text_system() {
         let mut mgr = ClipboardManager::new();
-        mgr.set_text(
-            ClipboardKind::System,
-            "hello".to_string(),
-            Some(PeerId(1)),
-        );
+        mgr.set_text(ClipboardKind::System, "hello".to_string(), Some(PeerId(1)));
 
         assert_eq!(mgr.get_text(ClipboardKind::System), Some("hello"));
         // Selection should be unaffected.
@@ -320,10 +316,7 @@ mod tests {
         let mut contents = ClipboardContents::new();
         contents.set(
             DataFlavor::FileListFlavor,
-            ClipboardData::FileList(vec![
-                "/tmp/a.txt".to_string(),
-                "/tmp/b.txt".to_string(),
-            ]),
+            ClipboardData::FileList(vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]),
         );
         mgr.set_contents(ClipboardKind::System, contents);
 

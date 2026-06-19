@@ -8,19 +8,20 @@
 //! exception types.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
-use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
-use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 use crate::lang_class::{create_constructor_object, create_method_object};
+use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Err(RuntimeError::UnsupportedOperationException {
         message: "Java object serialization is not yet supported".into(),
-    }.into())
+    }
+    .into())
 }
 
 // ---------------------------------------------------------------------------
@@ -32,19 +33,22 @@ fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
 // ---------------------------------------------------------------------------
 
 fn oos_buffers() -> &'static Mutex<HashMap<usize, Vec<u8>>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = std::sync::OnceLock::new();
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, Vec<u8>>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn ois_buffers() -> &'static Mutex<HashMap<usize, (Vec<u8>, usize)>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, (Vec<u8>, usize)>>> = std::sync::OnceLock::new();
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, (Vec<u8>, usize)>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Wire handle registry for object reference tracking during serialization.
 /// Maps OOS/OIS address -> (next_handle, handle_to_address map, address_to_handle map)
 fn handle_registry() -> &'static Mutex<HashMap<usize, HandleState>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, HandleState>>> = std::sync::OnceLock::new();
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, HandleState>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -304,10 +308,7 @@ fn filter_enter_depth(addr: usize) -> bool {
     st.depth = st.depth.saturating_add(1);
     if st.max_depth > 0 && st.depth > st.max_depth {
         st.rejected = true;
-        st.reason = format!(
-            "graph depth {} exceeds maxdepth={}",
-            st.depth, st.max_depth
-        );
+        st.reason = format!("graph depth {} exceeds maxdepth={}", st.depth, st.max_depth);
         return false;
     }
     true
@@ -373,10 +374,7 @@ fn filter_check_array(addr: usize, length: usize) -> bool {
     }
     if st.max_array > 0 && length as u64 > st.max_array as u64 {
         st.rejected = true;
-        st.reason = format!(
-            "array length {} exceeds maxarray={}",
-            length, st.max_array
-        );
+        st.reason = format!("array length {} exceeds maxarray={}", length, st.max_array);
         return false;
     }
     true
@@ -390,7 +388,9 @@ fn filter_is_rejected(addr: usize) -> Option<String> {
         return None;
     }
     let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&addr).filter(|s| s.rejected).map(|s| s.reason.clone())
+    map.get(&addr)
+        .filter(|s| s.rejected)
+        .map(|s| s.reason.clone())
 }
 
 /// SECURITY (JEP-290 deserialization filter bypass, CRITICAL): mark the
@@ -414,7 +414,9 @@ fn filter_reject_class(addr: usize, class_name: &str) {
     // Whenever it does, bump `ois_filter_state_count` so the no-lock fast path
     // in the per-op accessors never under-reports this now-live entry.
     let existed = map.contains_key(&addr);
-    let st = map.entry(addr).or_insert_with(ObjectInputFilterState::unbounded);
+    let st = map
+        .entry(addr)
+        .or_insert_with(ObjectInputFilterState::unbounded);
     if !existed {
         ois_filter_state_count().fetch_add(1, Ordering::Relaxed);
     }
@@ -754,7 +756,9 @@ fn write_null_token(addr: usize) {
 /// Validate Java serialization stream header on an OIS buffer.
 fn validate_stream_header(addr: usize) -> bool {
     let data = ois_buf_read(addr, 4);
-    if data.len() < 4 { return false; }
+    if data.len() < 4 {
+        return false;
+    }
     let magic = u16::from_be_bytes([data[0], data[1]]);
     let version = u16::from_be_bytes([data[2], data[3]]);
     magic == STREAM_MAGIC && version == STREAM_VERSION
@@ -765,13 +769,15 @@ fn validate_stream_header(addr: usize) -> bool {
 ///           + u16 field count + TC_ENDBLOCKDATA + TC_NULL
 fn skip_class_desc(addr: usize) {
     let tc = ois_buf_read(addr, 1);
-    if tc[0] != TC_CLASSDESC { return; }
+    if tc[0] != TC_CLASSDESC {
+        return;
+    }
     // class name (u16 len + bytes)
     let len_bytes = ois_buf_read(addr, 2);
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
     let _ = ois_buf_read(addr, len); // name bytes
-    let _ = ois_buf_read(addr, 8);   // serialVersionUID
-    let _ = ois_buf_read(addr, 1);   // flags
+    let _ = ois_buf_read(addr, 8); // serialVersionUID
+    let _ = ois_buf_read(addr, 1); // flags
     let field_count_bytes = ois_buf_read(addr, 2);
     let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
     // Skip field descriptors
@@ -780,7 +786,7 @@ fn skip_class_desc(addr: usize) {
         let fname_len_bytes = ois_buf_read(addr, 2);
         let fname_len = u16::from_be_bytes([fname_len_bytes[0], fname_len_bytes[1]]) as usize;
         let _ = ois_buf_read(addr, fname_len); // field name
-        // For object/array type codes, there's a TC_STRING type descriptor
+                                               // For object/array type codes, there's a TC_STRING type descriptor
         let type_code = tc_byte[0] as char;
         if type_code == 'L' || type_code == '[' {
             let peek = ois_buf_read(addr, 1);
@@ -791,22 +797,24 @@ fn skip_class_desc(addr: usize) {
             }
         }
     }
-    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
-    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
+    let _ = ois_buf_read(addr, 1); // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1); // TC_NULL (super class desc)
 }
 
 /// Read a class descriptor from OIS buffer and return the class name.
 /// Also consumes the descriptor bytes.
 fn read_class_desc_name(addr: usize) -> String {
     let tc = ois_buf_read(addr, 1);
-    if tc[0] != TC_CLASSDESC { return "java/lang/Object".to_string(); }
+    if tc[0] != TC_CLASSDESC {
+        return "java/lang/Object".to_string();
+    }
     // class name (u16 len + bytes)
     let len_bytes = ois_buf_read(addr, 2);
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
     let name_bytes = ois_buf_read(addr, len);
     let class_name = String::from_utf8_lossy(&name_bytes).to_string();
-    let _ = ois_buf_read(addr, 8);   // serialVersionUID
-    let _ = ois_buf_read(addr, 1);   // flags
+    let _ = ois_buf_read(addr, 8); // serialVersionUID
+    let _ = ois_buf_read(addr, 1); // flags
     let field_count_bytes = ois_buf_read(addr, 2);
     let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
     // Skip field descriptors
@@ -815,7 +823,7 @@ fn read_class_desc_name(addr: usize) -> String {
         let fname_len_bytes = ois_buf_read(addr, 2);
         let fname_len = u16::from_be_bytes([fname_len_bytes[0], fname_len_bytes[1]]) as usize;
         let _ = ois_buf_read(addr, fname_len); // field name
-        // For object/array type codes, there's a TC_STRING type descriptor
+                                               // For object/array type codes, there's a TC_STRING type descriptor
         let type_code = tc_byte[0] as char;
         if type_code == 'L' || type_code == '[' {
             let peek = ois_buf_read(addr, 1);
@@ -826,8 +834,8 @@ fn read_class_desc_name(addr: usize) -> String {
             }
         }
     }
-    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
-    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
+    let _ = ois_buf_read(addr, 1); // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1); // TC_NULL (super class desc)
     class_name
 }
 
@@ -844,7 +852,9 @@ struct ClassDescriptor {
 /// Read a full class descriptor from the OIS buffer, returning structured info.
 fn read_class_descriptor(addr: usize) -> Option<ClassDescriptor> {
     let tc = ois_buf_read(addr, 1);
-    if tc[0] != TC_CLASSDESC { return None; }
+    if tc[0] != TC_CLASSDESC {
+        return None;
+    }
     // class name
     let len_bytes = ois_buf_read(addr, 2);
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
@@ -853,10 +863,16 @@ fn read_class_descriptor(addr: usize) -> Option<ClassDescriptor> {
     // serialVersionUID
     let svuid_bytes = ois_buf_read(addr, 8);
     let serial_version_uid = i64::from_be_bytes([
-        svuid_bytes[0], svuid_bytes[1], svuid_bytes[2], svuid_bytes[3],
-        svuid_bytes[4], svuid_bytes[5], svuid_bytes[6], svuid_bytes[7],
+        svuid_bytes[0],
+        svuid_bytes[1],
+        svuid_bytes[2],
+        svuid_bytes[3],
+        svuid_bytes[4],
+        svuid_bytes[5],
+        svuid_bytes[6],
+        svuid_bytes[7],
     ]);
-    let _ = ois_buf_read(addr, 1);   // flags
+    let _ = ois_buf_read(addr, 1); // flags
     let field_count_bytes = ois_buf_read(addr, 2);
     let field_count = u16::from_be_bytes([field_count_bytes[0], field_count_bytes[1]]) as usize;
     let mut field_types = Vec::with_capacity(field_count);
@@ -880,23 +896,42 @@ fn read_class_descriptor(addr: usize) -> Option<ClassDescriptor> {
         field_types.push(type_code);
         field_names.push(fname);
     }
-    let _ = ois_buf_read(addr, 1);   // TC_ENDBLOCKDATA
-    let _ = ois_buf_read(addr, 1);   // TC_NULL (super class desc)
-    Some(ClassDescriptor { class_name, serial_version_uid, field_types, field_names })
+    let _ = ois_buf_read(addr, 1); // TC_ENDBLOCKDATA
+    let _ = ois_buf_read(addr, 1); // TC_NULL (super class desc)
+    Some(ClassDescriptor {
+        class_name,
+        serial_version_uid,
+        field_types,
+        field_names,
+    })
 }
 
 #[cfg(test)]
 pub(crate) fn reset_serialization_globals() {
-    oos_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    ois_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    oos_buffers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    ois_buffers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    handle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // PERF: clear via the helper so `ois_filter_state_count` is reset too.
     filter_state_clear_all();
     // Clear the per-stream and process-wide JEP-290 filters too, so leftover
     // filter installs from a prior test can never bleed into the next one
     // (the synthetic read-path now consults these globals — see C3).
-    ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *process_serial_filter().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    ois_stream_filters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    *process_serial_filter()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Test-only serialization guard. The (de)serialization machinery keeps its
@@ -977,7 +1012,10 @@ fn compute_default_svuid(class_name: &str) -> i64 {
 
 /// Type-code character to descriptor mapping helper.
 fn type_code_is_primitive(code: i32) -> bool {
-    matches!(code as u8 as char, 'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z')
+    matches!(
+        code as u8 as char,
+        'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z'
+    )
 }
 
 /// Read a single field value from the OIS buffer based on its type code.
@@ -990,8 +1028,7 @@ fn read_field_value(ctx: &mut dyn NativeContext, addr: usize, type_code: char) -
         'J' => {
             let bytes = ois_buf_read(addr, 8);
             Value::Long(i64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         }
         'F' => {
@@ -1001,8 +1038,7 @@ fn read_field_value(ctx: &mut dyn NativeContext, addr: usize, type_code: char) -
         'D' => {
             let bytes = ois_buf_read(addr, 8);
             Value::Double(f64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         }
         'Z' => {
@@ -1106,11 +1142,7 @@ fn oos_write_primitive(addr: usize, type_code: char, val: &Value) {
 /// (cycle) detection via the per-stream wire-handle table. This is shared by
 /// `writeObject`, the object-field marshaller, and `defaultWriteObject`, so
 /// nested object graphs round-trip instead of degrading to `TC_NULL`.
-fn oos_write_value(
-    ctx: &mut dyn NativeContext,
-    addr: usize,
-    val: &Value,
-) -> MethodCallResult {
+fn oos_write_value(ctx: &mut dyn NativeContext, addr: usize, val: &Value) -> MethodCallResult {
     let obj = match val {
         Value::Object(None) => {
             write_null_token(addr);
@@ -1260,13 +1292,20 @@ fn oos_write_array(
     let arr_class_name: String = if class_name.starts_with('[') {
         class_name.to_string()
     } else {
-        format!("[{}", array_element_descriptor_char(ctx.heap_element_type_of(arr)))
+        format!(
+            "[{}",
+            array_element_descriptor_char(ctx.heap_element_type_of(arr))
+        )
     };
     let svuid = compute_default_svuid(&arr_class_name);
     write_class_desc(addr, &arr_class_name, svuid, SC_SERIALIZABLE, &[]);
     let len = ctx.array_length(arr);
     oos_buf_write(addr, &(len as i32).to_be_bytes());
-    let elem_char: char = arr_class_name.as_bytes().get(1).map(|b| *b as char).unwrap_or('L');
+    let elem_char: char = arr_class_name
+        .as_bytes()
+        .get(1)
+        .map(|b| *b as char)
+        .unwrap_or('L');
     for i in 0..len {
         let v = ctx.get_array_element(arr, i);
         match elem_char {
@@ -1361,7 +1400,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         }
         // Remember the stream "this" so Externalizable.writeExternal can be
         // driven through its primitive writers from the shared marshaller.
-        oos_stream_refs().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, this);
+        oos_stream_refs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, this);
         Ok(None)
     });
 
@@ -1369,7 +1411,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     r.register(cls, "writeObject", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
-        let depth = match ctx.get_field(this, 2) { Value::Int(d) => d, _ => 0 };
+        let depth = match ctx.get_field(this, 2) {
+            Value::Int(d) => d,
+            _ => 0,
+        };
 
         // Enforce max depth limit
         {
@@ -1377,14 +1422,22 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             if let Some(state) = registry.get(&addr) {
                 if depth + 1 > state.max_depth {
                     return Err(RuntimeError::IOException {
-                        message: format!("Serialization depth {} exceeds maximum {}", depth + 1, state.max_depth),
-                    }.into());
+                        message: format!(
+                            "Serialization depth {} exceeds maximum {}",
+                            depth + 1,
+                            state.max_depth
+                        ),
+                    }
+                    .into());
                 }
             }
         }
 
         ctx.set_field(this, 2, Value::Int(depth + 1));
-        let count = match ctx.get_field(this, 3) { Value::Int(c) => c, _ => 0 };
+        let count = match ctx.get_field(this, 3) {
+            Value::Int(c) => c,
+            _ => 0,
+        };
 
         // Enforce max references limit
         {
@@ -1392,8 +1445,13 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             if let Some(state) = registry.get(&addr) {
                 if count + 1 > state.max_references {
                     return Err(RuntimeError::IOException {
-                        message: format!("Serialization reference count {} exceeds maximum {}", count + 1, state.max_references),
-                    }.into());
+                        message: format!(
+                            "Serialization reference count {} exceeds maximum {}",
+                            count + 1,
+                            state.max_references
+                        ),
+                    }
+                    .into());
                 }
             }
         }
@@ -1468,7 +1526,14 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
                 SC_SERIALIZABLE | SC_WRITE_METHOD,
                 &field_refs,
             );
-            cur_push(addr, CurFrame { obj, class_id, read_desc: None });
+            cur_push(
+                addr,
+                CurFrame {
+                    obj,
+                    class_id,
+                    read_desc: None,
+                },
+            );
             let hook = ctx.invoke_special(
                 &class_name,
                 "writeObject",
@@ -1488,77 +1553,133 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     // (fields included) via the shared marshaller; sharing/back-references
     // only ever point at *shared* writes, so not registering a handle is the
     // correct unshared semantics.
-    r.register(cls, "writeUnshared", "(Ljava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let addr = this.as_ptr() as usize;
-        let count = match ctx.get_field(this, 3) { Value::Int(c) => c, _ => 0 };
-        ctx.set_field(this, 3, Value::Int(count + 1));
-        let val = args.get(1).copied().unwrap_or(Value::Object(None));
-        oos_write_value(ctx, addr, &val)
-    });
+    r.register(
+        cls,
+        "writeUnshared",
+        "(Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr = this.as_ptr() as usize;
+            let count = match ctx.get_field(this, 3) {
+                Value::Int(c) => c,
+                _ => 0,
+            };
+            ctx.set_field(this, 3, Value::Int(count + 1));
+            let val = args.get(1).copied().unwrap_or(Value::Object(None));
+            oos_write_value(ctx, addr, &val)
+        },
+    );
 
     // Primitive/data writers — write actual big-endian bytes to the buffer.
     r.register(cls, "writeInt", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+        let val = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeLong", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let val = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeFloat", "(F)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Float(v)) => *v, _ => 0.0 };
+        let val = match args.get(1) {
+            Some(Value::Float(v)) => *v,
+            _ => 0.0,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeDouble", "(D)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Double(v)) => *v, _ => 0.0 };
+        let val = match args.get(1) {
+            Some(Value::Double(v)) => *v,
+            _ => 0.0,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeBoolean", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val: u8 = match args.get(1) { Some(Value::Int(v)) if *v != 0 => 1, _ => 0 };
+        let val: u8 = match args.get(1) {
+            Some(Value::Int(v)) if *v != 0 => 1,
+            _ => 0,
+        };
         oos_buf_write(this.as_ptr() as usize, &[val]);
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeByte", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Int(v)) => *v as u8, _ => 0u8 };
+        let val = match args.get(1) {
+            Some(Value::Int(v)) => *v as u8,
+            _ => 0u8,
+        };
         oos_buf_write(this.as_ptr() as usize, &[val]);
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeShort", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Int(v)) => *v as i16, _ => 0i16 };
+        let val = match args.get(1) {
+            Some(Value::Int(v)) => *v as i16,
+            _ => 0i16,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
     r.register(cls, "writeChar", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Int(v)) => *v as u16, _ => 0u16 };
+        let val = match args.get(1) {
+            Some(Value::Int(v)) => *v as u16,
+            _ => 0u16,
+        };
         oos_buf_write(this.as_ptr() as usize, &val.to_be_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
@@ -1572,7 +1693,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         let bytes = s.as_bytes();
         oos_buf_write(addr, &(bytes.len() as u16).to_be_bytes());
         oos_buf_write(addr, bytes);
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
@@ -1583,7 +1707,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
         oos_buf_write(this.as_ptr() as usize, s.as_bytes());
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
@@ -1594,8 +1721,13 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
             _ => String::new(),
         };
-        for ch in s.encode_utf16() { oos_buf_write(addr, &ch.to_be_bytes()); }
-        let c = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => 0 };
+        for ch in s.encode_utf16() {
+            oos_buf_write(addr, &ch.to_be_bytes());
+        }
+        let c = match ctx.get_field(this, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 3, Value::Int(c + 1));
         Ok(None)
     });
@@ -1656,7 +1788,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
         }
         // Drop per-stream writer state so a reused address starts clean.
-        oos_stream_refs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        oos_stream_refs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
         cur_clear(addr);
         Ok(None)
     });
@@ -1671,7 +1806,10 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     // useProtocolVersion(int)V
     r.register(cls, "useProtocolVersion", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let version = match args.get(1) { Some(Value::Int(v)) => *v, _ => 2 };
+        let version = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 2,
+        };
         ctx.set_field(this, 1, Value::Int(version));
         Ok(None)
     });
@@ -1753,9 +1891,8 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         }
         TC_LONGSTRING => {
             let lb = ois_buf_read(addr, 8);
-            let wire_len = u64::from_be_bytes([
-                lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7],
-            ]);
+            let wire_len =
+                u64::from_be_bytes([lb[0], lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7]]);
 
             // SECURITY (deserialization DoS via unbounded allocation, HIGH):
             // `TC_LONGSTRING` carries a full u64 length straight off the wire.
@@ -1873,7 +2010,14 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     if let Ok(class_id) = resolved {
         if class_is_externalizable(ctx, class_id) {
             if let Some(stream) = ois_stream_ref(addr) {
-                cur_push(addr, CurFrame { obj, class_id, read_desc: None });
+                cur_push(
+                    addr,
+                    CurFrame {
+                        obj,
+                        class_id,
+                        read_desc: None,
+                    },
+                );
                 let _ = ctx.invoke_virtual(
                     obj,
                     "readExternal",
@@ -1886,9 +2030,12 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         }
         // Custom readObject hook: push the curObj frame and dispatch so the
         // hook can call defaultReadObject() + the primitive readers.
-        if let Some(_m) =
-            find_private_method(ctx, class_id, "readObject", "(Ljava/io/ObjectInputStream;)V")
-        {
+        if let Some(_m) = find_private_method(
+            ctx,
+            class_id,
+            "readObject",
+            "(Ljava/io/ObjectInputStream;)V",
+        ) {
             if let Some(stream) = ois_stream_ref(addr) {
                 // The descriptor field metadata is stashed so a nested
                 // defaultReadObject() can decode it; reuse the curObj frame.
@@ -1938,8 +2085,9 @@ fn ois_read_descriptor_fields(
             .collect();
         for (i, tc) in desc.field_types.clone().iter().enumerate() {
             let val = read_field_value(ctx, addr, *tc);
-            if let Some((_, slot)) =
-                names_snapshot.iter().find(|(n, _)| n == &desc.field_names[i])
+            if let Some((_, slot)) = names_snapshot
+                .iter()
+                .find(|(n, _)| n == &desc.field_names[i])
             {
                 ctx.set_field(obj, *slot, val);
             } else {
@@ -1971,9 +2119,8 @@ fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         return Value::Object(None);
     }
     let len_bytes = ois_buf_read(addr, 4);
-    let length =
-        i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
-            as usize;
+    let length = i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
+        as usize;
 
     // JEP-290 maxarray: reject *before* allocating to avoid the
     // attacker-controlled length triggering a multi-GB allocation.
@@ -2096,7 +2243,8 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
                         if !validate_stream_header(addr) {
                             return Err(RuntimeError::IOException {
                                 message: "invalid stream header".into(),
-                            }.into());
+                            }
+                            .into());
                         }
                     }
                 }
@@ -2107,8 +2255,8 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, Value::Int(0)); // enable_resolve off
         ctx.set_field(this, 4, Value::Int(1)); // block_mode on
         ctx.set_field(this, 5, Value::Int(0)); // closed = false
-        // Remember the stream "this" for Externalizable / custom-readObject
-        // dispatch driven from the shared reader.
+                                               // Remember the stream "this" for Externalizable / custom-readObject
+                                               // dispatch driven from the shared reader.
         ois_stream_refs_map()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2173,7 +2321,10 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     r.register(cls, "readUnshared", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
-        let count = match ctx.get_field(this, 2) { Value::Int(c) => c, _ => 0 };
+        let count = match ctx.get_field(this, 2) {
+            Value::Int(c) => c,
+            _ => 0,
+        };
         ctx.set_field(this, 2, Value::Int(count + 1));
         let remaining = ois_buf_remaining(addr);
         if remaining == 0 {
@@ -2219,8 +2370,9 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     r.register(cls, "readLong", "()J", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let bytes = ois_buf_read(this.as_ptr() as usize, 8);
-        let val = i64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                       bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let val = i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         Ok(Some(Value::Long(val)))
     });
     r.register(cls, "readFloat", "()F", |_ctx, args| {
@@ -2232,8 +2384,9 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     r.register(cls, "readDouble", "()D", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let bytes = ois_buf_read(this.as_ptr() as usize, 8);
-        let val = f64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                       bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let val = f64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         Ok(Some(Value::Double(val)))
     });
     r.register(cls, "readBoolean", "()Z", |_ctx, args| {
@@ -2299,12 +2452,17 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     });
 
     // readFields() -> GetField
-    r.register(cls, "readFields", "()Ljava/io/ObjectInputStream$GetField;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2);
-        ctx.set_field(obj, 0, Value::Int(0));
-        ctx.set_field(obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        cls,
+        "readFields",
+        "()Ljava/io/ObjectInputStream$GetField;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2);
+            ctx.set_field(obj, 0, Value::Int(0));
+            ctx.set_field(obj, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
     r.register(cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2315,12 +2473,21 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         ois_clear_handles(addr);
         // Drop the per-stream JEP-290 filter so a fresh stream at the same
         // address starts from a clean slate.
-        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
-        ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
+        ois_stream_filter_objs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
         // Drop JEP-290 per-stream counter state (depth/refs/bytes) too.
         ois_clear_filter_state(addr);
         // Drop reader-side stream ref + curObj frames.
-        ois_stream_refs_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_refs_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
         cur_clear(addr);
         Ok(None)
     });
@@ -2337,16 +2504,22 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
             if !validate_stream_header(addr) {
                 return Err(RuntimeError::IOException {
                     message: "invalid stream header".into(),
-                }.into());
+                }
+                .into());
             }
         }
         Ok(None)
     });
 
-    r.register(cls, "readClassDescriptor", "()Ljava/io/ObjectStreamClass;", |ctx, _args| {
-        let desc = alloc_stream_class_stub(ctx, "java/lang/Object");
-        Ok(Some(Value::Object(Some(desc))))
-    });
+    r.register(
+        cls,
+        "readClassDescriptor",
+        "()Ljava/io/ObjectStreamClass;",
+        |ctx, _args| {
+            let desc = alloc_stream_class_stub(ctx, "java/lang/Object");
+            Ok(Some(Value::Object(Some(desc))))
+        },
+    );
 
     // resolveClass(ObjectStreamClass) -> Class
     //
@@ -2446,7 +2619,10 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     // setObjectInputFilter(ObjectInputFilter)V — per-stream filter slot.
     // Must be set before the first object is read (we do NOT enforce that
     // here — the JDK does — but we honour subsequent installs).
-    r.register(cls, "setObjectInputFilter", "(Ljava/io/ObjectInputFilter;)V",
+    r.register(
+        cls,
+        "setObjectInputFilter",
+        "(Ljava/io/ObjectInputFilter;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let addr = this.as_ptr() as usize;
@@ -2454,8 +2630,14 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
                     // null filter => clear.
-                    ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
-                    ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+                    ois_stream_filters()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&addr);
+                    ois_stream_filter_objs()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&addr);
                     return Ok(None);
                 }
             };
@@ -2468,13 +2650,22 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
                     pattern: String::new(),
                 },
             };
-            ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, parsed);
-            ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, filter_obj);
+            ois_stream_filters()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, parsed);
+            ois_stream_filter_objs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, filter_obj);
             Ok(None)
         },
     );
 
-    r.register(cls, "getObjectInputFilter", "()Ljava/io/ObjectInputFilter;",
+    r.register(
+        cls,
+        "getObjectInputFilter",
+        "()Ljava/io/ObjectInputFilter;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
             let addr = this.as_ptr() as usize;
@@ -2487,8 +2678,12 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(cls, "readObjectOverride", "()Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))));
+    r.register(
+        cls,
+        "readObjectOverride",
+        "()Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2551,10 +2746,7 @@ const ACC_ENUM: u16 = 0x4000;
 /// Find a no-arg constructor in `class_id` with the given access-flag
 /// mask (`ACC_PRIVATE` accepted — callers are usually looking for
 /// something specific). Returns the matching `MethodMetadata` or None.
-fn find_no_arg_constructor(
-    ctx: &dyn NativeContext,
-    class_id: ClassId,
-) -> Option<MethodMetadata> {
+fn find_no_arg_constructor(ctx: &dyn NativeContext, class_id: ClassId) -> Option<MethodMetadata> {
     for m in ctx.declared_methods(class_id) {
         if m.name == "<init>" && m.descriptor == "()V" {
             return Some(m);
@@ -2636,10 +2828,7 @@ fn find_inheritable_method(
     let mut cur = Some(class_id);
     while let Some(cid) = cur {
         for m in ctx.declared_methods(cid) {
-            if m.name == name
-                && m.descriptor == descriptor
-                && (m.access_flags & ACC_STATIC) == 0
-            {
+            if m.name == name && m.descriptor == descriptor && (m.access_flags & ACC_STATIC) == 0 {
                 return Some(m);
             }
         }
@@ -2761,14 +2950,24 @@ fn build_object_stream_class(
     }
 
     let has_write_object = if is_serializable {
-        find_private_method(ctx, class_id, "writeObject", "(Ljava/io/ObjectOutputStream;)V")
-            .is_some() as i32
+        find_private_method(
+            ctx,
+            class_id,
+            "writeObject",
+            "(Ljava/io/ObjectOutputStream;)V",
+        )
+        .is_some() as i32
     } else {
         0
     };
     let has_read_object = if is_serializable {
-        find_private_method(ctx, class_id, "readObject", "(Ljava/io/ObjectInputStream;)V")
-            .is_some() as i32
+        find_private_method(
+            ctx,
+            class_id,
+            "readObject",
+            "(Ljava/io/ObjectInputStream;)V",
+        )
+        .is_some() as i32
     } else {
         0
     };
@@ -2808,22 +3007,10 @@ fn build_object_stream_class(
     // bytecode reader handles both paths via the descriptor-aware
     // `get_field_as`.
     ctx.set_field_by_name(desc, "suid", Value::Long(svuid));
-    ctx.set_field_by_name(
-        desc,
-        "serializable",
-        Value::Int(is_serializable as i32),
-    );
-    ctx.set_field_by_name(
-        desc,
-        "externalizable",
-        Value::Int(is_externalizable as i32),
-    );
+    ctx.set_field_by_name(desc, "serializable", Value::Int(is_serializable as i32));
+    ctx.set_field_by_name(desc, "externalizable", Value::Int(is_externalizable as i32));
     ctx.set_field_by_name(desc, "isEnum", Value::Int(is_enum as i32));
-    ctx.set_field_by_name(
-        desc,
-        "hasWriteObjectData",
-        Value::Int(has_write_object),
-    );
+    ctx.set_field_by_name(desc, "hasWriteObjectData", Value::Int(has_write_object));
     ctx.set_field_by_name(
         desc,
         "hasBlockExternalData",
@@ -2864,10 +3051,20 @@ fn build_object_stream_class(
     // writeObjectMethod / readObjectMethod / readObjectNoDataMethod —
     // these are all spec-required to be `private`; `findPrivateMethod`
     // matches real-JDK `ObjectStreamClass#getPrivateMethod`.
-    let wo = find_private_method(ctx, class_id, "writeObject", "(Ljava/io/ObjectOutputStream;)V")
-        .map(|m| create_method_object(ctx, &m));
-    let ro = find_private_method(ctx, class_id, "readObject", "(Ljava/io/ObjectInputStream;)V")
-        .map(|m| create_method_object(ctx, &m));
+    let wo = find_private_method(
+        ctx,
+        class_id,
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+    )
+    .map(|m| create_method_object(ctx, &m));
+    let ro = find_private_method(
+        ctx,
+        class_id,
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+    )
+    .map(|m| create_method_object(ctx, &m));
     let rond = find_private_method(ctx, class_id, "readObjectNoData", "()V")
         .map(|m| create_method_object(ctx, &m));
     ctx.set_field_by_name(desc, "writeObjectMethod", Value::Object(wo));
@@ -2943,44 +3140,68 @@ fn register_object_stream_class(r: &mut NativeMethodRegistry) {
     // deserialization (e.g. the Gradle test worker reading a HotSpot-written
     // WorkerConfig stream). The second arg (`checkSuperclass`) is irrelevant for
     // the declared-only check the spec performs here.
-    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;Z)Z", |ctx, args| {
-        Ok(Some(Value::Int(class_has_static_initializer(ctx, args) as i32)))
-    });
+    r.register(
+        cls,
+        "hasStaticInitializer",
+        "(Ljava/lang/Class;Z)Z",
+        |ctx, args| {
+            Ok(Some(Value::Int(
+                class_has_static_initializer(ctx, args) as i32
+            )))
+        },
+    );
 
     // Older single-arg form seen in some JDKs.
-    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;)Z", |ctx, args| {
-        Ok(Some(Value::Int(class_has_static_initializer(ctx, args) as i32)))
-    });
+    r.register(
+        cls,
+        "hasStaticInitializer",
+        "(Ljava/lang/Class;)Z",
+        |ctx, args| {
+            Ok(Some(Value::Int(
+                class_has_static_initializer(ctx, args) as i32
+            )))
+        },
+    );
 
     // lookup(Class) -> ObjectStreamClass (static)
     // WP0.2: returns a fully-populated descriptor cached per-ClassId.
-    r.register(cls, "lookup", "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;", |ctx, args| {
-        let mirror = obj_arg(args, 0)?;
-        let class_id = match class_id_of_mirror(ctx, mirror) {
-            Some(id) => id,
-            None => return Ok(Some(Value::Object(None))),
-        };
-        match build_object_stream_class(ctx, class_id, false) {
-            Some(desc) => Ok(Some(Value::Object(Some(desc)))),
-            None => Ok(Some(Value::Object(None))), // non-Serializable -> null
-        }
-    });
+    r.register(
+        cls,
+        "lookup",
+        "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;",
+        |ctx, args| {
+            let mirror = obj_arg(args, 0)?;
+            let class_id = match class_id_of_mirror(ctx, mirror) {
+                Some(id) => id,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            match build_object_stream_class(ctx, class_id, false) {
+                Some(desc) => Ok(Some(Value::Object(Some(desc)))),
+                None => Ok(Some(Value::Object(None))), // non-Serializable -> null
+            }
+        },
+    );
 
     // lookupAny(Class) -> ObjectStreamClass (static)
     // WP0.2: returns a descriptor even for non-Serializable classes —
     // real-JDK uses this during (de)serialization to reason about a
     // superclass that may or may not itself be Serializable.
-    r.register(cls, "lookupAny", "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;", |ctx, args| {
-        let mirror = obj_arg(args, 0)?;
-        let class_id = match class_id_of_mirror(ctx, mirror) {
-            Some(id) => id,
-            None => return Ok(Some(Value::Object(None))),
-        };
-        match build_object_stream_class(ctx, class_id, true) {
-            Some(desc) => Ok(Some(Value::Object(Some(desc)))),
-            None => Ok(Some(Value::Object(None))),
-        }
-    });
+    r.register(
+        cls,
+        "lookupAny",
+        "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;",
+        |ctx, args| {
+            let mirror = obj_arg(args, 0)?;
+            let class_id = match class_id_of_mirror(ctx, mirror) {
+                Some(id) => id,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            match build_object_stream_class(ctx, class_id, true) {
+                Some(desc) => Ok(Some(Value::Object(Some(desc)))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
 
     // getName() -> String
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
@@ -2998,37 +3219,47 @@ fn register_object_stream_class(r: &mut NativeMethodRegistry) {
 
     // getField(String) -> ObjectStreamField
     // WP0.2: consult the fields[] slot (6) and linear-scan by name.
-    r.register(cls, "getField", "(Ljava/lang/String;)Ljava/io/ObjectStreamField;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fields_val = ctx.get_field(this, 6);
-        let arr = match fields_val {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let target_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let n = ctx.array_length(arr);
-        for i in 0..n {
-            if let Value::Object(Some(osf)) = ctx.get_array_element(arr, i) {
-                let fname = ctx.get_field(osf, 0);
-                if let Value::Object(Some(fs)) = fname {
-                    if ctx.read_string(fs).as_deref() == Some(target_name.as_str()) {
-                        return Ok(Some(Value::Object(Some(osf))));
+    r.register(
+        cls,
+        "getField",
+        "(Ljava/lang/String;)Ljava/io/ObjectStreamField;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fields_val = ctx.get_field(this, 6);
+            let arr = match fields_val {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let n = ctx.array_length(arr);
+            for i in 0..n {
+                if let Value::Object(Some(osf)) = ctx.get_array_element(arr, i) {
+                    let fname = ctx.get_field(osf, 0);
+                    if let Value::Object(Some(fs)) = fname {
+                        if ctx.read_string(fs).as_deref() == Some(target_name.as_str()) {
+                            return Ok(Some(Value::Object(Some(osf))));
+                        }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // getFields() -> ObjectStreamField[]
     // WP0.2: returns the cached fields[] array built by `lookup`.
-    r.register(cls, "getFields", "()[Ljava/io/ObjectStreamField;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 6)))
-    });
+    r.register(
+        cls,
+        "getFields",
+        "()[Ljava/io/ObjectStreamField;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 6)))
+        },
+    );
 
     // forClass() -> Class
     // WP0.2: returns the cached Class mirror (slot 7).
@@ -3136,7 +3367,10 @@ fn register_object_stream_field(r: &mut NativeMethodRegistry) {
     // isPrimitive() -> boolean
     r.register(cls, "isPrimitive", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let code = match ctx.get_field(this, 1) { Value::Int(c) => c, _ => 0 };
+        let code = match ctx.get_field(this, 1) {
+            Value::Int(c) => c,
+            _ => 0,
+        };
         let prim = if type_code_is_primitive(code) { 1 } else { 0 };
         Ok(Some(Value::Int(prim)))
     });
@@ -3166,8 +3400,18 @@ fn register_externalizable(r: &mut NativeMethodRegistry) {
     let cls = "java/io/Externalizable";
     // Interface contract methods — concrete subclasses override these to
     // perform their own serialization. Default no-op for the abstract base.
-    r.register(cls, "writeExternal", "(Ljava/io/ObjectOutput;)V", native_noop_with_this);
-    r.register(cls, "readExternal", "(Ljava/io/ObjectInput;)V", native_noop_with_this);
+    r.register(
+        cls,
+        "writeExternal",
+        "(Ljava/io/ObjectOutput;)V",
+        native_noop_with_this,
+    );
+    r.register(
+        cls,
+        "readExternal",
+        "(Ljava/io/ObjectInput;)V",
+        native_noop_with_this,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3302,7 +3546,10 @@ impl SerialFilter {
             if let Some(eq) = token.find('=') {
                 let key = token[..eq].trim().to_ascii_lowercase();
                 let value_s = token[eq + 1..].trim();
-                if matches!(key.as_str(), "maxdepth" | "maxrefs" | "maxbytes" | "maxarray") {
+                if matches!(
+                    key.as_str(),
+                    "maxdepth" | "maxrefs" | "maxbytes" | "maxarray"
+                ) {
                     if let Ok(v) = value_s.parse::<i64>() {
                         entries.push(FilterEntry::Limit { key, value: v });
                         continue;
@@ -3420,7 +3667,9 @@ fn evaluate_serial_filters(ois_addr: usize, class_name: &str) -> FilterStatus {
     // Per-stream filter installed via `setObjectInputFilter` (synthetic
     // ALLOW/REJECT objects compiled to `SerialFilter`).
     {
-        let map = ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner());
+        let map = ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(f) = map.get(&ois_addr) {
             match f.check(class_name) {
                 FilterStatus::Rejected => return FilterStatus::Rejected,
@@ -3443,7 +3692,9 @@ fn evaluate_serial_filters(ois_addr: usize, class_name: &str) -> FilterStatus {
             }
         }
     }
-    let guard = process_serial_filter().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = process_serial_filter()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(f) = guard.as_ref() {
         return f.check(class_name);
     }
@@ -3473,11 +3724,15 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
 
     // checkInput(FilterInfo) -> Status
     r.register(
-        cls, "checkInput",
+        cls,
+        "checkInput",
         "(Ljava/io/ObjectInputFilter$FilterInfo;)Ljava/io/ObjectInputFilter$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status = match ctx.get_field(this, 0) { Value::Int(s) => s, _ => 0 };
+            let status = match ctx.get_field(this, 0) {
+                Value::Int(s) => s,
+                _ => 0,
+            };
             let status_obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1);
             ctx.set_field(status_obj, 0, Value::Int(status));
             Ok(Some(Value::Object(Some(status_obj))))
@@ -3500,7 +3755,8 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
 
     // merge (static)
     r.register(
-        cls, "merge",
+        cls,
+        "merge",
         "(Ljava/io/ObjectInputFilter;Ljava/io/ObjectInputFilter;)Ljava/io/ObjectInputFilter;",
         |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 0))))),
     );
@@ -3511,7 +3767,8 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
     // populated either from `jdk.serialFilter` or from the call to
     // `setSerialFilter` below).
     r.register(
-        "java/io/ObjectInputFilter$Config", "getSerialFilter",
+        "java/io/ObjectInputFilter$Config",
+        "getSerialFilter",
         "()Ljava/io/ObjectInputFilter;",
         |_ctx, _args| {
             let obj = process_serial_filter_obj()
@@ -3525,7 +3782,8 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
     // Config.setSerialFilter (static) — JEP-290 §2.1: must throw
     // IllegalStateException if a filter has already been set.
     r.register(
-        "java/io/ObjectInputFilter$Config", "setSerialFilter",
+        "java/io/ObjectInputFilter$Config",
+        "setSerialFilter",
         "(Ljava/io/ObjectInputFilter;)V",
         |ctx, args| {
             // Already-set guard.
@@ -3592,7 +3850,12 @@ fn register_object_output(r: &mut NativeMethodRegistry) {
     r.register(cls, "registerNatives", "()V", native_noop);
     // Interface defaults — concrete subclasses (ObjectOutputStream) provide the
     // real implementations dispatched via virtual dispatch.
-    r.register(cls, "writeObject", "(Ljava/lang/Object;)V", native_noop_with_this);
+    r.register(
+        cls,
+        "writeObject",
+        "(Ljava/lang/Object;)V",
+        native_noop_with_this,
+    );
     r.register(cls, "flush", "()V", native_noop_with_this);
     r.register(cls, "close", "()V", native_noop_with_this);
 }
@@ -3647,16 +3910,21 @@ fn register_invalid_class_exception(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(cls, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Object(Some(cname))) = args.get(1) {
-            ctx.set_field(this, 1, Value::Object(Some(*cname)));
-        }
-        if let Some(Value::Object(Some(msg))) = args.get(2) {
-            ctx.set_field(this, 0, Value::Object(Some(*msg)));
-        }
-        Ok(None)
-    });
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(Value::Object(Some(cname))) = args.get(1) {
+                ctx.set_field(this, 1, Value::Object(Some(*cname)));
+            }
+            if let Some(Value::Object(Some(msg))) = args.get(2) {
+                ctx.set_field(this, 0, Value::Object(Some(*msg)));
+            }
+            Ok(None)
+        },
+    );
 
     r.register(cls, "getMessage", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3690,7 +3958,12 @@ fn register_not_serializable_exception(r: &mut NativeMethodRegistry) {
 fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
     register_exception_type(r, "java/io/StreamCorruptedException");
     // No-arg constructor — exception fields default to null/empty.
-    r.register("java/io/StreamCorruptedException", "<init>", "()V", native_noop_with_this);
+    r.register(
+        "java/io/StreamCorruptedException",
+        "<init>",
+        "()V",
+        native_noop_with_this,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3951,14 +4224,22 @@ mod serialization_tests {
     #[test]
     fn test_type_code_primitives() {
         for c in ['B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z'] {
-            assert!(type_code_is_primitive(c as i32), "expected primitive: {}", c);
+            assert!(
+                type_code_is_primitive(c as i32),
+                "expected primitive: {}",
+                c
+            );
         }
     }
 
     #[test]
     fn test_type_code_non_primitives() {
         for c in ['L', '[', 'X', 'Q'] {
-            assert!(!type_code_is_primitive(c as i32), "expected non-primitive: {}", c);
+            assert!(
+                !type_code_is_primitive(c as i32),
+                "expected non-primitive: {}",
+                c
+            );
         }
     }
 
@@ -3968,191 +4249,326 @@ mod serialization_tests {
     fn test_oos_init_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectOutputStream", "<init>", "(Ljava/io/OutputStream;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectOutputStream",
+                "<init>",
+                "(Ljava/io/OutputStream;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_oos_write_object_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectOutputStream", "writeObject", "(Ljava/lang/Object;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectOutputStream",
+                "writeObject",
+                "(Ljava/lang/Object;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_oos_primitive_writers_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectOutputStream", "writeInt", "(I)V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "writeLong", "(J)V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "writeFloat", "(F)V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "writeDouble", "(D)V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "writeBoolean", "(Z)V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "writeUTF", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "writeInt", "(I)V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "writeLong", "(J)V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "writeFloat", "(F)V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "writeDouble", "(D)V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "writeBoolean", "(Z)V")
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectOutputStream",
+                "writeUTF",
+                "(Ljava/lang/String;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_ois_init_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInputStream", "<init>", "(Ljava/io/InputStream;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "<init>",
+                "(Ljava/io/InputStream;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_ois_read_object_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readObject",
+                "()Ljava/lang/Object;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osc_lookup_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectStreamClass",
-            "lookup",
-            "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "lookup",
+                "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osf_get_name_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "getName", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamField",
+                "getName",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_serializable_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/Serializable", "registerNatives", "()V").is_some());
+        assert!(r
+            .find("java/io/Serializable", "registerNatives", "()V")
+            .is_some());
     }
 
     #[test]
     fn test_externalizable_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/Externalizable", "writeExternal", "(Ljava/io/ObjectOutput;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/Externalizable",
+                "writeExternal",
+                "(Ljava/io/ObjectOutput;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_filter_check_input_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectInputFilter",
-            "checkInput",
-            "(Ljava/io/ObjectInputFilter$FilterInfo;)Ljava/io/ObjectInputFilter$Status;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputFilter",
+                "checkInput",
+                "(Ljava/io/ObjectInputFilter$FilterInfo;)Ljava/io/ObjectInputFilter$Status;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_filter_config_get_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectInputFilter$Config",
-            "getSerialFilter",
-            "()Ljava/io/ObjectInputFilter;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputFilter$Config",
+                "getSerialFilter",
+                "()Ljava/io/ObjectInputFilter;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_invalid_class_exception_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/InvalidClassException", "getMessage", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                "java/io/InvalidClassException",
+                "getMessage",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_not_serializable_exception_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/NotSerializableException", "<init>", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/NotSerializableException",
+                "<init>",
+                "(Ljava/lang/String;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_stream_corrupted_exception_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/StreamCorruptedException", "<init>", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/StreamCorruptedException",
+                "<init>",
+                "(Ljava/lang/String;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_oos_control_methods_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectOutputStream", "reset", "()V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "flush", "()V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "close", "()V").is_some());
-        assert!(r.find("java/io/ObjectOutputStream", "useProtocolVersion", "(I)V").is_some());
-        assert!(r.find(
-            "java/io/ObjectOutputStream", "putFields",
-            "()Ljava/io/ObjectOutputStream$PutField;"
-        ).is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "reset", "()V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "flush", "()V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "close", "()V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectOutputStream", "useProtocolVersion", "(I)V")
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectOutputStream",
+                "putFields",
+                "()Ljava/io/ObjectOutputStream$PutField;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_ois_additional_methods_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInputStream", "close", "()V").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "available", "()I").is_some());
-        assert!(r.find(
-            "java/io/ObjectInputStream", "readFields",
-            "()Ljava/io/ObjectInputStream$GetField;"
-        ).is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readStreamHeader", "()V").is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "close", "()V")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "available", "()I")
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readFields",
+                "()Ljava/io/ObjectInputStream$GetField;"
+            )
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readStreamHeader", "()V")
+            .is_some());
     }
 
     #[test]
     fn test_osc_accessors_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamClass", "getSerialVersionUID", "()J").is_some());
-        assert!(r.find("java/io/ObjectStreamClass", "getName", "()Ljava/lang/String;").is_some());
-        assert!(r.find("java/io/ObjectStreamClass", "toString", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find("java/io/ObjectStreamClass", "getSerialVersionUID", "()J")
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "getName",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "toString",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osf_accessors_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "isPrimitive", "()Z").is_some());
-        assert!(r.find("java/io/ObjectStreamField", "getTypeCode", "()C").is_some());
-        assert!(r.find("java/io/ObjectStreamField", "getOffset", "()I").is_some());
+        assert!(r
+            .find("java/io/ObjectStreamField", "isPrimitive", "()Z")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectStreamField", "getTypeCode", "()C")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectStreamField", "getOffset", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_object_output_interface_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectOutput", "writeObject", "(Ljava/lang/Object;)V").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectOutput",
+                "writeObject",
+                "(Ljava/lang/Object;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_object_input_interface_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInput", "readObject", "()Ljava/lang/Object;").is_some());
+        assert!(r
+            .find("java/io/ObjectInput", "readObject", "()Ljava/lang/Object;")
+            .is_some());
     }
 
     #[test]
     fn test_invalid_class_getclassname_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/InvalidClassException", "getClassname", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                "java/io/InvalidClassException",
+                "getClassname",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_ois_read_class_descriptor_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectInputStream", "readClassDescriptor",
-            "()Ljava/io/ObjectStreamClass;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readClassDescriptor",
+                "()Ljava/io/ObjectStreamClass;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4166,10 +4582,13 @@ mod serialization_tests {
     fn test_filter_config_set_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectInputFilter$Config", "setSerialFilter",
-            "(Ljava/io/ObjectInputFilter;)V"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputFilter$Config",
+                "setSerialFilter",
+                "(Ljava/io/ObjectInputFilter;)V"
+            )
+            .is_some());
     }
 
     // ===== JEP-290 ObjectInputFilter — pattern parser + filter pipeline =====
@@ -4213,9 +4632,10 @@ mod serialization_tests {
         // byte for the already-installed check) so the test is hermetic and
         // cannot race against the process-wide OnceLock that other tests
         // may touch.
-        fn try_install(state: &mut Option<SerialFilter>, new: SerialFilter)
-            -> Result<(), RuntimeError>
-        {
+        fn try_install(
+            state: &mut Option<SerialFilter>,
+            new: SerialFilter,
+        ) -> Result<(), RuntimeError> {
             if state.is_some() {
                 return Err(RuntimeError::IllegalStateException {
                     message: "Serial filter can only be set once".into(),
@@ -4250,7 +4670,10 @@ mod serialization_tests {
         let f = SerialFilter::parse("!java.util.*;*");
         assert_eq!(f.check("java.util.HashMap"), FilterStatus::Rejected);
         // Sub-package must NOT match `java.util.*`.
-        assert_eq!(f.check("java.util.concurrent.ConcurrentHashMap"), FilterStatus::Allowed);
+        assert_eq!(
+            f.check("java.util.concurrent.ConcurrentHashMap"),
+            FilterStatus::Allowed
+        );
 
         // Bare `*` matches everything.
         let f = SerialFilter::parse("*");
@@ -4340,7 +4763,10 @@ mod serialization_tests {
         let err = RuntimeError::UnsupportedOperationException {
             message: "Java object serialization is not yet supported".into(),
         };
-        assert!(matches!(err, RuntimeError::UnsupportedOperationException { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::UnsupportedOperationException { .. }
+        ));
     }
 
     #[test]
@@ -4349,8 +4775,14 @@ mod serialization_tests {
             message: "Java object serialization is not yet supported".into(),
         };
         if let RuntimeError::UnsupportedOperationException { message } = err {
-            assert!(message.contains("serialization"), "Message should mention serialization");
-            assert!(message.contains("not yet supported"), "Message should say not yet supported");
+            assert!(
+                message.contains("serialization"),
+                "Message should mention serialization"
+            );
+            assert!(
+                message.contains("not yet supported"),
+                "Message should say not yet supported"
+            );
         } else {
             panic!("Expected UnsupportedOperationException");
         }
@@ -4359,11 +4791,18 @@ mod serialization_tests {
     #[test]
     fn test_deserialization_not_supported_message() {
         let err = RuntimeError::UnsupportedOperationException {
-            message: "Java object deserialization is not supported (NotSerializableException)".into(),
+            message: "Java object deserialization is not supported (NotSerializableException)"
+                .into(),
         };
         if let RuntimeError::UnsupportedOperationException { message } = err {
-            assert!(message.contains("deserialization"), "Should mention deserialization");
-            assert!(message.contains("NotSerializableException"), "Should reference NotSerializableException");
+            assert!(
+                message.contains("deserialization"),
+                "Should mention deserialization"
+            );
+            assert!(
+                message.contains("NotSerializableException"),
+                "Should reference NotSerializableException"
+            );
         } else {
             panic!("Expected UnsupportedOperationException");
         }
@@ -4474,32 +4913,70 @@ mod serialization_tests {
         // TC constants should be contiguous from 0x70 to 0x7E
         let expected: Vec<u8> = (0x70..=0x7E).collect();
         let actual = [
-            TC_NULL, TC_REFERENCE, TC_CLASSDESC, TC_OBJECT, TC_STRING,
-            TC_ARRAY, TC_CLASS, TC_BLOCKDATA, TC_ENDBLOCKDATA, TC_RESET,
-            TC_BLOCKDATALONG, TC_EXCEPTION, TC_LONGSTRING, TC_PROXYCLASSDESC, TC_ENUM,
+            TC_NULL,
+            TC_REFERENCE,
+            TC_CLASSDESC,
+            TC_OBJECT,
+            TC_STRING,
+            TC_ARRAY,
+            TC_CLASS,
+            TC_BLOCKDATA,
+            TC_ENDBLOCKDATA,
+            TC_RESET,
+            TC_BLOCKDATALONG,
+            TC_EXCEPTION,
+            TC_LONGSTRING,
+            TC_PROXYCLASSDESC,
+            TC_ENUM,
         ];
         assert_eq!(actual.len(), expected.len());
         for (i, tc) in actual.iter().enumerate() {
-            assert_eq!(*tc, expected[i], "TC at index {} should be 0x{:02X}", i, expected[i]);
+            assert_eq!(
+                *tc, expected[i],
+                "TC at index {} should be 0x{:02X}",
+                i, expected[i]
+            );
         }
     }
 
     #[test]
     fn test_sc_flags_are_powers_of_two() {
         // Each flag should be a distinct power of 2 (except SC_ENUM which is 0x10)
-        let flags = [SC_WRITE_METHOD, SC_SERIALIZABLE, SC_EXTERNALIZABLE, SC_BLOCK_DATA, SC_ENUM];
+        let flags = [
+            SC_WRITE_METHOD,
+            SC_SERIALIZABLE,
+            SC_EXTERNALIZABLE,
+            SC_BLOCK_DATA,
+            SC_ENUM,
+        ];
         for flag in &flags {
-            assert!(flag.is_power_of_two(), "Flag 0x{:02X} should be power of 2", flag);
+            assert!(
+                flag.is_power_of_two(),
+                "Flag 0x{:02X} should be power of 2",
+                flag
+            );
         }
     }
 
     #[test]
     fn test_sc_flags_no_overlap() {
-        let flags = [SC_WRITE_METHOD, SC_SERIALIZABLE, SC_EXTERNALIZABLE, SC_BLOCK_DATA, SC_ENUM];
+        let flags = [
+            SC_WRITE_METHOD,
+            SC_SERIALIZABLE,
+            SC_EXTERNALIZABLE,
+            SC_BLOCK_DATA,
+            SC_ENUM,
+        ];
         for i in 0..flags.len() {
             for j in (i + 1)..flags.len() {
                 assert_ne!(flags[i], flags[j], "Flags at {} and {} overlap", i, j);
-                assert_eq!(flags[i] & flags[j], 0, "Flags 0x{:02X} and 0x{:02X} share bits", flags[i], flags[j]);
+                assert_eq!(
+                    flags[i] & flags[j],
+                    0,
+                    "Flags 0x{:02X} and 0x{:02X} share bits",
+                    flags[i],
+                    flags[j]
+                );
             }
         }
     }
@@ -4518,8 +4995,20 @@ mod serialization_tests {
         // readObject should be registered as a method that throws
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readUnshared", "()Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readObject",
+                "()Ljava/lang/Object;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readUnshared",
+                "()Ljava/lang/Object;"
+            )
+            .is_some());
     }
 
     // --- OIS primitive reader defaults ---
@@ -4528,15 +5017,37 @@ mod serialization_tests {
     fn test_ois_primitive_readers_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectInputStream", "readInt", "()I").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readLong", "()J").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readFloat", "()F").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readDouble", "()D").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readBoolean", "()Z").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readByte", "()B").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readShort", "()S").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readChar", "()C").is_some());
-        assert!(r.find("java/io/ObjectInputStream", "readUTF", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readInt", "()I")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readLong", "()J")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readFloat", "()F")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readDouble", "()D")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readBoolean", "()Z")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readByte", "()B")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readShort", "()S")
+            .is_some());
+        assert!(r
+            .find("java/io/ObjectInputStream", "readChar", "()C")
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "readUTF",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     // --- ObjectStreamClass method completeness ---
@@ -4545,40 +5056,52 @@ mod serialization_tests {
     fn test_osc_lookup_any_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectStreamClass", "lookupAny",
-            "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "lookupAny",
+                "(Ljava/lang/Class;)Ljava/io/ObjectStreamClass;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osc_get_field_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectStreamClass", "getField",
-            "(Ljava/lang/String;)Ljava/io/ObjectStreamField;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "getField",
+                "(Ljava/lang/String;)Ljava/io/ObjectStreamField;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osc_get_fields_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectStreamClass", "getFields",
-            "()[Ljava/io/ObjectStreamField;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "getFields",
+                "()[Ljava/io/ObjectStreamField;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osc_for_class_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find(
-            "java/io/ObjectStreamClass", "forClass",
-            "()Ljava/lang/Class;"
-        ).is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamClass",
+                "forClass",
+                "()Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     // --- OSF completeness ---
@@ -4587,28 +5110,48 @@ mod serialization_tests {
     fn test_osf_is_unshared_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "isUnshared", "()Z").is_some());
+        assert!(r
+            .find("java/io/ObjectStreamField", "isUnshared", "()Z")
+            .is_some());
     }
 
     #[test]
     fn test_osf_compare_to_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "compareTo", "(Ljava/lang/Object;)I").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamField",
+                "compareTo",
+                "(Ljava/lang/Object;)I"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osf_get_type_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "getType", "()Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamField",
+                "getType",
+                "()Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_osf_get_type_string_registered() {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
-        assert!(r.find("java/io/ObjectStreamField", "getTypeString", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectStreamField",
+                "getTypeString",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     // ===== M24 Binary Protocol Tests =====
@@ -4659,7 +5202,10 @@ mod serialization_tests {
         let after_name = 4 + name_len;
         // 8 bytes SVUID + 1 byte flags + 2 bytes field count + 1 TC_ENDBLOCKDATA + 1 TC_NULL
         assert_eq!(buf[after_name + 8], SC_SERIALIZABLE); // flags
-        assert_eq!(u16::from_be_bytes([buf[after_name + 9], buf[after_name + 10]]), 0); // 0 fields
+        assert_eq!(
+            u16::from_be_bytes([buf[after_name + 9], buf[after_name + 10]]),
+            0
+        ); // 0 fields
         assert_eq!(buf[after_name + 11], TC_ENDBLOCKDATA);
         assert_eq!(buf[after_name + 12], TC_NULL);
     }
@@ -4982,9 +5528,8 @@ mod serialization_tests {
     fn jep290_parse_mixed_with_class_patterns() {
         // Class-name patterns are now compiled into `patterns` (no longer a
         // silent no-op); limit clauses are still picked up alongside them.
-        let s = parse_serial_filter(
-            "!com.evil.*;java.util.*;maxdepth=5;maxbytes=1024;com.example.Foo",
-        );
+        let s =
+            parse_serial_filter("!com.evil.*;java.util.*;maxdepth=5;maxbytes=1024;com.example.Foo");
         assert_eq!(s.max_depth, 5);
         assert_eq!(s.max_bytes, 1024);
         // Pattern-only clauses leave maxrefs/maxarray unbounded.
@@ -5021,9 +5566,15 @@ mod serialization_tests {
         // was UNDECIDED (silently allowed).
         let addr = 0x4A45_5070_usize;
         filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
-        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
 
-        ois_set_filter_state(addr, parse_serial_filter("!com.evil.**;java.util.*;maxdepth=10"));
+        ois_set_filter_state(
+            addr,
+            parse_serial_filter("!com.evil.**;java.util.*;maxdepth=10"),
+        );
 
         // Reject pattern fires (recursive `**`).
         assert_eq!(
@@ -5111,7 +5662,10 @@ mod serialization_tests {
             let _ = ois_buf_read(addr, 1);
         }
         let snapshot = ois_get_filter_state(addr).expect("filter state");
-        assert!(!snapshot.rejected, "max_bytes=200 must not trip on 100 bytes");
+        assert!(
+            !snapshot.rejected,
+            "max_bytes=200 must not trip on 100 bytes"
+        );
         assert_eq!(snapshot.bytes, 100);
     }
 
@@ -5124,10 +5678,7 @@ mod serialization_tests {
 
         // Two back-references — the second one must trip the cap.
         assert!(filter_account_ref(addr), "first ref under cap of 1");
-        assert!(
-            !filter_account_ref(addr),
-            "second ref must trip max_refs=1"
-        );
+        assert!(!filter_account_ref(addr), "second ref must trip max_refs=1");
 
         let snapshot = ois_get_filter_state(addr).expect("filter state");
         assert!(snapshot.rejected);
@@ -5147,10 +5698,7 @@ mod serialization_tests {
 
         assert!(filter_enter_depth(addr), "depth 1");
         assert!(filter_enter_depth(addr), "depth 2");
-        assert!(
-            !filter_enter_depth(addr),
-            "depth 3 must trip max_depth=2"
-        );
+        assert!(!filter_enter_depth(addr), "depth 3 must trip max_depth=2");
 
         let snapshot = ois_get_filter_state(addr).expect("filter state");
         assert!(snapshot.rejected);
@@ -5187,7 +5735,10 @@ mod serialization_tests {
         // / `ois_read_array` / `TC_ENUM` now call before instantiating a class.
         let addr = 0x4A45_5100_usize;
         filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
-        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
 
         // Reject anything under `evil.**`, allow everything else.
         ois_stream_filters()
@@ -5212,7 +5763,10 @@ mod serialization_tests {
             why
         );
 
-        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&addr);
     }
 
     #[test]
@@ -5241,10 +5795,14 @@ mod serialization_tests {
         filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
         ois_buf_load(addr, b"hello".to_vec());
         let remaining = ois_buf_remaining(addr) as u64;
-        let clamped =
-            (u64::MAX).min(remaining).min(MAX_SERIAL_STRING_BYTES as u64) as usize;
+        let clamped = (u64::MAX)
+            .min(remaining)
+            .min(MAX_SERIAL_STRING_BYTES as u64) as usize;
         assert_eq!(clamped, 5, "clamp must bound to bytes remaining");
-        assert!(clamped <= MAX_SERIAL_STRING_BYTES, "clamp must honour hard cap");
+        assert!(
+            clamped <= MAX_SERIAL_STRING_BYTES,
+            "clamp must honour hard cap"
+        );
     }
 
     #[test]
@@ -5308,19 +5866,25 @@ mod serialization_tests {
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
         let read_object = r
-            .find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;")
+            .find(
+                "java/io/ObjectInputStream",
+                "readObject",
+                "()Ljava/lang/Object;",
+            )
             .expect("readObject must be registered");
 
         let mut ctx = MockNativeContext::new();
-        let ois_class = ctx.ensure_class_initialized("java/io/ObjectInputStream").unwrap();
+        let ois_class = ctx
+            .ensure_class_initialized("java/io/ObjectInputStream")
+            .unwrap();
         let ois = ctx.alloc_object(ois_class, 6);
         ctx.set_field(ois, 1, Value::Int(0)); // depth
         ctx.set_field(ois, 2, Value::Int(0)); // objects_read
 
         let addr = ois.as_ptr() as usize;
         filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
-        // Pre-install a tripped filter so the readObject path
-        // immediately observes the sticky flag.
+                                   // Pre-install a tripped filter so the readObject path
+                                   // immediately observes the sticky flag.
         let mut tripped = parse_serial_filter("maxdepth=1");
         tripped.rejected = true;
         tripped.reason = "synthetic for test".to_string();
@@ -5393,12 +5957,21 @@ mod wp02_tests {
         let mut ctx = MockNativeContext::new();
         // Register via ensure_class_initialized so they all have ClassIds.
         let object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
-        let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
-        let _externalizable =
-            ctx.ensure_class_initialized("java/io/Externalizable").unwrap();
-        let _osc = ctx.ensure_class_initialized("java/io/ObjectStreamClass").unwrap();
-        let _osf = ctx.ensure_class_initialized("java/io/ObjectStreamField").unwrap();
-        let _method = ctx.ensure_class_initialized("java/lang/reflect/Method").unwrap();
+        let serializable = ctx
+            .ensure_class_initialized("java/io/Serializable")
+            .unwrap();
+        let _externalizable = ctx
+            .ensure_class_initialized("java/io/Externalizable")
+            .unwrap();
+        let _osc = ctx
+            .ensure_class_initialized("java/io/ObjectStreamClass")
+            .unwrap();
+        let _osf = ctx
+            .ensure_class_initialized("java/io/ObjectStreamField")
+            .unwrap();
+        let _method = ctx
+            .ensure_class_initialized("java/lang/reflect/Method")
+            .unwrap();
         let _ctor = ctx
             .ensure_class_initialized("java/lang/reflect/Constructor")
             .unwrap();
@@ -5419,13 +5992,7 @@ mod wp02_tests {
                 fm("a", "I", ACC_PUBLIC, 0, foo),
                 fm("b", "I", ACC_PUBLIC, 1, foo),
                 fm("c", "I", ACC_PUBLIC, 2, foo),
-                fm(
-                    "skip",
-                    "I",
-                    ACC_PUBLIC | ACC_WP02_TRANSIENT,
-                    3,
-                    foo,
-                ),
+                fm("skip", "I", ACC_PUBLIC | ACC_WP02_TRANSIENT, 3, foo),
             ],
         );
         // Foo's methods: private writeObject + protected writeReplace.
@@ -5438,12 +6005,7 @@ mod wp02_tests {
                     ACC_WP02_PRIVATE,
                     foo,
                 ),
-                mm(
-                    "writeReplace",
-                    "()Ljava/lang/Object;",
-                    ACC_PROTECTED,
-                    foo,
-                ),
+                mm("writeReplace", "()Ljava/lang/Object;", ACC_PROTECTED, foo),
             ],
         );
         (ctx, foo)
@@ -5540,8 +6102,7 @@ mod wp02_tests {
     #[test]
     fn osc_find_write_replace_method_when_present() {
         let (ctx, foo) = build_foo_ctx();
-        let found =
-            find_inheritable_method(&ctx, foo, "writeReplace", "()Ljava/lang/Object;");
+        let found = find_inheritable_method(&ctx, foo, "writeReplace", "()Ljava/lang/Object;");
         assert!(
             found.is_some(),
             "find_inheritable_method must locate writeReplace on Foo"
@@ -5554,13 +6115,9 @@ mod wp02_tests {
         let base = ctx.class_id_by_name("Base").unwrap();
         // Base has no writeReplace — walking up from Base also hits
         // `Object` which has none. Must be None.
-        assert!(find_inheritable_method(
-            &ctx,
-            base,
-            "writeReplace",
-            "()Ljava/lang/Object;"
-        )
-        .is_none());
+        assert!(
+            find_inheritable_method(&ctx, base, "writeReplace", "()Ljava/lang/Object;").is_none()
+        );
     }
 
     #[test]
@@ -5621,17 +6178,16 @@ mod marshal_tests {
     fn setup() -> (MockNativeContext, ClassId, ClassId) {
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
-        let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
+        let serializable = ctx
+            .ensure_class_initialized("java/io/Serializable")
+            .unwrap();
         let _string = ctx.ensure_class_initialized("java/lang/String").unwrap();
         let point = ctx.ensure_class_initialized("Point").unwrap();
         let holder = ctx.ensure_class_initialized("Holder").unwrap();
 
         ctx.set_interfaces(point, vec![serializable]);
         ctx.set_interfaces(holder, vec![serializable]);
-        ctx.set_declared_fields(
-            point,
-            vec![fm("x", "I", 0, point), fm("y", "I", 1, point)],
-        );
+        ctx.set_declared_fields(point, vec![fm("x", "I", 0, point), fm("y", "I", 1, point)]);
         ctx.set_declared_fields(
             holder,
             vec![
@@ -5666,8 +6222,7 @@ mod marshal_tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert(addr, HandleState::new());
 
-        oos_write_value(&mut ctx, addr, &Value::Object(Some(h)))
-            .expect("write must succeed");
+        oos_write_value(&mut ctx, addr, &Value::Object(Some(h))).expect("write must succeed");
 
         // Round-trip: load the written bytes back as a reader on the same addr.
         let bytes = oos_buf_snapshot(addr);
@@ -5700,7 +6255,9 @@ mod marshal_tests {
         let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
-        let _serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
+        let _serializable = ctx
+            .ensure_class_initialized("java/io/Serializable")
+            .unwrap();
         // Plain (non-Serializable) class.
         let plain = ctx.ensure_class_initialized("Plain").unwrap();
         let obj = ctx.alloc_object(plain, 1);
@@ -5767,7 +6324,9 @@ mod marshal_tests {
         let _serial_guard = super::serialization_test_guard();
         let mut ctx = MockNativeContext::new();
         let _object = ctx.ensure_class_initialized("java/lang/Object").unwrap();
-        let serializable = ctx.ensure_class_initialized("java/io/Serializable").unwrap();
+        let serializable = ctx
+            .ensure_class_initialized("java/io/Serializable")
+            .unwrap();
         let arrh = ctx.ensure_class_initialized("ArrHolder").unwrap();
         ctx.set_interfaces(arrh, vec![serializable]);
         ctx.set_declared_fields(arrh, vec![fm("data", "[I", 0, arrh)]);

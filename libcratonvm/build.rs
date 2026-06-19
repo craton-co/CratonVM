@@ -56,9 +56,7 @@ fn main() {
         Ok(s) => {
             // Non-fatal: a failed regen must not break the build (the
             // hand-maintained header is still valid).
-            println!(
-                "cargo:warning=libcratonvm: cbindgen exited with {s}; header left unchanged"
-            );
+            println!("cargo:warning=libcratonvm: cbindgen exited with {s}; header left unchanged");
         }
         Err(e) => {
             println!(

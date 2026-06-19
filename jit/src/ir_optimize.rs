@@ -171,22 +171,46 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
     match op {
         Op::Add => {
             if a.root == NO_NODE {
-                Affine { root: b.root, k: b.k, c: w_add(is_int, b.c, a.c) }
+                Affine {
+                    root: b.root,
+                    k: b.k,
+                    c: w_add(is_int, b.c, a.c),
+                }
             } else if b.root == NO_NODE {
-                Affine { root: a.root, k: a.k, c: w_add(is_int, a.c, b.c) }
+                Affine {
+                    root: a.root,
+                    k: a.k,
+                    c: w_add(is_int, a.c, b.c),
+                }
             } else if a.root == b.root {
-                Affine { root: a.root, k: w_add(is_int, a.k, b.k), c: w_add(is_int, a.c, b.c) }
+                Affine {
+                    root: a.root,
+                    k: w_add(is_int, a.k, b.k),
+                    c: w_add(is_int, a.c, b.c),
+                }
             } else {
                 opaque
             }
         }
         Op::Sub => {
             if b.root == NO_NODE {
-                Affine { root: a.root, k: a.k, c: w_sub(is_int, a.c, b.c) }
+                Affine {
+                    root: a.root,
+                    k: a.k,
+                    c: w_sub(is_int, a.c, b.c),
+                }
             } else if a.root == NO_NODE {
-                Affine { root: b.root, k: w_neg(is_int, b.k), c: w_sub(is_int, a.c, b.c) }
+                Affine {
+                    root: b.root,
+                    k: w_neg(is_int, b.k),
+                    c: w_sub(is_int, a.c, b.c),
+                }
             } else if a.root == b.root {
-                Affine { root: a.root, k: w_sub(is_int, a.k, b.k), c: w_sub(is_int, a.c, b.c) }
+                Affine {
+                    root: a.root,
+                    k: w_sub(is_int, a.k, b.k),
+                    c: w_sub(is_int, a.c, b.c),
+                }
             } else {
                 opaque
             }
@@ -194,12 +218,24 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
         Op::Mul => {
             if a.root == NO_NODE {
                 if b.root == NO_NODE {
-                    Affine { root: NO_NODE, k: 0, c: w_mul(is_int, a.c, b.c) }
+                    Affine {
+                        root: NO_NODE,
+                        k: 0,
+                        c: w_mul(is_int, a.c, b.c),
+                    }
                 } else {
-                    Affine { root: b.root, k: w_mul(is_int, b.k, a.c), c: w_mul(is_int, b.c, a.c) }
+                    Affine {
+                        root: b.root,
+                        k: w_mul(is_int, b.k, a.c),
+                        c: w_mul(is_int, b.c, a.c),
+                    }
                 }
             } else if b.root == NO_NODE {
-                Affine { root: a.root, k: w_mul(is_int, a.k, b.c), c: w_mul(is_int, a.c, b.c) }
+                Affine {
+                    root: a.root,
+                    k: w_mul(is_int, a.k, b.c),
+                    c: w_mul(is_int, a.c, b.c),
+                }
             } else {
                 opaque
             }
@@ -254,7 +290,11 @@ fn reassociate_affine(graph: &mut Graph) {
         if node.op == Op::Dead {
             continue;
         }
-        let opaque = Affine { root: id as NodeId, k: 1, c: 0 };
+        let opaque = Affine {
+            root: id as NodeId,
+            k: 1,
+            c: 0,
+        };
         let is_int = match int_width(node.ty) {
             Some(w) => w,
             None => {
@@ -265,9 +305,13 @@ fn reassociate_affine(graph: &mut Graph) {
         // Read an operand's already-computed affine form; only inputs with a
         // strictly-lower id are available (φ back-edges read as None → opaque).
         let geta = |slot: usize| -> Option<Affine> {
-            node.inputs
-                .get(slot)
-                .and_then(|&i| if (i as usize) < id { aff[i as usize] } else { None })
+            node.inputs.get(slot).and_then(|&i| {
+                if (i as usize) < id {
+                    aff[i as usize]
+                } else {
+                    None
+                }
+            })
         };
         let res = match &node.op {
             Op::Const(v) => Affine {
@@ -276,7 +320,11 @@ fn reassociate_affine(graph: &mut Graph) {
                 c: if is_int { (*v as i32) as i64 } else { *v },
             },
             Op::Neg => match geta(0) {
-                Some(a) => Affine { root: a.root, k: w_neg(is_int, a.k), c: w_neg(is_int, a.c) },
+                Some(a) => Affine {
+                    root: a.root,
+                    k: w_neg(is_int, a.k),
+                    c: w_neg(is_int, a.c),
+                },
                 None => opaque,
             },
             Op::Add | Op::Sub | Op::Mul => match (geta(0), geta(1)) {
@@ -339,8 +387,17 @@ fn try_fold(nodes: &[Node], id: NodeId) -> Option<i64> {
     let node = &nodes[id as usize];
     let is_int = node.ty == IrType::Int;
     match &node.op {
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::And | Op::Or | Op::Xor
-        | Op::Shl | Op::Shr | Op::UShr => {
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::And
+        | Op::Or
+        | Op::Xor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr => {
             let a = const_value(nodes, node.inputs[0])?;
             let b = const_value(nodes, node.inputs[1])?;
             let raw = match &node.op {
@@ -783,7 +840,11 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
     // Back-edge control node(s): the region's predecessors other than the
     // entry edge (`inputs[0]`). For a reducible loop these are the control
     // nodes that close the loop.
-    let entry_pred = graph.nodes[region as usize].inputs.first().copied().unwrap_or(NO_NODE);
+    let entry_pred = graph.nodes[region as usize]
+        .inputs
+        .first()
+        .copied()
+        .unwrap_or(NO_NODE);
     let back_ctrls: Vec<NodeId> = graph.nodes[region as usize]
         .inputs
         .iter()
@@ -859,11 +920,7 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
             continue;
         }
         // Loads / stores / calls / allocations: pinned to a control/mem input.
-        if node
-            .inputs
-            .iter()
-            .any(|&inp| body.contains(&inp))
-        {
+        if node.inputs.iter().any(|&inp| body.contains(&inp)) {
             body.insert(id as NodeId);
         }
     }
@@ -876,12 +933,7 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
 /// returns false. `depth` bounds the recursion so a cyclic phi (e.g. from a
 /// *different* loop nest) cannot cause unbounded recursion — exceeding the
 /// bound is treated conservatively as variant.
-fn is_loop_invariant(
-    graph: &Graph,
-    id: NodeId,
-    region: NodeId,
-    body: &FxHashSet<NodeId>,
-) -> bool {
+fn is_loop_invariant(graph: &Graph, id: NodeId, region: NodeId, body: &FxHashSet<NodeId>) -> bool {
     is_loop_invariant_d(graph, id, region, body, 0)
 }
 
@@ -931,9 +983,7 @@ fn is_loop_invariant_d(
 fn loop_has_memory_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
     body.iter().any(|&id| {
         let op = &graph.nodes[id as usize].op;
-        !op.is_pure()
-            && !op.is_control()
-            && !matches!(op, Op::Load(_) | Op::Phi | Op::Dead)
+        !op.is_pure() && !op.is_control() && !matches!(op, Op::Load(_) | Op::Phi | Op::Dead)
     })
 }
 
@@ -960,7 +1010,11 @@ fn licm(graph: &mut Graph) -> bool {
         }
         let body = loop_body(graph, region);
         // The pre-header is the control feeding the region's entry edge.
-        let preheader = graph.nodes[region as usize].inputs.first().copied().unwrap_or(NO_NODE);
+        let preheader = graph.nodes[region as usize]
+            .inputs
+            .first()
+            .copied()
+            .unwrap_or(NO_NODE);
         if preheader == NO_NODE || body.contains(&preheader) {
             // No identifiable pre-header outside the loop → cannot hoist.
             continue;
@@ -999,7 +1053,7 @@ fn licm(graph: &mut Graph) -> bool {
                     // so treat slot 0 as base.
                     (inputs[0], inputs[1])
                 }
-                3 => (inputs[2], NO_NODE),           // [ctrl, mem, base]
+                3 => (inputs[2], NO_NODE),             // [ctrl, mem, base]
                 n if n >= 4 => (inputs[2], inputs[3]), // [ctrl, mem, base, index]
                 _ => (NO_NODE, NO_NODE),
             };
@@ -1050,7 +1104,13 @@ pub fn licm_scev_corroborates(code: &[u8], code_len: usize) -> bool {
     }
     let pairs: Vec<(usize, usize)> = loops
         .iter()
-        .filter_map(|li| li.back_edges.iter().copied().max().map(|be| (li.header_pc, be)))
+        .filter_map(|li| {
+            li.back_edges
+                .iter()
+                .copied()
+                .max()
+                .map(|be| (li.header_pc, be))
+        })
         .collect();
     let ivs = crate::scev::analyze_induction_variables(code, code_len, &pairs);
     let has_counted_iv = ivs.iter().any(|iv| iv.stride != 0);
@@ -1593,7 +1653,9 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
     }
     if if_node == NO_NODE {
         if dbg {
-            eprintln!("[DBG_UNROLL] region {region}: bail — no loop exit If (ctrl==region/back_ctrl)");
+            eprintln!(
+                "[DBG_UNROLL] region {region}: bail — no loop exit If (ctrl==region/back_ctrl)"
+            );
         }
         return None;
     }
@@ -1648,7 +1710,14 @@ fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Opt
             return None; // too large / non-terminating within the cap
         }
     }
-    Some(CountedLoop { iv_phi, iv_init, iv_stride, trip, if_node, exit_ctrl })
+    Some(CountedLoop {
+        iv_phi,
+        iv_init,
+        iv_stride,
+        trip,
+        if_node,
+        exit_ctrl,
+    })
 }
 
 /// Collapse trivial single-input `Op::Merge` nodes (control pass-throughs the
@@ -1747,7 +1816,11 @@ fn unroll(graph: &mut Graph) -> bool {
             continue;
         }
         let back_ctrl = back_inputs[0];
-        let entry_pred = rin.iter().copied().find(|&i| i != back_ctrl).unwrap_or(NO_NODE);
+        let entry_pred = rin
+            .iter()
+            .copied()
+            .find(|&i| i != back_ctrl)
+            .unwrap_or(NO_NODE);
         if entry_pred == NO_NODE {
             continue;
         }
@@ -1995,7 +2068,9 @@ fn unroll(graph: &mut Graph) -> bool {
             let mut next: FxHashMap<NodeId, NodeId> = FxHashMap::default();
             for &p in &carried {
                 if p == info.iv_phi {
-                    let v = info.iv_init.wrapping_add((t + 1).wrapping_mul(info.iv_stride));
+                    let v = info
+                        .iv_init
+                        .wrapping_add((t + 1).wrapping_mul(info.iv_stride));
                     let c = graph.add(Op::Const(v), IrType::Int, vec![], None);
                     next.insert(p, c);
                 } else {
@@ -2046,7 +2121,12 @@ mod tests {
     use super::*;
     use crate::ir::{IrBuilder, MemKind};
 
-    fn build_and_optimize(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
+    fn build_and_optimize(
+        code: &[u8],
+        code_len: usize,
+        num_params: usize,
+        num_locals: usize,
+    ) -> Graph {
         let builder = IrBuilder::new(num_params, num_locals);
         let mut graph = builder.build(code, code_len).expect("build failed");
         optimize(&mut graph);
@@ -2146,7 +2226,12 @@ mod tests {
 
     // ── Affine strength reduction (reassociation) ───────────────────
 
-    fn build_and_reassociate(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
+    fn build_and_reassociate(
+        code: &[u8],
+        code_len: usize,
+        num_params: usize,
+        num_locals: usize,
+    ) -> Graph {
         let builder = IrBuilder::new(num_params, num_locals);
         let mut graph = builder.build(code, code_len).expect("build failed");
         reassociate_affine(&mut graph);
@@ -2181,7 +2266,11 @@ mod tests {
         } else {
             (val.inputs[1], val.inputs[0])
         };
-        assert_eq!(graph.nodes[c_id as usize].op, Op::Const(11), "additive constant");
+        assert_eq!(
+            graph.nodes[c_id as usize].op,
+            Op::Const(11),
+            "additive constant"
+        );
         let mul = &graph.nodes[mul_id as usize];
         assert_eq!(mul.op, Op::Mul);
         let (px, k_id) = if graph.nodes[mul.inputs[0] as usize].op == Op::Param(0) {
@@ -2190,7 +2279,11 @@ mod tests {
             (mul.inputs[1], mul.inputs[0])
         };
         assert_eq!(graph.nodes[px as usize].op, Op::Param(0));
-        assert_eq!(graph.nodes[k_id as usize].op, Op::Const(6), "multiplicative constant");
+        assert_eq!(
+            graph.nodes[k_id as usize].op,
+            Op::Const(6),
+            "multiplicative constant"
+        );
         // The whole intermediate chain collapsed: exactly one Mul + one Add remain.
         assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
         assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Add).count(), 1);
@@ -2212,7 +2305,11 @@ mod tests {
         } else {
             val.inputs[0]
         };
-        assert_eq!(graph.nodes[k_id as usize].op, Op::Const(32761), "181*181 folds to 32761");
+        assert_eq!(
+            graph.nodes[k_id as usize].op,
+            Op::Const(32761),
+            "181*181 folds to 32761"
+        );
         assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
     }
 
@@ -2277,9 +2374,17 @@ mod tests {
     fn test_fold_i32_add_overflow_wraps() {
         // Java: Integer.MIN_VALUE + (-1) == Integer.MAX_VALUE (0x7FFF_FFFF)
         let r = fold_binop(IrType::Int, Op::Add, i32::MIN as i64, -1).unwrap();
-        assert_eq!(r, i32::MAX as i64, "INT_MIN + (-1) must wrap to INT_MAX, got {:#x}", r);
+        assert_eq!(
+            r,
+            i32::MAX as i64,
+            "INT_MIN + (-1) must wrap to INT_MAX, got {:#x}",
+            r
+        );
         // High 32 bits must be sign-extension of low 32 bits (i.e. 0 here).
-        assert_eq!(r as i32 as i64, r, "result must be a clean i32 sign-extension");
+        assert_eq!(
+            r as i32 as i64, r,
+            "result must be a clean i32 sign-extension"
+        );
     }
 
     #[test]
@@ -2401,7 +2506,15 @@ mod tests {
         // between: the first store is dead and must be removed; the second
         // (live) store and the allocation survive.
         let mut g = probe_graph();
-        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
         let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
         let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
         // Compact [base, value] layout (as used by the EA bridge/tests).
@@ -2433,7 +2546,15 @@ mod tests {
         // store; load(same obj); store  — the first store IS observed by the
         // load, so it must NOT be removed.
         let mut g = probe_graph();
-        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
         let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
         let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
         let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
@@ -2482,12 +2603,25 @@ mod tests {
         // write-only phase does not apply here) — this test isolates the
         // distinct-field non-conflation property of the overwrite phase.
         let mut g = probe_graph();
-        let alloc = g.add(Op::New { class_id: 1, num_fields: 2 }, IrType::Ref, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
         let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
         let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
         // Different MemKind → different location key (Int vs Long slot).
         let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
-        let s2 = g.add(Op::Store(MemKind::Long), IrType::Void, vec![alloc, c2], None);
+        let s2 = g.add(
+            Op::Store(MemKind::Long),
+            IrType::Void,
+            vec![alloc, c2],
+            None,
+        );
         // Read the object back so it is observed (write-only phase off).
         let load = g.add(Op::Load(MemKind::Int), IrType::Int, vec![alloc], None);
         let ret = g.add(Op::Return, IrType::Void, vec![g.entry, load], None);
@@ -2509,7 +2643,15 @@ mod tests {
         // the overwrite case: there is only ONE store, so the straight-line
         // overwrite phase cannot fire — only the write-only phase can.)
         let mut g = probe_graph();
-        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
         let c1 = g.add(Op::Const(7), IrType::Int, vec![], None);
         let store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
         // The method returns void; the alloc never escapes and is never read.
@@ -2531,7 +2673,15 @@ mod tests {
         // caller). The caller may read the field, so the store is observable
         // and must be kept — guards the kafka bug-25-class escape hole.
         let mut g = probe_graph();
-        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
         let c1 = g.add(Op::Const(7), IrType::Int, vec![], None);
         let store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
         // The allocation is RETURNED → escapes.
@@ -2599,7 +2749,12 @@ mod tests {
     /// Returns (graph, return_node); the Return's value input is the accumulator
     /// phi (its post-loop value), its control is the loop-exit projection.
     fn reduction_loop(init: i64, bound: i64, stride: i64) -> (Graph, NodeId) {
-        let mut g = Graph { nodes: Vec::new(), entry: 0, exit: 0, safepoints: Vec::new() };
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+        };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -2642,7 +2797,10 @@ mod tests {
     fn test_unroll_counted_reduction_folds_to_constant() {
         // for (i=0; i<5; i++) acc += i;  =>  acc == 0+1+2+3+4 == 10
         let (mut g, ret) = reduction_loop(0, 5, 1);
-        assert!(unroll(&mut g), "a constant-trip counted reduction must unroll");
+        assert!(
+            unroll(&mut g),
+            "a constant-trip counted reduction must unroll"
+        );
         fold_pipeline(&mut g);
         let val = g.nodes[ret as usize].inputs[1];
         assert_eq!(
@@ -2671,7 +2829,10 @@ mod tests {
     fn test_unroll_nonzero_init_and_stride() {
         // for (i=3; i<11; i+=2) acc += i;  =>  i ∈ {3,5,7,9}  =>  sum == 24
         let (mut g, ret) = reduction_loop(3, 11, 2);
-        assert!(unroll(&mut g), "non-zero init/stride counted loop must unroll");
+        assert!(
+            unroll(&mut g),
+            "non-zero init/stride counted loop must unroll"
+        );
         fold_pipeline(&mut g);
         let val = g.nodes[ret as usize].inputs[1];
         assert_eq!(g.nodes[val as usize].op, Op::Const(24), "3+5+7+9 == 24");
@@ -2698,7 +2859,10 @@ mod tests {
 
         let changed = licm(&mut g);
 
-        assert!(changed, "an invariant load in a barrier-free loop must hoist");
+        assert!(
+            changed,
+            "an invariant load in a barrier-free loop must hoist"
+        );
         assert_eq!(
             g.nodes[load as usize].inputs[0], preheader,
             "the hoisted load's control input must be re-anchored to the pre-header"
@@ -2746,9 +2910,22 @@ mod tests {
         // A store pinned into the body (ctrl = region) is the barrier. Its
         // base is a *different* local alloc so DSE-style reasoning is moot;
         // for LICM any in-body store disqualifies hoisting.
-        let other = g.add(Op::New { class_id: 9, num_fields: 1 }, IrType::Ref, vec![region], None);
+        let other = g.add(
+            Op::New {
+                class_id: 9,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![region],
+            None,
+        );
         let cval = g.add(Op::Const(5), IrType::Int, vec![], None);
-        let _st = g.add(Op::Store(MemKind::Int), IrType::Void, vec![region, mem, other, cval], None);
+        let _st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![region, mem, other, cval],
+            None,
+        );
         let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
         g.exit = ret;
 

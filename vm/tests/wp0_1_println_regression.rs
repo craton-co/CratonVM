@@ -80,8 +80,7 @@ fn test_println_multi_line_no_npe() {
             matches!(shared.heap.get_field(*stream, 0), Value::Int(1 | 2)),
             "fd tag must remain a valid Int(1|2) after allocation round {text}"
         );
-        let read_back =
-            cratonvm_vm::vm::read_java_string(&shared.heap, s).unwrap_or_default();
+        let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s).unwrap_or_default();
         assert_eq!(
             read_back, *text,
             "create_java_string round-trip must survive between println calls"

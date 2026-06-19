@@ -84,7 +84,11 @@ fn redefine_round_trip_replaces_method_body_and_bumps_generation() {
     let v1_body = {
         let cls = cm.class_store.get(cid).unwrap();
         // Find the `foo` method (skip `<init>`).
-        let m = cls.methods.iter().find(|m| &*m.name == "foo").expect("foo method present");
+        let m = cls
+            .methods
+            .iter()
+            .find(|m| &*m.name == "foo")
+            .expect("foo method present");
         m.code().expect("foo has Code attr").code.clone()
     };
 
@@ -102,7 +106,11 @@ fn redefine_round_trip_replaces_method_body_and_bumps_generation() {
     // Method body changed.
     let v2_body = {
         let cls = cm.class_store.get(cid).unwrap();
-        let m = cls.methods.iter().find(|m| &*m.name == "foo").expect("foo still present");
+        let m = cls
+            .methods
+            .iter()
+            .find(|m| &*m.name == "foo")
+            .expect("foo still present");
         m.code().expect("foo still has Code").code.clone()
     };
     assert_ne!(
@@ -229,7 +237,9 @@ fn redefine_rejects_bad_magic() {
         .expect("define ok");
     let mut bad = vec![0u8; 16];
     bad[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    let err = cm.redefine_class(cid, bad, RedefineOptions::default()).unwrap_err();
+    let err = cm
+        .redefine_class(cid, bad, RedefineOptions::default())
+        .unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("UnsupportedClassRedefinition") && msg.contains("bad magic"),
@@ -432,8 +442,15 @@ fn rejected_redefine_does_not_swap_methods_or_bump_generation() {
             .map(|c| c.code.clone())
             .unwrap_or_default()
     };
-    assert_eq!(body_before, body_after, "rejected redefine must not mutate methods");
-    assert_eq!(cm.class_redefine_generation(cid), 0, "rejected redefine must not bump generation");
+    assert_eq!(
+        body_before, body_after,
+        "rejected redefine must not mutate methods"
+    );
+    assert_eq!(
+        cm.class_redefine_generation(cid),
+        0,
+        "rejected redefine must not bump generation"
+    );
 }
 
 // --------------------------------------------------------------------------

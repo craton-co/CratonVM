@@ -516,17 +516,17 @@ impl<'a> Emitter<'a> {
             0x2F => self.array_load(RegKind::S64, ".s64", 8)?, // laload
             0x30 => self.array_load(RegKind::F32, ".f32", 4)?, // faload
             0x31 => self.array_load(RegKind::F64, ".f64", 8)?, // daload
-            0x33 => self.array_load_byte()?,                    // baload
-            0x34 => self.array_load_char()?,                    // caload
-            0x35 => self.array_load_short()?,                   // saload
+            0x33 => self.array_load_byte()?,                   // baload
+            0x34 => self.array_load_char()?,                   // caload
+            0x35 => self.array_load_short()?,                  // saload
             // ── array store ─────────────────────────────────────────
             0x4F => self.array_store(RegKind::S32, ".s32", 4)?, // iastore
             0x50 => self.array_store(RegKind::S64, ".s64", 8)?, // lastore
             0x51 => self.array_store(RegKind::F32, ".f32", 4)?, // fastore
             0x52 => self.array_store(RegKind::F64, ".f64", 8)?, // dastore
-            0x54 => self.array_store_byte()?,                    // bastore
-            0x55 => self.array_store_char_or_short(2)?,          // castore
-            0x56 => self.array_store_char_or_short(2)?,          // sastore
+            0x54 => self.array_store_byte()?,                   // bastore
+            0x55 => self.array_store_char_or_short(2)?,         // castore
+            0x56 => self.array_store_char_or_short(2)?,         // sastore
             // ── stack ops ───────────────────────────────────────────
             0x57 => {
                 self.stack.pop()?;
@@ -617,8 +617,16 @@ impl<'a> Emitter<'a> {
             // Emitting one made ptxas reject every kernel that hit this
             // path. Reject upstream so the analyzer skips these methods
             // entirely. Proper IEEE remainder lowering is future work.
-            0x72 => return Err(LoweringError::UnsupportedNode("frem (f32 remainder; needs IEEE remainder lowering)".to_string())),
-            0x73 => return Err(LoweringError::UnsupportedNode("drem (f64 remainder; needs IEEE remainder lowering)".to_string())),
+            0x72 => {
+                return Err(LoweringError::UnsupportedNode(
+                    "frem (f32 remainder; needs IEEE remainder lowering)".to_string(),
+                ))
+            }
+            0x73 => {
+                return Err(LoweringError::UnsupportedNode(
+                    "drem (f64 remainder; needs IEEE remainder lowering)".to_string(),
+                ))
+            }
             0x74 => self.unop_i32("neg.s32")?,
             0x75 => self.unop_i64("neg.s64")?,
             0x76 => self.unop_f32("neg.f32")?,
@@ -651,17 +659,17 @@ impl<'a> Emitter<'a> {
             0x8A => self.conv("cvt.rn.f64.s64", RegKind::S64, RegKind::F64)?, // l2d
             0x8B => self.conv("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
             0x8C => self.conv("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
-            0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?,   // f2d
+            0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?, // f2d
             0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
-            0x91 => self.conv_truncate_i32(8)?,                                // i2b
+            0x91 => self.conv_truncate_i32(8)?,                            // i2b
             // i2c — Java `char` is an UNSIGNED 16-bit value, so JVMS i2c
             // zero-extends the low 16 bits (not sign-extends like i2b/i2s).
             // Route through the zero-extending helper so e.g. 0xFFFF maps
             // to 65535 rather than -1.
-            0x92 => self.conv_zext_u16()?,                                     // i2c (unsigned 16)
-            0x93 => self.conv_truncate_i32(16)?,                               // i2s
+            0x92 => self.conv_zext_u16()?,       // i2c (unsigned 16)
+            0x93 => self.conv_truncate_i32(16)?, // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
             // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
             // `cmp_long_or_float`, which unconditionally returned `Err`.
@@ -695,8 +703,7 @@ impl<'a> Emitter<'a> {
                 // the back branch; mark and stop. Anything else is
                 // non-canonical.
                 let target = if op == 0xA7 {
-                    let off =
-                        i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i32;
+                    let off = i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i32;
                     (pc as i32 + off) as usize
                 } else {
                     let off = i32::from_be_bytes([
@@ -749,8 +756,8 @@ impl<'a> Emitter<'a> {
                     0x39 => self.dstore(idx)?,
                     0x3A => self.astore(idx)?,
                     0x84 => {
-                        let delta = i16::from_be_bytes([self.bytes[pc + 4], self.bytes[pc + 5]])
-                            as i32;
+                        let delta =
+                            i16::from_be_bytes([self.bytes[pc + 4], self.bytes[pc + 5]]) as i32;
                         self.iinc(idx, delta)?;
                     }
                     _ => {
@@ -784,29 +791,17 @@ impl<'a> Emitter<'a> {
             self.stack.push(tid);
             return Ok(());
         }
-        let r = self
-            .locals
-            .get(slot as usize)
-            .cloned()
-            .ok_or_else(|| {
-                LoweringError::UnsupportedNode(format!(
-                    "iload from uninitialised local {slot}"
-                ))
-            })?;
+        let r = self.locals.get(slot as usize).cloned().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!("iload from uninitialised local {slot}"))
+        })?;
         self.stack.push(r);
         Ok(())
     }
 
     fn lload(&mut self, slot: u16) -> Result<(), LoweringError> {
-        let r = self
-            .locals
-            .get(slot as usize)
-            .cloned()
-            .ok_or_else(|| {
-                LoweringError::UnsupportedNode(format!(
-                    "lload from uninitialised local {slot}"
-                ))
-            })?;
+        let r = self.locals.get(slot as usize).cloned().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!("lload from uninitialised local {slot}"))
+        })?;
         self.stack.push(r);
         Ok(())
     }
@@ -820,16 +815,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn aload(&mut self, slot: u16) -> Result<(), LoweringError> {
-        let r = self
-            .locals
-            .get(slot as usize)
-            .cloned()
-            .ok_or_else(|| {
-                LoweringError::UnsupportedNode(format!(
-                    "aload from uninitialised local {slot} \
+        let r = self.locals.get(slot as usize).cloned().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!(
+                "aload from uninitialised local {slot} \
                      (non-parameter object references are not supported)"
-                ))
-            })?;
+            ))
+        })?;
         self.stack.push(r);
         Ok(())
     }
@@ -870,15 +861,9 @@ impl<'a> Emitter<'a> {
             // dispatch — skip.
             return Ok(());
         }
-        let cur = self
-            .locals
-            .get(slot as usize)
-            .cloned()
-            .ok_or_else(|| {
-                LoweringError::UnsupportedNode(format!(
-                    "iinc on uninitialised local {slot}"
-                ))
-            })?;
+        let cur = self.locals.get(slot as usize).cloned().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!("iinc on uninitialised local {slot}"))
+        })?;
         let next = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
@@ -896,7 +881,12 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, b.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -905,7 +895,12 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S64);
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, b.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -952,12 +947,7 @@ impl<'a> Emitter<'a> {
         self.used_bounds_label = true;
         // Zero-divisor guard (applies to both div and rem).
         let p_zero = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(
-            self.body,
-            "    setp.eq.s32 {}, {}, 0;",
-            p_zero.name, b.name
-        )
-        .unwrap();
+        writeln!(self.body, "    setp.eq.s32 {}, {}, 0;", p_zero.name, b.name).unwrap();
         writeln!(
             self.body,
             "    @{} bra {};",
@@ -1001,7 +991,12 @@ impl<'a> Emitter<'a> {
             .unwrap();
         }
         let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, b.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -1014,12 +1009,7 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         self.used_bounds_label = true;
         let p_zero = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(
-            self.body,
-            "    setp.eq.s64 {}, {}, 0;",
-            p_zero.name, b.name
-        )
-        .unwrap();
+        writeln!(self.body, "    setp.eq.s64 {}, {}, 0;", p_zero.name, b.name).unwrap();
         writeln!(
             self.body,
             "    @{} bra {};",
@@ -1057,7 +1047,12 @@ impl<'a> Emitter<'a> {
             .unwrap();
         }
         let r = self.regs.fresh_reg(RegKind::S64);
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        writeln!(
+            self.body,
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, b.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -1103,14 +1098,14 @@ impl<'a> Emitter<'a> {
         // ≥ the operand width is undefined. Mask explicitly into a
         // fresh register before issuing the shift.
         let masked = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    and.b32 {}, {}, 31;", masked.name, b.name).unwrap();
+        // PTX shifts accept either signedness for the count operand.
         writeln!(
             self.body,
-            "    and.b32 {}, {}, 31;",
-            masked.name, b.name
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, masked.name
         )
         .unwrap();
-        // PTX shifts accept either signedness for the count operand.
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, masked.name).unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -1124,25 +1119,20 @@ impl<'a> Emitter<'a> {
         // masked by 0x3F for 64-bit shifts. PTX 64-bit shifts still
         // take a 32-bit count operand, so the mask stays in s32.
         let masked = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    and.b32 {}, {}, 63;", masked.name, b.name).unwrap();
         writeln!(
             self.body,
-            "    and.b32 {}, {}, 63;",
-            masked.name, b.name
+            "    {} {}, {}, {};",
+            mnemonic, r.name, a.name, masked.name
         )
         .unwrap();
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, masked.name).unwrap();
         self.stack.push(r);
         Ok(())
     }
 
     // ─────────────────── conversions ────────────────────────────────
 
-    fn conv(
-        &mut self,
-        mnemonic: &str,
-        _from: RegKind,
-        to: RegKind,
-    ) -> Result<(), LoweringError> {
+    fn conv(&mut self, mnemonic: &str, _from: RegKind, to: RegKind) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(to);
         writeln!(self.body, "    {} {}, {};", mnemonic, r.name, a.name).unwrap();
@@ -1271,18 +1261,8 @@ impl<'a> Emitter<'a> {
         )
         .unwrap();
         // Load signed 8-bit, widen to 32-bit (sign-extended) — Java baload semantics.
-        writeln!(
-            self.body,
-            "    ld.global.s8 {}, [{}];",
-            raw.name, addr.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    cvt.s32.s8 {}, {};",
-            result.name, raw.name
-        )
-        .unwrap();
+        writeln!(self.body, "    ld.global.s8 {}, [{}];", raw.name, addr.name).unwrap();
+        writeln!(self.body, "    cvt.s32.s8 {}, {};", result.name, raw.name).unwrap();
         self.stack.push(result);
         Ok(())
     }
@@ -1324,7 +1304,11 @@ impl<'a> Emitter<'a> {
         )
         .unwrap();
         let load_suffix = if is_char { "u16" } else { "s16" };
-        let cvt = if is_char { "cvt.u32.u16" } else { "cvt.s32.s16" };
+        let cvt = if is_char {
+            "cvt.u32.u16"
+        } else {
+            "cvt.s32.s16"
+        };
         writeln!(
             self.body,
             "    ld.global.{} {}, [{}];",
@@ -1484,12 +1468,7 @@ impl<'a> Emitter<'a> {
     fn scalar_return(&mut self, kind: RegKind, suffix: &str) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
         let ret_ptr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    ld.param.u64 {}, [ret_ptr];",
-            ret_ptr.name
-        )
-        .unwrap();
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
         if self.sig.is_reduction {
             // AUDIT 2026-05-24 (C31): dot-product / sum reduction shape.
             // The element-wise lowering substitutes `iload iv → tid` so
@@ -1649,8 +1628,7 @@ fn pre_loop_bound_source(
             0x2A..=0x2D => last_aload_local = Some((op - 0x2A) as u16),
             0x19 => last_aload_local = Some(bytes[pc + 1] as u16),
             0xC4 if bytes[pc + 1] == 0x19 => {
-                last_aload_local =
-                    Some(u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]));
+                last_aload_local = Some(u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]));
             }
             0xBE => {
                 last_arraylength_local = last_aload_local;

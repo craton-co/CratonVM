@@ -555,11 +555,9 @@ mod tests {
         // String in the current frame must be assignable to a declared
         // local of CharSequence (String implements CharSequence).
         let h = MockHierarchy;
-        let mut current =
-            VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
+        let mut current = VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
         current.locals[0] = VType::ObjectRef(Arc::from("java/lang/String"));
-        let mut declared =
-            VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
+        let mut declared = VerificationFrame::initial_frame("Foo", "m", "()V", true, 1, 1);
         declared.locals[0] = VType::ObjectRef(Arc::from("java/lang/CharSequence"));
         assert!(current.is_assignable_to(&declared, &h));
     }
@@ -572,11 +570,9 @@ mod tests {
         // a fall-through path; it must still be considered assignable since
         // Top is the top of the verification type lattice (JVMS 4.10.1.2).
         let h = MockHierarchy;
-        let mut current =
-            VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        let mut current = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
         current.locals[3] = VType::Int;
-        let mut declared =
-            VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
+        let mut declared = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
         declared.locals[3] = VType::Top;
         assert!(current.is_assignable_to(&declared, &h));
     }

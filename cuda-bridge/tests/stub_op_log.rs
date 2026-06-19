@@ -197,8 +197,8 @@ fn three_stage_pipeline() {
 
     // Allocate A and upload on s1.
     let host_a = [1.0_f32; 16]; // 16 × 4 = 64 bytes
-    let buf_a = DeviceBuffer::<f32>::from_host_async(&ctx, &host_a, &s1)
-        .expect("from_host_async A on s1");
+    let buf_a =
+        DeviceBuffer::<f32>::from_host_async(&ctx, &host_a, &s1).expect("from_host_async A on s1");
 
     // Load a synthetic module for f and g. If module creation fails
     // in stub mode, early-return — the spec says it's acceptable.
@@ -226,8 +226,8 @@ fn three_stage_pipeline() {
 
     // Upload B on s2.
     let host_b = [2.0_f32; 16]; // 64 bytes
-    let buf_b = DeviceBuffer::<f32>::from_host_async(&ctx, &host_b, &s2)
-        .expect("from_host_async B on s2");
+    let buf_b =
+        DeviceBuffer::<f32>::from_host_async(&ctx, &host_b, &s2).expect("from_host_async B on s2");
 
     // launch g(A, B) on s2.
     let args_g = KernelArgs::new()

@@ -178,7 +178,10 @@ fn rh3_phantom_enqueued_but_not_cleared() {
     let result = proc.process_references(&|_| false, 64, 0);
     assert_eq!(result.stats.phantom_refs_enqueued, 1);
     assert!(
-        result.to_enqueue.iter().any(|(r, q)| *r == phantom && *q == queue),
+        result
+            .to_enqueue
+            .iter()
+            .any(|(r, q)| *r == phantom && *q == queue),
         "phantom ref must be enqueued"
     );
 }
@@ -239,12 +242,7 @@ fn rh4_all_finalizers_run_without_panic() {
 #[test]
 fn rh4_finalizer_not_enqueued_when_referent_live() {
     let mut proc = ReferenceProcessor::new();
-    proc.discover_reference(
-        ReferenceType::Finalizer,
-        0x5000_0000,
-        0x6000_0000,
-        None,
-    );
+    proc.discover_reference(ReferenceType::Finalizer, 0x5000_0000, 0x6000_0000, None);
     let result = proc.process_references(&|a| a == 0x6000_0000, 64, 0);
     assert_eq!(result.stats.finalizer_refs_enqueued, 0);
     assert!(result.to_finalize.is_empty());
@@ -341,7 +339,7 @@ fn rh7_oopmap_scaffolding_retains_references() {
     // 2. A populated map reports `has_precise_oop_maps() == true`.
     // 3. `find_oop_map_for_pc` returns the exact entry at a safepoint
     //    PC and `None` elsewhere.
-    use cratonvm_jit::{ExecutableBuffer, CompiledMethod, OopMapEntry};
+    use cratonvm_jit::{CompiledMethod, ExecutableBuffer, OopMapEntry};
 
     let buf = ExecutableBuffer::new(4096).expect("exec alloc");
     let mut cm = CompiledMethod::new(buf);

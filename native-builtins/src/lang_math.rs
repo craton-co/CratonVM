@@ -4,14 +4,13 @@
 //! Math, StrictMath, and Number subclass native method implementations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 use crate::lang_string::{
     format_double, format_float, native_string_chars, native_string_code_point_at,
     native_string_code_point_count, native_string_format, native_string_format_locale,
-    native_string_formatted,
-    native_string_indent, native_string_is_blank, native_string_lines,
+    native_string_formatted, native_string_indent, native_string_is_blank, native_string_lines,
     native_string_offset_by_code_points, native_string_region_matches,
     native_string_region_matches_ic, native_string_repeat, native_string_transform,
     native_string_value_of_int, native_string_value_of_long, native_string_value_of_object,
@@ -118,7 +117,12 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "floorMod", "(JJ)J", native_math_floor_mod_long);
     registry.register(class, "toIntExact", "(J)I", native_math_to_int_exact);
     registry.register(class, "multiplyHigh", "(JJ)J", native_math_multiply_high);
-    registry.register(class, "unsignedMultiplyHigh", "(JJ)J", native_math_unsigned_multiply_high);
+    registry.register(
+        class,
+        "unsignedMultiplyHigh",
+        "(JJ)J",
+        native_math_unsigned_multiply_high,
+    );
 
     // --- Advanced functions (Phase 13 Step 3) ---
     registry.register(class, "hypot", "(DD)D", native_math_hypot);
@@ -1109,7 +1113,10 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
 // java.lang.Float / Double natives
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_float_to_raw_int_bits(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_to_raw_int_bits(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let f = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1128,7 +1135,10 @@ pub(crate) fn native_double_to_raw_long_bits(
     Ok(Some(Value::Long(d.to_bits() as i64)))
 }
 
-pub(crate) fn native_long_bits_to_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_bits_to_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let l = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1157,7 +1167,10 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 
 // --- abs ---
 #[inline(always)]
-pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_abs_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1166,13 +1179,19 @@ pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 #[inline(always)]
-pub(crate) fn native_math_abs_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_abs_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = long_arg(args, 0);
     Ok(Some(Value::Long(v.wrapping_abs())))
 }
 
 #[inline(always)]
-pub(crate) fn native_math_abs_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_abs_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1181,7 +1200,10 @@ pub(crate) fn native_math_abs_float(_ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 #[inline(always)]
-pub(crate) fn native_math_abs_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_abs_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1191,7 +1213,10 @@ pub(crate) fn native_math_abs_double(_ctx: &mut dyn NativeContext, args: &[Value
 
 // --- max ---
 #[inline(always)]
-pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_max_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1204,14 +1229,20 @@ pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 #[inline(always)]
-pub(crate) fn native_math_max_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_max_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = long_arg(args, 0);
     let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::max(a, b))))
 }
 
 #[inline(always)]
-pub(crate) fn native_math_max_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_max_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1224,7 +1255,10 @@ pub(crate) fn native_math_max_float(_ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 #[inline(always)]
-pub(crate) fn native_math_max_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_max_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1238,7 +1272,10 @@ pub(crate) fn native_math_max_double(_ctx: &mut dyn NativeContext, args: &[Value
 
 // --- min ---
 #[inline(always)]
-pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_min_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1251,14 +1288,20 @@ pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 #[inline(always)]
-pub(crate) fn native_math_min_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_min_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = long_arg(args, 0);
     let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::min(a, b))))
 }
 
 #[inline(always)]
-pub(crate) fn native_math_min_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_min_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1271,7 +1314,10 @@ pub(crate) fn native_math_min_float(_ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 #[inline(always)]
-pub(crate) fn native_math_min_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_min_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1477,7 +1523,10 @@ fn round_double(a: f64) -> i64 {
 }
 
 #[inline]
-pub(crate) fn native_math_round_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_round_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1517,7 +1566,10 @@ fn round_float(a: f32) -> i32 {
 }
 
 #[inline]
-pub(crate) fn native_math_round_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_round_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1529,7 +1581,10 @@ pub(crate) fn native_math_round_float(_ctx: &mut dyn NativeContext, args: &[Valu
 }
 
 #[inline]
-pub(crate) fn native_math_to_radians(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_to_radians(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1538,7 +1593,10 @@ pub(crate) fn native_math_to_radians(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 #[inline]
-pub(crate) fn native_math_to_degrees(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_to_degrees(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1580,7 +1638,10 @@ fn init_seed_if_zero() -> u64 {
     })
 }
 
-pub(crate) fn native_math_random(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_random(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let next = MATH_RANDOM_SEED.with(|c| {
         let mut v = c.get();
         if v == 0 {
@@ -1600,7 +1661,10 @@ pub(crate) fn native_math_random(_ctx: &mut dyn NativeContext, _args: &[Value]) 
 }
 
 #[inline]
-pub(crate) fn native_math_signum_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_signum_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1618,7 +1682,10 @@ pub(crate) fn native_math_signum_double(_ctx: &mut dyn NativeContext, args: &[Va
 }
 
 #[inline]
-pub(crate) fn native_math_signum_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_signum_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -1645,7 +1712,10 @@ pub(crate) fn native_math_cbrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 #[inline]
-pub(crate) fn native_math_ieee_remainder(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_ieee_remainder(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -1689,7 +1759,10 @@ pub(crate) fn math_overflow_err_long() -> cratonvm_types::error::MethodCallFaile
 }
 
 #[inline]
-pub(crate) fn native_math_add_exact_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_add_exact_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1705,7 +1778,10 @@ pub(crate) fn native_math_add_exact_int(_ctx: &mut dyn NativeContext, args: &[Va
 }
 
 #[inline]
-pub(crate) fn native_math_add_exact_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_add_exact_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1857,7 +1933,10 @@ pub(crate) fn native_math_decrement_exact_long(
 }
 
 #[inline]
-pub(crate) fn native_math_negate_exact_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_negate_exact_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1869,7 +1948,10 @@ pub(crate) fn native_math_negate_exact_int(_ctx: &mut dyn NativeContext, args: &
 }
 
 #[inline]
-pub(crate) fn native_math_negate_exact_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_negate_exact_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1885,7 +1967,10 @@ pub(crate) fn native_math_negate_exact_long(_ctx: &mut dyn NativeContext, args: 
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn native_math_floor_div_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_floor_div_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1908,7 +1993,10 @@ pub(crate) fn native_math_floor_div_int(_ctx: &mut dyn NativeContext, args: &[Va
 }
 
 #[inline]
-pub(crate) fn native_math_floor_div_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_floor_div_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1930,7 +2018,10 @@ pub(crate) fn native_math_floor_div_long(_ctx: &mut dyn NativeContext, args: &[V
 }
 
 #[inline]
-pub(crate) fn native_math_floor_mod_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_floor_mod_int(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -1952,7 +2043,10 @@ pub(crate) fn native_math_floor_mod_int(_ctx: &mut dyn NativeContext, args: &[Va
 }
 
 #[inline]
-pub(crate) fn native_math_floor_mod_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_floor_mod_long(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1973,7 +2067,10 @@ pub(crate) fn native_math_floor_mod_long(_ctx: &mut dyn NativeContext, args: &[V
 }
 
 #[inline]
-pub(crate) fn native_math_to_int_exact(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_to_int_exact(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -1985,7 +2082,10 @@ pub(crate) fn native_math_to_int_exact(_ctx: &mut dyn NativeContext, args: &[Val
 }
 
 #[inline]
-pub(crate) fn native_math_multiply_high(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_multiply_high(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -2006,7 +2106,10 @@ pub(crate) fn native_math_multiply_high(_ctx: &mut dyn NativeContext, args: &[Va
 /// interpreting it dominates EC keygen/sign/verify time. Byte-identical to the
 /// JDK by construction: both compute `(a·b mod 2^128) >> 64` over unsigned a,b.
 #[inline]
-pub(crate) fn native_math_unsigned_multiply_high(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_unsigned_multiply_high(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v as u64,
         _ => 0,
@@ -2082,7 +2185,10 @@ pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 #[inline]
-pub(crate) fn native_math_copy_sign_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_copy_sign_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let mag = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2095,7 +2201,10 @@ pub(crate) fn native_math_copy_sign_double(_ctx: &mut dyn NativeContext, args: &
 }
 
 #[inline]
-pub(crate) fn native_math_copy_sign_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_copy_sign_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let mag = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -2108,7 +2217,10 @@ pub(crate) fn native_math_copy_sign_float(_ctx: &mut dyn NativeContext, args: &[
 }
 
 #[inline]
-pub(crate) fn native_math_next_up_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_next_up_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2132,7 +2244,10 @@ pub(crate) fn native_math_next_up_double(_ctx: &mut dyn NativeContext, args: &[V
 }
 
 #[inline]
-pub(crate) fn native_math_next_down_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_next_down_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2156,7 +2271,10 @@ pub(crate) fn native_math_next_down_double(_ctx: &mut dyn NativeContext, args: &
 }
 
 #[inline]
-pub(crate) fn native_math_next_after(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_next_after(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let start = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2198,7 +2316,10 @@ pub(crate) fn native_math_next_after(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 #[inline]
-pub(crate) fn native_math_ulp_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_ulp_double(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2216,7 +2337,10 @@ pub(crate) fn native_math_ulp_double(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 #[inline]
-pub(crate) fn native_math_ulp_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_math_ulp_float(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -2294,25 +2418,25 @@ struct WrapperClassIdCache {
 }
 
 static WRAPPER_CIDS: WrapperClassIdCache = WrapperClassIdCache {
-    integer:   std::sync::atomic::AtomicU32::new(0),
-    long:      std::sync::atomic::AtomicU32::new(0),
-    float:     std::sync::atomic::AtomicU32::new(0),
-    double:    std::sync::atomic::AtomicU32::new(0),
-    boolean:   std::sync::atomic::AtomicU32::new(0),
-    byte:      std::sync::atomic::AtomicU32::new(0),
-    short:     std::sync::atomic::AtomicU32::new(0),
+    integer: std::sync::atomic::AtomicU32::new(0),
+    long: std::sync::atomic::AtomicU32::new(0),
+    float: std::sync::atomic::AtomicU32::new(0),
+    double: std::sync::atomic::AtomicU32::new(0),
+    boolean: std::sync::atomic::AtomicU32::new(0),
+    byte: std::sync::atomic::AtomicU32::new(0),
+    short: std::sync::atomic::AtomicU32::new(0),
     character: std::sync::atomic::AtomicU32::new(0),
 };
 
 fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::AtomicU32> {
     match class_name {
-        "java/lang/Integer"   => Some(&WRAPPER_CIDS.integer),
-        "java/lang/Long"      => Some(&WRAPPER_CIDS.long),
-        "java/lang/Float"     => Some(&WRAPPER_CIDS.float),
-        "java/lang/Double"    => Some(&WRAPPER_CIDS.double),
-        "java/lang/Boolean"   => Some(&WRAPPER_CIDS.boolean),
-        "java/lang/Byte"      => Some(&WRAPPER_CIDS.byte),
-        "java/lang/Short"     => Some(&WRAPPER_CIDS.short),
+        "java/lang/Integer" => Some(&WRAPPER_CIDS.integer),
+        "java/lang/Long" => Some(&WRAPPER_CIDS.long),
+        "java/lang/Float" => Some(&WRAPPER_CIDS.float),
+        "java/lang/Double" => Some(&WRAPPER_CIDS.double),
+        "java/lang/Boolean" => Some(&WRAPPER_CIDS.boolean),
+        "java/lang/Byte" => Some(&WRAPPER_CIDS.byte),
+        "java/lang/Short" => Some(&WRAPPER_CIDS.short),
         "java/lang/Character" => Some(&WRAPPER_CIDS.character),
         _ => None,
     }
@@ -2325,7 +2449,10 @@ fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::Atom
 /// Boolean, Byte, Short, Character) the resolved ClassId is cached in a
 /// process-wide atomic after the first successful `ensure_class_initialized`,
 /// so subsequent autoboxes skip the name lookup entirely.
-pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> cratonvm_types::ObjectRef {
+pub(crate) fn alloc_wrapper(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> cratonvm_types::ObjectRef {
     // Fast path: hit the wrapper-CID cache for the 8 well-known names.
     if let Some(slot) = wrapper_cid_slot(class_name) {
         let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
@@ -2347,12 +2474,9 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> cr
     // Non-cached class name (caller used a non-wrapper name).
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => ctx.alloc_object(class_id, 1),
-        Err(_) => {
-            ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
-        }
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     }
 }
-
 
 // Round-9 CRIT GC-correctness fix: BOOLEAN_CACHE and INTEGER_CACHE must
 // live process-global, NOT thread-local. Two reasons:
@@ -2469,7 +2593,10 @@ pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usi
     }
 }
 
-pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2477,7 +2604,10 @@ pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value
     if (-128..=127).contains(&val) {
         let idx = (val + 128) as usize;
         // Fast path: lock, read, drop lock before any heap allocation.
-        if let Some(cached) = { let c = integer_cache().lock(); c[idx] } {
+        if let Some(cached) = {
+            let c = integer_cache().lock();
+            c[idx]
+        } {
             return Ok(Some(Value::Object(Some(cached))));
         }
         let obj = alloc_wrapper(ctx, "java/lang/Integer");
@@ -2500,7 +2630,10 @@ pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value
 
 /// Shared unboxing for Integer.intValue(), Boolean.booleanValue(),
 /// Character.charValue(), Byte.byteValue(), Short.shortValue().
-pub(crate) fn native_wrapper_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2512,7 +2645,10 @@ pub(crate) fn native_wrapper_int_value(ctx: &mut dyn NativeContext, args: &[Valu
     }
 }
 
-pub(crate) fn native_integer_parse_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_parse_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2532,7 +2668,10 @@ pub(crate) fn native_integer_parse_int(ctx: &mut dyn NativeContext, args: &[Valu
     }
 }
 
-pub(crate) fn native_integer_parse_int_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_parse_int_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2558,7 +2697,10 @@ pub(crate) fn native_integer_parse_int_radix(ctx: &mut dyn NativeContext, args: 
 
 // --- Byte.parseByte ---
 
-pub(crate) fn native_byte_parse_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_byte_parse_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2578,7 +2720,10 @@ pub(crate) fn native_byte_parse_byte(ctx: &mut dyn NativeContext, args: &[Value]
     }
 }
 
-pub(crate) fn native_byte_parse_byte_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_byte_parse_byte_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2604,7 +2749,10 @@ pub(crate) fn native_byte_parse_byte_radix(ctx: &mut dyn NativeContext, args: &[
 
 // --- Short.parseShort ---
 
-pub(crate) fn native_short_parse_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_short_parse_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2624,7 +2772,10 @@ pub(crate) fn native_short_parse_short(ctx: &mut dyn NativeContext, args: &[Valu
     }
 }
 
-pub(crate) fn native_short_parse_short_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_short_parse_short_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2648,7 +2799,10 @@ pub(crate) fn native_short_parse_short_radix(ctx: &mut dyn NativeContext, args: 
     }
 }
 
-pub(crate) fn native_integer_to_hex_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_to_hex_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2682,7 +2836,10 @@ pub(crate) fn native_integer_ntz(_ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Int(v.trailing_zeros() as i32)))
 }
 
-pub(crate) fn native_integer_bit_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_bit_count(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
@@ -2690,7 +2847,10 @@ pub(crate) fn native_integer_bit_count(_ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Int(v.count_ones() as i32)))
 }
 
-pub(crate) fn native_integer_reverse(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_reverse(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
@@ -2698,7 +2858,10 @@ pub(crate) fn native_integer_reverse(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Int(v.reverse_bits() as i32)))
 }
 
-pub(crate) fn native_integer_reverse_bytes(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_reverse_bytes(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
@@ -2708,7 +2871,10 @@ pub(crate) fn native_integer_reverse_bytes(_ctx: &mut dyn NativeContext, args: &
 
 // --- Long ---
 
-pub(crate) fn native_long_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -2716,7 +2882,10 @@ pub(crate) fn native_long_value_of(ctx: &mut dyn NativeContext, args: &[Value]) 
     if (-128..=127).contains(&val) {
         let idx = (val + 128) as usize;
         // Fast path: lock, read, drop lock before any heap allocation.
-        if let Some(cached) = { let c = long_cache().lock(); c[idx] } {
+        if let Some(cached) = {
+            let c = long_cache().lock();
+            c[idx]
+        } {
             return Ok(Some(Value::Object(Some(cached))));
         }
         let obj = alloc_wrapper(ctx, "java/lang/Long");
@@ -2737,7 +2906,10 @@ pub(crate) fn native_long_value_of(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_wrapper_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
@@ -2749,7 +2921,10 @@ pub(crate) fn native_wrapper_long_value(ctx: &mut dyn NativeContext, args: &[Val
     }
 }
 
-pub(crate) fn native_long_parse_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_parse_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2785,7 +2960,10 @@ pub(crate) fn native_long_ntz(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(v.trailing_zeros() as i32)))
 }
 
-pub(crate) fn native_long_bit_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_bit_count(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Long(v)) => *v as u64,
         _ => 0,
@@ -2793,7 +2971,10 @@ pub(crate) fn native_long_bit_count(_ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(v.count_ones() as i32)))
 }
 
-pub(crate) fn native_long_reverse(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_reverse(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Long(v)) => *v as u64,
         _ => 0,
@@ -2801,7 +2982,10 @@ pub(crate) fn native_long_reverse(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Long(v.reverse_bits() as i64)))
 }
 
-pub(crate) fn native_long_reverse_bytes(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_reverse_bytes(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Long(v)) => *v as u64,
         _ => 0,
@@ -2811,7 +2995,10 @@ pub(crate) fn native_long_reverse_bytes(_ctx: &mut dyn NativeContext, args: &[Va
 
 // --- Boolean ---
 
-pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_boolean_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2847,7 +3034,10 @@ pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value
     // Fallback (Boolean class somehow unavailable / fields not yet set):
     // keep the canonical-cache behaviour so repeated calls are at least
     // self-consistent.
-    if let Some(o) = { let c = boolean_cache().lock(); c[idx] } {
+    if let Some(o) = {
+        let c = boolean_cache().lock();
+        c[idx]
+    } {
         return Ok(Some(Value::Object(Some(o))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Boolean");
@@ -2862,7 +3052,10 @@ pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value
 
 // --- Character ---
 
-pub(crate) fn native_character_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2872,7 +3065,10 @@ pub(crate) fn native_character_value_of(ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_character_is_digit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_is_digit(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let ch = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
@@ -2881,7 +3077,10 @@ pub(crate) fn native_character_is_digit(_ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-pub(crate) fn native_character_is_letter(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_is_letter(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let ch = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => 0,
@@ -3009,7 +3208,10 @@ pub(crate) fn native_character_is_letter_or_digit(
 // ---------------------------------------------------------------------------
 
 // Int-stored field 0 → Long
-pub(crate) fn native_wrapper_int_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_to_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
@@ -3022,7 +3224,10 @@ pub(crate) fn native_wrapper_int_to_long(ctx: &mut dyn NativeContext, args: &[Va
 }
 
 // Int-stored field 0 → Float
-pub(crate) fn native_wrapper_int_to_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_to_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Float(0.0))),
@@ -3035,7 +3240,10 @@ pub(crate) fn native_wrapper_int_to_float(ctx: &mut dyn NativeContext, args: &[V
 }
 
 // Int-stored field 0 → Double
-pub(crate) fn native_wrapper_int_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_to_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Double(0.0))),
@@ -3048,7 +3256,10 @@ pub(crate) fn native_wrapper_int_to_double(ctx: &mut dyn NativeContext, args: &[
 }
 
 // Long field 0 → Int
-pub(crate) fn native_wrapper_long_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_to_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3061,7 +3272,10 @@ pub(crate) fn native_wrapper_long_to_int(ctx: &mut dyn NativeContext, args: &[Va
 }
 
 // Long field 0 → Float
-pub(crate) fn native_wrapper_long_to_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_to_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Float(0.0))),
@@ -3074,7 +3288,10 @@ pub(crate) fn native_wrapper_long_to_float(ctx: &mut dyn NativeContext, args: &[
 }
 
 // Long field 0 → Double
-pub(crate) fn native_wrapper_long_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_to_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Double(0.0))),
@@ -3087,7 +3304,10 @@ pub(crate) fn native_wrapper_long_to_double(ctx: &mut dyn NativeContext, args: &
 }
 
 // Float field 0 → Int
-pub(crate) fn native_wrapper_float_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_to_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3100,7 +3320,10 @@ pub(crate) fn native_wrapper_float_to_int(ctx: &mut dyn NativeContext, args: &[V
 }
 
 // Float field 0 → Long
-pub(crate) fn native_wrapper_float_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_to_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
@@ -3113,7 +3336,10 @@ pub(crate) fn native_wrapper_float_to_long(ctx: &mut dyn NativeContext, args: &[
 }
 
 // Float field 0 → Double
-pub(crate) fn native_wrapper_float_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_to_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Double(0.0))),
@@ -3126,7 +3352,10 @@ pub(crate) fn native_wrapper_float_to_double(ctx: &mut dyn NativeContext, args: 
 }
 
 // Double field 0 → Int
-pub(crate) fn native_wrapper_double_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_double_to_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3139,7 +3368,10 @@ pub(crate) fn native_wrapper_double_to_int(ctx: &mut dyn NativeContext, args: &[
 }
 
 // Double field 0 → Long
-pub(crate) fn native_wrapper_double_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_double_to_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
@@ -3152,7 +3384,10 @@ pub(crate) fn native_wrapper_double_to_long(ctx: &mut dyn NativeContext, args: &
 }
 
 // Double field 0 → Float
-pub(crate) fn native_wrapper_double_to_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_double_to_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Float(0.0))),
@@ -3169,7 +3404,10 @@ pub(crate) fn native_wrapper_double_to_float(ctx: &mut dyn NativeContext, args: 
 // ---------------------------------------------------------------------------
 
 // toString for Int-stored wrappers (Integer, Byte, Short)
-pub(crate) fn native_wrapper_int_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3269,7 +3507,10 @@ pub(crate) fn native_character_instance_to_string(
 }
 
 // hashCode for Int-stored wrappers (Integer, Byte, Short, Character)
-pub(crate) fn native_wrapper_int_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3281,7 +3522,10 @@ pub(crate) fn native_wrapper_int_hash_code(ctx: &mut dyn NativeContext, args: &[
 }
 
 // hashCode for Boolean wrapper (true=1231, false=1237)
-pub(crate) fn native_boolean_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_boolean_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1237))),
@@ -3293,7 +3537,10 @@ pub(crate) fn native_boolean_hash_code(ctx: &mut dyn NativeContext, args: &[Valu
 }
 
 // hashCode for Long wrapper: (v ^ (v >>> 32)) as i32
-pub(crate) fn native_wrapper_long_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3306,7 +3553,10 @@ pub(crate) fn native_wrapper_long_hash_code(ctx: &mut dyn NativeContext, args: &
 }
 
 // hashCode for Float wrapper: floatToIntBits(v)
-pub(crate) fn native_wrapper_float_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3338,7 +3588,10 @@ pub(crate) fn native_wrapper_double_hash_code(
 }
 
 // equals for Int-stored wrappers (Integer, Boolean, Character, Byte, Short)
-pub(crate) fn native_wrapper_int_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_int_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3353,7 +3606,10 @@ pub(crate) fn native_wrapper_int_equals(ctx: &mut dyn NativeContext, args: &[Val
 }
 
 // equals for Long wrapper
-pub(crate) fn native_wrapper_long_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_long_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3374,7 +3630,10 @@ pub(crate) fn native_wrapper_long_equals(ctx: &mut dyn NativeContext, args: &[Va
 }
 
 // equals for Float wrapper (NaN == NaN is true per Float.equals spec, using to_bits)
-pub(crate) fn native_wrapper_float_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3399,7 +3658,10 @@ pub(crate) fn native_wrapper_float_equals(ctx: &mut dyn NativeContext, args: &[V
 }
 
 // equals for Double wrapper (NaN == NaN is true per Double.equals spec, using to_bits)
-pub(crate) fn native_wrapper_double_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_double_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3427,7 +3689,10 @@ pub(crate) fn native_wrapper_double_equals(ctx: &mut dyn NativeContext, args: &[
 // Phase 12: Character additional methods
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_character_digit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_digit(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let ch = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => return Ok(Some(Value::Int(-1))),
@@ -3443,7 +3708,10 @@ pub(crate) fn native_character_digit(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Int(result)))
 }
 
-pub(crate) fn native_character_for_digit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_for_digit(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let digit = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => return Ok(Some(Value::Int(0))),
@@ -3471,7 +3739,10 @@ pub(crate) fn native_character_get_numeric_value(
     Ok(Some(Value::Int(result)))
 }
 
-pub(crate) fn native_character_char_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_character_char_count(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let cp = match args.first() {
         Some(Value::Int(v)) => *v as u32,
         _ => return Ok(Some(Value::Int(1))),
@@ -3537,7 +3808,10 @@ pub(crate) fn native_character_static_to_string(
 // Phase 12: Boolean additional methods
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_boolean_parse_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_boolean_parse_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3573,7 +3847,10 @@ pub(crate) fn native_boolean_static_hash_code(
     Ok(Some(Value::Int(if val { 1231 } else { 1237 })))
 }
 
-pub(crate) fn native_boolean_compare(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_boolean_compare(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v != 0,
         _ => false,
@@ -3595,7 +3872,10 @@ pub(crate) fn native_boolean_compare(_ctx: &mut dyn NativeContext, args: &[Value
 ///
 /// Effectively: true iff the system property exists and equals "true"
 /// (case-insensitive).  A null/absent property yields false.
-pub(crate) fn native_boolean_get_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_boolean_get_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         // null or missing argument → false (matches JDK's NPE-swallow).
@@ -3610,7 +3890,10 @@ pub(crate) fn native_boolean_get_boolean(ctx: &mut dyn NativeContext, args: &[Va
 
 // --- Integer/Long radix helpers ---
 
-pub(crate) fn native_integer_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_to_string_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -3633,7 +3916,10 @@ pub(crate) fn native_integer_to_string_radix(ctx: &mut dyn NativeContext, args: 
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_long_parse_long_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_parse_long_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -3657,7 +3943,10 @@ pub(crate) fn native_long_parse_long_radix(ctx: &mut dyn NativeContext, args: &[
     }
 }
 
-pub(crate) fn native_long_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_to_string_radix(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -3699,7 +3988,10 @@ fn i64_to_radix_string(val: i64, radix: u32) -> String {
 
 // --- Float ---
 
-pub(crate) fn native_float_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3709,7 +4001,10 @@ pub(crate) fn native_float_value_of(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_wrapper_float_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_float_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Float(0.0))),
@@ -3732,7 +4027,10 @@ pub(crate) fn native_float_int_bits_to_float(
     Ok(Some(Value::Float(f32::from_bits(bits as u32))))
 }
 
-pub(crate) fn native_float_is_nan(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_is_nan(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3740,7 +4038,10 @@ pub(crate) fn native_float_is_nan(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(if v.is_nan() { 1 } else { 0 })))
 }
 
-pub(crate) fn native_float_is_infinite(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_is_infinite(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3750,7 +4051,10 @@ pub(crate) fn native_float_is_infinite(_ctx: &mut dyn NativeContext, args: &[Val
 
 // --- Double (boxing) ---
 
-pub(crate) fn native_double_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3760,7 +4064,10 @@ pub(crate) fn native_double_value_of(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_wrapper_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_wrapper_double_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Double(0.0))),
@@ -3772,7 +4079,10 @@ pub(crate) fn native_wrapper_double_value(ctx: &mut dyn NativeContext, args: &[V
     }
 }
 
-pub(crate) fn native_double_is_nan(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_is_nan(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3780,7 +4090,10 @@ pub(crate) fn native_double_is_nan(_ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Int(if v.is_nan() { 1 } else { 0 })))
 }
 
-pub(crate) fn native_double_is_infinite(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_is_infinite(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3796,13 +4109,11 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
         "NaN" => Ok(f32::NAN),
         "Infinity" | "+Infinity" => Ok(f32::INFINITY),
         "-Infinity" => Ok(f32::NEG_INFINITY),
-        _ => {
-            trimmed
-                .parse::<f32>()
-                .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
-                    message: format!("For input string: \"{s}\""),
-                })
-        }
+        _ => trimmed.parse::<f32>().map_err(|_| {
+            cratonvm_types::error::RuntimeError::NumberFormatException {
+                message: format!("For input string: \"{s}\""),
+            }
+        }),
     }
 }
 
@@ -3812,17 +4123,18 @@ fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeErr
         "NaN" => Ok(f64::NAN),
         "Infinity" | "+Infinity" => Ok(f64::INFINITY),
         "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => {
-            trimmed
-                .parse::<f64>()
-                .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
-                    message: format!("For input string: \"{s}\""),
-                })
-        }
+        _ => trimmed.parse::<f64>().map_err(|_| {
+            cratonvm_types::error::RuntimeError::NumberFormatException {
+                message: format!("For input string: \"{s}\""),
+            }
+        }),
     }
 }
 
-pub(crate) fn native_float_parse_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_parse_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
@@ -3836,7 +4148,10 @@ pub(crate) fn native_float_parse_float(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Float(val)))
 }
 
-pub(crate) fn native_double_parse_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_parse_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
@@ -3850,7 +4165,10 @@ pub(crate) fn native_double_parse_double(ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Double(val)))
 }
 
-pub(crate) fn native_float_value_of_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_value_of_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
@@ -3866,7 +4184,10 @@ pub(crate) fn native_float_value_of_string(ctx: &mut dyn NativeContext, args: &[
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_double_value_of_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_value_of_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
@@ -3882,7 +4203,10 @@ pub(crate) fn native_double_value_of_string(ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Object(Some(obj))))
 }
 
-pub(crate) fn native_float_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3891,7 +4215,10 @@ pub(crate) fn native_float_to_string(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
 
-pub(crate) fn native_double_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3900,7 +4227,10 @@ pub(crate) fn native_double_to_string(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
 
-pub(crate) fn native_float_to_int_bits(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_to_int_bits(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let f = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3914,7 +4244,10 @@ pub(crate) fn native_float_to_int_bits(_ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Int(bits)))
 }
 
-pub(crate) fn native_double_to_long_bits(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_to_long_bits(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let d = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3928,7 +4261,10 @@ pub(crate) fn native_double_to_long_bits(_ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Long(bits)))
 }
 
-pub(crate) fn native_float_compare(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_float_compare(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -3941,7 +4277,10 @@ pub(crate) fn native_float_compare(_ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
 }
 
-pub(crate) fn native_double_compare(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_double_compare(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -3955,7 +4294,10 @@ pub(crate) fn native_double_compare(_ctx: &mut dyn NativeContext, args: &[Value]
 
 // --- Byte ---
 
-pub(crate) fn native_byte_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_byte_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -3967,7 +4309,10 @@ pub(crate) fn native_byte_value_of(ctx: &mut dyn NativeContext, args: &[Value]) 
 
 // --- Short ---
 
-pub(crate) fn native_short_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_short_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -3981,7 +4326,10 @@ pub(crate) fn native_short_value_of(ctx: &mut dyn NativeContext, args: &[Value])
 // Integer.compare / Integer.compareTo / Long.compare / Long.compareTo
 // ===========================================================================
 
-pub(crate) fn native_integer_compare(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_compare(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -3993,7 +4341,10 @@ pub(crate) fn native_integer_compare(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Int(a.cmp(&b) as i32)))
 }
 
-pub(crate) fn native_integer_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_integer_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this_val = match args.first() {
         Some(Value::Object(Some(r))) => match ctx.get_field(*r, 0) {
             Value::Int(v) => v,
@@ -4011,7 +4362,10 @@ pub(crate) fn native_integer_compare_to(ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Int(this_val.cmp(&other_val) as i32)))
 }
 
-pub(crate) fn native_long_compare(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_compare(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -4023,7 +4377,10 @@ pub(crate) fn native_long_compare(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(a.cmp(&b) as i32)))
 }
 
-pub(crate) fn native_long_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_long_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this_val = match args.first() {
         Some(Value::Object(Some(r))) => match ctx.get_field(*r, 0) {
             Value::Long(v) => v,
@@ -4150,7 +4507,10 @@ mod tests {
     fn math_max_double_with_nan() {
         let mut ctx = mock_ctx();
         // f64::max(1.0, NaN) returns 1.0 in Rust (propagates non-NaN)
-        let r = native_math_max_double(&mut ctx, &[Value::Double(f64::NAN), Value::Double(f64::NAN)]);
+        let r = native_math_max_double(
+            &mut ctx,
+            &[Value::Double(f64::NAN), Value::Double(f64::NAN)],
+        );
         match r.unwrap() {
             Some(Value::Double(v)) => assert!(v.is_nan()),
             other => panic!("expected NaN Double, got {other:?}"),
@@ -4257,7 +4617,9 @@ mod tests {
     #[test]
     fn math_round_double_negatives_and_specials() {
         let mut ctx = mock_ctx();
-        let round = |v: f64| match native_math_round_double(&mut mock_ctx(), &[Value::Double(v)]).unwrap() {
+        let round = |v: f64| match native_math_round_double(&mut mock_ctx(), &[Value::Double(v)])
+            .unwrap()
+        {
             Some(Value::Long(x)) => x,
             other => panic!("expected Long, got {other:?}"),
         };
@@ -4290,10 +4652,11 @@ mod tests {
 
     #[test]
     fn math_round_float_negatives_and_specials() {
-        let round = |v: f32| match native_math_round_float(&mut mock_ctx(), &[Value::Float(v)]).unwrap() {
-            Some(Value::Int(x)) => x,
-            other => panic!("expected Int, got {other:?}"),
-        };
+        let round =
+            |v: f32| match native_math_round_float(&mut mock_ctx(), &[Value::Float(v)]).unwrap() {
+                Some(Value::Int(x)) => x,
+                other => panic!("expected Int, got {other:?}"),
+            };
         assert_eq!(round(-0.5_f32), 0);
         assert_eq!(round(-2.5_f32), -2);
         assert_eq!(round(-2.6_f32), -3);
@@ -4527,4 +4890,3 @@ mod tests {
         assert!(registry.len() > 50);
     }
 }
-

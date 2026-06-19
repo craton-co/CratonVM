@@ -46,10 +46,7 @@ fn test_resources_dir() -> String {
 }
 
 fn fixture_compiled() -> bool {
-    let path = format!(
-        "{}/cratonvm/Wp21MethodSurface.class",
-        test_resources_dir()
-    );
+    let path = format!("{}/cratonvm/Wp21MethodSurface.class", test_resources_dir());
     std::path::Path::new(&path).exists()
 }
 
@@ -137,7 +134,10 @@ fn method_existing_natives_still_registered() {
         ("isSynthetic", "()Z"),
         ("isDefault", "()Z"),
         ("getDefaultValue", "()Ljava/lang/Object;"),
-        ("getParameterAnnotations", "()[[Ljava/lang/annotation/Annotation;"),
+        (
+            "getParameterAnnotations",
+            "()[[Ljava/lang/annotation/Annotation;",
+        ),
     ];
     for (name, desc) in &probes {
         assert!(
@@ -157,8 +157,7 @@ fn basic_surface() {
         eprintln!("Skipping basic_surface: Wp21MethodSurface.class not staged");
         return;
     }
-    let n = run_probe("basicSurface")
-        .expect("WP2.1: basicSurface probe must invoke cleanly");
+    let n = run_probe("basicSurface").expect("WP2.1: basicSurface probe must invoke cleanly");
     assert_eq!(
         n, 1,
         "WP2.1: basic Method surface (name/toString/return/param/exception/modifiers/declaring) failed; \
@@ -173,8 +172,7 @@ fn boolean_flags() {
         eprintln!("Skipping boolean_flags: fixture not staged");
         return;
     }
-    let n = run_probe("booleanFlags")
-        .expect("WP2.1: booleanFlags probe must invoke cleanly");
+    let n = run_probe("booleanFlags").expect("WP2.1: booleanFlags probe must invoke cleanly");
     assert_eq!(
         n, 1,
         "WP2.1: isDefault / isVarArgs flag handling regression"
@@ -235,8 +233,7 @@ fn generic_types() {
         eprintln!("Skipping generic_types: fixture not staged");
         return;
     }
-    let n = run_probe("genericTypes")
-        .expect("WP2.1: genericTypes probe must invoke cleanly");
+    let n = run_probe("genericTypes").expect("WP2.1: genericTypes probe must invoke cleanly");
     assert_eq!(
         n, 1,
         "WP2.1: getGenericReturnType / getGenericParameterTypes / getGenericExceptionTypes regression"
@@ -272,14 +269,8 @@ fn closes_method_surface() {
 
 #[test]
 fn fixture_class_file_is_staged() {
-    let java = format!(
-        "{}/cratonvm/Wp21MethodSurface.java",
-        test_resources_dir()
-    );
-    let class = format!(
-        "{}/cratonvm/Wp21MethodSurface.class",
-        test_resources_dir()
-    );
+    let java = format!("{}/cratonvm/Wp21MethodSurface.java", test_resources_dir());
+    let class = format!("{}/cratonvm/Wp21MethodSurface.class", test_resources_dir());
     assert!(
         std::path::Path::new(&java).exists(),
         "Wp21MethodSurface.java fixture must exist at {java}"

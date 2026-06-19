@@ -77,8 +77,19 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "MonthNames",
         &[
-            "January", "February", "March", "April", "May", "June", "July",
-            "August", "September", "October", "November", "December", "",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+            "",
         ],
     );
     put_arr(
@@ -86,23 +97,35 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "MonthAbbreviations",
         &[
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-            "Oct", "Nov", "Dec", "",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
         ],
     );
     put_arr(
         ctx,
         map,
         "MonthNarrows",
-        &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", ""],
+        &[
+            "J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", "",
+        ],
     );
     put_arr(
         ctx,
         map,
         "standalone.MonthNames",
         &[
-            "January", "February", "March", "April", "May", "June", "July",
-            "August", "September", "October", "November", "December", "",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+            "",
         ],
     );
     put_arr(
@@ -110,15 +133,16 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "standalone.MonthAbbreviations",
         &[
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-            "Oct", "Nov", "Dec", "",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
         ],
     );
     put_arr(
         ctx,
         map,
         "standalone.MonthNarrows",
-        &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", ""],
+        &[
+            "J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", "",
+        ],
     );
     // 7-element day arrays starting with Sunday — the JDK's
     // `DateFormatSymbols.toOneBasedArray` prepends an empty slot so the
@@ -130,8 +154,13 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "DayNames",
         &[
-            "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
-            "Friday", "Saturday",
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
         ],
     );
     put_arr(
@@ -140,19 +169,19 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "DayAbbreviations",
         &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
-    put_arr(
-        ctx,
-        map,
-        "DayNarrows",
-        &["S", "M", "T", "W", "T", "F", "S"],
-    );
+    put_arr(ctx, map, "DayNarrows", &["S", "M", "T", "W", "T", "F", "S"]);
     put_arr(
         ctx,
         map,
         "standalone.DayNames",
         &[
-            "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
-            "Friday", "Saturday",
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
         ],
     );
     put_arr(
@@ -192,12 +221,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "standalone.QuarterAbbreviations",
         &["Q1", "Q2", "Q3", "Q4"],
     );
-    put_arr(
-        ctx,
-        map,
-        "standalone.QuarterNarrows",
-        &["1", "2", "3", "4"],
-    );
+    put_arr(ctx, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
     // 9-slot DateTimePatterns: 4 time patterns (FULL/LONG/MEDIUM/SHORT),
     // 4 date patterns, 1 date-time combiner — the standard JDK layout
     // SimpleDateFormat consumes via DateFormatSymbols.
@@ -250,8 +274,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "NumberElements",
         &[
-            ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}",
-            "NaN",
+            ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
         ],
     );
     put_str(ctx, map, "TimePatternChars", "hHmsSaEcLkKzZ");
@@ -259,19 +282,41 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
 
 fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     let langs: &[(&str, &str)] = &[
-        ("en", "English"), ("fr", "French"), ("de", "German"),
-        ("es", "Spanish"), ("it", "Italian"), ("ja", "Japanese"),
-        ("ko", "Korean"), ("zh", "Chinese"), ("ru", "Russian"),
-        ("pt", "Portuguese"), ("nl", "Dutch"), ("sv", "Swedish"),
-        ("ar", "Arabic"), ("hi", "Hindi"), ("tr", "Turkish"),
+        ("en", "English"),
+        ("fr", "French"),
+        ("de", "German"),
+        ("es", "Spanish"),
+        ("it", "Italian"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("zh", "Chinese"),
+        ("ru", "Russian"),
+        ("pt", "Portuguese"),
+        ("nl", "Dutch"),
+        ("sv", "Swedish"),
+        ("ar", "Arabic"),
+        ("hi", "Hindi"),
+        ("tr", "Turkish"),
     ];
     let countries: &[(&str, &str)] = &[
-        ("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"),
-        ("FR", "France"), ("DE", "Germany"), ("ES", "Spain"),
-        ("IT", "Italy"), ("JP", "Japan"), ("CN", "China"),
-        ("KR", "South Korea"), ("RU", "Russia"), ("BR", "Brazil"),
-        ("AU", "Australia"), ("NL", "Netherlands"), ("SE", "Sweden"),
-        ("MX", "Mexico"), ("IN", "India"), ("ZA", "South Africa"),
+        ("US", "United States"),
+        ("GB", "United Kingdom"),
+        ("CA", "Canada"),
+        ("FR", "France"),
+        ("DE", "Germany"),
+        ("ES", "Spain"),
+        ("IT", "Italy"),
+        ("JP", "Japan"),
+        ("CN", "China"),
+        ("KR", "South Korea"),
+        ("RU", "Russia"),
+        ("BR", "Brazil"),
+        ("AU", "Australia"),
+        ("NL", "Netherlands"),
+        ("SE", "Sweden"),
+        ("MX", "Mexico"),
+        ("IN", "India"),
+        ("ZA", "South Africa"),
     ];
     for (k, v) in langs {
         put_str(ctx, map, k, v);
@@ -474,7 +519,11 @@ fn parse_props_into_map(ctx: &mut dyn NativeContext, map: ObjectRef, bytes: &[u8
             let v = ctx.create_string(&val);
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
-                &[Value::Object(Some(map)), Value::Object(Some(k)), Value::Object(Some(v))],
+                &[
+                    Value::Object(Some(map)),
+                    Value::Object(Some(k)),
+                    Value::Object(Some(v)),
+                ],
             )
             .ok();
         }
@@ -514,14 +563,16 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 // synthetic Locales and the JDK's predefined constants
                 // (Locale.FRENCH, …) whose codes live in BaseLocale, not the
                 // synthetic side table.
-                let lang = match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let country = match ctx.invoke_virtual(*loc, "getCountry", "()Ljava/lang/String;", &[]) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
+                let lang =
+                    match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                let country =
+                    match ctx.invoke_virtual(*loc, "getCountry", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
                 (lang, country)
             } else {
                 (String::new(), String::new())
@@ -541,7 +592,11 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         chain.push((format!("{bundle_name}_{lang}"), lang.clone(), String::new()));
     }
     if !lang.is_empty() && !country.is_empty() {
-        chain.push((format!("{bundle_name}_{lang}_{country}"), lang.clone(), country.clone()));
+        chain.push((
+            format!("{bundle_name}_{lang}_{country}"),
+            lang.clone(),
+            country.clone(),
+        ));
     }
 
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
@@ -582,7 +637,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         "Can't find bundle for base name {bundle_name}, locale {lang}"
     ));
     ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
-    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+        exc,
+    ))
 }
 
 fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -646,14 +703,15 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // Key absent: throw MissingResourceException — ResourceBundle.getObject's
             // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it
             // to produce the "???key???" sentinel.
-            let exc =
-                alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
             ));
             ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
-            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            ));
         }
     }
 
@@ -688,10 +746,12 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this_cid = ctx.class_id_of_object(this);
     if ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/PropertyResourceBundle") {
         return match ctx.get_field_by_name(this, "lookup") {
-            Value::Object(Some(lookup)) => cratonvm_native_collections::native_map_contains_key_pub(
-                ctx,
-                &[Value::Object(Some(lookup)), Value::Object(Some(key))],
-            ),
+            Value::Object(Some(lookup)) => {
+                cratonvm_native_collections::native_map_contains_key_pub(
+                    ctx,
+                    &[Value::Object(Some(lookup)), Value::Object(Some(key))],
+                )
+            }
             _ => Ok(Some(Value::Int(0))),
         };
     }
@@ -848,10 +908,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Object(None))),
         };
-        cratonvm_native_collections::native_map_key_set_pub(
-            ctx,
-            &[Value::Object(Some(map))],
-        )
+        cratonvm_native_collections::native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
     });
     // Per JLS / java.util.ResourceBundle Javadoc: getLocale() must NEVER
     // return null on a successfully loaded bundle. Stock JDK returns the
@@ -875,9 +932,12 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
     });
-    registry.register(rb, "getBaseBundleName", "()Ljava/lang/String;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    registry.register(
+        rb,
+        "getBaseBundleName",
+        "()Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // sun.util.resources.LocaleData.getBundle(String, Locale)  →ResourceBundle
     // Internally this calls `sun.util.resources.Bundles.of(name, locale,
@@ -930,8 +990,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             let elems = make_string_array(
                 ctx,
                 &[
-                    ".", ",", ";", "%", "0", "#", "-", "E",
-                    "\u{2030}", "\u{221E}", "NaN", ".", ",",
+                    ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN", ".", ",",
                 ],
             );
             ctx.set_array_element(outer, 0, Value::Object(Some(elems)));
@@ -976,25 +1035,70 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "currencyInitialized", Value::Int(1));
             // Set every public char/string field via the corresponding
             // setter so we don't depend on instance-field layout.
-            let _ = ctx.invoke_virtual(this, "setDecimalSeparator", "(C)V", &[Value::Int('.' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setGroupingSeparator", "(C)V", &[Value::Int(',' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setPatternSeparator", "(C)V", &[Value::Int(';' as i32)]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setDecimalSeparator",
+                "(C)V",
+                &[Value::Int('.' as i32)],
+            );
+            let _ = ctx.invoke_virtual(
+                this,
+                "setGroupingSeparator",
+                "(C)V",
+                &[Value::Int(',' as i32)],
+            );
+            let _ = ctx.invoke_virtual(
+                this,
+                "setPatternSeparator",
+                "(C)V",
+                &[Value::Int(';' as i32)],
+            );
             let _ = ctx.invoke_virtual(this, "setPercent", "(C)V", &[Value::Int('%' as i32)]);
             let _ = ctx.invoke_virtual(this, "setZeroDigit", "(C)V", &[Value::Int('0' as i32)]);
             let _ = ctx.invoke_virtual(this, "setDigit", "(C)V", &[Value::Int('#' as i32)]);
             let _ = ctx.invoke_virtual(this, "setMinusSign", "(C)V", &[Value::Int('-' as i32)]);
             let _ = ctx.invoke_virtual(this, "setPerMill", "(C)V", &[Value::Int(0x2030)]);
             let exp = ctx.create_string("E");
-            let _ = ctx.invoke_virtual(this, "setExponentSeparator", "(Ljava/lang/String;)V", &[Value::Object(Some(exp))]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setExponentSeparator",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exp))],
+            );
             let inf = ctx.create_string("\u{221E}");
-            let _ = ctx.invoke_virtual(this, "setInfinity", "(Ljava/lang/String;)V", &[Value::Object(Some(inf))]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setInfinity",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(inf))],
+            );
             let nan = ctx.create_string("NaN");
-            let _ = ctx.invoke_virtual(this, "setNaN", "(Ljava/lang/String;)V", &[Value::Object(Some(nan))]);
-            let _ = ctx.invoke_virtual(this, "setMonetaryDecimalSeparator", "(C)V", &[Value::Int('.' as i32)]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setNaN",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(nan))],
+            );
+            let _ = ctx.invoke_virtual(
+                this,
+                "setMonetaryDecimalSeparator",
+                "(C)V",
+                &[Value::Int('.' as i32)],
+            );
             let cs = ctx.create_string("$");
-            let _ = ctx.invoke_virtual(this, "setCurrencySymbol", "(Ljava/lang/String;)V", &[Value::Object(Some(cs))]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setCurrencySymbol",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(cs))],
+            );
             let ics = ctx.create_string("USD");
-            let _ = ctx.invoke_virtual(this, "setInternationalCurrencySymbol", "(Ljava/lang/String;)V", &[Value::Object(Some(ics))]);
+            let _ = ctx.invoke_virtual(
+                this,
+                "setInternationalCurrencySymbol",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(ics))],
+            );
             // Locale field is not exposed via a public setter; the JDK's
             // own initialize() does putfield directly. Use invoke on a
             // synthetic helper via reflection-free path: call getLocale()

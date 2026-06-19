@@ -190,23 +190,11 @@ fn register_factories(registry: &mut NativeMethodRegistry) {
         let full_desc = format!("(){}", ret_desc);
         let owner_name: &'static str = owner;
 
-        let cb: cratonvm_native_api::NativeCallback =
-            make_factory_callback(owner_name);
-        registry.register(
-            "jdk/internal/access/SharedSecrets",
-            method,
-            &full_desc,
-            cb,
-        );
+        let cb: cratonvm_native_api::NativeCallback = make_factory_callback(owner_name);
+        registry.register("jdk/internal/access/SharedSecrets", method, &full_desc, cb);
         // Legacy package alias.
-        let cb2: cratonvm_native_api::NativeCallback =
-            make_factory_callback(owner_name);
-        registry.register(
-            "jdk/internal/misc/SharedSecrets",
-            method,
-            &full_desc,
-            cb2,
-        );
+        let cb2: cratonvm_native_api::NativeCallback = make_factory_callback(owner_name);
+        registry.register("jdk/internal/misc/SharedSecrets", method, &full_desc, cb2);
     }
 }
 
@@ -222,10 +210,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     // index-bounded match.
     macro_rules! gen_factory {
         ($name:ident, $owner:literal) => {
-            fn $name(
-                ctx: &mut dyn NativeContext,
-                _args: &[Value],
-            ) -> MethodCallResult {
+            fn $name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
                 let obj = alloc_singleton(ctx, $owner);
                 Ok(Some(Value::Object(Some(obj))))
             }
@@ -247,10 +232,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jsec, "java/security/AccessController$1");
     gen_factory!(f_jujar, "cratonvm/internal/ss/JavaUtilJarAccess$1");
     gen_factory!(f_juzf, "java/util/zip/ZipFile$1");
-    gen_factory!(
-        f_jnhc,
-        "cratonvm/internal/ss/JavaNetHttpCookieAccess$1"
-    );
+    gen_factory!(f_jnhc, "cratonvm/internal/ss/JavaNetHttpCookieAccess$1");
     gen_factory!(f_jois, "java/io/ObjectInputStream$1");
     gen_factory!(f_jurb, "java/util/ResourceBundle$1");
 
@@ -281,19 +263,13 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
 
 // JavaLangAccess (Thinnest + a few mediums) -----------------------------------
 
-fn jla_current_carrier_thread(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jla_current_carrier_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // In platform-thread-only mode carrier == current thread.
     let t = ctx.current_thread_object();
     Ok(Some(Value::Object(Some(t))))
 }
 
-fn jla_get_reflection_factory(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jla_get_reflection_factory(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // The real JDK returns a `jdk.internal.reflect.ReflectionFactory`
     // singleton.  Most callers immediately invoke methods on it
     // (e.g. `newConstructorAccessor`) which our reflection layer
@@ -329,10 +305,7 @@ fn jla_set_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     Ok(None)
 }
 
-fn jla_get_enum_constants_shared(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_get_enum_constants_shared(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver (System$1 / JavaLangAccess object)
     // args[1] = the Class<E> argument
     if let Some(Value::Object(Some(cls))) = args.get(1) {
@@ -363,10 +336,7 @@ fn jla_get_enum_constants_shared(
 /// unnamed `java.lang.Module` (name field = null, matching the real unnamed
 /// module). The caller only stores it and passes it to the no-op
 /// `setBootLoaderUnnamedModule0` and to `addEnableNativeAccess`.
-fn jla_define_unnamed_module(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jla_define_unnamed_module(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Mirror `Class.getModule()` shape: 2-field synthetic Module, field 0 =
     // name (None = unnamed).
     let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
@@ -380,18 +350,12 @@ fn jla_define_unnamed_module(
 /// returns the same module for chaining. `BootLoader.<clinit>` calls it on the
 /// unnamed module and discards the result. CratonVM does not enforce native
 /// access, so this is an identity passthrough returning the argument module.
-fn jla_add_enable_native_access(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver (System$1), args[1] = the Module argument.
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-fn jla_new_string_utf8_no_repl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_new_string_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (byte[] bytes, int offset, int length) -> String
     // Decode the bytes as UTF-8 with no replacement on malformed
     // sequences — we use the standard `String::from_utf8_lossy`
@@ -424,10 +388,7 @@ fn jla_new_string_utf8_no_repl(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-fn jla_get_bytes_utf8_no_repl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_get_bytes_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (System$1), args[1] = the String.
     let s = match args.get(1) {
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
@@ -441,10 +402,7 @@ fn jla_get_bytes_utf8_no_repl(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-fn jla_new_stack_trace_element(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_new_stack_trace_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `newStackTraceElement(StackFrameInfo sfi)` constructs a
     // `StackTraceElement` from a `StackFrameInfo`.  The
     // stackwalker already builds STE objects directly; we
@@ -514,10 +472,7 @@ fn jla_get_declared_public_methods(
     }
 }
 
-fn jla_get_methods_or_null(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class.
     if let Some(Value::Object(Some(cls))) = args.get(1) {
         ctx.invoke(
@@ -678,10 +633,7 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
 
 // JavaLangInvokeAccess --------------------------------------------------------
 
-fn jlia_find_method_handle_type(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jlia_find_method_handle_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Delegates to MethodType.methodType(Class, Class[]).  Owner C
     // (WP1.6) has the authoritative MethodHandle layer; this
     // bridge is a thin passthrough so SharedSecrets-dependent
@@ -712,10 +664,7 @@ fn jlia_link_method_handle_constant(
     Ok(Some(Value::Object(None)))
 }
 
-fn jlia_make_class_value_map(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jlia_make_class_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // `makeClassValueMap()` returns a weak map keyed by Class.  We
     // back it with a simple HashMap — cratonvm doesn't currently
     // have weak Class references, but the map is only used for
@@ -758,10 +707,7 @@ fn jlra_wait_for_reference_processing(
     Ok(Some(Value::Int(0)))
 }
 
-fn jlra_run_finalization(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jlra_run_finalization(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Finalization is driven by the FinalizerThread, already
     // polled on each GC cycle.  Calling here is a nudge — still
     // a no-op until the polled channel is empty.
@@ -781,10 +727,7 @@ fn register_java_lang_ref_access(registry: &mut NativeMethodRegistry) {
 
 // JavaLangReflectAccess -------------------------------------------------------
 
-fn jlrefa_copy_method(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jlrefa_copy_method(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // The real JDK `copyMethod` clones a Method with a fresh
     // `override` flag so `setAccessible(true)` doesn't mutate the
     // cached prototype.  Our Method mirror is mutable-by-design
@@ -795,28 +738,19 @@ fn jlrefa_copy_method(
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-fn jlrefa_copy_field(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jlrefa_copy_field(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (ReflectAccess), args[1] = the
     // Field to copy.
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-fn jlrefa_copy_constructor(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jlrefa_copy_constructor(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (ReflectAccess), args[1] = the
     // Constructor to copy.
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-fn jlrefa_new_parameter(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jlrefa_new_parameter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `newParameter(Executable, int, String, int)` — construct a
     // `java.lang.reflect.Parameter`.  We follow the JDK layout:
     // slots (executable, index, name, modifiers).
@@ -836,10 +770,7 @@ fn jlrefa_new_parameter(
     Ok(param)
 }
 
-fn jlrefa_new_accessible_object(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jlrefa_new_accessible_object(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     ctx.new_object("java/lang/reflect/AccessibleObject")
 }
 
@@ -926,10 +857,7 @@ fn register_java_io_access(registry: &mut NativeMethodRegistry) {
 
 // JavaIORandomAccessFileAccess ------------------------------------------------
 
-fn jiorafa_open(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jiorafa_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Signature: (String name, String mode) -> RandomAccessFile.
     // INSTANCE method: args[0] = receiver (JavaIORandomAccessFileAccess$1),
     // args[1] = name, args[2] = mode. Allocate a fresh RandomAccessFile and
@@ -946,10 +874,7 @@ fn jiorafa_open(
     )
 }
 
-fn jiorafa_open_as_channel(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jiorafa_open_as_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Return a FileChannel backed by the RAF.  The real RAF
     // getChannel() native already builds one.
     // INSTANCE method: args[0] = receiver, args[1] = the RandomAccessFile.
@@ -1047,19 +972,49 @@ fn register_java_io_fd_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/io/FileDescriptor$1";
     registry.register(owner, "get", "(Ljava/io/FileDescriptor;)I", jiofd_get);
     registry.register(owner, "set", "(Ljava/io/FileDescriptor;I)V", jiofd_set);
-    registry.register(owner, "getAppend", "(Ljava/io/FileDescriptor;)Z", jiofd_get_append);
-    registry.register(owner, "setAppend", "(Ljava/io/FileDescriptor;Z)V", jiofd_set_append);
-    registry.register(owner, "getHandle", "(Ljava/io/FileDescriptor;)J", jiofd_get_handle);
-    registry.register(owner, "setHandle", "(Ljava/io/FileDescriptor;J)V", jiofd_set_handle);
+    registry.register(
+        owner,
+        "getAppend",
+        "(Ljava/io/FileDescriptor;)Z",
+        jiofd_get_append,
+    );
+    registry.register(
+        owner,
+        "setAppend",
+        "(Ljava/io/FileDescriptor;Z)V",
+        jiofd_set_append,
+    );
+    registry.register(
+        owner,
+        "getHandle",
+        "(Ljava/io/FileDescriptor;)J",
+        jiofd_get_handle,
+    );
+    registry.register(
+        owner,
+        "setHandle",
+        "(Ljava/io/FileDescriptor;J)V",
+        jiofd_set_handle,
+    );
     registry.register(owner, "close", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
-    registry.register(owner, "registerCleanup", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
+    registry.register(
+        owner,
+        "registerCleanup",
+        "(Ljava/io/FileDescriptor;)V",
+        jiofd_noop,
+    );
     registry.register(
         owner,
         "registerCleanup",
         "(Ljava/io/FileDescriptor;Ljdk/internal/ref/PhantomCleanable;)V",
         jiofd_noop,
     );
-    registry.register(owner, "unregisterCleanup", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
+    registry.register(
+        owner,
+        "unregisterCleanup",
+        "(Ljava/io/FileDescriptor;)V",
+        jiofd_noop,
+    );
 }
 
 fn register_java_io_raf_access(registry: &mut NativeMethodRegistry) {
@@ -1098,10 +1053,7 @@ fn jniaa_get_host_from_name_service(
     }
 }
 
-fn jniaa_get_original_host_name(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jniaa_get_original_host_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (InetAddress$1), args[1] = addr.
     if let Some(Value::Object(Some(addr))) = args.get(1) {
         // `holder.originalHostName` in real JDK.  We store the
@@ -1140,10 +1092,7 @@ fn register_java_net_inet_address_access(registry: &mut NativeMethodRegistry) {
 
 // JavaNetUriAccess ------------------------------------------------------------
 
-fn jnuri_create(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jnuri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (String scheme, String ssp) -> URI: forwards to `URI.create(scheme:ssp)`.
     // INSTANCE method: args[0] = receiver (JavaNetUriAccess$1),
     // args[1] = scheme, args[2] = ssp.
@@ -1177,20 +1126,14 @@ fn register_java_net_uri_access(registry: &mut NativeMethodRegistry) {
 
 // JavaNioAccess ---------------------------------------------------------------
 
-fn jnio_get_buffer_pool(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_get_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Return a synthetic BufferPool whose `getCount` / `getMemoryUsed`
     // natives are already registered in phases_late.
     let pool = alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean");
     Ok(Some(Value::Object(Some(pool))))
 }
 
-fn jnio_new_direct_byte_buffer(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jnio_new_direct_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // JavaNioAccess.newDirectByteBuffer(long addr, int cap[, Object att,
     // MemorySegment seg]) -> a DirectByteBuffer wrapping the native address.
     // args = [this(Buffer$1), addr, cap, ...]. JDK-25 has no `DirectByteBuffer(long,int)`
@@ -1211,10 +1154,7 @@ fn jnio_new_direct_byte_buffer(
     )
 }
 
-fn jnio_acquire_session(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_acquire_session(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Scoped memory sessions — return null so callers treat it
     // as "no session" and the regular strong-reference path runs.
     Ok(Some(Value::Object(None)))
@@ -1228,19 +1168,13 @@ fn jnio_acquire_session(
 /// direct buffer the heap-buffer path substitutes) calls them via
 /// `IOUtil.acquireScope`. CratonVM's direct/arena memory is never freed
 /// underneath an in-flight native, so pinning is unnecessary: no-op.
-fn jnio_session_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_session_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// JDK-25 `JavaNioAccess.hasSession(Buffer)` — whether the buffer is backed
 /// by a non-global memory session. CratonVM tracks none, so always false.
-fn jnio_has_session(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_has_session(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(0)))
 }
 
@@ -1249,10 +1183,7 @@ fn jnio_has_session(
 /// a direct buffer). Used by the heap→direct copy and the channel I/O path
 /// to locate the off-heap bytes. Read the field by name so it works under the
 /// real `java.nio.Buffer` layout.
-fn jnio_get_buffer_address(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jnio_get_buffer_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match args.get(1) {
         Some(Value::Object(Some(buf))) => match ctx.get_field_by_name(*buf, "address") {
             Value::Long(a) => a,
@@ -1268,10 +1199,7 @@ fn jnio_get_buffer_address(
 /// backing array (`hb`) of the buffer, or null for a direct buffer. Together
 /// with `getBufferAddress` this gives `ScopedMemoryAccess` the (base,offset)
 /// pair for a bulk copy.
-fn jnio_get_buffer_base(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jnio_get_buffer_base(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let base = match args.get(1) {
         Some(Value::Object(Some(buf))) => ctx.get_field_by_name(*buf, "hb"),
         _ => Value::Object(None),
@@ -1286,10 +1214,7 @@ fn jnio_get_buffer_base(
 /// JDK-25 `JavaNioAccess.isThreadConfined(Buffer)Z` — whether the buffer's
 /// session is confined to the current thread. CratonVM has no sessions, so
 /// the buffer is never confined.
-fn jnio_is_thread_confined(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_is_thread_confined(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(0)))
 }
 
@@ -1298,18 +1223,12 @@ fn jnio_is_thread_confined(
 /// real DirectByteBuffer accounting already runs in `direct_buffer.rs`
 /// (`try_reserve`/`release`); these SharedSecrets hooks are a no-op so the
 /// JDK's parallel `Bits` counters don't double-count or block.
-fn jnio_reserve_memory_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_reserve_memory_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// JDK-25 `JavaNioAccess.pageSize()I` — OS page size. 4 KiB on every target.
-fn jnio_page_size(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_page_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(4096)))
 }
 
@@ -1324,18 +1243,12 @@ fn jnio_page_size(
 /// `"direct"` for the name, zero counters for the rest. That's
 /// spec-compatible: the legacy interface only documents the value
 /// shape, not strict per-call accuracy of the counters.
-fn jnio_get_direct_buffer_pool(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jnio_get_direct_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let pool = alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4);
     Ok(Some(Value::Object(Some(pool))))
 }
 
-fn vm_buffer_pool_get_name(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn vm_buffer_pool_get_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Legacy `jdk.internal.misc.VM$BufferPool.getName()` — the only
     // direct-buffer pool surface this object covers, so always
     // "direct".  Real JDK uses the same constant.
@@ -1343,10 +1256,7 @@ fn vm_buffer_pool_get_name(
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn vm_buffer_pool_get_count(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn vm_buffer_pool_get_count(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // No live direct-buffer accounting — return zero so callers that
     // chart counts see "no pool activity" rather than NPEing.
     Ok(Some(Value::Long(0)))
@@ -1400,11 +1310,36 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // what `IOUtil.acquireScope`/`releaseScope` call on every channel I/O of a
     // (temp) direct buffer; without them every FileChannel/SocketChannel op
     // hits a linkage error after the interruptible-channel begin/end runs.
-    registry.register(owner, "acquireSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
-    registry.register(owner, "releaseSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
-    registry.register(owner, "hasSession", "(Ljava/nio/Buffer;)Z", jnio_has_session);
-    registry.register(owner, "isThreadConfined", "(Ljava/nio/Buffer;)Z", jnio_is_thread_confined);
-    registry.register(owner, "getBufferAddress", "(Ljava/nio/Buffer;)J", jnio_get_buffer_address);
+    registry.register(
+        owner,
+        "acquireSession",
+        "(Ljava/nio/Buffer;)V",
+        jnio_session_noop,
+    );
+    registry.register(
+        owner,
+        "releaseSession",
+        "(Ljava/nio/Buffer;)V",
+        jnio_session_noop,
+    );
+    registry.register(
+        owner,
+        "hasSession",
+        "(Ljava/nio/Buffer;)Z",
+        jnio_has_session,
+    );
+    registry.register(
+        owner,
+        "isThreadConfined",
+        "(Ljava/nio/Buffer;)Z",
+        jnio_is_thread_confined,
+    );
+    registry.register(
+        owner,
+        "getBufferAddress",
+        "(Ljava/nio/Buffer;)J",
+        jnio_get_buffer_address,
+    );
     registry.register(
         owner,
         "getBufferBase",
@@ -1456,10 +1391,7 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
 
 // JavaSecurityAccess ----------------------------------------------------------
 
-fn jsec_do_intersection_privilege(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jsec_do_intersection_privilege(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (PrivilegedAction action, AccessControlContext stack,
     //  AccessControlContext context) -> Object
     // Invokes action.run() ignoring the contexts (cratonvm has no
@@ -1479,10 +1411,7 @@ fn jsec_do_intersection_privilege(
     }
 }
 
-fn jsec_get_protect_domains(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jsec_get_protect_domains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Returns ProtectionDomain[] for a given AccessControlContext.
     // We synthesise a single-element array with the PD from
     // `Class.getProtectionDomain0` on the caller's class — which
@@ -1532,10 +1461,7 @@ fn jujar_jar_file_has_classpath_attribute(
     Ok(Some(Value::Int(0)))
 }
 
-fn jujar_ensure_initialization(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jujar_ensure_initialization(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
@@ -1557,10 +1483,7 @@ fn register_java_util_jar_access(registry: &mut NativeMethodRegistry) {
 
 // JavaUtilZipFileAccess -------------------------------------------------------
 
-fn juzf_get_entry(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn juzf_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (ZipFile zf, String name, Function<String,JarEntry> factory) -> ZipEntry
     // Delegate to ZipFile.getEntry(String).
     // INSTANCE method: args[0] = receiver (ZipFile$1), args[1] = zf,
@@ -1587,10 +1510,7 @@ fn juzf_entry_local_name_encoding(
     Ok(Some(Value::Int(1)))
 }
 
-fn juzf_get_manifest_name(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn juzf_get_manifest_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let s = ctx.create_string("META-INF/MANIFEST.MF");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -1619,10 +1539,7 @@ fn register_java_util_zip_file_access(registry: &mut NativeMethodRegistry) {
 
 // JavaNetHttpCookieAccess -----------------------------------------------------
 
-fn jnhc_parse_cookie(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jnhc_parse_cookie(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Thin passthrough to HttpCookie.parse(String).
     // INSTANCE method: args[0] = receiver (JavaNetHttpCookieAccess$1),
     // args[1] = the header String.
@@ -1651,10 +1568,7 @@ fn register_java_net_http_cookie_access(registry: &mut NativeMethodRegistry) {
 
 // JavaObjectInputStreamAccess -------------------------------------------------
 
-fn jois_check_array(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn jois_check_array(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // (ObjectInputStream ois, Class<?> arrayType, int length) -> void
     // No-op: cratonvm does not impose a `maxArrayLength` limit
     // separate from the normal heap allocator; the allocation
@@ -1674,10 +1588,7 @@ fn register_java_object_input_stream_access(registry: &mut NativeMethodRegistry)
 
 // JavaUtilResourceBundleAccess ------------------------------------------------
 
-fn jurb_set_parent(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jurb_set_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (ResourceBundle$1),
     // args[1] = bundle, args[2] = parent.
     if let (Some(Value::Object(Some(bundle))), Some(parent)) = (args.get(1), args.get(2)) {
@@ -1686,10 +1597,7 @@ fn jurb_set_parent(
     Ok(None)
 }
 
-fn jurb_get_parent(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jurb_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (ResourceBundle$1), args[1] = bundle.
     if let Some(Value::Object(Some(bundle))) = args.get(1) {
         Ok(Some(ctx.get_field_by_name(*bundle, "parent")))
@@ -1698,10 +1606,7 @@ fn jurb_get_parent(
     }
 }
 
-fn jurb_set_locale(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jurb_set_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (ResourceBundle$1),
     // args[1] = bundle, args[2] = locale.
     if let (Some(Value::Object(Some(bundle))), Some(locale)) = (args.get(1), args.get(2)) {
@@ -1805,12 +1710,8 @@ mod tests {
         for (method, ret, _) in FACTORIES {
             let desc = format!("(){}", ret);
             assert!(
-                r.find(
-                    "jdk/internal/access/SharedSecrets",
-                    method,
-                    &desc
-                )
-                .is_some(),
+                r.find("jdk/internal/access/SharedSecrets", method, &desc)
+                    .is_some(),
                 "factory {method} not registered (descriptor {desc})"
             );
             assert!(

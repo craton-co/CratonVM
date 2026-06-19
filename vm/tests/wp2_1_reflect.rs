@@ -48,7 +48,8 @@ fn can_access_registered_on_method_field_constructor() {
         "java/lang/reflect/Constructor",
     ] {
         assert!(
-            r.find(klass, "canAccess", "(Ljava/lang/Object;)Z").is_some(),
+            r.find(klass, "canAccess", "(Ljava/lang/Object;)Z")
+                .is_some(),
             "canAccess must be registered on {klass}"
         );
     }
@@ -59,7 +60,12 @@ fn class_get_enclosing_class_typed_register() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
-        r.find("java/lang/Class", "getEnclosingClass", "()Ljava/lang/Class;").is_some(),
+        r.find(
+            "java/lang/Class",
+            "getEnclosingClass",
+            "()Ljava/lang/Class;"
+        )
+        .is_some(),
         "Class.getEnclosingClass must be registered"
     );
 }
@@ -93,11 +99,13 @@ fn parameter_is_implicit_and_synthetic_register() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
-        r.find("java/lang/reflect/Parameter", "isImplicit", "()Z").is_some(),
+        r.find("java/lang/reflect/Parameter", "isImplicit", "()Z")
+            .is_some(),
         "Parameter.isImplicit must be registered"
     );
     assert!(
-        r.find("java/lang/reflect/Parameter", "isSynthetic", "()Z").is_some(),
+        r.find("java/lang/reflect/Parameter", "isSynthetic", "()Z")
+            .is_some(),
         "Parameter.isSynthetic must be registered"
     );
 }
@@ -151,7 +159,8 @@ fn record_component_natives_register() {
         "RecordComponent.getType must be registered"
     );
     assert!(
-        r.find(rc, "getDeclaringRecord", "()Ljava/lang/Class;").is_some(),
+        r.find(rc, "getDeclaringRecord", "()Ljava/lang/Class;")
+            .is_some(),
         "RecordComponent.getDeclaringRecord must be registered"
     );
 }
@@ -288,9 +297,6 @@ fn reflect_probe_class_files_exist_when_staged() {
         "ReflectProbe$Foo.class",
         "ReflectProbe$MyAnno.class",
     ] {
-        assert!(
-            probe.join(inner).exists(),
-            "{inner} must be staged"
-        );
+        assert!(probe.join(inner).exists(), "{inner} must be staged");
     }
 }

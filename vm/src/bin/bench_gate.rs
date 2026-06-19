@@ -185,7 +185,10 @@ fn walk_criterion(
             // The "new" estimates live under <root>/<bench>/.../new/estimates.json
             // We require the parent's parent's name to be "new" to filter out
             // baseline/change estimates.
-            if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+            if path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
                 != Some("new")
             {
                 continue;
@@ -249,11 +252,7 @@ impl std::error::Error for GateError {}
 
 /// Run the comparator. Returns a `GateReport` describing the outcome.
 /// Pure function — used by tests as well as the CLI.
-pub fn compare(
-    baseline: &Baseline,
-    run: &BTreeMap<String, f64>,
-    threshold: f64,
-) -> GateReport {
+pub fn compare(baseline: &Baseline, run: &BTreeMap<String, f64>, threshold: f64) -> GateReport {
     let mut entries = Vec::new();
     let mut deltas_for_geomean = Vec::new();
 
@@ -336,7 +335,11 @@ pub fn format_report(report: &GateReport) -> String {
     for e in &report.entries {
         s.push_str(&format!(
             "{:<40}  {:>14.0}  {:>14.0}  {:>+8.2}%  {}\n",
-            e.metric, e.baseline_ns, e.current_ns, e.delta_pct, e.status.label(),
+            e.metric,
+            e.baseline_ns,
+            e.current_ns,
+            e.delta_pct,
+            e.status.label(),
         ));
     }
     s.push_str(&format!("{}\n", "-".repeat(95)));
@@ -354,12 +357,10 @@ pub fn format_report(report: &GateReport) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn load_baseline(path: &Path) -> Result<Baseline, GateError> {
-    let raw = fs::read_to_string(path).map_err(|e| {
-        GateError::BaselineCorrupt(format!("cannot read {}: {e}", path.display()))
-    })?;
-    serde_json::from_str(&raw).map_err(|e| {
-        GateError::BaselineCorrupt(format!("invalid json in {}: {e}", path.display()))
-    })
+    let raw = fs::read_to_string(path)
+        .map_err(|e| GateError::BaselineCorrupt(format!("cannot read {}: {e}", path.display())))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| GateError::BaselineCorrupt(format!("invalid json in {}: {e}", path.display())))
 }
 
 pub fn save_baseline(path: &Path, baseline: &Baseline) -> Result<(), GateError> {
@@ -371,14 +372,10 @@ pub fn save_baseline(path: &Path, baseline: &Baseline) -> Result<(), GateError> 
     }
     let raw = serde_json::to_string_pretty(baseline)
         .map_err(|e| GateError::Io(format!("serializing baseline: {e}")))?;
-    fs::write(path, raw)
-        .map_err(|e| GateError::Io(format!("writing {}: {e}", path.display())))
+    fs::write(path, raw).map_err(|e| GateError::Io(format!("writing {}: {e}", path.display())))
 }
 
-pub fn baseline_from_run(
-    run: &BTreeMap<String, f64>,
-    host: String,
-) -> Baseline {
+pub fn baseline_from_run(run: &BTreeMap<String, f64>, host: String) -> Baseline {
     let metrics = run
         .iter()
         .map(|(k, v)| (k.clone(), MetricEntry { median_ns: *v }))
@@ -457,9 +454,9 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Result<CliArgs, GateErro
                 let v = iter
                     .next()
                     .ok_or_else(|| GateError::BadArgs("--threshold requires a number".into()))?;
-                let n: f64 = v.parse().map_err(|e| {
-                    GateError::BadArgs(format!("--threshold not a float: {e}"))
-                })?;
+                let n: f64 = v
+                    .parse()
+                    .map_err(|e| GateError::BadArgs(format!("--threshold not a float: {e}")))?;
                 if !(n >= 0.0 && n.is_finite()) {
                     return Err(GateError::BadArgs(
                         "--threshold must be >= 0 and finite".into(),
@@ -475,9 +472,9 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Result<CliArgs, GateErro
                 args.report = Some(PathBuf::from(v));
             }
             "--criterion-dir" => {
-                let v = iter.next().ok_or_else(|| {
-                    GateError::BadArgs("--criterion-dir requires a path".into())
-                })?;
+                let v = iter
+                    .next()
+                    .ok_or_else(|| GateError::BadArgs("--criterion-dir requires a path".into()))?;
                 args.criterion_dir = Some(PathBuf::from(v));
             }
             "-h" | "--help" => args.show_help = true,
@@ -555,18 +552,13 @@ fn run(args: CliArgs) -> Result<i32, GateError> {
     if let Some(rp) = args.report {
         let raw = serde_json::to_string_pretty(&report)
             .map_err(|e| GateError::Io(format!("serialize report: {e}")))?;
-        fs::write(&rp, raw)
-            .map_err(|e| GateError::Io(format!("writing {}: {e}", rp.display())))?;
+        fs::write(&rp, raw).map_err(|e| GateError::Io(format!("writing {}: {e}", rp.display())))?;
     }
     Ok(if report.passed { 0 } else { 1 })
 }
 
 fn host_label() -> String {
-    format!(
-        "{}-{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    )
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH,)
 }
 
 fn main() -> ExitCode {
@@ -798,9 +790,15 @@ mod tests {
     #[test]
     fn parse_args_understands_flags() {
         let args = parse_args(
-            ["--threshold", "0.10", "--update-baseline", "--baseline", "x.json"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "--threshold",
+                "0.10",
+                "--update-baseline",
+                "--baseline",
+                "x.json",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         )
         .unwrap();
         assert_eq!(args.threshold, Some(0.10));
@@ -810,8 +808,7 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_negative_threshold() {
-        let err = parse_args(["--threshold", "-0.1"].iter().map(|s| s.to_string()))
-            .unwrap_err();
+        let err = parse_args(["--threshold", "-0.1"].iter().map(|s| s.to_string())).unwrap_err();
         matches!(err, GateError::BadArgs(_));
     }
 

@@ -73,7 +73,19 @@ fn stub_helpers() -> JitRuntimeHelpers {
 
 /// Edge-value matrix exercised by every single-argument intrinsic.
 fn edge_values() -> Vec<i32> {
-    let mut v = vec![0i32, -1, 1, 2, 3, 7, 0x55, -0x55, i32::MIN, i32::MAX, 0x0F0F_0F0F_u32 as i32];
+    let mut v = vec![
+        0i32,
+        -1,
+        1,
+        2,
+        3,
+        7,
+        0x55,
+        -0x55,
+        i32::MIN,
+        i32::MAX,
+        0x0F0F_0F0F_u32 as i32,
+    ];
     for shift in 0..32 {
         v.push(1i32 << shift);
     }
@@ -106,7 +118,7 @@ fn compile_unary(entry: usize) -> impl Fn(i32) -> i32 {
                 needs_context: false,
                 num_params: 1,
                 return_type: b'I',
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
@@ -153,7 +165,7 @@ fn compile_binary(entry: usize) -> impl Fn(i32, i32) -> i32 {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'I',
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
@@ -170,7 +182,11 @@ fn compile_binary(entry: usize) -> impl Fn(i32, i32) -> i32 {
     .expect("JIT compilation of binary INT_BITS intrinsic failed");
     move |x: i32, y: i32| {
         // SAFETY: see `compile_unary`.
-        unsafe { compiled.try_call(&[x as i64, y as i64]).expect("test JIT call") as i32 }
+        unsafe {
+            compiled
+                .try_call(&[x as i64, y as i64])
+                .expect("test JIT call") as i32
+        }
     }
 }
 
@@ -301,7 +317,26 @@ fn int_compare_matches_reference() {
 /// width, > width (x86 masks CL & 0x1f for 32-bit), and negative (the JDK
 /// rotates by `distance mod 32`, which x86's CL masking reproduces).
 fn rotate_distances() -> Vec<i32> {
-    vec![0, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, -1, -7, -32, -33, i32::MIN, i32::MAX]
+    vec![
+        0,
+        1,
+        7,
+        8,
+        15,
+        16,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
+        -1,
+        -7,
+        -32,
+        -33,
+        i32::MIN,
+        i32::MAX,
+    ]
 }
 
 #[test]

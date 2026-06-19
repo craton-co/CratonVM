@@ -371,14 +371,13 @@ impl PlatformBackend for X11Backend {
         w: u32,
         h: u32,
     ) -> Result<(), PlatformError> {
-        let info = self.windows.get_mut(&id).ok_or(PlatformError::WindowNotFound)?;
+        let info = self
+            .windows
+            .get_mut(&id)
+            .ok_or(PlatformError::WindowNotFound)?;
         let _ = self.conn.configure_window(
             info.xid,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y)
-                .width(w)
-                .height(h),
+            &ConfigureWindowAux::new().x(x).y(y).width(w).height(h),
         );
         info.width = w;
         info.height = h;
@@ -415,12 +414,9 @@ impl PlatformBackend for X11Backend {
             height: info.height as u16,
             count: 0,
         };
-        let _ = self.conn.send_event(
-            false,
-            info.xid,
-            EventMask::EXPOSURE,
-            event,
-        );
+        let _ = self
+            .conn
+            .send_event(false, info.xid, EventMask::EXPOSURE, event);
         let _ = self.conn.flush();
         Ok(())
     }
@@ -442,14 +438,15 @@ impl PlatformBackend for X11Backend {
             .checked_mul(height as usize)
             .map_or(true, |n| n > pixels.len())
         {
-            return Err(PlatformError::CreationFailed("pixel buffer too small".into()));
+            return Err(PlatformError::CreationFailed(
+                "pixel buffer too small".into(),
+            ));
         }
 
         // X11 put_image expects the data as bytes. For 32-bit depth
         // we pass the pixel data directly.
-        let data: &[u8] = unsafe {
-            std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4)
-        };
+        let data: &[u8] =
+            unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4) };
 
         let _ = self.conn.put_image(
             ImageFormat::Z_PIXMAP,
@@ -534,7 +531,10 @@ impl PlatformBackend for X11Backend {
 
     fn screen_size(&self) -> (u32, u32) {
         let screen = self.screen();
-        (screen.width_in_pixels as u32, screen.height_in_pixels as u32)
+        (
+            screen.width_in_pixels as u32,
+            screen.height_in_pixels as u32,
+        )
     }
 
     fn screen_dpi(&self) -> f64 {
@@ -734,12 +734,7 @@ impl PlatformBackend for X11Backend {
         None
     }
 
-    fn show_message_dialog(
-        &mut self,
-        title: &str,
-        message: &str,
-        _msg_type: MessageDialogType,
-    ) {
+    fn show_message_dialog(&mut self, title: &str, message: &str, _msg_type: MessageDialogType) {
         // Without GTK we can't show a real dialog. Log it.
         warn!("X11 message dialog [{title}]: {message}");
     }
@@ -800,10 +795,9 @@ fn load_fontdue_font(_settings: &FontdueSettings) -> Option<fontdue::Font> {
 
             for path in FONT_SEARCH_PATHS {
                 if let Ok(data) = std::fs::read(path) {
-                    if let Ok(font) = fontdue::Font::from_bytes(
-                        data,
-                        fontdue::FontSettings::default(),
-                    ) {
+                    if let Ok(font) =
+                        fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+                    {
                         return Some(font);
                     }
                 }

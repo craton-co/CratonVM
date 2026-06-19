@@ -27,9 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use cratonvm_classloading::{
-    ClassLoaderId, ClassManager, DefineClassOptions, RedefineOptions,
-};
+use cratonvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions, RedefineOptions};
 use tempfile::tempdir;
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
@@ -216,11 +214,8 @@ fn make_malformed_fat_jar(dir: &Path) -> PathBuf {
 
     // Zip-slip entry — must be rejected by `is_safe_entry_name` so it
     // does NOT poison the `entries_cache` namespace.
-    zip.start_file(
-        "BOOT-INF/classes/../../../etc/passwd.class",
-        opts,
-    )
-    .unwrap();
+    zip.start_file("BOOT-INF/classes/../../../etc/passwd.class", opts)
+        .unwrap();
     zip.write_all(b"\xCA\xFE\xBA\xBE_evil_zip_slip").unwrap();
 
     // Truncated-magic .class entry — bytes are too short to parse as a
@@ -240,9 +235,7 @@ fn malformed_jar_zip_slip_entry_does_not_poison_cache() {
     let dir = tempdir().expect("tempdir");
     let jar_path = make_malformed_fat_jar(dir.path());
 
-    let cp = cratonvm_classloading::ClassPath::new(&[jar_path
-        .to_string_lossy()
-        .into_owned()]);
+    let cp = cratonvm_classloading::ClassPath::new(&[jar_path.to_string_lossy().into_owned()]);
 
     // The safe entry under BOOT-INF/classes/ must still be findable —
     // rejecting the zip-slip entry must NOT corrupt the surrounding
@@ -268,11 +261,7 @@ fn malformed_jar_zip_slip_entry_does_not_poison_cache() {
     // (it doesn't second-guess attacker-supplied entry names — that's
     // the caller's job), but the load path `find_class` validates every
     // input and any path traversal is rejected up-front.
-    let relative_keys = [
-        "../../etc/passwd",
-        "../../../etc/passwd",
-        "etc/passwd",
-    ];
+    let relative_keys = ["../../etc/passwd", "../../../etc/passwd", "etc/passwd"];
     for k in &relative_keys {
         assert!(
             cp.find_class(k).is_err(),
@@ -379,9 +368,7 @@ fn malformed_jar_zip_bomb_declared_size_is_capped() {
     zip.write_all(&payload).unwrap();
     zip.finish().unwrap();
 
-    let cp = cratonvm_classloading::ClassPath::new(&[jar_path
-        .to_string_lossy()
-        .into_owned()]);
+    let cp = cratonvm_classloading::ClassPath::new(&[jar_path.to_string_lossy().into_owned()]);
     let got = cp
         .find_class("com/example/Big")
         .expect("1 MiB legit payload must round-trip");
@@ -427,23 +414,13 @@ fn two_loaders_same_name_yield_distinct_class_ids() {
 
     // Define Foo (v1 bytes) under loader A.
     let id_a = cm
-        .define_class_with_options(
-            "Foo",
-            &v1,
-            loader_a,
-            DefineClassOptions::default(),
-        )
+        .define_class_with_options("Foo", &v1, loader_a, DefineClassOptions::default())
         .expect("Foo under loader A must define ok");
 
     // Define Foo (v2 bytes) under loader B. Same binary name, distinct
     // loader id → must succeed (loader namespaces are independent).
     let id_b = cm
-        .define_class_with_options(
-            "Foo",
-            &v2,
-            loader_b,
-            DefineClassOptions::default(),
-        )
+        .define_class_with_options("Foo", &v2, loader_b, DefineClassOptions::default())
         .expect("Foo under loader B must define ok despite same name in loader A");
 
     assert_ne!(
@@ -492,7 +469,10 @@ fn two_loaders_same_name_yield_distinct_class_ids() {
     // and that registration must be one of `id_a` or `id_b` — never
     // a freshly-minted third id.
     let any = cm.get_loaded_class_id("Foo");
-    assert!(any.is_some(), "Foo must be findable through user-loaders fallback");
+    assert!(
+        any.is_some(),
+        "Foo must be findable through user-loaders fallback"
+    );
     let resolved_any = any.unwrap();
     assert!(
         resolved_any == id_a || resolved_any == id_b,
@@ -518,12 +498,7 @@ fn loader_lookup_unknown_loader_returns_none() {
     let loader_c = ClassLoaderId::UserDefined(303);
 
     let id_a = cm
-        .define_class_with_options(
-            "Foo",
-            &v1,
-            loader_a,
-            DefineClassOptions::default(),
-        )
+        .define_class_with_options("Foo", &v1, loader_a, DefineClassOptions::default())
         .expect("define Foo under A");
 
     // Look up under loader_c — since `Foo` is NOT defined there, the
@@ -715,4 +690,3 @@ fn redefine_verify_failure_rolls_back_method_bodies_and_generation() {
         );
     }
 }
-

@@ -241,8 +241,14 @@ mod tests {
 
     #[test]
     fn ctor_access_classify() {
-        assert_eq!(ConstructorAccess::from_modifiers(0x0001), ConstructorAccess::Public);
-        assert_eq!(ConstructorAccess::from_modifiers(0x0002), ConstructorAccess::Private);
+        assert_eq!(
+            ConstructorAccess::from_modifiers(0x0001),
+            ConstructorAccess::Public
+        );
+        assert_eq!(
+            ConstructorAccess::from_modifiers(0x0002),
+            ConstructorAccess::Private
+        );
         assert_eq!(
             ConstructorAccess::from_modifiers(0x0004),
             ConstructorAccess::Protected
@@ -277,15 +283,9 @@ mod tests {
             "com/example/Outer"
         ));
         // Primitive first parameter — not an inner-class ctor.
-        assert!(!is_inner_class_ctor_descriptor(
-            "(I)V",
-            "com/example/Outer"
-        ));
+        assert!(!is_inner_class_ctor_descriptor("(I)V", "com/example/Outer"));
         // Empty descriptor — not an inner-class ctor.
-        assert!(!is_inner_class_ctor_descriptor(
-            "()V",
-            "com/example/Outer"
-        ));
+        assert!(!is_inner_class_ctor_descriptor("()V", "com/example/Outer"));
     }
 
     #[test]

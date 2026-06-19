@@ -403,8 +403,8 @@ fn parse_signed_data(
     let sid_raw = si.read_seq_raw()?;
     let digest_alg_seq = si.read_seq_raw()?;
     let digest_alg_oid = first_oid_of_seq(&digest_alg_seq)?;
-    let digest_alg = digest_alg_from_oid(&digest_alg_oid)
-        .ok_or("unsupported digest algorithm in SignerInfo")?;
+    let digest_alg =
+        digest_alg_from_oid(&digest_alg_oid).ok_or("unsupported digest algorithm in SignerInfo")?;
 
     // Authenticated attributes [0] IMPLICIT SET OF Attribute.
     //
@@ -419,8 +419,9 @@ fn parse_signed_data(
     } else {
         None
     };
-    let auth_attrs = auth_attrs
-        .ok_or("SignerInfo is missing authenticatedAttributes — refusing to skip integrity check")?;
+    let auth_attrs = auth_attrs.ok_or(
+        "SignerInfo is missing authenticatedAttributes — refusing to skip integrity check",
+    )?;
     // DER re-encoding of SignedAttributes as an explicit SET OF Attribute.
     let signed_attrs_der = encode_tlv(TAG_SET, &auth_attrs);
 
@@ -512,7 +513,9 @@ fn parse_signed_data(
                 // verified; this only fires for a curve/digest/key combo
                 // outside that set (P-521, Brainpool, explicit
                 // ECParameters, an unusual DSA digest, ...).  Fail-closed.
-                return Err("SignerInfo signature algorithm not verifiable (unsupported curve/key)");
+                return Err(
+                    "SignerInfo signature algorithm not verifiable (unsupported curve/key)",
+                );
             }
         }
     }
@@ -741,9 +744,7 @@ fn read_tlv(buf: &[u8]) -> Result<(Tlv<'_>, usize), &'static str> {
         (len, 1 + n)
     };
     let hdr = 1 + hdr_extra;
-    let total = hdr
-        .checked_add(content_len)
-        .ok_or("TLV length overflow")?;
+    let total = hdr.checked_add(content_len).ok_or("TLV length overflow")?;
     if total > MAX_SIGNER_BLOCK {
         return Err("TLV exceeds MAX_SIGNER_BLOCK");
     }
@@ -881,9 +882,7 @@ fn decode_oid(content: &[u8]) -> Result<String, &'static str> {
 
 mod sha1 {
     pub fn digest(data: &[u8]) -> [u8; 20] {
-        let mut h: [u32; 5] = [
-            0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
-        ];
+        let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
         let mut msg = data.to_vec();
         let bit_len = (data.len() as u64).wrapping_mul(8);
         msg.push(0x80);
@@ -979,8 +978,7 @@ mod sha256 {
                 ]);
             }
             for i in 16..64 {
-                let s0 =
-                    w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
                 let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
                 w[i] = w[i - 16]
                     .wrapping_add(s0)
@@ -1365,9 +1363,7 @@ fn parse_spki(spki_der: &[u8]) -> Result<PublicKey, &'static str> {
         // parameter OID inside the AlgorithmIdentifier.
         "1.2.840.10045.2.1" => match ec_named_curve_oid(&alg_seq) {
             // prime256v1 / secp256r1 (NIST P-256)
-            Some(ref o) if o == "1.2.840.10045.3.1.7" => {
-                Ok(PublicKey::EcP256(spki_der.to_vec()))
-            }
+            Some(ref o) if o == "1.2.840.10045.3.1.7" => Ok(PublicKey::EcP256(spki_der.to_vec())),
             // secp384r1 (NIST P-384)
             Some(ref o) if o == "1.3.132.0.34" => Ok(PublicKey::EcP384(spki_der.to_vec())),
             // Any other / absent curve — unsupported, fail-closed.
@@ -1573,9 +1569,7 @@ fn verify_signature_with_spki(
         (PublicKey::EcP384(spki), SigFamily::Ecdsa) => {
             ecdsa_p384_verify(&spki, digest_alg, message, sig)
         }
-        (PublicKey::Dsa(spki), SigFamily::Dsa) => {
-            dsa_verify(&spki, digest_alg, message, sig)
-        }
+        (PublicKey::Dsa(spki), SigFamily::Dsa) => dsa_verify(&spki, digest_alg, message, sig),
         // Recognised algorithm but a key type / curve we do not handle
         // (P-521, Brainpool, key/alg mismatch, ...).  Fail-closed.
         _ => SigVerify::Unsupported,
@@ -1951,8 +1945,9 @@ impl TrustStore {
         // cycle); the host VM, which already links it, calls
         // `extend_from_anchors` directly with the decoded DER blobs.  We
         // record that the seam exists.
-        ts.sources_loaded
-            .push("system-root-store: extend_from_anchors() seam (host VM supplies DER)".to_string());
+        ts.sources_loaded.push(
+            "system-root-store: extend_from_anchors() seam (host VM supplies DER)".to_string(),
+        );
 
         // 4. JDK `cacerts` fallback (JKS, password "changeit").  Now
         // parsed natively by the in-module JKS walker — every
@@ -2229,7 +2224,9 @@ fn parse_pkcs12_certs(bytes: &[u8], password: &str) -> Result<Vec<Vec<u8>>, &'st
     if !pfx.verify_mac(password) {
         return Err("PKCS#12: MAC verification failed (wrong password or tampered store)");
     }
-    let bags = pfx.bags(password).map_err(|_| "PKCS#12: bag decode failed")?;
+    let bags = pfx
+        .bags(password)
+        .map_err(|_| "PKCS#12: bag decode failed")?;
     let mut out = Vec::new();
     for bag in &bags {
         if let p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) = &bag.bag {
@@ -2540,10 +2537,7 @@ fn now_utc_14() -> [u8; 14] {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     let mut out = [0u8; 14];
-    let s = format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}",
-        year, m, d, hh, mm, ss
-    );
+    let s = format!("{:04}{:02}{:02}{:02}{:02}{:02}", year, m, d, hh, mm, ss);
     let b = s.as_bytes();
     out[..b.len().min(14)].copy_from_slice(&b[..b.len().min(14)]);
     out
@@ -2658,7 +2652,10 @@ fn extract_ext_facts(cert_der: &[u8]) -> Result<CertExtFacts, TrustError> {
                 | OID_EXT_AUTHORITY_INFO_ACCESS
         );
         if !recognised {
-            warn!("jar signer: cert carries unprocessed critical extension {}", oid);
+            warn!(
+                "jar signer: cert carries unprocessed critical extension {}",
+                oid
+            );
             return Err(TrustError::UnknownCriticalExtension);
         }
     }
@@ -3053,7 +3050,10 @@ pub fn verify_sf_binds_manifest(sf_bytes: &[u8], manifest_bytes: &[u8]) -> bool 
         let Some(expected) = base64_decode(value.trim()) else {
             continue;
         };
-        if best.as_ref().map_or(true, |(b, _)| digest_strength(alg) > digest_strength(*b)) {
+        if best
+            .as_ref()
+            .map_or(true, |(b, _)| digest_strength(alg) > digest_strength(*b))
+        {
             best = Some((alg, expected));
         }
     }
@@ -3273,7 +3273,11 @@ mod tests {
     fn issuer_and_serial(cn: &str, serial: u64) -> Vec<u8> {
         // Name ::= SEQUENCE OF RDN; each RDN is SET OF ATV.
         // ATV ::= SEQUENCE { type OID, value ANY (we use PrintableString=0x13) }
-        let atv = seq(&[oid("2.5.4.3").as_slice(), tlv(0x13, cn.as_bytes()).as_slice()].concat());
+        let atv = seq(&[
+            oid("2.5.4.3").as_slice(),
+            tlv(0x13, cn.as_bytes()).as_slice(),
+        ]
+        .concat());
         let rdn = set(&atv);
         let name = seq(&rdn);
         let iasn_inner = [name.as_slice(), integer(serial).as_slice()].concat();
@@ -3291,10 +3295,11 @@ mod tests {
             _ => vec![0; 32],
         };
         let stored = if tamper_digest {
-            vec![0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-                 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
-                 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-                 0xBE, 0xEF]
+            vec![
+                0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
+                0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+                0xDE, 0xAD, 0xBE, 0xEF,
+            ]
         } else {
             dig
         };
@@ -3315,7 +3320,8 @@ mod tests {
             set(&octet(&stored)).as_slice(),
         ]
         .concat());
-        let attrs_set_content = [attr_content_type.as_slice(), attr_message_digest.as_slice()].concat();
+        let attrs_set_content =
+            [attr_content_type.as_slice(), attr_message_digest.as_slice()].concat();
         let auth_attrs = ctx_imp(0, &attrs_set_content);
 
         // SignerInfo
@@ -3350,14 +3356,19 @@ mod tests {
         .concat());
 
         // Outer ContentInfo
-        seq(&[oid(OID_SIGNED_DATA).as_slice(), ctx_imp(0, &signed_data).as_slice()].concat())
+        seq(&[
+            oid(OID_SIGNED_DATA).as_slice(),
+            ctx_imp(0, &signed_data).as_slice(),
+        ]
+        .concat())
     }
 
     #[test]
     fn verifies_self_consistent_sha256_signer_block() {
         let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: abc123=\r\n\r\n";
         let block = build_signer_block(sf, DigestAlg::Sha256, /*tamper=*/ false);
-        let vs = verify_signer_block(&block, sf, &legacy_ts()).expect("well-formed block should verify");
+        let vs =
+            verify_signer_block(&block, sf, &legacy_ts()).expect("well-formed block should verify");
         assert_eq!(vs.digest_alg, DigestAlg::Sha256);
         assert_eq!(vs.chain.len(), 1);
         // Cert bytes must be the *embedded* cert DER, not the outer block.
@@ -3526,7 +3537,11 @@ mod tests {
 
     /// Build a `Name ::= SEQUENCE { RDN }` with a single CN attribute.
     fn x509_name(cn: &str) -> Vec<u8> {
-        let atv = seq(&[oid("2.5.4.3").as_slice(), tlv(0x13, cn.as_bytes()).as_slice()].concat());
+        let atv = seq(&[
+            oid("2.5.4.3").as_slice(),
+            tlv(0x13, cn.as_bytes()).as_slice(),
+        ]
+        .concat());
         let rdn = set(&atv);
         seq(&rdn)
     }
@@ -3700,8 +3715,7 @@ mod tests {
         let (tbs, _) = build_tbs("RealLeaf", "RealRoot");
         let sig_alg = algorithm_identifier("1.2.840.113549.1.1.11");
         let bit_string = tlv(0x03, &[0u8, 0xDE, 0xAD]); // bogus sig bytes
-        let leaf_der =
-            seq(&[tbs.as_slice(), sig_alg.as_slice(), bit_string.as_slice()].concat());
+        let leaf_der = seq(&[tbs.as_slice(), sig_alg.as_slice(), bit_string.as_slice()].concat());
 
         let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
         let mut ts = TrustStore::empty();
@@ -3801,29 +3815,25 @@ mod tests {
     // DigestInfo prefix + 11-byte minimum padding needs k >= 94), so the
     // round-trip test for those digests requires a larger modulus.
     const RSA1024_N: &[u8] = &[
-        0xe5, 0x2f, 0x42, 0xb1, 0xda, 0x1c, 0x87, 0xb6, 0xcf, 0x39, 0x39, 0xd8,
-        0x78, 0xc2, 0x3b, 0x59, 0x53, 0x5b, 0x0f, 0x3a, 0xd8, 0x47, 0xb2, 0x07,
-        0xd7, 0xb2, 0xdc, 0x49, 0x97, 0xbc, 0x32, 0xbe, 0x5e, 0x6f, 0xfa, 0xd7,
-        0xbd, 0xf0, 0x83, 0xb1, 0xfe, 0xe0, 0xc6, 0xaf, 0x69, 0x84, 0xec, 0x36,
-        0x90, 0xb6, 0x9f, 0xc3, 0x0a, 0xd8, 0x8b, 0x53, 0x15, 0x4b, 0x1c, 0xaa,
-        0xd7, 0x02, 0xf6, 0x0c, 0x94, 0x6f, 0xc8, 0x65, 0xec, 0x8c, 0xf6, 0xb0,
-        0x6f, 0x03, 0x53, 0xcc, 0x69, 0x28, 0x41, 0x47, 0x6e, 0x9d, 0x3b, 0x85,
-        0x3e, 0xd7, 0xed, 0xd5, 0xf7, 0x23, 0xa8, 0x4b, 0xbc, 0xa7, 0x2d, 0xaa,
-        0xa3, 0x6b, 0xac, 0xfa, 0xe6, 0x69, 0xbd, 0x13, 0x1c, 0xcc, 0x3b, 0x08,
-        0x27, 0x3c, 0x71, 0x2c, 0x83, 0xf0, 0x07, 0x94, 0xfc, 0x0d, 0x15, 0x01,
+        0xe5, 0x2f, 0x42, 0xb1, 0xda, 0x1c, 0x87, 0xb6, 0xcf, 0x39, 0x39, 0xd8, 0x78, 0xc2, 0x3b,
+        0x59, 0x53, 0x5b, 0x0f, 0x3a, 0xd8, 0x47, 0xb2, 0x07, 0xd7, 0xb2, 0xdc, 0x49, 0x97, 0xbc,
+        0x32, 0xbe, 0x5e, 0x6f, 0xfa, 0xd7, 0xbd, 0xf0, 0x83, 0xb1, 0xfe, 0xe0, 0xc6, 0xaf, 0x69,
+        0x84, 0xec, 0x36, 0x90, 0xb6, 0x9f, 0xc3, 0x0a, 0xd8, 0x8b, 0x53, 0x15, 0x4b, 0x1c, 0xaa,
+        0xd7, 0x02, 0xf6, 0x0c, 0x94, 0x6f, 0xc8, 0x65, 0xec, 0x8c, 0xf6, 0xb0, 0x6f, 0x03, 0x53,
+        0xcc, 0x69, 0x28, 0x41, 0x47, 0x6e, 0x9d, 0x3b, 0x85, 0x3e, 0xd7, 0xed, 0xd5, 0xf7, 0x23,
+        0xa8, 0x4b, 0xbc, 0xa7, 0x2d, 0xaa, 0xa3, 0x6b, 0xac, 0xfa, 0xe6, 0x69, 0xbd, 0x13, 0x1c,
+        0xcc, 0x3b, 0x08, 0x27, 0x3c, 0x71, 0x2c, 0x83, 0xf0, 0x07, 0x94, 0xfc, 0x0d, 0x15, 0x01,
         0x5a, 0x98, 0x65, 0x34, 0x46, 0x16, 0x20, 0x45,
     ];
     const RSA1024_D: &[u8] = &[
-        0x9d, 0xa6, 0x41, 0xd1, 0x87, 0x80, 0x62, 0x96, 0x8c, 0xbb, 0x07, 0xa0,
-        0x71, 0x88, 0xe2, 0x3c, 0x52, 0xcb, 0x6b, 0x91, 0x85, 0xde, 0xe3, 0x86,
-        0xe3, 0x88, 0x24, 0x61, 0xf7, 0x1f, 0x3d, 0x24, 0x98, 0x5f, 0x9d, 0x04,
-        0x34, 0xa2, 0xb2, 0x64, 0x89, 0x37, 0xe3, 0x54, 0x1c, 0x58, 0x94, 0x08,
-        0x00, 0xc9, 0xae, 0xe2, 0x02, 0x9e, 0xec, 0x4f, 0xcd, 0x70, 0xea, 0x9a,
-        0x55, 0xe6, 0xb2, 0x8a, 0xad, 0x7c, 0x0f, 0xd5, 0x27, 0x70, 0x73, 0x72,
-        0x31, 0x1b, 0x75, 0xc6, 0x21, 0x0e, 0x8b, 0x9d, 0x88, 0x99, 0x1a, 0xe6,
-        0xcd, 0xc0, 0x8c, 0x71, 0x63, 0xa4, 0xa6, 0x6a, 0x0c, 0x95, 0x85, 0xc0,
-        0x35, 0xda, 0x5f, 0xc5, 0xc7, 0x65, 0x24, 0x42, 0xb7, 0xf3, 0x1e, 0xb6,
-        0xbe, 0x95, 0x03, 0x00, 0xea, 0x09, 0x0a, 0xc3, 0xd8, 0x52, 0xa0, 0x9f,
+        0x9d, 0xa6, 0x41, 0xd1, 0x87, 0x80, 0x62, 0x96, 0x8c, 0xbb, 0x07, 0xa0, 0x71, 0x88, 0xe2,
+        0x3c, 0x52, 0xcb, 0x6b, 0x91, 0x85, 0xde, 0xe3, 0x86, 0xe3, 0x88, 0x24, 0x61, 0xf7, 0x1f,
+        0x3d, 0x24, 0x98, 0x5f, 0x9d, 0x04, 0x34, 0xa2, 0xb2, 0x64, 0x89, 0x37, 0xe3, 0x54, 0x1c,
+        0x58, 0x94, 0x08, 0x00, 0xc9, 0xae, 0xe2, 0x02, 0x9e, 0xec, 0x4f, 0xcd, 0x70, 0xea, 0x9a,
+        0x55, 0xe6, 0xb2, 0x8a, 0xad, 0x7c, 0x0f, 0xd5, 0x27, 0x70, 0x73, 0x72, 0x31, 0x1b, 0x75,
+        0xc6, 0x21, 0x0e, 0x8b, 0x9d, 0x88, 0x99, 0x1a, 0xe6, 0xcd, 0xc0, 0x8c, 0x71, 0x63, 0xa4,
+        0xa6, 0x6a, 0x0c, 0x95, 0x85, 0xc0, 0x35, 0xda, 0x5f, 0xc5, 0xc7, 0x65, 0x24, 0x42, 0xb7,
+        0xf3, 0x1e, 0xb6, 0xbe, 0x95, 0x03, 0x00, 0xea, 0x09, 0x0a, 0xc3, 0xd8, 0x52, 0xa0, 0x9f,
         0x0d, 0x12, 0xb9, 0xbf, 0x3f, 0xf1, 0x72, 0xad,
     ];
 
@@ -3878,8 +3888,10 @@ mod tests {
         match super::parse_spki(&spki).expect("parse rsa spki") {
             super::PublicKey::Rsa(k) => {
                 assert_eq!(k.k, 64, "512-bit modulus => k = 64 bytes");
-                assert_eq!(k.e.cmp(&super::BigUint::from_bytes_be(&[1, 0, 1])),
-                           std::cmp::Ordering::Equal);
+                assert_eq!(
+                    k.e.cmp(&super::BigUint::from_bytes_be(&[1, 0, 1])),
+                    std::cmp::Ordering::Equal
+                );
             }
             _ => panic!("expected RSA key"),
         }
@@ -3912,7 +3924,12 @@ mod tests {
         use super::{DigestAlg, SigVerify};
         // Use the 1024-bit key so even SHA-512's EMSA block fits the modulus.
         let spki = rsa_spki(RSA1024_N, 65537);
-        for alg in [DigestAlg::Sha1, DigestAlg::Sha256, DigestAlg::Sha384, DigestAlg::Sha512] {
+        for alg in [
+            DigestAlg::Sha1,
+            DigestAlg::Sha256,
+            DigestAlg::Sha384,
+            DigestAlg::Sha512,
+        ] {
             let msg = b"the quick brown fox";
             let sig = rsa_sign(msg, alg, RSA1024_N, RSA1024_D);
             assert_eq!(
@@ -4015,8 +4032,16 @@ mod tests {
         // --- SignerInfo / SignedData over a `.SF`.
         let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: zzz=\r\n\r\n";
         let dig = sha256::digest(sf).to_vec();
-        let attr_ct = seq(&[oid(OID_CONTENT_TYPE).as_slice(), set(&oid(OID_DATA)).as_slice()].concat());
-        let attr_md = seq(&[oid(OID_MESSAGE_DIGEST).as_slice(), set(&octet(&dig)).as_slice()].concat());
+        let attr_ct = seq(&[
+            oid(OID_CONTENT_TYPE).as_slice(),
+            set(&oid(OID_DATA)).as_slice(),
+        ]
+        .concat());
+        let attr_md = seq(&[
+            oid(OID_MESSAGE_DIGEST).as_slice(),
+            set(&octet(&dig)).as_slice(),
+        ]
+        .concat());
         let attrs_inner = [attr_ct.as_slice(), attr_md.as_slice()].concat();
         // SignedAttributes signed form = explicit SET.
         let signed_attrs_der = set(&attrs_inner);
@@ -4047,7 +4072,11 @@ mod tests {
             set(&signer_info).as_slice(),
         ]
         .concat());
-        let block = seq(&[oid(OID_SIGNED_DATA).as_slice(), ctx_imp(0, &signed_data).as_slice()].concat());
+        let block = seq(&[
+            oid(OID_SIGNED_DATA).as_slice(),
+            ctx_imp(0, &signed_data).as_slice(),
+        ]
+        .concat());
 
         // Trust store with the root anchor.
         let mut ts = TrustStore::empty();
@@ -4104,14 +4133,17 @@ mod tests {
         // `pkcs8` (which we enable); the ecdsa `VerifyingKey` wrapper's
         // own impl is gated on `pem` (which we don't), so convert.
         let pk = p256::PublicKey::from(vk);
-        let spki = pk.to_public_key_der().expect("spki encode").as_bytes().to_vec();
+        let spki = pk
+            .to_public_key_der()
+            .expect("spki encode")
+            .as_bytes()
+            .to_vec();
 
         let msg = b"jarsigner-signed-attributes-bytes";
         // ECDSA-with-SHA256: sign the SHA-256 prehash; emit DER (r,s).
         let prehash = super::raw_digest(DigestAlg::Sha256, msg);
-        let der_sig: ecdsa::der::Signature<p256::NistP256> = sk
-            .sign_prehash(&prehash)
-            .expect("p256 sign");
+        let der_sig: ecdsa::der::Signature<p256::NistP256> =
+            sk.sign_prehash(&prehash).expect("p256 sign");
         let sig_der = der_sig.as_bytes().to_vec();
 
         assert_eq!(
@@ -4141,13 +4173,16 @@ mod tests {
         let sk = SigningKey::from_slice(&[0x22u8; 48]).expect("p384 signing key");
         let vk = sk.verifying_key();
         let pk = p384::PublicKey::from(vk);
-        let spki = pk.to_public_key_der().expect("spki encode").as_bytes().to_vec();
+        let spki = pk
+            .to_public_key_der()
+            .expect("spki encode")
+            .as_bytes()
+            .to_vec();
 
         let msg = b"another signed-attrs blob";
         let prehash = super::raw_digest(DigestAlg::Sha384, msg);
-        let der_sig: ecdsa::der::Signature<p384::NistP384> = sk
-            .sign_prehash(&prehash)
-            .expect("p384 sign");
+        let der_sig: ecdsa::der::Signature<p384::NistP384> =
+            sk.sign_prehash(&prehash).expect("p384 sign");
         let sig_der = der_sig.as_bytes().to_vec();
 
         assert_eq!(
@@ -4207,7 +4242,11 @@ mod tests {
         let vk = VerifyingKey::from_components(components, y).expect("dsa verifying key");
         let sk = SigningKey::from_components(vk.clone(), x).expect("dsa signing key");
 
-        let spki = vk.to_public_key_der().expect("dsa spki").as_bytes().to_vec();
+        let spki = vk
+            .to_public_key_der()
+            .expect("dsa spki")
+            .as_bytes()
+            .to_vec();
         assert!(matches!(
             super::parse_spki(&spki).unwrap(),
             super::PublicKey::Dsa(_)
@@ -4502,7 +4541,10 @@ mod tests {
             .concat())
         };
         let cert = X509Cert::parse(&der).expect("parse expired cert");
-        assert!(!super::cert_dates_ok(&cert), "year-2001 notAfter must be expired");
+        assert!(
+            !super::cert_dates_ok(&cert),
+            "year-2001 notAfter must be expired"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4539,9 +4581,7 @@ mod tests {
     fn sf_binds_manifest_accepts_matching_digest() {
         let manifest = b"Manifest-Version: 1.0\r\n\r\nName: a/B.class\r\nSHA-256-Digest: xyz\r\n";
         let mdigest = b64enc(&raw_digest(DigestAlg::Sha256, manifest));
-        let sf = format!(
-            "Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: {mdigest}\r\n\r\n"
-        );
+        let sf = format!("Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: {mdigest}\r\n\r\n");
         assert!(verify_sf_binds_manifest(sf.as_bytes(), manifest));
     }
 
@@ -4579,7 +4619,11 @@ mod tests {
         assert_eq!(parsed[0].alg, DigestAlg::Sha256);
         assert!(digest_matches(parsed[0].alg, body, &parsed[0].expected));
         // A different body must NOT match the recorded digest.
-        assert!(!digest_matches(parsed[0].alg, b"tampered", &parsed[0].expected));
+        assert!(!digest_matches(
+            parsed[0].alg,
+            b"tampered",
+            &parsed[0].expected
+        ));
     }
 
     #[test]

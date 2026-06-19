@@ -30,7 +30,11 @@ use std::time::Duration;
 
 fn probe_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().join("apps").join("string_decode_probe")
+    manifest
+        .parent()
+        .unwrap()
+        .join("apps")
+        .join("string_decode_probe")
 }
 
 fn cratonvm_binary() -> Option<PathBuf> {
@@ -42,7 +46,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -91,8 +99,10 @@ fn run_probe(name: &str) -> Option<(String, String, std::process::ExitStatus)> {
     let jdk = jdk_home()?;
     let classes = probe_dir();
     let mut child = Command::new(&bin)
-        .arg("--java-home").arg(&jdk)
-        .arg("-c").arg(&classes)
+        .arg("--java-home")
+        .arg(&jdk)
+        .arg("-c")
+        .arg(&classes)
         .arg(name)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -126,18 +136,29 @@ fn deep_list_tostring_concat_and_valueof() {
         Some(t) => t,
         None => return,
     };
-    assert!(stdout.contains("t=[a, b, c]"),
-        "direct toString() concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("t=[a, b, c]"),
+        "direct toString() concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("xs=[a, b, c]"),
         "SCF concat with object regressed (the S107/Wave 2 garble).\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.lines().any(|l| l.trim_end() == "[a, b, c]"),
-        "println(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("v=[a, b, c]"),
-        "String.valueOf(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("OK"),
-        "DeepListProbe did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(status.success(),
-        "DeepListProbe exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", status);
+    assert!(
+        stdout.lines().any(|l| l.trim_end() == "[a, b, c]"),
+        "println(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("v=[a, b, c]"),
+        "String.valueOf(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("OK"),
+        "DeepListProbe did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "DeepListProbe exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status
+    );
 }
 
 #[test]
@@ -146,18 +167,31 @@ fn int_list_tostring_concat_and_valueof() {
         Some(t) => t,
         None => return,
     };
-    assert!(stdout.contains("t=[1, 2, 3]"),
-        "direct toString() concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("xs=[1, 2, 3]"),
-        "SCF concat with object regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.lines().any(|l| l.trim_end() == "[1, 2, 3]"),
-        "println(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("v=[1, 2, 3]"),
-        "String.valueOf(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("OK"),
-        "IntListProbe did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(status.success(),
-        "IntListProbe exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", status);
+    assert!(
+        stdout.contains("t=[1, 2, 3]"),
+        "direct toString() concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("xs=[1, 2, 3]"),
+        "SCF concat with object regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim_end() == "[1, 2, 3]"),
+        "println(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("v=[1, 2, 3]"),
+        "String.valueOf(Object) regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("OK"),
+        "IntListProbe did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "IntListProbe exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status
+    );
 }
 
 #[test]
@@ -166,14 +200,25 @@ fn str_decode_basic_round_trip() {
         Some(t) => t,
         None => return,
     };
-    assert!(stdout.contains("latin=abcde"),
-        "plain latin string regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("sb=xs=[a, b, c]"),
-        "StringBuilder.toString concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("concat=xs=[a, b, c]"),
-        "literal+literal concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("OK"),
-        "StrDecode did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(status.success(),
-        "StrDecode exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", status);
+    assert!(
+        stdout.contains("latin=abcde"),
+        "plain latin string regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("sb=xs=[a, b, c]"),
+        "StringBuilder.toString concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("concat=xs=[a, b, c]"),
+        "literal+literal concat regressed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("OK"),
+        "StrDecode did not reach OK marker.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "StrDecode exited non-zero: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status
+    );
 }

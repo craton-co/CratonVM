@@ -95,9 +95,7 @@ fn probe_readable(a: usize) -> bool {
     }
     // SAFETY: VirtualQuery returned non-zero, so the buffer is initialized.
     let mbi = unsafe { mbi.assume_init() };
-    mbi.state == MEM_COMMIT
-        && mbi.protect & PAGE_NOACCESS == 0
-        && mbi.protect & PAGE_GUARD == 0
+    mbi.state == MEM_COMMIT && mbi.protect & PAGE_NOACCESS == 0 && mbi.protect & PAGE_GUARD == 0
 }
 
 #[cfg(not(windows))]

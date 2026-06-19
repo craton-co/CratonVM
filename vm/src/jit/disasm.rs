@@ -32,17 +32,45 @@ fn filter() -> Option<&'static Vec<String>> {
 /// Dump `code` (mapped at `entry` — addresses in the listing are real) to
 /// stderr if `Class.method` matches the `CRATONVM_DBG_JIT_DISASM` filter.
 /// `what` labels the compile path (`upgrade`, `osr`, `full`, ...).
-pub fn maybe_dump(what: &str, class_name: &str, method_name: &str, descriptor: &str, entry: *const u8, code: &[u8]) {
-    maybe_dump_annotated(what, class_name, method_name, descriptor, entry, code, None, None);
+pub fn maybe_dump(
+    what: &str,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry: *const u8,
+    code: &[u8],
+) {
+    maybe_dump_annotated(
+        what,
+        class_name,
+        method_name,
+        descriptor,
+        entry,
+        code,
+        None,
+        None,
+    );
 }
 
 /// x86-64 register name for a JIT local-home register number.
 fn reg_name(r: u8) -> &'static str {
     match r {
-        0 => "rax", 1 => "rcx", 2 => "rdx", 3 => "rbx",
-        4 => "rsp", 5 => "rbp", 6 => "rsi", 7 => "rdi",
-        8 => "r8", 9 => "r9", 10 => "r10", 11 => "r11",
-        12 => "r12", 13 => "r13", 14 => "r14", 15 => "r15",
+        0 => "rax",
+        1 => "rcx",
+        2 => "rdx",
+        3 => "rbx",
+        4 => "rsp",
+        5 => "rbp",
+        6 => "rsi",
+        7 => "rdi",
+        8 => "r8",
+        9 => "r9",
+        10 => "r10",
+        11 => "r11",
+        12 => "r12",
+        13 => "r13",
+        14 => "r14",
+        15 => "r15",
         _ => "r?",
     }
 }
@@ -120,7 +148,12 @@ pub fn maybe_dump_annotated(
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        out.push_str(&format!("  {:>6x}: {:<24} {}\n", insn.ip() - ip, bytes, text));
+        out.push_str(&format!(
+            "  {:>6x}: {:<24} {}\n",
+            insn.ip() - ip,
+            bytes,
+            text
+        ));
     }
     eprintln!("{out}");
 }

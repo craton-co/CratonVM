@@ -13,11 +13,11 @@
 //! - T3.1.15 Flow reactive streams (in lib.rs)
 //! - T3.1.16-T3.1.18 Virtual threads extras
 
+use crate::{alloc_concurrent_synthetic, obj_arg};
+use cratonvm_native_api::NativeContext;
 use cratonvm_native_api::NativeMethodRegistry;
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
-use cratonvm_native_api::NativeContext;
-use crate::{obj_arg, alloc_concurrent_synthetic};
 
 // =============================================================================
 // T3.8 — javax.naming / JNDI
@@ -63,47 +63,61 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
     });
 
     // bind(String, Object) — store binding
-    r.register(ic, "bind", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let value = args.get(2).copied().unwrap_or(Value::Object(None));
-        jndi_put_binding(ctx, this, name, value)?;
-        Ok(None)
-    });
+    r.register(
+        ic,
+        "bind",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            jndi_put_binding(ctx, this, name, value)?;
+            Ok(None)
+        },
+    );
 
     // rebind(String, Object) — replace binding
-    r.register(ic, "rebind", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let value = args.get(2).copied().unwrap_or(Value::Object(None));
-        jndi_put_binding(ctx, this, name, value)?;
-        Ok(None)
-    });
+    r.register(
+        ic,
+        "rebind",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            jndi_put_binding(ctx, this, name, value)?;
+            Ok(None)
+        },
+    );
 
     // lookup(String) -> Object — retrieve binding
-    r.register(ic, "lookup", "(Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
+    r.register(
+        ic,
+        "lookup",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
 
-        // Check for DNS URL scheme: "dns:///hostname" or "dns://server/name"
-        if let Some(Value::Object(Some(name_obj))) = args.get(1) {
-            if let Some(name_str) = ctx.read_string(*name_obj) {
-                if name_str.starts_with("dns:") {
-                    return jndi_dns_lookup(ctx, &name_str);
+            // Check for DNS URL scheme: "dns:///hostname" or "dns://server/name"
+            if let Some(Value::Object(Some(name_obj))) = args.get(1) {
+                if let Some(name_str) = ctx.read_string(*name_obj) {
+                    if name_str.starts_with("dns:") {
+                        return jndi_dns_lookup(ctx, &name_str);
+                    }
                 }
             }
-        }
 
-        let result = jndi_get_binding(ctx, this, name);
-        match result {
-            Value::Object(None) => {
-                Err(RuntimeError::IllegalStateException {
+            let result = jndi_get_binding(ctx, this, name);
+            match result {
+                Value::Object(None) => Err(RuntimeError::IllegalStateException {
                     message: format!("javax.naming.NameNotFoundException: Name not found"),
-                }.into())
+                }
+                .into()),
+                other => Ok(Some(other)),
             }
-            other => Ok(Some(other)),
-        }
-    });
+        },
+    );
 
     // unbind(String)
     r.register(ic, "unbind", "(Ljava/lang/String;)V", |ctx, args| {
@@ -117,86 +131,125 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
     r.register(ic, "close", "()V", |_ctx, _args| Ok(None));
 
     // getEnvironment() -> Hashtable
-    r.register(ic, "getEnvironment", "()Ljava/util/Hashtable;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        ic,
+        "getEnvironment",
+        "()Ljava/util/Hashtable;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
 
     // rename(String, String)
-    r.register(ic, "rename", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let old_name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let new_name = args.get(2).copied().unwrap_or(Value::Object(None));
-        let val = jndi_get_binding(ctx, this, old_name);
-        if matches!(val, Value::Object(None)) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "javax.naming.NameNotFoundException".to_string(),
-            }.into());
-        }
-        jndi_remove_binding(ctx, this, old_name)?;
-        jndi_put_binding(ctx, this, new_name, val)?;
-        Ok(None)
-    });
+    r.register(
+        ic,
+        "rename",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let old_name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let new_name = args.get(2).copied().unwrap_or(Value::Object(None));
+            let val = jndi_get_binding(ctx, this, old_name);
+            if matches!(val, Value::Object(None)) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "javax.naming.NameNotFoundException".to_string(),
+                }
+                .into());
+            }
+            jndi_remove_binding(ctx, this, old_name)?;
+            jndi_put_binding(ctx, this, new_name, val)?;
+            Ok(None)
+        },
+    );
 
     // --- RMI registry (java.rmi.registry.LocateRegistry / Registry) ---
     // Minimal: creates an in-memory registry object
     let reg = "java/rmi/registry/LocateRegistry";
-    r.register(reg, "createRegistry", "(I)Ljava/rmi/registry/Registry;", |ctx, args| {
-        let _port = match args.get(0) {
-            Some(Value::Int(v)) => *v,
-            _ => 1099,
-        };
-        // Create a synthetic Registry backed by a HashMap
-        let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
-        let keys_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let vals_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        ctx.set_field(bindings, 0, Value::Object(Some(keys_arr)));
-        ctx.set_field(bindings, 1, Value::Object(Some(vals_arr)));
-        ctx.set_field(bindings, 2, Value::Int(0));
-        ctx.set_field(registry, 0, Value::Object(Some(bindings)));
-        ctx.set_field(registry, 1, Value::Int(_port));
-        Ok(Some(Value::Object(Some(registry))))
-    });
+    r.register(
+        reg,
+        "createRegistry",
+        "(I)Ljava/rmi/registry/Registry;",
+        |ctx, args| {
+            let _port = match args.get(0) {
+                Some(Value::Int(v)) => *v,
+                _ => 1099,
+            };
+            // Create a synthetic Registry backed by a HashMap
+            let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
+            let keys_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let vals_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            ctx.set_field(bindings, 0, Value::Object(Some(keys_arr)));
+            ctx.set_field(bindings, 1, Value::Object(Some(vals_arr)));
+            ctx.set_field(bindings, 2, Value::Int(0));
+            ctx.set_field(registry, 0, Value::Object(Some(bindings)));
+            ctx.set_field(registry, 1, Value::Int(_port));
+            Ok(Some(Value::Object(Some(registry))))
+        },
+    );
 
-    r.register(reg, "getRegistry", "(Ljava/lang/String;I)Ljava/rmi/registry/Registry;", |ctx, args| {
-        // Return a synthetic registry pointing to the given host:port
-        let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        ctx.set_field(bindings, 0, Value::Object(Some(keys)));
-        ctx.set_field(bindings, 1, Value::Object(Some(vals)));
-        ctx.set_field(bindings, 2, Value::Int(0));
-        ctx.set_field(registry, 0, Value::Object(Some(bindings)));
-        let port = match args.get(1) { Some(Value::Int(v)) => *v, _ => 1099 };
-        ctx.set_field(registry, 1, Value::Int(port));
-        Ok(Some(Value::Object(Some(registry))))
-    });
+    r.register(
+        reg,
+        "getRegistry",
+        "(Ljava/lang/String;I)Ljava/rmi/registry/Registry;",
+        |ctx, args| {
+            // Return a synthetic registry pointing to the given host:port
+            let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
+            let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            ctx.set_field(bindings, 0, Value::Object(Some(keys)));
+            ctx.set_field(bindings, 1, Value::Object(Some(vals)));
+            ctx.set_field(bindings, 2, Value::Int(0));
+            ctx.set_field(registry, 0, Value::Object(Some(bindings)));
+            let port = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1099,
+            };
+            ctx.set_field(registry, 1, Value::Int(port));
+            Ok(Some(Value::Object(Some(registry))))
+        },
+    );
 
     let ri = "java/rmi/registry/Registry";
-    r.register(ri, "bind", "(Ljava/lang/String;Ljava/rmi/Remote;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let obj = args.get(2).copied().unwrap_or(Value::Object(None));
-        jndi_put_binding(ctx, this, name, obj)?;
-        Ok(None)
-    });
+    r.register(
+        ri,
+        "bind",
+        "(Ljava/lang/String;Ljava/rmi/Remote;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let obj = args.get(2).copied().unwrap_or(Value::Object(None));
+            jndi_put_binding(ctx, this, name, obj)?;
+            Ok(None)
+        },
+    );
 
-    r.register(ri, "lookup", "(Ljava/lang/String;)Ljava/rmi/Remote;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let val = jndi_get_binding(ctx, this, name);
-        Ok(Some(val))
-    });
+    r.register(
+        ri,
+        "lookup",
+        "(Ljava/lang/String;)Ljava/rmi/Remote;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = jndi_get_binding(ctx, this, name);
+            Ok(Some(val))
+        },
+    );
 
-    r.register(ri, "rebind", "(Ljava/lang/String;Ljava/rmi/Remote;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let obj = args.get(2).copied().unwrap_or(Value::Object(None));
-        jndi_put_binding(ctx, this, name, obj)?;
-        Ok(None)
-    });
+    r.register(
+        ri,
+        "rebind",
+        "(Ljava/lang/String;Ljava/rmi/Remote;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let obj = args.get(2).copied().unwrap_or(Value::Object(None));
+            jndi_put_binding(ctx, this, name, obj)?;
+            Ok(None)
+        },
+    );
 
     r.register(ri, "unbind", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -214,7 +267,10 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(empty))));
             }
         };
-        let size = match ctx.get_field(bindings, 2) { Value::Int(n) => n as usize, _ => 0 };
+        let size = match ctx.get_field(bindings, 2) {
+            Value::Int(n) => n as usize,
+            _ => 0,
+        };
         let keys_arr = match ctx.get_field(bindings, 0) {
             Value::Object(Some(a)) => a,
             _ => {
@@ -242,7 +298,10 @@ fn jndi_put_binding(
         Value::Object(Some(b)) => b,
         _ => return Ok(()),
     };
-    let size = match ctx.get_field(bindings, 2) { Value::Int(n) => n as usize, _ => 0 };
+    let size = match ctx.get_field(bindings, 2) {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
     let keys_arr = match ctx.get_field(bindings, 0) {
         Value::Object(Some(a)) => a,
         _ => return Ok(()),
@@ -307,7 +366,10 @@ fn jndi_get_binding(ctx: &mut dyn NativeContext, this: ObjectRef, name: Value) -
         Value::Object(Some(b)) => b,
         _ => return Value::Object(None),
     };
-    let size = match ctx.get_field(bindings, 2) { Value::Int(n) => n as usize, _ => 0 };
+    let size = match ctx.get_field(bindings, 2) {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
     let keys_arr = match ctx.get_field(bindings, 0) {
         Value::Object(Some(a)) => a,
         _ => return Value::Object(None),
@@ -353,7 +415,10 @@ fn jndi_remove_binding(
         Value::Object(Some(b)) => b,
         _ => return Ok(()),
     };
-    let size = match ctx.get_field(bindings, 2) { Value::Int(n) => n as usize, _ => 0 };
+    let size = match ctx.get_field(bindings, 2) {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
     let keys_arr = match ctx.get_field(bindings, 0) {
         Value::Object(Some(a)) => a,
         _ => return Ok(()),
@@ -395,7 +460,10 @@ fn jndi_remove_binding(
 }
 
 /// DNS lookup via JNDI: resolves "dns:///hostname" or "dns://server/name"
-fn jndi_dns_lookup(ctx: &mut dyn NativeContext, url: &str) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+fn jndi_dns_lookup(
+    ctx: &mut dyn NativeContext,
+    url: &str,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
     // Parse: dns:///hostname or dns://server/hostname
     let path = url.strip_prefix("dns:").unwrap_or(url);
     let hostname = path.trim_start_matches('/');
@@ -408,18 +476,21 @@ fn jndi_dns_lookup(ctx: &mut dyn NativeContext, url: &str) -> Result<Option<Valu
             let addresses: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
             if addresses.is_empty() {
                 return Err(RuntimeError::IllegalStateException {
-                    message: format!("javax.naming.NameNotFoundException: DNS lookup failed for {}", hostname),
-                }.into());
+                    message: format!(
+                        "javax.naming.NameNotFoundException: DNS lookup failed for {}",
+                        hostname
+                    ),
+                }
+                .into());
             }
             // Return the first address as a string
             let s = ctx.create_string(&addresses[0]);
             Ok(Some(Value::Object(Some(s))))
         }
-        Err(e) => {
-            Err(RuntimeError::IllegalStateException {
-                message: format!("javax.naming.NamingException: DNS resolution failed: {}", e),
-            }.into())
+        Err(e) => Err(RuntimeError::IllegalStateException {
+            message: format!("javax.naming.NamingException: DNS resolution failed: {}", e),
         }
+        .into()),
     }
 }
 
@@ -433,16 +504,26 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- XMLInputFactory ---
     let xif = "javax/xml/stream/XMLInputFactory";
-    r.register(xif, "newInstance", "()Ljavax/xml/stream/XMLInputFactory;", |ctx, _args| {
-        let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
-        ctx.set_field(factory, 0, Value::Int(0)); // configuration flags
-        Ok(Some(Value::Object(Some(factory))))
-    });
-    r.register(xif, "newFactory", "()Ljavax/xml/stream/XMLInputFactory;", |ctx, _args| {
-        let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
-        ctx.set_field(factory, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(factory))))
-    });
+    r.register(
+        xif,
+        "newInstance",
+        "()Ljavax/xml/stream/XMLInputFactory;",
+        |ctx, _args| {
+            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
+            ctx.set_field(factory, 0, Value::Int(0)); // configuration flags
+            Ok(Some(Value::Object(Some(factory))))
+        },
+    );
+    r.register(
+        xif,
+        "newFactory",
+        "()Ljavax/xml/stream/XMLInputFactory;",
+        |ctx, _args| {
+            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
+            ctx.set_field(factory, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(factory))))
+        },
+    );
 
     // createXMLEventReader(InputStream) -> XMLEventReader
     r.register(
@@ -473,7 +554,8 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             // Try to read content from the reader
-            let content = match ctx.invoke_virtual(reader, "toString", "()Ljava/lang/String;", &[]) {
+            let content = match ctx.invoke_virtual(reader, "toString", "()Ljava/lang/String;", &[])
+            {
                 Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -506,23 +588,29 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         let idx = ctx.get_field(this, 2).as_int().unwrap_or(0);
         Ok(Some(Value::Int(if idx < count { 1 } else { 0 })))
     });
-    r.register(xer, "nextEvent", "()Ljavax/xml/stream/events/XMLEvent;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        let idx = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        if idx >= count {
-            return Err(RuntimeError::IllegalStateException {
-                message: "javax.xml.stream.XMLStreamException: No more events".to_string(),
-            }.into());
-        }
-        let events = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let event = ctx.get_array_element(events, idx as usize);
-        ctx.set_field(this, 2, Value::Int(idx + 1));
-        Ok(Some(event))
-    });
+    r.register(
+        xer,
+        "nextEvent",
+        "()Ljavax/xml/stream/events/XMLEvent;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            let idx = ctx.get_field(this, 2).as_int().unwrap_or(0);
+            if idx >= count {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "javax.xml.stream.XMLStreamException: No more events".to_string(),
+                }
+                .into());
+            }
+            let events = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let event = ctx.get_array_element(events, idx as usize);
+            ctx.set_field(this, 2, Value::Int(idx + 1));
+            Ok(Some(event))
+        },
+    );
     r.register(xer, "close", "()V", |_ctx, _args| Ok(None));
 
     // --- XMLStreamReader ---
@@ -541,7 +629,8 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         if idx >= count {
             return Err(RuntimeError::IllegalStateException {
                 message: "No more events".to_string(),
-            }.into());
+            }
+            .into());
         }
         let events = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
@@ -567,7 +656,9 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        if idx < 0 { return Ok(Some(Value::Object(None))); }
+        if idx < 0 {
+            return Ok(Some(Value::Object(None)));
+        }
         let event = match ctx.get_array_element(events, idx as usize) {
             Value::Object(Some(e)) => e,
             _ => return Ok(Some(Value::Object(None))),
@@ -581,7 +672,9 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        if idx < 0 { return Ok(Some(Value::Object(None))); }
+        if idx < 0 {
+            return Ok(Some(Value::Object(None)));
+        }
         let event = match ctx.get_array_element(events, idx as usize) {
             Value::Object(Some(e)) => e,
             _ => return Ok(Some(Value::Object(None))),
@@ -625,60 +718,90 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
 
     // --- SchemaFactory ---
     let sf = "javax/xml/validation/SchemaFactory";
-    r.register(sf, "newInstance", "(Ljava/lang/String;)Ljavax/xml/validation/SchemaFactory;", |ctx, _args| {
-        let factory = alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1);
-        ctx.set_field(factory, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(factory))))
-    });
+    r.register(
+        sf,
+        "newInstance",
+        "(Ljava/lang/String;)Ljavax/xml/validation/SchemaFactory;",
+        |ctx, _args| {
+            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1);
+            ctx.set_field(factory, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(factory))))
+        },
+    );
     // newSchema(Source) — returns a Schema object
-    r.register(sf, "newSchema", "(Ljavax/xml/transform/Source;)Ljavax/xml/validation/Schema;", |ctx, _args| {
-        let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
-        ctx.set_field(schema, 0, Value::Int(1)); // valid
-        Ok(Some(Value::Object(Some(schema))))
-    });
+    r.register(
+        sf,
+        "newSchema",
+        "(Ljavax/xml/transform/Source;)Ljavax/xml/validation/Schema;",
+        |ctx, _args| {
+            let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
+            ctx.set_field(schema, 0, Value::Int(1)); // valid
+            Ok(Some(Value::Object(Some(schema))))
+        },
+    );
     // newSchema() — no-arg: returns a permissive schema
-    r.register(sf, "newSchema", "()Ljavax/xml/validation/Schema;", |ctx, _args| {
-        let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
-        ctx.set_field(schema, 0, Value::Int(1));
-        Ok(Some(Value::Object(Some(schema))))
-    });
+    r.register(
+        sf,
+        "newSchema",
+        "()Ljavax/xml/validation/Schema;",
+        |ctx, _args| {
+            let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
+            ctx.set_field(schema, 0, Value::Int(1));
+            Ok(Some(Value::Object(Some(schema))))
+        },
+    );
 
     // Schema.newValidator()
     let schema = "javax/xml/validation/Schema";
-    r.register(schema, "newValidator", "()Ljavax/xml/validation/Validator;", |ctx, _args| {
-        let v = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Validator", 1);
-        ctx.set_field(v, 0, Value::Int(1));
-        Ok(Some(Value::Object(Some(v))))
-    });
+    r.register(
+        schema,
+        "newValidator",
+        "()Ljavax/xml/validation/Validator;",
+        |ctx, _args| {
+            let v = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Validator", 1);
+            ctx.set_field(v, 0, Value::Int(1));
+            Ok(Some(Value::Object(Some(v))))
+        },
+    );
 
     // Validator.validate(Source) — performs XML well-formedness checking
     let validator = "javax/xml/validation/Validator";
-    r.register(validator, "validate", "(Ljavax/xml/transform/Source;)V", |ctx, args| {
-        // Extract XML content from the Source if possible and check well-formedness
-        if let Some(Value::Object(Some(source))) = args.get(1) {
-            // Try to get the system ID (file path/URL) or content from the source
-            if let Ok(Some(Value::Object(Some(stream)))) = ctx.invoke_virtual(
-                *source, "getInputStream", "()Ljava/io/InputStream;", &[]
-            ) {
-                let xml = stax_read_input_stream(ctx, stream);
-                if !xml.is_empty() {
-                    validate_xml_well_formedness(&xml).map_err(|msg| {
-                        RuntimeError::IllegalStateException {
-                            message: format!("org.xml.sax.SAXParseException: {}", msg),
-                        }
-                    })?;
+    r.register(
+        validator,
+        "validate",
+        "(Ljavax/xml/transform/Source;)V",
+        |ctx, args| {
+            // Extract XML content from the Source if possible and check well-formedness
+            if let Some(Value::Object(Some(source))) = args.get(1) {
+                // Try to get the system ID (file path/URL) or content from the source
+                if let Ok(Some(Value::Object(Some(stream)))) =
+                    ctx.invoke_virtual(*source, "getInputStream", "()Ljava/io/InputStream;", &[])
+                {
+                    let xml = stax_read_input_stream(ctx, stream);
+                    if !xml.is_empty() {
+                        validate_xml_well_formedness(&xml).map_err(|msg| {
+                            RuntimeError::IllegalStateException {
+                                message: format!("org.xml.sax.SAXParseException: {}", msg),
+                            }
+                        })?;
+                    }
                 }
             }
-        }
-        Ok(None)
-    });
+            Ok(None)
+        },
+    );
 
     // XMLConstants field constants
     let xc = "javax/xml/XMLConstants";
-    r.register(xc, "W3C_XML_SCHEMA_NS_URI", "Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("http://www.w3.org/2001/XMLSchema");
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        xc,
+        "W3C_XML_SCHEMA_NS_URI",
+        "Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("http://www.w3.org/2001/XMLSchema");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -703,7 +826,9 @@ fn stax_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) -> String 
             Ok(Some(Value::Int(n))) => n,
             _ => -1,
         };
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         for i in 0..n as usize {
             match ctx.get_array_element(buf, i) {
                 Value::Int(b) => result.push(b as u8),
@@ -904,135 +1029,179 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
     });
 
     // getEngineByName(String) -> ScriptEngine
-    r.register(sem, "getEngineByName", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;", |ctx, args| {
-        let name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        // We provide a minimal "cratonvm-eval" and "js" engine (expression evaluator)
-        if name == "cratonvm-eval" || name == "js" || name == "javascript"
-            || name == "nashorn" || name == "graal.js" || name == "rhino"
-        {
-            let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
-            // Fields: 0=bindings_map, 1=engine_name
-            let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
-            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            ctx.set_field(bindings, 0, Value::Object(Some(keys)));
-            ctx.set_field(bindings, 1, Value::Object(Some(vals)));
-            ctx.set_field(bindings, 2, Value::Int(0));
-            ctx.set_field(engine, 0, Value::Object(Some(bindings)));
-            let name_s = ctx.create_string(&name);
-            ctx.set_field(engine, 1, Value::Object(Some(name_s)));
-            return Ok(Some(Value::Object(Some(engine))));
-        }
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        sem,
+        "getEngineByName",
+        "(Ljava/lang/String;)Ljavax/script/ScriptEngine;",
+        |ctx, args| {
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // We provide a minimal "cratonvm-eval" and "js" engine (expression evaluator)
+            if name == "cratonvm-eval"
+                || name == "js"
+                || name == "javascript"
+                || name == "nashorn"
+                || name == "graal.js"
+                || name == "rhino"
+            {
+                let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
+                // Fields: 0=bindings_map, 1=engine_name
+                let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+                let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+                let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+                ctx.set_field(bindings, 0, Value::Object(Some(keys)));
+                ctx.set_field(bindings, 1, Value::Object(Some(vals)));
+                ctx.set_field(bindings, 2, Value::Int(0));
+                ctx.set_field(engine, 0, Value::Object(Some(bindings)));
+                let name_s = ctx.create_string(&name);
+                ctx.set_field(engine, 1, Value::Object(Some(name_s)));
+                return Ok(Some(Value::Object(Some(engine))));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // getEngineByExtension(String) -> ScriptEngine
-    r.register(sem, "getEngineByExtension", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;", |ctx, args| {
-        let ext = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        if ext == "js" {
-            let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
-            let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
-            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            ctx.set_field(bindings, 0, Value::Object(Some(keys)));
-            ctx.set_field(bindings, 1, Value::Object(Some(vals)));
-            ctx.set_field(bindings, 2, Value::Int(0));
-            ctx.set_field(engine, 0, Value::Object(Some(bindings)));
-            let name_s = ctx.create_string("javascript");
-            ctx.set_field(engine, 1, Value::Object(Some(name_s)));
-            return Ok(Some(Value::Object(Some(engine))));
-        }
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        sem,
+        "getEngineByExtension",
+        "(Ljava/lang/String;)Ljavax/script/ScriptEngine;",
+        |ctx, args| {
+            let ext = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if ext == "js" {
+                let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
+                let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+                let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+                let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+                ctx.set_field(bindings, 0, Value::Object(Some(keys)));
+                ctx.set_field(bindings, 1, Value::Object(Some(vals)));
+                ctx.set_field(bindings, 2, Value::Int(0));
+                ctx.set_field(engine, 0, Value::Object(Some(bindings)));
+                let name_s = ctx.create_string("javascript");
+                ctx.set_field(engine, 1, Value::Object(Some(name_s)));
+                return Ok(Some(Value::Object(Some(engine))));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // --- ScriptEngine ---
     let se = "javax/script/ScriptEngine";
     // eval(String) -> Object — evaluate a script expression
-    r.register(se, "eval", "(Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        let script = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        // Simple expression evaluator for numeric expressions
-        let result = eval_simple_expression(&script);
-        match result {
-            Some(n) => {
-                // Box the result as an Integer or Double
-                if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                    let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
-                    ctx.set_field(boxed, 0, Value::Int(n as i32));
-                    Ok(Some(Value::Object(Some(boxed))))
-                } else {
-                    let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
-                    ctx.set_field(boxed, 0, Value::Double(n));
-                    Ok(Some(Value::Object(Some(boxed))))
+    r.register(
+        se,
+        "eval",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let script = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Simple expression evaluator for numeric expressions
+            let result = eval_simple_expression(&script);
+            match result {
+                Some(n) => {
+                    // Box the result as an Integer or Double
+                    if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
+                        let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+                        ctx.set_field(boxed, 0, Value::Int(n as i32));
+                        Ok(Some(Value::Object(Some(boxed))))
+                    } else {
+                        let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+                        ctx.set_field(boxed, 0, Value::Double(n));
+                        Ok(Some(Value::Object(Some(boxed))))
+                    }
+                }
+                None => {
+                    // Return the script as a string if not evaluable
+                    let s = ctx.create_string(&script);
+                    Ok(Some(Value::Object(Some(s))))
                 }
             }
-            None => {
-                // Return the script as a string if not evaluable
-                let s = ctx.create_string(&script);
-                Ok(Some(Value::Object(Some(s))))
-            }
-        }
-    });
+        },
+    );
 
     // put(String, Object) — set a binding
-    r.register(se, "put", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key = args.get(1).copied().unwrap_or(Value::Object(None));
-        let val = args.get(2).copied().unwrap_or(Value::Object(None));
-        let bindings = match ctx.get_field(this, 0) {
-            Value::Object(Some(b)) => b,
-            _ => return Ok(None),
-        };
-        script_put_binding(ctx, bindings, key, val);
-        Ok(None)
-    });
+    r.register(
+        se,
+        "put",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = args.get(2).copied().unwrap_or(Value::Object(None));
+            let bindings = match ctx.get_field(this, 0) {
+                Value::Object(Some(b)) => b,
+                _ => return Ok(None),
+            };
+            script_put_binding(ctx, bindings, key, val);
+            Ok(None)
+        },
+    );
 
     // get(String) -> Object
-    r.register(se, "get", "(Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key = args.get(1).copied().unwrap_or(Value::Object(None));
-        let bindings = match ctx.get_field(this, 0) {
-            Value::Object(Some(b)) => b,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        Ok(Some(script_get_binding(ctx, bindings, key)))
-    });
+    r.register(
+        se,
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let bindings = match ctx.get_field(this, 0) {
+                Value::Object(Some(b)) => b,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(script_get_binding(ctx, bindings, key)))
+        },
+    );
 
     // createBindings() -> Bindings
-    r.register(se, "createBindings", "()Ljavax/script/Bindings;", |ctx, _args| {
-        let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        ctx.set_field(bindings, 0, Value::Object(Some(keys)));
-        ctx.set_field(bindings, 1, Value::Object(Some(vals)));
-        ctx.set_field(bindings, 2, Value::Int(0));
-        Ok(Some(Value::Object(Some(bindings))))
-    });
+    r.register(
+        se,
+        "createBindings",
+        "()Ljavax/script/Bindings;",
+        |ctx, _args| {
+            let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            ctx.set_field(bindings, 0, Value::Object(Some(keys)));
+            ctx.set_field(bindings, 1, Value::Object(Some(vals)));
+            ctx.set_field(bindings, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(bindings))))
+        },
+    );
 
     // --- SimpleBindings ---
     let sb = "javax/script/SimpleBindings";
-    r.register(sb, "put", "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key = args.get(1).copied().unwrap_or(Value::Object(None));
-        let val = args.get(2).copied().unwrap_or(Value::Object(None));
-        let old = script_get_binding(ctx, this, key);
-        script_put_binding(ctx, this, key, val);
-        Ok(Some(old))
-    });
-    r.register(sb, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key = args.get(1).copied().unwrap_or(Value::Object(None));
-        Ok(Some(script_get_binding(ctx, this, key)))
-    });
+    r.register(
+        sb,
+        "put",
+        "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = args.get(2).copied().unwrap_or(Value::Object(None));
+            let old = script_get_binding(ctx, this, key);
+            script_put_binding(ctx, this, key, val);
+            Ok(Some(old))
+        },
+    );
+    r.register(
+        sb,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            Ok(Some(script_get_binding(ctx, this, key)))
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -1096,7 +1265,9 @@ fn script_get_binding(ctx: &mut dyn NativeContext, bindings: ObjectRef, key: Val
 /// Supports: integer/float literals, +, -, *, /, parentheses.
 fn eval_simple_expression(expr: &str) -> Option<f64> {
     let expr = expr.trim();
-    if expr.is_empty() { return None; }
+    if expr.is_empty() {
+        return None;
+    }
 
     // Simple recursive descent parser
     let tokens = tokenize_expr(expr)?;
@@ -1154,8 +1325,14 @@ fn parse_add_sub(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
     let mut left = parse_mul_div(tokens, pos)?;
     while *pos < tokens.len() {
         match tokens[*pos] {
-            ExprToken::Op('+') => { *pos += 1; left += parse_mul_div(tokens, pos)?; }
-            ExprToken::Op('-') => { *pos += 1; left -= parse_mul_div(tokens, pos)?; }
+            ExprToken::Op('+') => {
+                *pos += 1;
+                left += parse_mul_div(tokens, pos)?;
+            }
+            ExprToken::Op('-') => {
+                *pos += 1;
+                left -= parse_mul_div(tokens, pos)?;
+            }
             _ => break,
         }
     }
@@ -1166,9 +1343,26 @@ fn parse_mul_div(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
     let mut left = parse_unary(tokens, pos)?;
     while *pos < tokens.len() {
         match tokens[*pos] {
-            ExprToken::Op('*') => { *pos += 1; left *= parse_unary(tokens, pos)?; }
-            ExprToken::Op('/') => { *pos += 1; let r = parse_unary(tokens, pos)?; if r == 0.0 { return None; } left /= r; }
-            ExprToken::Op('%') => { *pos += 1; let r = parse_unary(tokens, pos)?; if r == 0.0 { return None; } left %= r; }
+            ExprToken::Op('*') => {
+                *pos += 1;
+                left *= parse_unary(tokens, pos)?;
+            }
+            ExprToken::Op('/') => {
+                *pos += 1;
+                let r = parse_unary(tokens, pos)?;
+                if r == 0.0 {
+                    return None;
+                }
+                left /= r;
+            }
+            ExprToken::Op('%') => {
+                *pos += 1;
+                let r = parse_unary(tokens, pos)?;
+                if r == 0.0 {
+                    return None;
+                }
+                left %= r;
+            }
             _ => break,
         }
     }
@@ -1176,18 +1370,32 @@ fn parse_mul_div(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
 }
 
 fn parse_unary(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
-    if *pos >= tokens.len() { return None; }
+    if *pos >= tokens.len() {
+        return None;
+    }
     match &tokens[*pos] {
-        ExprToken::Op('-') => { *pos += 1; Some(-parse_primary(tokens, pos)?) }
-        ExprToken::Op('+') => { *pos += 1; parse_primary(tokens, pos) }
+        ExprToken::Op('-') => {
+            *pos += 1;
+            Some(-parse_primary(tokens, pos)?)
+        }
+        ExprToken::Op('+') => {
+            *pos += 1;
+            parse_primary(tokens, pos)
+        }
         _ => parse_primary(tokens, pos),
     }
 }
 
 fn parse_primary(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
-    if *pos >= tokens.len() { return None; }
+    if *pos >= tokens.len() {
+        return None;
+    }
     match &tokens[*pos] {
-        ExprToken::Num(n) => { let v = *n; *pos += 1; Some(v) }
+        ExprToken::Num(n) => {
+            let v = *n;
+            *pos += 1;
+            Some(v)
+        }
         ExprToken::LParen => {
             *pos += 1;
             let v = parse_add_sub(tokens, pos)?;
@@ -1232,31 +1440,54 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
 
     // Charset.availableCharsets() -> SortedMap
     let cs = "java/nio/charset/Charset";
-    r.register(cs, "availableCharsets", "()Ljava/util/SortedMap;", |ctx, _args| {
-        // Return a TreeMap with the standard charsets
-        let charsets = [
-            "US-ASCII", "ISO-8859-1", "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE",
-            "UTF-32", "UTF-32BE", "UTF-32LE", "Shift_JIS", "EUC-JP", "ISO-2022-JP",
-            "Big5", "EUC-KR", "GB2312", "GBK", "GB18030", "windows-1252", "windows-1251",
-            "KOI8-R", "ISO-8859-2", "ISO-8859-15",
-        ];
-        let map = alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3);
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
-        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
-        for (i, name) in charsets.iter().enumerate() {
-            let key = ctx.create_string(name);
-            let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2);
-            let name_s = ctx.create_string(name);
-            ctx.set_field(charset, 0, Value::Object(Some(name_s)));
-            ctx.set_field(charset, 1, Value::Object(None)); // aliases
-            ctx.set_array_element(keys, i, Value::Object(Some(key)));
-            ctx.set_array_element(vals, i, Value::Object(Some(charset)));
-        }
-        ctx.set_field(map, 0, Value::Object(Some(keys)));
-        ctx.set_field(map, 1, Value::Object(Some(vals)));
-        ctx.set_field(map, 2, Value::Int(charsets.len() as i32));
-        Ok(Some(Value::Object(Some(map))))
-    });
+    r.register(
+        cs,
+        "availableCharsets",
+        "()Ljava/util/SortedMap;",
+        |ctx, _args| {
+            // Return a TreeMap with the standard charsets
+            let charsets = [
+                "US-ASCII",
+                "ISO-8859-1",
+                "UTF-8",
+                "UTF-16",
+                "UTF-16BE",
+                "UTF-16LE",
+                "UTF-32",
+                "UTF-32BE",
+                "UTF-32LE",
+                "Shift_JIS",
+                "EUC-JP",
+                "ISO-2022-JP",
+                "Big5",
+                "EUC-KR",
+                "GB2312",
+                "GBK",
+                "GB18030",
+                "windows-1252",
+                "windows-1251",
+                "KOI8-R",
+                "ISO-8859-2",
+                "ISO-8859-15",
+            ];
+            let map = alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3);
+            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
+            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
+            for (i, name) in charsets.iter().enumerate() {
+                let key = ctx.create_string(name);
+                let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2);
+                let name_s = ctx.create_string(name);
+                ctx.set_field(charset, 0, Value::Object(Some(name_s)));
+                ctx.set_field(charset, 1, Value::Object(None)); // aliases
+                ctx.set_array_element(keys, i, Value::Object(Some(key)));
+                ctx.set_array_element(vals, i, Value::Object(Some(charset)));
+            }
+            ctx.set_field(map, 0, Value::Object(Some(keys)));
+            ctx.set_field(map, 1, Value::Object(Some(vals)));
+            ctx.set_field(map, 2, Value::Int(charsets.len() as i32));
+            Ok(Some(Value::Object(Some(map))))
+        },
+    );
 
     // String.getBytes(String charsetName) — extended encoding support
     // This is registered elsewhere for UTF-8/ISO-8859-1; we add Shift_JIS support
@@ -1293,7 +1524,9 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         }
         // For now, report that compilation is not supported in native mode
         // Real javac compilation requires the full JDK compiler pipeline
-        let msg = ctx.create_string("CratonVM: javac native compilation not yet available. Use JDK bytecode path.");
+        let msg = ctx.create_string(
+            "CratonVM: javac native compilation not yet available. Use JDK bytecode path.",
+        );
         let stderr = alloc_concurrent_synthetic(ctx, "java/io/PrintStream", 1);
         ctx.set_field(stderr, 0, Value::Object(Some(msg)));
         Ok(Some(Value::Int(2))) // exit code 2 = error
@@ -1301,30 +1534,40 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
 
     // JavaCompiler via ToolProvider
     let tp = "javax/tools/ToolProvider";
-    r.register(tp, "getSystemJavaCompiler", "()Ljavax/tools/JavaCompiler;", |ctx, _args| {
-        // Return a compiler object with run/getTask/getStandardFileManager support
-        let compiler = alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler", 2);
-        let name = ctx.create_string("cratonvm-javac");
-        ctx.set_field(compiler, 0, Value::Object(Some(name)));
-        ctx.set_field(compiler, 1, Value::Int(0)); // invocation count
-        Ok(Some(Value::Object(Some(compiler))))
-    });
+    r.register(
+        tp,
+        "getSystemJavaCompiler",
+        "()Ljavax/tools/JavaCompiler;",
+        |ctx, _args| {
+            // Return a compiler object with run/getTask/getStandardFileManager support
+            let compiler = alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler", 2);
+            let name = ctx.create_string("cratonvm-javac");
+            ctx.set_field(compiler, 0, Value::Object(Some(name)));
+            ctx.set_field(compiler, 1, Value::Int(0)); // invocation count
+            Ok(Some(Value::Object(Some(compiler))))
+        },
+    );
 
     // JavaCompiler.run(InputStream, OutputStream, OutputStream, String...) -> int
     let jc = "javax/tools/JavaCompiler";
-    r.register(jc, "run", "(Ljava/io/InputStream;Ljava/io/OutputStream;Ljava/io/OutputStream;[Ljava/lang/String;)I", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        let files = match args.get(4) {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Int(1))),
-        };
-        let len = ctx.array_length(files);
-        if len == 0 {
-            return Ok(Some(Value::Int(1))); // no files to compile
-        }
-        // Real javac compilation requires JDK compiler pipeline; report error code 2
-        Ok(Some(Value::Int(2)))
-    });
+    r.register(
+        jc,
+        "run",
+        "(Ljava/io/InputStream;Ljava/io/OutputStream;Ljava/io/OutputStream;[Ljava/lang/String;)I",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let files = match args.get(4) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            let len = ctx.array_length(files);
+            if len == 0 {
+                return Ok(Some(Value::Int(1))); // no files to compile
+            }
+            // Real javac compilation requires JDK compiler pipeline; report error code 2
+            Ok(Some(Value::Int(2)))
+        },
+    );
 
     // JavaCompiler.getStandardFileManager(DiagnosticListener, Locale, Charset) -> StandardJavaFileManager
     r.register(jc, "getStandardFileManager", "(Ljavax/tools/DiagnosticListener;Ljava/util/Locale;Ljava/nio/charset/Charset;)Ljavax/tools/StandardJavaFileManager;", |ctx, _args| {
@@ -1356,14 +1599,19 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
     r.register(sfm, "close", "()V", |_ctx, _args| Ok(None));
 
     // StandardJavaFileManager.getJavaFileObjectsFromStrings(Iterable) -> Iterable
-    r.register(sfm, "getJavaFileObjectsFromStrings", "(Ljava/lang/Iterable;)Ljava/lang/Iterable;", |ctx, _args| {
-        // Return an empty list; file objects require JDK filesystem integration
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
-    });
+    r.register(
+        sfm,
+        "getJavaFileObjectsFromStrings",
+        "(Ljava/lang/Iterable;)Ljava/lang/Iterable;",
+        |ctx, _args| {
+            // Return an empty list; file objects require JDK filesystem integration
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
 
     // --- T3.13: JShell ---
     let jshell = "jdk/jshell/JShell";
@@ -1380,31 +1628,36 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
     });
 
     // eval(String) -> List<SnippetEvent>
-    r.register(jshell, "eval", "(Ljava/lang/String;)Ljava/util/List;", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        let source = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let source_trimmed = source.trim().trim_end_matches(';');
-        let result_str = jshell_evaluate(source_trimmed);
+    r.register(
+        jshell,
+        "eval",
+        "(Ljava/lang/String;)Ljava/util/List;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let source = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let source_trimmed = source.trim().trim_end_matches(';');
+            let result_str = jshell_evaluate(source_trimmed);
 
-        // Create a SnippetEvent
-        let event = alloc_concurrent_synthetic(ctx, "jdk/jshell/SnippetEvent", 3);
-        let src = ctx.create_string(&source);
-        let val = ctx.create_string(&result_str);
-        ctx.set_field(event, 0, Value::Object(Some(src)));   // source
-        ctx.set_field(event, 1, Value::Object(Some(val)));   // value
-        ctx.set_field(event, 2, Value::Int(0));               // status (0=VALID)
+            // Create a SnippetEvent
+            let event = alloc_concurrent_synthetic(ctx, "jdk/jshell/SnippetEvent", 3);
+            let src = ctx.create_string(&source);
+            let val = ctx.create_string(&result_str);
+            ctx.set_field(event, 0, Value::Object(Some(src))); // source
+            ctx.set_field(event, 1, Value::Object(Some(val))); // value
+            ctx.set_field(event, 2, Value::Int(0)); // status (0=VALID)
 
-        // Wrap in a single-element list
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(arr, 0, Value::Object(Some(event)));
-        ctx.set_field(list, 0, Value::Object(Some(arr)));
-        ctx.set_field(list, 1, Value::Int(1));
-        Ok(Some(Value::Object(Some(list))))
-    });
+            // Wrap in a single-element list
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            ctx.set_array_element(arr, 0, Value::Object(Some(event)));
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(1));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
 
     r.register(jshell, "close", "()V", |_ctx, _args| Ok(None));
 
@@ -1414,15 +1667,20 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(se, "status", "()Ljdk/jshell/Snippet$Status;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Return a Status enum
-        let status = alloc_concurrent_synthetic(ctx, "jdk/jshell/Snippet$Status", 2);
-        let name = ctx.create_string("VALID");
-        ctx.set_field(status, 0, Value::Object(Some(name)));
-        ctx.set_field(status, 1, ctx.get_field(this, 2));
-        Ok(Some(Value::Object(Some(status))))
-    });
+    r.register(
+        se,
+        "status",
+        "()Ljdk/jshell/Snippet$Status;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Return a Status enum
+            let status = alloc_concurrent_synthetic(ctx, "jdk/jshell/Snippet$Status", 2);
+            let name = ctx.create_string("VALID");
+            ctx.set_field(status, 0, Value::Object(Some(name)));
+            ctx.set_field(status, 1, ctx.get_field(this, 2));
+            Ok(Some(Value::Object(Some(status))))
+        },
+    );
 
     // --- T3.14: jpackage ---
     let jp = "jdk/jpackage/main/Main";
@@ -1509,9 +1767,10 @@ fn validate_xml_well_formedness(xml: &str) -> Result<(), String> {
 
             if pos + 1 < len && bytes[pos + 1] == b'/' {
                 // End tag
-                let end = xml[pos..].find('>').map(|i| pos + i).ok_or_else(|| {
-                    "Unclosed end tag".to_string()
-                })?;
+                let end = xml[pos..]
+                    .find('>')
+                    .map(|i| pos + i)
+                    .ok_or_else(|| "Unclosed end tag".to_string())?;
                 let tag_name = xml[pos + 2..end].trim().to_string();
                 match tag_stack.pop() {
                     Some(open) if open == tag_name => {}
@@ -1531,30 +1790,38 @@ fn validate_xml_well_formedness(xml: &str) -> Result<(), String> {
                 pos = end + 1;
             } else if pos + 1 < len && bytes[pos + 1] == b'?' {
                 // Processing instruction — skip
-                let end = xml[pos..].find("?>").map(|i| pos + i + 2).ok_or_else(|| {
-                    "Unclosed processing instruction".to_string()
-                })?;
+                let end = xml[pos..]
+                    .find("?>")
+                    .map(|i| pos + i + 2)
+                    .ok_or_else(|| "Unclosed processing instruction".to_string())?;
                 pos = end;
             } else if pos + 3 < len && &xml[pos..pos + 4] == "<!--" {
                 // Comment — skip
-                let end = xml[pos..].find("-->").map(|i| pos + i + 3).ok_or_else(|| {
-                    "Unclosed comment".to_string()
-                })?;
+                let end = xml[pos..]
+                    .find("-->")
+                    .map(|i| pos + i + 3)
+                    .ok_or_else(|| "Unclosed comment".to_string())?;
                 pos = end;
             } else if pos + 8 < len && &xml[pos..pos + 9] == "<![CDATA[" {
                 // CDATA — skip
-                let end = xml[pos..].find("]]>").map(|i| pos + i + 3).ok_or_else(|| {
-                    "Unclosed CDATA section".to_string()
-                })?;
+                let end = xml[pos..]
+                    .find("]]>")
+                    .map(|i| pos + i + 3)
+                    .ok_or_else(|| "Unclosed CDATA section".to_string())?;
                 pos = end;
             } else {
                 // Start tag or self-closing
-                let end = xml[pos..].find('>').map(|i| pos + i).ok_or_else(|| {
-                    "Unclosed start tag".to_string()
-                })?;
+                let end = xml[pos..]
+                    .find('>')
+                    .map(|i| pos + i)
+                    .ok_or_else(|| "Unclosed start tag".to_string())?;
                 let content = &xml[pos + 1..end];
                 let self_closing = content.ends_with('/');
-                let content = if self_closing { &content[..content.len() - 1] } else { content };
+                let content = if self_closing {
+                    &content[..content.len() - 1]
+                } else {
+                    content
+                };
                 let tag_name = content.split_whitespace().next().unwrap_or("").to_string();
 
                 if tag_name.is_empty() {
@@ -1598,10 +1865,7 @@ fn validate_xml_well_formedness(xml: &str) -> Result<(), String> {
     }
 
     if !tag_stack.is_empty() {
-        return Err(format!(
-            "Unclosed tag(s): {}",
-            tag_stack.join(", ")
-        ));
+        return Err(format!("Unclosed tag(s): {}", tag_stack.join(", ")));
     }
 
     Ok(())
@@ -1692,7 +1956,10 @@ fn unescape_java_string(s: &str) -> String {
                 Some('"') => result.push('"'),
                 Some('\'') => result.push('\''),
                 Some('0') => result.push('\0'),
-                Some(other) => { result.push('\\'); result.push(other); }
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
                 None => result.push('\\'),
             }
         } else {
@@ -1707,8 +1974,8 @@ fn try_parse_var_decl(s: &str) -> Option<String> {
     // Patterns: "int x = ...", "long x = ...", "double x = ...", "float x = ...",
     //           "String x = ...", "boolean x = ...", "var x = ...", "char x = ..."
     let type_prefixes = [
-        "int ", "long ", "double ", "float ", "short ", "byte ",
-        "boolean ", "char ", "String ", "var ", "Object ",
+        "int ", "long ", "double ", "float ", "short ", "byte ", "boolean ", "char ", "String ",
+        "var ", "Object ",
     ];
     for prefix in &type_prefixes {
         if s.starts_with(prefix) {
@@ -1783,7 +2050,11 @@ fn try_string_concat(s: &str) -> Option<String> {
         }
     }
 
-    if found_string { Some(result) } else { None }
+    if found_string {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 /// Find the closing quote in a string, handling escape sequences.
@@ -1810,9 +2081,14 @@ fn find_top_level_plus(s: &str) -> Option<usize> {
         if bytes[i] == b'"' {
             i += 1;
             while i < bytes.len() {
-                if bytes[i] == b'\\' { i += 2; }
-                else if bytes[i] == b'"' { i += 1; break; }
-                else { i += 1; }
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
             }
         } else if bytes[i] == b'+' {
             return Some(i);
@@ -1917,7 +2193,9 @@ mod tests {
     fn test_stax_cdata() {
         let xml = r#"<root><![CDATA[some data]]></root>"#;
         let events = stax_parse_events(xml);
-        assert!(events.iter().any(|e| e.event_type == STAX_CHARACTERS && e.text.as_deref() == Some("some data")));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == STAX_CHARACTERS && e.text.as_deref() == Some("some data")));
     }
 
     #[test]

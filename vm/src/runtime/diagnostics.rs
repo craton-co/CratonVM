@@ -199,11 +199,18 @@ pub struct HealthCheck {
 }
 
 /// Perform a basic health check on VM state.
-pub fn check_health(summary: &DiagnosticSummary, heap_usage_percent: f64, live_threads: u64) -> HealthCheck {
+pub fn check_health(
+    summary: &DiagnosticSummary,
+    heap_usage_percent: f64,
+    live_threads: u64,
+) -> HealthCheck {
     let mut warnings = Vec::new();
 
     let heap_healthy = if heap_usage_percent > 95.0 {
-        warnings.push(format!("Heap usage critically high: {:.1}%", heap_usage_percent));
+        warnings.push(format!(
+            "Heap usage critically high: {:.1}%",
+            heap_usage_percent
+        ));
         false
     } else if heap_usage_percent > 80.0 {
         warnings.push(format!("Heap usage elevated: {:.1}%", heap_usage_percent));
@@ -256,12 +263,7 @@ pub fn check_health(summary: &DiagnosticSummary, heap_usage_percent: f64, live_t
 ///     setting `RUST_LOG=warn` or above see why something failed.
 ///   - Honors `CRATONVM_STRICT_SWALLOWS=1` — when set, escalates the swallow
 ///     to a panic so the culprit is impossible to miss during debugging.
-pub fn record_swallow(
-    shared: &crate::vm::SharedVm,
-    site: &str,
-    category: &str,
-    detail: &str,
-) {
+pub fn record_swallow(shared: &crate::vm::SharedVm, site: &str, category: &str, detail: &str) {
     shared
         .swallow_counter
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -272,9 +274,7 @@ pub fn record_swallow(
         "B6: silent-swallow — error suppressed to keep VM running"
     );
     if crate::runtime::env_cache::strict_swallows() {
-        panic!(
-            "CRATONVM_STRICT_SWALLOWS=1: swallow at {site} [{category}]: {detail}"
-        );
+        panic!("CRATONVM_STRICT_SWALLOWS=1: swallow at {site} [{category}]: {detail}");
     }
 }
 
@@ -368,11 +368,21 @@ mod tests {
     #[test]
     fn test_health_check_high_heap() {
         let summary = DiagnosticSummary {
-            uptime_secs: 100.0, bytecodes_executed: 0, method_invocations: 0,
-            exceptions_thrown: 0, classes_loaded: 0, classes_unloaded: 0,
-            gc_cycles: 0, gc_pause_us: 0, heap_bytes_allocated: 0,
-            monitor_contentions: 0, threads_created: 0, jit_compilations: 0,
-            jit_deoptimizations: 0, safepoints: 0, safepoint_pause_us: 0,
+            uptime_secs: 100.0,
+            bytecodes_executed: 0,
+            method_invocations: 0,
+            exceptions_thrown: 0,
+            classes_loaded: 0,
+            classes_unloaded: 0,
+            gc_cycles: 0,
+            gc_pause_us: 0,
+            heap_bytes_allocated: 0,
+            monitor_contentions: 0,
+            threads_created: 0,
+            jit_compilations: 0,
+            jit_deoptimizations: 0,
+            safepoints: 0,
+            safepoint_pause_us: 0,
         };
         let health = check_health(&summary, 96.0, 5);
         assert!(!health.heap_healthy);
@@ -383,11 +393,21 @@ mod tests {
     #[test]
     fn test_health_check_high_threads() {
         let summary = DiagnosticSummary {
-            uptime_secs: 100.0, bytecodes_executed: 0, method_invocations: 0,
-            exceptions_thrown: 0, classes_loaded: 0, classes_unloaded: 0,
-            gc_cycles: 0, gc_pause_us: 0, heap_bytes_allocated: 0,
-            monitor_contentions: 0, threads_created: 0, jit_compilations: 0,
-            jit_deoptimizations: 0, safepoints: 0, safepoint_pause_us: 0,
+            uptime_secs: 100.0,
+            bytecodes_executed: 0,
+            method_invocations: 0,
+            exceptions_thrown: 0,
+            classes_loaded: 0,
+            classes_unloaded: 0,
+            gc_cycles: 0,
+            gc_pause_us: 0,
+            heap_bytes_allocated: 0,
+            monitor_contentions: 0,
+            threads_created: 0,
+            jit_compilations: 0,
+            jit_deoptimizations: 0,
+            safepoints: 0,
+            safepoint_pause_us: 0,
         };
         let health = check_health(&summary, 50.0, 20000);
         assert!(!health.threads_healthy);

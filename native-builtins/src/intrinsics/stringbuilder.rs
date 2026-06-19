@@ -19,10 +19,7 @@ use cratonvm_types::{error::MethodCallResult, Value};
 ///
 /// Registry binds this descriptor to `native_sb_append_string`
 /// (`lang_string.rs:171`).
-pub fn intrinsic_sb_append_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_string(ctx, args)
 }
 
@@ -30,10 +27,7 @@ pub fn intrinsic_sb_append_string(
 ///
 /// Registry binds this descriptor to `native_sb_append_int`
 /// (`lang_string.rs:183`).
-pub fn intrinsic_sb_append_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_int(ctx, args)
 }
 
@@ -41,10 +35,7 @@ pub fn intrinsic_sb_append_int(
 ///
 /// Registry binds this descriptor to `native_sb_append_char`
 /// (`lang_string.rs:195`).
-pub fn intrinsic_sb_append_char(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_char(ctx, args)
 }
 
@@ -52,10 +43,7 @@ pub fn intrinsic_sb_append_char(
 ///
 /// Registry binds this descriptor to `native_sb_append_long`
 /// (`lang_string.rs:243`).
-pub fn intrinsic_sb_append_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_long(ctx, args)
 }
 
@@ -63,10 +51,7 @@ pub fn intrinsic_sb_append_long(
 ///
 /// Registry binds this descriptor to `native_sb_append_boolean`
 /// (`lang_string.rs:231`).
-pub fn intrinsic_sb_append_bool(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_boolean(ctx, args)
 }
 
@@ -74,10 +59,7 @@ pub fn intrinsic_sb_append_bool(
 ///
 /// Registry binds this descriptor to `native_sb_append_object`
 /// (`lang_string.rs:279`).
-pub fn intrinsic_sb_append_object(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_append_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_append_object(ctx, args)
 }
 
@@ -85,10 +67,7 @@ pub fn intrinsic_sb_append_object(
 ///
 /// Registry binds this descriptor to `native_sb_to_string`
 /// (`lang_string.rs:331`).
-pub fn intrinsic_sb_to_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_to_string(ctx, args)
 }
 
@@ -96,10 +75,7 @@ pub fn intrinsic_sb_to_string(
 ///
 /// Registry binds this descriptor to `native_sb_length`
 /// (`lang_string.rs:334`).
-pub fn intrinsic_sb_length(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_sb_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_sb_length(ctx, args)
 }
 

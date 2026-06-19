@@ -19,8 +19,8 @@
 
 use cratonvm_native_api::charset as engine;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
 
@@ -267,7 +267,10 @@ fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
 /// Indexed slots are kept as a fallback for synthetic-mode-only consumers.
 fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
     if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
-        let pos = ctx.get_field_by_name(this, "position").as_int().unwrap_or(0);
+        let pos = ctx
+            .get_field_by_name(this, "position")
+            .as_int()
+            .unwrap_or(0);
         let lim = ctx.get_field_by_name(this, "limit").as_int().unwrap_or(0);
         return Some((a, pos, lim));
     }
@@ -387,11 +390,21 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let (carr, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_coder_result(ctx, CR_UNDERFLOW))))),
+        None => {
+            return Ok(Some(Value::Object(Some(alloc_coder_result(
+                ctx,
+                CR_UNDERFLOW,
+            )))))
+        }
     };
     let (barr, bpos, blim) = match buf_state(ctx, bb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_coder_result(ctx, CR_OVERFLOW))))),
+        None => {
+            return Ok(Some(Value::Object(Some(alloc_coder_result(
+                ctx,
+                CR_OVERFLOW,
+            )))))
+        }
     };
 
     let name = enc_name(ctx, this);
@@ -467,11 +480,21 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let (barr, bpos, blim) = match buf_state(ctx, bb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_coder_result(ctx, CR_UNDERFLOW))))),
+        None => {
+            return Ok(Some(Value::Object(Some(alloc_coder_result(
+                ctx,
+                CR_UNDERFLOW,
+            )))))
+        }
     };
     let (carr, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_coder_result(ctx, CR_OVERFLOW))))),
+        None => {
+            return Ok(Some(Value::Object(Some(alloc_coder_result(
+                ctx,
+                CR_OVERFLOW,
+            )))))
+        }
     };
 
     let name = enc_name(ctx, this);
@@ -486,9 +509,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // sequence, leaving its bytes buffered for the next call).
     let (decoded, input_len) = match engine::decode_bytes(&name, &bytes) {
         Ok(chars) => (chars, bytes.len()),
-        Err(e)
-            if e.kind == engine::CodingErrorKind::Incomplete && !end_of_input =>
-        {
+        Err(e) if e.kind == engine::CodingErrorKind::Incomplete && !end_of_input => {
             // Decode only the valid prefix; the partial trailing bytes stay in
             // the buffer (position advances only past the prefix) and the
             // decoder reports UNDERFLOW.
@@ -666,10 +687,7 @@ fn native_string_get_bytes_charset(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-fn native_string_get_bytes_named(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_string_get_bytes_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
     let val = ctx.read_string(this).unwrap_or_default();
     let name = match args.get(1) {
@@ -796,24 +814,19 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
     //
     // Override with a direct UTF-8 encode (matches the platform default
     // charset we report from `Charset.defaultCharset`).
-    registry.register(
-        s,
-        "getBytes",
-        "()[B",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let text = ctx.read_string(this).unwrap_or_default();
-            let bytes = text.as_bytes();
-            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-            for (i, &b) in bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
+    registry.register(s, "getBytes", "()[B", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let text = ctx.read_string(this).unwrap_or_default();
+        let bytes = text.as_bytes();
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+        }
+        Ok(Some(Value::Object(Some(arr))))
+    });
 }
 
 /// `CharsetEncoder.encode(CharBuffer) -> ByteBuffer` — uses the
@@ -928,7 +941,10 @@ mod tests {
         // 2-byte 0xC2 0xA9 a UTF-8 fallback would emit).
         assert_eq!(ctx.array_length(arr), 2);
         assert_eq!(ctx.get_array_element(arr, 0).as_int(), Some(0x41));
-        assert_eq!(ctx.get_array_element(arr, 1).as_int(), Some(0xA9u8 as i8 as i32));
+        assert_eq!(
+            ctx.get_array_element(arr, 1).as_int(),
+            Some(0xA9u8 as i8 as i32)
+        );
     }
 
     #[test]

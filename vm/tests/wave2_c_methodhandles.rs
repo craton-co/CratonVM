@@ -51,7 +51,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -141,7 +145,9 @@ fn methodhandles_probe_matches_hotspot_matrix() {
         rc,
         Some(0),
         "wave2-c: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
 
     // The seven HotSpot-reference lines, in order.  The probe constructs each
@@ -162,7 +168,9 @@ fn methodhandles_probe_matches_hotspot_matrix() {
         matched >= 5,
         "wave2-c: only {} of 7 MethodHandle lookups matched HotSpot. \
          expected (any 5+ of) {:?}, got stdout={:?}",
-        matched, expected, stdout
+        matched,
+        expected,
+        stdout
     );
     assert!(
         stdout.contains("OK"),

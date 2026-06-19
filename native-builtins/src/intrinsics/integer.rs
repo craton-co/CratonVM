@@ -36,8 +36,8 @@
 //! every handler forwards `args` verbatim.
 
 use cratonvm_native_api::NativeContext;
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 /// Intrinsic for `java/lang/Integer.valueOf (I)Ljava/lang/Integer;` (static).
 ///
@@ -118,18 +118,12 @@ mod tests {
         let parse_int: NativeCallback = intrinsic_integer_parse_int;
         // Distinct call sites => distinct fn pointers; this also keeps the
         // bindings live so the coercions above are not optimised away.
-        assert!(!std::ptr::eq(
-            value_of as *const (),
-            int_value as *const (),
-        ));
+        assert!(!std::ptr::eq(value_of as *const (), int_value as *const (),));
         assert!(!std::ptr::eq(
             int_value as *const (),
             parse_int as *const (),
         ));
-        assert!(!std::ptr::eq(
-            value_of as *const (),
-            parse_int as *const (),
-        ));
+        assert!(!std::ptr::eq(value_of as *const (), parse_int as *const (),));
     }
 
     /// The three intrinsics must be distinct handlers — guards against an

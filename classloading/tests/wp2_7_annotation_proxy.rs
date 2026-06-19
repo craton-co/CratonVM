@@ -23,9 +23,7 @@ use cratonvm_classloading::annotations::{
     annotation_descriptor_to_class_name, annotation_type_matches,
     class_name_to_annotation_descriptor, field_annotations, method_annotations, AnnotationsView,
 };
-use cratonvm_reader::attribute::{
-    Annotation, ElementValue, ElementValuePair, LazyAttribute,
-};
+use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair, LazyAttribute};
 use cratonvm_reader::class_file::ClassFile;
 use cratonvm_reader::read_class;
 use std::path::PathBuf;
@@ -86,7 +84,10 @@ fn class_level_annotation_matches_descriptor_form() {
     };
     let view = AnnotationsView::new(&cf.attributes);
     let found = view.find_by_type_descriptor("LTest;", |idx| cf.constant_pool.get_utf8(idx));
-    assert!(found.is_some(), "@Test class-level annotation must match LTest;");
+    assert!(
+        found.is_some(),
+        "@Test class-level annotation must match LTest;"
+    );
 }
 
 #[test]
@@ -208,7 +209,9 @@ fn annotation_default_is_visible_through_view() {
         .find(|m| &*m.name == "value")
         .expect("Test.value() must exist");
     let view = method_annotations(value_method);
-    let default = view.annotation_default().expect("Test.value() must carry AnnotationDefault");
+    let default = view
+        .annotation_default()
+        .expect("Test.value() must carry AnnotationDefault");
     match default {
         ElementValue::Const { tag, .. } => assert_eq!(*tag, b's'),
         other => panic!("expected Const('s'), got {other:?}"),

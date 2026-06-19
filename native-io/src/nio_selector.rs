@@ -63,15 +63,15 @@
 //! dropping the selector state drops only its clones, not the originals.
 //! This avoids double-close issues.
 
-use parking_lot::{Mutex, RwLock};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 #[allow(unused_imports)]
 use std::time::{Duration, Instant};
 // C27 (Round-11 GC-safety fix): the sk_table side-table is now keyed by
@@ -322,9 +322,7 @@ impl SelectorState {
         }
         let mut pipefd: [libc::c_int; 2] = [0; 2];
         // SAFETY: pipe2 fills pipefd with two valid fds (read, write).
-        let rc = unsafe {
-            libc::pipe2(pipefd.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC)
-        };
+        let rc = unsafe { libc::pipe2(pipefd.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             // SAFETY: efd was a valid fd from epoll_create1.
@@ -338,9 +336,7 @@ impl SelectorState {
             u64: u64::MAX,
         };
         // SAFETY: efd, pipefd[0], &mut ev are all valid for this call.
-        let rc = unsafe {
-            libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, pipefd[0], &mut ev)
-        };
+        let rc = unsafe { libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, pipefd[0], &mut ev) };
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             // SAFETY: all fds are valid.
@@ -379,9 +375,8 @@ impl SelectorState {
             // SAFETY: rfd is a valid non-blocking fd; read returns -1/EAGAIN
             // when empty.
             loop {
-                let n = unsafe {
-                    libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                };
+                let n =
+                    unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n <= 0 {
                     break;
                 }
@@ -426,7 +421,10 @@ fn next_selector_id() -> i32 {
 // ---------------------------------------------------------------------------
 
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 fn illegal_arg(msg: impl Into<String>) -> MethodCallFailed {
@@ -451,7 +449,9 @@ fn closed_selector() -> MethodCallFailed {
 /// tests and for `sun.nio.ch.SelectorProvider.openSelector0()` callers.
 pub fn selector_open() -> i32 {
     let id = next_selector_id();
-    selectors().write().insert(id, Mutex::new(SelectorState::new()));
+    selectors()
+        .write()
+        .insert(id, Mutex::new(SelectorState::new()));
     id
 }
 
@@ -514,9 +514,7 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
         if let Some(wfd) = st.wakeup_pipe_write {
             let byte: u8 = b'W';
             // SAFETY: wfd is a valid non-blocking fd; partial writes ok.
-            let _ = unsafe {
-                libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
-            };
+            let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
         }
     }
 
@@ -608,17 +606,10 @@ pub fn selector_register(
                 // SAFETY: efd, os, &mut ev all valid for this call. ENOENT
                 // on a stale MOD just means the prev handle was already
                 // dropped — fall back to ADD.
-                let rc = unsafe {
-                    libc::epoll_ctl(efd, op, os as libc::c_int, &mut ev)
-                };
+                let rc = unsafe { libc::epoll_ctl(efd, op, os as libc::c_int, &mut ev) };
                 if rc < 0 && op == libc::EPOLL_CTL_MOD {
                     let _ = unsafe {
-                        libc::epoll_ctl(
-                            efd,
-                            libc::EPOLL_CTL_ADD,
-                            os as libc::c_int,
-                            &mut ev,
-                        )
+                        libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, os as libc::c_int, &mut ev)
                     };
                 }
             }
@@ -663,14 +654,8 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
                 u64: net_fd as u64,
             };
             // SAFETY: efd, os, &mut ev valid.
-            let _ = unsafe {
-                libc::epoll_ctl(
-                    efd,
-                    libc::EPOLL_CTL_MOD,
-                    os as libc::c_int,
-                    &mut ev,
-                )
-            };
+            let _ =
+                unsafe { libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev) };
         }
     }
     Ok(())
@@ -853,8 +838,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             None => continue, // Race: key was removed/cancelled.
         };
         let is_listener = *listeners.get(&net_fd).unwrap_or(&false);
-        let ready =
-            linux_ready_for(ev.events as i32, interest, is_listener);
+        let ready = linux_ready_for(ev.events as i32, interest, is_listener);
         // Translate _, _ — borrow check juggling: take a non-mut snapshot,
         // then reapply.
         if ready != 0 {
@@ -1020,13 +1004,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
         0i32
     } else {
         // SAFETY: pollfds is a valid slice, length fits in u32.
-        unsafe {
-            WSAPoll(
-                pollfds.as_mut_ptr(),
-                pollfds.len() as u32,
-                timeout_ms,
-            )
-        }
+        unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) }
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
@@ -1222,8 +1200,7 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
         let Some((net_fd, interest, is_listener)) = key_index.get(i).copied() else {
             continue;
         };
-        let in_ready =
-            pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+        let in_ready = pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
         let out_ready = pfd.revents & libc::POLLOUT != 0;
         let mut ready = 0;
         if is_listener {
@@ -1572,10 +1549,7 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // C27: side-table is now keyed by GC-stable identity hash code; the
     // stored `channel` is an `ObjectRef`, not a raw pointer.
     let key = ctx.identity_hash_code(key_obj);
-    let channel = sk_table()
-        .read()
-        .get(&key)
-        .map(|s| s.channel)?;
+    let channel = sk_table().read().get(&key).map(|s| s.channel)?;
     // The channel's registry id lives in the socket_channel side-table now
     // (its F_REG_ID object slot collides with a real-JDK reference field).
     crate::socket_channel::channel_net_fd(ctx, channel)
@@ -1585,10 +1559,7 @@ fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i3
     // C27: identity-hash-code key + stored `ObjectRef` value (no
     // from_raw resurrection).
     let key = ctx.identity_hash_code(key_obj);
-    let s = sk_table()
-        .read()
-        .get(&key)
-        .map(|s| s.selector)?;
+    let s = sk_table().read().get(&key).map(|s| s.selector)?;
     Some(selector_id_from_obj(ctx, s))
 }
 
@@ -1610,7 +1581,9 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // identity hash — its int slots are reference-typed and would coerce to
     // null (see `sel_obj_ids`). The field writes below are kept as a
     // best-effort legacy path but are not relied upon.
-    sel_obj_ids().write().insert(ctx.identity_hash_code(obj), id);
+    sel_obj_ids()
+        .write()
+        .insert(ctx.identity_hash_code(obj), id);
     let n = ctx.object_num_fields(obj);
     if n > SI_ID {
         ctx.set_field(obj, SI_ID, Value::Int(id));
@@ -1673,9 +1646,7 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
         let st = s.lock();
         st.keys
             .values()
-            .filter(|k| {
-                k.interest_ops != 0 && k.key_hash != 0 && k.handle.os_handle().is_none()
-            })
+            .filter(|k| k.interest_ops != 0 && k.key_hash != 0 && k.handle.os_handle().is_none())
             .map(|k| (k.net_fd, k.key_hash))
             .collect()
     };
@@ -1841,8 +1812,8 @@ struct SkState {
 }
 
 fn sk_table() -> &'static parking_lot::RwLock<FxHashMap<i32, SkState>> {
-    static REG: std::sync::OnceLock<parking_lot::RwLock<FxHashMap<i32, SkState>>>
-        = std::sync::OnceLock::new();
+    static REG: std::sync::OnceLock<parking_lot::RwLock<FxHashMap<i32, SkState>>> =
+        std::sync::OnceLock::new();
     REG.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()))
 }
 
@@ -1960,9 +1931,7 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(crate::socket_channel::TcpHandleClone::Listener(l)) => {
             Some(SelectableKind::Listener(l))
         }
-        Some(crate::socket_channel::TcpHandleClone::Stream(s)) => {
-            Some(SelectableKind::Stream(s))
-        }
+        Some(crate::socket_channel::TcpHandleClone::Stream(s)) => Some(SelectableKind::Stream(s)),
         None => None,
     };
 
@@ -2127,8 +2096,7 @@ fn sk_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.interest_ops))
-        .unwrap_or(Value::Int(0));
+    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.interest_ops)).unwrap_or(Value::Int(0));
     Ok(Some(v))
 }
 
@@ -2191,8 +2159,7 @@ fn sk_ready_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.ready_ops))
-        .unwrap_or(Value::Int(0));
+    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.ready_ops)).unwrap_or(Value::Int(0));
     Ok(Some(v))
 }
 
@@ -2202,10 +2169,8 @@ fn sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
     // A registered key with no side-table row is treated as valid: it was just
     // created by channel_register and only an explicit cancel() marks it invalid.
-    let valid = sk_state_get_field(ctx, this, |s| {
-        Value::Int(if s.cancelled { 0 } else { 1 })
-    })
-    .unwrap_or(Value::Int(1));
+    let valid = sk_state_get_field(ctx, this, |s| Value::Int(if s.cancelled { 0 } else { 1 }))
+        .unwrap_or(Value::Int(1));
     Ok(Some(valid))
 }
 
@@ -2355,7 +2320,12 @@ fn build_set(ctx: &mut dyn NativeContext, keys: &[ObjectRef]) -> ObjectRef {
             Err(_) => ctx.alloc_object(ClassId::new(0), 1),
         },
     };
-    let _ = ctx.invoke_special("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+    let _ = ctx.invoke_special(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
     for key in keys {
         let _ = ctx.invoke_virtual(
             set,
@@ -2397,10 +2367,7 @@ fn selector_is_open_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// It synchronizes on internal locks and walks ready key state we don't
 /// populate, so we route the timeout straight to our native select and
 /// invoke the optional consumer over freshly ready keys (Selector.select(Consumer)).
-fn selector_lock_and_do_select(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn selector_lock_and_do_select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(v @ Value::Object(Some(_))) => v,
         _ => return Ok(Some(Value::Int(0))),
@@ -2414,7 +2381,9 @@ fn selector_lock_and_do_select(
     let n = selector_select_native(ctx, &[this, Value::Long(timeout)])?;
     // If a Consumer<SelectionKey> was supplied, drive it across the ready keys.
     if let Value::Object(Some(c)) = consumer {
-        if let Value::Object(Some(set)) = selector_selected_keys(ctx, &[this])?.unwrap_or(Value::Object(None)) {
+        if let Value::Object(Some(set)) =
+            selector_selected_keys(ctx, &[this])?.unwrap_or(Value::Object(None))
+        {
             // The synthetic HashSet's backing array is at slot 0, size at slot 1.
             let arr = match ctx.get_field(set, 0) {
                 Value::Object(Some(a)) => a,
@@ -2483,9 +2452,7 @@ fn epoll_create_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(ioex(
-            "EPoll.epollCreate: not supported on this platform",
-        ));
+        return Err(ioex("EPoll.epollCreate: not supported on this platform"));
     }
 }
 
@@ -2514,7 +2481,12 @@ fn epoll_ctl_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         };
         // SAFETY: epfd, fd valid integers; ev points to a stack value.
         let rc = unsafe {
-            libc::epoll_ctl(epfd as libc::c_int, op as libc::c_int, fd as libc::c_int, &mut ev)
+            libc::epoll_ctl(
+                epfd as libc::c_int,
+                op as libc::c_int,
+                fd as libc::c_int,
+                &mut ev,
+            )
         };
         return Ok(Some(Value::Int(rc as i32)));
     }
@@ -2670,13 +2642,28 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // that read out of our 5-field SelectionKeyImpl synthetic.
     let sk_class = "java/nio/channels/SelectionKey";
     for c in [sk_class, ski] {
-        r.register(c, "channel", "()Ljava/nio/channels/SelectableChannel;", sk_channel);
+        r.register(
+            c,
+            "channel",
+            "()Ljava/nio/channels/SelectableChannel;",
+            sk_channel,
+        );
         r.register(c, "selector", "()Ljava/nio/channels/Selector;", sk_selector);
         r.register(c, "interestOps", "()I", sk_interest_ops);
-        r.register(c, "interestOps", "(I)Ljava/nio/channels/SelectionKey;", sk_set_interest_ops);
+        r.register(
+            c,
+            "interestOps",
+            "(I)Ljava/nio/channels/SelectionKey;",
+            sk_set_interest_ops,
+        );
         r.register(c, "readyOps", "()I", sk_ready_ops);
         r.register(c, "isValid", "()Z", sk_is_valid);
-        r.register(c, "attach", "(Ljava/lang/Object;)Ljava/lang/Object;", sk_attach);
+        r.register(
+            c,
+            "attach",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            sk_attach,
+        );
         r.register(c, "attachment", "()Ljava/lang/Object;", sk_attachment);
         r.register(c, "cancel", "()V", sk_cancel_public);
     }
@@ -2687,7 +2674,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // directly from our native KeyState registry.
     let sel_iface = "java/nio/channels/Selector";
     for c in [sel_iface, sel] {
-        r.register(c, "selectedKeys", "()Ljava/util/Set;", selector_selected_keys);
+        r.register(
+            c,
+            "selectedKeys",
+            "()Ljava/util/Set;",
+            selector_selected_keys,
+        );
         r.register(c, "keys", "()Ljava/util/Set;", selector_keys);
     }
     // Public Selector entry points — short-circuit the JDK bytecode (which
@@ -2697,11 +2689,21 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         r.register(c, "select", "()I", selector_select_blocking);
         r.register(c, "select", "(J)I", selector_select_native);
         r.register(c, "selectNow", "()I", selector_select_now_native);
-        r.register(c, "wakeup", "()Ljava/nio/channels/Selector;", selector_wakeup_public);
+        r.register(
+            c,
+            "wakeup",
+            "()Ljava/nio/channels/Selector;",
+            selector_wakeup_public,
+        );
         r.register(c, "close", "()V", selector_close_native);
         r.register(c, "isOpen", "()Z", selector_is_open_native);
         // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
-        r.register(c, "lockAndDoSelect", "(Ljava/util/function/Consumer;J)I", selector_lock_and_do_select);
+        r.register(
+            c,
+            "lockAndDoSelect",
+            "(Ljava/util/function/Consumer;J)I",
+            selector_lock_and_do_select,
+        );
     }
 
     // IOUtil.fdVal — used by every SocketChannelImpl to extract the raw
@@ -2718,13 +2720,13 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // implementation actually performs the syscall; on Windows / macOS
     // the methods return an IOException, which matches the JDK's behavior
     // when EPoll is unavailable.
-    r.register("sun/nio/ch/EPoll", "epollCreate", "()I", epoll_create_native);
     r.register(
         "sun/nio/ch/EPoll",
-        "epollCtl",
-        "(IIII)I",
-        epoll_ctl_native,
+        "epollCreate",
+        "()I",
+        epoll_create_native,
     );
+    r.register("sun/nio/ch/EPoll", "epollCtl", "(IIII)I", epoll_ctl_native);
     r.register(
         "sun/nio/ch/EPoll",
         "epollWait",
@@ -3024,11 +3026,9 @@ mod tests {
         let r = selector_select(id, -5);
         assert!(r.is_err(), "negative timeout must fail");
         match r {
-            Err(MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(
-                    RuntimeError::IllegalArgumentException { message: _ },
-                ),
-            )) => {}
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::IllegalArgumentException { message: _ },
+            ))) => {}
             _ => panic!("expected IllegalArgumentException, got {r:?}"),
         }
         selector_close(id);

@@ -4,15 +4,14 @@
 //! ClassLoader hierarchy, URLClassLoader, MethodHandles.Lookup, ProtectionDomain,
 //! and CodeSource native method implementations.
 
-
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ObjectRef, Value};
-use cratonvm_types::error::MethodCallResult;
-use crate::{obj_arg, alloc_concurrent_synthetic};
 use crate::service_loader::impl_jars_load_class;
+use crate::{alloc_concurrent_synthetic, obj_arg};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 /// Monotonic counter for generating unique hidden class names.
 pub static HIDDEN_CLASS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,10 +42,18 @@ pub fn peek_app_loader() -> Option<ObjectRef> {
 /// Reset singleton loader instances. Called when creating a new VM to avoid
 /// stale ObjectRefs from a previous VM instance.
 pub fn reset_loader_singletons() {
-    *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *platform_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    class_data_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    defining_loader_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    class_data_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// GC root scan for the singleton built-in class loaders.
@@ -66,7 +73,10 @@ pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
     if let Some(o) = *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
         out.push(o);
     }
-    if let Some(o) = *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(o) = *platform_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         out.push(o);
     }
     // Defining-loader side-table values are live ClassLoader objects reachable
@@ -84,9 +94,7 @@ pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
 /// [`gc_scan_loader_singleton_roots`]). After a moving collection the cached
 /// loader objects relocate; repoint the stored `ObjectRef`s to their new
 /// addresses so subsequent `getClassLoader()` calls return the live object.
-pub fn gc_update_loader_singleton_refs(
-    pointer_map: &std::collections::HashMap<usize, usize>,
-) {
+pub fn gc_update_loader_singleton_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
     if pointer_map.is_empty() {
         return;
     }
@@ -100,10 +108,16 @@ pub fn gc_update_loader_singleton_refs(
         }
     };
     remap(&mut app_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
-    remap(&mut platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
+    remap(
+        &mut platform_loader_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
     // Remap the defining-loader side-table values (relocated ClassLoader objects).
     {
-        let mut map = defining_loader_store().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = defining_loader_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for obj_ref in map.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -132,8 +146,7 @@ pub fn gc_update_loader_singleton_refs(
 // Cleared in `reset_loader_singletons` to avoid stale refs across VMs.
 // ---------------------------------------------------------------------------
 fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Value>> {
-    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<ObjectRef, Value>>> =
-        OnceLock::new();
+    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<ObjectRef, Value>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -198,7 +211,9 @@ pub fn get_class_data(mirror: ObjectRef) -> Value {
 
 /// Get or create the singleton platform class loader.
 pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let existing = *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner());
+    let existing = *platform_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(obj) = existing {
         return obj;
     }
@@ -209,7 +224,9 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     // (classloader_real) reads the real field slot, not CL_NAME_REF.
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     // Platform's parent is bootstrap (null) — already set by alloc_classloader
-    *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    *platform_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(obj);
     obj
 }
 
@@ -288,7 +305,8 @@ const LK_PACKAGE: i32 = 0x08;
 const LK_MODULE: i32 = 0x10;
 const LK_UNCONDITIONAL: i32 = 0x20;
 const LK_ORIGINAL: i32 = 0x40;
-const LK_FULL_POWER: i32 = LK_PUBLIC | LK_PRIVATE | LK_PROTECTED | LK_PACKAGE | LK_MODULE | LK_ORIGINAL;
+const LK_FULL_POWER: i32 =
+    LK_PUBLIC | LK_PRIVATE | LK_PROTECTED | LK_PACKAGE | LK_MODULE | LK_ORIGINAL;
 
 // HiddenClass synthetic field indices (2 fields)
 const HC_NEST_HOST_REF: usize = 0;
@@ -404,9 +422,11 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // those fields by name with empty ConcurrentHashMaps so the JDK bytecode path
     // works without additional intercepts.
     if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
-        let name_to_module = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        let name_to_module =
+            alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
         ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
-        let module_to_reader = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        let module_to_reader =
+            alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
         ctx.set_field_by_name(obj, "moduleToReader", Value::Object(Some(module_to_reader)));
     }
     // S111r17: `java/lang/ClassLoader` declares `packages:ConcurrentHashMap`
@@ -421,7 +441,8 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // `Package.getPackages()` → `ClassLoader.getClassLoader(...).getPackages()`
     // → `packages()`. Pre-populate an empty CHM so the bytecode path runs
     // without additional intercepts.
-    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages_map =
+        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(obj, "packages", Value::Object(Some(packages_map)));
     // `ClassLoader.setDefaultAssertionStatus` uses `synchronized (assertionLock)`.
     // Real JDK ctors assign `this.assertionLock = new Object()`; synthetic
@@ -518,7 +539,8 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader — initialize `packages` CHM so
     // ClassLoader.packages() doesn't NPE on `getfield + values()`.
-    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages_map =
+        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -535,7 +557,8 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
-    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages_map =
+        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -553,7 +576,8 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
-    let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages_map =
+        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     // Assign unique loader ID for namespace isolation
     let lid = ctx.allocate_loader_id();
@@ -567,9 +591,7 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 pub(crate) fn is_builtin_loader_class(class_name: &str) -> bool {
     matches!(
         class_name,
-        "java/lang/ClassLoader"
-            | "java/net/URLClassLoader"
-            | "java/security/SecureClassLoader"
+        "java/lang/ClassLoader" | "java/net/URLClassLoader" | "java/security/SecureClassLoader"
     ) || class_name.starts_with("jdk/internal/loader/")
         || class_name.starts_with("sun/misc/Launcher$")
 }
@@ -862,8 +884,7 @@ fn is_cglib_proxy_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    name.contains("$$EnhancerByCGLIB$$")
-        || name.starts_with("net/sf/cglib/proxy/")
+    name.contains("$$EnhancerByCGLIB$$") || name.starts_with("net/sf/cglib/proxy/")
 }
 
 /// Returns a `Class` mirror to use as a stand-in when we short-circuit a
@@ -897,11 +918,7 @@ fn cglib_placeholder_mirror(ctx: &mut dyn NativeContext) -> Value {
 /// strict enough (`$$EnhancerByCGLIB$$` literal token or
 /// `net/sf/cglib/proxy/` package prefix) that false positives on
 /// legitimate Quarkus/Keycloak classes are not possible.
-fn cglib_guard_value(
-    ctx: &mut dyn NativeContext,
-    name: &str,
-    _bytes: &[u8],
-) -> Option<Value> {
+fn cglib_guard_value(ctx: &mut dyn NativeContext, name: &str, _bytes: &[u8]) -> Option<Value> {
     // Strict-name match only. We do NOT sniff bytecode — the previous
     // `sniff_class_file_this_name` fallback was a defensive class-file
     // parser, but bytecode parsing on adversarial / truncated buffers
@@ -911,9 +928,7 @@ fn cglib_guard_value(
     // will SEGV (the original problem) but at least we cannot regress
     // unrelated apps by mis-classifying their bytecode.
     if is_cglib_proxy_name(name) {
-        tracing::warn!(
-            "[cglib-shim] short-circuiting defineClass for {name} (SEGV avoidance)"
-        );
+        tracing::warn!("[cglib-shim] short-circuiting defineClass for {name} (SEGV avoidance)");
         return Some(cglib_placeholder_mirror(ctx));
     }
     None
@@ -1008,9 +1023,7 @@ fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Pre-validate the class file header so that obviously-bad bytes
     // never reach `define_class_full` (cheap CAFEBABE magic check).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        tracing::warn!(
-            "[define_class] invalid magic for {name_str}; rejecting"
-        );
+        tracing::warn!("[define_class] invalid magic for {name_str}; rejecting");
         return Ok(Some(Value::Object(None)));
     }
 
@@ -1166,9 +1179,7 @@ fn read_byte_array_slice(
             ));
         }
         None => {
-            return Err(format!(
-                "offset+length overflow (off={off}, len={len})"
-            ));
+            return Err(format!("offset+length overflow (off={off}, len={len})"));
         }
     }
     let ctx_ref: &dyn NativeContext = ctx;
@@ -1395,9 +1406,7 @@ fn define_class_via_full(
     // minor + major) and CAFEBABE magic must be present, otherwise the
     // backend parser may dereference garbage past the buffer end.
     if bytes.len() < 8 || bytes[0..4] != CLASS_FILE_MAGIC {
-        tracing::warn!(
-            "[define_class] invalid magic for {name}; rejecting"
-        );
+        tracing::warn!("[define_class] invalid magic for {name}; rejecting");
         return Err(RuntimeError::IllegalArgumentException {
             message: "defineClass: not a valid class file (bad magic)".into(),
         }
@@ -1414,9 +1423,7 @@ fn define_class_via_full(
     let define_result = match define_result {
         Ok(r) => r,
         Err(_) => {
-            tracing::error!(
-                "[define_class] panic inside define_class_full for {name}; aborting"
-            );
+            tracing::error!("[define_class] panic inside define_class_full for {name}; aborting");
             return Err(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
@@ -1435,9 +1442,7 @@ fn define_class_via_full(
             // when `initialize == true`).
             if initialize {
                 if let Err(msg) = ctx.initialize_class(cid) {
-                    tracing::warn!(
-                        "defineClass0 initialize: <clinit> for {name} failed: {msg}"
-                    );
+                    tracing::warn!("defineClass0 initialize: <clinit> for {name} failed: {msg}");
                 }
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -1770,10 +1775,7 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
 /// rather than try to parse it.
 const UNSAFE_DEFINE_CLASS_MAX_BYTES: usize = 1024 * 1024;
 
-fn unsafe_define_class_defensive(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::error::{LinkageError, RuntimeError};
     // arg[0] = this (Unsafe singleton), ignored
     // arg[1] = name : String (may be null — bytecode carries this_class)
@@ -1800,9 +1802,7 @@ fn unsafe_define_class_defensive(
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
-            tracing::warn!(
-                "Unsafe.defineClass({name_str}): null bytecode array — throwing NPE"
-            );
+            tracing::warn!("Unsafe.defineClass({name_str}): null bytecode array — throwing NPE");
             return Err(RuntimeError::NullPointerException {
                 message: Some("Unsafe.defineClass: bytecode array must not be null".into()),
             }
@@ -1892,9 +1892,7 @@ fn unsafe_define_class_defensive(
     // (magic + minor + major) so the backend never reads past EOF.
     // Malformed bytes → ClassFormatError (JVMS 5.3.5), not a silent null.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        tracing::warn!(
-            "Unsafe.defineClass({name_str}): bad magic — throwing ClassFormatError"
-        );
+        tracing::warn!("Unsafe.defineClass({name_str}): bad magic — throwing ClassFormatError");
         return Err(LinkageError::ClassFormatError {
             class_name: name_str,
             message: "Unsafe.defineClass: not a valid class file (bad magic)".into(),
@@ -1911,9 +1909,7 @@ fn unsafe_define_class_defensive(
 
     // Resolve loader id from arg[5]. Null loader → system (id 0).
     let loader_id = match args.get(5) {
-        Some(Value::Object(Some(loader_obj))) => {
-            get_or_assign_loader_id(ctx, *loader_obj)
-        }
+        Some(Value::Object(Some(loader_obj))) => get_or_assign_loader_id(ctx, *loader_obj),
         _ => 0,
     };
 
@@ -1967,9 +1963,7 @@ fn unsafe_define_class_defensive(
             // to NoClassDefFoundError; everything else is a malformed-class
             // (ClassFormatError). Either way the caller observes the real
             // fault rather than an NPE on a null Class.
-            tracing::warn!(
-                "Unsafe.defineClass({name_str}) backend failed: {msg} — throwing"
-            );
+            tracing::warn!("Unsafe.defineClass({name_str}) backend failed: {msg} — throwing");
             let lower = msg.to_ascii_lowercase();
             if lower.contains("not found") || lower.contains("no class def") {
                 Err(LinkageError::NoClassDefFoundError {
@@ -1995,9 +1989,7 @@ fn cl_resolve_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // resolveClass(Class) — trigger class preparation and linking
     if let Some(Value::Object(Some(class_mirror))) = args.get(1) {
         if let Some(cid) = crate::lang_class::mirror_class_id(ctx, *class_mirror) {
-            let _ = ctx.ensure_class_initialized(
-                &ctx.class_name_of_id(cid).unwrap_or_default()
-            );
+            let _ = ctx.ensure_class_initialized(&ctx.class_name_of_id(cid).unwrap_or_default());
         }
     }
     Ok(None)
@@ -2188,7 +2180,10 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         if dbg_all {
-            eprintln!("[GRES-DBG] getResource({}) -> NULL (no urls, no bytes)", resource_name);
+            eprintln!(
+                "[GRES-DBG] getResource({}) -> NULL (no urls, no bytes)",
+                resource_name
+            );
         }
         return Ok(Some(Value::Object(None)));
     };
@@ -2373,7 +2368,11 @@ fn cl_get_resources_impl(
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if dbg_all {
-        eprintln!("[GRES-DBG] getResources({}) -> {} URLs", resource_name, urls.len());
+        eprintln!(
+            "[GRES-DBG] getResources({}) -> {} URLs",
+            resource_name,
+            urls.len()
+        );
         for u in &urls {
             eprintln!("[GRES-DBG]   url: {}", u);
         }
@@ -2532,13 +2531,28 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
         // `getURLs(boolean)` that includes/excludes the loaderless entries.
         r.register(cls, "getURLs", "()[Ljava/net/URL;", ucp_get_urls_empty);
         // `closeLoaders` — both signatures.
-        r.register(cls, "closeLoaders", "()Ljava/util/List;", ucp_close_loaders_list);
+        r.register(
+            cls,
+            "closeLoaders",
+            "()Ljava/util/List;",
+            ucp_close_loaders_list,
+        );
         r.register(cls, "closeLoaders", "()V", ucp_close_loaders_void);
         // `findResource` — return null URL when probed reflectively. Both
         // the public (String) form and the internal (String, boolean) form
         // are covered.
-        r.register(cls, "findResource", "(Ljava/lang/String;)Ljava/net/URL;", ucp_find_resource_null);
-        r.register(cls, "findResource", "(Ljava/lang/String;Z)Ljava/net/URL;", ucp_find_resource_null);
+        r.register(
+            cls,
+            "findResource",
+            "(Ljava/lang/String;)Ljava/net/URL;",
+            ucp_find_resource_null,
+        );
+        r.register(
+            cls,
+            "findResource",
+            "(Ljava/lang/String;Z)Ljava/net/URL;",
+            ucp_find_resource_null,
+        );
     }
 }
 
@@ -2577,7 +2591,9 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let len = ctx.array_length(arr);
-        if idx >= len { return Ok(Some(Value::Object(None))); }
+        if idx >= len {
+            return Ok(Some(Value::Object(None)));
+        }
         let elem = ctx.get_array_element(arr, idx);
         ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
         Ok(Some(elem))
@@ -2600,7 +2616,9 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let len = ctx.array_length(arr);
-        if idx >= len { return Ok(Some(Value::Object(None))); }
+        if idx >= len {
+            return Ok(Some(Value::Object(None)));
+        }
         let elem = ctx.get_array_element(arr, idx);
         ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
         Ok(Some(elem))
@@ -2681,18 +2699,27 @@ fn cl_get_defined_packages(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     Ok(Some(Value::Object(Some(empty))))
 }
 
-fn cl_set_default_assertion_status(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn cl_set_default_assertion_status(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(None)
 }
 
-fn cl_register_as_parallel_capable(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn cl_register_as_parallel_capable(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Static method (invokestatic, descriptor ()Z).  The real JDK uses
     // getCallerClass() to find which ClassLoader subclass is being registered.
     // We don't enforce parallel-capability checks, so just return true.
     Ok(Some(Value::Int(1)))
 }
 
-fn cl_is_registered_as_parallel_capable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn cl_is_registered_as_parallel_capable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let val = match ctx.get_field(this, CL_IS_PARALLEL_CAPABLE) {
         Value::Int(v) => v,
@@ -2769,12 +2796,7 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
 }
 
 /// Initialize a URLClassLoader: store the URL array, extract paths, register with classpath.
-fn ucl_setup(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    urls: Value,
-    parent: Value,
-) {
+fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: Value) {
     ctx.set_field(this, UCL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     ctx.set_field(this, UCL_PARENT_REF, parent);
     ctx.set_field(this, UCL_CLOSED, Value::Int(0));
@@ -2805,7 +2827,10 @@ fn ucl_setup(
 
     if !paths.is_empty() {
         ctx.register_dynamic_classpath(&paths);
-        tracing::debug!("URLClassLoader.<init>: registered {} URLs to classpath", paths.len());
+        tracing::debug!(
+            "URLClassLoader.<init>: registered {} URLs to classpath",
+            paths.len()
+        );
     }
 }
 
@@ -3013,7 +3038,11 @@ fn lk_has_full_privilege_access(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn lk_has_private_access(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let modes = lk_modes_of(ctx, this);
-    Ok(Some(Value::Int(if (modes & LK_PRIVATE) != 0 { 1 } else { 0 })))
+    Ok(Some(Value::Int(if (modes & LK_PRIVATE) != 0 {
+        1
+    } else {
+        0
+    })))
 }
 
 fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3385,8 +3414,7 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // so we can pass it to the backend. The backend resolves it to
     // the actual nest_host (handles transitive nest membership).
     let nest_host_class_name = if nestmate {
-        if let Value::Object(Some(lookup_mirror)) =
-            ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF)
+        if let Value::Object(Some(lookup_mirror)) = ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF)
         {
             crate::lang_class::mirror_class_id(ctx, lookup_mirror)
                 .and_then(|cid| ctx.class_name_of_id(cid))
@@ -3493,18 +3521,30 @@ fn alloc_method_handle(
 ) -> ObjectRef {
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_FIELD_COUNT);
     ctx.set_field(mh, MH_KIND, Value::Int(kind));
-    ctx.set_field(mh, MH_TARGET_CLASS, match class_mirror {
-        Some(r) => Value::Object(Some(r)),
-        None => Value::Object(None),
-    });
-    ctx.set_field(mh, MH_NAME, match name {
-        Some(r) => Value::Object(Some(r)),
-        None => Value::Object(None),
-    });
-    ctx.set_field(mh, MH_TYPE, match method_type {
-        Some(r) => Value::Object(Some(r)),
-        None => Value::Object(None),
-    });
+    ctx.set_field(
+        mh,
+        MH_TARGET_CLASS,
+        match class_mirror {
+            Some(r) => Value::Object(Some(r)),
+            None => Value::Object(None),
+        },
+    );
+    ctx.set_field(
+        mh,
+        MH_NAME,
+        match name {
+            Some(r) => Value::Object(Some(r)),
+            None => Value::Object(None),
+        },
+    );
+    ctx.set_field(
+        mh,
+        MH_TYPE,
+        match method_type {
+            Some(r) => Value::Object(Some(r)),
+            None => Value::Object(None),
+        },
+    );
     // Resolve class ID if class mirror is available
     if let Some(mirror) = class_mirror {
         if let Some(cid) = crate::lang_class::mirror_class_id(ctx, mirror) {
@@ -3518,9 +3558,8 @@ fn alloc_method_handle(
     // mirror from the Lookup.findXxx JVM call); fall back to a synthetic
     // `()V` MethodType when nothing was supplied (e.g. lk_unreflect, where
     // the Java caller did not pass an explicit MethodType).
-    let mt_to_store = method_type.or_else(|| {
-        crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V")
-    });
+    let mt_to_store =
+        method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V"));
     if let Some(mt) = mt_to_store {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
@@ -3529,78 +3568,162 @@ fn alloc_method_handle(
 
 // findVirtual(Class refc, String name, MethodType type) -> MethodHandle
 fn lk_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let mtype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mtype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 0, class_mirror, name, mtype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let mtype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mtype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 1, class_mirror, name, mtype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let mtype = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mtype = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let name_str = ctx.create_string("<init>");
     let mh = alloc_method_handle(ctx, 2, class_mirror, Some(name_str), mtype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let ftype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let ftype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 3, class_mirror, name, ftype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let ftype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let ftype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 4, class_mirror, name, ftype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let ftype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let ftype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 5, class_mirror, name, ftype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let ftype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let ftype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 6, class_mirror, name, ftype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lk_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let mtype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let mtype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let mh = alloc_method_handle(ctx, 7, class_mirror, name, mtype);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 // VarHandle synthetic layout (3 fields): 0=target_class, 1=field_name, 2=field_type
 fn lk_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let name = match args.get(2) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
-    let ftype = match args.get(3) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let class_mirror = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let ftype = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3);
-    if let Some(cm) = class_mirror { ctx.set_field(vh, 0, Value::Object(Some(cm))); }
-    if let Some(n) = name { ctx.set_field(vh, 1, Value::Object(Some(n))); }
-    if let Some(t) = ftype { ctx.set_field(vh, 2, Value::Object(Some(t))); }
+    if let Some(cm) = class_mirror {
+        ctx.set_field(vh, 0, Value::Object(Some(cm)));
+    }
+    if let Some(n) = name {
+        ctx.set_field(vh, 1, Value::Object(Some(n)));
+    }
+    if let Some(t) = ftype {
+        ctx.set_field(vh, 2, Value::Object(Some(t)));
+    }
     Ok(Some(Value::Object(Some(vh))))
 }
 
@@ -3610,14 +3733,23 @@ fn lk_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn lk_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // unreflect(Method) -> MethodHandle — extract class/name from the Method object
-    let method = match args.get(1) { Some(Value::Object(Some(o))) => Some(*o), _ => None };
+    let method = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     // C6: Method/Constructor use real-JDK field layout; read by name.
-    let class_mirror = method.map(|m| ctx.get_field_by_name(m, "clazz")).and_then(|v| match v {
-        Value::Object(Some(r)) => Some(r), _ => None,
-    });
-    let name = method.map(|m| ctx.get_field_by_name(m, "name")).and_then(|v| match v {
-        Value::Object(Some(r)) => Some(r), _ => None,
-    });
+    let class_mirror = method
+        .map(|m| ctx.get_field_by_name(m, "clazz"))
+        .and_then(|v| match v {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        });
+    let name = method
+        .map(|m| ctx.get_field_by_name(m, "name"))
+        .and_then(|v| match v {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        });
     let mh = alloc_method_handle(ctx, 0, class_mirror, name, None);
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -3721,20 +3853,60 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 
     r.register(cl, "<init>", "()V", cl_init_default);
     r.register(cl, "<init>", "(Ljava/lang/ClassLoader;)V", cl_init_parent);
-    r.register(cl, "<init>", "(Ljava/lang/String;Ljava/lang/ClassLoader;)V", cl_init_name_parent);
-    r.register(cl, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_load_class);
-    r.register(cl, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", cl_load_class_resolve);
+    r.register(
+        cl,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;)V",
+        cl_init_name_parent,
+    );
+    r.register(
+        cl,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        cl_load_class,
+    );
+    r.register(
+        cl,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
+        cl_load_class_resolve,
+    );
     // T19_H12_LOADCLASS_MODULE — JDK 25 package-private overload used by
     // `Class.forName(Module, String)`'s stock bytecode. Registering on
     // ClassLoader keeps real ClassLoader receivers correct; the
     // `Class.forName(Module, String)` native (lang_class.rs) bypasses
     // the broken JDK bytecode path entirely so we never dispatch this
     // virtual call onto a synthetic Module whose receiver-class drifts.
-    r.register(cl, "loadClass", "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;", cl_load_class_module);
-    r.register(cl, "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_find_class);
-    r.register(cl, "findClass", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;", cl_find_class_module);
-    r.register(cl, "defineClass", "(Ljava/lang/String;[BII)Ljava/lang/Class;", cl_define_class_basic);
-    r.register(cl, "defineClass", "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;", cl_define_class_pd);
+    r.register(
+        cl,
+        "loadClass",
+        "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;",
+        cl_load_class_module,
+    );
+    r.register(
+        cl,
+        "findClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        cl_find_class,
+    );
+    r.register(
+        cl,
+        "findClass",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
+        cl_find_class_module,
+    );
+    r.register(
+        cl,
+        "defineClass",
+        "(Ljava/lang/String;[BII)Ljava/lang/Class;",
+        cl_define_class_basic,
+    );
+    r.register(
+        cl,
+        "defineClass",
+        "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
+        cl_define_class_pd,
+    );
     r.register(cl, "defineClass", "(Ljava/lang/String;Ljava/nio/ByteBuffer;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", cl_define_class_bb);
     // WP2.3-C: JDK-internal defineClass0/1/2 natives that the public
     // overloads route through. CGLIB / direct user code typically calls
@@ -3762,17 +3934,62 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         unsafe_define_class_defensive,
     );
     r.register(cl, "resolveClass", "(Ljava/lang/Class;)V", cl_resolve_class);
-    r.register(cl, "findLoadedClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_find_loaded_class);
+    r.register(
+        cl,
+        "findLoadedClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        cl_find_loaded_class,
+    );
     r.register(cl, "getParent", "()Ljava/lang/ClassLoader;", cl_get_parent);
     r.register(cl, "getName", "()Ljava/lang/String;", cl_get_name);
-    r.register(cl, "getSystemClassLoader", "()Ljava/lang/ClassLoader;", cl_get_system_class_loader);
-    r.register(cl, "getPlatformClassLoader", "()Ljava/lang/ClassLoader;", cl_get_platform_class_loader);
-    r.register(cl, "getResource", "(Ljava/lang/String;)Ljava/net/URL;", cl_get_resource);
-    r.register(cl, "getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;", cl_get_resources);
-    r.register(cl, "getSystemResources", "(Ljava/lang/String;)Ljava/util/Enumeration;", cl_get_system_resources);
-    r.register(cl, "getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;", cl_get_resource_as_stream);
-    r.register(cl, "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;", cl_get_defined_package);
-    r.register(cl, "getDefinedPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
+    r.register(
+        cl,
+        "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        cl_get_system_class_loader,
+    );
+    r.register(
+        cl,
+        "getPlatformClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        cl_get_platform_class_loader,
+    );
+    r.register(
+        cl,
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        cl_get_resource,
+    );
+    r.register(
+        cl,
+        "getResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        cl_get_resources,
+    );
+    r.register(
+        cl,
+        "getSystemResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        cl_get_system_resources,
+    );
+    r.register(
+        cl,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        cl_get_resource_as_stream,
+    );
+    r.register(
+        cl,
+        "getDefinedPackage",
+        "(Ljava/lang/String;)Ljava/lang/Package;",
+        cl_get_defined_package,
+    );
+    r.register(
+        cl,
+        "getDefinedPackages",
+        "()[Ljava/lang/Package;",
+        cl_get_defined_packages,
+    );
     // `ClassLoader.getPackages()` — real JDK bytecode is
     // `return packages().toArray(Package[]::new)` with a stream pipeline that
     // (in our boot) leaks a `ReferencePipeline$Head` into the caller's local
@@ -3780,10 +3997,30 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
     // Override with an empty array — matches the empty `getDefinedPackages`
     // override and is sufficient for jboss-modules' sanity scan.
-    r.register(cl, "getPackages", "()[Ljava/lang/Package;", cl_get_defined_packages);
-    r.register(cl, "setDefaultAssertionStatus", "(Z)V", cl_set_default_assertion_status);
-    r.register(cl, "registerAsParallelCapable", "()Z", cl_register_as_parallel_capable);
-    r.register(cl, "isRegisteredAsParallelCapable", "()Z", cl_is_registered_as_parallel_capable);
+    r.register(
+        cl,
+        "getPackages",
+        "()[Ljava/lang/Package;",
+        cl_get_defined_packages,
+    );
+    r.register(
+        cl,
+        "setDefaultAssertionStatus",
+        "(Z)V",
+        cl_set_default_assertion_status,
+    );
+    r.register(
+        cl,
+        "registerAsParallelCapable",
+        "()Z",
+        cl_register_as_parallel_capable,
+    );
+    r.register(
+        cl,
+        "isRegisteredAsParallelCapable",
+        "()Z",
+        cl_is_registered_as_parallel_capable,
+    );
 
     // -----------------------------------------------------------------------
     // java/net/URLClassLoader
@@ -3791,29 +4028,84 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     let ucl = UCL_CLASS;
 
     r.register(ucl, "<init>", "([Ljava/net/URL;)V", ucl_init_urls);
-    r.register(ucl, "<init>", "([Ljava/net/URL;Ljava/lang/ClassLoader;)V", ucl_init_urls_parent);
-    r.register(ucl, "<init>", "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V", ucl_init_urls_parent_factory);
-    r.register(ucl, "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", ucl_find_class);
-    r.register(ucl, "findResource", "(Ljava/lang/String;)Ljava/net/URL;", ucl_find_resource);
-    r.register(ucl, "findResources", "(Ljava/lang/String;)Ljava/util/Enumeration;", ucl_find_resources);
+    r.register(
+        ucl,
+        "<init>",
+        "([Ljava/net/URL;Ljava/lang/ClassLoader;)V",
+        ucl_init_urls_parent,
+    );
+    r.register(
+        ucl,
+        "<init>",
+        "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V",
+        ucl_init_urls_parent_factory,
+    );
+    r.register(
+        ucl,
+        "findClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        ucl_find_class,
+    );
+    r.register(
+        ucl,
+        "findResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        ucl_find_resource,
+    );
+    r.register(
+        ucl,
+        "findResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        ucl_find_resources,
+    );
     r.register(ucl, "getURLs", "()[Ljava/net/URL;", ucl_get_urls);
     r.register(ucl, "addURL", "(Ljava/net/URL;)V", ucl_add_url);
     r.register(ucl, "close", "()V", ucl_close);
-    r.register(ucl, "newInstance", "([Ljava/net/URL;)Ljava/net/URLClassLoader;", ucl_new_instance);
-    r.register(ucl, "newInstance", "([Ljava/net/URL;Ljava/lang/ClassLoader;)Ljava/net/URLClassLoader;", ucl_new_instance_parent);
+    r.register(
+        ucl,
+        "newInstance",
+        "([Ljava/net/URL;)Ljava/net/URLClassLoader;",
+        ucl_new_instance,
+    );
+    r.register(
+        ucl,
+        "newInstance",
+        "([Ljava/net/URL;Ljava/lang/ClassLoader;)Ljava/net/URLClassLoader;",
+        ucl_new_instance_parent,
+    );
 
     // -----------------------------------------------------------------------
     // java/lang/invoke/MethodHandles$Lookup
     // -----------------------------------------------------------------------
     let lk = LK_CLASS;
 
-    r.register(lk, "lookup", "()Ljava/lang/invoke/MethodHandles$Lookup;", lk_lookup);
+    r.register(
+        lk,
+        "lookup",
+        "()Ljava/lang/invoke/MethodHandles$Lookup;",
+        lk_lookup,
+    );
     r.register(lk, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_private_lookup_in);
-    r.register(lk, "publicLookup", "()Ljava/lang/invoke/MethodHandles$Lookup;", lk_public_lookup);
+    r.register(
+        lk,
+        "publicLookup",
+        "()Ljava/lang/invoke/MethodHandles$Lookup;",
+        lk_public_lookup,
+    );
     r.register(lk, "lookupClass", "()Ljava/lang/Class;", lk_lookup_class);
-    r.register(lk, "previousLookupClass", "()Ljava/lang/Class;", lk_previous_lookup_class);
+    r.register(
+        lk,
+        "previousLookupClass",
+        "()Ljava/lang/Class;",
+        lk_previous_lookup_class,
+    );
     r.register(lk, "lookupModes", "()I", lk_lookup_modes);
-    r.register(lk, "hasFullPrivilegeAccess", "()Z", lk_has_full_privilege_access);
+    r.register(
+        lk,
+        "hasFullPrivilegeAccess",
+        "()Z",
+        lk_has_full_privilege_access,
+    );
     r.register(lk, "hasPrivateAccess", "()Z", lk_has_private_access);
     r.register(lk, "defineClass", "([B)Ljava/lang/Class;", lk_define_class);
     r.register(lk, "defineHiddenClass", "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_define_hidden_class);
@@ -3821,10 +4113,30 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // findVarHandle/findStaticVarHandle are all registered in
     // lang_invoke::register_p63_method_handles_lookup — do NOT re-register here
     // as that would overwrite the real implementations with incompatible stubs.
-    r.register(lk, "unreflect", "(Ljava/lang/reflect/Method;)Ljava/lang/invoke/MethodHandle;", lk_unreflect);
-    r.register(lk, "unreflectSpecial", "(Ljava/lang/reflect/Method;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;", lk_unreflect_special);
-    r.register(lk, "in", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_in_method);
-    r.register(lk, "dropLookupMode", "(I)Ljava/lang/invoke/MethodHandles$Lookup;", lk_drop_lookup_mode);
+    r.register(
+        lk,
+        "unreflect",
+        "(Ljava/lang/reflect/Method;)Ljava/lang/invoke/MethodHandle;",
+        lk_unreflect,
+    );
+    r.register(
+        lk,
+        "unreflectSpecial",
+        "(Ljava/lang/reflect/Method;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        lk_unreflect_special,
+    );
+    r.register(
+        lk,
+        "in",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandles$Lookup;",
+        lk_in_method,
+    );
+    r.register(
+        lk,
+        "dropLookupMode",
+        "(I)Ljava/lang/invoke/MethodHandles$Lookup;",
+        lk_drop_lookup_mode,
+    );
 
     // -----------------------------------------------------------------------
     // java/lang/ClassLoader$HiddenClass (stub)
@@ -3836,10 +4148,30 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // -----------------------------------------------------------------------
     let pd = PD_CLASS;
 
-    r.register(pd, "<init>", "(Ljava/security/CodeSource;Ljava/security/PermissionCollection;)V", pd_init);
-    r.register(pd, "getCodeSource", "()Ljava/security/CodeSource;", pd_get_code_source);
-    r.register(pd, "getPermissions", "()Ljava/security/PermissionCollection;", pd_get_permissions);
-    r.register(pd, "getClassLoader", "()Ljava/lang/ClassLoader;", pd_get_class_loader);
+    r.register(
+        pd,
+        "<init>",
+        "(Ljava/security/CodeSource;Ljava/security/PermissionCollection;)V",
+        pd_init,
+    );
+    r.register(
+        pd,
+        "getCodeSource",
+        "()Ljava/security/CodeSource;",
+        pd_get_code_source,
+    );
+    r.register(
+        pd,
+        "getPermissions",
+        "()Ljava/security/PermissionCollection;",
+        pd_get_permissions,
+    );
+    r.register(
+        pd,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        pd_get_class_loader,
+    );
     r.register(pd, "implies", "(Ljava/security/Permission;)Z", pd_implies);
 
     // -----------------------------------------------------------------------
@@ -3847,9 +4179,19 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // -----------------------------------------------------------------------
     let cs = CS_CLASS;
 
-    r.register(cs, "<init>", "(Ljava/net/URL;[Ljava/security/cert/Certificate;)V", cs_init);
+    r.register(
+        cs,
+        "<init>",
+        "(Ljava/net/URL;[Ljava/security/cert/Certificate;)V",
+        cs_init,
+    );
     r.register(cs, "getLocation", "()Ljava/net/URL;", cs_get_location);
-    r.register(cs, "getCertificates", "()[Ljava/security/cert/Certificate;", cs_get_certificates);
+    r.register(
+        cs,
+        "getCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        cs_get_certificates,
+    );
 
     // -----------------------------------------------------------------------
     // java/io/ByteArrayInputStream — 4-field (buf=0, pos=1, mark=2, count=3)
@@ -3862,9 +4204,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
             Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
             _ => 0,
         };
-        ctx.set_field(this, 0, buf);       // buf
-        ctx.set_field(this, 1, Value::Int(0));   // pos
-        ctx.set_field(this, 2, Value::Int(0));   // mark
+        ctx.set_field(this, 0, buf); // buf
+        ctx.set_field(this, 1, Value::Int(0)); // pos
+        ctx.set_field(this, 2, Value::Int(0)); // mark
         ctx.set_field(this, 3, Value::Int(len)); // count
         Ok(None)
     });
@@ -3873,9 +4215,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let buf = args.get(1).copied().unwrap_or(Value::Object(None));
         let off = args[2].as_int().unwrap_or(0);
         let len = args[3].as_int().unwrap_or(0);
-        ctx.set_field(this, 0, buf);              // buf
-        ctx.set_field(this, 1, Value::Int(off));  // pos
-        ctx.set_field(this, 2, Value::Int(off));  // mark
+        ctx.set_field(this, 0, buf); // buf
+        ctx.set_field(this, 1, Value::Int(off)); // pos
+        ctx.set_field(this, 2, Value::Int(off)); // mark
         ctx.set_field(this, 3, Value::Int(off + len)); // count
         Ok(None)
     });
@@ -3883,12 +4225,17 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = ctx.get_field(this, 1).as_int().unwrap_or(0);
         let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        if pos >= count { return Ok(Some(Value::Int(-1))); }
+        if pos >= count {
+            return Ok(Some(Value::Int(-1)));
+        }
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Int(-1))),
         };
-        let b = ctx.get_array_element(arr, pos as usize).as_int().unwrap_or(0);
+        let b = ctx
+            .get_array_element(arr, pos as usize)
+            .as_int()
+            .unwrap_or(0);
         ctx.set_field(this, 1, Value::Int(pos + 1));
         Ok(Some(Value::Int(b & 0xff)))
     });
@@ -3899,7 +4246,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let len = args[3].as_int().unwrap_or(0) as usize;
         let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let count = ctx.get_field(this, 3).as_int().unwrap_or(0) as usize;
-        if pos >= count { return Ok(Some(Value::Int(-1))); }
+        if pos >= count {
+            return Ok(Some(Value::Int(-1)));
+        }
         let avail = count - pos;
         let n = len.min(avail);
         let arr = match ctx.get_field(this, 0) {
@@ -3983,12 +4332,17 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
             // BAIS: buf=0, pos=1, mark=2, count=3
             let pos = ctx.get_field(stream, 1).as_int().unwrap_or(0);
             let count = ctx.get_field(stream, 3).as_int().unwrap_or(0);
-            if pos >= count { return None; }
+            if pos >= count {
+                return None;
+            }
             let buf = match ctx.get_field(stream, 0) {
                 Value::Object(Some(a)) => a,
                 _ => return None,
             };
-            let b = ctx.get_array_element(buf, pos as usize).as_int().unwrap_or(0);
+            let b = ctx
+                .get_array_element(buf, pos as usize)
+                .as_int()
+                .unwrap_or(0);
             ctx.set_field(stream, 1, Value::Int(pos + 1));
             Some((b & 0xFF) as u8)
         } else {
@@ -4015,7 +4369,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let stream = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field(this, 0, stream); // in (FilterInputStream.in)
-        // readBuffer = new byte[8]
+                                        // readBuffer = new byte[8]
         let rb = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
         ctx.set_field(this, 1, Value::Object(Some(rb)));
         Ok(None)
@@ -4027,7 +4381,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 4 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readInt".into(),
-            }.into());
+            }
+            .into());
         }
         let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         Ok(Some(Value::Int(v)))
@@ -4039,7 +4394,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 2 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readShort".into(),
-            }.into());
+            }
+            .into());
         }
         let v = i16::from_be_bytes([bytes[0], bytes[1]]);
         Ok(Some(Value::Int(v as i32)))
@@ -4051,7 +4407,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 2 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUnsignedShort".into(),
-            }.into());
+            }
+            .into());
         }
         let v = u16::from_be_bytes([bytes[0], bytes[1]]);
         Ok(Some(Value::Int(v as i32)))
@@ -4063,10 +4420,12 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 8 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readLong".into(),
-            }.into());
+            }
+            .into());
         }
-        let v = i64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                     bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let v = i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         Ok(Some(Value::Long(v)))
     });
 
@@ -4076,7 +4435,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.is_empty() {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readBoolean".into(),
-            }.into());
+            }
+            .into());
         }
         Ok(Some(Value::Int(if bytes[0] != 0 { 1 } else { 0 })))
     });
@@ -4087,7 +4447,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.is_empty() {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readByte".into(),
-            }.into());
+            }
+            .into());
         }
         Ok(Some(Value::Int(bytes[0] as i8 as i32)))
     });
@@ -4098,7 +4459,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.is_empty() {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUnsignedByte".into(),
-            }.into());
+            }
+            .into());
         }
         Ok(Some(Value::Int(bytes[0] as i32)))
     });
@@ -4109,7 +4471,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 2 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readChar".into(),
-            }.into());
+            }
+            .into());
         }
         let v = u16::from_be_bytes([bytes[0], bytes[1]]);
         Ok(Some(Value::Int(v as i32)))
@@ -4121,7 +4484,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 4 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFloat".into(),
-            }.into());
+            }
+            .into());
         }
         let bits = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         Ok(Some(Value::Float(f32::from_bits(bits))))
@@ -4133,10 +4497,12 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < 8 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readDouble".into(),
-            }.into());
+            }
+            .into());
         }
-        let bits = u64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                        bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let bits = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         Ok(Some(Value::Double(f64::from_bits(bits))))
     });
 
@@ -4149,7 +4515,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < len {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFully".into(),
-            }.into());
+            }
+            .into());
         }
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(dst, off + i, Value::Int(b as i8 as i32));
@@ -4165,7 +4532,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if bytes.len() < len {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFully".into(),
-            }.into());
+            }
+            .into());
         }
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(dst, i, Value::Int(b as i8 as i32));
@@ -4181,34 +4549,42 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         if len_bytes.len() < 2 {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUTF".into(),
-            }.into());
+            }
+            .into());
         }
         let utf_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
         let data = dis_read_n(ctx, this, utf_len);
         if data.len() < utf_len {
             return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUTF data".into(),
-            }.into());
+            }
+            .into());
         }
         // Decode modified UTF-8
         let mut chars = Vec::new();
         let mut i = 0;
         while i < data.len() {
             let b = data[i];
-            if b == 0 { break; }
+            if b == 0 {
+                break;
+            }
             if b < 0x80 {
                 chars.push(b as char);
                 i += 1;
             } else if b & 0xE0 == 0xC0 {
-                if i + 1 >= data.len() { break; }
-                let c = ((b as u32 & 0x1F) << 6) | (data[i+1] as u32 & 0x3F);
+                if i + 1 >= data.len() {
+                    break;
+                }
+                let c = ((b as u32 & 0x1F) << 6) | (data[i + 1] as u32 & 0x3F);
                 chars.push(char::from_u32(c).unwrap_or('?'));
                 i += 2;
             } else if b & 0xF0 == 0xE0 {
-                if i + 2 >= data.len() { break; }
+                if i + 2 >= data.len() {
+                    break;
+                }
                 let c = ((b as u32 & 0x0F) << 12)
-                    | ((data[i+1] as u32 & 0x3F) << 6)
-                    | (data[i+2] as u32 & 0x3F);
+                    | ((data[i + 1] as u32 & 0x3F) << 6)
+                    | (data[i + 2] as u32 & 0x3F);
                 chars.push(char::from_u32(c).unwrap_or('?'));
                 i += 3;
             } else {
@@ -4385,49 +4761,93 @@ mod classloader_tests {
     #[test]
     fn test_cl_init_parent_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "<init>", "(Ljava/lang/ClassLoader;)V").is_some());
+        assert!(r
+            .find(CL_CLASS, "<init>", "(Ljava/lang/ClassLoader;)V")
+            .is_some());
     }
 
     #[test]
     fn test_cl_init_name_parent_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "<init>", "(Ljava/lang/String;Ljava/lang/ClassLoader;)V").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/ClassLoader;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_load_class_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_load_class_resolve_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "loadClass",
+                "(Ljava/lang/String;Z)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_find_class_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "findClass", "(Ljava/lang/String;)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "findClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_find_class_module_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "findClass", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "findClass",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_define_class_basic_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "defineClass", "(Ljava/lang/String;[BII)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "defineClass",
+                "(Ljava/lang/String;[BII)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_define_class_pd_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "defineClass", "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "defineClass",
+                "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4524,55 +4944,89 @@ mod classloader_tests {
     #[test]
     fn test_cl_get_parent_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "getParent", "()Ljava/lang/ClassLoader;").is_some());
+        assert!(r
+            .find(CL_CLASS, "getParent", "()Ljava/lang/ClassLoader;")
+            .is_some());
     }
 
     #[test]
     fn test_cl_get_name_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "getName", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(CL_CLASS, "getName", "()Ljava/lang/String;")
+            .is_some());
     }
 
     #[test]
     fn test_cl_get_system_class_loader_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "getSystemClassLoader", "()Ljava/lang/ClassLoader;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "getSystemClassLoader",
+                "()Ljava/lang/ClassLoader;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_get_platform_class_loader_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "getPlatformClassLoader", "()Ljava/lang/ClassLoader;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "getPlatformClassLoader",
+                "()Ljava/lang/ClassLoader;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_resolve_class_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "resolveClass", "(Ljava/lang/Class;)V").is_some());
+        assert!(r
+            .find(CL_CLASS, "resolveClass", "(Ljava/lang/Class;)V")
+            .is_some());
     }
 
     #[test]
     fn test_cl_find_loaded_class_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "findLoadedClass", "(Ljava/lang/String;)Ljava/lang/Class;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "findLoadedClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_get_resource_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "getResource", "(Ljava/lang/String;)Ljava/net/URL;").is_some());
+        assert!(r
+            .find(
+                CL_CLASS,
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cl_register_as_parallel_capable_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "registerAsParallelCapable", "()Z").is_some());
+        assert!(r
+            .find(CL_CLASS, "registerAsParallelCapable", "()Z")
+            .is_some());
     }
 
     #[test]
     fn test_cl_is_registered_as_parallel_capable_registered() {
         let r = make_registry();
-        assert!(r.find(CL_CLASS, "isRegisteredAsParallelCapable", "()Z").is_some());
+        assert!(r
+            .find(CL_CLASS, "isRegisteredAsParallelCapable", "()Z")
+            .is_some());
     }
 
     // --- URLClassLoader registration tests ---
@@ -4586,7 +5040,13 @@ mod classloader_tests {
     #[test]
     fn test_ucl_init_urls_parent_registered() {
         let r = make_registry();
-        assert!(r.find(UCL_CLASS, "<init>", "([Ljava/net/URL;Ljava/lang/ClassLoader;)V").is_some());
+        assert!(r
+            .find(
+                UCL_CLASS,
+                "<init>",
+                "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4610,13 +5070,25 @@ mod classloader_tests {
     #[test]
     fn test_ucl_new_instance_registered() {
         let r = make_registry();
-        assert!(r.find(UCL_CLASS, "newInstance", "([Ljava/net/URL;)Ljava/net/URLClassLoader;").is_some());
+        assert!(r
+            .find(
+                UCL_CLASS,
+                "newInstance",
+                "([Ljava/net/URL;)Ljava/net/URLClassLoader;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_ucl_new_instance_parent_registered() {
         let r = make_registry();
-        assert!(r.find(UCL_CLASS, "newInstance", "([Ljava/net/URL;Ljava/lang/ClassLoader;)Ljava/net/URLClassLoader;").is_some());
+        assert!(r
+            .find(
+                UCL_CLASS,
+                "newInstance",
+                "([Ljava/net/URL;Ljava/lang/ClassLoader;)Ljava/net/URLClassLoader;"
+            )
+            .is_some());
     }
 
     // --- MethodHandles$Lookup registration tests ---
@@ -4624,13 +5096,25 @@ mod classloader_tests {
     #[test]
     fn test_lk_lookup_registered() {
         let r = make_registry();
-        assert!(r.find(LK_CLASS, "lookup", "()Ljava/lang/invoke/MethodHandles$Lookup;").is_some());
+        assert!(r
+            .find(
+                LK_CLASS,
+                "lookup",
+                "()Ljava/lang/invoke/MethodHandles$Lookup;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_lk_public_lookup_registered() {
         let r = make_registry();
-        assert!(r.find(LK_CLASS, "publicLookup", "()Ljava/lang/invoke/MethodHandles$Lookup;").is_some());
+        assert!(r
+            .find(
+                LK_CLASS,
+                "publicLookup",
+                "()Ljava/lang/invoke/MethodHandles$Lookup;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4648,7 +5132,13 @@ mod classloader_tests {
     #[test]
     fn test_lk_find_constructor_registered() {
         let r = make_registry();
-        assert!(r.find(LK_CLASS, "findConstructor", "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;").is_some());
+        assert!(r
+            .find(
+                LK_CLASS,
+                "findConstructor",
+                "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4660,7 +5150,13 @@ mod classloader_tests {
     #[test]
     fn test_lk_drop_lookup_mode_registered() {
         let r = make_registry();
-        assert!(r.find(LK_CLASS, "dropLookupMode", "(I)Ljava/lang/invoke/MethodHandles$Lookup;").is_some());
+        assert!(r
+            .find(
+                LK_CLASS,
+                "dropLookupMode",
+                "(I)Ljava/lang/invoke/MethodHandles$Lookup;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -4943,19 +5439,29 @@ mod classloader_tests {
     #[test]
     fn test_pd_init_registered() {
         let r = make_registry();
-        assert!(r.find(PD_CLASS, "<init>", "(Ljava/security/CodeSource;Ljava/security/PermissionCollection;)V").is_some());
+        assert!(r
+            .find(
+                PD_CLASS,
+                "<init>",
+                "(Ljava/security/CodeSource;Ljava/security/PermissionCollection;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_pd_get_code_source_registered() {
         let r = make_registry();
-        assert!(r.find(PD_CLASS, "getCodeSource", "()Ljava/security/CodeSource;").is_some());
+        assert!(r
+            .find(PD_CLASS, "getCodeSource", "()Ljava/security/CodeSource;")
+            .is_some());
     }
 
     #[test]
     fn test_pd_implies_registered() {
         let r = make_registry();
-        assert!(r.find(PD_CLASS, "implies", "(Ljava/security/Permission;)Z").is_some());
+        assert!(r
+            .find(PD_CLASS, "implies", "(Ljava/security/Permission;)Z")
+            .is_some());
     }
 
     // --- CodeSource registration tests ---
@@ -4963,19 +5469,33 @@ mod classloader_tests {
     #[test]
     fn test_cs_init_registered() {
         let r = make_registry();
-        assert!(r.find(CS_CLASS, "<init>", "(Ljava/net/URL;[Ljava/security/cert/Certificate;)V").is_some());
+        assert!(r
+            .find(
+                CS_CLASS,
+                "<init>",
+                "(Ljava/net/URL;[Ljava/security/cert/Certificate;)V"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_cs_get_location_registered() {
         let r = make_registry();
-        assert!(r.find(CS_CLASS, "getLocation", "()Ljava/net/URL;").is_some());
+        assert!(r
+            .find(CS_CLASS, "getLocation", "()Ljava/net/URL;")
+            .is_some());
     }
 
     #[test]
     fn test_cs_get_certificates_registered() {
         let r = make_registry();
-        assert!(r.find(CS_CLASS, "getCertificates", "()[Ljava/security/cert/Certificate;").is_some());
+        assert!(r
+            .find(
+                CS_CLASS,
+                "getCertificates",
+                "()[Ljava/security/cert/Certificate;"
+            )
+            .is_some());
     }
 
     // --- Delegation model tests ---

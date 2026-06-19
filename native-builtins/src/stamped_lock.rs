@@ -820,8 +820,12 @@ mod tests {
         }
         let counts: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         // At the barrier rendezvous all 4 readers were holding.
-        assert!(counts.iter().any(|c| *c == n as i32),
-            "expected at least one observation of {} concurrent readers, got {:?}", n, counts);
+        assert!(
+            counts.iter().any(|c| *c == n as i32),
+            "expected at least one observation of {} concurrent readers, got {:?}",
+            n,
+            counts
+        );
         assert_eq!(rw_read_count(a), 0);
     }
 }

@@ -41,7 +41,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -116,7 +120,9 @@ fn bdprobe_full_arithmetic_roundtrip() {
         rc,
         Some(0),
         "rbigdec1-full: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     // Ignore [tracing]-prefixed warn lines so the assertion only sees the
     // application stdout.  HotSpot prints "11\n20\nOK".
@@ -128,7 +134,8 @@ fn bdprobe_full_arithmetic_roundtrip() {
     assert!(
         lines.iter().any(|l| *l == "11"),
         "rbigdec1-full: expected '11' line (BigDecimal.ONE.add(TEN)). Got lines={:?}\nstderr={:?}",
-        lines, stderr
+        lines,
+        stderr
     );
     assert!(
         lines.iter().any(|l| *l == "20"),

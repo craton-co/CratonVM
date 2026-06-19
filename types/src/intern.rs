@@ -209,7 +209,10 @@ mod tests {
         let pool = StringPool::new();
         let a = pool.intern_arc("hello");
         let b = pool.intern_arc("hello");
-        assert!(Arc::ptr_eq(&a, &b), "same string must yield same allocation");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same string must yield same allocation"
+        );
     }
 
     #[test]
@@ -236,8 +239,7 @@ mod tests {
             let handles: Vec<_> = (0..4)
                 .map(|_| s.spawn(|| pool_ref.intern_arc("shared")))
                 .collect();
-            let results: Vec<Arc<str>> =
-                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let results: Vec<Arc<str>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             for r in &results {
                 assert!(Arc::ptr_eq(r, &results[0]));
             }
@@ -255,8 +257,7 @@ mod tests {
                 .iter()
                 .map(|&val| s.spawn(move || pool_ref.intern_arc(val)))
                 .collect();
-            let results: Vec<Arc<str>> =
-                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let results: Vec<Arc<str>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             // All four must be distinct allocations with correct values.
             for (i, r) in results.iter().enumerate() {
                 assert_eq!(&**r, strings[i]);
@@ -393,10 +394,7 @@ mod tests {
             let handles: Vec<_> = (0..4)
                 .map(|_| s.spawn(|| pool_ref.intern_arc("java/lang/String")))
                 .collect();
-            let results: Vec<Arc<str>> = handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect();
+            let results: Vec<Arc<str>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             for r in &results {
                 assert!(Arc::ptr_eq(r, &results[0]));
                 assert_eq!(&**r, "java/lang/String");

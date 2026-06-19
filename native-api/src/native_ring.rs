@@ -281,10 +281,7 @@ mod tests {
     #[test]
     fn eager_register_resolves() {
         register_name(PTR_EAGER, "java/lang/Foo.bar()V");
-        assert_eq!(
-            name_of(PTR_EAGER).as_deref(),
-            Some("java/lang/Foo.bar()V")
-        );
+        assert_eq!(name_of(PTR_EAGER).as_deref(), Some("java/lang/Foo.bar()V"));
     }
 
     #[test]
@@ -296,16 +293,10 @@ mod tests {
         }
         register_name_lazy(PTR_LAZY, resolver);
         // First lookup runs the resolver...
-        assert_eq!(
-            name_of(PTR_LAZY).as_deref(),
-            Some("java/lang/Baz.qux()V")
-        );
+        assert_eq!(name_of(PTR_LAZY).as_deref(), Some("java/lang/Baz.qux()V"));
         // ...and promotes the result into the eager map for subsequent hits.
         assert!(name_map().lock().contains_key(&PTR_LAZY));
-        assert_eq!(
-            name_of(PTR_LAZY).as_deref(),
-            Some("java/lang/Baz.qux()V")
-        );
+        assert_eq!(name_of(PTR_LAZY).as_deref(), Some("java/lang/Baz.qux()V"));
     }
 
     #[test]

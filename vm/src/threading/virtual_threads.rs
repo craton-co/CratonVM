@@ -71,7 +71,13 @@ pub struct FrozenFrame {
 impl FrozenFrame {
     /// Create a lightweight FrozenFrame for testing (no restoration metadata).
     #[cfg(test)]
-    pub fn test_frame(class: &str, method: &str, pc: usize, locals: Vec<u64>, stack: Vec<u64>) -> Self {
+    pub fn test_frame(
+        class: &str,
+        method: &str,
+        pc: usize,
+        locals: Vec<u64>,
+        stack: Vec<u64>,
+    ) -> Self {
         let local_tags = vec![0u8; locals.len()];
         let stack_tags = vec![0u8; stack.len()];
         Self {
@@ -432,9 +438,7 @@ impl ForkJoinScheduler {
     /// Submit a virtual thread for execution (goes into the global queue).
     pub fn submit(&self, vt_id: u64) {
         self.submission_queue.lock().push_back(vt_id);
-        self.stats
-            .total_submissions
-            .fetch_add(1, Ordering::Relaxed);
+        self.stats.total_submissions.fetch_add(1, Ordering::Relaxed);
         self.total_created.fetch_add(1, Ordering::Relaxed);
         // Wake one carrier thread waiting for work.
         self.task_available.notify_one();
@@ -681,7 +685,10 @@ impl VirtualThreadManager {
             drop(threads);
             if was_parked {
                 self.scheduler.submit(vt_id);
-                self.scheduler.stats.total_unparks.fetch_add(1, Ordering::Relaxed);
+                self.scheduler
+                    .stats
+                    .total_unparks
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -772,7 +779,10 @@ impl VirtualThreadManager {
         if let Some(vt) = threads.get_mut(&vt_id) {
             let result = vt.park_with_frames(frames);
             if result {
-                self.scheduler.stats.total_parks.fetch_add(1, Ordering::Relaxed);
+                self.scheduler
+                    .stats
+                    .total_parks
+                    .fetch_add(1, Ordering::Relaxed);
             }
             result
         } else {
@@ -790,7 +800,10 @@ impl VirtualThreadManager {
             drop(threads);
             if was_parked {
                 self.scheduler.submit(vt_id);
-                self.scheduler.stats.total_unparks.fetch_add(1, Ordering::Relaxed);
+                self.scheduler
+                    .stats
+                    .total_unparks
+                    .fetch_add(1, Ordering::Relaxed);
             }
             frames
         } else {
@@ -873,7 +886,7 @@ impl VirtualThreadManager {
         vt_id: u64,
         raw_id: i64,
     ) -> Result<(), super::event_loop::EventLoopError> {
-        use super::event_loop::{EventLoopId, event_loop_manager};
+        use super::event_loop::{event_loop_manager, EventLoopId};
         let eid = EventLoopId::from_raw(raw_id)?;
         // Verify the id actually exists.
         event_loop_manager().lookup(eid)?;
@@ -895,7 +908,7 @@ impl VirtualThreadManager {
         raw_id: i64,
         task: super::event_loop::EventLoopTask,
     ) -> Result<(), super::event_loop::EventLoopError> {
-        use super::event_loop::{EventLoopId, event_loop_manager};
+        use super::event_loop::{event_loop_manager, EventLoopId};
         let eid = EventLoopId::from_raw(raw_id)?;
         event_loop_manager().schedule_on_event_loop(eid, task)
     }
@@ -1052,9 +1065,7 @@ mod tests {
 
     #[test]
     fn continuation_state_transitions() {
-        let scope = ContinuationScope {
-            name: "sc".into(),
-        };
+        let scope = ContinuationScope { name: "sc".into() };
         let mut c = Continuation::new(scope);
         assert_eq!(c.state, ContinuationState::New);
 
@@ -1073,9 +1084,7 @@ mod tests {
 
     #[test]
     fn continuation_yield_count_increments() {
-        let mut c = Continuation::new(ContinuationScope {
-            name: "s".into(),
-        });
+        let mut c = Continuation::new(ContinuationScope { name: "s".into() });
         c.state = ContinuationState::Running;
         c.freeze(Vec::new());
         assert_eq!(c.yield_count(), 1);
@@ -1086,9 +1095,7 @@ mod tests {
 
     #[test]
     fn continuation_can_yield() {
-        let mut c = Continuation::new(ContinuationScope {
-            name: "s".into(),
-        });
+        let mut c = Continuation::new(ContinuationScope { name: "s".into() });
         assert!(!c.can_yield()); // New
         c.state = ContinuationState::Running;
         assert!(c.can_yield());
@@ -1238,10 +1245,7 @@ mod tests {
         // Carrier 0 should steal it.
         let stolen = sched.try_steal(0);
         assert_eq!(stolen, Some(300));
-        assert_eq!(
-            sched.stats.total_steals.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(sched.stats.total_steals.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1284,10 +1288,7 @@ mod tests {
         sched.submit(1);
         sched.submit(2);
         sched.submit(3);
-        assert_eq!(
-            sched.stats().total_submissions.load(Ordering::Relaxed),
-            3
-        );
+        assert_eq!(sched.stats().total_submissions.load(Ordering::Relaxed), 3);
     }
 
     // -- VirtualThreadManager -------------------------------------------------
@@ -1341,10 +1342,7 @@ mod tests {
         let id = mgr.create_virtual_thread("vt");
         mgr.start(id);
         mgr.terminate(id);
-        assert_eq!(
-            mgr.get_state(id),
-            Some(VirtualThreadState::Terminated)
-        );
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Terminated));
     }
 
     #[test]
@@ -1506,12 +1504,14 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         let counter = Arc::new(AtomicUsize::new(0));
-        let handles: Vec<_> = (0..1000).map(|_| {
-            let c = counter.clone();
-            std::thread::spawn(move || {
-                c.fetch_add(1, Ordering::Relaxed);
+        let handles: Vec<_> = (0..1000)
+            .map(|_| {
+                let c = counter.clone();
+                std::thread::spawn(move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                })
             })
-        }).collect();
+            .collect();
         for h in handles {
             h.join().unwrap();
         }
@@ -1559,9 +1559,8 @@ mod tests {
     #[test]
     fn test_virtual_thread_exception_propagation() {
         // If virtual thread throws, it should be joinable with error
-        let handle = std::thread::spawn(|| -> Result<i32, String> {
-            Err("virtual thread failure".into())
-        });
+        let handle =
+            std::thread::spawn(|| -> Result<i32, String> { Err("virtual thread failure".into()) });
         let result = handle.join().unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "virtual thread failure");
@@ -1591,14 +1590,16 @@ mod tests {
         thread_local! {
             static LOCAL: RefCell<i32> = RefCell::new(0);
         }
-        let handles: Vec<_> = (0..5).map(|i| {
-            std::thread::spawn(move || {
-                LOCAL.with(|v| {
-                    *v.borrow_mut() = i;
-                    assert_eq!(*v.borrow(), i);
-                });
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    LOCAL.with(|v| {
+                        *v.borrow_mut() = i;
+                        assert_eq!(*v.borrow(), i);
+                    });
+                })
             })
-        }).collect();
+            .collect();
         for h in handles {
             h.join().unwrap();
         }
@@ -1703,25 +1704,29 @@ mod tests {
         use crate::classloading::ClassId;
         use crate::runtime::frame::Frame;
 
-        let scope = ContinuationScope { name: "VirtualThread".into() };
+        let scope = ContinuationScope {
+            name: "VirtualThread".into(),
+        };
         let mut cont = Continuation::new(scope);
         cont.state = ContinuationState::Running;
 
         // Create a stack of 3 nested frames (simulating call chain)
-        let frames: Vec<Frame> = (0..3).map(|i| {
-            Frame::new(
-                ClassId::new(i),
-                format!("Class{}", i),
-                format!("method{}", i),
-                "()V".to_string(),
-                None,
-                vec![0xb1], // return
-                vec![],
-                5,
-                2,
-                &[Value::Int(i as i32 * 10)],
-            )
-        }).collect();
+        let frames: Vec<Frame> = (0..3)
+            .map(|i| {
+                Frame::new(
+                    ClassId::new(i),
+                    format!("Class{}", i),
+                    format!("method{}", i),
+                    "()V".to_string(),
+                    None,
+                    vec![0xb1], // return
+                    vec![],
+                    5,
+                    2,
+                    &[Value::Int(i as i32 * 10)],
+                )
+            })
+            .collect();
 
         cont.freeze_frames(frames);
         assert_eq!(cont.state, ContinuationState::Suspended);
@@ -1747,28 +1752,32 @@ mod tests {
         use crate::classloading::ClassId;
         use crate::runtime::frame::Frame;
 
-        let scope = ContinuationScope { name: "VirtualThread".into() };
+        let scope = ContinuationScope {
+            name: "VirtualThread".into(),
+        };
         let mut cont = Continuation::new(scope);
         cont.state = ContinuationState::Running;
 
         // Create a deep call stack (100 frames — e.g. recursive method)
         let depth = 100;
-        let frames: Vec<Frame> = (0..depth).map(|i| {
-            let mut f = Frame::new(
-                ClassId::new(0),
-                "RecursiveClass".to_string(),
-                "recurse".to_string(),
-                "(I)V".to_string(),
-                None,
-                vec![0xb1],
-                vec![],
-                5,
-                3,
-                &[Value::Int(i as i32)],
-            );
-            f.pc = i; // each frame at different PC
-            f
-        }).collect();
+        let frames: Vec<Frame> = (0..depth)
+            .map(|i| {
+                let mut f = Frame::new(
+                    ClassId::new(0),
+                    "RecursiveClass".to_string(),
+                    "recurse".to_string(),
+                    "(I)V".to_string(),
+                    None,
+                    vec![0xb1],
+                    vec![],
+                    5,
+                    3,
+                    &[Value::Int(i as i32)],
+                );
+                f.pc = i; // each frame at different PC
+                f
+            })
+            .collect();
 
         cont.freeze_frames(frames);
         assert_eq!(cont.frozen_frames.len(), depth);
@@ -1787,7 +1796,9 @@ mod tests {
         use crate::runtime::frame::Frame;
         use cratonvm_reader::attribute::ExceptionTableEntry;
 
-        let scope = ContinuationScope { name: "VirtualThread".into() };
+        let scope = ContinuationScope {
+            name: "VirtualThread".into(),
+        };
         let mut cont = Continuation::new(scope);
         cont.state = ContinuationState::Running;
 
@@ -1862,15 +1873,17 @@ mod tests {
         }
 
         let stolen_count = Arc::new(AtomicUsize::new(0));
-        let handles: Vec<_> = (1..4).map(|idx| {
-            let s = sched.clone();
-            let sc = stolen_count.clone();
-            std::thread::spawn(move || {
-                while let Some(_) = s.try_steal(idx) {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                }
+        let handles: Vec<_> = (1..4)
+            .map(|idx| {
+                let s = sched.clone();
+                let sc = stolen_count.clone();
+                std::thread::spawn(move || {
+                    while let Some(_) = s.try_steal(idx) {
+                        sc.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -1882,7 +1895,6 @@ mod tests {
 
     #[test]
     fn p81_scheduler_carrier_reuse() {
-        
         use std::collections::HashSet;
 
         let mgr = VirtualThreadManager::new(1); // 1 carrier
@@ -1966,8 +1978,11 @@ mod tests {
         }
 
         mgr.shutdown();
-        assert_eq!(counter.load(Ordering::SeqCst), 1000,
-            "all 1000 virtual threads should have executed");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1000,
+            "all 1000 virtual threads should have executed"
+        );
     }
 
     // -- 81.3: Virtual Thread Park/Unpark --------------------------------
@@ -2056,7 +2071,11 @@ mod tests {
 
         // The scheduler should have the task resubmitted
         let task = mgr.scheduler().next_task(0);
-        assert_eq!(task, Some(id), "timer should have resubmitted the virtual thread");
+        assert_eq!(
+            task,
+            Some(id),
+            "timer should have resubmitted the virtual thread"
+        );
     }
 
     #[test]

@@ -41,9 +41,7 @@ static GLOBAL: OnceLock<Arc<(AtomicI32, Mutex<()>, Condvar)>> = OnceLock::new();
 /// before any `SharedVm` exists.
 pub fn global() -> Arc<(AtomicI32, Mutex<()>, Condvar)> {
     GLOBAL
-        .get_or_init(|| {
-            Arc::new((AtomicI32::new(0), Mutex::new(()), Condvar::new()))
-        })
+        .get_or_init(|| Arc::new((AtomicI32::new(0), Mutex::new(()), Condvar::new())))
         .clone()
 }
 

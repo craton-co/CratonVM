@@ -16,11 +16,7 @@
 
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-    )
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic,)
 )]
 
 use std::collections::HashMap;
@@ -438,8 +434,7 @@ impl JvmThread {
         *OFFSET.get_or_init(|| {
             let t = JvmThread::default();
             let base = &t as *const JvmThread as usize;
-            let ss_addr =
-                &t.shadow_stack as *const cratonvm_gc::shadow_stack::ShadowStack as usize;
+            let ss_addr = &t.shadow_stack as *const cratonvm_gc::shadow_stack::ShadowStack as usize;
             ss_addr - base
         })
     }

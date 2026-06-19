@@ -28,11 +28,7 @@ fn normalise_url_path(raw: &str) -> String {
     let p = raw.strip_prefix("file:").unwrap_or(raw);
     let p = p.strip_prefix("//").unwrap_or(p);
     let bytes = p.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b':'
-    {
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
         p[1..].to_string()
     } else {
         p.to_string()
@@ -142,27 +138,15 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
 
     // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
     // `getfield packages → values()` and would NPE on null.
-    let packages = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/ConcurrentHashMap",
-        16,
-    );
+    let packages = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
 
     // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
-    let pkg2certs = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/ConcurrentHashMap",
-        16,
-    );
+    let pkg2certs = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
 
     // `parallelLockMap` — used by `getClassLoadingLock`.
-    let lock_map = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/ConcurrentHashMap",
-        16,
-    );
+    let lock_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
 
     // `assertionLock` — `setDefaultAssertionStatus` synchronizes on it.
@@ -185,7 +169,10 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // native `<init>()V` (a bare `alloc_concurrent_synthetic` leaves the segments
     // array null, so `computeIfAbsent` would silently no-op) and only when null
     // so a real ctor that already ran is not clobbered.
-    if !matches!(ctx.get_field_by_name(this, "pdcache"), Value::Object(Some(_))) {
+    if !matches!(
+        ctx.get_field_by_name(this, "pdcache"),
+        Value::Object(Some(_))
+    ) {
         if let Ok(Some(Value::Object(Some(chm)))) =
             ctx.new_object("java/util/concurrent/ConcurrentHashMap")
         {
@@ -241,9 +228,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
         );
     }
     if !matches!(existing, Value::Object(Some(_))) {
-        if let Ok(Some(Value::Object(Some(whm)))) =
-            ctx.new_object("java/util/WeakHashMap")
-        {
+        if let Ok(Some(Value::Object(Some(whm)))) = ctx.new_object("java/util/WeakHashMap") {
             // Route through the native `WeakHashMap.<init>()V` so the
             // backing buckets array is installed; ignore failure (the
             // object is still a valid non-null monitor either way).
@@ -355,24 +340,19 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     );
 
     // ClassLoader.getParent() — read parent field
-    r.register(
-        cl,
-        "getParent",
-        "()Ljava/lang/ClassLoader;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let parent = ctx.get_field_by_name(this, "parent");
-            // Coerce Int(0) from zero-initialized fields to Object(None)
-            match parent {
-                Value::Object(_) => Ok(Some(parent)),
-                Value::Int(0) | Value::Long(0) => Ok(Some(Value::Object(None))),
-                _ => Ok(Some(Value::Object(None))),
-            }
-        },
-    );
+    r.register(cl, "getParent", "()Ljava/lang/ClassLoader;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let parent = ctx.get_field_by_name(this, "parent");
+        // Coerce Int(0) from zero-initialized fields to Object(None)
+        match parent {
+            Value::Object(_) => Ok(Some(parent)),
+            Value::Int(0) | Value::Long(0) => Ok(Some(Value::Object(None))),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
 
     // ClassLoader.getName() — read name field
     r.register(cl, "getName", "()Ljava/lang/String;", |ctx, args| {
@@ -466,12 +446,9 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     );
 
     // ClassLoader.registerAsParallelCapable() — always return true
-    r.register(
-        cl,
-        "registerAsParallelCapable",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+    r.register(cl, "registerAsParallelCapable", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
 
     // URLClassLoader ctors — Spring Boot launcher allocates
     // `LaunchedURLClassLoader` / `LaunchedClassLoader` via these signatures
@@ -769,7 +746,9 @@ fn cl_real_load_class(
     let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
     let msg = ctx.create_string(&class_name);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
-    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+        exc,
+    ))
 }
 
 /// Get or create the system (app) class loader singleton.

@@ -27,10 +27,20 @@ fn empty_get_returns_null() {
     let hm = new_hashmap(&reg, &mut ctx);
 
     let key = boxed_int(&mut ctx, 42);
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), key]).unwrap();
-    assert_eq!(got, Some(Value::Object(None)),
-               "get() on an empty map must return null");
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), key],
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        Some(Value::Object(None)),
+        "get() on an empty map must return null"
+    );
 }
 
 #[test]
@@ -41,17 +51,41 @@ fn single_put_get_round_trip() {
 
     let k = boxed_int(&mut ctx, 7);
     let v = boxed_int(&mut ctx, 100);
-    let prev = call(&reg, &mut ctx, HM, "put", PUT,
-                    &[Value::Object(Some(hm)), k, v]).unwrap();
-    assert_eq!(prev, Some(Value::Object(None)),
-               "put of new key returns null");
+    let prev = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, v],
+    )
+    .unwrap();
+    assert_eq!(
+        prev,
+        Some(Value::Object(None)),
+        "put of new key returns null"
+    );
 
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), k]).unwrap();
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
     assert_eq!(got, Some(v), "get of put key returns the put value");
 
-    let size = call(&reg, &mut ctx, HM, "size", "()I",
-                    &[Value::Object(Some(hm))]).unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     assert_eq!(size, Some(Value::Int(1)));
 }
 
@@ -67,19 +101,39 @@ fn n_100_distinct_keys_round_trip() {
         let k = boxed_int(&mut ctx, i);
         let v = boxed_int(&mut ctx, i * 10);
         pairs.push((k, v));
-        call(&reg, &mut ctx, HM, "put", PUT,
-             &[Value::Object(Some(hm)), k, v]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            HM,
+            "put",
+            PUT,
+            &[Value::Object(Some(hm)), k, v],
+        )
+        .unwrap();
     }
 
     // Every key should map back to its value.
     for (k, v) in &pairs {
-        let got = call(&reg, &mut ctx, HM, "get", GET,
-                       &[Value::Object(Some(hm)), *k]).unwrap();
-        assert_eq!(got, Some(*v),
-                   "round-trip mismatch on key={:?}", k);
+        let got = call(
+            &reg,
+            &mut ctx,
+            HM,
+            "get",
+            GET,
+            &[Value::Object(Some(hm)), *k],
+        )
+        .unwrap();
+        assert_eq!(got, Some(*v), "round-trip mismatch on key={:?}", k);
     }
-    let size = call(&reg, &mut ctx, HM, "size", "()I",
-                    &[Value::Object(Some(hm))]).unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     assert_eq!(size, Some(Value::Int(100)));
 }
 
@@ -93,23 +147,53 @@ fn overwrite_returns_old_value_and_keeps_size() {
     let v1 = boxed_int(&mut ctx, 11);
     let v2 = boxed_int(&mut ctx, 22);
 
-    let prev1 = call(&reg, &mut ctx, HM, "put", PUT,
-                     &[Value::Object(Some(hm)), k, v1]).unwrap();
+    let prev1 = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, v1],
+    )
+    .unwrap();
     assert_eq!(prev1, Some(Value::Object(None)));
 
-    let prev2 = call(&reg, &mut ctx, HM, "put", PUT,
-                     &[Value::Object(Some(hm)), k, v2]).unwrap();
-    assert_eq!(prev2, Some(v1),
-               "overwriting a key must return the previous value");
+    let prev2 = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, v2],
+    )
+    .unwrap();
+    assert_eq!(
+        prev2,
+        Some(v1),
+        "overwriting a key must return the previous value"
+    );
 
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), k]).unwrap();
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
     assert_eq!(got, Some(v2));
 
-    let size = call(&reg, &mut ctx, HM, "size", "()I",
-                    &[Value::Object(Some(hm))]).unwrap();
-    assert_eq!(size, Some(Value::Int(1)),
-               "overwrite keeps size at 1");
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
+    assert_eq!(size, Some(Value::Int(1)), "overwrite keeps size at 1");
 }
 
 #[test]
@@ -120,20 +204,47 @@ fn remove_then_get_returns_null() {
 
     let k = boxed_int(&mut ctx, 5);
     let v = boxed_int(&mut ctx, 50);
-    call(&reg, &mut ctx, HM, "put", PUT,
-         &[Value::Object(Some(hm)), k, v]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, v],
+    )
+    .unwrap();
 
-    let removed = call(&reg, &mut ctx, HM, "remove", GET,
-                       &[Value::Object(Some(hm)), k]).unwrap();
-    assert_eq!(removed, Some(v),
-               "remove returns the prior value");
+    let removed = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "remove",
+        GET,
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
+    assert_eq!(removed, Some(v), "remove returns the prior value");
 
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), k]).unwrap();
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
     assert_eq!(got, Some(Value::Object(None)));
 
-    let size = call(&reg, &mut ctx, HM, "size", "()I",
-                    &[Value::Object(Some(hm))]).unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     assert_eq!(size, Some(Value::Int(0)));
 }
 
@@ -153,16 +264,37 @@ fn resize_after_32_puts_keeps_all_findable() {
         let k = boxed_int(&mut ctx, i + 1000);
         let v = boxed_int(&mut ctx, i + 2000);
         pairs.push((k, v));
-        call(&reg, &mut ctx, HM, "put", PUT,
-             &[Value::Object(Some(hm)), k, v]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            HM,
+            "put",
+            PUT,
+            &[Value::Object(Some(hm)), k, v],
+        )
+        .unwrap();
     }
     for (k, v) in &pairs {
-        let got = call(&reg, &mut ctx, HM, "get", GET,
-                       &[Value::Object(Some(hm)), *k]).unwrap();
+        let got = call(
+            &reg,
+            &mut ctx,
+            HM,
+            "get",
+            GET,
+            &[Value::Object(Some(hm)), *k],
+        )
+        .unwrap();
         assert_eq!(got, Some(*v), "post-resize lookup failed for key {:?}", k);
     }
-    let size = call(&reg, &mut ctx, HM, "size", "()I",
-                    &[Value::Object(Some(hm))]).unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "size",
+        "()I",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     assert_eq!(size, Some(Value::Int(32)));
 }
 
@@ -179,21 +311,41 @@ fn keyset_iterator_visits_all_keys() {
         let k = boxed_int(&mut ctx, i + 100);
         let v = boxed_int(&mut ctx, i + 200);
         keys.push(k);
-        call(&reg, &mut ctx, HM, "put", PUT,
-             &[Value::Object(Some(hm)), k, v]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            HM,
+            "put",
+            PUT,
+            &[Value::Object(Some(hm)), k, v],
+        )
+        .unwrap();
     }
 
-    let key_set = call(&reg, &mut ctx, HM, "keySet", "()Ljava/util/Set;",
-                       &[Value::Object(Some(hm))]).unwrap();
+    let key_set = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "keySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     let key_set_obj = match key_set {
         Some(Value::Object(Some(o))) => o,
         other => panic!("keySet returned {:?}", other),
     };
 
     // HashSet.iterator() — registered via the HS family.
-    let iter = call(&reg, &mut ctx, "java/util/HashSet", "iterator",
-                    "()Ljava/util/Iterator;",
-                    &[Value::Object(Some(key_set_obj))]).unwrap();
+    let iter = call(
+        &reg,
+        &mut ctx,
+        "java/util/HashSet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(key_set_obj))],
+    )
+    .unwrap();
     let iter_obj = match iter {
         Some(Value::Object(Some(o))) => o,
         other => panic!("HashSet.iterator returned {:?}", other),
@@ -203,16 +355,28 @@ fn keyset_iterator_visits_all_keys() {
     // by HashSet's KeyItr fallback. Walk until hasNext returns 0.
     let mut visited = 0usize;
     loop {
-        let has_next = call(&reg, &mut ctx, "java/util/HashMap$KeyItr",
-                            "hasNext", "()Z",
-                            &[Value::Object(Some(iter_obj))]).unwrap();
+        let has_next = call(
+            &reg,
+            &mut ctx,
+            "java/util/HashMap$KeyItr",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(iter_obj))],
+        )
+        .unwrap();
         match has_next {
             Some(Value::Int(n)) if n != 0 => {}
             _ => break,
         }
-        let n = call(&reg, &mut ctx, "java/util/HashMap$KeyItr", "next",
-                     "()Ljava/lang/Object;",
-                     &[Value::Object(Some(iter_obj))]).unwrap();
+        let n = call(
+            &reg,
+            &mut ctx,
+            "java/util/HashMap$KeyItr",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iter_obj))],
+        )
+        .unwrap();
         match n {
             Some(Value::Object(Some(_))) => visited += 1,
             _ => break,
@@ -221,8 +385,10 @@ fn keyset_iterator_visits_all_keys() {
             panic!("iterator runaway");
         }
     }
-    assert_eq!(visited, 10,
-               "iterator should visit each of the 10 keys exactly once, got {visited}");
+    assert_eq!(
+        visited, 10,
+        "iterator should visit each of the 10 keys exactly once, got {visited}"
+    );
 }
 
 #[test]
@@ -240,19 +406,39 @@ fn colliding_keys_iterate_in_tail_append_order_like_hotspot() {
     for &k in &[0i32, 16, 32] {
         let key = boxed_int(&mut ctx, k);
         let val = boxed_int(&mut ctx, k);
-        call(&reg, &mut ctx, HM, "put", PUT,
-             &[Value::Object(Some(hm)), key, val]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            HM,
+            "put",
+            PUT,
+            &[Value::Object(Some(hm)), key, val],
+        )
+        .unwrap();
     }
 
-    let key_set = call(&reg, &mut ctx, HM, "keySet", "()Ljava/util/Set;",
-                       &[Value::Object(Some(hm))]).unwrap();
+    let key_set = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "keySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     let key_set_obj = match key_set {
         Some(Value::Object(Some(o))) => o,
         other => panic!("keySet returned {:?}", other),
     };
-    let iter = call(&reg, &mut ctx, "java/util/HashSet", "iterator",
-                    "()Ljava/util/Iterator;",
-                    &[Value::Object(Some(key_set_obj))]).unwrap();
+    let iter = call(
+        &reg,
+        &mut ctx,
+        "java/util/HashSet",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(key_set_obj))],
+    )
+    .unwrap();
     let iter_obj = match iter {
         Some(Value::Object(Some(o))) => o,
         other => panic!("HashSet.iterator returned {:?}", other),
@@ -260,16 +446,28 @@ fn colliding_keys_iterate_in_tail_append_order_like_hotspot() {
 
     let mut order = Vec::new();
     loop {
-        let has_next = call(&reg, &mut ctx, "java/util/HashMap$KeyItr",
-                            "hasNext", "()Z",
-                            &[Value::Object(Some(iter_obj))]).unwrap();
+        let has_next = call(
+            &reg,
+            &mut ctx,
+            "java/util/HashMap$KeyItr",
+            "hasNext",
+            "()Z",
+            &[Value::Object(Some(iter_obj))],
+        )
+        .unwrap();
         match has_next {
             Some(Value::Int(n)) if n != 0 => {}
             _ => break,
         }
-        let n = call(&reg, &mut ctx, "java/util/HashMap$KeyItr", "next",
-                     "()Ljava/lang/Object;",
-                     &[Value::Object(Some(iter_obj))]).unwrap();
+        let n = call(
+            &reg,
+            &mut ctx,
+            "java/util/HashMap$KeyItr",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(iter_obj))],
+        )
+        .unwrap();
         match n {
             Some(Value::Object(Some(o))) => match ctx.get_field(o, 0) {
                 Value::Int(v) => order.push(v),
@@ -282,8 +480,12 @@ fn colliding_keys_iterate_in_tail_append_order_like_hotspot() {
         }
     }
 
-    assert_eq!(order, vec![0, 16, 32],
-        "colliding keys must iterate in insertion (tail-append) order, got {:?}", order);
+    assert_eq!(
+        order,
+        vec![0, 16, 32],
+        "colliding keys must iterate in insertion (tail-append) order, got {:?}",
+        order
+    );
 }
 
 #[test]
@@ -297,12 +499,26 @@ fn null_value_put_returns_null_and_then_get_returns_null() {
     let hm = new_hashmap(&reg, &mut ctx);
 
     let k = boxed_int(&mut ctx, 1);
-    let prev = call(&reg, &mut ctx, HM, "put", PUT,
-                    &[Value::Object(Some(hm)), k, Value::Object(None)]).unwrap();
+    let prev = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, Value::Object(None)],
+    )
+    .unwrap();
     assert_eq!(prev, Some(Value::Object(None)));
 
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), k]).unwrap();
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
     // A successful get-of-null-value returns null. The implementation does
     // not distinguish absent-key from mapped-to-null, which mirrors the
     // common HashMap-of-nulls anti-pattern. Treat both as null.
@@ -318,20 +534,38 @@ fn contains_key_distinguishes_present_from_absent() {
     let k = boxed_int(&mut ctx, 7);
     let absent = boxed_int(&mut ctx, 99);
     let v = boxed_int(&mut ctx, 1);
-    call(&reg, &mut ctx, HM, "put", PUT,
-         &[Value::Object(Some(hm)), k, v]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), k, v],
+    )
+    .unwrap();
 
-    let has_present = call(&reg, &mut ctx, HM, "containsKey",
-                           "(Ljava/lang/Object;)Z",
-                           &[Value::Object(Some(hm)), k]).unwrap();
+    let has_present = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(hm)), k],
+    )
+    .unwrap();
     assert_eq!(has_present, Some(Value::Int(1)));
 
-    let has_absent = call(&reg, &mut ctx, HM, "containsKey",
-                          "(Ljava/lang/Object;)Z",
-                          &[Value::Object(Some(hm)), absent]).unwrap();
+    let has_absent = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(hm)), absent],
+    )
+    .unwrap();
     assert_eq!(has_absent, Some(Value::Int(0)));
 }
-
 
 const BIFUNC: &str =
     "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;";
@@ -350,8 +584,15 @@ fn merge_present_key_stores_boxed_result_not_unboxed() {
 
     let key = boxed_int(&mut ctx, 1);
     let one = boxed_int(&mut ctx, 1);
-    call(&reg, &mut ctx, HM, "put", PUT,
-         &[Value::Object(Some(hm)), key, one]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), key, one],
+    )
+    .unwrap();
 
     // The remap BiFunction returns a BOXED Integer(11).
     let eleven = boxed_int(&mut ctx, 11);
@@ -359,15 +600,32 @@ fn merge_present_key_stores_boxed_result_not_unboxed() {
 
     let value = boxed_int(&mut ctx, 10);
     let bifn = boxed_int(&mut ctx, 0); // dummy non-null function receiver
-    let ret = call(&reg, &mut ctx, HM, "merge", BIFUNC,
-                   &[Value::Object(Some(hm)), key, value, bifn]).unwrap();
+    let ret = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "merge",
+        BIFUNC,
+        &[Value::Object(Some(hm)), key, value, bifn],
+    )
+    .unwrap();
     assert_eq!(ret, Some(eleven), "merge returns the boxed remap result");
 
     // The stored value must be retrievable as the boxed Integer — NOT null.
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), key]).unwrap();
-    assert_eq!(got, Some(eleven),
-        "merge must store the BOXED result; unboxing made get() return null");
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), key],
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        Some(eleven),
+        "merge must store the BOXED result; unboxing made get() return null"
+    );
 }
 
 // Same regression for `compute` (shared the `normalize_for_compare` bug).
@@ -379,20 +637,43 @@ fn compute_present_key_stores_boxed_result_not_unboxed() {
 
     let key = boxed_int(&mut ctx, 1);
     let one = boxed_int(&mut ctx, 1);
-    call(&reg, &mut ctx, HM, "put", PUT,
-         &[Value::Object(Some(hm)), key, one]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        HM,
+        "put",
+        PUT,
+        &[Value::Object(Some(hm)), key, one],
+    )
+    .unwrap();
 
     let twelve = boxed_int(&mut ctx, 12);
     ctx.set_invoke_virtual_result(Ok(Some(twelve)));
 
     let bifn = boxed_int(&mut ctx, 0);
-    let ret = call(&reg, &mut ctx, HM, "compute",
-                   "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
-                   &[Value::Object(Some(hm)), key, bifn]).unwrap();
+    let ret = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        &[Value::Object(Some(hm)), key, bifn],
+    )
+    .unwrap();
     assert_eq!(ret, Some(twelve), "compute returns the boxed remap result");
 
-    let got = call(&reg, &mut ctx, HM, "get", GET,
-                   &[Value::Object(Some(hm)), key]).unwrap();
-    assert_eq!(got, Some(twelve),
-        "compute must store the BOXED result; unboxing made get() return null");
+    let got = call(
+        &reg,
+        &mut ctx,
+        HM,
+        "get",
+        GET,
+        &[Value::Object(Some(hm)), key],
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        Some(twelve),
+        "compute must store the BOXED result; unboxing made get() return null"
+    );
 }

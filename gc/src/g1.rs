@@ -352,7 +352,12 @@ impl G1Collector {
     /// Create a new G1 collector with the given configuration.
     pub fn new(config: G1CollectorConfig) -> Self {
         let num_regions = config.heap_size / config.region_size;
-        assert!(num_regions > 0, "g1: heap must fit at least one region (heap_size={}, region_size={})", config.heap_size, config.region_size);
+        assert!(
+            num_regions > 0,
+            "g1: heap must fit at least one region (heap_size={}, region_size={})",
+            config.heap_size,
+            config.region_size
+        );
 
         let regions: Vec<G1Region> = (0..num_regions)
             .map(|_| G1Region::new(config.region_size))
@@ -374,8 +379,7 @@ impl G1Collector {
         // buffer. The previous global `MarkBitmap::new(0, heap_size)`
         // silently rejected every real address.
 
-        let ihop_threshold =
-            (config.heap_size as u64 * config.ihop_percent as u64 / 100) as usize;
+        let ihop_threshold = (config.heap_size as u64 * config.ihop_percent as u64 / 100) as usize;
 
         Self {
             config: config.clone(),
@@ -633,8 +637,7 @@ impl G1Collector {
             .enumerate()
             .filter(|(_, r)| {
                 !r.pinned
-                    && (r.region_type == RegionType::Eden
-                        || r.region_type == RegionType::Survivor)
+                    && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
             .collect();
@@ -839,10 +842,7 @@ impl G1Collector {
 
         self.log_gc_event(&G1CollectionType::YoungOnly, pause_ms, &stats);
 
-        GcResult {
-            stats,
-            pointer_map,
-        }
+        GcResult { stats, pointer_map }
     }
 
     /// Phase H (RH.8) test hook — invoke `f` with mutable access to
@@ -925,8 +925,7 @@ impl G1Collector {
             .enumerate()
             .filter(|(_, r)| {
                 !r.pinned
-                    && (r.region_type == RegionType::Eden
-                        || r.region_type == RegionType::Survivor)
+                    && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
             .collect();
@@ -935,8 +934,8 @@ impl G1Collector {
         // garbage first).  See [`Self::select_old_regions_for_mixed_gc`]
         // for the stand-alone helper; the logic is duplicated here to
         // avoid releasing the `regions` lock guard.
-        let max_old = (regions.len() * self.config.old_cset_region_threshold_percent as usize)
-            / 100;
+        let max_old =
+            (regions.len() * self.config.old_cset_region_threshold_percent as usize) / 100;
         let max_old = max_old.max(1);
 
         let mut old_candidates: Vec<(usize, f64)> = regions
@@ -1065,7 +1064,8 @@ impl G1Collector {
         // scheduling counters only accessed during STW pauses (single-threaded).
         let remaining = self.mixed_gc_remaining.load(Ordering::Relaxed);
         if remaining > 0 {
-            self.mixed_gc_remaining.store(remaining - 1, Ordering::Relaxed);
+            self.mixed_gc_remaining
+                .store(remaining - 1, Ordering::Relaxed);
             if remaining - 1 == 0 {
                 self.marking_complete.store(false, Ordering::Relaxed);
             }
@@ -1084,10 +1084,7 @@ impl G1Collector {
 
         self.log_gc_event(&G1CollectionType::Mixed, pause_ms, &stats);
 
-        GcResult {
-            stats,
-            pointer_map,
-        }
+        GcResult { stats, pointer_map }
     }
 
     // -----------------------------------------------------------------------
@@ -1298,8 +1295,7 @@ impl G1Collector {
                             // forwarded target onto the worklist when this
                             // call site actually evacuated it. See the
                             // matching comment in the Array branch above.
-                            let already_forwarded =
-                                pointer_map.contains_key(&(ref_ptr as usize));
+                            let already_forwarded = pointer_map.contains_key(&(ref_ptr as usize));
                             if let Some(new_ptr) = self.evacuate_object(
                                 regions,
                                 ref_ptr,
@@ -1307,9 +1303,8 @@ impl G1Collector {
                                 objects_copied,
                                 bytes_copied,
                             ) {
-                                let new_value = Value::Object(Some(unsafe {
-                                    ObjectRef::from_raw(new_ptr)
-                                }));
+                                let new_value =
+                                    Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
                                 unsafe {
                                     std::ptr::write(slot_ptr as *mut Value, new_value);
                                 }
@@ -1613,8 +1608,7 @@ impl G1Collector {
     /// Audit fix (HIGH-3): also clears the mark worklist so a previous
     /// aborted cycle doesn't leak gray pointers into the new cycle.
     pub fn start_concurrent_mark(&self) {
-        self.gc_state
-            .set_phase(ConcurrentGcPhase::InitialMark);
+        self.gc_state.set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
         // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
         // previous cycle's mark bits don't leak into this one.
@@ -1627,9 +1621,9 @@ impl G1Collector {
         self.mark_worklist.lock().clear();
         // Round-9 gc HIGH-5: reset overflow indicator at cycle start so
         // a previous cycle's overflow doesn't trigger a needless rescan.
-        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
-        self.gc_state
-            .set_phase(ConcurrentGcPhase::ConcurrentMark);
+        self.mark_worklist_overflowed
+            .store(false, Ordering::Relaxed);
+        self.gc_state.set_phase(ConcurrentGcPhase::ConcurrentMark);
     }
 
     /// Perform an incremental step of concurrent marking.
@@ -1711,7 +1705,8 @@ impl G1Collector {
         // this terminates after a bounded number of passes.
         if self.mark_worklist_overflowed.load(Ordering::Relaxed) {
             // Reset the flag so we can detect re-overflow during recovery.
-            self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
+            self.mark_worklist_overflowed
+                .store(false, Ordering::Relaxed);
             for region in regions.iter() {
                 if region.region_type == RegionType::Free {
                     continue;
@@ -1740,8 +1735,7 @@ impl G1Collector {
             // refilled the worklist with newly-discovered references.
             // Returning `false` causes the marking loop to call us
             // again, which will drain whatever the rescan produced.
-            return worklist.is_empty()
-                && !self.mark_worklist_overflowed.load(Ordering::Relaxed);
+            return worklist.is_empty() && !self.mark_worklist_overflowed.load(Ordering::Relaxed);
         }
 
         // Worklist empty and no overflow: marking complete.
@@ -1833,8 +1827,7 @@ impl G1Collector {
                             // the push and record the event so remark
                             // can run a conservative full re-walk.
                             if worklist.len() >= MARK_WORKLIST_CAP {
-                                self.mark_worklist_overflowed
-                                    .store(true, Ordering::Relaxed);
+                                self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                             } else {
                                 worklist.push(ref_ptr as usize);
                             }
@@ -1877,8 +1870,7 @@ impl G1Collector {
                             // the push and record the event so remark
                             // can run a conservative full re-walk.
                             if worklist.len() >= MARK_WORKLIST_CAP {
-                                self.mark_worklist_overflowed
-                                    .store(true, Ordering::Relaxed);
+                                self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                             } else {
                                 worklist.push(ref_ptr as usize);
                             }
@@ -2035,10 +2027,7 @@ impl G1Collector {
             };
 
             // Free completely empty old regions
-            if region.live_bytes == 0
-                && region.region_type == RegionType::Old
-                && !region.pinned
-            {
+            if region.live_bytes == 0 && region.region_type == RegionType::Old && !region.pinned {
                 region.reset();
             }
         }
@@ -2048,7 +2037,8 @@ impl G1Collector {
         self.mark_worklist.lock().clear();
         // Round-9 gc HIGH-5: clear the overflow indicator so the next
         // cycle starts in a clean state.
-        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
+        self.mark_worklist_overflowed
+            .store(false, Ordering::Relaxed);
         // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
         // protocol so no mutator log push that observed the gate as
         // active can be stranded after the cycle ends. The drained
@@ -2306,9 +2296,7 @@ impl G1Collector {
         let obj = GarbageCollector::alloc_object(self, class_id, num_fields);
         let n = num_fields.min(descriptor_bytes.len());
         for i in 0..n {
-            if let Some(default) =
-                crate::heap::default_value_for_descriptor(descriptor_bytes[i])
-            {
+            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
                 GarbageCollector::set_field(self, obj, i, default);
             }
         }
@@ -2325,9 +2313,7 @@ impl G1Collector {
         let obj = self.try_alloc_object(class_id, num_fields)?;
         let n = num_fields.min(descriptor_bytes.len());
         for i in 0..n {
-            if let Some(default) =
-                crate::heap::default_value_for_descriptor(descriptor_bytes[i])
-            {
+            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
                 GarbageCollector::set_field(self, obj, i, default);
             }
         }
@@ -2510,7 +2496,9 @@ impl G1Collector {
                     // `add_reference` takes `&self` (interior
                     // `parking_lot::Mutex` on the FxHashSet — see
                     // `RememberedSet`).
-                    unsafe { (*cached_ptr).rset.add_reference(src_idx); }
+                    unsafe {
+                        (*cached_ptr).rset.add_reference(src_idx);
+                    }
                     return true;
                 }
             }
@@ -2863,7 +2851,10 @@ impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
-            eprintln!("FATAL: G1: out of heap space for object allocation ({} bytes)", total_size);
+            eprintln!(
+                "FATAL: G1: out of heap space for object allocation ({} bytes)",
+                total_size
+            );
             std::process::abort();
         });
 
@@ -2892,7 +2883,10 @@ impl GarbageCollector for G1Collector {
             .expect("array data size overflow in g1 alloc_array");
         let total_size = HEADER_SIZE + data_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
-            eprintln!("FATAL: G1: out of heap space for array allocation ({} bytes)", total_size);
+            eprintln!(
+                "FATAL: G1: out of heap space for array allocation ({} bytes)",
+                total_size
+            );
             std::process::abort();
         });
 
@@ -2975,9 +2969,7 @@ impl GarbageCollector for G1Collector {
         // the read can never escape the object's backing memory.
         {
             let regions = self.regions.lock();
-            if let Some((start, total_payload)) =
-                self.humongous_span(&regions, obj, total_size)
-            {
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u8; SLOT_SIZE];
                 if self.humongous_copy(
                     &regions,
@@ -3055,9 +3047,7 @@ impl GarbageCollector for G1Collector {
         // translation so the write can never escape the object's memory.
         let stored = {
             let regions = self.regions.lock();
-            if let Some((start, total_payload)) =
-                self.humongous_span(&regions, obj, total_size)
-            {
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 let mut tmp = [0u8; SLOT_SIZE];
                 // SAFETY: copy the 16-byte `Value` bit pattern into a byte buf.
                 unsafe {
@@ -3084,11 +3074,14 @@ impl GarbageCollector for G1Collector {
         };
 
         if stored && is_ref_store {
-            self.post_write_barrier_rset(obj, match value {
-                Value::Object(Some(r)) => r,
-                // Null store: nothing to record in the RSet.
-                _ => return,
-            });
+            self.post_write_barrier_rset(
+                obj,
+                match value {
+                    Value::Object(Some(r)) => r,
+                    // Null store: nothing to record in the RSet.
+                    _ => return,
+                },
+            );
         }
     }
 
@@ -3154,11 +3147,9 @@ impl GarbageCollector for G1Collector {
             let regions = self.regions.lock();
             // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
             // total so the humongous span / payload bound is exact.
-            let total_size = HEADER_SIZE
-                + crate::heap::array_data_size(len, element_type).unwrap_or(0);
-            if let Some((start, total_payload)) =
-                self.humongous_span(&regions, obj, total_size)
-            {
+            let total_size =
+                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 if !self.humongous_copy(
                     &regions,
                     start,
@@ -3192,17 +3183,13 @@ impl GarbageCollector for G1Collector {
             ArrayElementType::Short => {
                 Value::Int(unsafe { std::ptr::read(p as *const i16) } as i32)
             }
-            ArrayElementType::Char => {
-                Value::Int(unsafe { std::ptr::read(p as *const u16) } as i32)
-            }
+            ArrayElementType::Char => Value::Int(unsafe { std::ptr::read(p as *const u16) } as i32),
             ArrayElementType::Reference => {
                 let r: u64 = unsafe { std::ptr::read(p as *const u64) };
                 if r == 0 {
                     Value::Object(None)
                 } else {
-                    Value::Object(Some(unsafe {
-                        ObjectRef::from_raw(r as usize as *mut u8)
-                    }))
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(r as usize as *mut u8) }))
                 }
             }
         })
@@ -3233,8 +3220,12 @@ impl GarbageCollector for G1Collector {
         // SAFETY: each write stays within `raw`'s 8 bytes (elem_size <= 8).
         unsafe {
             match element_type {
-                ArrayElementType::Int => std::ptr::write(p as *mut i32, value.as_int().unwrap_or(0)),
-                ArrayElementType::Long => std::ptr::write(p as *mut i64, value.as_long().unwrap_or(0)),
+                ArrayElementType::Int => {
+                    std::ptr::write(p as *mut i32, value.as_int().unwrap_or(0))
+                }
+                ArrayElementType::Long => {
+                    std::ptr::write(p as *mut i64, value.as_long().unwrap_or(0))
+                }
                 ArrayElementType::Float => std::ptr::write(
                     p as *mut f32,
                     match value {
@@ -3272,11 +3263,9 @@ impl GarbageCollector for G1Collector {
         // region-translated path. Either way the write is bounds-confined.
         let stored = {
             let regions = self.regions.lock();
-            let total_size = HEADER_SIZE
-                + crate::heap::array_data_size(len, element_type).unwrap_or(0);
-            if let Some((start, total_payload)) =
-                self.humongous_span(&regions, obj, total_size)
-            {
+            let total_size =
+                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 self.humongous_copy(
                     &regions,
                     start,
@@ -3346,9 +3335,7 @@ impl GarbageCollector for G1Collector {
         let pause_ms = pause_start.elapsed().as_millis() as u64;
 
         // 2. Check IHOP -> start concurrent mark if threshold reached
-        if self.check_ihop()
-            && self.gc_state.phase() == ConcurrentGcPhase::Idle
-        {
+        if self.check_ihop() && self.gc_state.phase() == ConcurrentGcPhase::Idle {
             self.start_concurrent_mark();
         }
 
@@ -3383,8 +3370,7 @@ impl GarbageCollector for G1Collector {
         // they are still useful for surfacing call sites that need auditing
         // for SATB callsite coverage.
         debug_assert!(
-            !self.gc_state.is_marking_active()
-                || consume_satb_pre_barrier_epoch(),
+            !self.gc_state.is_marking_active() || consume_satb_pre_barrier_epoch(),
             "G1 write_barrier invoked while concurrent marking is active without a \
              corresponding SATB pre-barrier on this thread. The trait contract \
              requires callers to invoke `VmHeap::satb_barrier(old_value)` BEFORE \
@@ -3604,10 +3590,7 @@ pub fn select_evacuation_candidates(
     // Only old regions with at least one garbage byte are candidates.
     let mut candidates: Vec<(&crate::region::Region, f64)> = regions
         .iter()
-        .filter(|r| {
-            r.region_type == crate::region::RegionType::Old
-                && r.garbage_bytes() > 0
-        })
+        .filter(|r| r.region_type == crate::region::RegionType::Old && r.garbage_bytes() > 0)
         .map(|r| {
             // Ratio: garbage / live. If live is 0 the region is pure
             // garbage → infinite priority.
@@ -3673,7 +3656,7 @@ mod tests {
     fn small_config() -> G1CollectorConfig {
         G1CollectorConfig {
             heap_size: 8 * 1024 * 1024, // 8 MB
-            region_size: 1024 * 1024,     // 1 MB
+            region_size: 1024 * 1024,   // 1 MB
             max_gc_pause_ms: 200,
             ihop_percent: 45,
             promotion_age: 3,
@@ -3889,14 +3872,20 @@ mod tests {
         let gc = make_collector();
         // Small array fits in a single region → NOT humongous.
         let small = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 10);
-        assert!(!gc.is_humongous(small), "small array misclassified as humongous");
+        assert!(
+            !gc.is_humongous(small),
+            "small array misclassified as humongous"
+        );
         // Large array (~1.6 MB) spans multiple regions → humongous.
         let large = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 400_000);
         assert!(gc.count_regions(RegionType::HumongousStart) >= 1);
         assert!(gc.is_humongous(large), "humongous array not detected");
         // A plain object is not humongous either.
         let obj = gc.alloc_object(ClassId::new(1), 3);
-        assert!(!gc.is_humongous(obj), "small object misclassified as humongous");
+        assert!(
+            !gc.is_humongous(obj),
+            "small object misclassified as humongous"
+        );
     }
 
     // C2: long[] elements are 8 bytes; the per-region payload capacity
@@ -3935,10 +3924,22 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), num_fields);
         assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
         let per_region = (gc.config.region_size - HEADER_SIZE) / SLOT_SIZE;
-        for &i in &[0usize, per_region - 1, per_region, per_region + 1, num_fields - 1] {
+        for &i in &[
+            0usize,
+            per_region - 1,
+            per_region,
+            per_region + 1,
+            num_fields - 1,
+        ] {
             gc.set_field(obj, i, Value::Int(i as i32));
         }
-        for &i in &[0usize, per_region - 1, per_region, per_region + 1, num_fields - 1] {
+        for &i in &[
+            0usize,
+            per_region - 1,
+            per_region,
+            per_region + 1,
+            num_fields - 1,
+        ] {
             assert_eq!(gc.get_field(obj, i).as_int(), Some(i as i32), "field {i}");
         }
         // Out-of-layout field read/write must be a benign no-op (drop), not OOB.
@@ -4041,10 +4042,7 @@ mod tests {
         let result = gc.young_collection(&mut roots, &NoopMonitors);
 
         assert!(result.pointer_map.contains_key(&old_addr));
-        assert_eq!(
-            result.pointer_map[&old_addr],
-            roots[0].as_ptr() as usize
-        );
+        assert_eq!(result.pointer_map[&old_addr], roots[0].as_ptr() as usize);
     }
 
     // -- Mixed collection --
@@ -4142,7 +4140,11 @@ mod tests {
         // the exact calculation so future rounding tweaks don't break.
         let expected = cfg.heap_size * 70 / 100;
         let actual = gc.marking_threshold_bytes();
-        let diff = if actual > expected { actual - expected } else { expected - actual };
+        let diff = if actual > expected {
+            actual - expected
+        } else {
+            expected - actual
+        };
         assert!(
             diff * 100 <= expected,
             "ihop threshold {actual} deviates from {expected} by more than 1 %"
@@ -4157,7 +4159,10 @@ mod tests {
         let gc = G1Collector::new(G1CollectorConfig::default());
         let forty_percent = gc.config.heap_size * 40 / 100;
         gc.old_gen_bytes.store(forty_percent, Ordering::Relaxed);
-        assert!(!gc.check_ihop(), "IHOP fired at 40% occupancy with 70% threshold");
+        assert!(
+            !gc.check_ihop(),
+            "IHOP fired at 40% occupancy with 70% threshold"
+        );
     }
 
     #[test]
@@ -4168,7 +4173,10 @@ mod tests {
         let seventy_five_percent = gc.config.heap_size * 75 / 100;
         gc.old_gen_bytes
             .store(seventy_five_percent, Ordering::Relaxed);
-        assert!(gc.check_ihop(), "IHOP didn't fire at 75% occupancy with 70% threshold");
+        assert!(
+            gc.check_ihop(),
+            "IHOP didn't fire at 75% occupancy with 70% threshold"
+        );
     }
 
     // -- Region pinning --
@@ -4607,8 +4615,8 @@ mod tests {
     #[test]
     fn p89_tlab_refill_returns_none_when_exhausted() {
         let cfg = G1CollectorConfig {
-            heap_size: 2 * 65536,     // 2 regions
-            region_size: 65536,        // 64 KB regions
+            heap_size: 2 * 65536, // 2 regions
+            region_size: 65536,   // 64 KB regions
             ..small_config()
         };
         let gc = G1Collector::new(cfg);
@@ -4624,7 +4632,9 @@ mod tests {
                 Some(_) => refills += 1,
                 None => break,
             }
-            if refills > 20 { break; } // safety
+            if refills > 20 {
+                break;
+            } // safety
         }
         // Should have run out eventually
         assert!(gc.refill_tlab(16384).is_none());
@@ -4635,7 +4645,7 @@ mod tests {
     #[test]
     fn p89_young_gc_trigger_and_collect() {
         let gc = make_collector(); // 8 MB, 1 MB regions
-        // Allocate objects until GC is needed
+                                   // Allocate objects until GC is needed
         let mut roots: Vec<ObjectRef> = Vec::new();
         for i in 0..50 {
             if let Some(obj) = gc.try_alloc_object(ClassId::new(1), 2) {
@@ -4688,7 +4698,7 @@ mod tests {
     #[test]
     fn p89_humongous_allocation() {
         let gc = make_collector(); // 1 MB regions
-        // Object with > 512KB of fields = humongous
+                                   // Object with > 512KB of fields = humongous
         let num_fields = (512 * 1024) / SLOT_SIZE + 1;
         let obj = gc.try_alloc_object(ClassId::new(1), num_fields);
         assert!(obj.is_some());
@@ -4744,7 +4754,10 @@ mod tests {
         // After multiple rounds of GC+fill, heap should eventually be fully packed
         // Verify the allocation eventually fails
         let final_try = gc.try_alloc_object(ClassId::new(1), 4);
-        assert!(final_try.is_none(), "heap should be exhausted after repeated fill+GC cycles");
+        assert!(
+            final_try.is_none(),
+            "heap should be exhausted after repeated fill+GC cycles"
+        );
     }
 
     // -- 89.2: SATB write barrier --
@@ -4834,8 +4847,9 @@ mod tests {
         let result = rp.process_references(&is_marked, 64, 0);
 
         // Weak referent should be cleared
-        assert!(result.stats.weak_refs_cleared > 0
-            || rp.cleared_ref_objects().contains(&weak_addr));
+        assert!(
+            result.stats.weak_refs_cleared > 0 || rp.cleared_ref_objects().contains(&weak_addr)
+        );
     }
 
     #[test]
@@ -4948,11 +4962,7 @@ mod tests {
     // T5.5.4 — select_evacuation_candidates tests
     // -----------------------------------------------------------------
 
-    fn make_old_region(
-        index: usize,
-        top: usize,
-        live_bytes: usize,
-    ) -> crate::region::Region {
+    fn make_old_region(index: usize, top: usize, live_bytes: usize) -> crate::region::Region {
         let mut r = crate::region::Region {
             index,
             region_type: crate::region::RegionType::Old,
@@ -5003,9 +5013,9 @@ mod tests {
         // the first to fit; the remaining two must be dropped.
         // cost per region = live * 4 ns → region with live=100 costs 400 ns.
         let regions = vec![
-            make_old_region(0, 1000, 100),   // 400 ns, ratio 9.0
-            make_old_region(1, 1000, 200),   // 800 ns, ratio 4.0
-            make_old_region(2, 1000, 300),   // 1200 ns, ratio 2.33
+            make_old_region(0, 1000, 100), // 400 ns, ratio 9.0
+            make_old_region(1, 1000, 200), // 800 ns, ratio 4.0
+            make_old_region(2, 1000, 300), // 1200 ns, ratio 2.33
         ];
         let picked = select_evacuation_candidates(&regions, 500);
         // Only region 0 fits (400 ns); region 1 would push to 1200 ns.
@@ -5025,7 +5035,7 @@ mod tests {
     fn evacuation_candidates_skip_zero_garbage_regions() {
         // Region 1 has live == top → garbage_bytes == 0 → ineligible.
         let regions = vec![
-            make_old_region(0, 1000, 100), // garbage 900
+            make_old_region(0, 1000, 100),  // garbage 900
             make_old_region(1, 1000, 1000), // garbage 0, skip
         ];
         let picked = select_evacuation_candidates(&regions, u64::MAX);
@@ -5121,7 +5131,11 @@ mod tests {
             // The byte at base+region_size belongs to no region unless
             // another region happens to start there.
             if let Some(idx) = got {
-                assert_ne!(idx, i, "ptr {:#x} should not resolve back to region {}", just_past, i);
+                assert_ne!(
+                    idx, i,
+                    "ptr {:#x} should not resolve back to region {}",
+                    just_past, i
+                );
             }
         }
     }
@@ -5149,12 +5163,7 @@ mod tests {
         }
 
         // High addresses well above any plausible region base.
-        let max_base = gc
-            .region_lookup
-            .iter()
-            .map(|(b, _)| *b)
-            .max()
-            .unwrap();
+        let max_base = gc.region_lookup.iter().map(|(b, _)| *b).max().unwrap();
         let well_above = max_base + gc.config.region_size + 0x10_0000;
         assert_eq!(
             gc.region_for_ptr(&regions, well_above as *mut u8),
@@ -5219,11 +5228,7 @@ mod tests {
 
         // Call through the trait method (NOT the inherent shortcut), to
         // exercise the dispatch path the VM uses.
-        <G1Collector as GarbageCollector>::write_barrier_pre(
-            &gc,
-            std::ptr::null_mut(),
-            old_obj,
-        );
+        <G1Collector as GarbageCollector>::write_barrier_pre(&gc, std::ptr::null_mut(), old_obj);
 
         // Force a per-thread flush so the global queue sees the entry
         // (the auto-flush threshold is 256).
@@ -5266,12 +5271,7 @@ mod tests {
             fn alloc_object(&self, _: ClassId, _: usize) -> ObjectRef {
                 unreachable!("not called by this test")
             }
-            fn alloc_array(
-                &self,
-                _: ClassId,
-                _: ArrayElementType,
-                _: usize,
-            ) -> ObjectRef {
+            fn alloc_array(&self, _: ClassId, _: ArrayElementType, _: usize) -> ObjectRef {
                 unreachable!()
             }
             fn get_header(&self, _: ObjectRef) -> &ObjectHeader {
@@ -5304,19 +5304,10 @@ mod tests {
             fn array_length(&self, _: ObjectRef) -> usize {
                 unreachable!()
             }
-            fn get_array_element(
-                &self,
-                _: ObjectRef,
-                _: usize,
-            ) -> Result<Value, i32> {
+            fn get_array_element(&self, _: ObjectRef, _: usize) -> Result<Value, i32> {
                 unreachable!()
             }
-            fn set_array_element(
-                &self,
-                _: ObjectRef,
-                _: usize,
-                _: Value,
-            ) -> Result<(), i32> {
+            fn set_array_element(&self, _: ObjectRef, _: usize, _: Value) -> Result<(), i32> {
                 unreachable!()
             }
             fn needs_gc(&self) -> bool {
@@ -5363,6 +5354,8 @@ mod tests {
         }
         // Survival of the loop = default body is empty = zero-cost.
         // Reclaim the leaked backing alloc.
-        unsafe { drop(Box::from_raw(leaked)); }
+        unsafe {
+            drop(Box::from_raw(leaked));
+        }
     }
 }

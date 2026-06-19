@@ -323,7 +323,10 @@ impl AotProfileBundle {
     /// Filter entries keeping only those whose `class_sha256` matches the
     /// class bytes currently present on the class path. Unknown classes are
     /// silently dropped — this is the integrity guard required by the spec.
-    pub fn filter_by_live_class_hashes(self, live_hashes: &HashMap<String, [u8; SHA256_LEN]>) -> Self {
+    pub fn filter_by_live_class_hashes(
+        self,
+        live_hashes: &HashMap<String, [u8; SHA256_LEN]>,
+    ) -> Self {
         let mut kept = Vec::with_capacity(self.entries.len());
         for e in self.entries {
             match live_hashes.get(&e.class_name) {
@@ -484,11 +487,14 @@ impl CdsArchiveWithBuildIdV2 {
             .map_err(|e| e.to_string())?;
 
         let mut f = std::fs::File::create(&self.output_path).map_err(|e| e.to_string())?;
-        f.write_all(&CDS_BUILD_ID_MAGIC.to_be_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&CDS_BUILD_ID_MAGIC.to_be_bytes())
+            .map_err(|e| e.to_string())?;
         let id_bytes = self.build_id.as_bytes();
         let id_len = id_bytes.len().min(u16::MAX as usize) as u16;
-        f.write_all(&id_len.to_be_bytes()).map_err(|e| e.to_string())?;
-        f.write_all(&id_bytes[..id_len as usize]).map_err(|e| e.to_string())?;
+        f.write_all(&id_len.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&id_bytes[..id_len as usize])
+            .map_err(|e| e.to_string())?;
         f.write_all(&inner_bytes).map_err(|e| e.to_string())?;
 
         let _ = std::fs::remove_file(&tmp_path);
@@ -498,7 +504,10 @@ impl CdsArchiveWithBuildIdV2 {
     /// Read build-id and class bytes back from `path`. Returns `None` if the
     /// header is missing, the build ID does not match `expected_build_id`,
     /// or the underlying CDS archive fails to load.
-    pub fn try_load(path: &str, expected_build_id: &str) -> Option<(String, HashMap<String, Vec<u8>>)> {
+    pub fn try_load(
+        path: &str,
+        expected_build_id: &str,
+    ) -> Option<(String, HashMap<String, Vec<u8>>)> {
         let mut file = std::fs::File::open(path).ok()?;
         let mut magic_buf = [0u8; 4];
         file.read_exact(&mut magic_buf).ok()?;
@@ -615,8 +624,12 @@ pub fn startup_load(config: AotPipelineConfig) -> StartupStats {
                 if p.extension().and_then(|e| e.to_str()) != Some("profile") {
                     continue;
                 }
-                let Ok(data) = std::fs::read(&p) else { continue };
-                let Some(bundle) = AotProfileBundle::deserialize(&data) else { continue };
+                let Ok(data) = std::fs::read(&p) else {
+                    continue;
+                };
+                let Some(bundle) = AotProfileBundle::deserialize(&data) else {
+                    continue;
+                };
                 stats.aot_profiles_loaded += bundle.entries.len();
                 with_state(|state| state.aot_loaded.extend(bundle.entries));
             }
@@ -1035,7 +1048,13 @@ mod tests {
             AotProfileEntry::new([0xAA; 32], "com/foo/Bar", "hot", "()V", 9_999)
                 .with_jit_code(vec![0x48, 0x89, 0xE5, 0xC3], 0x1),
         );
-        record_profile_entry(AotProfileEntry::new([0xBB; 32], "com/foo/Baz", "warm", "(I)I", 100));
+        record_profile_entry(AotProfileEntry::new(
+            [0xBB; 32],
+            "com/foo/Baz",
+            "warm",
+            "(I)I",
+            100,
+        ));
 
         // Shutdown writes them to <hash>.profile files.
         let shut = shutdown_flush();
@@ -1051,7 +1070,10 @@ mod tests {
         assert!(names.contains("com/foo/Bar"));
         assert!(names.contains("com/foo/Baz"));
         // Also verify JIT code bytes survived.
-        let bar = loaded.iter().find(|e| e.class_name == "com/foo/Bar").unwrap();
+        let bar = loaded
+            .iter()
+            .find(|e| e.class_name == "com/foo/Bar")
+            .unwrap();
         assert_eq!(bar.jit_code, vec![0x48, 0x89, 0xE5, 0xC3]);
 
         reset_pipeline_state();
@@ -1074,7 +1096,10 @@ mod tests {
             ..Default::default()
         };
         startup_load(dump_cfg);
-        record_cds_class("java/lang/Object", vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 0x34]);
+        record_cds_class(
+            "java/lang/Object",
+            vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 0x34],
+        );
         record_cds_class(
             "java/lang/String",
             vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 0x34, 0x10, 0x20],

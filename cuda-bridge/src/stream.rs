@@ -158,8 +158,7 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
 #[cfg(feature = "cuda")]
-static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 // ── Public Stream type ────────────────────────────────────────────────
 
@@ -206,8 +205,7 @@ impl Stream {
         let cuda_stream = device
             .fork_default_stream()
             .map_err(|e| crate::DeviceError::Driver(format!("fork_default_stream: {e:?}")))?;
-        let id = CUDA_STREAM_ID_COUNTER
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = CUDA_STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             inner: StreamCuda {
                 // cudarc's `CudaStream` is not `Send`/`Sync`, but the

@@ -79,10 +79,7 @@ fn key_for(cl: ObjectRef, this: ObjectRef) -> Key {
 }
 
 /// `get(ClassLoader)V` — return the stored value or null.
-fn native_aclv_get(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_aclv_get(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -98,10 +95,7 @@ fn native_aclv_get(
 /// `putIfAbsent(ClassLoader, V)V` — if no mapping exists for `(cl, this)`,
 /// store `value` and return null. Otherwise return the existing value
 /// (matching `Map.putIfAbsent` semantics).
-fn native_aclv_put_if_absent(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_aclv_put_if_absent(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -125,10 +119,7 @@ fn native_aclv_put_if_absent(
 }
 
 /// `remove(ClassLoader)V` — remove and return the previous value, or null.
-fn native_aclv_remove(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_aclv_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -152,10 +143,7 @@ fn native_aclv_remove(
 /// We reproduce the observable effect: if a mapping already exists, return it.
 /// Otherwise call `mappingFunction.apply(cl, this)`, store the result, and
 /// return it.
-fn native_aclv_compute_if_absent(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),

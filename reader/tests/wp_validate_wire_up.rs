@@ -134,5 +134,8 @@ fn validate_is_documented_as_manual() {
     // callers can inspect/log/ignore as they choose.
     let pool = ConstantPool::new(vec![ConstantPoolEntry::Tombstone]);
     let errors = pool.validate();
-    assert!(errors.is_empty(), "an empty pool has no cross-refs to validate");
+    assert!(
+        errors.is_empty(),
+        "an empty pool has no cross-refs to validate"
+    );
 }

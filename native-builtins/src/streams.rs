@@ -27,9 +27,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use cratonvm_types::Value;
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 use crate::alloc_concurrent_synthetic;
 
@@ -135,22 +135,50 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
     // bytecode is what `invokeinterface` looks up, so we register all the
     // declared-on-the-call-site variants.
     let classes: &[(&str, &str)] = &[
-        ("java/util/stream/BaseStream", "Ljava/util/stream/BaseStream;"),
+        (
+            "java/util/stream/BaseStream",
+            "Ljava/util/stream/BaseStream;",
+        ),
         ("java/util/stream/Stream", "Ljava/util/stream/Stream;"),
         ("java/util/stream/Stream", "Ljava/util/stream/BaseStream;"),
         ("java/util/stream/IntStream", "Ljava/util/stream/IntStream;"),
-        ("java/util/stream/IntStream", "Ljava/util/stream/BaseStream;"),
-        ("java/util/stream/LongStream", "Ljava/util/stream/LongStream;"),
-        ("java/util/stream/LongStream", "Ljava/util/stream/BaseStream;"),
-        ("java/util/stream/DoubleStream", "Ljava/util/stream/DoubleStream;"),
-        ("java/util/stream/DoubleStream", "Ljava/util/stream/BaseStream;"),
+        (
+            "java/util/stream/IntStream",
+            "Ljava/util/stream/BaseStream;",
+        ),
+        (
+            "java/util/stream/LongStream",
+            "Ljava/util/stream/LongStream;",
+        ),
+        (
+            "java/util/stream/LongStream",
+            "Ljava/util/stream/BaseStream;",
+        ),
+        (
+            "java/util/stream/DoubleStream",
+            "Ljava/util/stream/DoubleStream;",
+        ),
+        (
+            "java/util/stream/DoubleStream",
+            "Ljava/util/stream/BaseStream;",
+        ),
     ];
 
     for (cls, ret) in classes {
         let sig_return_self = format!("(){}", ret);
-        registry.register(cls, "sequential", &sig_return_self, native_stream_return_this);
+        registry.register(
+            cls,
+            "sequential",
+            &sig_return_self,
+            native_stream_return_this,
+        );
         registry.register(cls, "parallel", &sig_return_self, native_stream_return_this);
-        registry.register(cls, "unordered", &sig_return_self, native_stream_return_this);
+        registry.register(
+            cls,
+            "unordered",
+            &sig_return_self,
+            native_stream_return_this,
+        );
 
         let sig_onclose = format!("(Ljava/lang/Runnable;){}", ret);
         registry.register(cls, "onClose", &sig_onclose, native_stream_return_this);
@@ -185,7 +213,12 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
         "java/util/stream/LongStream",
         "java/util/stream/DoubleStream",
     ] {
-        registry.register(cls, "iterator", "()Ljava/util/Iterator;", native_stream_empty_iterator);
+        registry.register(
+            cls,
+            "iterator",
+            "()Ljava/util/Iterator;",
+            native_stream_empty_iterator,
+        );
     }
     // `ServiceLoader$Itr.{hasNext,next}` are registered by
     // `register_service_loader_itr_overrides` (called from `register_stream_overrides`),
@@ -328,11 +361,7 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_stream_overrides(&mut r);
         assert!(r
-            .find(
-                "java/util/concurrent/Flow$Subscription",
-                "request",
-                "(J)V"
-            )
+            .find("java/util/concurrent/Flow$Subscription", "request", "(J)V")
             .is_some());
         assert!(r
             .find("java/util/concurrent/Flow$Subscription", "cancel", "()V")
@@ -344,21 +373,38 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_stream_overrides(&mut r);
         // BaseStream-declared signatures
-        assert!(r.find(
-            "java/util/stream/BaseStream", "sequential",
-            "()Ljava/util/stream/BaseStream;").is_some());
+        assert!(r
+            .find(
+                "java/util/stream/BaseStream",
+                "sequential",
+                "()Ljava/util/stream/BaseStream;"
+            )
+            .is_some());
         // Stream-narrowed return type (covariant override seen on call sites)
-        assert!(r.find(
-            "java/util/stream/Stream", "sequential",
-            "()Ljava/util/stream/BaseStream;").is_some());
-        assert!(r.find(
-            "java/util/stream/Stream", "sequential",
-            "()Ljava/util/stream/Stream;").is_some());
-        assert!(r.find(
-            "java/util/stream/Stream", "isParallel", "()Z").is_some());
-        assert!(r.find(
-            "java/util/stream/IntStream", "parallel",
-            "()Ljava/util/stream/IntStream;").is_some());
+        assert!(r
+            .find(
+                "java/util/stream/Stream",
+                "sequential",
+                "()Ljava/util/stream/BaseStream;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/util/stream/Stream",
+                "sequential",
+                "()Ljava/util/stream/Stream;"
+            )
+            .is_some());
+        assert!(r
+            .find("java/util/stream/Stream", "isParallel", "()Z")
+            .is_some());
+        assert!(r
+            .find(
+                "java/util/stream/IntStream",
+                "parallel",
+                "()Ljava/util/stream/IntStream;"
+            )
+            .is_some());
     }
 
     #[test]

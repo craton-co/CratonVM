@@ -163,7 +163,12 @@ mod imp {
         let mut ok = Thread32First(snap, &mut e);
         while ok != 0 {
             if e.th32_owner_process_id == pid && e.th32_thread_id != self_tid {
-                dump_thread(process, exe_base, e.th32_thread_id, e.th32_thread_id == main_tid);
+                dump_thread(
+                    process,
+                    exe_base,
+                    e.th32_thread_id,
+                    e.th32_thread_id == main_tid,
+                );
             }
             e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
             ok = Thread32Next(snap, &mut e);
@@ -221,7 +226,9 @@ mod imp {
                 let rva = addr - exe_base;
                 match sym_opt(process, addr) {
                     Some(n) => eprintln!("[stwwatch] #{frame:02} exe+0x{rva:x}  {n}"),
-                    None => eprintln!("[stwwatch] #{frame:02} exe+0x{rva:x}  (RVA — symbolize offline)"),
+                    None => {
+                        eprintln!("[stwwatch] #{frame:02} exe+0x{rva:x}  (RVA — symbolize offline)")
+                    }
                 }
             } else {
                 eprintln!("[stwwatch] #{frame:02} 0x{addr:x}  {}", sym(process, addr));

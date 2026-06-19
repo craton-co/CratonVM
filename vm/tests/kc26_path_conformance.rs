@@ -21,8 +21,7 @@ fn workspace_root() -> PathBuf {
 
 fn read_ws(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 // ===========================================================================
@@ -46,10 +45,10 @@ fn kc26_path_get_file_system_registered() {
 #[test]
 fn kc26_path_resolve_registered() {
     let src = read_ws("native-builtins/src/phases_late.rs");
-    let has_resolve_string = src.contains("\"resolve\"")
-        && src.contains("(Ljava/lang/String;)Ljava/nio/file/Path;");
-    let has_resolve_path = src.contains("\"resolve\"")
-        && src.contains("(Ljava/nio/file/Path;)Ljava/nio/file/Path;");
+    let has_resolve_string =
+        src.contains("\"resolve\"") && src.contains("(Ljava/lang/String;)Ljava/nio/file/Path;");
+    let has_resolve_path =
+        src.contains("\"resolve\"") && src.contains("(Ljava/nio/file/Path;)Ljava/nio/file/Path;");
     assert!(
         has_resolve_string,
         "[KC26.2a] Path.resolve(String) must be registered"
@@ -139,7 +138,13 @@ fn kc26_filesystems_get_default_registered() {
 fn kc26_filesystem_methods_registered() {
     let src = read_ws("native-builtins/src/phases_late.rs");
 
-    let methods = &["getSeparator", "getPath", "provider", "isOpen", "isReadOnly"];
+    let methods = &[
+        "getSeparator",
+        "getPath",
+        "provider",
+        "isOpen",
+        "isReadOnly",
+    ];
     let mut missing = Vec::new();
 
     for &name in methods {

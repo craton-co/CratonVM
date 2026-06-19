@@ -204,7 +204,9 @@ pub fn dispatch(
         (CS_METHOD, CMD_M_VARIABLE_TABLE) => handle_method_variable_table(data, state),
         (CS_METHOD, CMD_M_BYTECODES) => handle_method_bytecodes(data, state),
         (CS_METHOD, CMD_M_IS_OBSOLETE) => handle_method_is_obsolete(),
-        (CS_METHOD, CMD_M_VARIABLE_TABLE_WITH_GENERIC) => handle_method_variable_table_generic(data, state),
+        (CS_METHOD, CMD_M_VARIABLE_TABLE_WITH_GENERIC) => {
+            handle_method_variable_table_generic(data, state)
+        }
 
         // -- ObjectReference -----------------------------------------------
         (CS_OBJECT_REF, CMD_OR_REFERENCE_TYPE) => handle_or_reference_type(data, state),
@@ -339,9 +341,9 @@ fn handle_vm_capabilities() -> CommandResult {
     // 7 boolean capabilities:
     // [0] canWatchFieldModification
     pw.put_u8(1); // true — T6.4.4
-    // [1] canWatchFieldAccess
+                  // [1] canWatchFieldAccess
     pw.put_u8(1); // true — T6.4.4
-    // [2] canGetBytecodes
+                  // [2] canGetBytecodes
     pw.put_u8(0);
     // [3] canGetSyntheticAttribute
     pw.put_u8(0);
@@ -711,7 +713,9 @@ fn handle_er_set(data: &[u8], state: &mut DebugState) -> CommandResult {
         }
     }
 
-    let req_id = state.events.set_event_request(kind, suspend_policy, modifiers.clone());
+    let req_id = state
+        .events
+        .set_event_request(kind, suspend_policy, modifiers.clone());
 
     // -- T6.4.4: Store watchpoints for field access/modification events -------
     if kind == EventKind::FieldAccess || kind == EventKind::FieldModification {
@@ -754,11 +758,14 @@ fn handle_er_set(data: &[u8], state: &mut DebugState) -> CommandResult {
         }
 
         if condition.is_some() || hit_count_filter.is_some() {
-            state.breakpoint_conditions.insert(req_id, crate::debug::BreakpointCondition {
-                condition,
-                hit_count: 0,
-                hit_count_filter,
-            });
+            state.breakpoint_conditions.insert(
+                req_id,
+                crate::debug::BreakpointCondition {
+                    condition,
+                    hit_count: 0,
+                    hit_count_filter,
+                },
+            );
         }
     }
 
@@ -778,8 +785,12 @@ fn handle_er_clear(data: &[u8], state: &mut DebugState) -> CommandResult {
     state.events.clear_event_request(request_id);
 
     // T6.4.4: Clean up watchpoints associated with this request.
-    state.field_access_watchpoints.retain(|w| w.request_id != request_id);
-    state.field_modification_watchpoints.retain(|w| w.request_id != request_id);
+    state
+        .field_access_watchpoints
+        .retain(|w| w.request_id != request_id);
+    state
+        .field_modification_watchpoints
+        .retain(|w| w.request_id != request_id);
 
     // T6.4.5: Clean up breakpoint conditions.
     state.breakpoint_conditions.remove(&request_id);
@@ -942,7 +953,8 @@ fn handle_ct_invoke_method(data: &[u8], state: &mut DebugState) -> CommandResult
     // Derive a best-effort return signature from the stored method
     // metadata.  If the method isn't registered yet we fall back to `V`
     // (void) so the bridge is free to tag the result.
-    let return_sig = return_signature_for(state, class_id, method_id).unwrap_or_else(|| "V".to_string());
+    let return_sig =
+        return_signature_for(state, class_id, method_id).unwrap_or_else(|| "V".to_string());
 
     let bridge = match state.vm_bridge.clone() {
         Some(b) => b,
@@ -980,7 +992,7 @@ fn handle_method_line_table(data: &[u8], state: &mut DebugState) -> CommandResul
         let start = lines.first().map(|l| l.0).unwrap_or(0);
         let end = lines.last().map(|l| l.0).unwrap_or(0);
         pw.put_u64_be(start); // start
-        pw.put_u64_be(end);   // end
+        pw.put_u64_be(end); // end
         pw.put_u32_be(lines.len() as u32);
         for &(code_index, line_number) in lines {
             pw.put_u64_be(code_index);
@@ -1170,7 +1182,8 @@ fn handle_or_invoke_method(data: &[u8], state: &mut DebugState) -> CommandResult
     let invoke_options = reader.read_u32_be().unwrap_or(0);
     let non_virtual = (invoke_options & 2) != 0;
 
-    let return_sig = return_signature_for(state, class_id, method_id).unwrap_or_else(|| "V".to_string());
+    let return_sig =
+        return_signature_for(state, class_id, method_id).unwrap_or_else(|| "V".to_string());
 
     let bridge = match state.vm_bridge.clone() {
         Some(b) => b,
@@ -1330,7 +1343,10 @@ fn handle_ar_get_values(data: &[u8], state: &mut DebugState) -> CommandResult {
                     b'I' | b'F' => pw.put_u32_be(0),
                     b'J' | b'D' => pw.put_u64_be(0),
                     b'B' | b'Z' => pw.put_u8(0),
-                    b'S' | b'C' => { pw.put_u8(0); pw.put_u8(0); }
+                    b'S' | b'C' => {
+                        pw.put_u8(0);
+                        pw.put_u8(0);
+                    }
                     _ => pw.put_u64_be(0), // object ref
                 }
             }
@@ -1567,7 +1583,7 @@ mod tests {
         // canWatchFieldModification and canWatchFieldAccess are enabled (T6.4.4)
         assert_eq!(res.data[0], 1); // canWatchFieldModification
         assert_eq!(res.data[1], 1); // canWatchFieldAccess
-        // Remaining capabilities are false
+                                    // Remaining capabilities are false
         assert!(res.data[2..].iter().all(|&b| b == 0));
     }
 
@@ -1644,9 +1660,14 @@ mod tests {
         // Set a breakpoint event request.
         let mut set_data = PayloadWriter::new();
         set_data.put_u8(EventKind::Breakpoint as u8); // eventKind
-        set_data.put_u8(SuspendPolicy::All as u8);    // suspendPolicy
-        set_data.put_u32_be(0);                        // modifiers = 0
-        let res = dispatch(CS_EVENT_REQUEST, CMD_ER_SET, &set_data.into_bytes(), &mut st);
+        set_data.put_u8(SuspendPolicy::All as u8); // suspendPolicy
+        set_data.put_u32_be(0); // modifiers = 0
+        let res = dispatch(
+            CS_EVENT_REQUEST,
+            CMD_ER_SET,
+            &set_data.into_bytes(),
+            &mut st,
+        );
         assert_eq!(res.error_code, ERR_NONE);
         let req_id = u32::from_be_bytes([res.data[0], res.data[1], res.data[2], res.data[3]]);
         assert!(req_id > 0);
@@ -1655,7 +1676,12 @@ mod tests {
         let mut clear_data = PayloadWriter::new();
         clear_data.put_u8(EventKind::Breakpoint as u8);
         clear_data.put_u32_be(req_id);
-        let res = dispatch(CS_EVENT_REQUEST, CMD_ER_CLEAR, &clear_data.into_bytes(), &mut st);
+        let res = dispatch(
+            CS_EVENT_REQUEST,
+            CMD_ER_CLEAR,
+            &clear_data.into_bytes(),
+            &mut st,
+        );
         assert_eq!(res.error_code, ERR_NONE);
         assert_eq!(st.events.request_count(), 0);
     }
@@ -1702,7 +1728,13 @@ mod tests {
         // --- Server side: parse from the wire, dispatch, produce reply. -
         let parsed = read_packet(&mut Cursor::new(&wire[..])).unwrap();
         let (id, cs, c, data) = match parsed {
-            JdwpPacket::Command { id, command_set, command, data, .. } => (id, command_set, command, data),
+            JdwpPacket::Command {
+                id,
+                command_set,
+                command,
+                data,
+                ..
+            } => (id, command_set, command, data),
             _ => panic!("expected command"),
         };
         let result = dispatch(cs, c, &data, st);
@@ -1723,7 +1755,11 @@ mod tests {
         let mut st = fresh_state();
         let reply = wire_roundtrip(CS_VM, CMD_VM_VERSION, &[], &mut st);
         match reply {
-            JdwpPacket::Reply { id, error_code, data } => {
+            JdwpPacket::Reply {
+                id,
+                error_code,
+                data,
+            } => {
                 assert_eq!(id, 0xCAFEBABE);
                 assert_eq!(error_code, 0);
                 assert!(String::from_utf8_lossy(&data).contains("CratonVM"));
@@ -1737,7 +1773,11 @@ mod tests {
         let mut st = fresh_state();
         let reply = wire_roundtrip(CS_VM, CMD_VM_ID_SIZES, &[], &mut st);
         match reply {
-            JdwpPacket::Reply { id, error_code, data } => {
+            JdwpPacket::Reply {
+                id,
+                error_code,
+                data,
+            } => {
                 assert_eq!(id, 0xCAFEBABE);
                 assert_eq!(error_code, 0);
                 // Five u32 BE fields, each = 8 (our ID size).
@@ -1762,7 +1802,9 @@ mod tests {
         body.put_u32_be(0);
         let reply = wire_roundtrip(CS_EVENT_REQUEST, CMD_ER_SET, &body.into_bytes(), &mut st);
         let req_id = match reply {
-            JdwpPacket::Reply { error_code, data, .. } => {
+            JdwpPacket::Reply {
+                error_code, data, ..
+            } => {
                 assert_eq!(error_code, 0);
                 assert_eq!(data.len(), 4);
                 u32::from_be_bytes([data[0], data[1], data[2], data[3]])
@@ -1778,7 +1820,9 @@ mod tests {
         clr.put_u32_be(req_id);
         let reply = wire_roundtrip(CS_EVENT_REQUEST, CMD_ER_CLEAR, &clr.into_bytes(), &mut st);
         match reply {
-            JdwpPacket::Reply { error_code, data, .. } => {
+            JdwpPacket::Reply {
+                error_code, data, ..
+            } => {
                 assert_eq!(error_code, 0);
                 assert!(data.is_empty());
             }
@@ -1804,7 +1848,9 @@ mod tests {
 
         let reply = wire_roundtrip(CS_EVENT_REQUEST, CMD_ER_SET, &body.into_bytes(), &mut st);
         match reply {
-            JdwpPacket::Reply { error_code, data, .. } => {
+            JdwpPacket::Reply {
+                error_code, data, ..
+            } => {
                 assert_eq!(error_code, 0);
                 assert_eq!(data.len(), 4);
                 let req_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -1831,7 +1877,13 @@ mod tests {
         write_packet(&mut wire, &client_pkt).unwrap();
         let parsed = read_packet(&mut Cursor::new(&wire[..])).unwrap();
         let (id, cs, c, data) = match parsed {
-            JdwpPacket::Command { id, command_set, command, data, .. } => (id, command_set, command, data),
+            JdwpPacket::Command {
+                id,
+                command_set,
+                command,
+                data,
+                ..
+            } => (id, command_set, command, data),
             _ => panic!(),
         };
         let result = dispatch(cs, c, &data, &mut st);
@@ -1936,11 +1988,7 @@ mod tests {
                 .unwrap_or(Err(BridgeError::Internal))
         }
 
-        fn new_array(
-            &self,
-            array_type_id: u64,
-            length: i32,
-        ) -> Result<u64, BridgeError> {
+        fn new_array(&self, array_type_id: u64, length: i32) -> Result<u64, BridgeError> {
             self.calls.lock().unwrap().push(MockCall::NewArray {
                 array_type_id,
                 length,
@@ -2029,7 +2077,9 @@ mod tests {
             .push(Ok(InvokeOutcome::returned(DebuggerValue::Int(7))));
 
         let payload = build_ct_invoke_payload(
-            10, 1, 42,
+            10,
+            1,
+            42,
             &[DebuggerValue::Int(3), DebuggerValue::Int(4)],
             0,
         );
@@ -2043,16 +2093,31 @@ mod tests {
         assert_eq!(ret, 7);
         // Exception: tag L, id 0.
         assert_eq!(res.data[5], b'L');
-        assert_eq!(u64::from_be_bytes([
-            res.data[6], res.data[7], res.data[8], res.data[9],
-            res.data[10], res.data[11], res.data[12], res.data[13]
-        ]), 0);
+        assert_eq!(
+            u64::from_be_bytes([
+                res.data[6],
+                res.data[7],
+                res.data[8],
+                res.data[9],
+                res.data[10],
+                res.data[11],
+                res.data[12],
+                res.data[13]
+            ]),
+            0
+        );
 
         // Verify handler forwarded the right things to the bridge.
         let calls = bridge.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            MockCall::Static { class_id, method_id, thread_id, args, return_sig } => {
+            MockCall::Static {
+                class_id,
+                method_id,
+                thread_id,
+                args,
+                return_sig,
+            } => {
                 assert_eq!(*class_id, 10);
                 assert_eq!(*method_id, 42);
                 assert_eq!(*thread_id, 1);
@@ -2083,14 +2148,26 @@ mod tests {
         assert_eq!(res.data.len(), 18);
         assert_eq!(res.data[0], b'L');
         let ret_id = u64::from_be_bytes([
-            res.data[1], res.data[2], res.data[3], res.data[4],
-            res.data[5], res.data[6], res.data[7], res.data[8]
+            res.data[1],
+            res.data[2],
+            res.data[3],
+            res.data[4],
+            res.data[5],
+            res.data[6],
+            res.data[7],
+            res.data[8],
         ]);
         assert_eq!(ret_id, 0); // null return
         assert_eq!(res.data[9], b'L');
         let exc = u64::from_be_bytes([
-            res.data[10], res.data[11], res.data[12], res.data[13],
-            res.data[14], res.data[15], res.data[16], res.data[17]
+            res.data[10],
+            res.data[11],
+            res.data[12],
+            res.data[13],
+            res.data[14],
+            res.data[15],
+            res.data[16],
+            res.data[17],
         ]);
         assert_eq!(exc, 99);
     }
@@ -2129,8 +2206,14 @@ mod tests {
         assert_eq!(res.data.len(), 18);
         assert_eq!(res.data[0], b'L');
         let obj_id = u64::from_be_bytes([
-            res.data[1], res.data[2], res.data[3], res.data[4],
-            res.data[5], res.data[6], res.data[7], res.data[8]
+            res.data[1],
+            res.data[2],
+            res.data[3],
+            res.data[4],
+            res.data[5],
+            res.data[6],
+            res.data[7],
+            res.data[8],
         ]);
         assert_eq!(obj_id, 0xBEEF);
         assert_eq!(res.data[9], b'L');
@@ -2138,8 +2221,13 @@ mod tests {
         let calls = bridge.calls.lock().unwrap();
         match &calls[0] {
             MockCall::Instance {
-                receiver_id, class_id, method_id, thread_id,
-                args, return_sig, non_virtual
+                receiver_id,
+                class_id,
+                method_id,
+                thread_id,
+                args,
+                return_sig,
+                non_virtual,
             } => {
                 assert_eq!(*receiver_id, 100);
                 assert_eq!(*class_id, 5);
@@ -2192,14 +2280,26 @@ mod tests {
         assert_eq!(res.data.len(), 18);
         assert_eq!(res.data[0], b'L');
         let ret_id = u64::from_be_bytes([
-            res.data[1], res.data[2], res.data[3], res.data[4],
-            res.data[5], res.data[6], res.data[7], res.data[8]
+            res.data[1],
+            res.data[2],
+            res.data[3],
+            res.data[4],
+            res.data[5],
+            res.data[6],
+            res.data[7],
+            res.data[8],
         ]);
         assert_eq!(ret_id, 0); // null return
         assert_eq!(res.data[9], b'L');
         let exc = u64::from_be_bytes([
-            res.data[10], res.data[11], res.data[12], res.data[13],
-            res.data[14], res.data[15], res.data[16], res.data[17]
+            res.data[10],
+            res.data[11],
+            res.data[12],
+            res.data[13],
+            res.data[14],
+            res.data[15],
+            res.data[16],
+            res.data[17],
         ]);
         assert_eq!(exc, 0xCAFE);
     }
@@ -2229,21 +2329,35 @@ mod tests {
         let mut pw = PayloadWriter::new();
         pw.put_u64_be(77); // arrayTypeID
         pw.put_u32_be(16); // length
-        let res = dispatch(CS_ARRAY_TYPE, CMD_AT_NEW_INSTANCE, &pw.into_bytes(), &mut st);
+        let res = dispatch(
+            CS_ARRAY_TYPE,
+            CMD_AT_NEW_INSTANCE,
+            &pw.into_bytes(),
+            &mut st,
+        );
         assert_eq!(res.error_code, ERR_NONE);
 
         // Reply: tag(1)=[ + id(8) = 9 bytes.
         assert_eq!(res.data.len(), 9);
         assert_eq!(res.data[0], b'[');
         let id = u64::from_be_bytes([
-            res.data[1], res.data[2], res.data[3], res.data[4],
-            res.data[5], res.data[6], res.data[7], res.data[8]
+            res.data[1],
+            res.data[2],
+            res.data[3],
+            res.data[4],
+            res.data[5],
+            res.data[6],
+            res.data[7],
+            res.data[8],
         ]);
         assert_eq!(id, 0x4242);
 
         let calls = bridge.calls.lock().unwrap();
         match &calls[0] {
-            MockCall::NewArray { array_type_id, length } => {
+            MockCall::NewArray {
+                array_type_id,
+                length,
+            } => {
                 assert_eq!(*array_type_id, 77);
                 assert_eq!(*length, 16);
             }
@@ -2263,7 +2377,12 @@ mod tests {
         let mut pw = PayloadWriter::new();
         pw.put_u64_be(0xDEAD);
         pw.put_u32_be(10);
-        let res = dispatch(CS_ARRAY_TYPE, CMD_AT_NEW_INSTANCE, &pw.into_bytes(), &mut st);
+        let res = dispatch(
+            CS_ARRAY_TYPE,
+            CMD_AT_NEW_INSTANCE,
+            &pw.into_bytes(),
+            &mut st,
+        );
         assert_eq!(res.error_code, ERR_INVALID_CLASS);
         assert!(res.data.is_empty());
     }
@@ -2274,7 +2393,12 @@ mod tests {
         let mut pw = PayloadWriter::new();
         pw.put_u64_be(77);
         pw.put_u32_be(16);
-        let res = dispatch(CS_ARRAY_TYPE, CMD_AT_NEW_INSTANCE, &pw.into_bytes(), &mut st);
+        let res = dispatch(
+            CS_ARRAY_TYPE,
+            CMD_AT_NEW_INSTANCE,
+            &pw.into_bytes(),
+            &mut st,
+        );
         assert_eq!(res.error_code, ERR_VM_DEAD);
     }
 
@@ -2294,7 +2418,9 @@ mod tests {
         let payload = build_ct_invoke_payload(10, 1, 42, &[DebuggerValue::Int(1)], 0);
         let reply = wire_roundtrip(CS_CLASS_TYPE, CMD_CT_INVOKE_METHOD, &payload, &mut st);
         match reply {
-            JdwpPacket::Reply { error_code, data, .. } => {
+            JdwpPacket::Reply {
+                error_code, data, ..
+            } => {
                 assert_eq!(error_code, 0);
                 // Reply should decode tag=I, i32=99, excTag=L, excId=0.
                 assert_eq!(data[0], b'I');

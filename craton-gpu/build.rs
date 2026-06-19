@@ -63,9 +63,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let out_dir = PathBuf::from(
-        std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"),
-    );
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let classes_dir = out_dir.join("classes");
     let jar_path = out_dir.join("craton-gpu-annotations.jar");
 
@@ -110,9 +108,7 @@ fn main() {
 
     // 1. Is javac on PATH?
     if !javac_available() {
-        println!(
-            "cargo:warning=javac not found; craton-gpu annotations will not be compiled"
-        );
+        println!("cargo:warning=javac not found; craton-gpu annotations will not be compiled");
         emit_env("", &classes_dir);
         return;
     }

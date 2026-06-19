@@ -119,24 +119,52 @@ pub type SmartMessage = Cow<'static, str>;
 /// reference (zero allocation).  Otherwise an owned `String` is produced.
 pub fn smart_message(msg: &str) -> SmartMessage {
     match msg {
-        s if s == exception_messages::NULL_POINTER => Cow::Borrowed(exception_messages::NULL_POINTER),
-        s if s == exception_messages::ARRAY_INDEX_OOB => Cow::Borrowed(exception_messages::ARRAY_INDEX_OOB),
+        s if s == exception_messages::NULL_POINTER => {
+            Cow::Borrowed(exception_messages::NULL_POINTER)
+        }
+        s if s == exception_messages::ARRAY_INDEX_OOB => {
+            Cow::Borrowed(exception_messages::ARRAY_INDEX_OOB)
+        }
         s if s == exception_messages::CLASS_CAST => Cow::Borrowed(exception_messages::CLASS_CAST),
         s if s == exception_messages::ARITHMETIC => Cow::Borrowed(exception_messages::ARITHMETIC),
-        s if s == exception_messages::STACK_OVERFLOW => Cow::Borrowed(exception_messages::STACK_OVERFLOW),
-        s if s == exception_messages::OUT_OF_MEMORY => Cow::Borrowed(exception_messages::OUT_OF_MEMORY),
-        s if s == exception_messages::CLASS_NOT_FOUND => Cow::Borrowed(exception_messages::CLASS_NOT_FOUND),
-        s if s == exception_messages::NO_SUCH_METHOD => Cow::Borrowed(exception_messages::NO_SUCH_METHOD),
-        s if s == exception_messages::NO_SUCH_FIELD => Cow::Borrowed(exception_messages::NO_SUCH_FIELD),
-        s if s == exception_messages::ILLEGAL_ARGUMENT => Cow::Borrowed(exception_messages::ILLEGAL_ARGUMENT),
-        s if s == exception_messages::ILLEGAL_STATE => Cow::Borrowed(exception_messages::ILLEGAL_STATE),
-        s if s == exception_messages::UNSUPPORTED_OP => Cow::Borrowed(exception_messages::UNSUPPORTED_OP),
-        s if s == exception_messages::NEGATIVE_ARRAY => Cow::Borrowed(exception_messages::NEGATIVE_ARRAY),
-        s if s == exception_messages::ILLEGAL_MONITOR => Cow::Borrowed(exception_messages::ILLEGAL_MONITOR),
+        s if s == exception_messages::STACK_OVERFLOW => {
+            Cow::Borrowed(exception_messages::STACK_OVERFLOW)
+        }
+        s if s == exception_messages::OUT_OF_MEMORY => {
+            Cow::Borrowed(exception_messages::OUT_OF_MEMORY)
+        }
+        s if s == exception_messages::CLASS_NOT_FOUND => {
+            Cow::Borrowed(exception_messages::CLASS_NOT_FOUND)
+        }
+        s if s == exception_messages::NO_SUCH_METHOD => {
+            Cow::Borrowed(exception_messages::NO_SUCH_METHOD)
+        }
+        s if s == exception_messages::NO_SUCH_FIELD => {
+            Cow::Borrowed(exception_messages::NO_SUCH_FIELD)
+        }
+        s if s == exception_messages::ILLEGAL_ARGUMENT => {
+            Cow::Borrowed(exception_messages::ILLEGAL_ARGUMENT)
+        }
+        s if s == exception_messages::ILLEGAL_STATE => {
+            Cow::Borrowed(exception_messages::ILLEGAL_STATE)
+        }
+        s if s == exception_messages::UNSUPPORTED_OP => {
+            Cow::Borrowed(exception_messages::UNSUPPORTED_OP)
+        }
+        s if s == exception_messages::NEGATIVE_ARRAY => {
+            Cow::Borrowed(exception_messages::NEGATIVE_ARRAY)
+        }
+        s if s == exception_messages::ILLEGAL_MONITOR => {
+            Cow::Borrowed(exception_messages::ILLEGAL_MONITOR)
+        }
         s if s == exception_messages::INTERRUPTED => Cow::Borrowed(exception_messages::INTERRUPTED),
         s if s == exception_messages::INDEX_OOB => Cow::Borrowed(exception_messages::INDEX_OOB),
-        s if s == exception_messages::CONCURRENT_MOD => Cow::Borrowed(exception_messages::CONCURRENT_MOD),
-        s if s == exception_messages::NO_CLASS_DEF => Cow::Borrowed(exception_messages::NO_CLASS_DEF),
+        s if s == exception_messages::CONCURRENT_MOD => {
+            Cow::Borrowed(exception_messages::CONCURRENT_MOD)
+        }
+        s if s == exception_messages::NO_CLASS_DEF => {
+            Cow::Borrowed(exception_messages::NO_CLASS_DEF)
+        }
         s if s == exception_messages::LINKAGE => Cow::Borrowed(exception_messages::LINKAGE),
         s if s == exception_messages::VERIFY => Cow::Borrowed(exception_messages::VERIFY),
         other => Cow::Owned(other.to_string()),
@@ -145,7 +173,10 @@ pub fn smart_message(msg: &str) -> SmartMessage {
 
 /// Format an array-index-out-of-bounds message.
 pub fn array_index_oob_message(index: i32, length: i32) -> SmartMessage {
-    Cow::Owned(format!("Index {} out of bounds for length {}", index, length))
+    Cow::Owned(format!(
+        "Index {} out of bounds for length {}",
+        index, length
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +551,10 @@ mod tests {
             pool.acquire_hit_count()
         );
         // Pool holds at least one idle Vec between iterations.
-        assert!(pool.pool_size() >= 1, "pool should still hold a Vec for reuse");
+        assert!(
+            pool.pool_size() >= 1,
+            "pool should still hold a Vec for reuse"
+        );
         VecPool::<u64>::disable_stats();
     }
 
@@ -542,7 +576,11 @@ mod tests {
         let v2 = pool.acquire(1);
         assert_eq!(v2.as_ptr(), original_ptr, "expected same allocation reused");
         assert!(v2.capacity() >= 256, "capacity must be >= 256 after reuse");
-        assert_eq!(v2.capacity(), original_cap, "capacity must be preserved exactly");
+        assert_eq!(
+            v2.capacity(),
+            original_cap,
+            "capacity must be preserved exactly"
+        );
         assert_eq!(v2.len(), 0, "Vec is cleared on release");
     }
 
@@ -566,13 +604,13 @@ mod tests {
         assert_eq!(base_hits, 0);
         assert_eq!(base_stored, 0);
 
-        let v1 = pool.acquire(16);  // fresh alloc, count=1 hits=0
-        let v2 = pool.acquire(16);  // fresh alloc, count=2 hits=0
-        let v3 = pool.acquire(16);  // fresh alloc, count=3 hits=0
+        let v1 = pool.acquire(16); // fresh alloc, count=1 hits=0
+        let v2 = pool.acquire(16); // fresh alloc, count=2 hits=0
+        let v3 = pool.acquire(16); // fresh alloc, count=3 hits=0
 
-        pool.release(v1);           // stored, release_stored=1
-        pool.release(v2);           // stored, release_stored=2
-        pool.release(v3);           // shard full (cap=2) → dropped, release_stored still 2
+        pool.release(v1); // stored, release_stored=1
+        pool.release(v2); // stored, release_stored=2
+        pool.release(v3); // shard full (cap=2) → dropped, release_stored still 2
 
         assert_eq!(pool.acquire_count(), 3);
         assert_eq!(pool.acquire_hit_count(), 0);

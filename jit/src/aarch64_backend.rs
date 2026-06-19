@@ -3725,11 +3725,7 @@ fn emit_addr_into_ip0(
     // correct two's-complement 64-bit value).
     emitter.mov_imm64(crate::aarch64::Reg::X16, offset as i64 as u64);
     // IP0 = base + IP0
-    emitter.add(
-        crate::aarch64::Reg::X16,
-        base,
-        crate::aarch64::Reg::X16,
-    );
+    emitter.add(crate::aarch64::Reg::X16, base, crate::aarch64::Reg::X16);
 }
 
 /// Lower an ADD/SUB-immediate (`rd = rn ± imm`) safely.
@@ -4603,10 +4599,10 @@ mod tests {
     #[test]
     fn backend_prologue_emits_stp_fp_lr() {
         let result = make_backend_with_method(0, 0, &[0xb1]); // return void
-        // Bug-fix (ARM64 BUG #2): the prologue now uses the writeback
-        // `STP FP, LR, [SP, #-16]!` form (StpPre) so SP is decremented as part
-        // of the save, instead of the old non-writeback `Stp` with an unsound
-        // "16 already consumed" SUB fudge.
+                                                              // Bug-fix (ARM64 BUG #2): the prologue now uses the writeback
+                                                              // `STP FP, LR, [SP, #-16]!` form (StpPre) so SP is decremented as part
+                                                              // of the save, instead of the old non-writeback `Stp` with an unsound
+                                                              // "16 already consumed" SUB fudge.
         let has_stp_fp_lr = result.instructions.iter().any(|inst| {
             matches!(
                 inst,
@@ -4636,7 +4632,10 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::Ret));
-        assert!(has_ldp, "epilogue must restore FP/LR with post-index LDP (LdpPost, #16)");
+        assert!(
+            has_ldp,
+            "epilogue must restore FP/LR with post-index LDP (LdpPost, #16)"
+        );
         assert!(has_ret, "epilogue must emit RET");
     }
 
@@ -5137,11 +5136,9 @@ mod tests {
         let mut backend = Arm64Backend::new();
         backend.emit_fconst(2.5);
         let expected_bits = 2.5f64.to_bits() as i64;
-        let has_movimm_bits = backend
-            .buffer
-            .instructions()
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::MovImm { imm, .. } if *imm == expected_bits));
+        let has_movimm_bits = backend.buffer.instructions().iter().any(
+            |inst| matches!(inst, Arm64Instruction::MovImm { imm, .. } if *imm == expected_bits),
+        );
         assert!(
             has_movimm_bits,
             "emit_fconst should materialize the exact f64 bit pattern {:#018x}",

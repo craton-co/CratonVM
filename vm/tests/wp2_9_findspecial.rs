@@ -53,7 +53,10 @@ fn findspecial_signature_takes_four_class_args() {
     let inner = &desc[1..desc.find(')').unwrap()];
     // Count L-prefixed types: should be 3 (Class, String, MethodType, Class) — wait, 4.
     let class_args = inner.matches("Ljava/lang/Class;").count();
-    assert_eq!(class_args, 2, "two Class args expected (refc + specialCaller)");
+    assert_eq!(
+        class_args, 2,
+        "two Class args expected (refc + specialCaller)"
+    );
     assert!(inner.contains("Ljava/lang/String;"));
     assert!(inner.contains("Ljava/lang/invoke/MethodType;"));
 }

@@ -164,7 +164,9 @@ impl JvmtiCapabilities {
             "can_generate_method_entry_events" => self.can_generate_method_entry_events,
             "can_generate_method_exit_events" => self.can_generate_method_exit_events,
             "can_generate_all_class_hook_events" => self.can_generate_all_class_hook_events,
-            "can_generate_compiled_method_load_events" => self.can_generate_compiled_method_load_events,
+            "can_generate_compiled_method_load_events" => {
+                self.can_generate_compiled_method_load_events
+            }
             "can_generate_monitor_events" => self.can_generate_monitor_events,
             "can_generate_vm_object_alloc_events" => self.can_generate_vm_object_alloc_events,
             "can_generate_garbage_collection_events" => self.can_generate_garbage_collection_events,

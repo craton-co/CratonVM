@@ -76,8 +76,12 @@ fn lookup_define_hidden_class_with_class_data_native_registered() {
     cratonvm_native_builtins::lookup_define::register_lookup_define_class(&mut r);
 
     assert!(
-        r.find(LK_CLASS, "defineHiddenClassWithClassData", HIDDEN_WITH_DATA_DESC)
-            .is_some(),
+        r.find(
+            LK_CLASS,
+            "defineHiddenClassWithClassData",
+            HIDDEN_WITH_DATA_DESC
+        )
+        .is_some(),
         "Lookup.defineHiddenClassWithClassData must be registered \
          (LambdaMetafactory + Weld classData-bound proxies use this)"
     );
@@ -120,11 +124,6 @@ fn define_class_options_nest_host_field_is_load_bearing() {
     // Method existence is a compile-time check — passing `opts` below
     // would fail to compile if the signature drifted.
     let _ = |cm: &mut ClassManager, bytes: &[u8]| {
-        cm.define_class_with_options(
-            "Probe",
-            bytes,
-            ClassLoaderId::Application,
-            opts.clone(),
-        )
+        cm.define_class_with_options("Probe", bytes, ClassLoaderId::Application, opts.clone())
     };
 }

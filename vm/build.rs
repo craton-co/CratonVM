@@ -25,7 +25,12 @@ fn is_modern_java(path: &Path) -> bool {
     content.lines().take(20).any(|l| l.contains("// JAVA21+"))
 }
 
-fn compile_files(files: &[PathBuf], out_dir: &Path, extra_args: &[&str], log_failure: bool) -> bool {
+fn compile_files(
+    files: &[PathBuf],
+    out_dir: &Path,
+    extra_args: &[&str],
+    log_failure: bool,
+) -> bool {
     if files.is_empty() {
         return true;
     }
@@ -76,10 +81,7 @@ fn javac_available_cached(out_dir: &Path) -> bool {
     let present = javac_check.is_ok_and(|o| o.status.success());
     // Best-effort cache write; if the FS is read-only we'll just
     // shell out again next build (no correctness impact).
-    let _ = std::fs::write(
-        &cache_path,
-        if present { "present" } else { "absent" },
-    );
+    let _ = std::fs::write(&cache_path, if present { "present" } else { "absent" });
     present
 }
 
@@ -140,15 +142,19 @@ fn main() {
     }
 
     // Partition into legacy and modern files.
-    let (modern, legacy): (Vec<_>, Vec<_>) = java_files
-        .into_iter()
-        .partition(|f| is_modern_java(f));
+    let (modern, legacy): (Vec<_>, Vec<_>) =
+        java_files.into_iter().partition(|f| is_modern_java(f));
 
     // Pass 1: legacy files (try -source 7, fall back to no flags).
     // Only the *fallback* attempt logs on failure — the first attempt
     // is speculative and a mismatched toolchain is expected.
     if !legacy.is_empty()
-        && !compile_files(&legacy, &output_dir, &["-source", "7", "-target", "7"], false)
+        && !compile_files(
+            &legacy,
+            &output_dir,
+            &["-source", "7", "-target", "7"],
+            false,
+        )
     {
         compile_files(&legacy, &output_dir, &[], true);
     }
@@ -157,9 +163,7 @@ fn main() {
     // Also speculative — if the host javac doesn't support --release 21
     // we fall back to plain javac which handles modern syntax on JDK
     // 21+ toolchains.
-    if !modern.is_empty()
-        && !compile_files(&modern, &output_dir, &["--release", "21"], false)
-    {
+    if !modern.is_empty() && !compile_files(&modern, &output_dir, &["--release", "21"], false) {
         compile_files(&modern, &output_dir, &[], true);
     }
 }

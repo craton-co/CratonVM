@@ -111,15 +111,27 @@ impl JvmtiError {
             Self::InvalidClassFormat => "JVMTI_ERROR_INVALID_CLASS_FORMAT",
             Self::CircularClassDefinition => "JVMTI_ERROR_CIRCULAR_CLASS_DEFINITION",
             Self::FailsVerification => "JVMTI_ERROR_FAILS_VERIFICATION",
-            Self::UnsupportedRedefinitionMethodAdded => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_ADDED",
-            Self::UnsupportedRedefinitionSchemaChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_SCHEMA_CHANGED",
+            Self::UnsupportedRedefinitionMethodAdded => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_ADDED"
+            }
+            Self::UnsupportedRedefinitionSchemaChanged => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_SCHEMA_CHANGED"
+            }
             Self::InvalidTypeState => "JVMTI_ERROR_INVALID_TYPESTATE",
-            Self::UnsupportedRedefinitionHierarchyChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_HIERARCHY_CHANGED",
-            Self::UnsupportedRedefinitionMethodDeleted => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_DELETED",
+            Self::UnsupportedRedefinitionHierarchyChanged => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_HIERARCHY_CHANGED"
+            }
+            Self::UnsupportedRedefinitionMethodDeleted => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_DELETED"
+            }
             Self::UnsupportedVersion => "JVMTI_ERROR_UNSUPPORTED_VERSION",
             Self::NamesDontMatch => "JVMTI_ERROR_NAMES_DONT_MATCH",
-            Self::UnsupportedRedefinitionClassModifiersChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_CLASS_MODIFIERS_CHANGED",
-            Self::UnsupportedRedefinitionMethodModifiersChanged => "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_MODIFIERS_CHANGED",
+            Self::UnsupportedRedefinitionClassModifiersChanged => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_CLASS_MODIFIERS_CHANGED"
+            }
+            Self::UnsupportedRedefinitionMethodModifiersChanged => {
+                "JVMTI_ERROR_UNSUPPORTED_REDEFINITION_METHOD_MODIFIERS_CHANGED"
+            }
             Self::MustPossessCapability => "JVMTI_ERROR_MUST_POSSESS_CAPABILITY",
             Self::NullPointer => "JVMTI_ERROR_NULL_POINTER",
             Self::AbsentInformation => "JVMTI_ERROR_ABSENT_INFORMATION",
@@ -343,46 +355,76 @@ impl JvmtiCapabilities {
     pub fn union(&self, other: &Self) -> Self {
         Self {
             can_tag_objects: self.can_tag_objects || other.can_tag_objects,
-            can_generate_field_modification_events: self.can_generate_field_modification_events || other.can_generate_field_modification_events,
-            can_generate_field_access_events: self.can_generate_field_access_events || other.can_generate_field_access_events,
+            can_generate_field_modification_events: self.can_generate_field_modification_events
+                || other.can_generate_field_modification_events,
+            can_generate_field_access_events: self.can_generate_field_access_events
+                || other.can_generate_field_access_events,
             can_get_bytecodes: self.can_get_bytecodes || other.can_get_bytecodes,
-            can_get_synthetic_attribute: self.can_get_synthetic_attribute || other.can_get_synthetic_attribute,
-            can_get_owned_monitor_info: self.can_get_owned_monitor_info || other.can_get_owned_monitor_info,
-            can_get_current_contended_monitor: self.can_get_current_contended_monitor || other.can_get_current_contended_monitor,
+            can_get_synthetic_attribute: self.can_get_synthetic_attribute
+                || other.can_get_synthetic_attribute,
+            can_get_owned_monitor_info: self.can_get_owned_monitor_info
+                || other.can_get_owned_monitor_info,
+            can_get_current_contended_monitor: self.can_get_current_contended_monitor
+                || other.can_get_current_contended_monitor,
             can_get_monitor_info: self.can_get_monitor_info || other.can_get_monitor_info,
             can_pop_frame: self.can_pop_frame || other.can_pop_frame,
             can_redefine_classes: self.can_redefine_classes || other.can_redefine_classes,
             can_signal_thread: self.can_signal_thread || other.can_signal_thread,
-            can_get_source_file_name: self.can_get_source_file_name || other.can_get_source_file_name,
+            can_get_source_file_name: self.can_get_source_file_name
+                || other.can_get_source_file_name,
             can_get_line_numbers: self.can_get_line_numbers || other.can_get_line_numbers,
-            can_get_source_debug_extension: self.can_get_source_debug_extension || other.can_get_source_debug_extension,
-            can_access_local_variables: self.can_access_local_variables || other.can_access_local_variables,
-            can_maintain_original_method_order: self.can_maintain_original_method_order || other.can_maintain_original_method_order,
-            can_generate_single_step_events: self.can_generate_single_step_events || other.can_generate_single_step_events,
-            can_generate_exception_events: self.can_generate_exception_events || other.can_generate_exception_events,
-            can_generate_frame_pop_events: self.can_generate_frame_pop_events || other.can_generate_frame_pop_events,
-            can_generate_breakpoint_events: self.can_generate_breakpoint_events || other.can_generate_breakpoint_events,
+            can_get_source_debug_extension: self.can_get_source_debug_extension
+                || other.can_get_source_debug_extension,
+            can_access_local_variables: self.can_access_local_variables
+                || other.can_access_local_variables,
+            can_maintain_original_method_order: self.can_maintain_original_method_order
+                || other.can_maintain_original_method_order,
+            can_generate_single_step_events: self.can_generate_single_step_events
+                || other.can_generate_single_step_events,
+            can_generate_exception_events: self.can_generate_exception_events
+                || other.can_generate_exception_events,
+            can_generate_frame_pop_events: self.can_generate_frame_pop_events
+                || other.can_generate_frame_pop_events,
+            can_generate_breakpoint_events: self.can_generate_breakpoint_events
+                || other.can_generate_breakpoint_events,
             can_suspend: self.can_suspend || other.can_suspend,
             can_redefine_any_class: self.can_redefine_any_class || other.can_redefine_any_class,
-            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time || other.can_get_current_thread_cpu_time,
+            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time
+                || other.can_get_current_thread_cpu_time,
             can_get_thread_cpu_time: self.can_get_thread_cpu_time || other.can_get_thread_cpu_time,
-            can_generate_method_entry_events: self.can_generate_method_entry_events || other.can_generate_method_entry_events,
-            can_generate_method_exit_events: self.can_generate_method_exit_events || other.can_generate_method_exit_events,
-            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events || other.can_generate_all_class_hook_events,
-            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events || other.can_generate_compiled_method_load_events,
-            can_generate_monitor_events: self.can_generate_monitor_events || other.can_generate_monitor_events,
-            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events || other.can_generate_vm_object_alloc_events,
-            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events || other.can_generate_native_method_bind_events,
-            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events || other.can_generate_garbage_collection_events,
-            can_generate_object_free_events: self.can_generate_object_free_events || other.can_generate_object_free_events,
+            can_generate_method_entry_events: self.can_generate_method_entry_events
+                || other.can_generate_method_entry_events,
+            can_generate_method_exit_events: self.can_generate_method_exit_events
+                || other.can_generate_method_exit_events,
+            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events
+                || other.can_generate_all_class_hook_events,
+            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events
+                || other.can_generate_compiled_method_load_events,
+            can_generate_monitor_events: self.can_generate_monitor_events
+                || other.can_generate_monitor_events,
+            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events
+                || other.can_generate_vm_object_alloc_events,
+            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events
+                || other.can_generate_native_method_bind_events,
+            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events
+                || other.can_generate_garbage_collection_events,
+            can_generate_object_free_events: self.can_generate_object_free_events
+                || other.can_generate_object_free_events,
             can_force_early_return: self.can_force_early_return || other.can_force_early_return,
-            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info || other.can_get_owned_monitor_stack_depth_info,
+            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info
+                || other.can_get_owned_monitor_stack_depth_info,
             can_get_constant_pool: self.can_get_constant_pool || other.can_get_constant_pool,
-            can_set_native_method_prefix: self.can_set_native_method_prefix || other.can_set_native_method_prefix,
+            can_set_native_method_prefix: self.can_set_native_method_prefix
+                || other.can_set_native_method_prefix,
             can_retransform_classes: self.can_retransform_classes || other.can_retransform_classes,
-            can_retransform_any_class: self.can_retransform_any_class || other.can_retransform_any_class,
-            can_generate_resource_exhaustion_heap_events: self.can_generate_resource_exhaustion_heap_events || other.can_generate_resource_exhaustion_heap_events,
-            can_generate_resource_exhaustion_threads_events: self.can_generate_resource_exhaustion_threads_events || other.can_generate_resource_exhaustion_threads_events,
+            can_retransform_any_class: self.can_retransform_any_class
+                || other.can_retransform_any_class,
+            can_generate_resource_exhaustion_heap_events: self
+                .can_generate_resource_exhaustion_heap_events
+                || other.can_generate_resource_exhaustion_heap_events,
+            can_generate_resource_exhaustion_threads_events: self
+                .can_generate_resource_exhaustion_threads_events
+                || other.can_generate_resource_exhaustion_threads_events,
         }
     }
 
@@ -390,46 +432,76 @@ impl JvmtiCapabilities {
     pub fn subtract(&self, other: &Self) -> Self {
         Self {
             can_tag_objects: self.can_tag_objects && !other.can_tag_objects,
-            can_generate_field_modification_events: self.can_generate_field_modification_events && !other.can_generate_field_modification_events,
-            can_generate_field_access_events: self.can_generate_field_access_events && !other.can_generate_field_access_events,
+            can_generate_field_modification_events: self.can_generate_field_modification_events
+                && !other.can_generate_field_modification_events,
+            can_generate_field_access_events: self.can_generate_field_access_events
+                && !other.can_generate_field_access_events,
             can_get_bytecodes: self.can_get_bytecodes && !other.can_get_bytecodes,
-            can_get_synthetic_attribute: self.can_get_synthetic_attribute && !other.can_get_synthetic_attribute,
-            can_get_owned_monitor_info: self.can_get_owned_monitor_info && !other.can_get_owned_monitor_info,
-            can_get_current_contended_monitor: self.can_get_current_contended_monitor && !other.can_get_current_contended_monitor,
+            can_get_synthetic_attribute: self.can_get_synthetic_attribute
+                && !other.can_get_synthetic_attribute,
+            can_get_owned_monitor_info: self.can_get_owned_monitor_info
+                && !other.can_get_owned_monitor_info,
+            can_get_current_contended_monitor: self.can_get_current_contended_monitor
+                && !other.can_get_current_contended_monitor,
             can_get_monitor_info: self.can_get_monitor_info && !other.can_get_monitor_info,
             can_pop_frame: self.can_pop_frame && !other.can_pop_frame,
             can_redefine_classes: self.can_redefine_classes && !other.can_redefine_classes,
             can_signal_thread: self.can_signal_thread && !other.can_signal_thread,
-            can_get_source_file_name: self.can_get_source_file_name && !other.can_get_source_file_name,
+            can_get_source_file_name: self.can_get_source_file_name
+                && !other.can_get_source_file_name,
             can_get_line_numbers: self.can_get_line_numbers && !other.can_get_line_numbers,
-            can_get_source_debug_extension: self.can_get_source_debug_extension && !other.can_get_source_debug_extension,
-            can_access_local_variables: self.can_access_local_variables && !other.can_access_local_variables,
-            can_maintain_original_method_order: self.can_maintain_original_method_order && !other.can_maintain_original_method_order,
-            can_generate_single_step_events: self.can_generate_single_step_events && !other.can_generate_single_step_events,
-            can_generate_exception_events: self.can_generate_exception_events && !other.can_generate_exception_events,
-            can_generate_frame_pop_events: self.can_generate_frame_pop_events && !other.can_generate_frame_pop_events,
-            can_generate_breakpoint_events: self.can_generate_breakpoint_events && !other.can_generate_breakpoint_events,
+            can_get_source_debug_extension: self.can_get_source_debug_extension
+                && !other.can_get_source_debug_extension,
+            can_access_local_variables: self.can_access_local_variables
+                && !other.can_access_local_variables,
+            can_maintain_original_method_order: self.can_maintain_original_method_order
+                && !other.can_maintain_original_method_order,
+            can_generate_single_step_events: self.can_generate_single_step_events
+                && !other.can_generate_single_step_events,
+            can_generate_exception_events: self.can_generate_exception_events
+                && !other.can_generate_exception_events,
+            can_generate_frame_pop_events: self.can_generate_frame_pop_events
+                && !other.can_generate_frame_pop_events,
+            can_generate_breakpoint_events: self.can_generate_breakpoint_events
+                && !other.can_generate_breakpoint_events,
             can_suspend: self.can_suspend && !other.can_suspend,
             can_redefine_any_class: self.can_redefine_any_class && !other.can_redefine_any_class,
-            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time && !other.can_get_current_thread_cpu_time,
+            can_get_current_thread_cpu_time: self.can_get_current_thread_cpu_time
+                && !other.can_get_current_thread_cpu_time,
             can_get_thread_cpu_time: self.can_get_thread_cpu_time && !other.can_get_thread_cpu_time,
-            can_generate_method_entry_events: self.can_generate_method_entry_events && !other.can_generate_method_entry_events,
-            can_generate_method_exit_events: self.can_generate_method_exit_events && !other.can_generate_method_exit_events,
-            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events && !other.can_generate_all_class_hook_events,
-            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events && !other.can_generate_compiled_method_load_events,
-            can_generate_monitor_events: self.can_generate_monitor_events && !other.can_generate_monitor_events,
-            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events && !other.can_generate_vm_object_alloc_events,
-            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events && !other.can_generate_native_method_bind_events,
-            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events && !other.can_generate_garbage_collection_events,
-            can_generate_object_free_events: self.can_generate_object_free_events && !other.can_generate_object_free_events,
+            can_generate_method_entry_events: self.can_generate_method_entry_events
+                && !other.can_generate_method_entry_events,
+            can_generate_method_exit_events: self.can_generate_method_exit_events
+                && !other.can_generate_method_exit_events,
+            can_generate_all_class_hook_events: self.can_generate_all_class_hook_events
+                && !other.can_generate_all_class_hook_events,
+            can_generate_compiled_method_load_events: self.can_generate_compiled_method_load_events
+                && !other.can_generate_compiled_method_load_events,
+            can_generate_monitor_events: self.can_generate_monitor_events
+                && !other.can_generate_monitor_events,
+            can_generate_vm_object_alloc_events: self.can_generate_vm_object_alloc_events
+                && !other.can_generate_vm_object_alloc_events,
+            can_generate_native_method_bind_events: self.can_generate_native_method_bind_events
+                && !other.can_generate_native_method_bind_events,
+            can_generate_garbage_collection_events: self.can_generate_garbage_collection_events
+                && !other.can_generate_garbage_collection_events,
+            can_generate_object_free_events: self.can_generate_object_free_events
+                && !other.can_generate_object_free_events,
             can_force_early_return: self.can_force_early_return && !other.can_force_early_return,
-            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info && !other.can_get_owned_monitor_stack_depth_info,
+            can_get_owned_monitor_stack_depth_info: self.can_get_owned_monitor_stack_depth_info
+                && !other.can_get_owned_monitor_stack_depth_info,
             can_get_constant_pool: self.can_get_constant_pool && !other.can_get_constant_pool,
-            can_set_native_method_prefix: self.can_set_native_method_prefix && !other.can_set_native_method_prefix,
+            can_set_native_method_prefix: self.can_set_native_method_prefix
+                && !other.can_set_native_method_prefix,
             can_retransform_classes: self.can_retransform_classes && !other.can_retransform_classes,
-            can_retransform_any_class: self.can_retransform_any_class && !other.can_retransform_any_class,
-            can_generate_resource_exhaustion_heap_events: self.can_generate_resource_exhaustion_heap_events && !other.can_generate_resource_exhaustion_heap_events,
-            can_generate_resource_exhaustion_threads_events: self.can_generate_resource_exhaustion_threads_events && !other.can_generate_resource_exhaustion_threads_events,
+            can_retransform_any_class: self.can_retransform_any_class
+                && !other.can_retransform_any_class,
+            can_generate_resource_exhaustion_heap_events: self
+                .can_generate_resource_exhaustion_heap_events
+                && !other.can_generate_resource_exhaustion_heap_events,
+            can_generate_resource_exhaustion_threads_events: self
+                .can_generate_resource_exhaustion_threads_events
+                && !other.can_generate_resource_exhaustion_threads_events,
         }
     }
 
@@ -606,7 +678,8 @@ pub struct EventCallbacks {
     pub vm_death: Option<Box<dyn Fn() + Send + Sync>>,
     pub thread_start: Option<Box<dyn Fn(ThreadId) + Send + Sync>>,
     pub thread_end: Option<Box<dyn Fn(ThreadId) + Send + Sync>>,
-    pub class_file_load_hook: Option<Box<dyn Fn(ClassId, &str, &[u8]) -> Option<Vec<u8>> + Send + Sync>>,
+    pub class_file_load_hook:
+        Option<Box<dyn Fn(ClassId, &str, &[u8]) -> Option<Vec<u8>> + Send + Sync>>,
     pub class_load: Option<Box<dyn Fn(ThreadId, ClassId) + Send + Sync>>,
     pub class_prepare: Option<Box<dyn Fn(ThreadId, ClassId) + Send + Sync>>,
     pub method_entry: Option<Box<dyn Fn(ThreadId, MethodId) + Send + Sync>>,
@@ -779,20 +852,36 @@ impl JvmtiEventManager {
     /// state. Called after Enable / Disable of a relevant event kind so the
     /// interpreter's per-opcode hot-path load sees the correct value.
     fn recompute_per_event_flag(&self, kind: JvmtiEventKind) {
-        let global = self.global_events.read()
+        let global = self
+            .global_events
+            .read()
             .map(|g| g.contains(&kind))
             .unwrap_or(false);
-        let per_thread = self.thread_events.read()
+        let per_thread = self
+            .thread_events
+            .read()
             .map(|t| t.values().any(|s| s.contains(&kind)))
             .unwrap_or(false);
         let enabled = global || per_thread;
         match kind {
-            JvmtiEventKind::MethodEntry => self.any_method_entry_listener.store(enabled, Ordering::Release),
-            JvmtiEventKind::MethodExit => self.any_method_exit_listener.store(enabled, Ordering::Release),
-            JvmtiEventKind::SingleStep => self.any_single_step_listener.store(enabled, Ordering::Release),
-            JvmtiEventKind::FieldAccess => self.any_field_access_listener.store(enabled, Ordering::Release),
-            JvmtiEventKind::FieldModification => self.any_field_modification_listener.store(enabled, Ordering::Release),
-            JvmtiEventKind::FramePop => self.any_frame_pop_listener.store(enabled, Ordering::Release),
+            JvmtiEventKind::MethodEntry => self
+                .any_method_entry_listener
+                .store(enabled, Ordering::Release),
+            JvmtiEventKind::MethodExit => self
+                .any_method_exit_listener
+                .store(enabled, Ordering::Release),
+            JvmtiEventKind::SingleStep => self
+                .any_single_step_listener
+                .store(enabled, Ordering::Release),
+            JvmtiEventKind::FieldAccess => self
+                .any_field_access_listener
+                .store(enabled, Ordering::Release),
+            JvmtiEventKind::FieldModification => self
+                .any_field_modification_listener
+                .store(enabled, Ordering::Release),
+            JvmtiEventKind::FramePop => self
+                .any_frame_pop_listener
+                .store(enabled, Ordering::Release),
             _ => {}
         }
     }
@@ -832,7 +921,10 @@ impl JvmtiEventManager {
     /// The env is held by Weak<JvmtiEnv> so dropping the env does not keep
     /// the manager from garbage-collecting it.
     pub fn register_env(&self, env: &Arc<JvmtiEnv>) -> JvmtiResult<()> {
-        let mut list = self.attached_envs.write().map_err(|_| JvmtiError::Internal)?;
+        let mut list = self
+            .attached_envs
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         list.push(Arc::downgrade(env));
         self.any_listener.store(true, Ordering::Release);
         Ok(())
@@ -842,7 +934,10 @@ impl JvmtiEventManager {
     pub fn unregister_env(&self, env: &Arc<JvmtiEnv>) -> JvmtiResult<()> {
         let any_env_left: bool;
         {
-            let mut list = self.attached_envs.write().map_err(|_| JvmtiError::Internal)?;
+            let mut list = self
+                .attached_envs
+                .write()
+                .map_err(|_| JvmtiError::Internal)?;
             let target = Arc::as_ptr(env) as usize;
             list.retain(|w| {
                 w.upgrade()
@@ -852,29 +947,43 @@ impl JvmtiEventManager {
             any_env_left = list.iter().any(|w| w.strong_count() > 0);
         }
         // Lock released above — now safe to re-check global/thread event state.
-        let have_global = self.global_events.read()
+        let have_global = self
+            .global_events
+            .read()
             .map(|g| !g.is_empty())
             .unwrap_or(false);
-        let have_thread = self.thread_events.read()
+        let have_thread = self
+            .thread_events
+            .read()
             .map(|t| t.values().any(|s| !s.is_empty()))
             .unwrap_or(false);
-        self.any_listener.store(any_env_left || have_global || have_thread, Ordering::Release);
+        self.any_listener.store(
+            any_env_left || have_global || have_thread,
+            Ordering::Release,
+        );
         Ok(())
     }
 
     /// Recompute the `any_listener` flag from the current state.
     /// Called after env detach or event-mode disable operations.
     fn recompute_any_listener(&self) {
-        let have_env = self.attached_envs.read()
+        let have_env = self
+            .attached_envs
+            .read()
             .map(|l| l.iter().any(|w| w.strong_count() > 0))
             .unwrap_or(false);
-        let have_global = self.global_events.read()
+        let have_global = self
+            .global_events
+            .read()
             .map(|g| !g.is_empty())
             .unwrap_or(false);
-        let have_thread = self.thread_events.read()
+        let have_thread = self
+            .thread_events
+            .read()
             .map(|t| t.values().any(|s| !s.is_empty()))
             .unwrap_or(false);
-        self.any_listener.store(have_env || have_global || have_thread, Ordering::Release);
+        self.any_listener
+            .store(have_env || have_global || have_thread, Ordering::Release);
     }
 
     /// Fast-path check: is any listener attached at all?
@@ -904,21 +1013,33 @@ impl JvmtiEventManager {
     ) -> JvmtiResult<()> {
         match thread {
             None => {
-                let mut global = self.global_events.write()
+                let mut global = self
+                    .global_events
+                    .write()
                     .map_err(|_| JvmtiError::Internal)?;
                 match mode {
-                    EventMode::Enable => { global.insert(event_kind); }
-                    EventMode::Disable => { global.remove(&event_kind); }
+                    EventMode::Enable => {
+                        global.insert(event_kind);
+                    }
+                    EventMode::Disable => {
+                        global.remove(&event_kind);
+                    }
                 }
                 // Lock dropped at end of scope.
             }
             Some(tid) => {
-                let mut per_thread = self.thread_events.write()
+                let mut per_thread = self
+                    .thread_events
+                    .write()
                     .map_err(|_| JvmtiError::Internal)?;
                 let set = per_thread.entry(tid).or_default();
                 match mode {
-                    EventMode::Enable => { set.insert(event_kind); }
-                    EventMode::Disable => { set.remove(&event_kind); }
+                    EventMode::Enable => {
+                        set.insert(event_kind);
+                    }
+                    EventMode::Disable => {
+                        set.remove(&event_kind);
+                    }
                 }
             }
         }
@@ -987,7 +1108,8 @@ impl JvmtiEventManager {
 
     /// Get the total number of events fired for a given kind.
     pub fn event_count(&self, kind: JvmtiEventKind) -> u64 {
-        self.event_counts.lock()
+        self.event_counts
+            .lock()
             .map(|c| c.get(&kind).copied().unwrap_or(0))
             .unwrap_or(0)
     }
@@ -995,34 +1117,50 @@ impl JvmtiEventManager {
     // --- Event firing methods ---
 
     pub fn fire_vm_init(&self) {
-        if !self.is_event_enabled(JvmtiEventKind::VmInit, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::VmInit, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::VmInit);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.vm_init { cb(); }
+            if let Some(ref cb) = cbs.vm_init {
+                cb();
+            }
         }
     }
 
     pub fn fire_vm_death(&self) {
-        if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::VmDeath);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.vm_death { cb(); }
+            if let Some(ref cb) = cbs.vm_death {
+                cb();
+            }
         }
     }
 
     pub fn fire_thread_start(&self, thread: ThreadId) {
-        if !self.is_event_enabled(JvmtiEventKind::ThreadStart, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ThreadStart, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ThreadStart);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.thread_start { cb(thread); }
+            if let Some(ref cb) = cbs.thread_start {
+                cb(thread);
+            }
         }
     }
 
     pub fn fire_thread_end(&self, thread: ThreadId) {
-        if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ThreadEnd);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.thread_end { cb(thread); }
+            if let Some(ref cb) = cbs.thread_end {
+                cb(thread);
+            }
         }
     }
 
@@ -1034,7 +1172,9 @@ impl JvmtiEventManager {
         class_name: &str,
         bytecode: &[u8],
     ) -> Option<Vec<u8>> {
-        if !self.is_event_enabled(JvmtiEventKind::ClassFileLoadHook, None) { return None; }
+        if !self.is_event_enabled(JvmtiEventKind::ClassFileLoadHook, None) {
+            return None;
+        }
         self.record_event(JvmtiEventKind::ClassFileLoadHook);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_file_load_hook {
@@ -1045,227 +1185,333 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
-        if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ClassLoad);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.class_load { cb(thread, class_id); }
+            if let Some(ref cb) = cbs.class_load {
+                cb(thread, class_id);
+            }
         }
     }
 
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
-        if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ClassPrepare);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.class_prepare { cb(thread, class_id); }
+            if let Some(ref cb) = cbs.class_prepare {
+                cb(thread, class_id);
+            }
         }
     }
 
     pub fn fire_method_entry(&self, thread: ThreadId, method: MethodId) {
-        if !self.is_event_enabled(JvmtiEventKind::MethodEntry, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::MethodEntry, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MethodEntry);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.method_entry {
                 // Panic-safe: agent callbacks may panic, don't bring down VM.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method)));
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method)));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.method_entry {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method)
+                    }));
                 }
             }
         }
     }
 
-    pub fn fire_method_exit(&self, thread: ThreadId, method: MethodId, was_popped_by_exception: bool, return_value: LocalValue) {
-        if !self.is_event_enabled(JvmtiEventKind::MethodExit, Some(thread)) { return; }
+    pub fn fire_method_exit(
+        &self,
+        thread: ThreadId,
+        method: MethodId,
+        was_popped_by_exception: bool,
+        return_value: LocalValue,
+    ) {
+        if !self.is_event_enabled(JvmtiEventKind::MethodExit, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MethodExit);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.method_exit {
                 let rv = return_value.clone();
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception, rv)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, method, was_popped_by_exception, rv)
+                }));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.method_exit {
                     let rv = return_value.clone();
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception, rv)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method, was_popped_by_exception, rv)
+                    }));
                 }
             }
         }
     }
 
     pub fn fire_exception(&self, thread: ThreadId, method: MethodId, location: i64) {
-        if !self.is_event_enabled(JvmtiEventKind::Exception, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::Exception, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::Exception);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.exception { cb(thread, method, location); }
+            if let Some(ref cb) = cbs.exception {
+                cb(thread, method, location);
+            }
         }
     }
 
     pub fn fire_exception_catch(&self, thread: ThreadId, method: MethodId, location: i64) {
-        if !self.is_event_enabled(JvmtiEventKind::ExceptionCatch, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::ExceptionCatch, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ExceptionCatch);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.exception_catch { cb(thread, method, location); }
+            if let Some(ref cb) = cbs.exception_catch {
+                cb(thread, method, location);
+            }
         }
     }
 
     pub fn fire_field_access(&self, thread: ThreadId, method: MethodId, field: FieldId) {
-        if !self.is_event_enabled(JvmtiEventKind::FieldAccess, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::FieldAccess, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::FieldAccess);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.field_access {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, method, field)
+                }));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.field_access {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method, field)
+                    }));
                 }
             }
         }
     }
 
     pub fn fire_field_modification(&self, thread: ThreadId, method: MethodId, field: FieldId) {
-        if !self.is_event_enabled(JvmtiEventKind::FieldModification, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::FieldModification, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::FieldModification);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.field_modification {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, method, field)
+                }));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.field_modification {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, field)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method, field)
+                    }));
                 }
             }
         }
     }
 
     pub fn fire_breakpoint(&self, thread: ThreadId, method: MethodId, location: i64) {
-        if !self.is_event_enabled(JvmtiEventKind::Breakpoint, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::Breakpoint, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::Breakpoint);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.breakpoint { cb(thread, method, location); }
+            if let Some(ref cb) = cbs.breakpoint {
+                cb(thread, method, location);
+            }
         }
     }
 
     pub fn fire_single_step(&self, thread: ThreadId, method: MethodId, location: i64) {
-        if !self.is_event_enabled(JvmtiEventKind::SingleStep, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::SingleStep, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::SingleStep);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.single_step {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, location)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, method, location)
+                }));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.single_step {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, location)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method, location)
+                    }));
                 }
             }
         }
     }
 
-    pub fn fire_frame_pop(&self, thread: ThreadId, method: MethodId, was_popped_by_exception: bool) {
-        if !self.is_event_enabled(JvmtiEventKind::FramePop, Some(thread)) { return; }
+    pub fn fire_frame_pop(
+        &self,
+        thread: ThreadId,
+        method: MethodId,
+        was_popped_by_exception: bool,
+    ) {
+        if !self.is_event_enabled(JvmtiEventKind::FramePop, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::FramePop);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.frame_pop {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, method, was_popped_by_exception)
+                }));
             }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
                 if let Some(ref cb) = cbs.frame_pop {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, method, was_popped_by_exception)));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, method, was_popped_by_exception)
+                    }));
                 }
             }
         }
     }
 
     pub fn fire_gc_start(&self) {
-        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::GarbageCollectionStart);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.gc_start { cb(); }
+            if let Some(ref cb) = cbs.gc_start {
+                cb();
+            }
         }
     }
 
     pub fn fire_gc_finish(&self) {
-        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::GarbageCollectionFinish);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.gc_finish { cb(); }
+            if let Some(ref cb) = cbs.gc_finish {
+                cb();
+            }
         }
     }
 
     pub fn fire_monitor_contended_enter(&self, thread: ThreadId, object: u64) {
-        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEnter, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEnter, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MonitorContendedEnter);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.monitor_contended_enter { cb(thread, object); }
+            if let Some(ref cb) = cbs.monitor_contended_enter {
+                cb(thread, object);
+            }
         }
     }
 
     pub fn fire_monitor_contended_entered(&self, thread: ThreadId, object: u64) {
-        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEntered, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::MonitorContendedEntered, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MonitorContendedEntered);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.monitor_contended_entered { cb(thread, object); }
+            if let Some(ref cb) = cbs.monitor_contended_entered {
+                cb(thread, object);
+            }
         }
     }
 
     pub fn fire_monitor_wait(&self, thread: ThreadId, object: u64, timeout: i64) {
-        if !self.is_event_enabled(JvmtiEventKind::MonitorWait, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::MonitorWait, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MonitorWait);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.monitor_wait { cb(thread, object, timeout); }
+            if let Some(ref cb) = cbs.monitor_wait {
+                cb(thread, object, timeout);
+            }
         }
     }
 
     pub fn fire_monitor_waited(&self, thread: ThreadId, object: u64, timed_out: bool) {
-        if !self.is_event_enabled(JvmtiEventKind::MonitorWaited, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::MonitorWaited, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::MonitorWaited);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.monitor_waited { cb(thread, object, timed_out); }
+            if let Some(ref cb) = cbs.monitor_waited {
+                cb(thread, object, timed_out);
+            }
         }
     }
 
     pub fn fire_compiled_method_load(&self, method: MethodId, code_size: usize) {
-        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodLoad, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodLoad, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::CompiledMethodLoad);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.compiled_method_load { cb(method, code_size); }
+            if let Some(ref cb) = cbs.compiled_method_load {
+                cb(method, code_size);
+            }
         }
     }
 
     pub fn fire_compiled_method_unload(&self, method: MethodId) {
-        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodUnload, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::CompiledMethodUnload, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::CompiledMethodUnload);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.compiled_method_unload { cb(method); }
+            if let Some(ref cb) = cbs.compiled_method_unload {
+                cb(method);
+            }
         }
     }
 
     pub fn fire_dynamic_code_generated(&self, name: &str, code_size: usize) {
-        if !self.is_event_enabled(JvmtiEventKind::DynamicCodeGenerated, None) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::DynamicCodeGenerated, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::DynamicCodeGenerated);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.dynamic_code_generated { cb(name, code_size); }
+            if let Some(ref cb) = cbs.dynamic_code_generated {
+                cb(name, code_size);
+            }
         }
     }
 
     pub fn fire_native_method_bind(&self, thread: ThreadId, method: MethodId) {
-        if !self.is_event_enabled(JvmtiEventKind::NativeMethodBind, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::NativeMethodBind, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::NativeMethodBind);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.native_method_bind { cb(thread, method); }
+            if let Some(ref cb) = cbs.native_method_bind {
+                cb(thread, method);
+            }
         }
     }
 
@@ -1283,8 +1529,7 @@ impl JvmtiEventManager {
     fn snapshot_envs(&self) -> Vec<Arc<JvmtiEnv>> {
         // Read-lock first: typical case is empty or unchanged list.
         if let Ok(list) = self.attached_envs.read() {
-            let strong: Vec<Arc<JvmtiEnv>> =
-                list.iter().filter_map(|w| w.upgrade()).collect();
+            let strong: Vec<Arc<JvmtiEnv>> = list.iter().filter_map(|w| w.upgrade()).collect();
             if strong.len() == list.len() {
                 return strong;
             }
@@ -1304,7 +1549,9 @@ impl JvmtiEventManager {
     fn dispatch_object_free(&self, tag: i64) {
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
-                if let Some(ref cb) = cbs.object_free { cb(tag); }
+                if let Some(ref cb) = cbs.object_free {
+                    cb(tag);
+                }
             }
         }
     }
@@ -1315,11 +1562,17 @@ impl JvmtiEventManager {
     /// "no tag" and should not normally reach this path; callers (the GC's
     /// tag-sweep step) are expected to filter those out.
     pub fn fire_object_free(&self, tag: i64) {
-        if !self.has_any_listener() { return; }
-        if !self.is_event_enabled(JvmtiEventKind::ObjectFree, None) { return; }
+        if !self.has_any_listener() {
+            return;
+        }
+        if !self.is_event_enabled(JvmtiEventKind::ObjectFree, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::ObjectFree);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.object_free { cb(tag); }
+            if let Some(ref cb) = cbs.object_free {
+                cb(tag);
+            }
         }
         self.dispatch_object_free(tag);
     }
@@ -1336,15 +1589,23 @@ impl JvmtiEventManager {
         class_id: ClassId,
         size: usize,
     ) {
-        if !self.has_any_listener() { return; }
-        if !self.is_event_enabled(JvmtiEventKind::VMObjectAlloc, Some(thread)) { return; }
+        if !self.has_any_listener() {
+            return;
+        }
+        if !self.is_event_enabled(JvmtiEventKind::VMObjectAlloc, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::VMObjectAlloc);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.vm_object_alloc { cb(thread, object_addr, class_id, size); }
+            if let Some(ref cb) = cbs.vm_object_alloc {
+                cb(thread, object_addr, class_id, size);
+            }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
-                if let Some(ref cb) = cbs.vm_object_alloc { cb(thread, object_addr, class_id, size); }
+                if let Some(ref cb) = cbs.vm_object_alloc {
+                    cb(thread, object_addr, class_id, size);
+                }
             }
         }
     }
@@ -1364,12 +1625,16 @@ impl JvmtiEventManager {
         size: usize,
     ) -> bool {
         // Hot-path: no listener → single atomic load + return.
-        if !self.has_any_listener() { return false; }
+        if !self.has_any_listener() {
+            return false;
+        }
         if !self.is_event_enabled(JvmtiEventKind::SampledObjectAlloc, Some(thread)) {
             return false;
         }
         let threshold = self.sampling_threshold.load(Ordering::Relaxed);
-        let prev = self.sampling_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        let prev = self
+            .sampling_bytes
+            .fetch_add(size as u64, Ordering::Relaxed);
         if threshold == 0 || prev.wrapping_add(size as u64) < threshold {
             return false;
         }
@@ -1389,7 +1654,9 @@ impl JvmtiEventManager {
         class_id: ClassId,
         size: usize,
     ) {
-        if !self.is_event_enabled(JvmtiEventKind::SampledObjectAlloc, Some(thread)) { return; }
+        if !self.is_event_enabled(JvmtiEventKind::SampledObjectAlloc, Some(thread)) {
+            return;
+        }
         self.record_event(JvmtiEventKind::SampledObjectAlloc);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.sampled_object_alloc {
@@ -1409,15 +1676,23 @@ impl JvmtiEventManager {
     /// Parameterless by spec; the agent is expected to call into IterateOverHeap
     /// (or similar) from inside the callback to materialize the dump.
     pub fn fire_data_dump_request(&self) {
-        if !self.has_any_listener() { return; }
-        if !self.is_event_enabled(JvmtiEventKind::DataDumpRequest, None) { return; }
+        if !self.has_any_listener() {
+            return;
+        }
+        if !self.is_event_enabled(JvmtiEventKind::DataDumpRequest, None) {
+            return;
+        }
         self.record_event(JvmtiEventKind::DataDumpRequest);
         if let Ok(cbs) = self.callbacks.read() {
-            if let Some(ref cb) = cbs.data_dump_request { cb(); }
+            if let Some(ref cb) = cbs.data_dump_request {
+                cb();
+            }
         }
         for env in self.snapshot_envs() {
             if let Ok(cbs) = env.event_manager.callbacks.read() {
-                if let Some(ref cb) = cbs.data_dump_request { cb(); }
+                if let Some(ref cb) = cbs.data_dump_request {
+                    cb();
+                }
             }
         }
     }
@@ -1530,7 +1805,8 @@ impl AgentRegistry {
     where
         F: Fn(&str) -> i32 + Send + Sync + 'static,
     {
-        self.on_load_callbacks.insert(name.to_string(), Box::new(callback));
+        self.on_load_callbacks
+            .insert(name.to_string(), Box::new(callback));
     }
 
     /// Register an Agent_OnUnload callback.
@@ -1538,7 +1814,8 @@ impl AgentRegistry {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.on_unload_callbacks.insert(name.to_string(), Box::new(callback));
+        self.on_unload_callbacks
+            .insert(name.to_string(), Box::new(callback));
     }
 
     /// Load all registered agents by invoking their Agent_OnLoad callbacks.
@@ -1557,7 +1834,9 @@ impl AgentRegistry {
             loaded_count += 1;
         }
         // Now invoke on_load callbacks for agents that have them registered
-        let agent_snapshot: Vec<(String, String)> = self.agents.iter()
+        let agent_snapshot: Vec<(String, String)> = self
+            .agents
+            .iter()
             .map(|a| (a.name.clone(), a.options.clone()))
             .collect();
         for (name, options) in &agent_snapshot {
@@ -1577,7 +1856,9 @@ impl AgentRegistry {
 
     /// Unload all loaded agents by invoking their Agent_OnUnload callbacks.
     pub fn unload_agents(&mut self) {
-        let names: Vec<String> = self.agents.iter()
+        let names: Vec<String> = self
+            .agents
+            .iter()
             .filter(|a| a.loaded)
             .map(|a| a.name.clone())
             .collect();
@@ -1695,7 +1976,8 @@ impl JvmtiEnv {
         event_kind: JvmtiEventKind,
         thread: Option<ThreadId>,
     ) -> JvmtiResult<()> {
-        self.event_manager.set_event_notification_mode(mode, event_kind, thread)
+        self.event_manager
+            .set_event_notification_mode(mode, event_kind, thread)
     }
 
     // --- Thread Functions ---
@@ -1711,9 +1993,15 @@ impl JvmtiEnv {
     pub fn unregister_thread(&self, id: ThreadId) -> JvmtiResult<()> {
         let mut threads = self.threads.write().map_err(|_| JvmtiError::Internal)?;
         threads.remove(&id);
-        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        let mut suspended = self
+            .suspended_threads
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         suspended.remove(&id);
-        let mut traces = self.stack_traces.write().map_err(|_| JvmtiError::Internal)?;
+        let mut traces = self
+            .stack_traces
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         traces.remove(&id);
         Ok(())
     }
@@ -1727,14 +2015,20 @@ impl JvmtiEnv {
     /// GetThreadInfo: return information about a thread.
     pub fn get_thread_info(&self, thread: ThreadId) -> JvmtiResult<ThreadInfo> {
         let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
-        threads.get(&thread).cloned().ok_or(JvmtiError::InvalidThread)
+        threads
+            .get(&thread)
+            .cloned()
+            .ok_or(JvmtiError::InvalidThread)
     }
 
     /// GetThreadState: return the state of a thread.
     pub fn get_thread_state(&self, thread: ThreadId) -> JvmtiResult<ThreadState> {
         let threads = self.threads.read().map_err(|_| JvmtiError::Internal)?;
         let info = threads.get(&thread).ok_or(JvmtiError::InvalidThread)?;
-        let suspended = self.suspended_threads.read().map_err(|_| JvmtiError::Internal)?;
+        let suspended = self
+            .suspended_threads
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
         let mut state = info.state.0;
         if suspended.contains(&thread) {
             state |= ThreadState::SUSPENDED;
@@ -1753,7 +2047,10 @@ impl JvmtiEnv {
             return Err(JvmtiError::InvalidThread);
         }
         drop(threads);
-        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        let mut suspended = self
+            .suspended_threads
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if suspended.contains(&thread) {
             return Err(JvmtiError::ThreadSuspended);
         }
@@ -1767,7 +2064,10 @@ impl JvmtiEnv {
         if !caps.can_suspend {
             return Err(JvmtiError::MustPossessCapability);
         }
-        let mut suspended = self.suspended_threads.write().map_err(|_| JvmtiError::Internal)?;
+        let mut suspended = self
+            .suspended_threads
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if !suspended.remove(&thread) {
             return Err(JvmtiError::ThreadNotSuspended);
         }
@@ -1778,13 +2078,21 @@ impl JvmtiEnv {
 
     /// Update the stack trace for a thread (called by VM during execution).
     pub fn set_stack_trace(&self, thread: ThreadId, frames: Vec<FrameInfo>) -> JvmtiResult<()> {
-        let mut traces = self.stack_traces.write().map_err(|_| JvmtiError::Internal)?;
+        let mut traces = self
+            .stack_traces
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         traces.insert(thread, frames);
         Ok(())
     }
 
     /// GetStackTrace: return the stack trace for a thread, limited to max_count frames.
-    pub fn get_stack_trace(&self, thread: ThreadId, start_depth: u32, max_count: u32) -> JvmtiResult<Vec<FrameInfo>> {
+    pub fn get_stack_trace(
+        &self,
+        thread: ThreadId,
+        start_depth: u32,
+        max_count: u32,
+    ) -> JvmtiResult<Vec<FrameInfo>> {
         let traces = self.stack_traces.read().map_err(|_| JvmtiError::Internal)?;
         let frames = traces.get(&thread).ok_or(JvmtiError::InvalidThread)?;
         let start = start_depth as usize;
@@ -1856,7 +2164,8 @@ impl JvmtiEnv {
 
     /// Check if a breakpoint is set at the given location.
     pub fn has_breakpoint(&self, location: &BreakpointLocation) -> bool {
-        self.breakpoints.read()
+        self.breakpoints
+            .read()
             .map(|bps| bps.contains(location))
             .unwrap_or(false)
     }
@@ -1869,7 +2178,10 @@ impl JvmtiEnv {
         if !caps.can_generate_field_access_events {
             return Err(JvmtiError::MustPossessCapability);
         }
-        let mut watches = self.field_access_watches.write().map_err(|_| JvmtiError::Internal)?;
+        let mut watches = self
+            .field_access_watches
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if !watches.insert(watch) {
             return Err(JvmtiError::Duplicate);
         }
@@ -1878,7 +2190,10 @@ impl JvmtiEnv {
 
     /// ClearFieldAccessWatch: remove a field access watch.
     pub fn clear_field_access_watch(&self, watch: &FieldWatch) -> JvmtiResult<()> {
-        let mut watches = self.field_access_watches.write().map_err(|_| JvmtiError::Internal)?;
+        let mut watches = self
+            .field_access_watches
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if !watches.remove(watch) {
             return Err(JvmtiError::NotFound);
         }
@@ -1891,7 +2206,10 @@ impl JvmtiEnv {
         if !caps.can_generate_field_modification_events {
             return Err(JvmtiError::MustPossessCapability);
         }
-        let mut watches = self.field_modification_watches.write().map_err(|_| JvmtiError::Internal)?;
+        let mut watches = self
+            .field_modification_watches
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if !watches.insert(watch) {
             return Err(JvmtiError::Duplicate);
         }
@@ -1900,7 +2218,10 @@ impl JvmtiEnv {
 
     /// ClearFieldModificationWatch: remove a field modification watch.
     pub fn clear_field_modification_watch(&self, watch: &FieldWatch) -> JvmtiResult<()> {
-        let mut watches = self.field_modification_watches.write().map_err(|_| JvmtiError::Internal)?;
+        let mut watches = self
+            .field_modification_watches
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         if !watches.remove(watch) {
             return Err(JvmtiError::NotFound);
         }
@@ -1916,7 +2237,10 @@ impl JvmtiEnv {
         depth: u32,
         vars: HashMap<u32, LocalValue>,
     ) -> JvmtiResult<()> {
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         locals.insert((thread, depth), vars);
         Ok(())
     }
@@ -1924,8 +2248,13 @@ impl JvmtiEnv {
     /// GetLocalVariableInt
     pub fn get_local_int(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i32> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
-        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        let locals = self
+            .local_variables
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
+        let frame = locals
+            .get(&(thread, depth))
+            .ok_or(JvmtiError::NoMoreFrames)?;
         match frame.get(&slot) {
             Some(LocalValue::Int(v)) => Ok(*v),
             Some(_) => Err(JvmtiError::TypeMismatch),
@@ -1936,8 +2265,13 @@ impl JvmtiEnv {
     /// GetLocalVariableLong
     pub fn get_local_long(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i64> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
-        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        let locals = self
+            .local_variables
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
+        let frame = locals
+            .get(&(thread, depth))
+            .ok_or(JvmtiError::NoMoreFrames)?;
         match frame.get(&slot) {
             Some(LocalValue::Long(v)) => Ok(*v),
             Some(_) => Err(JvmtiError::TypeMismatch),
@@ -1948,8 +2282,13 @@ impl JvmtiEnv {
     /// GetLocalVariableFloat
     pub fn get_local_float(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f32> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
-        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        let locals = self
+            .local_variables
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
+        let frame = locals
+            .get(&(thread, depth))
+            .ok_or(JvmtiError::NoMoreFrames)?;
         match frame.get(&slot) {
             Some(LocalValue::Float(v)) => Ok(*v),
             Some(_) => Err(JvmtiError::TypeMismatch),
@@ -1960,8 +2299,13 @@ impl JvmtiEnv {
     /// GetLocalVariableDouble
     pub fn get_local_double(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f64> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
-        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        let locals = self
+            .local_variables
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
+        let frame = locals
+            .get(&(thread, depth))
+            .ok_or(JvmtiError::NoMoreFrames)?;
         match frame.get(&slot) {
             Some(LocalValue::Double(v)) => Ok(*v),
             Some(_) => Err(JvmtiError::TypeMismatch),
@@ -1970,10 +2314,20 @@ impl JvmtiEnv {
     }
 
     /// GetLocalVariableObject
-    pub fn get_local_object(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<Option<u64>> {
+    pub fn get_local_object(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+    ) -> JvmtiResult<Option<u64>> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let locals = self.local_variables.read().map_err(|_| JvmtiError::Internal)?;
-        let frame = locals.get(&(thread, depth)).ok_or(JvmtiError::NoMoreFrames)?;
+        let locals = self
+            .local_variables
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
+        let frame = locals
+            .get(&(thread, depth))
+            .ok_or(JvmtiError::NoMoreFrames)?;
         match frame.get(&slot) {
             Some(LocalValue::Object(v)) => Ok(*v),
             Some(_) => Err(JvmtiError::TypeMismatch),
@@ -1982,45 +2336,90 @@ impl JvmtiEnv {
     }
 
     /// SetLocalVariableInt
-    pub fn set_local_int(&self, thread: ThreadId, depth: u32, slot: u32, value: i32) -> JvmtiResult<()> {
+    pub fn set_local_int(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+        value: i32,
+    ) -> JvmtiResult<()> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         let frame = locals.entry((thread, depth)).or_default();
         frame.insert(slot, LocalValue::Int(value));
         Ok(())
     }
 
     /// SetLocalVariableLong
-    pub fn set_local_long(&self, thread: ThreadId, depth: u32, slot: u32, value: i64) -> JvmtiResult<()> {
+    pub fn set_local_long(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+        value: i64,
+    ) -> JvmtiResult<()> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         let frame = locals.entry((thread, depth)).or_default();
         frame.insert(slot, LocalValue::Long(value));
         Ok(())
     }
 
     /// SetLocalVariableFloat
-    pub fn set_local_float(&self, thread: ThreadId, depth: u32, slot: u32, value: f32) -> JvmtiResult<()> {
+    pub fn set_local_float(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+        value: f32,
+    ) -> JvmtiResult<()> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         let frame = locals.entry((thread, depth)).or_default();
         frame.insert(slot, LocalValue::Float(value));
         Ok(())
     }
 
     /// SetLocalVariableDouble
-    pub fn set_local_double(&self, thread: ThreadId, depth: u32, slot: u32, value: f64) -> JvmtiResult<()> {
+    pub fn set_local_double(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+        value: f64,
+    ) -> JvmtiResult<()> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         let frame = locals.entry((thread, depth)).or_default();
         frame.insert(slot, LocalValue::Double(value));
         Ok(())
     }
 
     /// SetLocalVariableObject
-    pub fn set_local_object(&self, thread: ThreadId, depth: u32, slot: u32, value: Option<u64>) -> JvmtiResult<()> {
+    pub fn set_local_object(
+        &self,
+        thread: ThreadId,
+        depth: u32,
+        slot: u32,
+        value: Option<u64>,
+    ) -> JvmtiResult<()> {
         self.require_capability(|c| c.can_access_local_variables)?;
-        let mut locals = self.local_variables.write().map_err(|_| JvmtiError::Internal)?;
+        let mut locals = self
+            .local_variables
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         let frame = locals.entry((thread, depth)).or_default();
         frame.insert(slot, LocalValue::Object(value));
         Ok(())
@@ -2033,7 +2432,10 @@ impl JvmtiEnv {
     where
         F: Fn(ClassId, &[u8]) -> Vec<u8> + Send + Sync + 'static,
     {
-        let mut h = self.retransform_hook.lock().map_err(|_| JvmtiError::Internal)?;
+        let mut h = self
+            .retransform_hook
+            .lock()
+            .map_err(|_| JvmtiError::Internal)?;
         *h = Some(Box::new(hook));
         Ok(())
     }
@@ -2046,7 +2448,10 @@ impl JvmtiEnv {
         }
         drop(caps);
 
-        let hook = self.retransform_hook.lock().map_err(|_| JvmtiError::Internal)?;
+        let hook = self
+            .retransform_hook
+            .lock()
+            .map_err(|_| JvmtiError::Internal)?;
         let transformer = hook.as_ref().ok_or(JvmtiError::NotAvailable)?;
 
         for &cid in class_ids {
@@ -2059,7 +2464,8 @@ impl JvmtiEnv {
             let new_bytes = transformer(cid, &original_bytes);
 
             // Also fire ClassFileLoadHook if enabled
-            let final_bytes = self.event_manager
+            let final_bytes = self
+                .event_manager
                 .fire_class_file_load_hook(cid, &class_name, &new_bytes)
                 .unwrap_or(new_bytes);
 
@@ -2086,7 +2492,12 @@ impl JvmtiEnv {
                 return Err(JvmtiError::InvalidClassFormat);
             }
             // Basic magic number check for classfile (0xCAFEBABE)
-            if new_bytes.len() >= 4 && (new_bytes[0] != 0xCA || new_bytes[1] != 0xFE || new_bytes[2] != 0xBA || new_bytes[3] != 0xBE) {
+            if new_bytes.len() >= 4
+                && (new_bytes[0] != 0xCA
+                    || new_bytes[1] != 0xFE
+                    || new_bytes[2] != 0xBA
+                    || new_bytes[3] != 0xBE)
+            {
                 return Err(JvmtiError::InvalidClassFormat);
             }
             class.bytecode = new_bytes.clone();
@@ -2154,14 +2565,20 @@ impl JvmtiEnv {
 
     /// AddCapabilities: request additional capabilities.
     pub fn add_capabilities(&self, requested: &JvmtiCapabilities) -> JvmtiResult<()> {
-        let mut caps = self.capabilities.write().map_err(|_| JvmtiError::Internal)?;
+        let mut caps = self
+            .capabilities
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         *caps = caps.union(requested);
         Ok(())
     }
 
     /// RelinquishCapabilities: give up previously acquired capabilities.
     pub fn relinquish_capabilities(&self, to_relinquish: &JvmtiCapabilities) -> JvmtiResult<()> {
-        let mut caps = self.capabilities.write().map_err(|_| JvmtiError::Internal)?;
+        let mut caps = self
+            .capabilities
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         *caps = caps.subtract(to_relinquish);
         Ok(())
     }
@@ -2186,20 +2603,29 @@ impl JvmtiEnv {
 
     /// GetSystemProperty: retrieve a VM system property.
     pub fn get_system_property(&self, key: &str) -> JvmtiResult<String> {
-        let props = self.system_properties.read().map_err(|_| JvmtiError::Internal)?;
+        let props = self
+            .system_properties
+            .read()
+            .map_err(|_| JvmtiError::Internal)?;
         props.get(key).cloned().ok_or(JvmtiError::NotFound)
     }
 
     /// SetSystemProperty: set a VM system property.
     pub fn set_system_property(&self, key: &str, value: &str) -> JvmtiResult<()> {
-        let mut props = self.system_properties.write().map_err(|_| JvmtiError::Internal)?;
+        let mut props = self
+            .system_properties
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         props.insert(key.to_string(), value.to_string());
         Ok(())
     }
 
     /// Bulk-load system properties (called during VM init).
     pub fn load_system_properties(&self, props: &[(String, String)]) -> JvmtiResult<()> {
-        let mut sp = self.system_properties.write().map_err(|_| JvmtiError::Internal)?;
+        let mut sp = self
+            .system_properties
+            .write()
+            .map_err(|_| JvmtiError::Internal)?;
         for (k, v) in props {
             sp.insert(k.clone(), v.clone());
         }
@@ -2218,8 +2644,14 @@ impl fmt::Debug for JvmtiEnv {
         f.debug_struct("JvmtiEnv")
             .field("version", &self.get_version_number())
             .field("capabilities", &self.capabilities)
-            .field("thread_count", &self.threads.read().map(|t| t.len()).unwrap_or(0))
-            .field("breakpoint_count", &self.breakpoints.read().map(|b| b.len()).unwrap_or(0))
+            .field(
+                "thread_count",
+                &self.threads.read().map(|t| t.len()).unwrap_or(0),
+            )
+            .field(
+                "breakpoint_count",
+                &self.breakpoints.read().map(|b| b.len()).unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -2267,46 +2699,62 @@ pub fn any_listener_active() -> bool {
 
 /// Fire VMInit at the global level. No-op if no manager is installed.
 pub fn fire_vm_init() {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_vm_init(); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_vm_init();
+    }
 }
 
 /// Fire VMDeath at the global level. Called from VM shutdown / drop.
 pub fn fire_vm_death() {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_vm_death(); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_vm_death();
+    }
 }
 
 /// Fire ClassLoad at the global level. Called from the class manager
 /// after a new class has been registered.
 pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_class_load(thread, class_id); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_class_load(thread, class_id);
+    }
 }
 
 /// Fire ClassPrepare at the global level. Called from the class manager
 /// after the class has been linked / prepared.
 pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_class_prepare(thread, class_id); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_class_prepare(thread, class_id);
+    }
 }
 
 /// Fire GarbageCollectionStart at the global level. Called from the GC
 /// driver immediately before the collection phase.
 pub fn fire_gc_start() {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_gc_start(); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_gc_start();
+    }
 }
 
 /// Fire GarbageCollectionFinish at the global level.
 pub fn fire_gc_finish() {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_gc_finish(); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_gc_finish();
+    }
 }
 
 /// Fire Exception at the global level.
 pub fn fire_exception(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_exception(thread, method, location); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_exception(thread, method, location);
+    }
 }
 
 /// Fire ExceptionCatch at the global level. Called from the interpreter
 /// when a matching exception handler is resolved.
 pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_exception_catch(thread, method, location); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_exception_catch(thread, method, location);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2390,7 +2838,9 @@ pub fn any_frame_pop_listener_active() -> bool {
 /// path.
 #[inline]
 pub fn fire_method_entry(thread: ThreadId, method: MethodId) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_method_entry(thread, method); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_method_entry(thread, method);
+    }
 }
 
 /// Fire MethodExit at the global level. Called from every return-opcode and
@@ -2412,21 +2862,27 @@ pub fn fire_method_exit(
 /// dispatch loop when the thread's single-step flag is set.
 #[inline]
 pub fn fire_single_step(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_single_step(thread, method, location); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_single_step(thread, method, location);
+    }
 }
 
 /// Fire FieldAccess at the global level. Called from getfield / getstatic
 /// when a watchpoint exists for the resolved (class_id, field_index) tuple.
 #[inline]
 pub fn fire_field_access(thread: ThreadId, method: MethodId, field: FieldId) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_field_access(thread, method, field); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_field_access(thread, method, field);
+    }
 }
 
 /// Fire FieldModification at the global level. Called from putfield /
 /// putstatic when a watchpoint exists.
 #[inline]
 pub fn fire_field_modification(thread: ThreadId, method: MethodId, field: FieldId) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_field_modification(thread, method, field); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_field_modification(thread, method, field);
+    }
 }
 
 /// Fire FramePop at the global level. Called before a frame is dropped when
@@ -2483,7 +2939,8 @@ static FIELD_WATCHPOINTS: RwLock<Option<HashMap<(u64, usize), FieldWatchpoint>>>
 /// `any_single_step_listener: AtomicBool` design.
 static FIELD_WATCHPOINTS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn watchpoints_read_inner() -> std::sync::RwLockReadGuard<'static, Option<HashMap<(u64, usize), FieldWatchpoint>>> {
+fn watchpoints_read_inner(
+) -> std::sync::RwLockReadGuard<'static, Option<HashMap<(u64, usize), FieldWatchpoint>>> {
     // Panic-safe: on poison we would otherwise block the interpreter; fall
     // back by returning an already-poisoned guard which tests consult with
     // caution.  Callers simply treat a poisoned lock as "no watchpoints".
@@ -2503,7 +2960,9 @@ pub fn set_field_watchpoint(
     access: bool,
     modification: bool,
 ) -> JvmtiResult<()> {
-    let mut guard = FIELD_WATCHPOINTS.write().map_err(|_| JvmtiError::Internal)?;
+    let mut guard = FIELD_WATCHPOINTS
+        .write()
+        .map_err(|_| JvmtiError::Internal)?;
     let map = guard.get_or_insert_with(HashMap::new);
     let entry = map
         .entry((class_id, field_index))
@@ -2528,12 +2987,20 @@ pub fn clear_field_watchpoint(
     access: bool,
     modification: bool,
 ) -> JvmtiResult<()> {
-    let mut guard = FIELD_WATCHPOINTS.write().map_err(|_| JvmtiError::Internal)?;
-    let Some(map) = guard.as_mut() else { return Ok(()); };
+    let mut guard = FIELD_WATCHPOINTS
+        .write()
+        .map_err(|_| JvmtiError::Internal)?;
+    let Some(map) = guard.as_mut() else {
+        return Ok(());
+    };
     let key = (class_id, field_index);
     if let Some(entry) = map.get_mut(&key) {
-        if access { entry.access_watched = false; }
-        if modification { entry.modification_watched = false; }
+        if access {
+            entry.access_watched = false;
+        }
+        if modification {
+            entry.modification_watched = false;
+        }
         if !entry.access_watched && !entry.modification_watched {
             map.remove(&key);
         }
@@ -2586,7 +3053,9 @@ pub fn fire_field_access_if_watched(
     class_id: u64,
     field_index: usize,
 ) {
-    if !any_field_watchpoint_active() { return; }
+    if !any_field_watchpoint_active() {
+        return;
+    }
     if let Some(wp) = field_watchpoint_for(class_id, field_index) {
         if wp.access_watched {
             let field_id = encode_field_id(class_id, field_index);
@@ -2604,7 +3073,9 @@ pub fn fire_field_modification_if_watched(
     class_id: u64,
     field_index: usize,
 ) {
-    if !any_field_watchpoint_active() { return; }
+    if !any_field_watchpoint_active() {
+        return;
+    }
     if let Some(wp) = field_watchpoint_for(class_id, field_index) {
         if wp.modification_watched {
             let field_id = encode_field_id(class_id, field_index);
@@ -2631,7 +3102,9 @@ pub fn decode_field_id(field_id: FieldId) -> (u64, usize) {
 /// Fire ObjectFree at the global level. Called from the GC after a
 /// tagged object is reclaimed.
 pub fn fire_object_free(tag: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_object_free(tag); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_object_free(tag);
+    }
 }
 
 /// Fire VMObjectAlloc at the global level. Called from the allocator
@@ -2658,7 +3131,9 @@ pub fn record_allocation_sample(
 
 /// Fire DataDumpRequest at the global level.
 pub fn fire_data_dump_request() {
-    if let Some(m) = GLOBAL_MANAGER.get() { m.fire_data_dump_request(); }
+    if let Some(m) = GLOBAL_MANAGER.get() {
+        m.fire_data_dump_request();
+    }
 }
 
 /// Test-only reset hook: drop the installed global manager and install a
@@ -2669,24 +3144,37 @@ pub fn fire_data_dump_request() {
 pub(crate) fn reset_global_manager_for_tests() {
     if let Some(m) = GLOBAL_MANAGER.get() {
         // Best-effort clear of enabled state so tests don't see stale fires.
-        if let Ok(mut g) = m.global_events.write() { g.clear(); }
-        if let Ok(mut t) = m.thread_events.write() { t.clear(); }
-        if let Ok(mut c) = m.callbacks.write() { *c = EventCallbacks::default(); }
-        if let Ok(mut e) = m.attached_envs.write() { e.clear(); }
-        if let Ok(mut n) = m.event_counts.lock() { n.clear(); }
+        if let Ok(mut g) = m.global_events.write() {
+            g.clear();
+        }
+        if let Ok(mut t) = m.thread_events.write() {
+            t.clear();
+        }
+        if let Ok(mut c) = m.callbacks.write() {
+            *c = EventCallbacks::default();
+        }
+        if let Ok(mut e) = m.attached_envs.write() {
+            e.clear();
+        }
+        if let Ok(mut n) = m.event_counts.lock() {
+            n.clear();
+        }
         m.any_listener.store(false, Ordering::Release);
         m.any_method_entry_listener.store(false, Ordering::Release);
         m.any_method_exit_listener.store(false, Ordering::Release);
         m.any_single_step_listener.store(false, Ordering::Release);
         m.any_field_access_listener.store(false, Ordering::Release);
-        m.any_field_modification_listener.store(false, Ordering::Release);
+        m.any_field_modification_listener
+            .store(false, Ordering::Release);
         m.any_frame_pop_listener.store(false, Ordering::Release);
         m.sampling_bytes.store(0, Ordering::Relaxed);
     }
     // Also clear the T17.Δ field-watchpoint registry so watch-dependent
     // tests start from an empty table.
     if let Ok(mut w) = FIELD_WATCHPOINTS.write() {
-        if let Some(m) = w.as_mut() { m.clear(); }
+        if let Some(m) = w.as_mut() {
+            m.clear();
+        }
     }
     FIELD_WATCHPOINTS_ACTIVE.store(false, Ordering::Release);
 }
@@ -2721,12 +3209,34 @@ mod tests {
             bytecode: vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34],
             is_prepared: true,
             fields: vec![
-                FieldInfo { field_id: id * 100 + 1, name: "field1".to_string(), signature: "I".to_string(), modifiers: 1 },
-                FieldInfo { field_id: id * 100 + 2, name: "field2".to_string(), signature: "Ljava/lang/String;".to_string(), modifiers: 1 },
+                FieldInfo {
+                    field_id: id * 100 + 1,
+                    name: "field1".to_string(),
+                    signature: "I".to_string(),
+                    modifiers: 1,
+                },
+                FieldInfo {
+                    field_id: id * 100 + 2,
+                    name: "field2".to_string(),
+                    signature: "Ljava/lang/String;".to_string(),
+                    modifiers: 1,
+                },
             ],
             methods: vec![
-                MethodInfo { method_id: id * 100 + 10, name: "method1".to_string(), signature: "()V".to_string(), modifiers: 1, declaring_class: id },
-                MethodInfo { method_id: id * 100 + 11, name: "method2".to_string(), signature: "(I)I".to_string(), modifiers: 1, declaring_class: id },
+                MethodInfo {
+                    method_id: id * 100 + 10,
+                    name: "method1".to_string(),
+                    signature: "()V".to_string(),
+                    modifiers: 1,
+                    declaring_class: id,
+                },
+                MethodInfo {
+                    method_id: id * 100 + 11,
+                    name: "method2".to_string(),
+                    signature: "(I)I".to_string(),
+                    modifiers: 1,
+                    declaring_class: id,
+                },
             ],
         }
     }
@@ -2742,9 +3252,18 @@ mod tests {
     fn test_error_names() {
         let env = make_test_env();
         assert_eq!(env.get_error_name(JvmtiError::None), "JVMTI_ERROR_NONE");
-        assert_eq!(env.get_error_name(JvmtiError::InvalidThread), "JVMTI_ERROR_INVALID_THREAD");
-        assert_eq!(env.get_error_name(JvmtiError::OutOfMemory), "JVMTI_ERROR_OUT_OF_MEMORY");
-        assert_eq!(env.get_error_name(JvmtiError::MustPossessCapability), "JVMTI_ERROR_MUST_POSSESS_CAPABILITY");
+        assert_eq!(
+            env.get_error_name(JvmtiError::InvalidThread),
+            "JVMTI_ERROR_INVALID_THREAD"
+        );
+        assert_eq!(
+            env.get_error_name(JvmtiError::OutOfMemory),
+            "JVMTI_ERROR_OUT_OF_MEMORY"
+        );
+        assert_eq!(
+            env.get_error_name(JvmtiError::MustPossessCapability),
+            "JVMTI_ERROR_MUST_POSSESS_CAPABILITY"
+        );
     }
 
     #[test]
@@ -2758,21 +3277,36 @@ mod tests {
     #[test]
     fn test_event_notification_mode_global() {
         let env = make_test_env();
-        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
-        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
-        assert!(env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
-        env.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::VmInit, None).unwrap();
-        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::VmInit, None));
+        assert!(!env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::VmInit, None));
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None)
+            .unwrap();
+        assert!(env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::VmInit, None));
+        env.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::VmInit, None)
+            .unwrap();
+        assert!(!env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::VmInit, None));
     }
 
     #[test]
     fn test_event_notification_mode_per_thread() {
         let env = make_test_env();
         let tid = 42;
-        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
-        assert!(env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, Some(tid)));
-        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, Some(99)));
-        assert!(!env.event_manager.is_event_enabled(JvmtiEventKind::MethodEntry, None));
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
+            .unwrap();
+        assert!(env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::MethodEntry, Some(tid)));
+        assert!(!env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::MethodEntry, Some(99)));
+        assert!(!env
+            .event_manager
+            .is_event_enabled(JvmtiEventKind::MethodEntry, None));
     }
 
     #[test]
@@ -2795,7 +3329,11 @@ mod tests {
     #[test]
     fn test_thread_suspend_resume() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_suspend: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_suspend: true,
+            ..Default::default()
+        })
+        .unwrap();
         env.register_thread(1, make_thread_info("main")).unwrap();
 
         env.suspend_thread(1).unwrap();
@@ -2817,7 +3355,10 @@ mod tests {
     fn test_suspend_requires_capability() {
         let env = make_test_env();
         env.register_thread(1, make_thread_info("main")).unwrap();
-        assert_eq!(env.suspend_thread(1), Err(JvmtiError::MustPossessCapability));
+        assert_eq!(
+            env.suspend_thread(1),
+            Err(JvmtiError::MustPossessCapability)
+        );
     }
 
     #[test]
@@ -2826,9 +3367,27 @@ mod tests {
         env.register_thread(1, make_thread_info("main")).unwrap();
 
         let frames = vec![
-            FrameInfo { method_id: 100, class_id: 1, location: 0, method_name: "main".to_string(), class_name: "App".to_string() },
-            FrameInfo { method_id: 101, class_id: 1, location: 5, method_name: "run".to_string(), class_name: "App".to_string() },
-            FrameInfo { method_id: 102, class_id: 2, location: 10, method_name: "execute".to_string(), class_name: "Executor".to_string() },
+            FrameInfo {
+                method_id: 100,
+                class_id: 1,
+                location: 0,
+                method_name: "main".to_string(),
+                class_name: "App".to_string(),
+            },
+            FrameInfo {
+                method_id: 101,
+                class_id: 1,
+                location: 5,
+                method_name: "run".to_string(),
+                class_name: "App".to_string(),
+            },
+            FrameInfo {
+                method_id: 102,
+                class_id: 2,
+                location: 10,
+                method_name: "execute".to_string(),
+                class_name: "Executor".to_string(),
+            },
         ];
         env.set_stack_trace(1, frames).unwrap();
 
@@ -2847,9 +3406,17 @@ mod tests {
     #[test]
     fn test_breakpoints() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_generate_breakpoint_events: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_generate_breakpoint_events: true,
+            ..Default::default()
+        })
+        .unwrap();
 
-        let loc = BreakpointLocation { class_id: 1, method_id: 100, location: 5 };
+        let loc = BreakpointLocation {
+            class_id: 1,
+            method_id: 100,
+            location: 5,
+        };
         env.set_breakpoint(loc.clone()).unwrap();
         assert!(env.has_breakpoint(&loc));
 
@@ -2870,22 +3437,36 @@ mod tests {
             can_generate_field_access_events: true,
             can_generate_field_modification_events: true,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
-        let watch = FieldWatch { class_id: 1, field_id: 10 };
+        let watch = FieldWatch {
+            class_id: 1,
+            field_id: 10,
+        };
         env.set_field_access_watch(watch.clone()).unwrap();
-        assert_eq!(env.set_field_access_watch(watch.clone()), Err(JvmtiError::Duplicate));
+        assert_eq!(
+            env.set_field_access_watch(watch.clone()),
+            Err(JvmtiError::Duplicate)
+        );
         env.clear_field_access_watch(&watch).unwrap();
 
         env.set_field_modification_watch(watch.clone()).unwrap();
-        assert_eq!(env.set_field_modification_watch(watch.clone()), Err(JvmtiError::Duplicate));
+        assert_eq!(
+            env.set_field_modification_watch(watch.clone()),
+            Err(JvmtiError::Duplicate)
+        );
         env.clear_field_modification_watch(&watch).unwrap();
     }
 
     #[test]
     fn test_local_variables() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_access_local_variables: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_access_local_variables: true,
+            ..Default::default()
+        })
+        .unwrap();
 
         let mut vars = HashMap::new();
         vars.insert(0, LocalValue::Int(42));
@@ -2910,7 +3491,11 @@ mod tests {
     #[test]
     fn test_local_variable_set() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_access_local_variables: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_access_local_variables: true,
+            ..Default::default()
+        })
+        .unwrap();
 
         env.set_local_int(1, 0, 0, 99).unwrap();
         assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 99);
@@ -2931,8 +3516,14 @@ mod tests {
     #[test]
     fn test_local_variables_require_capability() {
         let env = make_test_env(); // no capabilities
-        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::MustPossessCapability));
-        assert_eq!(env.set_local_int(1, 0, 0, 1), Err(JvmtiError::MustPossessCapability));
+        assert_eq!(
+            env.get_local_int(1, 0, 0),
+            Err(JvmtiError::MustPossessCapability)
+        );
+        assert_eq!(
+            env.set_local_int(1, 0, 0, 1),
+            Err(JvmtiError::MustPossessCapability)
+        );
     }
 
     #[test]
@@ -2953,7 +3544,10 @@ mod tests {
         assert!(caps.can_suspend);
         assert!(!caps.can_redefine_classes);
 
-        let to_drop = JvmtiCapabilities { can_suspend: true, ..Default::default() };
+        let to_drop = JvmtiCapabilities {
+            can_suspend: true,
+            ..Default::default()
+        };
         env.relinquish_capabilities(&to_drop).unwrap();
 
         let caps = env.get_capabilities().unwrap();
@@ -2984,7 +3578,11 @@ mod tests {
     #[test]
     fn test_redefine_classes() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_redefine_classes: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_redefine_classes: true,
+            ..Default::default()
+        })
+        .unwrap();
         env.register_class(make_test_class(1)).unwrap();
 
         let new_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x37, 0xFF];
@@ -2997,22 +3595,36 @@ mod tests {
     #[test]
     fn test_redefine_invalid_classfile() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_redefine_classes: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_redefine_classes: true,
+            ..Default::default()
+        })
+        .unwrap();
         env.register_class(make_test_class(1)).unwrap();
 
         // Invalid magic number
         let bad_bytes = vec![0x00, 0x00, 0x00, 0x00];
-        assert_eq!(env.redefine_classes(&[(1, bad_bytes)]), Err(JvmtiError::InvalidClassFormat));
+        assert_eq!(
+            env.redefine_classes(&[(1, bad_bytes)]),
+            Err(JvmtiError::InvalidClassFormat)
+        );
 
         // Too short
         let short_bytes = vec![0xCA, 0xFE];
-        assert_eq!(env.redefine_classes(&[(1, short_bytes)]), Err(JvmtiError::InvalidClassFormat));
+        assert_eq!(
+            env.redefine_classes(&[(1, short_bytes)]),
+            Err(JvmtiError::InvalidClassFormat)
+        );
     }
 
     #[test]
     fn test_retransform_classes() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities { can_retransform_classes: true, ..Default::default() }).unwrap();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_retransform_classes: true,
+            ..Default::default()
+        })
+        .unwrap();
         env.register_class(make_test_class(1)).unwrap();
 
         // Set a transformer that appends a byte
@@ -3020,7 +3632,8 @@ mod tests {
             let mut new = bytes.to_vec();
             new.push(0xAA);
             new
-        }).unwrap();
+        })
+        .unwrap();
 
         env.retransform_classes(&[1]).unwrap();
 
@@ -3037,7 +3650,10 @@ mod tests {
 
         assert_eq!(env.get_system_property("java.version").unwrap(), "11.0.1");
         assert_eq!(env.get_system_property("os.name").unwrap(), "Linux");
-        assert_eq!(env.get_system_property("nonexistent"), Err(JvmtiError::NotFound));
+        assert_eq!(
+            env.get_system_property("nonexistent"),
+            Err(JvmtiError::NotFound)
+        );
 
         env.set_system_property("java.version", "17.0.1").unwrap();
         assert_eq!(env.get_system_property("java.version").unwrap(), "17.0.1");
@@ -3049,7 +3665,8 @@ mod tests {
         env.load_system_properties(&[
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(env.get_system_property("a").unwrap(), "1");
         assert_eq!(env.get_system_property("b").unwrap(), "2");
     }
@@ -3057,8 +3674,10 @@ mod tests {
     #[test]
     fn test_event_callbacks_fire() {
         let env = make_test_env();
-        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
-        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ThreadStart, None).unwrap();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None)
+            .unwrap();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ThreadStart, None)
+            .unwrap();
 
         let init_count = Arc::new(AtomicU32::new(0));
         let thread_count = Arc::new(AtomicU32::new(0));
@@ -3066,8 +3685,12 @@ mod tests {
         let tc = thread_count.clone();
 
         let cbs = EventCallbacks {
-            vm_init: Some(Box::new(move || { ic.fetch_add(1, Ordering::SeqCst); })),
-            thread_start: Some(Box::new(move |_tid| { tc.fetch_add(1, Ordering::SeqCst); })),
+            vm_init: Some(Box::new(move || {
+                ic.fetch_add(1, Ordering::SeqCst);
+            })),
+            thread_start: Some(Box::new(move |_tid| {
+                tc.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
         };
         env.event_manager.set_event_callbacks(cbs).unwrap();
@@ -3079,7 +3702,10 @@ mod tests {
         assert_eq!(init_count.load(Ordering::SeqCst), 2);
         assert_eq!(thread_count.load(Ordering::SeqCst), 1);
         assert_eq!(env.event_manager.event_count(JvmtiEventKind::VmInit), 2);
-        assert_eq!(env.event_manager.event_count(JvmtiEventKind::ThreadStart), 1);
+        assert_eq!(
+            env.event_manager.event_count(JvmtiEventKind::ThreadStart),
+            1
+        );
     }
 
     #[test]
@@ -3089,7 +3715,9 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
         let cbs = EventCallbacks {
-            vm_death: Some(Box::new(move || { c.fetch_add(1, Ordering::SeqCst); })),
+            vm_death: Some(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
         };
         env.event_manager.set_event_callbacks(cbs).unwrap();
@@ -3101,7 +3729,8 @@ mod tests {
     #[test]
     fn test_class_file_load_hook_transform() {
         let env = make_test_env();
-        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassFileLoadHook, None).unwrap();
+        env.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassFileLoadHook, None)
+            .unwrap();
 
         let cbs = EventCallbacks {
             class_file_load_hook: Some(Box::new(|_cid, _name, bytes| {
@@ -3114,14 +3743,18 @@ mod tests {
         env.event_manager.set_event_callbacks(cbs).unwrap();
 
         let original = vec![1, 2, 3];
-        let result = env.event_manager.fire_class_file_load_hook(1, "TestClass", &original);
+        let result = env
+            .event_manager
+            .fire_class_file_load_hook(1, "TestClass", &original);
         assert_eq!(result, Some(vec![1, 2, 3, 0xBB]));
     }
 
     #[test]
     fn test_agent_parse_agentlib() {
         let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:jdwp=transport=dt_socket,server=y").unwrap();
+        registry
+            .parse_agent_option("-agentlib:jdwp=transport=dt_socket,server=y")
+            .unwrap();
 
         assert_eq!(registry.agents().len(), 1);
         let agent = &registry.agents()[0];
@@ -3133,7 +3766,9 @@ mod tests {
     #[test]
     fn test_agent_parse_agentpath() {
         let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentpath:/opt/lib/myagent.so=debug").unwrap();
+        registry
+            .parse_agent_option("-agentpath:/opt/lib/myagent.so=debug")
+            .unwrap();
 
         let agent = &registry.agents()[0];
         assert_eq!(agent.path, "/opt/lib/myagent.so");
@@ -3144,7 +3779,9 @@ mod tests {
     #[test]
     fn test_agent_parse_javaagent() {
         let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-javaagent:agent.jar=premain_opt").unwrap();
+        registry
+            .parse_agent_option("-javaagent:agent.jar=premain_opt")
+            .unwrap();
 
         let agent = &registry.agents()[0];
         assert_eq!(agent.path, "agent.jar");
@@ -3155,8 +3792,14 @@ mod tests {
     #[test]
     fn test_agent_parse_invalid() {
         let mut registry = AgentRegistry::new();
-        assert_eq!(registry.parse_agent_option("-Xms512m"), Err(JvmtiError::IllegalArgument));
-        assert_eq!(registry.parse_agent_option("garbage"), Err(JvmtiError::IllegalArgument));
+        assert_eq!(
+            registry.parse_agent_option("-Xms512m"),
+            Err(JvmtiError::IllegalArgument)
+        );
+        assert_eq!(
+            registry.parse_agent_option("garbage"),
+            Err(JvmtiError::IllegalArgument)
+        );
     }
 
     #[test]
@@ -3203,7 +3846,11 @@ mod tests {
         let env = make_test_env();
         let triggered = Arc::new(AtomicU32::new(0));
         let t = triggered.clone();
-        env.set_gc_trigger(move || { t.fetch_add(1, Ordering::SeqCst); true }).unwrap();
+        env.set_gc_trigger(move || {
+            t.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
 
         env.force_garbage_collection().unwrap();
         assert_eq!(triggered.load(Ordering::SeqCst), 1);
@@ -3228,8 +3875,16 @@ mod tests {
 
     #[test]
     fn test_capabilities_union_and_subtract() {
-        let a = JvmtiCapabilities { can_suspend: true, can_redefine_classes: true, ..Default::default() };
-        let b = JvmtiCapabilities { can_suspend: true, can_retransform_classes: true, ..Default::default() };
+        let a = JvmtiCapabilities {
+            can_suspend: true,
+            can_redefine_classes: true,
+            ..Default::default()
+        };
+        let b = JvmtiCapabilities {
+            can_suspend: true,
+            can_retransform_classes: true,
+            ..Default::default()
+        };
 
         let union = a.union(&b);
         assert!(union.can_suspend);
@@ -3246,7 +3901,10 @@ mod tests {
     fn test_event_kind_from_raw() {
         assert_eq!(JvmtiEventKind::from_raw(50), Some(JvmtiEventKind::VmInit));
         assert_eq!(JvmtiEventKind::from_raw(51), Some(JvmtiEventKind::VmDeath));
-        assert_eq!(JvmtiEventKind::from_raw(60), Some(JvmtiEventKind::Breakpoint));
+        assert_eq!(
+            JvmtiEventKind::from_raw(60),
+            Some(JvmtiEventKind::Breakpoint)
+        );
         assert_eq!(JvmtiEventKind::from_raw(0), None);
         assert_eq!(JvmtiEventKind::from_raw(9999), None);
     }
@@ -3277,8 +3935,18 @@ mod tests {
     #[test]
     fn test_multiple_events_independently_tracked() {
         let em = JvmtiEventManager::new();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionStart, None).unwrap();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionFinish, None).unwrap();
+        em.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::GarbageCollectionStart,
+            None,
+        )
+        .unwrap();
+        em.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::GarbageCollectionFinish,
+            None,
+        )
+        .unwrap();
 
         let cbs = EventCallbacks {
             gc_start: Some(Box::new(|| {})),
@@ -3312,10 +3980,22 @@ mod tests {
     #[test]
     fn test_new_event_kinds_from_raw_roundtrip() {
         // Round-trip the four new kinds through the raw u32 encoding.
-        assert_eq!(JvmtiEventKind::from_raw(83), Some(JvmtiEventKind::ObjectFree));
-        assert_eq!(JvmtiEventKind::from_raw(84), Some(JvmtiEventKind::VMObjectAlloc));
-        assert_eq!(JvmtiEventKind::from_raw(86), Some(JvmtiEventKind::SampledObjectAlloc));
-        assert_eq!(JvmtiEventKind::from_raw(71), Some(JvmtiEventKind::DataDumpRequest));
+        assert_eq!(
+            JvmtiEventKind::from_raw(83),
+            Some(JvmtiEventKind::ObjectFree)
+        );
+        assert_eq!(
+            JvmtiEventKind::from_raw(84),
+            Some(JvmtiEventKind::VMObjectAlloc)
+        );
+        assert_eq!(
+            JvmtiEventKind::from_raw(86),
+            Some(JvmtiEventKind::SampledObjectAlloc)
+        );
+        assert_eq!(
+            JvmtiEventKind::from_raw(71),
+            Some(JvmtiEventKind::DataDumpRequest)
+        );
 
         assert_eq!(JvmtiEventKind::ObjectFree as u32, 83);
         assert_eq!(JvmtiEventKind::VMObjectAlloc as u32, 84);
@@ -3334,13 +4014,17 @@ mod tests {
         assert_eq!(set.len(), 4);
         // Debug round-trip sanity.
         assert_eq!(format!("{:?}", JvmtiEventKind::ObjectFree), "ObjectFree");
-        assert_eq!(format!("{:?}", JvmtiEventKind::DataDumpRequest), "DataDumpRequest");
+        assert_eq!(
+            format!("{:?}", JvmtiEventKind::DataDumpRequest),
+            "DataDumpRequest"
+        );
     }
 
     #[test]
     fn test_fire_object_free() {
         let em = JvmtiEventManager::new();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None)
+            .unwrap();
         let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
         let s = seen.clone();
         let cbs = EventCallbacks {
@@ -3358,7 +4042,8 @@ mod tests {
     fn test_fire_vm_object_alloc() {
         let em = JvmtiEventManager::new();
         let tid: ThreadId = 1;
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VMObjectAlloc, Some(tid)).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VMObjectAlloc, Some(tid))
+            .unwrap();
         let count = Arc::new(AtomicU32::new(0));
         let total_size = Arc::new(Mutex::new(0usize));
         let c = count.clone();
@@ -3381,7 +4066,12 @@ mod tests {
     fn test_sampled_alloc_threshold_rate_limits() {
         let em = JvmtiEventManager::new();
         let tid: ThreadId = 1;
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SampledObjectAlloc, Some(tid)).unwrap();
+        em.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::SampledObjectAlloc,
+            Some(tid),
+        )
+        .unwrap();
         em.set_sampling_interval(1024);
         let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
@@ -3396,9 +4086,14 @@ mod tests {
         // 8 × 128 B = 1024 B — crosses threshold exactly once.
         let mut fired = 0u32;
         for _ in 0..8 {
-            if em.record_allocation_sample(tid, 0x1000, 1, 128) { fired += 1; }
+            if em.record_allocation_sample(tid, 0x1000, 1, 128) {
+                fired += 1;
+            }
         }
-        assert_eq!(fired, 1, "threshold of 1024 should fire exactly once for 8×128 B");
+        assert_eq!(
+            fired, 1,
+            "threshold of 1024 should fire exactly once for 8×128 B"
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Reset counter — 4 × 256 B hits threshold once more.
@@ -3411,11 +4106,14 @@ mod tests {
     #[test]
     fn test_fire_data_dump_request() {
         let em = JvmtiEventManager::new();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None)
+            .unwrap();
         let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
         let cbs = EventCallbacks {
-            data_dump_request: Some(Box::new(move || { c.fetch_add(1, Ordering::SeqCst); })),
+            data_dump_request: Some(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
         };
         em.set_event_callbacks(cbs).unwrap();
@@ -3441,16 +4139,19 @@ mod tests {
     #[test]
     fn test_env_registration_broadcasts_callbacks() {
         let em = JvmtiEventManager::new();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ObjectFree, None)
+            .unwrap();
 
         // Attached env with its own ObjectFree callback.
         let env = Arc::new(JvmtiEnv::new());
         let agent_tags = Arc::new(Mutex::new(Vec::<i64>::new()));
         let t = agent_tags.clone();
-        env.event_manager.set_event_callbacks(EventCallbacks {
-            object_free: Some(Box::new(move |tag| t.lock().unwrap().push(tag))),
-            ..Default::default()
-        }).unwrap();
+        env.event_manager
+            .set_event_callbacks(EventCallbacks {
+                object_free: Some(Box::new(move |tag| t.lock().unwrap().push(tag))),
+                ..Default::default()
+            })
+            .unwrap();
 
         em.register_env(&env).unwrap();
         em.fire_object_free(123);
@@ -3468,7 +4169,8 @@ mod tests {
     #[test]
     fn test_env_dropped_envs_pruned() {
         let em = JvmtiEventManager::new();
-        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None).unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::DataDumpRequest, None)
+            .unwrap();
 
         {
             let env = Arc::new(JvmtiEnv::new());
@@ -3477,7 +4179,10 @@ mod tests {
         }
         // Snapshot after drop should be empty; no panic.
         let snap = em.snapshot_envs();
-        assert!(snap.is_empty(), "dropped envs must be pruned from attached list");
+        assert!(
+            snap.is_empty(),
+            "dropped envs must be pruned from attached list"
+        );
 
         em.fire_data_dump_request(); // no listener callback, just no panic.
     }
@@ -3532,14 +4237,16 @@ mod tests {
 
         let tid: ThreadId = 7;
         let cid: ClassId = 42;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
 
         let seen = Arc::new(Mutex::new(Vec::<(ThreadId, ClassId)>::new()));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
             class_load: Some(Box::new(move |t, c| s.lock().unwrap().push((t, c)))),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Free function drives through the global manager.
         fire_class_load(tid, cid);
@@ -3553,8 +4260,18 @@ mod tests {
         let mgr = ensure_global_manager();
         reset_global_manager_for_tests();
 
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionStart, None).unwrap();
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::GarbageCollectionFinish, None).unwrap();
+        mgr.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::GarbageCollectionStart,
+            None,
+        )
+        .unwrap();
+        mgr.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::GarbageCollectionFinish,
+            None,
+        )
+        .unwrap();
 
         let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let lg1 = log.clone();
@@ -3563,7 +4280,8 @@ mod tests {
             gc_start: Some(Box::new(move || lg1.lock().unwrap().push("start"))),
             gc_finish: Some(Box::new(move || lg2.lock().unwrap().push("finish"))),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         fire_gc_start();
         fire_gc_finish();
@@ -3577,17 +4295,24 @@ mod tests {
         let mgr = ensure_global_manager();
         reset_global_manager_for_tests();
 
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None).unwrap();
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmDeath, None).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmInit, None)
+            .unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::VmDeath, None)
+            .unwrap();
         let init = Arc::new(AtomicU32::new(0));
         let death = Arc::new(AtomicU32::new(0));
         let ic = init.clone();
         let dc = death.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            vm_init: Some(Box::new(move || { ic.fetch_add(1, Ordering::SeqCst); })),
-            vm_death: Some(Box::new(move || { dc.fetch_add(1, Ordering::SeqCst); })),
+            vm_init: Some(Box::new(move || {
+                ic.fetch_add(1, Ordering::SeqCst);
+            })),
+            vm_death: Some(Box::new(move || {
+                dc.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         fire_vm_init();
         fire_vm_death();
@@ -3602,13 +4327,19 @@ mod tests {
         reset_global_manager_for_tests();
 
         let tid: ThreadId = 3;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ExceptionCatch, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::ExceptionCatch,
+            Some(tid),
+        )
+        .unwrap();
         let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, i64)>::new()));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
             exception_catch: Some(Box::new(move |t, m, l| s.lock().unwrap().push((t, m, l)))),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         fire_exception_catch(tid, 99, 10);
         fire_exception_catch(tid, 99, 11);
         assert_eq!(*seen.lock().unwrap(), vec![(tid, 99, 10), (tid, 99, 11)]);
@@ -3628,13 +4359,15 @@ mod tests {
 
         let tid: ThreadId = 7;
         let mid: MethodId = 0x12345;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
+            .unwrap();
         let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId)>::new()));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
             method_entry: Some(Box::new(move |t, m| s.lock().unwrap().push((t, m)))),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(any_method_entry_listener_active());
         fire_method_entry(tid, mid);
@@ -3652,16 +4385,25 @@ mod tests {
 
         let tid: ThreadId = 8;
         let mid: MethodId = 0x22222;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid)).unwrap();
-        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool, LocalValue)>::new()));
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid))
+            .unwrap();
+        let seen = Arc::new(Mutex::new(
+            Vec::<(ThreadId, MethodId, bool, LocalValue)>::new(),
+        ));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            method_exit: Some(Box::new(move |t, m, exc, rv| s.lock().unwrap().push((t, m, exc, rv)))),
+            method_exit: Some(Box::new(move |t, m, exc, rv| {
+                s.lock().unwrap().push((t, m, exc, rv))
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         fire_method_exit(tid, mid, false, LocalValue::Int(42));
-        assert_eq!(*seen.lock().unwrap(), vec![(tid, mid, false, LocalValue::Int(42))]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(tid, mid, false, LocalValue::Int(42))]
+        );
         assert_eq!(mgr.event_count(JvmtiEventKind::MethodExit), 1);
     }
 
@@ -3675,13 +4417,17 @@ mod tests {
 
         let tid: ThreadId = 9;
         let mid: MethodId = 0x33333;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, Some(tid))
+            .unwrap();
         let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool)>::new()));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            method_exit: Some(Box::new(move |t, m, exc, _rv| s.lock().unwrap().push((t, m, exc)))),
+            method_exit: Some(Box::new(move |t, m, exc, _rv| {
+                s.lock().unwrap().push((t, m, exc))
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         fire_method_exit(tid, mid, true, LocalValue::Object(None));
         let got = seen.lock().unwrap();
@@ -3701,13 +4447,17 @@ mod tests {
 
         let tid: ThreadId = 10;
         let mid: MethodId = 0x44444;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid))
+            .unwrap();
         let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            single_step: Some(Box::new(move |_t, _m, _l| { c.fetch_add(1, Ordering::SeqCst); })),
+            single_step: Some(Box::new(move |_t, _m, _l| {
+                c.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         for pc in 0..10 {
             fire_single_step(tid, mid, pc);
@@ -3730,8 +4480,14 @@ mod tests {
         let class_id: u64 = 99;
         let field_index: usize = 3;
 
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldAccess, Some(tid)).unwrap();
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldModification, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldAccess, Some(tid))
+            .unwrap();
+        mgr.set_event_notification_mode(
+            EventMode::Enable,
+            JvmtiEventKind::FieldModification,
+            Some(tid),
+        )
+        .unwrap();
 
         set_field_watchpoint(class_id, field_index, true, true).unwrap();
         assert!(any_field_watchpoint_active());
@@ -3750,10 +4506,15 @@ mod tests {
         let a = accesses.clone();
         let m = mods.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            field_access: Some(Box::new(move |_t, _m, _f| { a.fetch_add(1, Ordering::SeqCst); })),
-            field_modification: Some(Box::new(move |_t, _m, _f| { m.fetch_add(1, Ordering::SeqCst); })),
+            field_access: Some(Box::new(move |_t, _m, _f| {
+                a.fetch_add(1, Ordering::SeqCst);
+            })),
+            field_modification: Some(Box::new(move |_t, _m, _f| {
+                m.fetch_add(1, Ordering::SeqCst);
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         fire_field_access_if_watched(tid, mid, class_id, field_index);
         fire_field_modification_if_watched(tid, mid, class_id, field_index);
@@ -3794,18 +4555,25 @@ mod tests {
 
         let tid: ThreadId = 12;
         let mid: MethodId = 0x66666;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FramePop, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FramePop, Some(tid))
+            .unwrap();
         let seen = Arc::new(Mutex::new(Vec::<(ThreadId, MethodId, bool)>::new()));
         let s = seen.clone();
         mgr.set_event_callbacks(EventCallbacks {
-            frame_pop: Some(Box::new(move |t, m, exc| s.lock().unwrap().push((t, m, exc)))),
+            frame_pop: Some(Box::new(move |t, m, exc| {
+                s.lock().unwrap().push((t, m, exc))
+            })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Fire once for a normal return and once for an exception unwind.
         fire_frame_pop(tid, mid, false);
         fire_frame_pop(tid, mid, true);
-        assert_eq!(*seen.lock().unwrap(), vec![(tid, mid, false), (tid, mid, true)]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(tid, mid, false), (tid, mid, true)]
+        );
         assert_eq!(mgr.event_count(JvmtiEventKind::FramePop), 2);
     }
 
@@ -3856,21 +4624,27 @@ mod tests {
 
         let tid: ThreadId = 13;
         // MethodEntry
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
+            .unwrap();
         assert!(mgr.has_method_entry_listener());
-        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodEntry, Some(tid))
+            .unwrap();
         assert!(!mgr.has_method_entry_listener());
 
         // MethodExit
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, None).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, None)
+            .unwrap();
         assert!(mgr.has_method_exit_listener());
-        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodExit, None).unwrap();
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodExit, None)
+            .unwrap();
         assert!(!mgr.has_method_exit_listener());
 
         // SingleStep (per-thread)
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::SingleStep, Some(tid))
+            .unwrap();
         assert!(mgr.has_single_step_listener());
-        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::SingleStep, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Disable, JvmtiEventKind::SingleStep, Some(tid))
+            .unwrap();
         assert!(!mgr.has_single_step_listener());
     }
 
@@ -3885,20 +4659,24 @@ mod tests {
 
         let tid: ThreadId = 14;
         let mid: MethodId = 0x77777;
-        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid)).unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
+            .unwrap();
 
         let ok_count = Arc::new(AtomicU32::new(0));
         let c = ok_count.clone();
         mgr.set_event_callbacks(EventCallbacks {
             method_entry: Some(Box::new(move |_t, m| {
                 c.fetch_add(1, Ordering::SeqCst);
-                if m == 999 { panic!("agent panic"); }
+                if m == 999 {
+                    panic!("agent panic");
+                }
             })),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
-        fire_method_entry(tid, mid);     // normal
-        fire_method_entry(tid, 999);     // agent panics
+        fire_method_entry(tid, mid); // normal
+        fire_method_entry(tid, 999); // agent panics
         fire_method_entry(tid, mid + 1); // must still deliver
         assert_eq!(ok_count.load(Ordering::SeqCst), 3);
     }

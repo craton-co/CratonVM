@@ -234,7 +234,10 @@ impl ConstantPool {
                             "cp#{i}: ClassReference name_index {} out of bounds",
                             name_index
                         ));
-                    } else if !matches!(self.entries.get(*name_index as usize), Some(ConstantPoolEntry::Utf8(_))) {
+                    } else if !matches!(
+                        self.entries.get(*name_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
                         errors.push(format!(
                             "cp#{i}: ClassReference name_index {} does not point to Utf8",
                             name_index
@@ -247,19 +250,34 @@ impl ConstantPool {
                             "cp#{i}: StringReference string_index {} out of bounds",
                             string_index
                         ));
-                    } else if !matches!(self.entries.get(*string_index as usize), Some(ConstantPoolEntry::Utf8(_))) {
+                    } else if !matches!(
+                        self.entries.get(*string_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
                         errors.push(format!(
                             "cp#{i}: StringReference string_index {} does not point to Utf8",
                             string_index
                         ));
                     }
                 }
-                ConstantPoolEntry::FieldReference { class_index, name_and_type_index }
-                | ConstantPoolEntry::MethodReference { class_index, name_and_type_index }
-                | ConstantPoolEntry::InterfaceMethodReference { class_index, name_and_type_index } => {
+                ConstantPoolEntry::FieldReference {
+                    class_index,
+                    name_and_type_index,
+                }
+                | ConstantPoolEntry::MethodReference {
+                    class_index,
+                    name_and_type_index,
+                }
+                | ConstantPoolEntry::InterfaceMethodReference {
+                    class_index,
+                    name_and_type_index,
+                } => {
                     if *class_index == 0 || *class_index >= len {
                         errors.push(format!("cp#{i}: class_index {} out of bounds", class_index));
-                    } else if !matches!(self.entries.get(*class_index as usize), Some(ConstantPoolEntry::ClassReference { .. })) {
+                    } else if !matches!(
+                        self.entries.get(*class_index as usize),
+                        Some(ConstantPoolEntry::ClassReference { .. })
+                    ) {
                         errors.push(format!(
                             "cp#{i}: class_index {} does not point to ClassReference",
                             class_index
@@ -270,17 +288,29 @@ impl ConstantPool {
                             "cp#{i}: name_and_type_index {} out of bounds",
                             name_and_type_index
                         ));
-                    } else if !matches!(self.entries.get(*name_and_type_index as usize), Some(ConstantPoolEntry::NameAndType { .. })) {
+                    } else if !matches!(
+                        self.entries.get(*name_and_type_index as usize),
+                        Some(ConstantPoolEntry::NameAndType { .. })
+                    ) {
                         errors.push(format!(
                             "cp#{i}: name_and_type_index {} does not point to NameAndType",
                             name_and_type_index
                         ));
                     }
                 }
-                ConstantPoolEntry::NameAndType { name_index, descriptor_index } => {
+                ConstantPoolEntry::NameAndType {
+                    name_index,
+                    descriptor_index,
+                } => {
                     if *name_index == 0 || *name_index >= len {
-                        errors.push(format!("cp#{i}: NameAndType name_index {} out of bounds", name_index));
-                    } else if !matches!(self.entries.get(*name_index as usize), Some(ConstantPoolEntry::Utf8(_))) {
+                        errors.push(format!(
+                            "cp#{i}: NameAndType name_index {} out of bounds",
+                            name_index
+                        ));
+                    } else if !matches!(
+                        self.entries.get(*name_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
                         errors.push(format!(
                             "cp#{i}: NameAndType name_index {} does not point to Utf8",
                             name_index
@@ -291,7 +321,10 @@ impl ConstantPool {
                             "cp#{i}: NameAndType descriptor_index {} out of bounds",
                             descriptor_index
                         ));
-                    } else if !matches!(self.entries.get(*descriptor_index as usize), Some(ConstantPoolEntry::Utf8(_))) {
+                    } else if !matches!(
+                        self.entries.get(*descriptor_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
                         errors.push(format!(
                             "cp#{i}: NameAndType descriptor_index {} does not point to Utf8",
                             descriptor_index
@@ -304,7 +337,10 @@ impl ConstantPool {
                             "cp#{i}: MethodType descriptor_index {} out of bounds",
                             descriptor_index
                         ));
-                    } else if !matches!(self.entries.get(*descriptor_index as usize), Some(ConstantPoolEntry::Utf8(_))) {
+                    } else if !matches!(
+                        self.entries.get(*descriptor_index as usize),
+                        Some(ConstantPoolEntry::Utf8(_))
+                    ) {
                         errors.push(format!(
                             "cp#{i}: MethodType descriptor_index {} does not point to Utf8",
                             descriptor_index
@@ -319,7 +355,9 @@ impl ConstantPool {
                 // not the constant pool, so it is intentionally not checked
                 // here — only the constant-pool-relative
                 // `name_and_type_index` is.)
-                ConstantPoolEntry::MethodHandle { reference_index, .. } => {
+                ConstantPoolEntry::MethodHandle {
+                    reference_index, ..
+                } => {
                     // JVMS §4.4.8: reference_index must point to a Fieldref,
                     // Methodref, or InterfaceMethodref. The exact kind is
                     // determined by reference_kind (and is version-dependent
@@ -346,8 +384,14 @@ impl ConstantPool {
                         ));
                     }
                 }
-                ConstantPoolEntry::Dynamic { name_and_type_index, .. }
-                | ConstantPoolEntry::InvokeDynamic { name_and_type_index, .. } => {
+                ConstantPoolEntry::Dynamic {
+                    name_and_type_index,
+                    ..
+                }
+                | ConstantPoolEntry::InvokeDynamic {
+                    name_and_type_index,
+                    ..
+                } => {
                     // JVMS §4.4.10 / §4.4.11: name_and_type_index must point
                     // to a NameAndType entry.
                     if *name_and_type_index == 0 || *name_and_type_index >= len {
@@ -459,14 +503,16 @@ mod tests {
                 descriptor_index: 2,
             },
             ConstantPoolEntry::MethodReference {
-                class_index: 1,         // points to Utf8, not ClassReference
+                class_index: 1, // points to Utf8, not ClassReference
                 name_and_type_index: 3,
             },
         ];
         let pool = ConstantPool::new(entries);
         let errors = pool.validate();
         assert!(!errors.is_empty());
-        assert!(errors.iter().any(|e| e.contains("does not point to ClassReference")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("does not point to ClassReference")));
     }
 
     #[test]

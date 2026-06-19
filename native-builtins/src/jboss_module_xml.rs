@@ -92,9 +92,10 @@ pub enum ParseError {
 }
 
 fn attr_str(attr: &quick_xml::events::attributes::Attribute) -> Result<String, ParseError> {
-    let raw = attr
-        .unescape_value()
-        .map_err(|e| ParseError::Xml { offset: 0, message: e.to_string() })?;
+    let raw = attr.unescape_value().map_err(|e| ParseError::Xml {
+        offset: 0,
+        message: e.to_string(),
+    })?;
     Ok(raw.to_string())
 }
 
@@ -363,12 +364,7 @@ pub fn build_module_spec_via_invoke(
         }
     }
     let spec = if let Value::Object(Some(b)) = builder {
-        ctx.invoke_virtual(
-            b,
-            "create",
-            "()Lorg/jboss/modules/ModuleSpec;",
-            &[],
-        )?
+        ctx.invoke_virtual(b, "create", "()Lorg/jboss/modules/ModuleSpec;", &[])?
     } else {
         None
     };
@@ -420,10 +416,7 @@ fn resolve_path_value(
     Ok(resolved.unwrap_or(Value::Object(None)))
 }
 
-pub fn native_parse_module_xml(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn native_parse_module_xml(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if args.len() < 5 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
             message: format!(
@@ -503,7 +496,10 @@ mod tests {
         assert_eq!(mx.name, "org.jboss.as.standalone");
         assert_eq!(mx.main_class.as_deref(), Some("org.jboss.as.server.Main"));
         assert_eq!(mx.properties.len(), 2);
-        assert_eq!(mx.properties[0], ("jboss.api".to_string(), "private".to_string()));
+        assert_eq!(
+            mx.properties[0],
+            ("jboss.api".to_string(), "private".to_string())
+        );
         assert_eq!(mx.dependencies.len(), 7);
         assert_eq!(mx.dependencies[0].name, "jdk.security.auth");
         assert_eq!(mx.dependencies[2].services, ServicesDisposition::Import);
@@ -557,10 +553,22 @@ mod tests {
 
     #[test]
     fn services_disposition_round_trips() {
-        assert_eq!(ServicesDisposition::parse("import"), ServicesDisposition::Import);
-        assert_eq!(ServicesDisposition::parse("export"), ServicesDisposition::Export);
-        assert_eq!(ServicesDisposition::parse("none"), ServicesDisposition::None);
-        assert_eq!(ServicesDisposition::parse("nonsense"), ServicesDisposition::None);
+        assert_eq!(
+            ServicesDisposition::parse("import"),
+            ServicesDisposition::Import
+        );
+        assert_eq!(
+            ServicesDisposition::parse("export"),
+            ServicesDisposition::Export
+        );
+        assert_eq!(
+            ServicesDisposition::parse("none"),
+            ServicesDisposition::None
+        );
+        assert_eq!(
+            ServicesDisposition::parse("nonsense"),
+            ServicesDisposition::None
+        );
         assert_eq!(ServicesDisposition::Import.as_str(), "import");
     }
 }

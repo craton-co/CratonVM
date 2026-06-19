@@ -199,20 +199,14 @@ fn parse_provider_lines(bytes: &[u8], out: &mut Vec<String>) {
 /// `Wp71JdbcSpi.countDriverProvidersNative()` — number of providers
 /// listed across every `META-INF/services/java.sql.Driver` resource
 /// reachable from the system classpath.
-fn native_count_driver_providers(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_count_driver_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let providers = collect_driver_providers(ctx)?;
     Ok(Some(Value::Int(providers.len() as i32)))
 }
 
 /// `Wp71JdbcSpi.firstDriverProviderNative()` — the first (lex-sorted)
 /// provider FQN, or `null` when no descriptor exists.
-fn native_first_driver_provider(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_first_driver_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let providers = collect_driver_providers(ctx)?;
     match providers.first() {
         Some(name) => {
@@ -228,10 +222,7 @@ fn native_first_driver_provider(
 /// `META-INF/services/java.sql.Driver` on the classpath, else 0. Used
 /// by the regression test to assert the synthetic SPI fixture is
 /// visible end-to-end.
-fn native_find_driver_provider(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_find_driver_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let expected = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => {
@@ -264,7 +255,11 @@ mod tests {
             )
             .is_some());
         assert!(r
-            .find("java/util/ServiceLoader", "iterator", "()Ljava/util/Iterator;")
+            .find(
+                "java/util/ServiceLoader",
+                "iterator",
+                "()Ljava/util/Iterator;"
+            )
             .is_some());
         assert!(r
             .find(

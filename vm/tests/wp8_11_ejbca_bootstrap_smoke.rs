@@ -63,14 +63,17 @@ fn wp8_11_provider_chain_seed_has_jdk25_defaults() {
     cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     // Spot-check the four providers EJBCA queries by name during init.
-    for cls in [
-        "java/security/Security",
-        "java/security/Provider",
-    ] {
+    for cls in ["java/security/Security", "java/security/Provider"] {
         assert!(
             r.find(cls, "getName", "()Ljava/lang/String;").is_some()
-                || r.find(cls, "getProviders", "()[Ljava/security/Provider;").is_some()
-                || r.find(cls, "getProvider", "(Ljava/lang/String;)Ljava/security/Provider;").is_some(),
+                || r.find(cls, "getProviders", "()[Ljava/security/Provider;")
+                    .is_some()
+                || r.find(
+                    cls,
+                    "getProvider",
+                    "(Ljava/lang/String;)Ljava/security/Provider;"
+                )
+                .is_some(),
             "Security/Provider must have at least one accessor registered, none found on {cls}"
         );
     }
@@ -143,14 +146,22 @@ fn wp8_11_service_loader_iterator_registered_for_resteasy() {
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
 
     assert!(
-        r.find("java/util/ServiceLoader", "load", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;")
-            .is_some(),
+        r.find(
+            "java/util/ServiceLoader",
+            "load",
+            "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"
+        )
+        .is_some(),
         "ServiceLoader.load(Class) must be registered (RESTEasy + JBoss-Logging \
          + Hibernate persistence-provider discovery all funnel through here)"
     );
     assert!(
-        r.find("java/util/ServiceLoader", "iterator", "()Ljava/util/Iterator;")
-            .is_some(),
+        r.find(
+            "java/util/ServiceLoader",
+            "iterator",
+            "()Ljava/util/Iterator;"
+        )
+        .is_some(),
         "ServiceLoader.iterator must be registered"
     );
 }

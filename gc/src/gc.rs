@@ -576,7 +576,11 @@ pub fn collect_with_finalizers(
             continue;
         }
         let new_ptr = forward_object(
-            from_space, to_space, old_ptr, &mut objects_copied, &mut pointer_map,
+            from_space,
+            to_space,
+            old_ptr,
+            &mut objects_copied,
+            &mut pointer_map,
         );
         *root = unsafe { ObjectRef::from_raw(new_ptr) };
     }
@@ -623,10 +627,15 @@ pub fn collect_with_finalizers(
                         let ref_ptr = raw as usize as *mut u8;
                         if from_space.contains(ref_ptr) {
                             let new_ref_ptr = forward_object(
-                                from_space, to_space, ref_ptr,
-                                &mut objects_copied, &mut pointer_map,
+                                from_space,
+                                to_space,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
                             );
-                            unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
+                            unsafe {
+                                std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                            }
                         }
                     }
                 }
@@ -640,12 +649,17 @@ pub fn collect_with_finalizers(
                     let ref_ptr = ref_obj.as_ptr();
                     if from_space.contains(ref_ptr) {
                         let new_ref_ptr = forward_object(
-                            from_space, to_space, ref_ptr,
-                            &mut objects_copied, &mut pointer_map,
+                            from_space,
+                            to_space,
+                            ref_ptr,
+                            &mut objects_copied,
+                            &mut pointer_map,
                         );
                         let new_value =
                             Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
-                        unsafe { std::ptr::write(slot_ptr as *mut Value, new_value); }
+                        unsafe {
+                            std::ptr::write(slot_ptr as *mut Value, new_value);
+                        }
                     }
                 }
             }
@@ -669,8 +683,7 @@ pub fn collect_with_finalizers(
     // and we stop when (a) finds no new unforwarded finalizable object AND
     // the Cheney scan has nothing left to chew on.
     let mut dead_finalizers = Vec::new();
-    let mut dead_finalizers_set: rustc_hash::FxHashSet<usize> =
-        rustc_hash::FxHashSet::default();
+    let mut dead_finalizers_set: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     loop {
         let mut newly_resurrected = false;
 
@@ -698,8 +711,11 @@ pub fn collect_with_finalizers(
                 continue;
             }
             let new_ptr = forward_object(
-                from_space, to_space, old_ptr,
-                &mut objects_copied, &mut pointer_map,
+                from_space,
+                to_space,
+                old_ptr,
+                &mut objects_copied,
+                &mut pointer_map,
             );
             let new_addr = new_ptr as usize;
             if dead_finalizers_set.insert(new_addr) {
@@ -747,10 +763,15 @@ pub fn collect_with_finalizers(
                             let ref_ptr = raw as usize as *mut u8;
                             if from_space.contains(ref_ptr) {
                                 let new_ref_ptr = forward_object(
-                                    from_space, to_space, ref_ptr,
-                                    &mut objects_copied, &mut pointer_map,
+                                    from_space,
+                                    to_space,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
                                 );
-                                unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
+                                unsafe {
+                                    std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                }
                             }
                         }
                     }
@@ -764,12 +785,17 @@ pub fn collect_with_finalizers(
                         let ref_ptr = ref_obj.as_ptr();
                         if from_space.contains(ref_ptr) {
                             let new_ref_ptr = forward_object(
-                                from_space, to_space, ref_ptr,
-                                &mut objects_copied, &mut pointer_map,
+                                from_space,
+                                to_space,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
                             );
                             let new_value =
                                 Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
-                            unsafe { std::ptr::write(slot_ptr as *mut Value, new_value); }
+                            unsafe {
+                                std::ptr::write(slot_ptr as *mut Value, new_value);
+                            }
                         }
                     }
                 }
@@ -810,7 +836,10 @@ pub fn update_value_ref(value: &mut Value, pointer_map: &HashMap<usize, usize>) 
             // SAFETY: new_addr was produced by the GC's pointer map and points
             // into to-space where a valid object was copied by forward_object.
             // The debug_assert verifies non-null during development.
-            debug_assert!(new_addr != 0, "gc: update_value_ref: pointer map contains null address");
+            debug_assert!(
+                new_addr != 0,
+                "gc: update_value_ref: pointer map contains null address"
+            );
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
@@ -1087,8 +1116,12 @@ mod tests {
     static GC_HOOK_STARTS: AtomicU32 = AtomicU32::new(0);
     static GC_HOOK_FINISHES: AtomicU32 = AtomicU32::new(0);
 
-    fn gc_hook_start_cb() { GC_HOOK_STARTS.fetch_add(1, CounterOrd::SeqCst); }
-    fn gc_hook_finish_cb() { GC_HOOK_FINISHES.fetch_add(1, CounterOrd::SeqCst); }
+    fn gc_hook_start_cb() {
+        GC_HOOK_STARTS.fetch_add(1, CounterOrd::SeqCst);
+    }
+    fn gc_hook_finish_cb() {
+        GC_HOOK_FINISHES.fetch_add(1, CounterOrd::SeqCst);
+    }
 
     fn gc_hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock as StdOnceLock};
@@ -1112,8 +1145,16 @@ mod tests {
         let (mut from, mut to) = heap.lock_spaces();
         let _ = collect(&mut from, &mut to, &mut roots);
 
-        assert_eq!(GC_HOOK_STARTS.load(CounterOrd::SeqCst), before_start + 1, "GarbageCollectionStart must fire exactly once per collect()");
-        assert_eq!(GC_HOOK_FINISHES.load(CounterOrd::SeqCst), before_finish + 1, "GarbageCollectionFinish must fire exactly once per collect()");
+        assert_eq!(
+            GC_HOOK_STARTS.load(CounterOrd::SeqCst),
+            before_start + 1,
+            "GarbageCollectionStart must fire exactly once per collect()"
+        );
+        assert_eq!(
+            GC_HOOK_FINISHES.load(CounterOrd::SeqCst),
+            before_finish + 1,
+            "GarbageCollectionFinish must fire exactly once per collect()"
+        );
     }
 
     #[test]

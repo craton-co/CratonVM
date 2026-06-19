@@ -140,9 +140,7 @@ impl GradleCompatChecker {
     /// Gradle probes `release`, `bin/java`, and optionally `lib/jvm.cfg`.
     pub fn check_java_home_valid(&self) -> CompatStatus {
         if !self.jdk_home.join("release").is_file() {
-            return CompatStatus::Error(
-                "release file missing; Gradle cannot detect JDK".into(),
-            );
+            return CompatStatus::Error("release file missing; Gradle cannot detect JDK".into());
         }
 
         let java_exists = if cfg!(unix) {
@@ -155,7 +153,9 @@ impl GradleCompatChecker {
         }
 
         if !self.jdk_home.join("lib/jvm.cfg").is_file() {
-            return CompatStatus::Warning("lib/jvm.cfg missing; some Gradle plugins may warn".into());
+            return CompatStatus::Warning(
+                "lib/jvm.cfg missing; some Gradle plugins may warn".into(),
+            );
         }
 
         CompatStatus::Ok
@@ -234,7 +234,10 @@ mod tests {
         let jdk = td.path().join("jdk");
         std::fs::create_dir_all(&jdk).unwrap();
         let checker = MavenCompatChecker::new(&jdk);
-        assert!(matches!(checker.check_java_home_valid(), CompatStatus::Error(_)));
+        assert!(matches!(
+            checker.check_java_home_valid(),
+            CompatStatus::Error(_)
+        ));
     }
 
     #[test]
@@ -244,7 +247,10 @@ mod tests {
         std::fs::create_dir_all(jdk.join("lib")).unwrap();
         std::fs::write(jdk.join("release"), "JAVA_VERSION=\"25\"\n").unwrap();
         let checker = MavenCompatChecker::new(&jdk);
-        assert!(matches!(checker.check_java_home_valid(), CompatStatus::Error(_)));
+        assert!(matches!(
+            checker.check_java_home_valid(),
+            CompatStatus::Error(_)
+        ));
     }
 
     #[test]
@@ -352,11 +358,7 @@ mod tests {
                 seen.push(name);
             } else {
                 // Opening tag.
-                let name = inner
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+                let name = inner.split_whitespace().next().unwrap_or("").to_string();
                 if name.is_empty() {
                     return Err("empty opening tag".into());
                 }
@@ -455,7 +457,10 @@ mod tests {
         let jdk = td.path().join("jdk");
         std::fs::create_dir_all(&jdk).unwrap();
         let checker = GradleCompatChecker::new(&jdk);
-        assert!(matches!(checker.check_java_home_valid(), CompatStatus::Error(_)));
+        assert!(matches!(
+            checker.check_java_home_valid(),
+            CompatStatus::Error(_)
+        ));
     }
 
     #[test]
@@ -465,7 +470,10 @@ mod tests {
         std::fs::create_dir_all(&jdk).unwrap();
         std::fs::write(jdk.join("release"), "JAVA_VERSION=\"25\"\n").unwrap();
         let checker = GradleCompatChecker::new(&jdk);
-        assert!(matches!(checker.check_java_home_valid(), CompatStatus::Error(_)));
+        assert!(matches!(
+            checker.check_java_home_valid(),
+            CompatStatus::Error(_)
+        ));
     }
 
     #[test]

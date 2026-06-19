@@ -16,10 +16,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
 use cratonvm_types::Value;
 
 /// `ServiceLoader.load(Class)` — use the thread context class loader.
-fn native_sl_load_class(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let service = match args.first() {
         Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
         _ => {
@@ -39,8 +36,8 @@ fn native_sl_load_class(
         .ok()
         .and_then(|v| v);
     let loader = match tcl {
-        Some(Value::Object(Some(t))) => {
-            ctx.invoke(
+        Some(Value::Object(Some(t))) => ctx
+            .invoke(
                 "java/lang/Thread",
                 "getContextClassLoader",
                 "()Ljava/lang/ClassLoader;",
@@ -48,18 +45,14 @@ fn native_sl_load_class(
             )
             .ok()
             .and_then(|v| v)
-            .unwrap_or(Value::Object(None))
-        }
+            .unwrap_or(Value::Object(None)),
         _ => Value::Object(None),
     };
     build_service_loader(ctx, service, loader)
 }
 
 /// `ServiceLoader.load(Class, ClassLoader)` — pass through caller's loader.
-fn native_sl_load_class_loader(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_load_class_loader(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let service = match args.first() {
         Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
         _ => {
@@ -103,11 +96,11 @@ fn build_service_loader(
 /// Example: `org.elasticsearch.xcontent.spi.XContentProvider` → `["x-content"]`
 pub(crate) fn derive_impl_jar_module_names(fqn: &str) -> Vec<String> {
     const KNOWN: &[(&str, &str)] = &[
-        ("org.elasticsearch.xcontent",   "x-content"),
-        ("org.elasticsearch.xpack",      "x-pack"),
-        ("org.elasticsearch.transport",  "transport"),
-        ("org.elasticsearch.common",     "common"),
-        ("org.elasticsearch.core",       "core"),
+        ("org.elasticsearch.xcontent", "x-content"),
+        ("org.elasticsearch.xpack", "x-pack"),
+        ("org.elasticsearch.transport", "transport"),
+        ("org.elasticsearch.common", "common"),
+        ("org.elasticsearch.core", "core"),
     ];
     for (prefix, module) in KNOWN {
         if fqn.starts_with(prefix) {
@@ -160,7 +153,10 @@ pub(crate) fn impl_jars_load_class(
     let class_file = format!("{internal_name}.class");
     for module_name in derive_impl_jar_module_names(&dotted) {
         let listing_path = format!("IMPL-JARS/{module_name}/LISTING.TXT");
-        let first_bytes = ctx.find_all_resource_bytes(&listing_path).into_iter().next();
+        let first_bytes = ctx
+            .find_all_resource_bytes(&listing_path)
+            .into_iter()
+            .next();
         let Some(listing_bytes) = first_bytes.or_else(|| ctx.find_resource(&listing_path)) else {
             continue;
         };
@@ -173,8 +169,10 @@ pub(crate) fn impl_jars_load_class(
             if let Some(class_bytes) =
                 try_read_from_inner_jar(ctx, &module_name, jar_name, &class_file)
             {
-                let opts =
-                    cratonvm_native_api::DefineClassFull { skip_verification: true, ..Default::default() };
+                let opts = cratonvm_native_api::DefineClassFull {
+                    skip_verification: true,
+                    ..Default::default()
+                };
                 if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, 0, opts) {
                     return Some(ctx.get_class_mirror(cid));
                 }
@@ -199,7 +197,9 @@ fn sl_non_builtin_loader(
         },
     };
     v.and_then(|r| {
-        let name = ctx.class_name_of_id(ctx.class_id_of_object(r)).unwrap_or_default();
+        let name = ctx
+            .class_name_of_id(ctx.class_id_of_object(r))
+            .unwrap_or_default();
         if crate::classloader::is_builtin_loader_class(&name) {
             None
         } else {
@@ -374,20 +374,16 @@ fn discover_providers(
                     _ => break,
                 }
                 enum_r = ctx.read_native_pin(enum_pin, enum_r);
-                let url_r = match ctx.invoke_virtual(
-                    enum_r,
-                    "nextElement",
-                    "()Ljava/lang/Object;",
-                    &[],
-                ) {
-                    Ok(Some(Value::Object(Some(r)))) => r,
-                    other => {
-                        if diag_sl {
-                            eprintln!("[SL-LOADER-DBG] nextElement -> {other:?}");
+                let url_r =
+                    match ctx.invoke_virtual(enum_r, "nextElement", "()Ljava/lang/Object;", &[]) {
+                        Ok(Some(Value::Object(Some(r)))) => r,
+                        other => {
+                            if diag_sl {
+                                eprintln!("[SL-LOADER-DBG] nextElement -> {other:?}");
+                            }
+                            break;
                         }
-                        break;
-                    }
-                };
+                    };
                 // Get URL string and extract the JAR-entry path so we can
                 // read bytes via the Rust classpath walker, avoiding the
                 // JDK URL.openStream / InputStream chain.
@@ -472,17 +468,13 @@ fn discover_providers(
                         Ok(Some(Value::Object(Some(r)))) => r,
                         _ => continue,
                     };
-                    let prefix_str = match ctx.invoke_virtual(
-                        jm,
-                        "prefix",
-                        "()Ljava/lang/String;",
-                        &[],
-                    ) {
-                        Ok(Some(Value::Object(Some(s)))) => {
-                            ctx.read_string(s).unwrap_or_default()
-                        }
-                        _ => continue,
-                    };
+                    let prefix_str =
+                        match ctx.invoke_virtual(jm, "prefix", "()Ljava/lang/String;", &[]) {
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
+                            _ => continue,
+                        };
                     if prefix_str.is_empty() {
                         continue;
                     }
@@ -525,13 +517,14 @@ fn discover_providers(
                 if diag_sl {
                     eprintln!("[SL-LOADER-DBG] reading LISTING.TXT: {listing_path}");
                 }
-                let first_bytes =
-                    ctx.find_all_resource_bytes(&listing_path).into_iter().next();
-                let listing_bytes =
-                    match first_bytes.or_else(|| ctx.find_resource(&listing_path)) {
-                        Some(b) => b,
-                        None => continue,
-                    };
+                let first_bytes = ctx
+                    .find_all_resource_bytes(&listing_path)
+                    .into_iter()
+                    .next();
+                let listing_bytes = match first_bytes.or_else(|| ctx.find_resource(&listing_path)) {
+                    Some(b) => b,
+                    None => continue,
+                };
                 if diag_sl {
                     eprintln!(
                         "[SL-LOADER-DBG] LISTING.TXT ({} bytes): {:?}",
@@ -618,34 +611,30 @@ fn is_valid_provider_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    s.chars().all(|c| {
-        c.is_alphanumeric() || c == '.' || c == '_' || c == '$'
-    })
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
 }
 
 /// `ServiceLoader.iterator()` — scan META-INF/services and return an
 /// Iterator<Object> over instantiated providers.
-fn native_sl_iterator(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sl = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     // Extract and pin the non-builtin loader BEFORE discover_providers (which
     // triggers GC via invoke). If the loader is not re-pinned it becomes stale.
-    let loader_pin_opt: Option<(_, cratonvm_types::ObjectRef)> = sl_non_builtin_loader(ctx, sl)
-        .map(|r| (ctx.pin_native_root(r), r));
+    let loader_pin_opt: Option<(_, cratonvm_types::ObjectRef)> =
+        sl_non_builtin_loader(ctx, sl).map(|r| (ctx.pin_native_root(r), r));
     let providers = discover_providers(ctx, sl)?;
 
     // Build an ArrayList and populate with load_provider_class(fqn).newInstance().
     let al_cls = "java/util/ArrayList";
-    let al_cid = ctx
-        .ensure_class_initialized(al_cls)
-        .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
+    let al_cid = ctx.ensure_class_initialized(al_cls).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
             message: "ArrayList: not loaded".to_string(),
-        }))?;
+        })
+    })?;
     let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
     // Pin the providers list as a GC root: the loop below repeatedly calls into
@@ -661,7 +650,10 @@ fn native_sl_iterator(
         Ok("1") | Ok("true") | Ok("yes")
     );
     if diag {
-        eprintln!("[SL-DBG] iterator() entering loop with {} providers", providers.len());
+        eprintln!(
+            "[SL-DBG] iterator() entering loop with {} providers",
+            providers.len()
+        );
     }
     for fqn in providers {
         if diag {
@@ -752,10 +744,7 @@ fn native_sl_iterator(
             .invoke(al_cls, "size", "()I", &[Value::Object(Some(list))])
             .ok()
             .and_then(|v| v);
-        eprintln!(
-            "[SL-DBG] iterator() final list size={:?}",
-            size
-        );
+        eprintln!("[SL-DBG] iterator() final list size={:?}", size);
         list = ctx.read_native_pin(list_pin, list);
     }
     let it = ctx.invoke(
@@ -806,10 +795,7 @@ fn native_sl_iterator(
 /// raw service instance has no `type()`/`get()` method. We now build a
 /// real `ServiceLoader$ProviderImpl(service, type, ctor)` per provider so
 /// `type()`/`get()` run real JDK bytecode and `instanceof Provider` holds.
-fn native_sl_stream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sl = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         // Null receiver → empty stream (not null) so downstream
@@ -851,11 +837,11 @@ fn native_sl_stream(
     // while the loop keeps re-entering Java (forName / getDeclaredConstructor
     // / <init> all can collect). Mirrors `native_sl_iterator`'s discipline.
     let al_cls = "java/util/ArrayList";
-    let al_cid = ctx
-        .ensure_class_initialized(al_cls)
-        .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
+    let al_cid = ctx.ensure_class_initialized(al_cls).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
             message: "ArrayList: not loaded".to_string(),
-        }))?;
+        })
+    })?;
     let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
     let list_pin = ctx.pin_native_root(list);
@@ -892,7 +878,10 @@ fn native_sl_stream(
             "java/lang/Class",
             "getDeclaredConstructor",
             "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
-            &[Value::Object(Some(type_now)), Value::Object(Some(empty_types))],
+            &[
+                Value::Object(Some(type_now)),
+                Value::Object(Some(empty_types)),
+            ],
         ) {
             Ok(Some(Value::Object(Some(c)))) => c,
             other => {
@@ -992,9 +981,7 @@ fn native_sl_stream(
         }
         if !ctor_ok {
             if diag {
-                eprintln!(
-                    "[SL-DBG]   stream skip (ProviderImpl <init> {fqn} → {ctor_err:?})"
-                );
+                eprintln!("[SL-DBG]   stream skip (ProviderImpl <init> {fqn} → {ctor_err:?})");
             }
             ctx.unpin_native_roots(type_pin);
             continue;
@@ -1047,10 +1034,7 @@ fn native_sl_stream(
 /// resolved: drain `iterator()` (service instances) straight into the
 /// synthetic stream. This loses the `Provider` wrapper semantics but
 /// keeps a non-empty stream rather than crashing.
-fn drain_instances_to_stream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn drain_instances_to_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let it = native_sl_iterator(ctx, args)?;
     let iter_obj = match it {
         Some(Value::Object(Some(o))) => o,
@@ -1075,10 +1059,7 @@ fn drain_instances_to_stream(
     alloc_synthetic_stream(ctx, &collected)
 }
 
-fn native_sl_find_first(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let it = native_sl_iterator(ctx, args)?;
     let iter_obj = match it {
         Some(Value::Object(Some(o))) => o,
@@ -1086,13 +1067,12 @@ fn native_sl_find_first(
             return empty_optional(ctx);
         }
     };
-    let has_next = ctx
-        .invoke(
-            "java/util/Iterator",
-            "hasNext",
-            "()Z",
-            &[Value::Object(Some(iter_obj))],
-        )?;
+    let has_next = ctx.invoke(
+        "java/util/Iterator",
+        "hasNext",
+        "()Z",
+        &[Value::Object(Some(iter_obj))],
+    )?;
     if matches!(has_next, Some(Value::Int(0)) | None) {
         return empty_optional(ctx);
     }
@@ -1116,12 +1096,7 @@ fn native_sl_find_first(
 }
 
 fn empty_optional(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let empty = ctx.invoke(
-        "java/util/Optional",
-        "empty",
-        "()Ljava/util/Optional;",
-        &[],
-    )?;
+    let empty = ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])?;
     Ok(empty)
 }
 
@@ -1135,10 +1110,7 @@ fn empty_optional(ctx: &mut dyn NativeContext) -> MethodCallResult {
 /// 3-field Spliterator (array, pos, fence) backed by the freshly-discovered
 /// providers so callers like `sl.spliterator().stream().filter(...)` see the
 /// real provider list.
-fn native_sl_spliterator(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sl_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Drive the existing iterator() native to produce an Iterator over the
     // instantiated providers, then drain it into an Object[]. The whole
     // approach mirrors `Spliterators.spliteratorUnknownSize` but is wired
@@ -1149,7 +1121,8 @@ fn native_sl_spliterator(
         Some(Value::Object(Some(o))) => o,
         _ => {
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let cid = ctx.ensure_class_initialized("java/util/Spliterator")
+            let cid = ctx
+                .ensure_class_initialized("java/util/Spliterator")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let n = ctx.class_num_total_fields(cid).max(3);
             let obj = ctx.alloc_object(cid, n);
@@ -1181,7 +1154,8 @@ fn native_sl_spliterator(
     for (i, v) in collected.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
-    let cid = ctx.ensure_class_initialized("java/util/Spliterator")
+    let cid = ctx
+        .ensure_class_initialized("java/util/Spliterator")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(cid).max(3);
     let obj = ctx.alloc_object(cid, n);
@@ -1245,7 +1219,8 @@ fn native_stream_support_stream_from_spliterator(
         // where eager buffering detached a shared entity (DetachedPreviousRowStateTest).
         // Any non-forEach op materialises on demand — see native-collections
         // `materialize_lazy_stream` / `stream_lazy_spliterator`.
-        let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+        let cid = ctx
+            .ensure_class_initialized("java/util/stream/Stream")
             .unwrap_or(cratonvm_types::ClassId::new(0));
         // Force ≥3 fields so the lazy-spliterator slot (2) exists alongside
         // elements (0) and close-handlers (1).
@@ -1261,8 +1236,7 @@ fn native_stream_support_stream_from_spliterator(
     // spliterator.
     let field0 = ctx.get_field(spliterator, 0);
     let arr = match field0 {
-        Value::Object(Some(a))
-            if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
         _ => return alloc_synthetic_stream(ctx, &[]),
     };
     let pos = match ctx.get_field(spliterator, 1) {
@@ -1281,7 +1255,8 @@ fn native_stream_support_stream_from_spliterator(
         let v = ctx.get_array_element(arr, pos + i);
         ctx.set_array_element(snapshot, i, v);
     }
-    let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+    let cid = ctx
+        .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
@@ -1289,15 +1264,13 @@ fn native_stream_support_stream_from_spliterator(
     Ok(Some(Value::Object(Some(stream))))
 }
 
-fn alloc_synthetic_stream(
-    ctx: &mut dyn NativeContext,
-    elems: &[Value],
-) -> MethodCallResult {
+fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     for (i, v) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
-    let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+    let cid = ctx
+        .ensure_class_initialized("java/util/stream/Stream")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
@@ -1312,10 +1285,7 @@ fn alloc_synthetic_stream(
 /// `register_service_loader_natives`) appends, growing storage on demand.
 const STREAM_COLLECTOR_CLASS: &str = "cratonvm/internal/StreamCollector";
 
-fn native_stream_collector_accept(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stream_collector_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -1477,9 +1447,7 @@ fn native_sl_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Err(e) => break Err(e),
         };
         let action_cur = ctx.read_native_pin(action_pin, action);
-        if let Err(e) =
-            ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem])
-        {
+        if let Err(e) = ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem]) {
             break Err(e);
         }
     };
@@ -1515,9 +1483,24 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Consumer;)V",
         native_sl_for_each,
     );
-    r.register(sl, "stream", "()Ljava/util/stream/Stream;", native_sl_stream);
-    r.register(sl, "spliterator", "()Ljava/util/Spliterator;", native_sl_spliterator);
-    r.register(sl, "findFirst", "()Ljava/util/Optional;", native_sl_find_first);
+    r.register(
+        sl,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_sl_stream,
+    );
+    r.register(
+        sl,
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        native_sl_spliterator,
+    );
+    r.register(
+        sl,
+        "findFirst",
+        "()Ljava/util/Optional;",
+        native_sl_find_first,
+    );
 
     // Re-register `StreamSupport.stream(Spliterator, boolean)` — see the
     // header comment on `native_stream_support_stream_from_spliterator`. This

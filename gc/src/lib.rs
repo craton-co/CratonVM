@@ -26,13 +26,13 @@ pub mod arena;
 pub mod card_table;
 pub mod class_unloading;
 pub mod collector;
-pub mod gc_quiescence;
 pub mod compact_header;
 pub mod compressed_oops;
 pub mod concurrent_mark;
 pub mod g1;
 pub mod g1_concurrent;
 pub mod gc;
+pub mod gc_quiescence;
 pub mod gen_heap;
 pub mod heap;
 pub mod mark_bitmap;
@@ -41,9 +41,9 @@ pub mod numa;
 pub mod old_gen;
 pub mod reference;
 pub mod region;
-pub mod satb;
 #[cfg(feature = "gpu-offload")]
 pub mod safepoint;
+pub mod satb;
 pub mod shadow_stack;
 pub mod tlab;
 pub mod vm_heap;
@@ -60,20 +60,26 @@ pub mod zgc;
 pub mod zgc_concurrent;
 
 pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
+pub use compact_header::{
+    CompactAllocator, CompactHeader, CompactHeaderSavingsReport, HashCodeTable, HeaderView,
+    LegacyHeaderFields, LockState, NarrowKlassTable,
+};
+pub use compressed_oops::{CompressedOop, CompressedOops, CompressedOopsMode, NarrowKlass};
+pub use concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState, ConcurrentMarker};
+pub use g1::{G1CollectionType, G1Collector, G1CollectorConfig};
+pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gc::{
     install_class_info_hook, install_gc_finish_hook, install_gc_start_hook, resolve_class_info,
     ClassInfoHook, JvmtiGcHook,
 };
-pub use vm_heap::{GcBackend, VmHeap};
-pub use compact_header::{CompactAllocator, CompactHeader, CompactHeaderSavingsReport, HashCodeTable, HeaderView, LegacyHeaderFields, LockState, NarrowKlassTable};
-pub use compressed_oops::{CompressedOop, CompressedOops, CompressedOopsMode, NarrowKlass};
-pub use concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState, ConcurrentMarker};
-pub use g1::{G1Collector, G1CollectionType, G1CollectorConfig};
-pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gen_heap::{GenerationalHeap, HeapStats, HeapStatsSnapshot};
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;
+pub use reference::{
+    ReferenceEntry, ReferenceProcessingResult, ReferenceProcessingStats, ReferenceProcessor,
+    ReferenceQueue, ReferenceType,
+};
 pub use region::{RegionHeap, RegionType, RememberedSet};
-pub use reference::{ReferenceEntry, ReferenceProcessor, ReferenceProcessingResult, ReferenceProcessingStats, ReferenceQueue, ReferenceType};
-pub use satb::{SatbBuffer, SatbQueue, flush_thread_satb_buffer, satb_thread_local_log};
+pub use satb::{flush_thread_satb_buffer, satb_thread_local_log, SatbBuffer, SatbQueue};
 pub use tlab::Tlab;
+pub use vm_heap::{GcBackend, VmHeap};

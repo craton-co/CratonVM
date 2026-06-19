@@ -27,9 +27,7 @@ use cratonvm_vm::vm::SharedVm;
 /// Helper: create a SharedVm with a classpath and attempt to load a class.
 /// Returns Ok(()) if class loading succeeds, Err with the failure message.
 fn try_load_class(classpath: &[&str], class_name: &str) -> Result<(), String> {
-    let config = VmConfig::new().with_classpath(
-        classpath.iter().map(|s| s.to_string()).collect(),
-    );
+    let config = VmConfig::new().with_classpath(classpath.iter().map(|s| s.to_string()).collect());
     let shared = Arc::new(SharedVm::new(config));
     *shared.self_arc.write() = Some(Arc::downgrade(&shared));
 
@@ -52,15 +50,9 @@ fn try_load_class(classpath: &[&str], class_name: &str) -> Result<(), String> {
 fn t2_11_1_spring_boot_hello_world() {
     let jar = std::env::var("SPRING_BOOT_JAR")
         .expect("Set SPRING_BOOT_JAR to a Spring Boot hello-world fat JAR path");
-    assert!(
-        std::path::Path::new(&jar).exists(),
-        "JAR not found: {jar}"
-    );
+    assert!(std::path::Path::new(&jar).exists(), "JAR not found: {jar}");
     // Spring Boot's launcher class must be resolvable.
-    let result = try_load_class(
-        &[&jar],
-        "org/springframework/boot/loader/JarLauncher",
-    );
+    let result = try_load_class(&[&jar], "org/springframework/boot/loader/JarLauncher");
     assert!(
         result.is_ok(),
         "Spring Boot hello-world boot failed: {}",
@@ -72,13 +64,10 @@ fn t2_11_1_spring_boot_hello_world() {
 #[test]
 #[ignore = "requires PETCLINIC_JAR env var pointing to the petclinic fat JAR"]
 fn t2_11_2_spring_boot_petclinic() {
-    let jar = std::env::var("PETCLINIC_JAR")
-        .expect("Set PETCLINIC_JAR to the petclinic fat JAR path");
+    let jar =
+        std::env::var("PETCLINIC_JAR").expect("Set PETCLINIC_JAR to the petclinic fat JAR path");
     assert!(std::path::Path::new(&jar).exists(), "JAR not found: {jar}");
-    let result = try_load_class(
-        &[&jar],
-        "org/springframework/boot/loader/JarLauncher",
-    );
+    let result = try_load_class(&[&jar], "org/springframework/boot/loader/JarLauncher");
     assert!(
         result.is_ok(),
         "Petclinic boot failed: {}",
@@ -93,10 +82,7 @@ fn t2_11_3_quarkus_hello_world() {
     let jar = std::env::var("QUARKUS_JAR")
         .expect("Set QUARKUS_JAR to a Quarkus hello-world runner JAR path");
     assert!(std::path::Path::new(&jar).exists(), "JAR not found: {jar}");
-    let result = try_load_class(
-        &[&jar],
-        "io/quarkus/runner/GeneratedMain",
-    );
+    let result = try_load_class(&[&jar], "io/quarkus/runner/GeneratedMain");
     assert!(
         result.is_ok(),
         "Quarkus boot failed: {}",
@@ -113,17 +99,13 @@ fn t2_11_3_quarkus_hello_world() {
 #[test]
 #[ignore = "requires JAVA_HOME env var pointing to JDK 25+ installation"]
 fn t2_11_4_javac_class_resolution() {
-    let java_home = std::env::var("JAVA_HOME")
-        .expect("Set JAVA_HOME to a JDK 25+ installation");
+    let java_home = std::env::var("JAVA_HOME").expect("Set JAVA_HOME to a JDK 25+ installation");
     let modules_path = format!("{java_home}/lib/modules");
     assert!(
         std::path::Path::new(&modules_path).exists(),
         "JDK modules not found at: {modules_path}"
     );
-    let result = try_load_class(
-        &[&modules_path],
-        "com/sun/tools/javac/Main",
-    );
+    let result = try_load_class(&[&modules_path], "com/sun/tools/javac/Main");
     assert!(
         result.is_ok(),
         "javac main class resolution failed: {}",
@@ -135,8 +117,7 @@ fn t2_11_4_javac_class_resolution() {
 #[test]
 #[ignore = "requires JAVA_HOME env var pointing to JDK 25+ installation"]
 fn t2_11_5_jshell_class_resolution() {
-    let java_home = std::env::var("JAVA_HOME")
-        .expect("Set JAVA_HOME to a JDK 25+ installation");
+    let java_home = std::env::var("JAVA_HOME").expect("Set JAVA_HOME to a JDK 25+ installation");
     let modules_path = format!("{java_home}/lib/modules");
     assert!(
         std::path::Path::new(&modules_path).exists(),

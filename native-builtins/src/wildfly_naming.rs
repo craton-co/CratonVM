@@ -53,10 +53,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::RwLock;
 
 use crate::jboss_msc::{global_container, Mode, ServiceName};
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -102,8 +102,17 @@ pub fn validate_jndi_name(name: &str) -> Result<(), String> {
     // inside what looks like a relative name).
     let lower = trimmed.to_ascii_lowercase();
     const REJECTED_SCHEMES: &[&str] = &[
-        "ldap:", "ldaps:", "rmi:", "dns:", "iiop:", "corbaname:", "http:", "https:", "file:",
-        "ftp:", "jar:",
+        "ldap:",
+        "ldaps:",
+        "rmi:",
+        "dns:",
+        "iiop:",
+        "corbaname:",
+        "http:",
+        "https:",
+        "file:",
+        "ftp:",
+        "jar:",
     ];
     for bad in REJECTED_SCHEMES {
         if lower.starts_with(bad) {
@@ -128,8 +137,7 @@ pub fn validate_jndi_name(name: &str) -> Result<(), String> {
         // After `java:` we accept either nothing, or one of the four
         // canonical sub-roots.
         let rest = &trimmed[colon_idx + 1..];
-        const ACCEPTED_ROOTS: &[&str] =
-            &["", "jboss/", "comp/", "global/", "app/", "module/"];
+        const ACCEPTED_ROOTS: &[&str] = &["", "jboss/", "comp/", "global/", "app/", "module/"];
         let root_ok = ACCEPTED_ROOTS.iter().any(|r| rest.starts_with(r));
         if !root_ok {
             return Err(format!(
@@ -182,9 +190,7 @@ pub fn context_names_bind_info_for(absolute: &str) -> Result<BindInfo, String> {
     let trimmed = absolute.trim();
     // Strip leading `java:` (if present) before turning the path into
     // MSC segments.
-    let after = trimmed
-        .strip_prefix("java:")
-        .unwrap_or(trimmed);
+    let after = trimmed.strip_prefix("java:").unwrap_or(trimmed);
     // MSC ServiceName segments — "java" root + each `/`-delimited piece.
     let mut segs: Vec<String> = vec!["java".to_string()];
     for seg in after.split('/') {
@@ -250,11 +256,7 @@ fn bindings_store() -> &'static RwLock<HashMap<JndiName, BindingEntry>> {
 
 /// High-level `bind` — accepts a raw absolute name, validates it,
 /// registers a binder service with MSC, and stores the binding.
-pub fn bind_value(
-    name: &str,
-    class_name: &str,
-    value: ObjectRef,
-) -> Result<(), String> {
+pub fn bind_value(name: &str, class_name: &str, value: ObjectRef) -> Result<(), String> {
     let info = context_names_bind_info_for(name)?;
     let mut entry = BindingEntry::new(info.binder_service_name.clone(), class_name, value);
 
@@ -291,11 +293,7 @@ pub fn bind_value(
 
 /// `rebind` — overwrite any existing entry.  Also re-asserts the MSC
 /// binder service.
-pub fn rebind_value(
-    name: &str,
-    class_name: &str,
-    value: ObjectRef,
-) -> Result<(), String> {
+pub fn rebind_value(name: &str, class_name: &str, value: ObjectRef) -> Result<(), String> {
     let info = context_names_bind_info_for(name)?;
     {
         let mut store = bindings_store().write();
@@ -509,10 +507,7 @@ fn flat_store_error(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed 
     }
 }
 
-fn native_initial_context_init(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_initial_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = environment table (null until `addToEnvironment` is called),
     // field 1 = default-init-ctx handle (we stash 0 since the Rust side owns
@@ -636,10 +631,7 @@ fn initial_context_env(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
     }
 }
 
-fn native_context_lookup(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_context_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
@@ -668,10 +660,7 @@ fn native_context_lookup(
     }
 }
 
-fn native_context_bind(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
@@ -679,7 +668,12 @@ fn native_context_bind(
     };
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Err(throw_naming_exception(ctx, "bind: null value not supported")),
+        _ => {
+            return Err(throw_naming_exception(
+                ctx,
+                "bind: null value not supported",
+            ))
+        }
     };
 
     // `java:` URL-scheme names go through the JDK URL-context factory so
@@ -707,10 +701,7 @@ fn native_context_bind(
     Ok(None)
 }
 
-fn native_context_rebind(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
@@ -718,7 +709,12 @@ fn native_context_rebind(
     };
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Err(throw_naming_exception(ctx, "rebind: null value not supported")),
+        _ => {
+            return Err(throw_naming_exception(
+                ctx,
+                "rebind: null value not supported",
+            ))
+        }
     };
 
     if is_java_url_scheme(&name) {
@@ -743,10 +739,7 @@ fn native_context_rebind(
     Ok(None)
 }
 
-fn native_context_unbind(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_context_unbind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
@@ -832,10 +825,7 @@ fn native_context_destroy_subcontext(
     Ok(None)
 }
 
-fn native_context_close(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_context_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Nothing to release — the store outlives individual Contexts.
     Ok(None)
 }
@@ -855,10 +845,7 @@ fn alloc_java_binding(
     obj
 }
 
-fn native_context_list_bindings(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match read_string_arg(ctx, args, 1) {
         Some(n) => n,
@@ -1006,12 +993,7 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;)V",
         native_context_rebind,
     );
-    r.register(
-        ic,
-        "unbind",
-        "(Ljava/lang/String;)V",
-        native_context_unbind,
-    );
+    r.register(ic, "unbind", "(Ljava/lang/String;)V", native_context_unbind);
     r.register(
         ic,
         "createSubcontext",
@@ -1034,7 +1016,12 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
 
     // --- org.jboss.as.naming.ServiceBasedNamingStore ---
     let sbns = "org/jboss/as/naming/ServiceBasedNamingStore";
-    r.register(sbns, "<init>", "()V", native_service_based_naming_store_init);
+    r.register(
+        sbns,
+        "<init>",
+        "()V",
+        native_service_based_naming_store_init,
+    );
     r.register(
         sbns,
         "bind",
@@ -1203,7 +1190,10 @@ mod tests {
         // The bind_info_for parse must produce a 4-or-more-segment
         // ServiceName plus the stripped binding path.
         let info = context_names_bind_info_for(&full).unwrap();
-        assert!(info.binder_service_name.canonical().starts_with("java.jboss.t19_2_b_hier"));
+        assert!(info
+            .binder_service_name
+            .canonical()
+            .starts_with("java.jboss.t19_2_b_hier"));
         assert!(info
             .binder_service_name
             .canonical()
@@ -1226,10 +1216,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_context_names_bind_info_parses_absolute_name() {
-        let info = context_names_bind_info_for(
-            "java:jboss/datasources/KeycloakDS",
-        )
-        .unwrap();
+        let info = context_names_bind_info_for("java:jboss/datasources/KeycloakDS").unwrap();
         assert_eq!(
             info.binder_service_name.canonical(),
             "java.jboss.datasources.KeycloakDS"

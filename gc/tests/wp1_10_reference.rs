@@ -30,7 +30,10 @@ fn phantom_reference_enqueued_when_referent_dead() {
     let result = proc.process_references(&always_dead, 100, 0);
     assert_eq!(result.stats.phantom_refs_enqueued, 1);
     // Enqueue pair: (reference_obj, queue_addr)
-    assert!(result.to_enqueue.iter().any(|&(r, q)| r == 0xA000 && q == 0xC000));
+    assert!(result
+        .to_enqueue
+        .iter()
+        .any(|&(r, q)| r == 0xA000 && q == 0xC000));
 }
 
 // -- WP1.10.B: PhantomReference referent NOT cleared (Java 9+) -------------

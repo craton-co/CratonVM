@@ -27,6 +27,10 @@ pub mod stamped;
 pub mod forkjoin;
 pub mod scheduled;
 
+pub use event_loop::{
+    current_event_loop, event_loop_manager, EventLoop, EventLoopAffinity, EventLoopError,
+    EventLoopId, EventLoopManager, EventLoopTask,
+};
 pub use gc_barrier::GcBarrier;
 pub use jvm_thread::{JvmThread, ParkState, ThreadId, ThreadKind};
 pub use monitor::MonitorTable;
@@ -34,10 +38,6 @@ pub use thread_registry::ThreadRegistry;
 pub use virtual_scheduler::VirtualThreadScheduler;
 pub use virtual_threads::{
     Continuation, ContinuationScope, ContinuationState, ForkJoinScheduler, FrozenFrame, PinReason,
-    SchedulerStatsSnapshot, ThreadBuilder, ThreadBuilderKind, VirtualThread,
-    VirtualThreadManager, VirtualThreadState,
-};
-pub use event_loop::{
-    EventLoop, EventLoopAffinity, EventLoopError, EventLoopId, EventLoopManager,
-    EventLoopTask, event_loop_manager, current_event_loop,
+    SchedulerStatsSnapshot, ThreadBuilder, ThreadBuilderKind, VirtualThread, VirtualThreadManager,
+    VirtualThreadState,
 };

@@ -147,7 +147,9 @@ impl NativeContext for MockNativeContext {
     // Class loading + invocation — no real loader, all stubs.
     // --------------------------------------------------------------
 
-    fn load_class(&mut self, _n: &str) -> MethodCallResult { Ok(None) }
+    fn load_class(&mut self, _n: &str) -> MethodCallResult {
+        Ok(None)
+    }
     fn new_object(&mut self, _c: &str) -> MethodCallResult {
         Ok(Some(Value::Object(Some(self.fresh_object_ref()))))
     }
@@ -165,16 +167,25 @@ impl NativeContext for MockNativeContext {
         let key = obj.as_ptr() as usize;
         // SAFETY: single-threaded test code.
         let map = unsafe { &mut *self.identity_hashes.get() };
-        *map.entry(key).or_insert_with(|| self.next_hash.fetch_add(1, Ordering::Relaxed))
+        *map.entry(key)
+            .or_insert_with(|| self.next_hash.fetch_add(1, Ordering::Relaxed))
     }
 
     fn record_printed_value(&mut self, _v: Value) {}
 
-    fn class_name_of_id(&self, _c: ClassId) -> Option<String> { None }
-    fn class_id_of_object(&self, _o: ObjectRef) -> ClassId { ClassId::new(0) }
+    fn class_name_of_id(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn class_id_of_object(&self, _o: ObjectRef) -> ClassId {
+        ClassId::new(0)
+    }
 
-    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
+    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+        None
+    }
 
     // --------------------------------------------------------------
     // Field store. Keyed by (object_pointer, slot/name) in the same
@@ -184,7 +195,10 @@ impl NativeContext for MockNativeContext {
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let key = (obj.as_ptr() as usize, format!("#{index}"));
-        self.fields_ref().get(&key).copied().unwrap_or(Value::Int(0))
+        self.fields_ref()
+            .get(&key)
+            .copied()
+            .unwrap_or(Value::Int(0))
     }
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let key = (obj.as_ptr() as usize, format!("#{index}"));
@@ -192,14 +206,21 @@ impl NativeContext for MockNativeContext {
     }
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
         let key = (obj.as_ptr() as usize, field_name.to_string());
-        self.fields_ref().get(&key).copied().unwrap_or(Value::Object(None))
+        self.fields_ref()
+            .get(&key)
+            .copied()
+            .unwrap_or(Value::Object(None))
     }
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let key = (obj.as_ptr() as usize, field_name.to_string());
         self.fields_mut().insert(key, value);
     }
-    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> { None }
-    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool { false }
+    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
+        None
+    }
+    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+        false
+    }
 
     // --------------------------------------------------------------
     // Arrays — stubs. Default-impl tests don't drive them, but the
@@ -212,11 +233,17 @@ impl NativeContext for MockNativeContext {
     fn new_ref_array(&mut self, _c: ClassId, _length: usize) -> ObjectRef {
         self.fresh_object_ref()
     }
-    fn array_length(&self, _o: ObjectRef) -> usize { 0 }
-    fn get_array_element(&self, _o: ObjectRef, _i: usize) -> Value { Value::Int(0) }
+    fn array_length(&self, _o: ObjectRef) -> usize {
+        0
+    }
+    fn get_array_element(&self, _o: ObjectRef, _i: usize) -> Value {
+        Value::Int(0)
+    }
     fn set_array_element(&self, _o: ObjectRef, _i: usize, _v: Value) {}
 
-    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind { ObjectKind::Object }
+    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind {
+        ObjectKind::Object
+    }
     fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
         ArrayElementType::Reference
     }
@@ -225,14 +252,26 @@ impl NativeContext for MockNativeContext {
     // Strings — minimal, opaque heap objects.
     // --------------------------------------------------------------
 
-    fn create_string(&mut self, _t: &str) -> ObjectRef { self.fresh_object_ref() }
-    fn read_string(&self, _o: ObjectRef) -> Option<String> { None }
+    fn create_string(&mut self, _t: &str) -> ObjectRef {
+        self.fresh_object_ref()
+    }
+    fn read_string(&self, _o: ObjectRef) -> Option<String> {
+        None
+    }
 
-    fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef { self.fresh_object_ref() }
+    fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
+        self.fresh_object_ref()
+    }
     fn record_printed_line(&mut self, _t: String) {}
-    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
-    fn get_system_property(&self, _k: &str) -> Option<String> { None }
-    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> { None }
+    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+        None
+    }
+    fn get_system_property(&self, _k: &str) -> Option<String> {
+        None
+    }
+    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+        None
+    }
 
     fn alloc_object(&mut self, _c: ClassId, _num_fields: usize) -> ObjectRef {
         // Field count is irrelevant — the field store grows on demand. We
@@ -244,50 +283,112 @@ impl NativeContext for MockNativeContext {
         Ok(ClassId::new(0))
     }
 
-    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool { c == p }
-    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> { None }
-    fn is_interface_class(&self, _c: ClassId) -> bool { false }
-    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> { None }
-    fn loader_id_of_class(&self, _c: ClassId) -> i32 { 2 } // Application loader by default
-    fn is_record_class(&self, _c: ClassId) -> bool { false }
-    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> { Vec::new() }
-    fn is_sealed_class(&self, _c: ClassId) -> bool { false }
-    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> { Vec::new() }
-    fn object_num_fields(&self, _obj: ObjectRef) -> usize { 0 }
+    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool {
+        c == p
+    }
+    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
+        None
+    }
+    fn is_interface_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
+        None
+    }
+    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+        2
+    } // Application loader by default
+    fn is_record_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn is_sealed_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+        Vec::new()
+    }
+    fn object_num_fields(&self, _obj: ObjectRef) -> usize {
+        0
+    }
 
     // --------------------------------------------------------------
     // Threading — single-threaded stubs.
     // --------------------------------------------------------------
 
-    fn thread_id(&self) -> u64 { 1 }
+    fn thread_id(&self) -> u64 {
+        1
+    }
     fn monitor_enter(&mut self, _o: ObjectRef) {}
     fn monitor_exit(&mut self, _o: ObjectRef) {}
-    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult { Ok(None) }
-    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_is_alive(&self, _o: ObjectRef) -> bool { false }
-    fn current_thread_object(&mut self) -> ObjectRef { self.fresh_object_ref() }
+    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_is_alive(&self, _o: ObjectRef) -> bool {
+        false
+    }
+    fn current_thread_object(&mut self) -> ObjectRef {
+        self.fresh_object_ref()
+    }
     fn thread_interrupt(&mut self, _o: ObjectRef) {}
-    fn is_interrupted(&self, _c: bool) -> bool { false }
-    fn active_thread_count(&self) -> i32 { 1 }
-    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> { Vec::new() }
+    fn is_interrupted(&self, _c: bool) -> bool {
+        false
+    }
+    fn active_thread_count(&self) -> i32 {
+        1
+    }
+    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
+        Vec::new()
+    }
 
-    fn heap_allocated_bytes(&self) -> usize { 0 }
-    fn loaded_class_count(&self) -> usize { 0 }
-    fn gc_collection_count(&self) -> u64 { 0 }
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+    fn loaded_class_count(&self) -> usize {
+        0
+    }
+    fn gc_collection_count(&self) -> u64 {
+        0
+    }
     fn force_gc(&mut self) {}
 
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> { Vec::new() }
-    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> { Vec::new() }
-    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> { Vec::new() }
-    fn class_access_flags(&self, _c: ClassId) -> u16 { 0 }
-    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
+    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+        Vec::new()
+    }
+    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+        Vec::new()
+    }
+    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
+        Vec::new()
+    }
+    fn class_access_flags(&self, _c: ClassId) -> u16 {
+        0
+    }
+    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
+        Value::Int(0)
+    }
     fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-    fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef { self.fresh_object_ref() }
+    fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
+        self.fresh_object_ref()
+    }
 
-    fn fd_table(&self) -> &crate::fd_table::FileDescriptorTable { shared_fd_table() }
+    fn fd_table(&self) -> &crate::fd_table::FileDescriptorTable {
+        shared_fd_table()
+    }
 
     // --------------------------------------------------------------
     // Volatile + CAS — back onto the plain field store. Sufficient for
@@ -322,22 +423,40 @@ impl NativeContext for MockNativeContext {
         Some(self.fresh_object_ref())
     }
 
-    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> { Vec::new() }
-    fn method_annotations(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Vec<AnnotationData> { Vec::new() }
-    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> { Vec::new() }
+    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
     fn method_parameter_annotations(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Vec<Vec<AnnotationData>> { Vec::new() }
-    fn class_signature(&self, _c: ClassId) -> Option<String> { None }
-    fn method_signature(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Option<String> { None }
-    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+    fn class_signature(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+        None
+    }
+    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+        None
+    }
     fn method_annotation_default(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Option<AnnotationElementValue> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Option<AnnotationElementValue> {
+        None
+    }
 
     // --------------------------------------------------------------
     // `invoke_virtual` — programmable single-shot script. When no
@@ -364,44 +483,76 @@ impl NativeContext for MockNativeContext {
     // Scoped values + Panama FFI — inert.
     // --------------------------------------------------------------
 
-    fn get_scoped_value(&self, _k: u64) -> Option<Value> { None }
+    fn get_scoped_value(&self, _k: u64) -> Option<Value> {
+        None
+    }
     fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
     fn pop_scoped_value(&mut self) {}
-    fn scoped_value_depth(&self) -> usize { 0 }
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
 
     fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
         None
     }
     fn free_native_memory(&mut self, _a: i64) {}
-    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
-    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
-    fn register_upcall(&mut self, _e: UpcallEntry) -> usize { 0 }
-    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
+    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> {
+        Ok(0)
+    }
+    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> {
+        None
+    }
+    fn register_upcall(&mut self, _e: UpcallEntry) -> usize {
+        0
+    }
+    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
+        None
+    }
 
-    fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
-    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }
-    fn list_application_class_names(&self) -> Vec<String> { Vec::new() }
+    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn list_application_class_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> { None }
-    fn define_class_with_loader(
-        &mut self, _n: &str, _b: &[u8], _l: u32,
-    ) -> Option<ClassId> { None }
-    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> { None }
-    fn allocate_loader_id(&mut self) -> u32 { 0 }
-    fn discover_reference(
-        &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
-    ) {}
+    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+        None
+    }
+    fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn allocate_loader_id(&mut self) -> u32 {
+        0
+    }
+    fn discover_reference(&mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>) {}
 
     // JPMS — classpath-only / permissive.
-    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool { true }
-    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
-    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool { true }
-    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
+    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
+    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
     fn check_deep_reflection_access(
         &self,
         _accessor: ClassId,
         _target: ClassId,
-    ) -> Result<(), String> { Ok(()) }
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // `Send` is auto-derived (every field is `Send`). We deliberately do NOT

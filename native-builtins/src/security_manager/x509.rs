@@ -255,7 +255,8 @@ fn extract_first_certificate(pkcs7: &[u8]) -> Result<&[u8], X509Error> {
         return Err(X509Error::NotPkcs7);
     }
 
-    let content_tag = read_tlv_tagged(after_type, TAG_CONTEXT_0).map_err(|_| X509Error::NotPkcs7)?;
+    let content_tag =
+        read_tlv_tagged(after_type, TAG_CONTEXT_0).map_err(|_| X509Error::NotPkcs7)?;
 
     // SignedData ::= SEQUENCE {
     //     version Version,
@@ -296,8 +297,8 @@ fn extract_first_certificate(pkcs7: &[u8]) -> Result<&[u8], X509Error> {
         let tlv = read_tlv(cursor).map_err(|_| X509Error::MalformedAsn1)?;
         if tlv.tag == TAG_CONTEXT_0 {
             // certificates SET: each entry is a Certificate SEQUENCE.
-            let first = read_tlv_tagged(tlv.content, TAG_SEQUENCE)
-                .map_err(|_| X509Error::NoSignerCert)?;
+            let first =
+                read_tlv_tagged(tlv.content, TAG_SEQUENCE).map_err(|_| X509Error::NoSignerCert)?;
             // Return the SEQUENCE including its own header — callers
             // parse it again as a standalone Certificate.
             let consumed = tlv.content.len() - first.rest.len();
@@ -328,10 +329,8 @@ fn extract_subject(cert_der: &[u8]) -> Result<&[u8], X509Error> {
     //     signatureAlgorithm AlgorithmIdentifier,
     //     signatureValue BIT STRING
     // }
-    let cert =
-        read_tlv_tagged(cert_der, TAG_SEQUENCE).map_err(|_| X509Error::MalformedCert)?;
-    let tbs =
-        read_tlv_tagged(cert.content, TAG_SEQUENCE).map_err(|_| X509Error::MalformedCert)?;
+    let cert = read_tlv_tagged(cert_der, TAG_SEQUENCE).map_err(|_| X509Error::MalformedCert)?;
+    let tbs = read_tlv_tagged(cert.content, TAG_SEQUENCE).map_err(|_| X509Error::MalformedCert)?;
 
     // TBSCertificate ::= SEQUENCE {
     //     version         [0] EXPLICIT Version DEFAULT v1,
@@ -380,8 +379,7 @@ fn extract_subject(cert_der: &[u8]) -> Result<&[u8], X509Error> {
     cursor = validity.rest;
 
     // subject Name SEQUENCE
-    let subject =
-        read_tlv_tagged(cursor, TAG_SEQUENCE).map_err(|_| X509Error::NoSubject)?;
+    let subject = read_tlv_tagged(cursor, TAG_SEQUENCE).map_err(|_| X509Error::NoSubject)?;
     if subject.content.is_empty() {
         return Err(X509Error::NoSubject);
     }
@@ -501,11 +499,9 @@ fn oid_to_string(bytes: &[u8]) -> String {
 /// renders something human-readable.
 fn decode_directory_string(tag: u8, content: &[u8]) -> String {
     match tag {
-        TAG_PRINTABLE_STRING | TAG_IA5_STRING | TAG_UTF8_STRING => {
-            std::str::from_utf8(content)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| format!("#{}", hex_encode(content)))
-        }
+        TAG_PRINTABLE_STRING | TAG_IA5_STRING | TAG_UTF8_STRING => std::str::from_utf8(content)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| format!("#{}", hex_encode(content))),
         TAG_TELETEX_STRING => {
             // T61/TeletexString is mostly ASCII in practice; fall back
             // to Latin-1 for anything outside ASCII so mojibake is at
@@ -738,7 +734,9 @@ pub(super) mod builder {
         let digest_algorithms = set(&[]);
 
         // EncapsulatedContentInfo SEQUENCE { contentType OID }
-        let encap = sequence(&oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01]));
+        let encap = sequence(&oid(&[
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
+        ]));
 
         // certificates [0] IMPLICIT { Certificate }
         let certificates = tlv(TAG_CONTEXT_0, cert_der);

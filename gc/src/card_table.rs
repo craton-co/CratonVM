@@ -319,12 +319,7 @@ impl CardTable {
 
     /// Check if a specific card is dirty.
     pub fn is_dirty(&self, card_index: usize) -> bool {
-        self.cells
-            .lock()
-            .cards
-            .get(card_index)
-            .copied()
-            == Some(CARD_DIRTY)
+        self.cells.lock().cards.get(card_index).copied() == Some(CARD_DIRTY)
     }
 
     /// Clear all cards (set to CARD_CLEAN). Also drops any pending
@@ -393,7 +388,11 @@ impl CardTable {
     /// Returns `None` if the computation would overflow.
     pub fn card_start_addr(&self, card_index: usize) -> usize {
         let offset = card_index.checked_mul(CARD_SIZE).unwrap_or_else(|| {
-            tracing::error!("card_table: card_start_addr overflow in card_index({}) * CARD_SIZE({})", card_index, CARD_SIZE);
+            tracing::error!(
+                "card_table: card_start_addr overflow in card_index({}) * CARD_SIZE({})",
+                card_index,
+                CARD_SIZE
+            );
             // Return a clamped value instead of aborting the entire VM.
             // The caller should never pass an index this large; this is a
             // defensive fallback so GC can skip the card instead of crashing.
@@ -409,13 +408,8 @@ impl CardTable {
     pub fn card_end_addr(&self, card_index: usize) -> usize {
         let next_index = card_index.saturating_add(1);
         let offset = next_index.checked_mul(CARD_SIZE).unwrap_or(usize::MAX);
-        let end = self
-            .base_addr
-            .checked_add(offset)
-            .unwrap_or(usize::MAX);
-        let region_end = self
-            .base_addr
-            .saturating_add(self.region_size);
+        let end = self.base_addr.checked_add(offset).unwrap_or(usize::MAX);
+        let region_end = self.base_addr.saturating_add(self.region_size);
         end.min(region_end)
     }
 
@@ -785,10 +779,10 @@ mod tests {
     fn dirty_multiple_regions() {
         let ct = CardTable::new(0x0, 8192);
         // Dirty cards 0, 3, 7, 15
-        ct.mark_dirty(0);       // card 0
-        ct.mark_dirty(1536);    // card 3
-        ct.mark_dirty(3584);    // card 7
-        ct.mark_dirty(7680);    // card 15
+        ct.mark_dirty(0); // card 0
+        ct.mark_dirty(1536); // card 3
+        ct.mark_dirty(3584); // card 7
+        ct.mark_dirty(7680); // card 15
 
         let dirty: Vec<usize> = ct.dirty_card_indices();
         assert_eq!(dirty, vec![0, 3, 7, 15]);
@@ -914,10 +908,7 @@ mod tests {
     fn thread_local_dirty_auto_flushes_at_threshold() {
         // Use a large region so the threshold-worth of distinct card
         // offsets is well-defined.
-        let ct = CardTable::new(
-            0x0,
-            CARD_SIZE * THREAD_BUFFER_FLUSH_THRESHOLD * 2,
-        );
+        let ct = CardTable::new(0x0, CARD_SIZE * THREAD_BUFFER_FLUSH_THRESHOLD * 2);
         // Push exactly THREAD_BUFFER_FLUSH_THRESHOLD offsets — the last
         // one should auto-flush the buffer.
         for i in 0..THREAD_BUFFER_FLUSH_THRESHOLD {
@@ -1026,16 +1017,20 @@ mod tests {
 
         // Interleave below the auto-flush threshold so everything stays in
         // the shared per-thread buffer until we explicitly flush.
-        a.thread_local_dirty(0);            // A: card 0
-        b.thread_local_dirty(CARD_SIZE);    // B: card 1
-        a.thread_local_dirty(2 * CARD_SIZE);// A: card 2
-        b.thread_local_dirty(3 * CARD_SIZE);// B: card 3
+        a.thread_local_dirty(0); // A: card 0
+        b.thread_local_dirty(CARD_SIZE); // B: card 1
+        a.thread_local_dirty(2 * CARD_SIZE); // A: card 2
+        b.thread_local_dirty(3 * CARD_SIZE); // B: card 3
 
         // Drain A via flush_all: only A's offsets should land in A's pending.
         a.flush_all();
         assert_eq!(a.pending_count(), 2, "A should own exactly its 2 offsets");
         // B's offsets must still be buffered (untouched by A's flush).
-        assert_eq!(b.pending_count(), 0, "B's buffered offsets must survive A's flush");
+        assert_eq!(
+            b.pending_count(),
+            0,
+            "B's buffered offsets must survive A's flush"
+        );
 
         let a_new = a.drain_pending();
         assert_eq!(a_new, 2);
@@ -1070,7 +1065,11 @@ mod tests {
         assert_eq!(b.pending_count(), 0, "A's flush must not take B's entry");
 
         b.flush_dirty_buffer();
-        assert_eq!(b.pending_count(), 1, "B's entry still available after A flushed");
+        assert_eq!(
+            b.pending_count(),
+            1,
+            "B's entry still available after A flushed"
+        );
 
         assert_eq!(a.drain_pending(), 1);
         assert_eq!(b.drain_pending(), 1);
@@ -1119,7 +1118,11 @@ mod tests {
         // A's cross-thread drain must not have disturbed B's buffered edge.
         assert_eq!(b.pending_count(), 0);
         b.flush_all();
-        assert_eq!(b.pending_count(), 1, "B's edge survived A's cross-thread drain");
+        assert_eq!(
+            b.pending_count(),
+            1,
+            "B's edge survived A's cross-thread drain"
+        );
         assert_eq!(b.drain_pending(), 1);
         assert!(b.is_dirty(1));
 

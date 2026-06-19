@@ -45,8 +45,13 @@ pub enum Op {
     /// to the holder allocation.  Canonical EA input layout:
     /// `[holder, value, (index)?]` (holder at 0, value at 1).
     Store(usize),
-    New { class_id: u32, num_fields: usize },
-    NewArray { element_type: u8 },
+    New {
+        class_id: u32,
+        num_fields: usize,
+    },
+    NewArray {
+        element_type: u8,
+    },
     Call,
     MonitorEnter,
     MonitorExit,
@@ -172,13 +177,15 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
     if holder_allocs.is_empty() {
         return false;
     }
-    holder_allocs.iter().all(|&a| match graph.nodes.get(a).map(|n| &n.op) {
-        Some(Op::New { num_fields, .. }) => field < *num_fields,
-        // Arrays have no statically-known field count here; treat any index as
-        // out-of-range so array stores take the conservative escape path.
-        Some(Op::NewArray { .. }) => false,
-        _ => false,
-    })
+    holder_allocs
+        .iter()
+        .all(|&a| match graph.nodes.get(a).map(|n| &n.op) {
+            Some(Op::New { num_fields, .. }) => field < *num_fields,
+            // Arrays have no statically-known field count here; treat any index as
+            // out-of-range so array stores take the conservative escape path.
+            Some(Op::NewArray { .. }) => false,
+            _ => false,
+        })
 }
 
 // ── Escape state ────────────────────────────────────────────────────────
@@ -928,9 +935,7 @@ pub fn find_materialization_points(
                 // Only stores whose HOLDER is this allocation describe its
                 // field state; a store that merely uses this alloc as a value
                 // is irrelevant here.
-                if store_holder(other_node) == Some(alloc)
-                    && *field_idx < num_fields
-                {
+                if store_holder(other_node) == Some(alloc) && *field_idx < num_fields {
                     if let Some(stored_val) = store_value(other_node) {
                         fields_at_escape[*field_idx] = Some(stored_val);
                     }
@@ -2053,7 +2058,10 @@ mod tests {
 
         let result = analyze_escapes(&g);
         // The allocation does not escape ...
-        assert_eq!(result.escape_states.get(&alloc), Some(&EscapeState::NoEscape));
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape)
+        );
         // ... and is now scalar-replaceable despite the intervening phi.
         let sr = result
             .scalar_replaceable
@@ -2132,7 +2140,10 @@ mod tests {
 
         let result = analyze_escapes(&g);
         assert!(
-            result.scalar_replaceable.iter().all(|s| s.alloc_node != alloc),
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
             "a phi merging the allocation with a Param must block scalar replacement"
         );
     }

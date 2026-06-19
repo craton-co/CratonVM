@@ -149,11 +149,11 @@ mod platform {
             return None;
         }
 
-        let memory_limit = read_cgroup_file("/sys/fs/cgroup/memory.max")
-            .and_then(|s| parse_u64(&s));
+        let memory_limit =
+            read_cgroup_file("/sys/fs/cgroup/memory.max").and_then(|s| parse_u64(&s));
 
-        let memory_usage = read_cgroup_file("/sys/fs/cgroup/memory.current")
-            .and_then(|s| parse_u64(&s));
+        let memory_usage =
+            read_cgroup_file("/sys/fs/cgroup/memory.current").and_then(|s| parse_u64(&s));
 
         // cpu.max format: "$MAX $PERIOD" or "max $PERIOD"
         let (cpu_quota, cpu_period) =
@@ -180,7 +180,7 @@ mod platform {
             memory_usage,
             cpu_quota,
             cpu_period,
-            cpu_shares: None, // v2 uses cpu.weight, not shares
+            cpu_shares: None,          // v2 uses cpu.weight, not shares
             effective_cpu_count: None, // caller computes this
         })
     }
@@ -195,28 +195,23 @@ mod platform {
             return None;
         }
 
-        let memory_limit =
-            read_cgroup_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-                .and_then(|s| parse_u64(&s))
-                // v1 uses a very large sentinel (PAGE_COUNTER_MAX << PAGE_SHIFT)
-                // for "no limit". Anything above 2^62 bytes is effectively unlimited.
-                .filter(|&v| v < (1u64 << 62));
+        let memory_limit = read_cgroup_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            .and_then(|s| parse_u64(&s))
+            // v1 uses a very large sentinel (PAGE_COUNTER_MAX << PAGE_SHIFT)
+            // for "no limit". Anything above 2^62 bytes is effectively unlimited.
+            .filter(|&v| v < (1u64 << 62));
 
-        let memory_usage =
-            read_cgroup_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-                .and_then(|s| parse_u64(&s));
+        let memory_usage = read_cgroup_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            .and_then(|s| parse_u64(&s));
 
         let cpu_quota =
-            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-                .and_then(|s| parse_i64(&s));
+            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").and_then(|s| parse_i64(&s));
 
         let cpu_period =
-            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-                .and_then(|s| parse_u64(&s));
+            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us").and_then(|s| parse_u64(&s));
 
         let cpu_shares =
-            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.shares")
-                .and_then(|s| parse_u64(&s));
+            read_cgroup_file("/sys/fs/cgroup/cpu/cpu.shares").and_then(|s| parse_u64(&s));
 
         Some(ContainerInfo {
             is_containerized: false,
@@ -376,7 +371,10 @@ mod tests {
     #[test]
     fn memory_limit_no_cgroup() {
         let info = ContainerInfo::non_containerized();
-        assert_eq!(effective_memory_limit(&info, 512 * 1024 * 1024), 512 * 1024 * 1024);
+        assert_eq!(
+            effective_memory_limit(&info, 512 * 1024 * 1024),
+            512 * 1024 * 1024
+        );
     }
 
     #[test]

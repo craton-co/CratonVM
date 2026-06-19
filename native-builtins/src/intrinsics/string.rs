@@ -31,10 +31,7 @@ use cratonvm_types::Value;
 /// `java/lang/String.length ()I` — code-unit count of the receiver string.
 ///
 /// Delegates verbatim to `crate::lang_string::native_string_length`.
-pub fn intrinsic_string_length(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_string_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_string_length(ctx, args)
 }
 
@@ -43,20 +40,14 @@ pub fn intrinsic_string_length(
 /// Delegates verbatim to `crate::lang_string::native_string_char_at`, which
 /// throws `NullPointerException` for a null receiver and
 /// `StringIndexOutOfBoundsException` for an out-of-range index.
-pub fn intrinsic_string_char_at(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_string_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_string_char_at(ctx, args)
 }
 
 /// `java/lang/String.isEmpty ()Z` — `true` iff the receiver has length 0.
 ///
 /// Delegates verbatim to `crate::lang_string::native_string_is_empty`.
-pub fn intrinsic_string_is_empty(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_string_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_string::native_string_is_empty(ctx, args)
 }
 
@@ -111,10 +102,7 @@ mod tests {
     fn char_at_valid() {
         let mut ctx = mock_ctx();
         let s = ctx.create_string("abc");
-        let r = intrinsic_string_char_at(
-            &mut ctx,
-            &[Value::Object(Some(s)), Value::Int(1)],
-        );
+        let r = intrinsic_string_char_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(1)]);
         assert_eq!(r.unwrap(), Some(Value::Int('b' as i32)));
     }
 
@@ -122,10 +110,7 @@ mod tests {
     fn char_at_out_of_bounds_throws() {
         let mut ctx = mock_ctx();
         let s = ctx.create_string("abc");
-        let r = intrinsic_string_char_at(
-            &mut ctx,
-            &[Value::Object(Some(s)), Value::Int(5)],
-        );
+        let r = intrinsic_string_char_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(5)]);
         assert!(r.is_err());
     }
 
@@ -133,20 +118,14 @@ mod tests {
     fn char_at_negative_index_throws() {
         let mut ctx = mock_ctx();
         let s = ctx.create_string("abc");
-        let r = intrinsic_string_char_at(
-            &mut ctx,
-            &[Value::Object(Some(s)), Value::Int(-1)],
-        );
+        let r = intrinsic_string_char_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(-1)]);
         assert!(r.is_err());
     }
 
     #[test]
     fn char_at_null_receiver_throws() {
         let mut ctx = mock_ctx();
-        let r = intrinsic_string_char_at(
-            &mut ctx,
-            &[Value::Object(None), Value::Int(0)],
-        );
+        let r = intrinsic_string_char_at(&mut ctx, &[Value::Object(None), Value::Int(0)]);
         assert!(r.is_err());
     }
 

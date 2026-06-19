@@ -29,7 +29,7 @@ const PREALLOC_CAP: usize = 1024;
 /// hard upper bound is 65 535.  We validate against this limit *before*
 /// allocating to prevent a crafted class file with huge counts from causing
 /// an out-of-memory denial-of-service.
-const MAX_CP_SIZE: u16 = u16::MAX;       // 65 535 — JVM spec §4.1
+const MAX_CP_SIZE: u16 = u16::MAX; // 65 535 — JVM spec §4.1
 const MAX_FIELD_COUNT: u16 = u16::MAX;
 const MAX_METHOD_COUNT: u16 = u16::MAX;
 const MAX_INTERFACE_COUNT: u16 = u16::MAX;
@@ -42,9 +42,7 @@ const MAX_ATTRIBUTE_COUNT: u16 = u16::MAX;
 fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReaderError> {
     if count > limit {
         return Err(ClassReaderError::InvalidClassData {
-            message: format!(
-                "{label} count {count} exceeds maximum allowed value {limit}"
-            ),
+            message: format!("{label} count {count} exceeds maximum allowed value {limit}"),
         });
     }
     Ok(())
@@ -116,12 +114,14 @@ pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> 
     let super_class = if super_class_index == 0 {
         None // java.lang.Object has no superclass
     } else {
-        Some(constant_pool.get_class_name_arc(super_class_index).ok_or_else(
-            || ClassReaderError::InvalidConstantPool {
-                index: super_class_index,
-                message: "super_class must reference a valid Class entry".to_string(),
-            },
-        )?)
+        Some(
+            constant_pool
+                .get_class_name_arc(super_class_index)
+                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+                    index: super_class_index,
+                    message: "super_class must reference a valid Class entry".to_string(),
+                })?,
+        )
     };
 
     // Interfaces
@@ -131,12 +131,12 @@ pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> 
         Vec::with_capacity((interfaces_count as usize).min(PREALLOC_CAP));
     for _ in 0..interfaces_count {
         let iface_index = buf.read_u16()?;
-        let iface_name = constant_pool.get_class_name_arc(iface_index).ok_or_else(|| {
-            ClassReaderError::InvalidConstantPool {
+        let iface_name = constant_pool
+            .get_class_name_arc(iface_index)
+            .ok_or_else(|| ClassReaderError::InvalidConstantPool {
                 index: iface_index,
                 message: "interface must reference a valid Class entry".to_string(),
-            }
-        })?;
+            })?;
         interfaces.push(iface_name);
     }
 
@@ -219,9 +219,7 @@ fn decode_java_mutf8_to_utf16(bytes: &[u8]) -> Result<Vec<u16>, ()> {
                 return Err(());
             }
             out.push(
-                (((b0 as u16) & 0x0F) << 12)
-                    | (((b1 as u16) & 0x3F) << 6)
-                    | ((b2 as u16) & 0x3F),
+                (((b0 as u16) & 0x0F) << 12) | (((b1 as u16) & 0x3F) << 6) | ((b2 as u16) & 0x3F),
             );
             i += 3;
         } else {
@@ -272,9 +270,7 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
                 let length = buf.read_u16()?;
                 let bytes = buf.read_bytes(length as usize)?;
                 match cesu8::from_java_cesu8(bytes) {
-                    Ok(string) => {
-                        ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&string))
-                    }
+                    Ok(string) => ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&string)),
                     Err(_) => {
                         // `from_java_cesu8` rejects lone surrogates. Recover that
                         // specific case (e.g. ANTLR `_serializedATN`) by decoding
@@ -287,9 +283,7 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
                         // malformed input keeps the original hard error.
                         let units = decode_java_mutf8_to_utf16(bytes)
                             .ok()
-                            .filter(|u| {
-                                u.iter().any(|&c| (0xD800..=0xDFFF).contains(&c))
-                            })
+                            .filter(|u| u.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)))
                             .ok_or(ClassReaderError::InvalidCesu8String { index: i })?;
                         let lossy = String::from_utf16_lossy(&units);
                         wide_utf8.insert(i, Arc::from(units.into_boxed_slice()));
@@ -466,12 +460,12 @@ fn read_field(
     // Fetch the `Arc<str>` straight from the constant pool — it was already
     // interned at parse time via `cratonvm_types::intern_arc`, so this is a
     // single refcount bump (no allocation, no UTF-8 re-copy).
-    let name = constant_pool
-        .get_utf8_arc(name_index)
-        .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+    let name = constant_pool.get_utf8_arc(name_index).ok_or_else(|| {
+        ClassReaderError::InvalidConstantPool {
             index: name_index,
             message: "field name must reference a valid Utf8 entry".to_string(),
-        })?;
+        }
+    })?;
     let descriptor_index = buf.read_u16()?;
     let descriptor = constant_pool
         .get_utf8_arc(descriptor_index)
@@ -501,12 +495,12 @@ fn read_method(
     // Fetch the `Arc<str>` straight from the constant pool — it was already
     // interned at parse time via `cratonvm_types::intern_arc`, so this is a
     // single refcount bump (no allocation, no UTF-8 re-copy).
-    let name = constant_pool
-        .get_utf8_arc(name_index)
-        .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+    let name = constant_pool.get_utf8_arc(name_index).ok_or_else(|| {
+        ClassReaderError::InvalidConstantPool {
             index: name_index,
             message: "method name must reference a valid Utf8 entry".to_string(),
-        })?;
+        }
+    })?;
     let descriptor_index = buf.read_u16()?;
     let descriptor = constant_pool
         .get_utf8_arc(descriptor_index)
@@ -902,7 +896,7 @@ mod tests {
         let mut raw = Vec::new();
         push_u16(&mut raw, 1); // attributes_count
         push_u16(&mut raw, 1); // name index
-        // Declared length = 1_000_000, but no body bytes follow.
+                               // Declared length = 1_000_000, but no body bytes follow.
         raw.extend_from_slice(&1_000_000_u32.to_be_bytes());
         let source: Arc<[u8]> = Arc::from(raw.as_slice());
         let mut buf = ClassFileBuffer::new(&source);

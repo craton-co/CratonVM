@@ -61,21 +61,15 @@ fn make_spi_classpath_dir() -> std::path::PathBuf {
     let services_dir = dir.path().join("META-INF").join("services");
     std::fs::create_dir_all(&services_dir).expect("create META-INF/services");
     let descriptor = services_dir.join("java.sql.Driver");
-    std::fs::write(
-        &descriptor,
-        "cratonvm.Wp18ServiceLoaderE2E$FakeDriver\n",
-    )
-    .expect("write META-INF/services/java.sql.Driver");
+    std::fs::write(&descriptor, "cratonvm.Wp18ServiceLoaderE2E$FakeDriver\n")
+        .expect("write META-INF/services/java.sql.Driver");
     let path = dir.path().to_path_buf();
     std::mem::forget(dir);
     path
 }
 
 fn vm_with_spi(spi_dir: &std::path::Path) -> Vm {
-    let cp = vec![
-        test_resources_dir(),
-        spi_dir.to_string_lossy().into_owned(),
-    ];
+    let cp = vec![test_resources_dir(), spi_dir.to_string_lossy().into_owned()];
     let config = VmConfig::new().with_classpath(cp);
     Vm::new(config)
 }
@@ -119,9 +113,7 @@ fn class_for_name_string_native_registered() {
 #[test]
 fn class_for_name_resolves_from_bytecode() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)"
-        );
+        eprintln!("Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)");
         return;
     }
     let mut vm = vm_no_spi();
@@ -134,9 +126,7 @@ fn class_for_name_resolves_from_bytecode() {
              resolution. Did the synthetic-stub method-table addition \
              land?",
         ),
-        other => panic!(
-            "forNameStringResolves expected Ok(Some(Int(1))), got: {other:?}",
-        ),
+        other => panic!("forNameStringResolves expected Ok(Some(Int(1))), got: {other:?}",),
     }
 }
 
@@ -150,9 +140,7 @@ fn class_for_name_resolves_from_bytecode() {
 #[test]
 fn buffered_reader_reader_ctor_resolves_from_bytecode() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)"
-        );
+        eprintln!("Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)");
         return;
     }
     let mut vm = vm_no_spi();
@@ -165,9 +153,7 @@ fn buffered_reader_reader_ctor_resolves_from_bytecode() {
              NoSuchMethodError at bytecode resolution. Did the \
              synthetic-stub method-table addition land?",
         ),
-        other => panic!(
-            "bufferedReaderCtorResolves expected Ok(Some(Int(1))), got: {other:?}",
-        ),
+        other => panic!("bufferedReaderCtorResolves expected Ok(Some(Int(1))), got: {other:?}",),
     }
 }
 
@@ -179,18 +165,14 @@ fn buffered_reader_reader_ctor_resolves_from_bytecode() {
 #[test]
 fn fake_driver_instantiates_directly() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)"
-        );
+        eprintln!("Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)");
         return;
     }
     let mut vm = vm_no_spi();
     let result = vm.invoke(FIXTURE_CLASS, "fakeDriverInstantiates", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!(
-            "fakeDriverInstantiates expected Ok(Some(Int(1))), got: {other:?}",
-        ),
+        other => panic!("fakeDriverInstantiates expected Ok(Some(Int(1))), got: {other:?}",),
     }
 }
 
@@ -201,9 +183,7 @@ fn fake_driver_instantiates_directly() {
 #[test]
 fn service_loader_iterator_discovers_driver() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)"
-        );
+        eprintln!("Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)");
         return;
     }
     let spi_dir = make_spi_classpath_dir();
@@ -221,8 +201,6 @@ fn service_loader_iterator_discovers_driver() {
             "ServiceLoader fixture caught a Throwable — \
              check Class.forName / BufferedReader.<init> resolution.",
         ),
-        other => panic!(
-            "serviceLoaderIteratorCount expected Ok(Some(Int(n>0))), got: {other:?}",
-        ),
+        other => panic!("serviceLoaderIteratorCount expected Ok(Some(Int(n>0))), got: {other:?}",),
     }
 }

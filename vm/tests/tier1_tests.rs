@@ -134,11 +134,8 @@ fn t1_hprof_dump_writes_a_real_file() {
 
     // Build a real Vm so self_arc is set, then call dump_heap directly.
     let vm = cratonvm_vm::vm::Vm::new(cfg);
-    let bytes = cratonvm_vm::runtime::hprof::dump_heap(
-        &vm.shared,
-        path.to_str().unwrap(),
-    )
-    .expect("HPROF dump must succeed on a fresh VM");
+    let bytes = cratonvm_vm::runtime::hprof::dump_heap(&vm.shared, path.to_str().unwrap())
+        .expect("HPROF dump must succeed on a fresh VM");
     assert!(bytes > 0, "dump_heap should write a non-zero file");
 
     let raw = std::fs::read(&path).unwrap();
@@ -285,18 +282,16 @@ fn t1_init_complexity_classifier_is_wired_through_jit() {
     // Complex constructor with putfield keeps the ban.
     let complex = [0x2a, 0x2a, 0x04, 0xb5, 0x00, 0x02, 0xb1];
     assert_eq!(classify_init_complexity(&complex), InitComplexity::Complex);
-    assert!(
-        should_skip_jit_with_init(
-            "Foo",
-            "<init>",
-            false,
-            true,
-            SkipPolicy::Aggressive,
-            &[],
-            InitComplexity::Complex,
-        )
-        .is_some(),
-    );
+    assert!(should_skip_jit_with_init(
+        "Foo",
+        "<init>",
+        false,
+        true,
+        SkipPolicy::Aggressive,
+        &[],
+        InitComplexity::Complex,
+    )
+    .is_some(),);
 }
 
 #[test]
@@ -339,17 +334,17 @@ fn t1_oop_map_end_to_end_push_and_find() {
     // records monotonically increasing native_pc_offsets.
     let entries = vec![
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x10,
             frame_slot_offsets: vec![-8, -16],
         },
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x20,
             frame_slot_offsets: vec![-8, -24],
         },
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x40,
             frame_slot_offsets: vec![-16, -32, -40],
         },
@@ -378,17 +373,17 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
     // Each has a different set of live oops.
     let maps = vec![
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x10,
             frame_slot_offsets: vec![-8], // caller's `this`
         },
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x30,
             frame_slot_offsets: vec![-8, -24], // caller's this + callee's arg
         },
         OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: 0x50,
             frame_slot_offsets: vec![-8, -48], // caller's this + return value
         },
@@ -411,7 +406,9 @@ fn t1_oop_map_property_random_slot_sets_round_trip() {
     // Deterministic LCG — reproducible without bringing in rand.
     let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
     let mut next_u32 = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 32) as u32
     };
 
@@ -428,7 +425,7 @@ fn t1_oop_map_property_random_slot_sets_round_trip() {
             slots.push(raw as i16);
         }
         entries.push(OopMapEntry {
-        bytecode_pc: 0,
+            bytecode_pc: 0,
             native_pc_offset: pc,
             frame_slot_offsets: slots,
         });
@@ -464,7 +461,7 @@ fn t1_math_signum_matches_ieee754() {
     // difference. The interpreter uses Java semantics.)
     assert_eq!((0.0f64).signum(), 1.0); // Rust
     assert_eq!((-0.0f64).signum(), -1.0); // Rust
-    // ±Infinity → ±1.0
+                                          // ±Infinity → ±1.0
     assert_eq!(f64::INFINITY.signum(), 1.0);
     assert_eq!(f64::NEG_INFINITY.signum(), -1.0);
     // Positive finite → 1.0
@@ -487,7 +484,7 @@ fn t1_i2b_i2c_i2s_truncation_semantics() {
     assert_eq!(v as i8 as i32, 127);
     let v = 0x0000_00FFi32;
     assert_eq!(v as i8 as i32, -1); // sign-extended
-    // i2c: 0xFFFF_FFFF → 0xFFFF (zero-extended)
+                                    // i2c: 0xFFFF_FFFF → 0xFFFF (zero-extended)
     let v = 0xFFFF_FFFFu32 as i32;
     assert_eq!(v as u16 as i32, 0xFFFF);
     let v = 0x0001_8000u32 as i32;
@@ -515,7 +512,7 @@ fn t1_long_shift_amount_masked_with_3f() {
     // Negative pattern with lshr (arithmetic)
     let neg: i64 = -1;
     assert_eq!(neg >> (0x100 & 0x3Fu32), -1); // 0x100 & 0x3F == 0
-    // lushr unsigned right shift
+                                              // lushr unsigned right shift
     let big: i64 = -1;
     assert_eq!(((big as u64) >> (33 & 0x3Fu32)) as i64, 0x7FFF_FFFF);
 }
@@ -570,10 +567,7 @@ fn t1_jimage_loads_real_jdk_modules() {
                 .find_class("java.base", "java/lang/Object")
                 .ok()
                 .flatten();
-            assert!(
-                found.is_some(),
-                "JDK jimage must contain java/lang/Object"
-            );
+            assert!(found.is_some(), "JDK jimage must contain java/lang/Object");
         }
         Err(_) => {
             // Not a valid jimage — might be a legacy jmod layout or
@@ -601,11 +595,12 @@ fn t1_exception_escape_through_finally() {
     let inner = RuntimeError::NullPointerException {
         message: Some("injected".into()),
     };
-    let wrapped: MethodCallFailed =
-        MethodCallFailed::InternalError(VmError::Runtime(inner));
+    let wrapped: MethodCallFailed = MethodCallFailed::InternalError(VmError::Runtime(inner));
     // Pattern-match the preserved variant and message.
     match wrapped {
-        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NullPointerException { message })) => {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NullPointerException {
+            message,
+        })) => {
             assert_eq!(message.as_deref(), Some("injected"));
         }
         other => panic!("expected preserved NPE, got {other:?}"),
@@ -903,9 +898,7 @@ fn t1_async_exception_round_trip_through_registry() {
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let tid = ThreadId(42);
-    shared
-        .thread_registry
-        .register(tid, "target", None);
+    shared.thread_registry.register(tid, "target", None);
 
     let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
     assert!(shared.thread_registry.post_async_exception(tid, throwable));
@@ -1039,7 +1032,11 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
         .collect();
     let before: std::collections::HashSet<usize> =
         roots.iter().map(|o| o.as_ptr() as usize).collect();
-    assert_eq!(before.len(), n, "each allocation must return a unique address");
+    assert_eq!(
+        before.len(),
+        n,
+        "each allocation must return a unique address"
+    );
     // Drive a GC cycle through the monitor-table cleanup path (which
     // walks the mark state). We don't care about the actual mark
     // bits; we only verify (a) no object is lost, (b) no duplicate
@@ -1214,10 +1211,20 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
 fn t9_stub_audit_counts_match_census() {
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../native-builtins/src/");
     let files = [
-        "lib.rs", "phases_late.rs", "phases_early.rs", "crypto.rs",
-        "tls.rs", "serialization.rs", "jmx.rs", "http2.rs",
-        "servlet.rs", "cds.rs", "aot.rs", "classfile_api.rs",
-        "lang_string.rs", "tests_extracted.rs",
+        "lib.rs",
+        "phases_late.rs",
+        "phases_early.rs",
+        "crypto.rs",
+        "tls.rs",
+        "serialization.rs",
+        "jmx.rs",
+        "http2.rs",
+        "servlet.rs",
+        "cds.rs",
+        "aot.rs",
+        "classfile_api.rs",
+        "lang_string.rs",
+        "tests_extracted.rs",
     ];
 
     let mut total_noop = 0usize;
@@ -1233,7 +1240,8 @@ fn t9_stub_audit_counts_match_census() {
         // imports, comments, or test code.
         for line in src.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("//") || trimmed.starts_with("pub fn")
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("pub fn")
                 || trimmed.starts_with("pub(crate) fn")
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("#[")
@@ -1242,7 +1250,8 @@ fn t9_stub_audit_counts_match_census() {
             }
             if trimmed.contains("native_noop_with_this") {
                 total_with_this += 1;
-            } else if trimmed.contains("native_noop") && !trimmed.contains("native_noop_with_this") {
+            } else if trimmed.contains("native_noop") && !trimmed.contains("native_noop_with_this")
+            {
                 total_noop += 1;
             }
             if trimmed.contains("native_return_false") && !trimmed.starts_with("pub") {
@@ -1290,9 +1299,11 @@ fn t9_stub_audit_counts_match_census() {
 /// T9.1.10 — No `native_return_false` on `equals(Object)Z`.
 #[test]
 fn t9_no_return_false_on_equals() {
-    let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../native-builtins/src/phases_early.rs")
-    ).unwrap_or_default();
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../native-builtins/src/phases_early.rs"
+    ))
+    .unwrap_or_default();
     let bad = r#""equals", "(Ljava/lang/Object;)Z", native_return_false"#;
     assert!(
         !src.contains(bad),
@@ -1303,12 +1314,16 @@ fn t9_no_return_false_on_equals() {
 /// T9.5.5 — No dead TLS stubs that are shadowed by phases_late.rs.
 #[test]
 fn t9_tls_stubs_not_shadowing_real_impls() {
-    let tls_src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../native-builtins/src/tls.rs")
-    ).unwrap_or_default();
-    let phases_src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../native-builtins/src/phases_late.rs")
-    ).unwrap_or_default();
+    let tls_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../native-builtins/src/tls.rs"
+    ))
+    .unwrap_or_default();
+    let phases_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../native-builtins/src/phases_late.rs"
+    ))
+    .unwrap_or_default();
     // Count methods registered in BOTH files — these are shadowed
     // stubs that could be deleted from tls.rs.
     let mut shadowed = 0;
@@ -1316,8 +1331,8 @@ fn t9_tls_stubs_not_shadowing_real_impls() {
         if line.contains("native_noop") || line.contains("native_noop_with_this") {
             // Extract method name between quotes
             if let Some(start) = line.find('"') {
-                if let Some(end) = line[start+1..].find('"') {
-                    let method = &line[start+1..start+1+end];
+                if let Some(end) = line[start + 1..].find('"') {
+                    let method = &line[start + 1..start + 1 + end];
                     if phases_src.contains(&format!("\"{method}\"")) {
                         shadowed += 1;
                     }
@@ -1341,12 +1356,7 @@ fn t1_weak_ref_cleared_on_referent_unreachable() {
     let refer_addr = referent.as_ptr() as usize;
     {
         let mut rp = shared.ref_processor.lock();
-        rp.discover_reference(
-            cratonvm_gc::ReferenceType::Weak,
-            ref_addr,
-            refer_addr,
-            None,
-        );
+        rp.discover_reference(cratonvm_gc::ReferenceType::Weak, ref_addr, refer_addr, None);
     }
     // Simulate GC: mark only the ref object, not the referent.
     {
@@ -1388,13 +1398,19 @@ fn t1_chained_exception_preserves_identity() {
     let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
     // Write a message into field 0 to simulate Throwable.detailMessage.
     let msg = shared.heap.alloc_object(ClassId::new(2), 1);
-    shared.heap.set_field(throwable, 0, Value::Object(Some(msg)));
+    shared
+        .heap
+        .set_field(throwable, 0, Value::Object(Some(msg)));
 
     // Wrap in MethodCallFailed and round-trip.
     let err = MethodCallFailed::ExceptionThrown(throwable);
     match err {
         MethodCallFailed::ExceptionThrown(obj) => {
-            assert_eq!(obj.as_ptr(), throwable.as_ptr(), "identity must be preserved");
+            assert_eq!(
+                obj.as_ptr(),
+                throwable.as_ptr(),
+                "identity must be preserved"
+            );
             // The message field must still be readable.
             match shared.heap.get_field(obj, 0) {
                 Value::Object(Some(m)) => assert_eq!(m.as_ptr(), msg.as_ptr()),

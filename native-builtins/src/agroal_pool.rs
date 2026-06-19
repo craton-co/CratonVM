@@ -44,7 +44,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
-use std::sync::{OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -79,7 +79,8 @@ pub(crate) const CFG_NUM_FIELDS: usize = 6;
 const CLS_DS: &str = "io/agroal/api/AgroalDataSource";
 const CLS_POOL: &str = "io/agroal/pool/ConnectionPool";
 const CLS_CONFIG: &str = "io/agroal/api/configuration/AgroalDataSourceConfiguration";
-const CLS_CONFIG_BUILDER: &str = "io/agroal/api/configuration/supplier/AgroalDataSourceConfigurationSupplier";
+const CLS_CONFIG_BUILDER: &str =
+    "io/agroal/api/configuration/supplier/AgroalDataSourceConfigurationSupplier";
 const CLS_PROPERTIES_READER: &str = "io/agroal/api/AgroalPropertiesReader";
 const CLS_CONNECTION: &str = "java/sql/Connection";
 const CLS_H2_CONNECTION: &str = "org/h2/jdbc/JdbcConnection";
@@ -219,7 +220,12 @@ struct Registry {
 
 fn registry() -> &'static Mutex<Registry> {
     static R: OnceLock<Mutex<Registry>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(Registry { pools: HashMap::new(), next_id: 1 }))
+    R.get_or_init(|| {
+        Mutex::new(Registry {
+            pools: HashMap::new(),
+            next_id: 1,
+        })
+    })
 }
 
 /// Reset the pool registry. For tests that need isolation between cases.
@@ -300,7 +306,12 @@ struct ConnReg {
 
 fn connection_registry() -> &'static Mutex<ConnReg> {
     static R: OnceLock<Mutex<ConnReg>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(ConnReg { conns: HashMap::new(), next_id: 1 }))
+    R.get_or_init(|| {
+        Mutex::new(ConnReg {
+            conns: HashMap::new(),
+            next_id: 1,
+        })
+    })
 }
 
 /// Acquire a connection from the pool. Blocks up to `DEFAULT_ACQUIRE_TIMEOUT`
@@ -310,7 +321,9 @@ pub fn acquire(pool_id: i32) -> Result<i64, String> {
     loop {
         {
             let mut reg = registry().lock();
-            let pool = reg.pools.get_mut(&pool_id)
+            let pool = reg
+                .pools
+                .get_mut(&pool_id)
                 .ok_or_else(|| "pool not found".to_string())?;
             if pool.closed {
                 return Err("pool closed".to_string());
@@ -325,7 +338,9 @@ pub fn acquire(pool_id: i32) -> Result<i64, String> {
                 drop(reg);
                 let id = open_backing_connection(&url)?;
                 let mut reg = registry().lock();
-                let pool = reg.pools.get_mut(&pool_id)
+                let pool = reg
+                    .pools
+                    .get_mut(&pool_id)
                     .ok_or_else(|| "pool not found".to_string())?;
                 pool.in_use.push(id);
                 pool.opened_total += 1;
@@ -333,7 +348,10 @@ pub fn acquire(pool_id: i32) -> Result<i64, String> {
             }
         }
         if Instant::now() >= deadline {
-            return Err("SQLTransientConnectionException: timeout waiting for Agroal connection".to_string());
+            return Err(
+                "SQLTransientConnectionException: timeout waiting for Agroal connection"
+                    .to_string(),
+            );
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -371,14 +389,18 @@ pub fn close_pool(pool_id: i32) {
 /// Return a snapshot of pool stats. Used by monitoring natives.
 pub fn pool_stats(pool_id: i32) -> Option<(usize, usize, u64, bool)> {
     let reg = registry().lock();
-    reg.pools.get(&pool_id).map(|p| (p.idle.len(), p.in_use.len(), p.opened_total, p.closed))
+    reg.pools
+        .get(&pool_id)
+        .map(|p| (p.idle.len(), p.in_use.len(), p.opened_total, p.closed))
 }
 
 /// Run `SELECT 1` on a backing connection to validate it's alive. Returns
 /// the integer result (expected 1) on success.
 pub fn validate_select_1(conn_id: i64) -> Result<i64, String> {
     let reg = connection_registry().lock();
-    let conn = reg.conns.get(&conn_id)
+    let conn = reg
+        .conns
+        .get(&conn_id)
         .ok_or_else(|| "connection not found".to_string())?;
     conn.query_row::<i64, _, _>("SELECT 1", [], |row| row.get(0))
         .map_err(|e| format!("validate failed: {}", e))
@@ -426,11 +448,20 @@ fn native_ds_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(target: "agroal_pool", error = %e, "pool creation failed");
-            return Err(RuntimeError::IllegalStateException { message: format!("SQLException: {}", e) }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: format!("SQLException: {}", e),
+            }
+            .into());
         }
     };
 
-    ctx.set_field(this, DS_FIELD_CONFIG, config.map(|o| Value::Object(Some(o))).unwrap_or(Value::Object(None)));
+    ctx.set_field(
+        this,
+        DS_FIELD_CONFIG,
+        config
+            .map(|o| Value::Object(Some(o)))
+            .unwrap_or(Value::Object(None)),
+    );
     ctx.set_field(this, DS_FIELD_POOL, Value::Int(pool_id));
     ctx.set_field(this, DS_FIELD_CLOSED, Value::Int(0));
     Ok(None)
@@ -442,7 +473,9 @@ fn read_config_from_object(ctx: &mut dyn NativeContext, cfg: ObjectRef) -> PoolC
         _ => String::new(),
     };
     let driver = match ctx.get_field(cfg, CFG_FIELD_DRIVER) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "org.h2.Driver".to_string()),
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .unwrap_or_else(|| "org.h2.Driver".to_string()),
         _ => "org.h2.Driver".to_string(),
     };
     let username = match ctx.get_field(cfg, CFG_FIELD_USERNAME) {
@@ -482,7 +515,9 @@ fn native_ds_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let ds = alloc_object_for(ctx, CLS_DS, DS_NUM_FIELDS);
     let init_args = [
         Value::Object(Some(ds)),
-        config.map(|o| Value::Object(Some(o))).unwrap_or(Value::Object(None)),
+        config
+            .map(|o| Value::Object(Some(o)))
+            .unwrap_or(Value::Object(None)),
     ];
     native_ds_init(ctx, &init_args)?;
     Ok(Some(Value::Object(Some(ds))))
@@ -497,20 +532,25 @@ fn native_ds_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if matches!(ctx.get_field(this, DS_FIELD_CLOSED), Value::Int(v) if v != 0) {
         return Err(RuntimeError::IllegalStateException {
             message: "SQLException: data source is closed".to_string(),
-        }.into());
+        }
+        .into());
     }
     let pool_id = match ctx.get_field(this, DS_FIELD_POOL) {
         Value::Int(v) => v,
         _ => {
             return Err(RuntimeError::IllegalStateException {
                 message: "SQLException: data source has no pool".to_string(),
-            }.into());
+            }
+            .into());
         }
     };
     let conn_id = match acquire(pool_id) {
         Ok(id) => id,
         Err(e) => {
-            return Err(RuntimeError::IllegalStateException { message: format!("SQLException: {}", e) }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: format!("SQLException: {}", e),
+            }
+            .into());
         }
     };
     // Allocate a Java-side java.sql.Connection wrapper. We use the H2
@@ -569,16 +609,20 @@ fn native_cfg_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn native_props_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let text = match obj_arg(args, 0) {
         Some(s) => ctx.read_string(s).unwrap_or_default(),
-        None => return Err(RuntimeError::IllegalArgumentException {
-            message: "readProperties: null input".to_string(),
-        }.into()),
+        None => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "readProperties: null input".to_string(),
+            }
+            .into())
+        }
     };
     let cfg = match parse_properties(&text) {
         Ok(c) => c,
         Err(e) => {
             return Err(RuntimeError::IllegalStateException {
                 message: format!("SQLException: {}", e),
-            }.into());
+            }
+            .into());
         }
     };
     write_config_to_object(ctx, &cfg)
@@ -613,10 +657,19 @@ fn native_pool_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let pool_id = match create_pool(cfg) {
         Ok(id) => id,
         Err(e) => {
-            return Err(RuntimeError::IllegalStateException { message: format!("SQLException: {}", e) }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: format!("SQLException: {}", e),
+            }
+            .into());
         }
     };
-    ctx.set_field(this, CP_FIELD_CONFIG, config.map(|o| Value::Object(Some(o))).unwrap_or(Value::Object(None)));
+    ctx.set_field(
+        this,
+        CP_FIELD_CONFIG,
+        config
+            .map(|o| Value::Object(Some(o)))
+            .unwrap_or(Value::Object(None)),
+    );
     ctx.set_field(this, CP_FIELD_SIZE, Value::Int(pool_id));
     ctx.set_field(this, CP_FIELD_STATE, Value::Int(0));
     Ok(None)
@@ -625,7 +678,10 @@ fn native_pool_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// PoolHandler.getConnection() — validate then return. In the synthetic path
 /// the PoolHandler just wraps a long connection ID in slot 0, so we mirror
 /// that behaviour.
-fn native_pool_handler_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_pool_handler_get_connection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
@@ -637,7 +693,8 @@ fn native_pool_handler_get_connection(ctx: &mut dyn NativeContext, args: &[Value
     if validate_select_1(conn_id).is_err() {
         return Err(RuntimeError::IllegalStateException {
             message: "SQLException: connection validation failed".to_string(),
-        }.into());
+        }
+        .into());
     }
     Ok(Some(Value::Object(Some(this))))
 }
@@ -847,18 +904,22 @@ mod tests {
     fn t19_8_agroal_natives_registered() {
         let mut r = NativeMethodRegistry::new();
         register_agroal_natives(&mut r);
-        assert!(r.find(CLS_DS, "getConnection", "()Ljava/sql/Connection;").is_some());
+        assert!(r
+            .find(CLS_DS, "getConnection", "()Ljava/sql/Connection;")
+            .is_some());
         assert!(r.find(CLS_DS, "close", "()V").is_some());
         assert!(r.find(
             CLS_DS,
             "from",
             "(Lio/agroal/api/configuration/AgroalDataSourceConfiguration;)Lio/agroal/api/AgroalDataSource;",
         ).is_some());
-        assert!(r.find(
-            CLS_PROPERTIES_READER,
-            "readProperties",
-            "(Ljava/lang/String;)Lio/agroal/api/configuration/AgroalDataSourceConfiguration;",
-        ).is_some());
+        assert!(r
+            .find(
+                CLS_PROPERTIES_READER,
+                "readProperties",
+                "(Ljava/lang/String;)Lio/agroal/api/configuration/AgroalDataSourceConfiguration;",
+            )
+            .is_some());
     }
 
     // Bonus: the native ds.from() path wiring through a config object.

@@ -41,7 +41,11 @@ fn native_stack_walker_boot_natives_registered() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::stack_walker::register_stack_walker_boot(&mut r);
     assert!(r
-        .find("java/lang/StackWalker", "getInstance", "()Ljava/lang/StackWalker;")
+        .find(
+            "java/lang/StackWalker",
+            "getInstance",
+            "()Ljava/lang/StackWalker;"
+        )
         .is_some());
     assert!(r
         .find(
@@ -51,7 +55,11 @@ fn native_stack_walker_boot_natives_registered() {
         )
         .is_some());
     assert!(r
-        .find("java/lang/StackWalker", "getCallerClass", "()Ljava/lang/Class;")
+        .find(
+            "java/lang/StackWalker",
+            "getCallerClass",
+            "()Ljava/lang/Class;"
+        )
         .is_some());
 }
 
@@ -74,13 +82,25 @@ fn lang_stackwalker_natives_registered() {
         )
         .is_some());
     assert!(r
-        .find("java/lang/StackFrameInfo", "getClassName", "()Ljava/lang/String;")
+        .find(
+            "java/lang/StackFrameInfo",
+            "getClassName",
+            "()Ljava/lang/String;"
+        )
         .is_some());
     assert!(r
-        .find("java/lang/StackFrameInfo", "getMethodName", "()Ljava/lang/String;")
+        .find(
+            "java/lang/StackFrameInfo",
+            "getMethodName",
+            "()Ljava/lang/String;"
+        )
         .is_some());
     assert!(r
-        .find("java/lang/StackFrameInfo", "getFileName", "()Ljava/lang/String;")
+        .find(
+            "java/lang/StackFrameInfo",
+            "getFileName",
+            "()Ljava/lang/String;"
+        )
         .is_some());
     assert!(r
         .find("java/lang/StackFrameInfo", "getLineNumber", "()I")
@@ -89,7 +109,11 @@ fn lang_stackwalker_natives_registered() {
         .find("java/lang/StackFrameInfo", "getByteCodeIndex", "()I")
         .is_some());
     assert!(r
-        .find("java/lang/StackFrameInfo", "getDeclaringClass", "()Ljava/lang/Class;")
+        .find(
+            "java/lang/StackFrameInfo",
+            "getDeclaringClass",
+            "()Ljava/lang/Class;"
+        )
         .is_some());
     assert!(r
         .find("java/lang/StackFrameInfo", "isNativeMethod", "()Z")
@@ -109,9 +133,18 @@ fn line_number_for_bci_picks_largest_start_leq_bci() {
     // Simulate the core scan logic for LineNumberTable lookup that
     // `crate::runtime::stackwalker::line_number_for_bci` uses.
     let entries = vec![
-        LineNumberEntry { start_pc: 0, line_number: 10 },
-        LineNumberEntry { start_pc: 5, line_number: 20 },
-        LineNumberEntry { start_pc: 9, line_number: 30 },
+        LineNumberEntry {
+            start_pc: 0,
+            line_number: 10,
+        },
+        LineNumberEntry {
+            start_pc: 5,
+            line_number: 20,
+        },
+        LineNumberEntry {
+            start_pc: 9,
+            line_number: 30,
+        },
     ];
 
     let lookup = |bci: u16| -> Option<u16> {

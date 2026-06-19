@@ -57,10 +57,10 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use parking_lot::RwLock;
 
 use crate::alloc_concurrent_synthetic;
 
@@ -143,7 +143,12 @@ struct KeyStoreRegistry {
 }
 
 fn registry() -> &'static RwLock<KeyStoreRegistry> {
-    KEYSTORE_REGISTRY.get_or_init(|| RwLock::new(KeyStoreRegistry { next_id: 1, stores: HashMap::new() }))
+    KEYSTORE_REGISTRY.get_or_init(|| {
+        RwLock::new(KeyStoreRegistry {
+            next_id: 1,
+            stores: HashMap::new(),
+        })
+    })
 }
 
 /// Stash a parsed keystore and return its assigned id.
@@ -292,7 +297,8 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
     // valid &str. Anything that came through `char[]` is by definition a
     // valid UTF-16 sequence, so this conversion is lossless for any password
     // a Java caller could possibly produce.
-    let password_str = std::str::from_utf8(password).map_err(|_| KeyStoreError::Pkcs12Parse("password not UTF-8".into()))?;
+    let password_str = std::str::from_utf8(password)
+        .map_err(|_| KeyStoreError::Pkcs12Parse("password not UTF-8".into()))?;
 
     // MAC verify (if a MAC is present) before we trust any decrypted bag.
     // Empty passwords MUST verify against an empty input the same way real
@@ -323,14 +329,21 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
 
         match &bag.bag {
             p12::SafeBagKind::Pkcs8ShroudedKeyBag(epk) => {
-                let key_der = epk.decrypt(password.as_ref()).ok_or(KeyStoreError::Pkcs12KeyDecryptFailed)?;
-                keys_by_local_id.entry(local_id.clone()).or_insert((friendly, key_der));
+                let key_der = epk
+                    .decrypt(password.as_ref())
+                    .ok_or(KeyStoreError::Pkcs12KeyDecryptFailed)?;
+                keys_by_local_id
+                    .entry(local_id.clone())
+                    .or_insert((friendly, key_der));
             }
             p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) => {
                 if local_id.is_empty() {
                     orphan_certs.push((friendly, der.clone()));
                 } else {
-                    certs_by_local_id.entry(local_id.clone()).or_default().push((friendly, der.clone()));
+                    certs_by_local_id
+                        .entry(local_id.clone())
+                        .or_default()
+                        .push((friendly, der.clone()));
                 }
             }
             // SDSI certs and other-bag-kinds: nothing standard to do; skip.
@@ -353,13 +366,11 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
             }
         }
 
-        let alias = key_friendly
-            .or(chain_friendly)
-            .unwrap_or_else(|| {
-                // Fallback: use the hex of the localKeyId, like keytool does
-                // when no friendlyName was specified.
-                hex_lower(&local_id)
-            });
+        let alias = key_friendly.or(chain_friendly).unwrap_or_else(|| {
+            // Fallback: use the hex of the localKeyId, like keytool does
+            // when no friendlyName was specified.
+            hex_lower(&local_id)
+        });
 
         entries.insert(
             alias.clone(),
@@ -372,13 +383,20 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
     }
 
     // Any cert-bags that didn't pair with a key go in as TrustedCert entries.
-    let mut walk = certs_by_local_id.into_iter().flat_map(|(_, v)| v).collect::<Vec<_>>();
+    let mut walk = certs_by_local_id
+        .into_iter()
+        .flat_map(|(_, v)| v)
+        .collect::<Vec<_>>();
     walk.extend(orphan_certs);
     for (idx, (friendly, der)) in walk.into_iter().enumerate() {
         let alias = friendly.unwrap_or_else(|| format!("cert_{}", idx));
         entries.insert(
             alias.clone(),
-            KeyStoreEntry { alias, creation_time_ms: 0, kind: EntryKind::TrustedCert { cert_der: der } },
+            KeyStoreEntry {
+                alias,
+                creation_time_ms: 0,
+                kind: EntryKind::TrustedCert { cert_der: der },
+            },
         );
     }
 
@@ -523,7 +541,11 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
                 let cert_der = r.bytes_u32len()?;
                 entries.insert(
                     alias.clone(),
-                    KeyStoreEntry { alias, creation_time_ms, kind: EntryKind::TrustedCert { cert_der } },
+                    KeyStoreEntry {
+                        alias,
+                        creation_time_ms,
+                        kind: EntryKind::TrustedCert { cert_der },
+                    },
                 );
             }
             other => return Err(KeyStoreError::BadJksTag(other)),
@@ -709,7 +731,11 @@ fn jks_recover_key(epki_der: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
         digest = h.finalize().to_vec();
         xor_key.extend_from_slice(&digest);
     }
-    let plain: Vec<u8> = encr_key.iter().zip(xor_key.iter()).map(|(a, b)| a ^ b).collect();
+    let plain: Vec<u8> = encr_key
+        .iter()
+        .zip(xor_key.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
 
     // Integrity: SHA1(passwd || plain) must equal the trailing digest.
     let mut hc = Sha1::new();
@@ -848,31 +874,47 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     // `KeyManagerFactory`/`TrustManagerFactory` init that walks `ks.aliases()`
     // hit `NoSuchMethodError IteratorEnumeration.hasMoreElements()`. Register
     // them here (real-JDK path), co-located with the producer.
-    r.register("java/util/IteratorEnumeration", "hasMoreElements", "()Z", |ctx, args| {
-        let this = this_arg(args)?;
-        let pos = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
-        let len = match ctx.get_field(this, 0) {
-            Value::Object(Some(arr)) => ctx.array_length(arr),
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
-    });
-    r.register("java/util/IteratorEnumeration", "nextElement", "()Ljava/lang/Object;", |ctx, args| {
-        let this = this_arg(args)?;
-        let pos = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
-        let elem = match ctx.get_field(this, 0) {
-            Value::Object(Some(arr)) => {
-                if pos < ctx.array_length(arr) {
-                    ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
-                    ctx.get_array_element(arr, pos)
-                } else {
-                    Value::Object(None)
+    r.register(
+        "java/util/IteratorEnumeration",
+        "hasMoreElements",
+        "()Z",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            let pos = match ctx.get_field(this, 1) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            let len = match ctx.get_field(this, 0) {
+                Value::Object(Some(arr)) => ctx.array_length(arr),
+                _ => 0,
+            };
+            Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
+        },
+    );
+    r.register(
+        "java/util/IteratorEnumeration",
+        "nextElement",
+        "()Ljava/lang/Object;",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            let pos = match ctx.get_field(this, 1) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            let elem = match ctx.get_field(this, 0) {
+                Value::Object(Some(arr)) => {
+                    if pos < ctx.array_length(arr) {
+                        ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
+                        ctx.get_array_element(arr, pos)
+                    } else {
+                        Value::Object(None)
+                    }
                 }
-            }
-            _ => Value::Object(None),
-        };
-        Ok(Some(elem))
-    });
+                _ => Value::Object(None),
+            };
+            Ok(Some(elem))
+        },
+    );
 
     let _ = SUN_KEYSTORE_FQN;
     r.set_category(__prev_cat);
@@ -885,7 +927,12 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
     r.register(fqn, "engineLoad", "(Ljava/io/InputStream;[C)V", engine_load);
 
     // engineGetKey(String, char[]) -> Key
-    r.register(fqn, "engineGetKey", "(Ljava/lang/String;[C)Ljava/security/Key;", engine_get_key);
+    r.register(
+        fqn,
+        "engineGetKey",
+        "(Ljava/lang/String;[C)Ljava/security/Key;",
+        engine_get_key,
+    );
 
     // engineGetCertificate(String) -> Certificate
     r.register(
@@ -904,19 +951,39 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
     );
 
     // engineAliases() -> Enumeration<String>
-    r.register(fqn, "engineAliases", "()Ljava/util/Enumeration;", engine_aliases);
+    r.register(
+        fqn,
+        "engineAliases",
+        "()Ljava/util/Enumeration;",
+        engine_aliases,
+    );
 
     // engineSize() -> int
     r.register(fqn, "engineSize", "()I", engine_size);
 
     // engineContainsAlias(String) -> boolean
-    r.register(fqn, "engineContainsAlias", "(Ljava/lang/String;)Z", engine_contains_alias);
+    r.register(
+        fqn,
+        "engineContainsAlias",
+        "(Ljava/lang/String;)Z",
+        engine_contains_alias,
+    );
 
     // engineIsKeyEntry(String) -> boolean
-    r.register(fqn, "engineIsKeyEntry", "(Ljava/lang/String;)Z", engine_is_key_entry);
+    r.register(
+        fqn,
+        "engineIsKeyEntry",
+        "(Ljava/lang/String;)Z",
+        engine_is_key_entry,
+    );
 
     // engineIsCertificateEntry(String) -> boolean
-    r.register(fqn, "engineIsCertificateEntry", "(Ljava/lang/String;)Z", engine_is_certificate_entry);
+    r.register(
+        fqn,
+        "engineIsCertificateEntry",
+        "(Ljava/lang/String;)Z",
+        engine_is_certificate_entry,
+    );
 
     // engineGetCreationDate(String) -> Date
     r.register(
@@ -937,12 +1004,22 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
     );
 
     // engineDeleteEntry(String) — companion in-memory removal.
-    r.register(fqn, "engineDeleteEntry", "(Ljava/lang/String;)V", engine_delete_entry);
+    r.register(
+        fqn,
+        "engineDeleteEntry",
+        "(Ljava/lang/String;)V",
+        engine_delete_entry,
+    );
 
     // engineStore(OutputStream, char[]) — serialise the side-table (as JKS,
     // which CV's load path detects by magic) so a store→load round-trip
     // preserves entries.
-    r.register(fqn, "engineStore", "(Ljava/io/OutputStream;[C)V", engine_store);
+    r.register(
+        fqn,
+        "engineStore",
+        "(Ljava/io/OutputStream;[C)V",
+        engine_store,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -953,7 +1030,10 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
 fn this_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(r))) => Ok(*r),
-        _ => Err(RuntimeError::NullPointerException { message: Some("KeyStore engine call on null receiver".into()) }.into()),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some("KeyStore engine call on null receiver".into()),
+        }
+        .into()),
     }
 }
 
@@ -995,8 +1075,14 @@ fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8>
         if let Some(name) = ctx.class_name_of_id(cls_id) {
             if name == "java/io/ByteArrayInputStream" {
                 let buf = ctx.get_field(stream, 0);
-                let pos = match ctx.get_field(stream, 1) { Value::Int(v) => v as usize, _ => 0 };
-                let count = match ctx.get_field(stream, 3) { Value::Int(v) => v as usize, _ => 0 };
+                let pos = match ctx.get_field(stream, 1) {
+                    Value::Int(v) => v as usize,
+                    _ => 0,
+                };
+                let count = match ctx.get_field(stream, 3) {
+                    Value::Int(v) => v as usize,
+                    _ => 0,
+                };
                 if let Value::Object(Some(arr)) = buf {
                     let total = ctx.array_length(arr).min(count);
                     let start = pos.min(total);
@@ -1110,7 +1196,10 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
 
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
@@ -1144,10 +1233,17 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
 
-    let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
-    let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
+    let Some(store) = keystore_lookup(id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(entry) = store.entries.get(&alias) else {
+        return Ok(Some(Value::Object(None)));
+    };
 
     let cert_der = match &entry.kind {
         EntryKind::TrustedCert { cert_der } => cert_der.clone(),
@@ -1157,16 +1253,25 @@ fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         },
     };
 
-    Ok(Some(Value::Object(Some(make_x509_mirror(ctx, &alias, &cert_der)))))
+    Ok(Some(Value::Object(Some(make_x509_mirror(
+        ctx, &alias, &cert_der,
+    )))))
 }
 
 fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
 
-    let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
-    let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
+    let Some(store) = keystore_lookup(id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(entry) = store.entries.get(&alias) else {
+        return Ok(Some(Value::Object(None)));
+    };
 
     let chain = match &entry.kind {
         EntryKind::PrivateKey { chain, .. } => chain.clone(),
@@ -1219,17 +1324,29 @@ fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
-    let present = keystore_lookup(id).map(|s| s.entries.contains_key(&alias)).unwrap_or(false);
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
+    let present = keystore_lookup(id)
+        .map(|s| s.entries.contains_key(&alias))
+        .unwrap_or(false);
     Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
 
 fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
     let yes = keystore_lookup(id)
-        .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::PrivateKey { .. })))
+        .and_then(|s| {
+            s.entries
+                .get(&alias)
+                .map(|e| matches!(e.kind, EntryKind::PrivateKey { .. }))
+        })
         .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
 }
@@ -1237,9 +1354,16 @@ fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
     let yes = keystore_lookup(id)
-        .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::TrustedCert { .. })))
+        .and_then(|s| {
+            s.entries
+                .get(&alias)
+                .map(|e| matches!(e.kind, EntryKind::TrustedCert { .. }))
+        })
         .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
 }
@@ -1247,8 +1371,13 @@ fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
-    let ms = keystore_lookup(id).and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms)).unwrap_or(0);
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
+    let ms = keystore_lookup(id)
+        .and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms))
+        .unwrap_or(0);
 
     // java/util/Date has a single `fastTime` long field in real-JDK layout
     // (slot 0 in our synthetic mirror).
@@ -1268,7 +1397,10 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
     let cert = match args.get(2) {
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(None),
@@ -1304,7 +1436,10 @@ fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
     keystore_delete_entry(id, &alias);
     Ok(None)
 }
@@ -1441,7 +1576,11 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     // Identity side-table fallback (real JKS objects have no field for it).
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
-        if let Some(&id) = store_id_by_identity().lock().unwrap_or_else(|e| e.into_inner()).get(&ih) {
+        if let Some(&id) = store_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ih)
+        {
             return id;
         }
     }
@@ -1458,7 +1597,10 @@ fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     // KeyStoreSpi object has no usable field (real JavaKeyStore$JKS = 1 field).
     let ih = ctx.identity_hash_code(this);
     if ih != 0 {
-        store_id_by_identity().lock().unwrap_or_else(|e| e.into_inner()).insert(ih, id);
+        store_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ih, id);
     }
 }
 
@@ -1469,7 +1611,9 @@ fn detect_algo_idx(key_der: &[u8]) -> i32 {
     // AlgorithmIdentifier: SEQUENCE { OID, optional params }. RSA OID is
     // 1.2.840.113549.1.1.1 (DER `06 09 2A 86 48 86 F7 0D 01 01 01`).
     // EC OID is `1.2.840.10045.2.1` (`06 07 2A 86 48 CE 3D 02 01`).
-    let needle_rsa = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    let needle_rsa = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+    ];
     let needle_ec = [0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
     if find_subseq(key_der, &needle_rsa).is_some() {
         return 6; // RSA
@@ -1597,8 +1741,13 @@ mod tests {
         // Flip a byte in the body (the entry_count high byte).
         bytes[8] ^= 0x01;
         let err = load_jks(&bytes, b"changeit").unwrap_err();
-        assert!(matches!(err, KeyStoreError::JksMacMismatch | KeyStoreError::BadJksTag(_)),
-            "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                KeyStoreError::JksMacMismatch | KeyStoreError::BadJksTag(_)
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1636,7 +1785,9 @@ mod tests {
                 KeyStoreEntry {
                     alias: "alpha".to_string(),
                     creation_time_ms: 42,
-                    kind: EntryKind::TrustedCert { cert_der: b"hi".to_vec() },
+                    kind: EntryKind::TrustedCert {
+                        cert_der: b"hi".to_vec(),
+                    },
                 },
             )]
             .into_iter()
@@ -1675,7 +1826,10 @@ mod tests {
         // Just a SEQUENCE prefix with garbage payload — should fail parse.
         let bogus = b"\x30\x05\x00\x00\x00\x00\x00";
         let err = load_pkcs12(bogus, b"x").unwrap_err();
-        assert!(matches!(err, KeyStoreError::Pkcs12Parse(_) | KeyStoreError::Pkcs12MacFailed));
+        assert!(matches!(
+            err,
+            KeyStoreError::Pkcs12Parse(_) | KeyStoreError::Pkcs12MacFailed
+        ));
     }
 
     #[test]
@@ -1687,7 +1841,9 @@ mod tests {
     #[test]
     fn detect_algo_idx_finds_rsa_oid() {
         let mut blob = vec![0u8; 16];
-        blob.extend_from_slice(&[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]);
+        blob.extend_from_slice(&[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+        ]);
         assert_eq!(detect_algo_idx(&blob), 6);
     }
 

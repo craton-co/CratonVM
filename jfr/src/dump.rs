@@ -243,7 +243,10 @@ struct StringPool {
 
 impl StringPool {
     fn new() -> Self {
-        Self { by_bytes: FxHashMap::default(), order: Vec::new() }
+        Self {
+            by_bytes: FxHashMap::default(),
+            order: Vec::new(),
+        }
     }
 
     /// Look up or insert `bytes`, returning its pool index.
@@ -757,8 +760,7 @@ pub fn dump_to_file(
     // Collect refs from both sources into one Vec for the merge-sort pass.
     // The repository iter and `extra` slice both borrow for the rest of the
     // function — no event-by-event clones.
-    let mut chunk_events: Vec<&EventInstance> =
-        Vec::with_capacity(repository.len() + extra.len());
+    let mut chunk_events: Vec<&EventInstance> = Vec::with_capacity(repository.len() + extra.len());
     chunk_events.extend(repository.iter());
     chunk_events.extend(extra.iter());
     // Stable sort by `start_time` so equal-timestamp events keep their
@@ -806,7 +808,10 @@ pub fn dump_to_file(
             }
         }
     }
-    let mut guard = PartGuard { path: &part_path, armed: true };
+    let mut guard = PartGuard {
+        path: &part_path,
+        armed: true,
+    };
 
     // J1 (round-2): walk every event we're about to emit and intern its string
     // payloads into a per-chunk constant pool. Subsequent serialization writes
@@ -830,7 +835,15 @@ pub fn dump_to_file(
         // `start_time_ns` field carries `chunk_start_time` (the true minimum
         // event tick) so the reader's delta reconstruction is exact — see the
         // underflow fix above.
-        write_header(&mut writer, 0, 0, 0, chunk_start_time, duration_ns, FILE_STATE_WRITING)?;
+        write_header(
+            &mut writer,
+            0,
+            0,
+            0,
+            chunk_start_time,
+            duration_ns,
+            FILE_STATE_WRITING,
+        )?;
 
         // J1: emit the checkpoint section (containing the string pool) BEFORE
         // the events so readers can resolve constant-pool indices during the
@@ -842,7 +855,11 @@ pub fn dump_to_file(
         // for a typical event payload up front; serialize_event_into clears
         // and refills it per call without re-allocating.
         let mut scratch: Vec<u8> = Vec::with_capacity(256);
-        let pool_ref = if string_pool.len() == 0 { None } else { Some(&string_pool) };
+        let pool_ref = if string_pool.len() == 0 {
+            None
+        } else {
+            Some(&string_pool)
+        };
 
         // LOW fix (2026-06-17): precompute the per-type declared FieldKind
         // vectors once so a Null field in a numeric/boolean slot can emit the
@@ -859,8 +876,7 @@ pub fn dump_to_file(
                         ty.fields
                             .iter()
                             .map(|f| {
-                                FieldKind::from_declared(&f.type_name)
-                                    .unwrap_or(FieldKind::String)
+                                FieldKind::from_declared(&f.type_name).unwrap_or(FieldKind::String)
                             })
                             .collect()
                     })
@@ -1033,13 +1049,19 @@ fn decode_event_value(
     match type_name {
         "int" => {
             let (v, c) = decode_compressed_long(&data[pos..]).ok_or_else(|| {
-                JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, "int decode failed"))
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "int decode failed",
+                ))
             })?;
             Ok((EventValue::Int(v as i32), c))
         }
         "long" => {
             let (v, c) = decode_compressed_long(&data[pos..]).ok_or_else(|| {
-                JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, "long decode failed"))
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "long decode failed",
+                ))
             })?;
             Ok((EventValue::Long(v), c))
         }
@@ -1251,19 +1273,21 @@ fn parse_checkpoint_pool(
             }
             strings.reserve(n_entries as usize);
             for _ in 0..n_entries {
-                let (_idx, ic) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
-                    JfrDumpError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "pool entry index decode failed",
-                    ))
-                })?;
+                let (_idx, ic) =
+                    decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pool entry index decode failed",
+                        ))
+                    })?;
                 pos += ic;
-                let (slen, lc) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
-                    JfrDumpError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "pool entry length decode failed",
-                    ))
-                })?;
+                let (slen, lc) =
+                    decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pool entry length decode failed",
+                        ))
+                    })?;
                 pos += lc;
                 // checked_add: `slen` is an attacker-controlled compressed-int;
                 // an unchecked `+` would wrap `usize` past the bounds check.
@@ -1282,9 +1306,8 @@ fn parse_checkpoint_pool(
                         "pool entry body extends past record",
                     )));
                 }
-                let s = std::str::from_utf8(&data[pos..end]).map_err(|e| {
-                    JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, e))
-                })?;
+                let s = std::str::from_utf8(&data[pos..end])
+                    .map_err(|e| JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
                 strings.push(std::sync::Arc::from(s));
                 pos = end;
             }
@@ -1334,10 +1357,8 @@ pub fn read_events(
     let minor = u16::from_be_bytes([data[6], data[7]]);
     let chunk_start_time = u64::from_be_bytes(data[32..40].try_into().unwrap());
     let timestamps_are_deltas = minor >= 1;
-    let checkpoint_offset =
-        u64::from_be_bytes(data[16..24].try_into().unwrap()) as usize;
-    let metadata_offset =
-        u64::from_be_bytes(data[24..32].try_into().unwrap()) as usize;
+    let checkpoint_offset = u64::from_be_bytes(data[16..24].try_into().unwrap()) as usize;
+    let metadata_offset = u64::from_be_bytes(data[24..32].try_into().unwrap()) as usize;
 
     // SECURITY: `checkpoint_offset` and `metadata_offset` come straight from the
     // untrusted 72-byte header. They become the `events_start` / `events_end`
@@ -1383,8 +1404,7 @@ pub fn read_events(
     // bound is provably in-bounds regardless of which layout branch produced
     // `events_end`.
     let events_end = events_end.min(data.len());
-    let pool_ref: Option<&[std::sync::Arc<str>]> =
-        if pool.is_empty() { None } else { Some(&pool) };
+    let pool_ref: Option<&[std::sync::Arc<str>]> = if pool.is_empty() { None } else { Some(&pool) };
 
     // Walk records within [events_start, events_end). Each record starts with
     // a compressed_int size field that includes the size byte(s).
@@ -1504,7 +1524,9 @@ pub fn read_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventValue};
+    use crate::event::{
+        EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventValue,
+    };
     use smallvec::smallvec;
     use std::sync::Arc;
 
@@ -1644,8 +1666,8 @@ mod tests {
         record.extend_from_slice(&encode_compressed_int(total as u64));
         record.extend_from_slice(&body);
 
-        let err = parse_checkpoint_pool(&record, 0)
-            .expect_err("oversized n_entries must be rejected");
+        let err =
+            parse_checkpoint_pool(&record, 0).expect_err("oversized n_entries must be rejected");
         match err {
             JfrDumpError::Io(e) => {
                 assert_eq!(e.kind(), io::ErrorKind::InvalidData);
@@ -1684,27 +1706,22 @@ mod tests {
             start_time: 1_000_000,
             end_time: 2_000_000,
             thread_id: 1,
-            fields: smallvec![
-                EventValue::Int(42),
-                EventValue::String(Arc::from("hello")),
-            ],
+            fields: smallvec![EventValue::Int(42), EventValue::String(Arc::from("hello")),],
         });
         repo.push(EventInstance {
             type_id,
             start_time: 3_000_000,
             end_time: 4_000_000,
             thread_id: 2,
-            fields: smallvec![
-                EventValue::Int(99),
-                EventValue::String(Arc::from("world")),
-            ],
+            fields: smallvec![EventValue::Int(99), EventValue::String(Arc::from("world")),],
         });
 
         let dir = std::env::temp_dir().join("jfr_test_dump");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test_dump.jfr");
 
-        let file_size = dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000, Vec::new(), false).unwrap();
+        let file_size =
+            dump_to_file(&path, &repo, &reg, 1_000_000, 3_000_000, Vec::new(), false).unwrap();
         assert!(file_size >= HEADER_SIZE);
 
         // Verify header
@@ -1907,18 +1924,18 @@ mod tests {
             end_time: 600,
             thread_id: 0,
             fields: smallvec![
-                EventValue::Null,        // i   -> Int(0)
-                EventValue::Int(11),     // after_i
-                EventValue::Null,        // l   -> Long(0)
-                EventValue::Int(22),     // after_l
-                EventValue::Null,        // f   -> Float(0.0)
-                EventValue::Int(33),     // after_f
-                EventValue::Null,        // d   -> Double(0.0)
-                EventValue::Int(44),     // after_d
-                EventValue::Null,        // b   -> Boolean(false)
-                EventValue::Int(55),     // after_b
-                EventValue::Null,        // s   -> Null (string null tag)
-                EventValue::Int(66),     // after_s
+                EventValue::Null,    // i   -> Int(0)
+                EventValue::Int(11), // after_i
+                EventValue::Null,    // l   -> Long(0)
+                EventValue::Int(22), // after_l
+                EventValue::Null,    // f   -> Float(0.0)
+                EventValue::Int(33), // after_f
+                EventValue::Null,    // d   -> Double(0.0)
+                EventValue::Int(44), // after_d
+                EventValue::Null,    // b   -> Boolean(false)
+                EventValue::Int(55), // after_b
+                EventValue::Null,    // s   -> Null (string null tag)
+                EventValue::Int(66), // after_s
             ],
         });
 
@@ -1933,8 +1950,16 @@ mod tests {
         assert_eq!(f.len(), 12, "all 12 fields decoded — no truncation");
 
         // The numeric/bool Nulls decode to the declared kind's typed zero.
-        assert!(matches!(f[0], EventValue::Int(0)), "int null -> Int(0): {:?}", f[0]);
-        assert!(matches!(f[2], EventValue::Long(0)), "long null -> Long(0): {:?}", f[2]);
+        assert!(
+            matches!(f[0], EventValue::Int(0)),
+            "int null -> Int(0): {:?}",
+            f[0]
+        );
+        assert!(
+            matches!(f[2], EventValue::Long(0)),
+            "long null -> Long(0): {:?}",
+            f[2]
+        );
         assert!(
             matches!(f[4], EventValue::Float(v) if v == 0.0),
             "float null -> Float(0.0): {:?}",
@@ -1951,16 +1976,44 @@ mod tests {
             f[8]
         );
         // The string Null keeps the canonical null tag and round-trips to Null.
-        assert!(matches!(f[10], EventValue::Null), "string null -> Null: {:?}", f[10]);
+        assert!(
+            matches!(f[10], EventValue::Null),
+            "string null -> Null: {:?}",
+            f[10]
+        );
 
         // Every sentinel that FOLLOWS a Null decodes to its written value —
         // this is the desync canary. Any width mismatch would corrupt these.
-        assert!(matches!(f[1], EventValue::Int(11)), "after_i intact: {:?}", f[1]);
-        assert!(matches!(f[3], EventValue::Int(22)), "after_l intact: {:?}", f[3]);
-        assert!(matches!(f[5], EventValue::Int(33)), "after_f intact: {:?}", f[5]);
-        assert!(matches!(f[7], EventValue::Int(44)), "after_d intact: {:?}", f[7]);
-        assert!(matches!(f[9], EventValue::Int(55)), "after_b intact: {:?}", f[9]);
-        assert!(matches!(f[11], EventValue::Int(66)), "after_s intact: {:?}", f[11]);
+        assert!(
+            matches!(f[1], EventValue::Int(11)),
+            "after_i intact: {:?}",
+            f[1]
+        );
+        assert!(
+            matches!(f[3], EventValue::Int(22)),
+            "after_l intact: {:?}",
+            f[3]
+        );
+        assert!(
+            matches!(f[5], EventValue::Int(33)),
+            "after_f intact: {:?}",
+            f[5]
+        );
+        assert!(
+            matches!(f[7], EventValue::Int(44)),
+            "after_d intact: {:?}",
+            f[7]
+        );
+        assert!(
+            matches!(f[9], EventValue::Int(55)),
+            "after_b intact: {:?}",
+            f[9]
+        );
+        assert!(
+            matches!(f[11], EventValue::Int(66)),
+            "after_s intact: {:?}",
+            f[11]
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2095,7 +2148,10 @@ mod tests {
 
         let reg = EventTypeRegistry::new();
         let result = read_events(&path, &reg);
-        assert!(result.is_err(), "metadata_offset past EOF must error, not panic");
+        assert!(
+            result.is_err(),
+            "metadata_offset past EOF must error, not panic"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2117,7 +2173,10 @@ mod tests {
 
         let reg = EventTypeRegistry::new();
         let result = read_events(&path, &reg);
-        assert!(result.is_err(), "checkpoint_offset past EOF must error, not panic");
+        assert!(
+            result.is_err(),
+            "checkpoint_offset past EOF must error, not panic"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2153,7 +2212,10 @@ mod tests {
         // Must return Err (record-bounded decode fails) rather than silently
         // reading the trailing bytes or panicking.
         let result = read_events(&path, &reg);
-        assert!(result.is_err(), "checkpoint field decode must stay within record");
+        assert!(
+            result.is_err(),
+            "checkpoint field decode must stay within record"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2227,10 +2289,7 @@ mod tests {
         // metadata_offset == checkpoint_offset == record_end_offset so the
         // events region is exactly [HEADER_SIZE, record_end_offset): the single
         // corrupt record, with `trailing` living past `events_end`.
-        let mut data = make_header_with_offsets(
-            record_end_offset as u64,
-            record_end_offset as u64,
-        );
+        let mut data = make_header_with_offsets(record_end_offset as u64, record_end_offset as u64);
         data.extend_from_slice(&record);
         data.extend_from_slice(&trailing);
         std::fs::write(&path, &data).unwrap();
@@ -2300,11 +2359,7 @@ mod tests {
 
         // Push three events with distinctive start_times. They will go through
         // the calling thread's shard in the global registry.
-        let pushed_starts: [u64; 3] = [
-            0xA0A0_0000_0011,
-            0xA0A0_0000_0022,
-            0xA0A0_0000_0033,
-        ];
+        let pushed_starts: [u64; 3] = [0xA0A0_0000_0011, 0xA0A0_0000_0022, 0xA0A0_0000_0033];
         for &start in &pushed_starts {
             push_to_thread_ring(EventInstance {
                 type_id,
@@ -2338,14 +2393,17 @@ mod tests {
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.checkpoint_offset, HEADER_SIZE);
-        assert!(header.metadata_offset > header.checkpoint_offset,
-            "metadata should sit past checkpoint + events region");
+        assert!(
+            header.metadata_offset > header.checkpoint_offset,
+            "metadata should sit past checkpoint + events region"
+        );
 
         // Read events back and verify each pushed event is present.
         let events = read_events(&path, &reg).unwrap();
         for &expected_start in &pushed_starts {
-            let found = events.iter().any(|e|
-                e.type_id == type_id && e.start_time == expected_start);
+            let found = events
+                .iter()
+                .any(|e| e.type_id == type_id && e.start_time == expected_start);
             assert!(
                 found,
                 "expected drained event with start_time {:#x} in file, got {} events",
@@ -2360,8 +2418,9 @@ mod tests {
         dump_to_file(&path2, &repo2, &reg, 0, 0, Vec::new(), false).unwrap();
         let events2 = read_events(&path2, &reg).unwrap();
         for &expected_start in &pushed_starts {
-            let still_there = events2.iter().any(|e|
-                e.type_id == type_id && e.start_time == expected_start);
+            let still_there = events2
+                .iter()
+                .any(|e| e.type_id == type_id && e.start_time == expected_start);
             assert!(
                 !still_there,
                 "drained events must not reappear in a second dump (start={:#x})",
@@ -2419,19 +2478,30 @@ mod tests {
             .filter(|e| e.type_id == type_id && (e.start_time & 0xFFFF_FFFF_FFFF_FF00) == tag)
             .map(|e| e.start_time)
             .collect();
-        assert_eq!(ours.len(), push_order.len(),
+        assert_eq!(
+            ours.len(),
+            push_order.len(),
             "expected all {} pushed events back, got {}: {:?}",
-            push_order.len(), ours.len(), ours);
+            push_order.len(),
+            ours.len(),
+            ours
+        );
         let sorted = {
             let mut v = ours.clone();
             v.sort();
             v
         };
-        assert_eq!(ours, sorted, "drained events should be written in start_time order");
+        assert_eq!(
+            ours, sorted,
+            "drained events should be written in start_time order"
+        );
         // Make sure the test actually exercises sorting (i.e. the push order
         // was not already monotonically increasing).
-        assert_ne!(push_order.to_vec(), sorted,
-            "test setup bug: push_order happens to equal sorted order");
+        assert_ne!(
+            push_order.to_vec(),
+            sorted,
+            "test setup bug: push_order happens to equal sorted order"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2522,9 +2592,23 @@ mod tests {
 
         let _ = crate::repository::global_ring_registry().drain_all();
 
-        crate::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
+        crate::builtin::emit_gc_event(
+            &mut fr,
+            1,
+            "G1 Young",
+            "Allocation Failure",
+            1_000_000,
+            500_000,
+        );
         crate::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
-        crate::builtin::emit_class_load_event(&mut fr, "java/lang/Object", "bootstrap", "bootstrap", 3_000_000, 100_000);
+        crate::builtin::emit_class_load_event(
+            &mut fr,
+            "java/lang/Object",
+            "bootstrap",
+            "bootstrap",
+            3_000_000,
+            100_000,
+        );
 
         // Drain ring shards into the recording's repository before stopping
         // so the snapshot below reflects the three emitted events.
@@ -2550,7 +2634,16 @@ mod tests {
             dump_repo.push(event.clone());
         }
 
-        let file_size = dump_to_file(&path, &dump_repo, &fr.type_registry, start_time, duration, Vec::new(), false).unwrap();
+        let file_size = dump_to_file(
+            &path,
+            &dump_repo,
+            &fr.type_registry,
+            start_time,
+            duration,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         let header = read_jfr_header(&path).unwrap();
 
         assert_eq!(header.magic, JFR_MAGIC);

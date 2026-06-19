@@ -51,10 +51,10 @@ use cratonvm_reader::method::ClassFileMethod;
 
 use cuda_bridge::{DeviceContext, DeviceModule};
 use jit_cuda::annotations::read_method_annotations;
-use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
+use jit_cuda::emitter::PtxModule;
 use jit_cuda::lowering::lower_method;
 use jit_cuda::signature::KernelSignature;
-use jit_cuda::emitter::PtxModule;
+use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
 
 /// Merge bridge: the reader switched method attributes to the lazy
 /// `LazyAttribute` representation, but `jit_cuda::annotations` still
@@ -288,10 +288,7 @@ impl OffloadCache {
         // (read-only input — same bytes as already on the device).
         sig.writes_param_mask = ptx_module.writes_param_mask;
         let ptx_text = ptx_module.render();
-        let ctx = self
-            .ctx
-            .as_ref()
-            .expect("ctx presence checked above");
+        let ctx = self.ctx.as_ref().expect("ctx presence checked above");
         let module = match DeviceModule::from_ptx(ctx, &ptx_text, &[kernel_name.as_str()]) {
             Ok(m) => m,
             Err(e) => {
@@ -328,9 +325,7 @@ impl OffloadCache {
 /// surface real multi-GPU support will plug into — see the
 /// `get_or_create` PHASE3 note.
 pub struct OffloadCacheRegistry {
-    per_device: parking_lot::RwLock<
-        rustc_hash::FxHashMap<u32, std::sync::Arc<OffloadCache>>,
-    >,
+    per_device: parking_lot::RwLock<rustc_hash::FxHashMap<u32, std::sync::Arc<OffloadCache>>>,
 }
 
 impl OffloadCacheRegistry {
@@ -542,9 +537,7 @@ pub fn try_dispatch(
                 }
             }
         }
-        LookupOutcome::Skip | LookupOutcome::Blacklisted => {
-            Ok(DispatchOutcome::FallThrough)
-        }
+        LookupOutcome::Skip | LookupOutcome::Blacklisted => Ok(DispatchOutcome::FallThrough),
     }
 }
 
@@ -736,8 +729,7 @@ mod tests {
             .join("ExcludedKernel.class");
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
-        let cf = read_class(&bytes)
-            .unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
+        let cf = read_class(&bytes).unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
         let methods = cf.methods;
         let name = cf.this_class;
         let cp = cf.constant_pool;
@@ -783,8 +775,7 @@ mod tests {
             .join("ExcludedAndKernel.class");
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
-        let cf = read_class(&bytes)
-            .unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
+        let cf = read_class(&bytes).unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
         let methods = cf.methods;
         let name = cf.this_class;
         let cp = cf.constant_pool;
@@ -809,9 +800,9 @@ mod tests {
         match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
             LookupOutcome::Blacklisted => {}
             LookupOutcome::Skip => panic!("expected Blacklisted, got Skip"),
-            LookupOutcome::Hit(_) => panic!(
-                "expected Blacklisted (exclude beats eligibility), got Hit — analyzer ran?!"
-            ),
+            LookupOutcome::Hit(_) => {
+                panic!("expected Blacklisted (exclude beats eligibility), got Hit — analyzer ran?!")
+            }
         }
     }
 
@@ -842,12 +833,7 @@ impl OffloadCache {
     /// Eagerly populate the cache for up to `max` `@GpuKernel`-annotated
     /// methods of `class`. Called from the class loader when
     /// `@EnableGpuAsync(warmup = N)` is detected on the class.
-    pub fn warmup_class(
-        &self,
-        class: &crate::classloading::Class,
-        class_id: ClassId,
-        max: usize,
-    ) {
+    pub fn warmup_class(&self, class: &crate::classloading::Class, class_id: ClassId, max: usize) {
         if max == 0 {
             return;
         }
@@ -866,8 +852,7 @@ impl OffloadCache {
                 break;
             }
             considered += 1;
-            let m_decoded_attrs =
-                decode_method_attrs(&method.attributes, &class.constant_pool);
+            let m_decoded_attrs = decode_method_attrs(&method.attributes, &class.constant_pool);
             let m_anns = jit_cuda::annotations::read_method_annotations(
                 &m_decoded_attrs,
                 &class.constant_pool,
@@ -876,13 +861,7 @@ impl OffloadCache {
                 continue;
             }
             let mi = method_index as u16;
-            match self.lookup_or_compile(
-                class_id,
-                &class.name,
-                mi,
-                method,
-                &class.constant_pool,
-            ) {
+            match self.lookup_or_compile(class_id, &class.name, mi, method, &class.constant_pool) {
                 LookupOutcome::Hit(_) => {
                     compiled += 1;
                 }
@@ -1057,8 +1036,7 @@ pub struct GcCriticalGuard;
 impl GcCriticalGuard {
     /// Increment the GC-critical counter and return the guard.
     pub fn acquire() -> Self {
-        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self
     }
 }
@@ -1066,8 +1044,7 @@ impl GcCriticalGuard {
 #[cfg(feature = "gpu-offload")]
 impl Drop for GcCriticalGuard {
     fn drop(&mut self) {
-        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -1149,8 +1126,7 @@ impl OffloadCache {
         args: cuda_bridge::KernelArgs,
         runtime_work: u32,
     ) -> std::sync::Arc<StreamSubmission> {
-        let handle = NEXT_SUBMISSION_HANDLE
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // `event` is populated only on the success path below, after
         // the launch is queued. Failure paths leave it None.
@@ -1204,24 +1180,23 @@ impl OffloadCache {
         // the two so n ≤ 2^20 keeps the original launch shape and
         // n > 2^20 grows to cover every output index.
         let estimated = kernel.signature.estimated_work.max(1) as u32;
-        let work = if runtime_work > estimated { runtime_work } else { estimated };
+        let work = if runtime_work > estimated {
+            runtime_work
+        } else {
+            estimated
+        };
         let cfg = cuda_bridge::LaunchConfig::elementwise(work);
 
         // 4. Launch on the user-supplied stream. The launch itself is
         //    non-blocking; `stream.synchronize()` below is what makes
         //    this call observably synchronous to the caller.
-        if let Err(e) = kernel.module.launch_on_stream(
-            ctx,
-            &kernel.kernel_name,
-            &cfg,
-            args,
-            &stream,
-        ) {
+        if let Err(e) =
+            kernel
+                .module
+                .launch_on_stream(ctx, &kernel.kernel_name, &cfg, args, &stream)
+        {
             return make(SubmissionStatus::Failed {
-                message: format!(
-                    "launch_on_stream({}): {}",
-                    kernel.kernel_name, e,
-                ),
+                message: format!("launch_on_stream({}): {}", kernel.kernel_name, e,),
             });
         }
 
@@ -1256,8 +1231,7 @@ impl OffloadCache {
 }
 
 #[cfg(feature = "gpu-offload")]
-static NEXT_SUBMISSION_HANDLE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_SUBMISSION_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // ── Submission registry ──────────────────────────────────────────────
 //
@@ -1278,8 +1252,7 @@ static SUBMISSIONS: OnceLock<
 
 #[cfg(feature = "gpu-offload")]
 fn submissions(
-) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<StreamSubmission>>>
-{
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<StreamSubmission>>> {
     SUBMISSIONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -1334,12 +1307,8 @@ pub fn release_submission(handle: u64) {
 // know which is which here. Phase 6 narrows it.
 
 #[cfg(feature = "gpu-offload")]
-fn record_failed_submission(
-    stream: Option<std::sync::Arc<Stream>>,
-    message: String,
-) -> u64 {
-    let handle = NEXT_SUBMISSION_HANDLE
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: String) -> u64 {
+    let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sub = std::sync::Arc::new(StreamSubmission {
         handle,
         stream,
@@ -1366,8 +1335,8 @@ pub fn dispatch_method_from_native(
     descriptor: &str,
     java_args: &[cratonvm_types::Value],
 ) -> u64 {
-    use cuda_bridge::{KernelArgs, Stream as CudaStream};
     use cratonvm_types::{ArrayElementType, Value};
+    use cuda_bridge::{KernelArgs, Stream as CudaStream};
     use std::sync::Arc;
 
     // 1. Resolve the cache.
@@ -1415,7 +1384,9 @@ pub fn dispatch_method_from_native(
             None => {
                 return record_failed_submission(
                     None,
-                    format!("submitMethod: class not loaded after load_class_concurrent: {class_name}"),
+                    format!(
+                        "submitMethod: class not loaded after load_class_concurrent: {class_name}"
+                    ),
                 );
             }
         };
@@ -1428,9 +1399,11 @@ pub fn dispatch_method_from_native(
                 );
             }
         };
-        let mi = match class.methods.iter().position(|m| {
-            &*m.name == method_name && &*m.descriptor == descriptor
-        }) {
+        let mi = match class
+            .methods
+            .iter()
+            .position(|m| &*m.name == method_name && &*m.descriptor == descriptor)
+        {
             Some(i) => i as u16,
             None => {
                 return record_failed_submission(
@@ -1465,7 +1438,8 @@ pub fn dispatch_method_from_native(
                     seen.push(cp);
                     // Field cp_index → NameAndType → Utf8 field name.
                     let Some(cratonvm_reader::constant_pool::ConstantPoolEntry::FieldReference {
-                        name_and_type_index, ..
+                        name_and_type_index,
+                        ..
                     }) = class.constant_pool.get(cp)
                     else {
                         return record_failed_submission(
@@ -1492,7 +1466,13 @@ pub fn dispatch_method_from_native(
                     };
                     names.push(nm.to_string());
                 }
-                (class_id, mi, is_static_local, names, compiled.signature.writes_param_mask)
+                (
+                    class_id,
+                    mi,
+                    is_static_local,
+                    names,
+                    compiled.signature.writes_param_mask,
+                )
             }
             LookupOutcome::Skip => {
                 return record_failed_submission(
@@ -1693,7 +1673,9 @@ pub fn dispatch_method_from_native(
                 Ok((args_after, wb_opt, bytes)) => {
                     kernel_args = args_after(kernel_args);
                     h2d_bytes = h2d_bytes.saturating_add(bytes);
-                    if pthis_len > max_array_len { max_array_len = pthis_len; }
+                    if pthis_len > max_array_len {
+                        max_array_len = pthis_len;
+                    }
                     if let Some(wb) = wb_opt {
                         writebacks.push(wb);
                     }
@@ -1730,13 +1712,14 @@ pub fn dispatch_method_from_native(
                     // post-launch D→H copy.
                     let is_written = (writes_param_mask >> i) & 1 == 1;
                     let arr_len = shared.heap.array_length(*obj_ref);
-                    match marshal_array_arg(
-                        shared, ctx, *obj_ref, element_type, is_written, &token,
-                    ) {
+                    match marshal_array_arg(shared, ctx, *obj_ref, element_type, is_written, &token)
+                    {
                         Ok((args_after, wb_opt, bytes)) => {
                             kernel_args = args_after(kernel_args);
                             h2d_bytes = h2d_bytes.saturating_add(bytes);
-                            if arr_len > max_array_len { max_array_len = arr_len; }
+                            if arr_len > max_array_len {
+                                max_array_len = arr_len;
+                            }
                             if let Some(wb) = wb_opt {
                                 writebacks.push(wb);
                             }
@@ -1759,13 +1742,13 @@ pub fn dispatch_method_from_native(
                 if let Some((etype, len, host_bytes, arr_handle)) =
                     try_gpu_array_snapshot(shared, *obj_ref)
                 {
-                    match marshal_resident_array_arg(
-                        ctx, etype, len, host_bytes, arr_handle,
-                    ) {
+                    match marshal_resident_array_arg(ctx, etype, len, host_bytes, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
                             if let Some(l) = wb.array_len() {
-                                if l > max_array_len { max_array_len = l; }
+                                if l > max_array_len {
+                                    max_array_len = l;
+                                }
                             }
                             writebacks.push(wb);
                         }
@@ -1937,7 +1920,11 @@ pub fn finalize_submission(
     // fall through to read the terminal status.
     let pending = submission.finalize.lock().take();
 
-    if let Some(FinalizeState { writebacks, _gc_critical }) = pending {
+    if let Some(FinalizeState {
+        writebacks,
+        _gc_critical,
+    }) = pending
+    {
         // 1. Wait for the kernel to complete via the recorded event.
         if let Some(event) = &submission.event {
             if let Err(e) = event.synchronize() {
@@ -2069,46 +2056,82 @@ pub(crate) mod device_cache {
 
     pub(crate) fn get_i32(handle: u64) -> Option<Arc<DeviceBuffer<i32>>> {
         match map().lock().get(&handle) {
-            Some(Entry { buf: CachedBuffer::I32(arc), .. }) => Some(arc.clone()),
+            Some(Entry {
+                buf: CachedBuffer::I32(arc),
+                ..
+            }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_i32(handle: u64, buf: Arc<DeviceBuffer<i32>>) {
-        map().lock().insert(handle, Entry { buf: CachedBuffer::I32(buf), dirty: false });
+        map().lock().insert(
+            handle,
+            Entry {
+                buf: CachedBuffer::I32(buf),
+                dirty: false,
+            },
+        );
     }
 
     pub(crate) fn get_i64(handle: u64) -> Option<Arc<DeviceBuffer<i64>>> {
         match map().lock().get(&handle) {
-            Some(Entry { buf: CachedBuffer::I64(arc), .. }) => Some(arc.clone()),
+            Some(Entry {
+                buf: CachedBuffer::I64(arc),
+                ..
+            }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_i64(handle: u64, buf: Arc<DeviceBuffer<i64>>) {
-        map().lock().insert(handle, Entry { buf: CachedBuffer::I64(buf), dirty: false });
+        map().lock().insert(
+            handle,
+            Entry {
+                buf: CachedBuffer::I64(buf),
+                dirty: false,
+            },
+        );
     }
 
     pub(crate) fn get_f32(handle: u64) -> Option<Arc<DeviceBuffer<f32>>> {
         match map().lock().get(&handle) {
-            Some(Entry { buf: CachedBuffer::F32(arc), .. }) => Some(arc.clone()),
+            Some(Entry {
+                buf: CachedBuffer::F32(arc),
+                ..
+            }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_f32(handle: u64, buf: Arc<DeviceBuffer<f32>>) {
-        map().lock().insert(handle, Entry { buf: CachedBuffer::F32(buf), dirty: false });
+        map().lock().insert(
+            handle,
+            Entry {
+                buf: CachedBuffer::F32(buf),
+                dirty: false,
+            },
+        );
     }
 
     pub(crate) fn get_f64(handle: u64) -> Option<Arc<DeviceBuffer<f64>>> {
         match map().lock().get(&handle) {
-            Some(Entry { buf: CachedBuffer::F64(arc), .. }) => Some(arc.clone()),
+            Some(Entry {
+                buf: CachedBuffer::F64(arc),
+                ..
+            }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_f64(handle: u64, buf: Arc<DeviceBuffer<f64>>) {
-        map().lock().insert(handle, Entry { buf: CachedBuffer::F64(buf), dirty: false });
+        map().lock().insert(
+            handle,
+            Entry {
+                buf: CachedBuffer::F64(buf),
+                dirty: false,
+            },
+        );
     }
 
     /// Phase 9 #1 — flag the cache entry as "device has writes the
@@ -2287,8 +2310,8 @@ pub(crate) mod h2d_trace {
 //     production fix would clear on every major-GC compaction event.
 #[cfg(feature = "gpu-offload")]
 pub(crate) mod input_cache {
-    use cuda_bridge::DeviceBuffer;
     use cratonvm_types::{ArrayElementType, ObjectRef};
+    use cuda_bridge::DeviceBuffer;
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
     use std::sync::{Arc, OnceLock};
@@ -2320,46 +2343,90 @@ pub(crate) mod input_cache {
     pub(crate) fn get_i32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
         let g = map().lock();
         let e = g.get(&obj)?;
-        if e.element_type != ArrayElementType::Int || e.len != len { return None; }
-        if let CachedBuffer::I32(a) = &e.buf { Some(a.clone()) } else { None }
+        if e.element_type != ArrayElementType::Int || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::I32(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
     }
     pub(crate) fn put_i32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i32>>) {
-        map().lock().insert(obj, Entry {
-            buf: CachedBuffer::I32(buf), len, element_type: ArrayElementType::Int,
-        });
+        map().lock().insert(
+            obj,
+            Entry {
+                buf: CachedBuffer::I32(buf),
+                len,
+                element_type: ArrayElementType::Int,
+            },
+        );
     }
     pub(crate) fn get_i64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
         let g = map().lock();
         let e = g.get(&obj)?;
-        if e.element_type != ArrayElementType::Long || e.len != len { return None; }
-        if let CachedBuffer::I64(a) = &e.buf { Some(a.clone()) } else { None }
+        if e.element_type != ArrayElementType::Long || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::I64(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
     }
     pub(crate) fn put_i64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i64>>) {
-        map().lock().insert(obj, Entry {
-            buf: CachedBuffer::I64(buf), len, element_type: ArrayElementType::Long,
-        });
+        map().lock().insert(
+            obj,
+            Entry {
+                buf: CachedBuffer::I64(buf),
+                len,
+                element_type: ArrayElementType::Long,
+            },
+        );
     }
     pub(crate) fn get_f32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
         let g = map().lock();
         let e = g.get(&obj)?;
-        if e.element_type != ArrayElementType::Float || e.len != len { return None; }
-        if let CachedBuffer::F32(a) = &e.buf { Some(a.clone()) } else { None }
+        if e.element_type != ArrayElementType::Float || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::F32(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
     }
     pub(crate) fn put_f32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f32>>) {
-        map().lock().insert(obj, Entry {
-            buf: CachedBuffer::F32(buf), len, element_type: ArrayElementType::Float,
-        });
+        map().lock().insert(
+            obj,
+            Entry {
+                buf: CachedBuffer::F32(buf),
+                len,
+                element_type: ArrayElementType::Float,
+            },
+        );
     }
     pub(crate) fn get_f64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
         let g = map().lock();
         let e = g.get(&obj)?;
-        if e.element_type != ArrayElementType::Double || e.len != len { return None; }
-        if let CachedBuffer::F64(a) = &e.buf { Some(a.clone()) } else { None }
+        if e.element_type != ArrayElementType::Double || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::F64(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
     }
     pub(crate) fn put_f64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f64>>) {
-        map().lock().insert(obj, Entry {
-            buf: CachedBuffer::F64(buf), len, element_type: ArrayElementType::Double,
-        });
+        map().lock().insert(
+            obj,
+            Entry {
+                buf: CachedBuffer::F64(buf),
+                len,
+                element_type: ArrayElementType::Double,
+            },
+        );
     }
 
     /// Drop the device-buffer cache entry for `obj`. Intended for
@@ -2375,7 +2442,9 @@ pub(crate) mod input_cache {
     }
 
     /// Diagnostic: current entry count.
-    pub fn len() -> usize { map().lock().len() }
+    pub fn len() -> usize {
+        map().lock().len()
+    }
 }
 
 // ── Per-type marshalling helpers ────────────────────────────────────
@@ -2390,19 +2459,51 @@ pub enum MarshalWriteback {
     // that names the same Java array. The post-sync writeback still
     // does a D->H copy into the JVM array — but the device buffer
     // survives, so the next submit's H->D upload is skipped.
-    I32 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>, len: usize },
-    I64 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>, len: usize },
-    F32 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, len: usize },
-    F64 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>, len: usize },
+    I32 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>,
+        len: usize,
+    },
+    I64 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>,
+        len: usize,
+    },
+    F32 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>,
+        len: usize,
+    },
+    F64 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
+        len: usize,
+    },
     // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
     // `DeviceBuffer<T>` is shared with `device_cache` so the next
     // kernel using the same `handle` reuses it instead of
     // re-uploading. Writeback target is the resident-store entry
     // keyed by `handle`, not a Java array object.
-    ResidentI32 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>, len: usize },
-    ResidentI64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>, len: usize },
-    ResidentF32 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, len: usize },
-    ResidentF64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>, len: usize },
+    ResidentI32 {
+        handle: u64,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>,
+        len: usize,
+    },
+    ResidentI64 {
+        handle: u64,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>,
+        len: usize,
+    },
+    ResidentF32 {
+        handle: u64,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>,
+        len: usize,
+    },
+    ResidentF64 {
+        handle: u64,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
+        len: usize,
+    },
     /// Phase 9 #1 follow-up — owns the 1-element `u64` device buffer
     /// the kernel uses to signal a bounds-check failure. The writeback
     /// downloads the cell after `event.synchronize()`; a non-zero
@@ -2411,7 +2512,9 @@ pub enum MarshalWriteback {
     /// corrupt output). The `Arc` form keeps the buffer alive across
     /// the launch even though only one reference exists today (matches
     /// the resident-variant ownership pattern).
-    FailureFlag { buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>> },
+    FailureFlag {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>>,
+    },
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -2539,8 +2642,7 @@ fn try_gpu_array_snapshot(
         cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
-    let (etype, len, bytes) =
-        cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
+    let (etype, len, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
     Some((etype, len, bytes, handle))
 }
 
@@ -2592,20 +2694,18 @@ fn marshal_resident_array_arg(
             // (returned alongside) keeps the buffer alive.
             let len32 = len as i32;
             let wb_arc = arc.clone();
-            let device_ptr =
-                std::sync::Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
-            let push: Box<dyn FnOnce(_) -> _> =
-                Box::new(move |args: cuda_bridge::KernelArgs| {
-                    // SAFETY: the Arc<DeviceBuffer<T>> we cloned
-                    // for the writeback (wb_arc, returned with the
-                    // writeback below) keeps the buffer alive for
-                    // the duration of `dispatch_method_from_native`,
-                    // which is when this closure fires and is
-                    // immediately consumed.
-                    let _ = &arc; // keep this clone alive past push
-                    let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
-                    args.push_device_ptr(buf_ref).push_i32(len32)
-                });
+            let device_ptr = std::sync::Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
+            let push: Box<dyn FnOnce(_) -> _> = Box::new(move |args: cuda_bridge::KernelArgs| {
+                // SAFETY: the Arc<DeviceBuffer<T>> we cloned
+                // for the writeback (wb_arc, returned with the
+                // writeback below) keeps the buffer alive for
+                // the duration of `dispatch_method_from_native`,
+                // which is when this closure fires and is
+                // immediately consumed.
+                let _ = &arc; // keep this clone alive past push
+                let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
+                args.push_device_ptr(buf_ref).push_i32(len32)
+            });
             (
                 push,
                 MarshalWriteback::$variant {
@@ -2812,19 +2912,18 @@ fn marshal_array_arg(
                 None
             };
             let device_ptr = Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
-            let push: Box<dyn FnOnce(_) -> _> =
-                Box::new(move |args: cuda_bridge::KernelArgs| {
-                    // SAFETY: `arc` is moved into this closure (kept
-                    // alive at least until it fires). The closure
-                    // runs once during the dispatch sequence and
-                    // immediately pushes the pointer into KernelArgs;
-                    // after that the writeback (when present) and/or
-                    // the `input_cache` Arc keep the buffer alive
-                    // through the launch and synchronize.
-                    let _ = &arc;
-                    let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
-                    args.push_device_ptr(buf_ref).push_i32(len32)
-                });
+            let push: Box<dyn FnOnce(_) -> _> = Box::new(move |args: cuda_bridge::KernelArgs| {
+                // SAFETY: `arc` is moved into this closure (kept
+                // alive at least until it fires). The closure
+                // runs once during the dispatch sequence and
+                // immediately pushes the pointer into KernelArgs;
+                // after that the writeback (when present) and/or
+                // the `input_cache` Arc keep the buffer alive
+                // through the launch and synchronize.
+                let _ = &arc;
+                let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
+                args.push_device_ptr(buf_ref).push_i32(len32)
+            });
             let bytes_uploaded = if uploaded { len * $elem_size } else { 0 };
             (push, wb_opt, bytes_uploaded)
         }};
@@ -2832,22 +2931,46 @@ fn marshal_array_arg(
 
     let (push, wb, bytes_uploaded) = match element_type {
         ArrayElementType::Int => arm!(
-            i32, I32, gpu_marshal::upload_obj_i32,
-            input_cache::get_i32, input_cache::put_i32, "i32", 4
+            i32,
+            I32,
+            gpu_marshal::upload_obj_i32,
+            input_cache::get_i32,
+            input_cache::put_i32,
+            "i32",
+            4
         ),
         ArrayElementType::Long => arm!(
-            i64, I64, gpu_marshal::upload_obj_i64,
-            input_cache::get_i64, input_cache::put_i64, "i64", 8
+            i64,
+            I64,
+            gpu_marshal::upload_obj_i64,
+            input_cache::get_i64,
+            input_cache::put_i64,
+            "i64",
+            8
         ),
         ArrayElementType::Float => arm!(
-            f32, F32, gpu_marshal::upload_obj_f32,
-            input_cache::get_f32, input_cache::put_f32, "f32", 4
+            f32,
+            F32,
+            gpu_marshal::upload_obj_f32,
+            input_cache::get_f32,
+            input_cache::put_f32,
+            "f32",
+            4
         ),
         ArrayElementType::Double => arm!(
-            f64, F64, gpu_marshal::upload_obj_f64,
-            input_cache::get_f64, input_cache::put_f64, "f64", 8
+            f64,
+            F64,
+            gpu_marshal::upload_obj_f64,
+            input_cache::get_f64,
+            input_cache::put_f64,
+            "f64",
+            8
         ),
-        other => return Err(format!("submitMethod: unsupported array element type: {other:?}")),
+        other => {
+            return Err(format!(
+                "submitMethod: unsupported array element type: {other:?}"
+            ))
+        }
     };
     Ok((push, wb, bytes_uploaded))
 }

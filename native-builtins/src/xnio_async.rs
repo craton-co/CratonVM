@@ -603,9 +603,11 @@ fn builder_from_this(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Arc<BuilderInner>, MethodCallFailed> {
-    let h = ctx.get_field(this, OMB_PENDING_HANDLE).as_long().unwrap_or(0);
-    lookup_builder(h)
-        .ok_or_else(|| ise("OptionMap.Builder: stale or unknown handle"))
+    let h = ctx
+        .get_field(this, OMB_PENDING_HANDLE)
+        .as_long()
+        .unwrap_or(0);
+    lookup_builder(h).ok_or_else(|| ise("OptionMap.Builder: stale or unknown handle"))
 }
 
 fn check_builder_live(b: &BuilderInner) -> Result<(), MethodCallFailed> {
@@ -636,8 +638,8 @@ fn native_builder_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let b = builder_from_this(ctx, this)?;
     check_builder_live(&b)?;
 
-    let (decl, name) = read_option_coords(ctx, opt)
-        .ok_or_else(|| iae("Builder.set: option has no name"))?;
+    let (decl, name) =
+        read_option_coords(ctx, opt).ok_or_else(|| iae("Builder.set: option has no name"))?;
     let key = OptionKey {
         declaring_class: decl,
         name,
@@ -708,7 +710,10 @@ fn inner_from_map(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Arc<OptionMapInner>, MethodCallFailed> {
-    let h = ctx.get_field(this, OM_ENTRIES_HANDLE).as_long().unwrap_or(0);
+    let h = ctx
+        .get_field(this, OM_ENTRIES_HANDLE)
+        .as_long()
+        .unwrap_or(0);
     lookup_map(h).ok_or_else(|| ise("OptionMap: stale or unknown handle"))
 }
 
@@ -757,9 +762,11 @@ fn native_option_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         declaring_class: decl,
         name,
     };
-    Ok(Some(Value::Int(
-        if inner.entries.contains_key(&key) { 1 } else { 0 },
-    )))
+    Ok(Some(Value::Int(if inner.entries.contains_key(&key) {
+        1
+    } else {
+        0
+    })))
 }
 
 /// `OptionMap.size()I`
@@ -936,16 +943,28 @@ fn lookup_options_field(ctx: &mut dyn NativeContext, name: &str) -> MethodCallRe
     }
 }
 
-fn native_options_get_worker_io_threads(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_worker_io_threads(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "WORKER_IO_THREADS")
 }
-fn native_options_get_worker_task_core_threads(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_worker_task_core_threads(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "WORKER_TASK_CORE_THREADS")
 }
-fn native_options_get_worker_task_max_threads(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_worker_task_max_threads(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "WORKER_TASK_MAX_THREADS")
 }
-fn native_options_get_worker_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_worker_name(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "WORKER_NAME")
 }
 fn native_options_get_backlog(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -954,19 +973,34 @@ fn native_options_get_backlog(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
 fn native_options_get_keep_alive(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     lookup_options_field(ctx, "KEEP_ALIVE")
 }
-fn native_options_get_tcp_nodelay(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_tcp_nodelay(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "TCP_NODELAY")
 }
-fn native_options_get_reuse_addresses(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_reuse_addresses(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "REUSE_ADDRESSES")
 }
-fn native_options_get_read_timeout(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_read_timeout(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "READ_TIMEOUT")
 }
-fn native_options_get_write_timeout(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_write_timeout(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "WRITE_TIMEOUT")
 }
-fn native_options_get_ssl_enabled(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_options_get_ssl_enabled(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     lookup_options_field(ctx, "SSL_ENABLED")
 }
 
@@ -977,7 +1011,11 @@ fn native_options_get_ssl_enabled(ctx: &mut dyn NativeContext, _args: &[Value]) 
 fn alloc_io_future(ctx: &mut dyn NativeContext, inner: Arc<IoFutureInner>) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "org/xnio/IoFuture", 3);
     let h = register_future(inner.clone());
-    ctx.set_field(obj, IOF_STATUS, Value::Int(inner.status.load(Ordering::SeqCst) as i32));
+    ctx.set_field(
+        obj,
+        IOF_STATUS,
+        Value::Int(inner.status.load(Ordering::SeqCst) as i32),
+    );
     ctx.set_field(obj, IOF_RESULT_SLOT, Value::Long(h));
     ctx.set_field(obj, IOF_NOTIFIER_LIST, Value::Long(h));
     obj
@@ -1359,12 +1397,7 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
         "(Lorg/xnio/Option;)Z",
         native_option_map_contains,
     );
-    registry.register(
-        "org/xnio/OptionMap",
-        "size",
-        "()I",
-        native_option_map_size,
-    );
+    registry.register("org/xnio/OptionMap", "size", "()I", native_option_map_size);
 
     // Builder
     registry.register(
@@ -1420,17 +1453,72 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
     // Accessors for each well-known field. Registered as top-level fn
     // pointers (not closures) because the native registry stores raw
     // function pointers.
-    registry.register("org/xnio/Options", "getWORKER_IO_THREADS", "()Lorg/xnio/Option;", native_options_get_worker_io_threads);
-    registry.register("org/xnio/Options", "getWORKER_TASK_CORE_THREADS", "()Lorg/xnio/Option;", native_options_get_worker_task_core_threads);
-    registry.register("org/xnio/Options", "getWORKER_TASK_MAX_THREADS", "()Lorg/xnio/Option;", native_options_get_worker_task_max_threads);
-    registry.register("org/xnio/Options", "getWORKER_NAME", "()Lorg/xnio/Option;", native_options_get_worker_name);
-    registry.register("org/xnio/Options", "getBACKLOG", "()Lorg/xnio/Option;", native_options_get_backlog);
-    registry.register("org/xnio/Options", "getKEEP_ALIVE", "()Lorg/xnio/Option;", native_options_get_keep_alive);
-    registry.register("org/xnio/Options", "getTCP_NODELAY", "()Lorg/xnio/Option;", native_options_get_tcp_nodelay);
-    registry.register("org/xnio/Options", "getREUSE_ADDRESSES", "()Lorg/xnio/Option;", native_options_get_reuse_addresses);
-    registry.register("org/xnio/Options", "getREAD_TIMEOUT", "()Lorg/xnio/Option;", native_options_get_read_timeout);
-    registry.register("org/xnio/Options", "getWRITE_TIMEOUT", "()Lorg/xnio/Option;", native_options_get_write_timeout);
-    registry.register("org/xnio/Options", "getSSL_ENABLED", "()Lorg/xnio/Option;", native_options_get_ssl_enabled);
+    registry.register(
+        "org/xnio/Options",
+        "getWORKER_IO_THREADS",
+        "()Lorg/xnio/Option;",
+        native_options_get_worker_io_threads,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getWORKER_TASK_CORE_THREADS",
+        "()Lorg/xnio/Option;",
+        native_options_get_worker_task_core_threads,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getWORKER_TASK_MAX_THREADS",
+        "()Lorg/xnio/Option;",
+        native_options_get_worker_task_max_threads,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getWORKER_NAME",
+        "()Lorg/xnio/Option;",
+        native_options_get_worker_name,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getBACKLOG",
+        "()Lorg/xnio/Option;",
+        native_options_get_backlog,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getKEEP_ALIVE",
+        "()Lorg/xnio/Option;",
+        native_options_get_keep_alive,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getTCP_NODELAY",
+        "()Lorg/xnio/Option;",
+        native_options_get_tcp_nodelay,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getREUSE_ADDRESSES",
+        "()Lorg/xnio/Option;",
+        native_options_get_reuse_addresses,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getREAD_TIMEOUT",
+        "()Lorg/xnio/Option;",
+        native_options_get_read_timeout,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getWRITE_TIMEOUT",
+        "()Lorg/xnio/Option;",
+        native_options_get_write_timeout,
+    );
+    registry.register(
+        "org/xnio/Options",
+        "getSSL_ENABLED",
+        "()Lorg/xnio/Option;",
+        native_options_get_ssl_enabled,
+    );
 
     // IoFuture
     registry.register(
@@ -1582,7 +1670,12 @@ mod tests {
     #[test]
     fn t19_7_e_option_simple_creates_option_with_type() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "WORKER_IO_THREADS", "java/lang/Integer");
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "WORKER_IO_THREADS",
+            "java/lang/Integer",
+        );
         // Field 1 should be the name string.
         let name_val = native_option_get_name(&mut ctx, &[Value::Object(Some(opt))])
             .unwrap()
@@ -1593,7 +1686,10 @@ mod tests {
         };
         assert_eq!(name, "WORKER_IO_THREADS");
         // Type should round-trip.
-        assert_eq!(read_option_type(&ctx, opt).as_deref(), Some("java/lang/Integer"));
+        assert_eq!(
+            read_option_type(&ctx, opt).as_deref(),
+            Some("java/lang/Integer")
+        );
     }
 
     #[test]
@@ -1609,7 +1705,12 @@ mod tests {
     #[test]
     fn t19_7_e_option_map_builder_set_get_round_trip() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "WORKER_IO_THREADS", "java/lang/Integer");
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "WORKER_IO_THREADS",
+            "java/lang/Integer",
+        );
         let b = new_builder(&mut ctx);
         // set(Option, I)
         native_builder_set(
@@ -1671,7 +1772,12 @@ mod tests {
     #[test]
     fn t19_7_e_option_map_immutable_after_build() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "WORKER_IO_THREADS", "java/lang/Integer");
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "WORKER_IO_THREADS",
+            "java/lang/Integer",
+        );
         let b = new_builder(&mut ctx);
         native_builder_set(
             &mut ctx,
@@ -1885,11 +1991,8 @@ mod tests {
         );
 
         // Complete the future → notifier list drained.
-        native_future_result_set_result(
-            &mut ctx,
-            &[Value::Object(Some(fr)), Value::Object(None)],
-        )
-        .unwrap();
+        native_future_result_set_result(&mut ctx, &[Value::Object(Some(fr)), Value::Object(None)])
+            .unwrap();
         assert_eq!(
             inner.state.lock().notifiers.len(),
             0,
@@ -1959,13 +2062,15 @@ mod tests {
     #[test]
     fn t19_7_e_option_cast_null_is_accepted() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "WORKER_NAME", "java/lang/String");
-        let r = native_option_cast(
+        let opt = make_option(
             &mut ctx,
-            &[Value::Object(Some(opt)), Value::Object(None)],
-        )
-        .unwrap()
-        .unwrap();
+            "org/xnio/Options",
+            "WORKER_NAME",
+            "java/lang/String",
+        );
+        let r = native_option_cast(&mut ctx, &[Value::Object(Some(opt)), Value::Object(None)])
+            .unwrap()
+            .unwrap();
         assert_eq!(r, Value::Object(None));
     }
 
@@ -1990,7 +2095,12 @@ mod tests {
     #[test]
     fn t19_7_e_option_parse_value_boolean_true() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "TCP_NODELAY", "java/lang/Boolean");
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "TCP_NODELAY",
+            "java/lang/Boolean",
+        );
         let s = ctx.create_string("TRUE");
         let r = native_option_parse_value(
             &mut ctx,
@@ -2026,7 +2136,12 @@ mod tests {
     #[test]
     fn t19_7_e_option_map_get_bool_round_trip() {
         let mut ctx = mock_ctx();
-        let opt = make_option(&mut ctx, "org/xnio/Options", "KEEP_ALIVE", "java/lang/Boolean");
+        let opt = make_option(
+            &mut ctx,
+            "org/xnio/Options",
+            "KEEP_ALIVE",
+            "java/lang/Boolean",
+        );
         let b = new_builder(&mut ctx);
         // set(Option, Z)
         native_builder_set_bool(

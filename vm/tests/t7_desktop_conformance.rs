@@ -104,12 +104,14 @@ fn t7_2_7_edt_safety() {
     assert!(edt_inst.is_running());
 
     // Post events
-    use cratonvm_native_awt::event::{AwtEvent, AwtEventData, PeerId, event_id};
+    use cratonvm_native_awt::event::{event_id, AwtEvent, AwtEventData, PeerId};
     let evt = AwtEvent {
         id: event_id::ACTION_PERFORMED,
         source_peer_id: PeerId(1),
         timestamp: 0,
-        data: AwtEventData::Action { command: "test".to_string() },
+        data: AwtEventData::Action {
+            command: "test".to_string(),
+        },
     };
     edt_inst.post_event(evt);
     assert_eq!(edt_inst.queue_length(), 1);
@@ -127,7 +129,7 @@ fn t7_2_7_edt_safety() {
 
 #[test]
 fn t7_2_peer_registry() {
-    use cratonvm_native_awt::peer::{PeerRegistry, ComponentType};
+    use cratonvm_native_awt::peer::{ComponentType, PeerRegistry};
 
     let mut reg = PeerRegistry::new();
     let frame_id = reg.create_peer(ComponentType::Frame);
@@ -207,7 +209,10 @@ fn t7_3_2_fill_shapes() {
     assert_eq!(pixels[idx], 0xFF0000FF, "filled rect center should be blue");
 
     let idx_outside = (5 * 100 + 5) as usize;
-    assert_eq!(pixels[idx_outside], 0x00000000, "outside should be transparent");
+    assert_eq!(
+        pixels[idx_outside], 0x00000000,
+        "outside should be transparent"
+    );
 
     eprintln!("[t7] Shape filling (rect): OK");
 }
@@ -223,7 +228,10 @@ fn t7_3_3_antialiasing_hint() {
     // Just verify no panic — AA diagonal line should have coverage variation
     let pixels = r.pixels();
     let center = pixels[(50 * 100 + 50) as usize];
-    assert_ne!(center, 0x00000000, "diagonal line center should have a pixel");
+    assert_ne!(
+        center, 0x00000000,
+        "diagonal line center should have a pixel"
+    );
 
     eprintln!("[t7] Antialiasing hint applied: OK");
 }
@@ -277,7 +285,10 @@ fn t7_3_5_image_rendering_bilinear() {
     let pixels = r.pixels();
     let center_idx = (30 * 100 + 30) as usize;
     let pixel = pixels[center_idx];
-    assert_ne!(pixel, 0x00000000, "center should not be transparent after scaled blit");
+    assert_ne!(
+        pixel, 0x00000000,
+        "center should not be transparent after scaled blit"
+    );
 
     eprintln!("[t7] Bilinear image rendering: OK");
 }
@@ -319,21 +330,32 @@ fn t7_color_operations() {
 
 #[test]
 fn t7_font_metrics() {
-    use cratonvm_native_awt::font::{FontEngine, FontSpec, PLAIN, BOLD};
+    use cratonvm_native_awt::font::{FontEngine, FontSpec, BOLD, PLAIN};
 
     let mut engine = FontEngine::new();
 
-    let spec = FontSpec { family: "Dialog".to_string(), style: PLAIN, size: 12 };
+    let spec = FontSpec {
+        family: "Dialog".to_string(),
+        style: PLAIN,
+        size: 12,
+    };
     let metrics = engine.get_metrics(&spec);
     assert!(metrics.ascent > 0);
     assert!(metrics.descent > 0);
     assert!(metrics.height > 0);
-    assert_eq!(metrics.height, metrics.ascent + metrics.descent + metrics.leading);
+    assert_eq!(
+        metrics.height,
+        metrics.ascent + metrics.descent + metrics.leading
+    );
 
     let width = engine.string_width(&spec, "Hello, World!");
     assert!(width > 0);
 
-    let big_spec = FontSpec { family: "Dialog".to_string(), style: BOLD, size: 24 };
+    let big_spec = FontSpec {
+        family: "Dialog".to_string(),
+        style: BOLD,
+        size: 24,
+    };
     let big_metrics = engine.get_metrics(&big_spec);
     assert!(big_metrics.height > metrics.height);
 
@@ -360,7 +382,10 @@ fn t7_graphics2d_state() {
     let mut state2 = Graphics2DState::create(100, 100);
     state2.set_color(0, 255, 0, 255);
     let t2 = state2.get_transform();
-    assert!(t2.is_identity(), "fresh Graphics2D should have identity transform");
+    assert!(
+        t2.is_identity(),
+        "fresh Graphics2D should have identity transform"
+    );
 
     // Dispose should not panic
     state.dispose();
@@ -375,12 +400,19 @@ fn t7_graphics2d_state() {
 
 #[test]
 fn t7_clipboard_operations() {
-    use cratonvm_native_awt::clipboard::{ClipboardManager, ClipboardKind, DataFlavor};
+    use cratonvm_native_awt::clipboard::{ClipboardKind, ClipboardManager, DataFlavor};
 
     let mut clip = ClipboardManager::new();
-    clip.set_text(ClipboardKind::System, "Hello from CratonVM".to_string(), None);
+    clip.set_text(
+        ClipboardKind::System,
+        "Hello from CratonVM".to_string(),
+        None,
+    );
 
-    assert_eq!(clip.get_text(ClipboardKind::System), Some("Hello from CratonVM"));
+    assert_eq!(
+        clip.get_text(ClipboardKind::System),
+        Some("Hello from CratonVM")
+    );
     assert!(clip.has_flavor(ClipboardKind::System, &DataFlavor::StringFlavor));
 
     let flavors = clip.available_flavors(ClipboardKind::System);
@@ -401,8 +433,10 @@ fn t7_4_1_javafx_documented_as_out_of_tree() {
         "docs/javafx-status.md should exist documenting JavaFX as out-of-tree"
     );
     let content = std::fs::read_to_string(doc_path).unwrap();
-    assert!(content.contains("out-of-tree") || content.contains("Gluon"),
-        "javafx-status.md should document JavaFX as out-of-tree/Gluon-supplied");
+    assert!(
+        content.contains("out-of-tree") || content.contains("Gluon"),
+        "javafx-status.md should document JavaFX as out-of-tree/Gluon-supplied"
+    );
     eprintln!("[t7] JavaFX documented as out-of-tree: OK");
 }
 
@@ -461,5 +495,8 @@ fn t7_5_4_readiness_measurement() {
     let count = registry.len();
     eprintln!("[t7] AWT/Swing native methods: {count}");
     eprintln!("[t7] T7 desktop support is functional (headless)");
-    assert!(count >= 50, "Expected >= 50 AWT natives for desktop support");
+    assert!(
+        count >= 50,
+        "Expected >= 50 AWT natives for desktop support"
+    );
 }

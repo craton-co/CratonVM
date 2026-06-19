@@ -340,7 +340,10 @@ fn code_source_defaults_to_runtime_url_when_unsupplied() {
         url.starts_with("file:/runtime-defined/"),
         "synthetic URL must start with file:/runtime-defined/, got: {url}",
     );
-    assert!(url.ends_with(".class"), "synthetic URL must end with .class, got: {url}");
+    assert!(
+        url.ends_with(".class"),
+        "synthetic URL must end with .class, got: {url}"
+    );
 }
 
 /// WP2.3-A — caller-supplied CodeSource takes precedence over the
@@ -483,7 +486,11 @@ fn hidden_class_repeated_mangling_remains_unique() {
             "every hidden class must have a unique stored name, but {n} repeated",
         );
     }
-    assert_eq!(seen_names.len(), 5, "5 distinct hidden class identities must be registered");
+    assert_eq!(
+        seen_names.len(),
+        5,
+        "5 distinct hidden class identities must be registered"
+    );
 }
 
 /// WP2.3-A — defining the same name with a different code_source per
@@ -515,8 +522,20 @@ fn hidden_classes_carry_independent_code_sources() {
         .define_class_with_options("Hello/TplA", &bytes, ClassLoaderId::Application, opts2)
         .expect("second hidden define ok (auto-mangled)");
     assert_ne!(id1, id2);
-    let cs1 = cm.class_store.get(id1).unwrap().code_source.as_ref().unwrap();
-    let cs2 = cm.class_store.get(id2).unwrap().code_source.as_ref().unwrap();
+    let cs1 = cm
+        .class_store
+        .get(id1)
+        .unwrap()
+        .code_source
+        .as_ref()
+        .unwrap();
+    let cs2 = cm
+        .class_store
+        .get(id2)
+        .unwrap()
+        .code_source
+        .as_ref()
+        .unwrap();
     assert_eq!(cs1.url.as_deref(), Some("file:/A.jar"));
     assert_eq!(cs2.url.as_deref(), Some("file:/B.jar"));
 }

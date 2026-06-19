@@ -10,12 +10,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
 use cratonvm_reader::class_access_flags::ClassAccessFlags;
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::field::ClassFileField;
 use cratonvm_reader::method::ClassFileMethod;
+use rustc_hash::FxHashSet;
 
 // ---------------------------------------------------------------------------
 // ClassState — the class lifecycle state machine (JVM spec 5.5)
@@ -169,10 +169,8 @@ fn sha256_hex(data: &[u8]) -> String {
             ]);
         }
         for i in 16..64 {
-            let s0 =
-                w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 =
-                w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
             w[i] = w[i - 16]
                 .wrapping_add(s0)
                 .wrapping_add(w[i - 7])
@@ -965,7 +963,9 @@ pub fn find_method_recursive<'a>(
     let mut current_id = class_id;
     let mut abstract_fallback: Option<(&'a ClassFileMethod, ClassId)> = None;
     loop {
-        let Some(class) = store.get(current_id) else { break };
+        let Some(class) = store.get(current_id) else {
+            break;
+        };
         if let Some(method) = class.find_method(method_name, method_descriptor) {
             if !method.is_abstract() {
                 // Concrete method (has a Code attribute, or is ACC_NATIVE) —
@@ -1132,7 +1132,8 @@ mod tests {
             name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Loaded, initializing_thread: None,
+            state: ClassState::Loaded,
+            initializing_thread: None,
             constant_pool: empty_constant_pool(),
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
             superclass,
@@ -1628,8 +1629,7 @@ mod tests {
         }
 
         // Look up "base_field" from the leaf class — must walk 99 levels.
-        let (idx, field, declaring) =
-            find_field_recursive(prev_id, "base_field", &store).unwrap();
+        let (idx, field, declaring) = find_field_recursive(prev_id, "base_field", &store).unwrap();
         assert_eq!(&*field.name, "base_field");
         assert_eq!(idx, 0);
         assert_eq!(declaring, root_id);
@@ -1741,8 +1741,7 @@ mod tests {
             0,
         ));
 
-        let (_, declaring) =
-            find_method_recursive(child_id, "run", "()V", &store).unwrap();
+        let (_, declaring) = find_method_recursive(child_id, "run", "()V", &store).unwrap();
         assert_eq!(declaring, child_id);
     }
 
@@ -1821,10 +1820,18 @@ mod tests {
         superinterfaces: Vec<ClassId>,
         methods: Vec<ClassFileMethod>,
     ) -> Class {
-        let mut c = make_class(id, name, Some(object_id), superinterfaces, vec![], methods, 0, 0);
-        c.access_flags = ClassAccessFlags::PUBLIC
-            | ClassAccessFlags::INTERFACE
-            | ClassAccessFlags::ABSTRACT;
+        let mut c = make_class(
+            id,
+            name,
+            Some(object_id),
+            superinterfaces,
+            vec![],
+            methods,
+            0,
+            0,
+        );
+        c.access_flags =
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT;
         c
     }
 
@@ -1834,40 +1841,75 @@ mod tests {
 
         // Object (no superclass)
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // Interface Greeting with abstract greet() and default shout()
         let iface_id = store.next_id();
         store.add(make_class(
-            iface_id, "Greeting", Some(obj_id), vec![],
+            iface_id,
+            "Greeting",
+            Some(obj_id),
+            vec![],
             vec![],
             vec![
                 make_abstract_method("greet", "(Ljava/lang/String;)Ljava/lang/String;"),
                 make_default_method("shout", "(Ljava/lang/String;)Ljava/lang/String;"),
             ],
-            0, 0,
+            0,
+            0,
         ));
 
         // Concrete class CasualGreeting implements Greeting, has greet() but NOT shout()
         let class_id = store.next_id();
         store.add(make_class(
-            class_id, "CasualGreeting", Some(obj_id), vec![iface_id],
+            class_id,
+            "CasualGreeting",
+            Some(obj_id),
+            vec![iface_id],
             vec![],
-            vec![
-                make_method("greet", "(Ljava/lang/String;)Ljava/lang/String;"),
-            ],
-            0, 0,
+            vec![make_method(
+                "greet",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            )],
+            0,
+            0,
         ));
 
         // greet() is on the concrete class → found directly
-        let found = find_method_recursive(class_id, "greet", "(Ljava/lang/String;)Ljava/lang/String;", &store);
+        let found = find_method_recursive(
+            class_id,
+            "greet",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &store,
+        );
         assert!(found.is_some(), "greet should be found on concrete class");
         assert_eq!(found.unwrap().1, class_id);
 
         // shout() is a default method on the interface → should be found via interface walk
-        let found = find_method_recursive(class_id, "shout", "(Ljava/lang/String;)Ljava/lang/String;", &store);
-        assert!(found.is_some(), "default method shout should be found via interface");
-        assert_eq!(found.unwrap().1, iface_id, "shout should resolve to the Greeting interface");
+        let found = find_method_recursive(
+            class_id,
+            "shout",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &store,
+        );
+        assert!(
+            found.is_some(),
+            "default method shout should be found via interface"
+        );
+        assert_eq!(
+            found.unwrap().1,
+            iface_id,
+            "shout should resolve to the Greeting interface"
+        );
     }
 
     #[test]
@@ -1882,7 +1924,16 @@ mod tests {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // Shared interface: default f()
         let shared_id = store.next_id();
@@ -1945,22 +1996,38 @@ mod tests {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // Interface with only abstract method (no default)
         let iface_id = store.next_id();
         store.add(make_interface(
-            iface_id, "Runnable", obj_id, vec![],
+            iface_id,
+            "Runnable",
+            obj_id,
+            vec![],
             vec![make_abstract_method("run", "()V")],
         ));
 
         // Concrete class implementing Runnable with run()
         let class_id = store.next_id();
         store.add(make_class(
-            class_id, "MyTask", Some(obj_id), vec![iface_id],
+            class_id,
+            "MyTask",
+            Some(obj_id),
+            vec![iface_id],
             vec![],
             vec![make_method("run", "()V")],
-            0, 0,
+            0,
+            0,
         ));
 
         // run() found on concrete class — the concrete declaration must win
@@ -1990,20 +2057,38 @@ mod tests {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // `Future` — declares `cancel(Z)Z` abstractly.
         let future_id = store.next_id();
         store.add(make_interface(
-            future_id, "java/util/concurrent/Future", obj_id, vec![],
+            future_id,
+            "java/util/concurrent/Future",
+            obj_id,
+            vec![],
             vec![make_abstract_method("cancel", "(Z)Z")],
         ));
 
         // `Delayed` — sibling superinterface, declares nothing relevant.
         let delayed_id = store.next_id();
         store.add(make_interface(
-            delayed_id, "java/util/concurrent/Delayed", obj_id, vec![],
-            vec![make_abstract_method("getDelay", "(Ljava/util/concurrent/TimeUnit;)J")],
+            delayed_id,
+            "java/util/concurrent/Delayed",
+            obj_id,
+            vec![],
+            vec![make_abstract_method(
+                "getDelay",
+                "(Ljava/util/concurrent/TimeUnit;)J",
+            )],
         ));
 
         // `ScheduledFuture extends Delayed, Future` — declares no methods of
@@ -2037,34 +2122,62 @@ mod tests {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // Super-interface with default method
         let super_iface_id = store.next_id();
         store.add(make_class(
-            super_iface_id, "Base", Some(obj_id), vec![],
+            super_iface_id,
+            "Base",
+            Some(obj_id),
+            vec![],
             vec![],
             vec![make_default_method("baseMethod", "()V")],
-            0, 0,
+            0,
+            0,
         ));
 
         // Sub-interface extending Base (no new methods)
         let sub_iface_id = store.next_id();
         store.add(make_class(
-            sub_iface_id, "Extended", Some(obj_id), vec![super_iface_id],
-            vec![], vec![], 0, 0,
+            sub_iface_id,
+            "Extended",
+            Some(obj_id),
+            vec![super_iface_id],
+            vec![],
+            vec![],
+            0,
+            0,
         ));
 
         // Concrete class implements Extended (which extends Base)
         let class_id = store.next_id();
         store.add(make_class(
-            class_id, "Impl", Some(obj_id), vec![sub_iface_id],
-            vec![], vec![], 0, 0,
+            class_id,
+            "Impl",
+            Some(obj_id),
+            vec![sub_iface_id],
+            vec![],
+            vec![],
+            0,
+            0,
         ));
 
         // baseMethod() should be found on the super-interface
         let found = find_method_recursive(class_id, "baseMethod", "()V", &store);
-        assert!(found.is_some(), "default method on super-interface should be found");
+        assert!(
+            found.is_some(),
+            "default method on super-interface should be found"
+        );
         assert_eq!(found.unwrap().1, super_iface_id);
     }
 
@@ -2073,26 +2186,51 @@ mod tests {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
-        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+        store.add(make_class(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
 
         // Interface with default method
         let iface_id = store.next_id();
         store.add(make_class(
-            iface_id, "Iface", Some(obj_id), vec![],
-            vec![], vec![make_default_method("doIt", "()V")], 0, 0,
+            iface_id,
+            "Iface",
+            Some(obj_id),
+            vec![],
+            vec![],
+            vec![make_default_method("doIt", "()V")],
+            0,
+            0,
         ));
 
         // Concrete class overrides the default method
         let class_id = store.next_id();
         store.add(make_class(
-            class_id, "Impl", Some(obj_id), vec![iface_id],
-            vec![], vec![make_method("doIt", "()V")], 0, 0,
+            class_id,
+            "Impl",
+            Some(obj_id),
+            vec![iface_id],
+            vec![],
+            vec![make_method("doIt", "()V")],
+            0,
+            0,
         ));
 
         // Should find the override on the concrete class, NOT the default
         let found = find_method_recursive(class_id, "doIt", "()V", &store);
         assert!(found.is_some());
-        assert_eq!(found.unwrap().1, class_id, "concrete override takes priority over default");
+        assert_eq!(
+            found.unwrap().1,
+            class_id,
+            "concrete override takes priority over default"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2142,26 +2280,8 @@ mod tests {
         // name and descriptor must share the same Arc<str> between the two.
         let methods_a = vec![make_method("run", "()V")];
         let methods_b = vec![make_method("run", "()V")];
-        let class_a = make_class(
-            ClassId::new(0),
-            "A",
-            None,
-            vec![],
-            vec![],
-            methods_a,
-            0,
-            0,
-        );
-        let class_b = make_class(
-            ClassId::new(1),
-            "B",
-            None,
-            vec![],
-            vec![],
-            methods_b,
-            0,
-            0,
-        );
+        let class_a = make_class(ClassId::new(0), "A", None, vec![], vec![], methods_a, 0, 0);
+        let class_b = make_class(ClassId::new(1), "B", None, vec![], vec![], methods_b, 0, 0);
 
         let name_a = class_a.interned_method_name(0).unwrap();
         let name_b = class_b.interned_method_name(0).unwrap();
@@ -2178,26 +2298,8 @@ mod tests {
     fn t10_intern_field_name_and_descriptor_shared() {
         let fields_a = vec![make_field("count")];
         let fields_b = vec![make_field("count")];
-        let class_a = make_class(
-            ClassId::new(0),
-            "A",
-            None,
-            vec![],
-            fields_a,
-            vec![],
-            0,
-            1,
-        );
-        let class_b = make_class(
-            ClassId::new(1),
-            "B",
-            None,
-            vec![],
-            fields_b,
-            vec![],
-            0,
-            1,
-        );
+        let class_a = make_class(ClassId::new(0), "A", None, vec![], fields_a, vec![], 0, 1);
+        let class_b = make_class(ClassId::new(1), "B", None, vec![], fields_b, vec![], 0, 1);
 
         let name_a = class_a.interned_field_name(0).unwrap();
         let name_b = class_b.interned_field_name(0).unwrap();
@@ -2212,16 +2314,7 @@ mod tests {
 
     #[test]
     fn t10_intern_out_of_range_returns_none() {
-        let class = make_class(
-            ClassId::new(0),
-            "Empty",
-            None,
-            vec![],
-            vec![],
-            vec![],
-            0,
-            0,
-        );
+        let class = make_class(ClassId::new(0), "Empty", None, vec![], vec![], vec![], 0, 0);
         assert!(class.interned_method_name(0).is_none());
         assert!(class.interned_method_descriptor(0).is_none());
         assert!(class.interned_field_name(0).is_none());

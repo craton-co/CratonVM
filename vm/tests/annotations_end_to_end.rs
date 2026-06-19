@@ -84,9 +84,7 @@ fn fixture_exists(class_name: &str) -> bool {
 /// `OffloadCache` API only needs `(class_id, class_name,
 /// method_index, &ClassFileMethod)`, so we don't go through the heavy
 /// `cratonvm_classloading::Class` path.
-fn load_methods(
-    class_name: &str,
-) -> (Vec<ClassFileMethod>, String, cratonvm_reader::ConstantPool) {
+fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String, cratonvm_reader::ConstantPool) {
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
@@ -97,10 +95,7 @@ fn load_methods(
 
 /// Pick the (first) method with a given name. Phase 1 fixtures each
 /// expose a single kernel method, so name-only lookup is enough.
-fn method_by_name<'a>(
-    methods: &'a [ClassFileMethod],
-    name: &str,
-) -> (u16, &'a ClassFileMethod) {
+fn method_by_name<'a>(methods: &'a [ClassFileMethod], name: &str) -> (u16, &'a ClassFileMethod) {
     let idx = methods
         .iter()
         .position(|m| &*m.name == name)
@@ -220,9 +215,7 @@ fn excluded_kernel_blacklisted() {
 #[ignore = "depends on Items 3/4 annotation-aware cache and Item 7 fixture"]
 fn excluded_and_kernel_exclude_wins() {
     if !fixture_exists("ExcludedAndKernel") {
-        eprintln!(
-            "[annotations] skipping excluded_and_kernel_exclude_wins: fixture missing"
-        );
+        eprintln!("[annotations] skipping excluded_and_kernel_exclude_wins: fixture missing");
         return;
     }
     let (methods, class_name, cp) = load_methods("ExcludedAndKernel");
@@ -281,9 +274,7 @@ fn warmup_class_compiles_two() {
 #[ignore = "depends on Items 3/4 annotation-aware analyzer and Item 7 fixture"]
 fn strict_rejects_allocation() {
     if !fixture_exists("StrictRejectsAllocation") {
-        eprintln!(
-            "[annotations] skipping strict_rejects_allocation: fixture missing"
-        );
+        eprintln!("[annotations] skipping strict_rejects_allocation: fixture missing");
         return;
     }
     let (methods, _class_name, _cp) = load_methods("StrictRejectsAllocation");

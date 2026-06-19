@@ -240,8 +240,14 @@ mod tests {
     fn layout_offsets_match_jit_contract() {
         let s = ShadowStack::empty();
         let base = &s as *const ShadowStack as usize;
-        assert_eq!(&s.top as *const usize as usize - base, ShadowStack::TOP_OFFSET);
-        assert_eq!(&s.end as *const usize as usize - base, ShadowStack::END_OFFSET);
+        assert_eq!(
+            &s.top as *const usize as usize - base,
+            ShadowStack::TOP_OFFSET
+        );
+        assert_eq!(
+            &s.end as *const usize as usize - base,
+            ShadowStack::END_OFFSET
+        );
     }
 
     #[test]

@@ -96,7 +96,10 @@ impl AllocHandle {
     /// Construct a handle from its parts. Normally obtained from
     /// [`NativeMemoryTable::allocate_handle`] rather than built by hand.
     pub fn new(alloc_id: i64, generation: u64) -> Self {
-        Self { alloc_id, generation }
+        Self {
+            alloc_id,
+            generation,
+        }
     }
 }
 
@@ -159,8 +162,14 @@ impl NativeMemoryTable {
         // a stale handle to be *rejected*, never wrongly accepted.
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
-        self.allocations
-            .insert(id, NativeAllocation { ptr, layout, generation });
+        self.allocations.insert(
+            id,
+            NativeAllocation {
+                ptr,
+                layout,
+                generation,
+            },
+        );
         // Keep the running `live_bytes` total in sync. `id` is a fresh
         // monotonic counter, so this `insert` never replaces an entry.
         self.live_bytes += layout.size();
@@ -662,9 +671,15 @@ mod tests {
         // Whole-allocation window is valid and equals the base pointer.
         assert_eq!(table.get_ptr_checked(id, 0, 64), Some(base));
         // Interior window is valid and offset correctly.
-        assert_eq!(table.get_ptr_checked(id, 16, 8), Some(unsafe { base.add(16) }));
+        assert_eq!(
+            table.get_ptr_checked(id, 16, 8),
+            Some(unsafe { base.add(16) })
+        );
         // One-past-the-end zero-length window is allowed.
-        assert_eq!(table.get_ptr_checked(id, 64, 0), Some(unsafe { base.add(64) }));
+        assert_eq!(
+            table.get_ptr_checked(id, 64, 0),
+            Some(unsafe { base.add(64) })
+        );
         // Past the end fails closed.
         assert!(table.get_ptr_checked(id, 60, 8).is_none());
         assert!(table.get_ptr_checked(id, 65, 0).is_none());
@@ -763,8 +778,7 @@ mod tests {
         //   3. the running `live_bytes` total is unchanged, and
         //   4. the dedicated free-on-exhaustion path actually ran,
         //      witnessed via the `EXHAUSTION_DEALLOCS` test counter.
-        let before = test_hooks::EXHAUSTION_DEALLOCS
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let before = test_hooks::EXHAUSTION_DEALLOCS.load(std::sync::atomic::Ordering::Relaxed);
         let mut table = NativeMemoryTable::new();
         table.next_id = i64::MAX;
         let result = table.allocate(4096, 8);
@@ -774,8 +788,7 @@ mod tests {
             "leaked block was inserted into table"
         );
         assert_eq!(table.live_bytes, 0, "live_bytes drifted on failure");
-        let after = test_hooks::EXHAUSTION_DEALLOCS
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let after = test_hooks::EXHAUSTION_DEALLOCS.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             after - before,
             1,
@@ -1044,7 +1057,10 @@ mod tests {
 
         // Remove and re-register: slot index 0 is reused, generation differs.
         table.remove(h0.slot);
-        assert!(table.get_checked(h0).is_none(), "stale handle must fail closed after remove");
+        assert!(
+            table.get_checked(h0).is_none(),
+            "stale handle must fail closed after remove"
+        );
 
         let h1 = table.register_handle(UpcallEntry {
             target: dummy_obj_ref(),
@@ -1054,7 +1070,10 @@ mod tests {
             return_kind: LAYOUT_LONG,
         });
         assert_eq!(h1.slot, 0, "slot should be reused");
-        assert_ne!(h0.generation, h1.generation, "generation must advance on reuse");
+        assert_ne!(
+            h0.generation, h1.generation,
+            "generation must advance on reuse"
+        );
         // Fresh handle resolves to the new entry...
         assert_eq!(table.get_checked(h1).unwrap().method_name, "second");
         // ...stale handle still fails closed (confused-deputy defence).
@@ -1110,20 +1129,23 @@ mod tests {
     #[test]
     fn test_memory_layout_basic_types() {
         // ValueLayout sizes per JVM spec
-        assert_eq!(std::mem::size_of::<i8>(), 1);   // JAVA_BYTE
-        assert_eq!(std::mem::size_of::<i16>(), 2);  // JAVA_SHORT
-        assert_eq!(std::mem::size_of::<i32>(), 4);  // JAVA_INT
-        assert_eq!(std::mem::size_of::<i64>(), 8);  // JAVA_LONG
-        assert_eq!(std::mem::size_of::<f32>(), 4);  // JAVA_FLOAT
-        assert_eq!(std::mem::size_of::<f64>(), 8);  // JAVA_DOUBLE
-        assert_eq!(std::mem::size_of::<bool>(), 1);  // JAVA_BOOLEAN
-        assert_eq!(std::mem::size_of::<u16>(), 2);  // JAVA_CHAR
+        assert_eq!(std::mem::size_of::<i8>(), 1); // JAVA_BYTE
+        assert_eq!(std::mem::size_of::<i16>(), 2); // JAVA_SHORT
+        assert_eq!(std::mem::size_of::<i32>(), 4); // JAVA_INT
+        assert_eq!(std::mem::size_of::<i64>(), 8); // JAVA_LONG
+        assert_eq!(std::mem::size_of::<f32>(), 4); // JAVA_FLOAT
+        assert_eq!(std::mem::size_of::<f64>(), 8); // JAVA_DOUBLE
+        assert_eq!(std::mem::size_of::<bool>(), 1); // JAVA_BOOLEAN
+        assert_eq!(std::mem::size_of::<u16>(), 2); // JAVA_CHAR
     }
 
     #[test]
     fn test_pointer_alignment() {
         // Pointers should be aligned to their size
-        assert_eq!(std::mem::align_of::<*const u8>(), std::mem::size_of::<*const u8>());
+        assert_eq!(
+            std::mem::align_of::<*const u8>(),
+            std::mem::size_of::<*const u8>()
+        );
     }
 
     #[test]
@@ -1132,7 +1154,9 @@ mod tests {
         let layout = std::alloc::Layout::from_size_align(64, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null());
-        unsafe { std::alloc::dealloc(ptr, layout); }
+        unsafe {
+            std::alloc::dealloc(ptr, layout);
+        }
     }
 
     #[test]
@@ -1160,7 +1184,10 @@ mod tests {
     fn test_struct_layout_composition() {
         // StructLayout should compose member layouts
         #[repr(C)]
-        struct Point { x: i32, y: i32 }
+        struct Point {
+            x: i32,
+            y: i32,
+        }
         assert_eq!(std::mem::size_of::<Point>(), 8);
         assert_eq!(std::mem::align_of::<Point>(), 4);
     }
@@ -1169,7 +1196,10 @@ mod tests {
     fn test_union_layout() {
         // UnionLayout takes the size of the largest member
         #[repr(C)]
-        union IntOrFloat { i: i32, f: f32 }
+        union IntOrFloat {
+            i: i32,
+            f: f32,
+        }
         assert_eq!(std::mem::size_of::<IntOrFloat>(), 4);
     }
 

@@ -71,7 +71,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -109,12 +113,19 @@ fn ensure_scanner_probe_compiled() -> bool {
     if !source.exists() {
         return false;
     }
-    let status = Command::new("javac").arg("-d").arg(&dir).arg(&source).status();
+    let status = Command::new("javac")
+        .arg("-d")
+        .arg(&dir)
+        .arg(&source)
+        .status();
     matches!(status, Ok(s) if s.success()) && class_file.exists()
 }
 
 /// Run the probe with the given stdin payload and return `(stdout, stderr, rc)`.
-fn run_scanner_probe(stdin_payload: &str, timeout: Duration) -> Option<(String, String, Option<i32>)> {
+fn run_scanner_probe(
+    stdin_payload: &str,
+    timeout: Duration,
+) -> Option<(String, String, Option<i32>)> {
     if !ensure_scanner_probe_compiled() {
         eprintln!("wave3_scanner: ScannerProbe.class missing and javac unavailable; skipping");
         return None;
@@ -166,8 +177,7 @@ fn run_scanner_probe(stdin_payload: &str, timeout: Duration) -> Option<(String, 
 #[test]
 fn scanner_reads_line_and_int_from_stdin() {
     // HotSpot reference: `line=world` + `int=42` + `OK`.
-    let Some((stdout, stderr, rc)) =
-        run_scanner_probe("world\n42\n", Duration::from_secs(120))
+    let Some((stdout, stderr, rc)) = run_scanner_probe("world\n42\n", Duration::from_secs(120))
     else {
         eprintln!(
             "wave3_scanner: prerequisites missing; skipping \

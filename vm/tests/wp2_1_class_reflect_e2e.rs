@@ -166,9 +166,7 @@ fn result_set_next_round_trips_through_method_get_return_type() {
 #[cfg(feature = "synthetic-jdk")]
 fn class_get_declared_methods_closure() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping class_get_declared_methods_closure: fixture not staged"
-        );
+        eprintln!("Skipping class_get_declared_methods_closure: fixture not staged");
         return;
     }
 
@@ -191,10 +189,7 @@ fn class_get_declared_methods_closure() {
 
 #[test]
 fn fixture_class_file_is_staged() {
-    let java = format!(
-        "{}/cratonvm/Wp21ClassReflectE2E.java",
-        test_resources_dir()
-    );
+    let java = format!("{}/cratonvm/Wp21ClassReflectE2E.java", test_resources_dir());
     let class = format!(
         "{}/cratonvm/Wp21ClassReflectE2E.class",
         test_resources_dir()

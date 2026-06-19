@@ -336,7 +336,10 @@ impl SoakReport {
         let mut out = String::with_capacity(2048);
         out.push_str("=== Soak Test Report ===\n\n");
         out.push_str(&format!("Verdict:          {}\n", self.verdict));
-        out.push_str(&format!("Duration:         {:.1}s\n", self.total_duration_secs));
+        out.push_str(&format!(
+            "Duration:         {:.1}s\n",
+            self.total_duration_secs
+        ));
         out.push_str(&format!("Iterations:       {}\n", self.total_iterations));
         out.push_str(&format!("Samples:          {}\n", self.samples.len()));
         out.push_str(&format!(
@@ -354,12 +357,30 @@ impl SoakReport {
 
         if let Some(proj) = &self.projection {
             out.push_str("\n--- Projection ---\n");
-            out.push_str(&format!("  Horizon:              {:.2} days ({:.0}s)\n", proj.target_days, proj.target_seconds));
-            out.push_str(&format!("  Projected heap bytes: {:.0}\n", proj.projected_heap_bytes));
-            out.push_str(&format!("  Projected heap growth: {:.2}%\n", proj.projected_heap_growth_percent));
-            out.push_str(&format!("  Projected thread cnt: {:.1}\n", proj.projected_thread_count));
-            out.push_str(&format!("  Projected fd count:   {:.1}\n", proj.projected_fd_count));
-            out.push_str(&format!("  Projected GC pause:   {:.1} ms\n", proj.projected_gc_pause_ms));
+            out.push_str(&format!(
+                "  Horizon:              {:.2} days ({:.0}s)\n",
+                proj.target_days, proj.target_seconds
+            ));
+            out.push_str(&format!(
+                "  Projected heap bytes: {:.0}\n",
+                proj.projected_heap_bytes
+            ));
+            out.push_str(&format!(
+                "  Projected heap growth: {:.2}%\n",
+                proj.projected_heap_growth_percent
+            ));
+            out.push_str(&format!(
+                "  Projected thread cnt: {:.1}\n",
+                proj.projected_thread_count
+            ));
+            out.push_str(&format!(
+                "  Projected fd count:   {:.1}\n",
+                proj.projected_fd_count
+            ));
+            out.push_str(&format!(
+                "  Projected GC pause:   {:.1} ms\n",
+                proj.projected_gc_pause_ms
+            ));
         }
 
         if !self.workload_iterations.is_empty() {
@@ -390,7 +411,11 @@ impl SoakReport {
 /// least-squares line to the samples and evaluating at `days * 86_400`s.
 pub fn project_to_days(samples: &[SoakMetricsSample], days: f64) -> ProjectedMetrics {
     let target_seconds = days * 86_400.0;
-    let initial_heap = samples.first().map(|s| s.heap_used_bytes).unwrap_or(0).max(1);
+    let initial_heap = samples
+        .first()
+        .map(|s| s.heap_used_bytes)
+        .unwrap_or(0)
+        .max(1);
 
     let heap_pts: Vec<(f64, f64)> = samples
         .iter()
@@ -612,7 +637,11 @@ impl SoakTestRunner {
         let p999 = percentile(&mut latencies, 99.9);
 
         // Heap growth as a percentage of the initial heap.
-        let initial_heap = samples.first().map(|s| s.heap_used_bytes).unwrap_or(1).max(1);
+        let initial_heap = samples
+            .first()
+            .map(|s| s.heap_used_bytes)
+            .unwrap_or(1)
+            .max(1);
         let final_heap = samples.last().map(|s| s.heap_used_bytes).unwrap_or(0);
         let observed_heap_growth_pct = if initial_heap > 0 {
             ((final_heap as f64 - initial_heap as f64) / initial_heap as f64) * 100.0
@@ -660,12 +689,12 @@ impl SoakTestRunner {
             let first = samples.first();
             let projected_thread_delta = (p.projected_thread_count
                 - first.map(|s| s.thread_count as f64).unwrap_or(0.0))
-                .max(0.0)
-                .round() as u32;
+            .max(0.0)
+            .round() as u32;
             let projected_fd_delta = (p.projected_fd_count
                 - first.map(|s| s.fd_count as f64).unwrap_or(0.0))
-                .max(0.0)
-                .round() as u32;
+            .max(0.0)
+            .round() as u32;
             (projected_thread_delta, projected_fd_delta)
         } else {
             (thread_growth, fd_growth)
@@ -972,8 +1001,7 @@ mod tests {
     #[test]
     fn test_linear_regression_negative_slope() {
         // y = -3x + 10
-        let points: Vec<(f64, f64)> =
-            (0..5).map(|i| (i as f64, -3.0 * i as f64 + 10.0)).collect();
+        let points: Vec<(f64, f64)> = (0..5).map(|i| (i as f64, -3.0 * i as f64 + 10.0)).collect();
         let (slope, intercept) = linear_regression(&points);
         assert!((slope - (-3.0)).abs() < 1e-10);
         assert!((intercept - 10.0).abs() < 1e-10);
@@ -1178,20 +1206,14 @@ mod tests {
 
     #[test]
     fn test_runner_no_workloads() {
-        let runner = SoakTestRunner::new(
-            short_config(),
-            Box::new(FakeCollector::new(0, 0, 0)),
-        );
+        let runner = SoakTestRunner::new(short_config(), Box::new(FakeCollector::new(0, 0, 0)));
         let result = runner.run();
         assert!(matches!(result, Err(SoakError::Setup(_))));
     }
 
     #[test]
     fn test_runner_pass_stable_metrics() {
-        let mut runner = SoakTestRunner::new(
-            short_config(),
-            Box::new(FakeCollector::new(0, 0, 0)),
-        );
+        let mut runner = SoakTestRunner::new(short_config(), Box::new(FakeCollector::new(0, 0, 0)));
         runner.add_workload(Box::new(NoOpWorkload::new("noop")));
         let report = runner.run().unwrap();
         assert_eq!(report.verdict, Verdict::Pass);
@@ -1218,10 +1240,7 @@ mod tests {
     fn test_runner_detects_thread_leak() {
         let mut cfg = short_config();
         cfg.max_thread_leak_count = 0; // any growth is a leak
-        let mut runner = SoakTestRunner::new(
-            cfg,
-            Box::new(FakeCollector::new(0, 1, 0)),
-        );
+        let mut runner = SoakTestRunner::new(cfg, Box::new(FakeCollector::new(0, 1, 0)));
         runner.add_workload(Box::new(NoOpWorkload::new("noop")));
         let report = runner.run().unwrap();
         assert!(report.thread_leak_detected);
@@ -1232,10 +1251,7 @@ mod tests {
     fn test_runner_detects_fd_leak() {
         let mut cfg = short_config();
         cfg.max_fd_leak_count = 0; // any growth is a leak
-        let mut runner = SoakTestRunner::new(
-            cfg,
-            Box::new(FakeCollector::new(0, 0, 2)),
-        );
+        let mut runner = SoakTestRunner::new(cfg, Box::new(FakeCollector::new(0, 0, 2)));
         runner.add_workload(Box::new(NoOpWorkload::new("noop")));
         let report = runner.run().unwrap();
         assert!(report.fd_leak_detected);
@@ -1363,10 +1379,7 @@ mod tests {
 
     #[test]
     fn test_runner_multiple_workloads() {
-        let mut runner = SoakTestRunner::new(
-            short_config(),
-            Box::new(FakeCollector::new(0, 0, 0)),
-        );
+        let mut runner = SoakTestRunner::new(short_config(), Box::new(FakeCollector::new(0, 0, 0)));
         runner.add_workload(Box::new(NoOpWorkload::new("w1")));
         runner.add_workload(Box::new(NoOpWorkload::new("w2")));
         let report = runner.run().unwrap();
@@ -1394,10 +1407,7 @@ mod tests {
 
     #[test]
     fn test_runner_warning_on_errors() {
-        let mut runner = SoakTestRunner::new(
-            short_config(),
-            Box::new(FakeCollector::new(0, 0, 0)),
-        );
+        let mut runner = SoakTestRunner::new(short_config(), Box::new(FakeCollector::new(0, 0, 0)));
         runner.add_workload(Box::new(FailingWorkload));
         let report = runner.run().unwrap();
         assert_eq!(report.verdict, Verdict::Warning);
@@ -1457,10 +1467,7 @@ mod tests {
 
     #[test]
     fn test_runner_setup_failure() {
-        let mut runner = SoakTestRunner::new(
-            short_config(),
-            Box::new(FakeCollector::new(0, 0, 0)),
-        );
+        let mut runner = SoakTestRunner::new(short_config(), Box::new(FakeCollector::new(0, 0, 0)));
         runner.add_workload(Box::new(SetupFailWorkload));
         let result = runner.run();
         assert!(matches!(result, Err(SoakError::Setup(_))));
@@ -1573,7 +1580,8 @@ mod tests {
                 // actually symmetric: the magnitude depends only on the
                 // distance from the center, so matched pairs have the
                 // same magnitude and opposite sign → slope is zero.
-                let from_center = ((i as i64) - (n as i64) / 2 + if i >= n / 2 { 1 } else { 0 }).abs();
+                let from_center =
+                    ((i as i64) - (n as i64) / 2 + if i >= n / 2 { 1 } else { 0 }).abs();
                 let mag = (amplitude as i64) * from_center / ((n / 2) as i64);
                 let delta = sign * mag;
                 let heap = (baseline as i64 + delta).max(0) as u64;
@@ -1630,7 +1638,10 @@ mod tests {
             .map(|s| (s.elapsed_secs, s.heap_used_bytes as f64))
             .collect();
         let (flat_slope, _) = linear_regression(&flat_pts);
-        assert!(flat_slope.abs() < 1e-9, "flat slope must be 0, got {flat_slope}");
+        assert!(
+            flat_slope.abs() < 1e-9,
+            "flat slope must be 0, got {flat_slope}"
+        );
         let flat_proj = project_to_days(&flat, 30.0);
         assert!(
             flat_proj.projected_heap_growth_percent.abs() < 1e-6,
@@ -1704,12 +1715,10 @@ mod tests {
         let proj = report.projection.as_ref().unwrap();
         assert_eq!(proj.target_days, 30.0);
         assert!(proj.projected_heap_growth_percent > 1.0);
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.contains("Projected heap grew") || i.contains("Projected heap"))
-        );
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("Projected heap grew") || i.contains("Projected heap")));
     }
 
     #[test]

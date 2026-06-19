@@ -15,10 +15,10 @@
 //! [`NativeKind::SyntheticStub`].
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, MethodCallFailed, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{obj_arg, alloc_concurrent_synthetic};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 /// Throw a clear `UnsupportedOperationException` from a Class-File API entry
 /// point that CratonVM cannot honestly implement (real parsing / bytecode
@@ -92,46 +92,69 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
     });
 
     // of(ClassFile$Option...) -> ClassFile
-    r.register(cf, "of", "([Ljava/lang/classfile/ClassFile$Option;)Ljava/lang/classfile/ClassFile;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2);
-        ctx.set_field(obj, 0, Value::Int(1)); // has options
-        ctx.set_field(obj, 1, Value::Int(CLASSFILE_MAJOR_69 as i32));
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        cf,
+        "of",
+        "([Ljava/lang/classfile/ClassFile$Option;)Ljava/lang/classfile/ClassFile;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2);
+            ctx.set_field(obj, 0, Value::Int(1)); // has options
+            ctx.set_field(obj, 1, Value::Int(CLASSFILE_MAJOR_69 as i32));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
     // parse(byte[]) -> ClassModel
     // Real parsing is not implemented; a fabricated ClassModel would silently
     // misreport the class structure. Fail loudly (catchable) instead.
-    r.register(cf, "parse", "([B)Ljava/lang/classfile/ClassModel;", |_ctx, _args| {
-        classfile_unsupported("ClassFile.parse(byte[])")
-    });
+    r.register(
+        cf,
+        "parse",
+        "([B)Ljava/lang/classfile/ClassModel;",
+        |_ctx, _args| classfile_unsupported("ClassFile.parse(byte[])"),
+    );
 
     // parse(Path) -> ClassModel
-    r.register(cf, "parse", "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;", |_ctx, _args| {
-        classfile_unsupported("ClassFile.parse(Path)")
-    });
+    r.register(
+        cf,
+        "parse",
+        "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;",
+        |_ctx, _args| classfile_unsupported("ClassFile.parse(Path)"),
+    );
 
     // build(ClassDesc, Consumer<ClassBuilder>) -> byte[]
     // Returning an empty byte[] fabricates a "successful" but invalid class.
     // Fail loudly instead so callers do not write a corrupt class file.
-    r.register(cf, "build", "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B", |_ctx, _args| {
-        classfile_unsupported("ClassFile.build")
-    });
+    r.register(
+        cf,
+        "build",
+        "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B",
+        |_ctx, _args| classfile_unsupported("ClassFile.build"),
+    );
 
     // buildTo(Path, ClassDesc, Consumer<ClassBuilder>) -> void
-    r.register(cf, "buildTo", "(Ljava/nio/file/Path;Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)V", |_ctx, _args| {
-        classfile_unsupported("ClassFile.buildTo")
-    });
+    r.register(
+        cf,
+        "buildTo",
+        "(Ljava/nio/file/Path;Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)V",
+        |_ctx, _args| classfile_unsupported("ClassFile.buildTo"),
+    );
 
     // buildModule(ModuleDesc, Consumer) -> byte[]
-    r.register(cf, "buildModule", "(Ljava/lang/module/ModuleDescriptor;Ljava/util/function/Consumer;)[B", |_ctx, _args| {
-        classfile_unsupported("ClassFile.buildModule")
-    });
+    r.register(
+        cf,
+        "buildModule",
+        "(Ljava/lang/module/ModuleDescriptor;Ljava/util/function/Consumer;)[B",
+        |_ctx, _args| classfile_unsupported("ClassFile.buildModule"),
+    );
 
     // transformClass(ClassModel, ClassTransform) -> byte[]
-    r.register(cf, "transformClass", "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B", |_ctx, _args| {
-        classfile_unsupported("ClassFile.transformClass")
-    });
+    r.register(
+        cf,
+        "transformClass",
+        "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B",
+        |_ctx, _args| classfile_unsupported("ClassFile.transformClass"),
+    );
 
     // latestMajorVersion() -> int
     r.register(cf, "latestMajorVersion", "()I", |_ctx, _args| {
@@ -163,26 +186,38 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         Ok(Some(v))
     });
 
-    r.register(cm, "flags", "()Ljava/lang/classfile/AccessFlags;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let flags = ctx.get_field(this, 2);
-        let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
-        ctx.set_field(af, 0, flags);
-        Ok(Some(Value::Object(Some(af))))
-    });
+    r.register(
+        cm,
+        "flags",
+        "()Ljava/lang/classfile/AccessFlags;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flags = ctx.get_field(this, 2);
+            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            ctx.set_field(af, 0, flags);
+            Ok(Some(Value::Object(Some(af))))
+        },
+    );
 
-    r.register(cm, "thisClass", "()Ljava/lang/classfile/constantpool/ClassEntry;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 3);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
-        ctx.set_field(entry, 0, idx);
-        Ok(Some(Value::Object(Some(entry))))
-    });
+    r.register(
+        cm,
+        "thisClass",
+        "()Ljava/lang/classfile/constantpool/ClassEntry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 3);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+            ctx.set_field(entry, 0, idx);
+            Ok(Some(Value::Object(Some(entry))))
+        },
+    );
 
     r.register(cm, "superclass", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 4);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+        let entry =
+            alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
         ctx.set_field(entry, 0, idx);
         let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, Value::Object(Some(entry)));
@@ -213,12 +248,18 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(list))))
     });
 
-    r.register(cm, "constantPool", "()Ljava/lang/classfile/constantpool/ConstantPool;", |ctx, _args| {
-        let cp = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ConstantPool", 2);
-        ctx.set_field(cp, 0, Value::Int(0));
-        ctx.set_field(cp, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(cp))))
-    });
+    r.register(
+        cm,
+        "constantPool",
+        "()Ljava/lang/classfile/constantpool/ConstantPool;",
+        |ctx, _args| {
+            let cp =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ConstantPool", 2);
+            ctx.set_field(cp, 0, Value::Int(0));
+            ctx.set_field(cp, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(cp))))
+        },
+    );
 
     r.register(cm, "isModuleInfo", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0))) // false
@@ -229,15 +270,21 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
 
-    r.register(cm, "superclassEntry", "()Ljava/util/Optional;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 4);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
-        ctx.set_field(entry, 0, idx);
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-        ctx.set_field(opt, 0, Value::Object(Some(entry)));
-        Ok(Some(Value::Object(Some(opt))))
-    });
+    r.register(
+        cm,
+        "superclassEntry",
+        "()Ljava/util/Optional;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 4);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+            ctx.set_field(entry, 0, idx);
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            ctx.set_field(opt, 0, Value::Object(Some(entry)));
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -247,35 +294,57 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
 fn register_method_model(r: &mut NativeMethodRegistry) {
     let mm = "java/lang/classfile/MethodModel";
 
-    r.register(mm, "flags", "()Ljava/lang/classfile/AccessFlags;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let flags = ctx.get_field(this, 0);
-        let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
-        ctx.set_field(af, 0, flags);
-        Ok(Some(Value::Object(Some(af))))
-    });
+    r.register(
+        mm,
+        "flags",
+        "()Ljava/lang/classfile/AccessFlags;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flags = ctx.get_field(this, 0);
+            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            ctx.set_field(af, 0, flags);
+            Ok(Some(Value::Object(Some(af))))
+        },
+    );
 
-    r.register(mm, "methodName", "()Ljava/lang/classfile/constantpool/Utf8Entry;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
-        ctx.set_field(entry, 0, idx);
-        Ok(Some(Value::Object(Some(entry))))
-    });
+    r.register(
+        mm,
+        "methodName",
+        "()Ljava/lang/classfile/constantpool/Utf8Entry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 1);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+            ctx.set_field(entry, 0, idx);
+            Ok(Some(Value::Object(Some(entry))))
+        },
+    );
 
-    r.register(mm, "methodType", "()Ljava/lang/classfile/constantpool/Utf8Entry;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 2);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
-        ctx.set_field(entry, 0, idx);
-        Ok(Some(Value::Object(Some(entry))))
-    });
+    r.register(
+        mm,
+        "methodType",
+        "()Ljava/lang/classfile/constantpool/Utf8Entry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 2);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+            ctx.set_field(entry, 0, idx);
+            Ok(Some(Value::Object(Some(entry))))
+        },
+    );
 
-    r.register(mm, "methodTypeSymbol", "()Ljava/lang/constant/MethodTypeDesc;", |ctx, _args| {
-        let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/MethodTypeDesc", 1);
-        ctx.set_field(desc, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(desc))))
-    });
+    r.register(
+        mm,
+        "methodTypeSymbol",
+        "()Ljava/lang/constant/MethodTypeDesc;",
+        |ctx, _args| {
+            let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/MethodTypeDesc", 1);
+            ctx.set_field(desc, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(desc))))
+        },
+    );
 
     r.register(mm, "code", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -318,35 +387,57 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
 fn register_field_model(r: &mut NativeMethodRegistry) {
     let fm = "java/lang/classfile/FieldModel";
 
-    r.register(fm, "flags", "()Ljava/lang/classfile/AccessFlags;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let flags = ctx.get_field(this, 0);
-        let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
-        ctx.set_field(af, 0, flags);
-        Ok(Some(Value::Object(Some(af))))
-    });
+    r.register(
+        fm,
+        "flags",
+        "()Ljava/lang/classfile/AccessFlags;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flags = ctx.get_field(this, 0);
+            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            ctx.set_field(af, 0, flags);
+            Ok(Some(Value::Object(Some(af))))
+        },
+    );
 
-    r.register(fm, "fieldName", "()Ljava/lang/classfile/constantpool/Utf8Entry;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
-        ctx.set_field(entry, 0, idx);
-        Ok(Some(Value::Object(Some(entry))))
-    });
+    r.register(
+        fm,
+        "fieldName",
+        "()Ljava/lang/classfile/constantpool/Utf8Entry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 1);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+            ctx.set_field(entry, 0, idx);
+            Ok(Some(Value::Object(Some(entry))))
+        },
+    );
 
-    r.register(fm, "fieldType", "()Ljava/lang/classfile/constantpool/Utf8Entry;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 2);
-        let entry = alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
-        ctx.set_field(entry, 0, idx);
-        Ok(Some(Value::Object(Some(entry))))
-    });
+    r.register(
+        fm,
+        "fieldType",
+        "()Ljava/lang/classfile/constantpool/Utf8Entry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 2);
+            let entry =
+                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+            ctx.set_field(entry, 0, idx);
+            Ok(Some(Value::Object(Some(entry))))
+        },
+    );
 
-    r.register(fm, "fieldTypeSymbol", "()Ljava/lang/constant/ClassDesc;", |ctx, _args| {
-        let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/ClassDesc", 1);
-        ctx.set_field(desc, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(desc))))
-    });
+    r.register(
+        fm,
+        "fieldTypeSymbol",
+        "()Ljava/lang/constant/ClassDesc;",
+        |ctx, _args| {
+            let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/ClassDesc", 1);
+            ctx.set_field(desc, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(desc))))
+        },
+    );
 
     r.register(fm, "attributes", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
@@ -381,11 +472,16 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 2)))
     });
 
-    r.register(code, "exceptionHandlers", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
-        ctx.set_field(list, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(list))))
-    });
+    r.register(
+        code,
+        "exceptionHandlers",
+        "()Ljava/util/List;",
+        |ctx, _args| {
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+            ctx.set_field(list, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
 
     r.register(code, "elements", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
@@ -405,25 +501,40 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
 fn register_class_builder(r: &mut NativeMethodRegistry) {
     let cb = "java/lang/classfile/ClassBuilder";
 
-    r.register(cb, "withFlags", "(I)Ljava/lang/classfile/ClassBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let flags = match args.get(1) {
-            Some(Value::Int(n)) => *n,
-            _ => 0,
-        };
-        ctx.set_field(this, 1, Value::Int(flags));
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "withFlags",
+        "(I)Ljava/lang/classfile/ClassBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let flags = match args.get(1) {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            };
+            ctx.set_field(this, 1, Value::Int(flags));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
-    r.register(cb, "withSuperclass", "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/ClassBuilder;", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "withSuperclass",
+        "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/ClassBuilder;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
-    r.register(cb, "withInterfaceSymbols", "(Ljava/util/List;)Ljava/lang/classfile/ClassBuilder;", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "withInterfaceSymbols",
+        "(Ljava/util/List;)Ljava/lang/classfile/ClassBuilder;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // withField(String, ClassDesc, Consumer<FieldBuilder>)
     r.register(cb, "withField", "(Ljava/lang/String;Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)Ljava/lang/classfile/ClassBuilder;", |ctx, args| {
@@ -437,15 +548,20 @@ fn register_class_builder(r: &mut NativeMethodRegistry) {
     });
 
     // withField(String, ClassDesc, int)
-    r.register(cb, "withField", "(Ljava/lang/String;Ljava/lang/constant/ClassDesc;I)Ljava/lang/classfile/ClassBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let count = match ctx.get_field(this, 2) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        ctx.set_field(this, 2, Value::Int(count + 1));
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "withField",
+        "(Ljava/lang/String;Ljava/lang/constant/ClassDesc;I)Ljava/lang/classfile/ClassBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let count = match ctx.get_field(this, 2) {
+                Value::Int(n) => n,
+                _ => 0,
+            };
+            ctx.set_field(this, 2, Value::Int(count + 1));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // withMethod(String, MethodTypeDesc, int, Consumer<MethodBuilder>)
     r.register(cb, "withMethod", "(Ljava/lang/String;Ljava/lang/constant/MethodTypeDesc;ILjava/util/function/Consumer;)Ljava/lang/classfile/ClassBuilder;", |_ctx, args| {
@@ -460,10 +576,15 @@ fn register_class_builder(r: &mut NativeMethodRegistry) {
     });
 
     // with(ClassElement)
-    r.register(cb, "with", "(Ljava/lang/classfile/ClassElement;)Ljava/lang/classfile/ClassBuilder;", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "with",
+        "(Ljava/lang/classfile/ClassElement;)Ljava/lang/classfile/ClassBuilder;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // build() -> byte[]
     // An empty byte[] is an invalid class file; fail loudly instead.
@@ -509,54 +630,108 @@ fn register_code_builder(r: &mut NativeMethodRegistry) {
     }
 
     // iconst(int)
-    r.register(cb, "iconst", "(I)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
-
-    // lconst(long)
-    r.register(cb, "lconst", "(J)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
-
-    // Zero-arg instructions returning CodeBuilder
-    for name in &[
-        "aconst_null", "iadd", "isub", "imul", "idiv", "irem", "ineg",
-        "ladd", "lsub", "lmul", "ldiv", "arraylength", "athrow",
-        "ireturn", "lreturn", "areturn", "return_", "nop", "pop", "dup",
-        "swap", "monitorenter", "monitorexit",
-    ] {
-        r.register(cb, name, "()Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
+    r.register(
+        cb,
+        "iconst",
+        "(I)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
             let this = obj_arg(args, 0)?;
             cb_inc_insn(ctx, this);
             Ok(Some(Value::Object(Some(this))))
-        });
+        },
+    );
+
+    // lconst(long)
+    r.register(
+        cb,
+        "lconst",
+        "(J)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+
+    // Zero-arg instructions returning CodeBuilder
+    for name in &[
+        "aconst_null",
+        "iadd",
+        "isub",
+        "imul",
+        "idiv",
+        "irem",
+        "ineg",
+        "ladd",
+        "lsub",
+        "lmul",
+        "ldiv",
+        "arraylength",
+        "athrow",
+        "ireturn",
+        "lreturn",
+        "areturn",
+        "return_",
+        "nop",
+        "pop",
+        "dup",
+        "swap",
+        "monitorenter",
+        "monitorexit",
+    ] {
+        r.register(
+            cb,
+            name,
+            "()Ljava/lang/classfile/CodeBuilder;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                cb_inc_insn(ctx, this);
+                Ok(Some(Value::Object(Some(this))))
+            },
+        );
     }
 
     // bipush(int), sipush(int)
-    r.register(cb, "bipush", "(I)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
-    r.register(cb, "sipush", "(I)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "bipush",
+        "(I)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        cb,
+        "sipush",
+        "(I)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // ldc(ConstantDesc)
-    r.register(cb, "ldc", "(Ljava/lang/constant/ConstantDesc;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "ldc",
+        "(Ljava/lang/constant/ConstantDesc;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // Invoke instructions — all take (ClassDesc, String, MethodTypeDesc)
-    for name in &["invokevirtual", "invokestatic", "invokespecial", "invokeinterface"] {
+    for name in &[
+        "invokevirtual",
+        "invokestatic",
+        "invokespecial",
+        "invokeinterface",
+    ] {
         r.register(cb, name,
             "(Ljava/lang/constant/ClassDesc;Ljava/lang/String;Ljava/lang/constant/MethodTypeDesc;)Ljava/lang/classfile/CodeBuilder;",
             |ctx, args| {
@@ -568,37 +743,62 @@ fn register_code_builder(r: &mut NativeMethodRegistry) {
     }
 
     // new_(ClassDesc)
-    r.register(cb, "new_", "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "new_",
+        "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // newarray(TypeKind)
-    r.register(cb, "newarray", "(Ljava/lang/classfile/TypeKind;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "newarray",
+        "(Ljava/lang/classfile/TypeKind;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // anewarray(ClassDesc)
-    r.register(cb, "anewarray", "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "anewarray",
+        "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // checkcast(ClassDesc), instanceof_(ClassDesc)
-    r.register(cb, "checkcast", "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
-    r.register(cb, "instanceof_", "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "checkcast",
+        "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        cb,
+        "instanceof_",
+        "(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // Field access: getfield, putfield, getstatic, putstatic (ClassDesc, String, ClassDesc)
     for name in &["getfield", "putfield", "getstatic", "putstatic"] {
@@ -614,7 +814,9 @@ fn register_code_builder(r: &mut NativeMethodRegistry) {
 
     // Branch instructions taking a Label
     for name in &["ifeq", "ifne", "if_icmpeq", "if_icmpne", "goto_"] {
-        r.register(cb, name,
+        r.register(
+            cb,
+            name,
             "(Ljava/lang/classfile/Label;)Ljava/lang/classfile/CodeBuilder;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
@@ -625,41 +827,61 @@ fn register_code_builder(r: &mut NativeMethodRegistry) {
     }
 
     // newLabel() -> Label
-    r.register(cb, "newLabel", "()Ljava/lang/classfile/Label;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let label_count = match ctx.get_field(this, 1) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        ctx.set_field(this, 1, Value::Int(label_count + 1));
-        let label = alloc_concurrent_synthetic(ctx, "java/lang/classfile/Label", 1);
-        ctx.set_field(label, 0, Value::Int(label_count));
-        Ok(Some(Value::Object(Some(label))))
-    });
+    r.register(
+        cb,
+        "newLabel",
+        "()Ljava/lang/classfile/Label;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let label_count = match ctx.get_field(this, 1) {
+                Value::Int(n) => n,
+                _ => 0,
+            };
+            ctx.set_field(this, 1, Value::Int(label_count + 1));
+            let label = alloc_concurrent_synthetic(ctx, "java/lang/classfile/Label", 1);
+            ctx.set_field(label, 0, Value::Int(label_count));
+            Ok(Some(Value::Object(Some(label))))
+        },
+    );
 
     // labelBinding(Label) -> CodeBuilder
-    r.register(cb, "labelBinding", "(Ljava/lang/classfile/Label;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        cb_inc_insn(ctx, this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "labelBinding",
+        "(Ljava/lang/classfile/Label;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            cb_inc_insn(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // block(Consumer<CodeBuilder>) -> CodeBuilder
-    r.register(cb, "block", "(Ljava/util/function/Consumer;)Ljava/lang/classfile/CodeBuilder;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let depth = match ctx.get_field(this, 2) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        ctx.set_field(this, 2, Value::Int(depth + 1));
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "block",
+        "(Ljava/util/function/Consumer;)Ljava/lang/classfile/CodeBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let depth = match ctx.get_field(this, 2) {
+                Value::Int(n) => n,
+                _ => 0,
+            };
+            ctx.set_field(this, 2, Value::Int(depth + 1));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // lineNumber(int) -> CodeBuilder
-    r.register(cb, "lineNumber", "(I)Ljava/lang/classfile/CodeBuilder;", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        cb,
+        "lineNumber",
+        "(I)Ljava/lang/classfile/CodeBuilder;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // localVariable(int, String, ClassDesc, Label, Label) -> CodeBuilder
     r.register(cb, "localVariable",
@@ -679,31 +901,49 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
     let ct = "java/lang/classfile/ClassTransform";
 
     // ofStateful(Supplier) -> ClassTransform
-    r.register(ct, "ofStateful", "(Ljava/util/function/Supplier;)Ljava/lang/classfile/ClassTransform;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(2)); // mapping
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "ofStateful",
+        "(Ljava/util/function/Supplier;)Ljava/lang/classfile/ClassTransform;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(2)); // mapping
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
     // dropping(Predicate) -> ClassTransform
-    r.register(ct, "dropping", "(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(1)); // dropping
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "dropping",
+        "(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(1)); // dropping
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
     // ACCEPT_ALL (static field sim) -> ClassTransform
-    r.register(ct, "ACCEPT_ALL", "()Ljava/lang/classfile/ClassTransform;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(0)); // identity
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "ACCEPT_ALL",
+        "()Ljava/lang/classfile/ClassTransform;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(0)); // identity
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
     // transformClass(ClassModel) -> byte[]
     // An empty byte[] is an invalid class file; fail loudly instead.
-    r.register(ct, "transformClass", "(Ljava/lang/classfile/ClassModel;)[B", |_ctx, _args| {
-        classfile_unsupported("ClassTransform.transformClass")
-    });
+    r.register(
+        ct,
+        "transformClass",
+        "(Ljava/lang/classfile/ClassModel;)[B",
+        |_ctx, _args| classfile_unsupported("ClassTransform.transformClass"),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -713,24 +953,39 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
 fn register_code_transform(r: &mut NativeMethodRegistry) {
     let ct = "java/lang/classfile/CodeTransform";
 
-    r.register(ct, "ofStateful", "(Ljava/util/function/Supplier;)Ljava/lang/classfile/CodeTransform;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(2));
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "ofStateful",
+        "(Ljava/util/function/Supplier;)Ljava/lang/classfile/CodeTransform;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(2));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
-    r.register(ct, "andThen", "(Ljava/lang/classfile/CodeTransform;)Ljava/lang/classfile/CodeTransform;", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(2));
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "andThen",
+        "(Ljava/lang/classfile/CodeTransform;)Ljava/lang/classfile/CodeTransform;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(2));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 
-    r.register(ct, "ACCEPT_ALL", "()Ljava/lang/classfile/CodeTransform;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
-        ctx.set_field(obj, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        ct,
+        "ACCEPT_ALL",
+        "()Ljava/lang/classfile/CodeTransform;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            ctx.set_field(obj, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -740,18 +995,28 @@ fn register_code_transform(r: &mut NativeMethodRegistry) {
 fn register_attribute(r: &mut NativeMethodRegistry) {
     let attr = "java/lang/classfile/Attribute";
 
-    r.register(attr, "attributeName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let _idx = ctx.get_field(this, 0);
-        let s = ctx.create_string("UnknownAttribute");
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        attr,
+        "attributeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let _idx = ctx.get_field(this, 0);
+            let s = ctx.create_string("UnknownAttribute");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
 
-    r.register(attr, "attributeMapper", "()Ljava/lang/classfile/AttributeMapper;", |ctx, _args| {
-        let mapper = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1);
-        ctx.set_field(mapper, 0, Value::Int(0));
-        Ok(Some(Value::Object(Some(mapper))))
-    });
+    r.register(
+        attr,
+        "attributeMapper",
+        "()Ljava/lang/classfile/AttributeMapper;",
+        |ctx, _args| {
+            let mapper = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1);
+            ctx.set_field(mapper, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(mapper))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -840,8 +1105,8 @@ mod classfile_api_tests {
         assert_eq!(ACC_STATIC, 0x0008);
         assert_eq!(ACC_FINAL, 0x0010);
         assert_eq!(ACC_SUPER, ACC_SYNCHRONIZED); // both 0x0020
-        assert_eq!(ACC_VOLATILE, ACC_BRIDGE);     // both 0x0040
-        assert_eq!(ACC_TRANSIENT, ACC_VARARGS);   // both 0x0080
+        assert_eq!(ACC_VOLATILE, ACC_BRIDGE); // both 0x0040
+        assert_eq!(ACC_TRANSIENT, ACC_VARARGS); // both 0x0080
         assert_eq!(ACC_NATIVE, 0x0100);
         assert_eq!(ACC_INTERFACE, 0x0200);
         assert_eq!(ACC_ABSTRACT, 0x0400);
@@ -871,53 +1136,89 @@ mod classfile_api_tests {
     #[test]
     fn test_classfile_of_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "of", "()Ljava/lang/classfile/ClassFile;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "of",
+                "()Ljava/lang/classfile/ClassFile;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_classfile_of_options_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "of",
-            "([Ljava/lang/classfile/ClassFile$Option;)Ljava/lang/classfile/ClassFile;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "of",
+                "([Ljava/lang/classfile/ClassFile$Option;)Ljava/lang/classfile/ClassFile;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_classfile_parse_bytes_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "parse", "([B)Ljava/lang/classfile/ClassModel;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "parse",
+                "([B)Ljava/lang/classfile/ClassModel;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_classfile_parse_path_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "parse",
-            "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "parse",
+                "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_classfile_build_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "build",
-            "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "build",
+                "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_classfile_latest_major_version_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "latestMajorVersion", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/ClassFile", "latestMajorVersion", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_classfile_latest_minor_version_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "latestMinorVersion", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/ClassFile", "latestMinorVersion", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_classfile_transform_class_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassFile", "transformClass",
-            "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassFile",
+                "transformClass",
+                "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B"
+            )
+            .is_some());
     }
 
     // --- ClassModel registration ---
@@ -925,46 +1226,73 @@ mod classfile_api_tests {
     #[test]
     fn test_class_model_major_version_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "majorVersion", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/ClassModel", "majorVersion", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_class_model_minor_version_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "minorVersion", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/ClassModel", "minorVersion", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_class_model_flags_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "flags",
-            "()Ljava/lang/classfile/AccessFlags;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassModel",
+                "flags",
+                "()Ljava/lang/classfile/AccessFlags;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_class_model_this_class_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "thisClass",
-            "()Ljava/lang/classfile/constantpool/ClassEntry;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassModel",
+                "thisClass",
+                "()Ljava/lang/classfile/constantpool/ClassEntry;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_class_model_superclass_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "superclass", "()Ljava/util/Optional;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassModel",
+                "superclass",
+                "()Ljava/util/Optional;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_class_model_is_module_info_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "isModuleInfo", "()Z").is_some());
+        assert!(r
+            .find("java/lang/classfile/ClassModel", "isModuleInfo", "()Z")
+            .is_some());
     }
 
     #[test]
     fn test_class_model_constant_pool_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassModel", "constantPool",
-            "()Ljava/lang/classfile/constantpool/ConstantPool;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassModel",
+                "constantPool",
+                "()Ljava/lang/classfile/constantpool/ConstantPool;"
+            )
+            .is_some());
     }
 
     // --- MethodModel registration ---
@@ -972,21 +1300,37 @@ mod classfile_api_tests {
     #[test]
     fn test_method_model_flags_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/MethodModel", "flags",
-            "()Ljava/lang/classfile/AccessFlags;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/MethodModel",
+                "flags",
+                "()Ljava/lang/classfile/AccessFlags;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_method_model_method_name_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/MethodModel", "methodName",
-            "()Ljava/lang/classfile/constantpool/Utf8Entry;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/MethodModel",
+                "methodName",
+                "()Ljava/lang/classfile/constantpool/Utf8Entry;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_method_model_code_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/MethodModel", "code", "()Ljava/util/Optional;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/MethodModel",
+                "code",
+                "()Ljava/util/Optional;"
+            )
+            .is_some());
     }
 
     // --- FieldModel registration ---
@@ -994,21 +1338,37 @@ mod classfile_api_tests {
     #[test]
     fn test_field_model_flags_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/FieldModel", "flags",
-            "()Ljava/lang/classfile/AccessFlags;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/FieldModel",
+                "flags",
+                "()Ljava/lang/classfile/AccessFlags;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_field_model_field_name_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/FieldModel", "fieldName",
-            "()Ljava/lang/classfile/constantpool/Utf8Entry;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/FieldModel",
+                "fieldName",
+                "()Ljava/lang/classfile/constantpool/Utf8Entry;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_field_model_attributes_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/FieldModel", "attributes", "()Ljava/util/List;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/FieldModel",
+                "attributes",
+                "()Ljava/util/List;"
+            )
+            .is_some());
     }
 
     // --- CodeModel registration ---
@@ -1016,25 +1376,37 @@ mod classfile_api_tests {
     #[test]
     fn test_code_model_max_stack_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeModel", "maxStack", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/CodeModel", "maxStack", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_code_model_max_locals_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeModel", "maxLocals", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/CodeModel", "maxLocals", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_code_model_code_length_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeModel", "codeLength", "()I").is_some());
+        assert!(r
+            .find("java/lang/classfile/CodeModel", "codeLength", "()I")
+            .is_some());
     }
 
     #[test]
     fn test_code_model_exception_handlers_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeModel", "exceptionHandlers", "()Ljava/util/List;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeModel",
+                "exceptionHandlers",
+                "()Ljava/util/List;"
+            )
+            .is_some());
     }
 
     // --- ClassBuilder registration ---
@@ -1042,8 +1414,13 @@ mod classfile_api_tests {
     #[test]
     fn test_class_builder_with_flags_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassBuilder", "withFlags",
-            "(I)Ljava/lang/classfile/ClassBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassBuilder",
+                "withFlags",
+                "(I)Ljava/lang/classfile/ClassBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -1065,22 +1442,37 @@ mod classfile_api_tests {
     #[test]
     fn test_code_builder_aload_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "aload",
-            "(I)Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "aload",
+                "(I)Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_builder_iconst_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "iconst",
-            "(I)Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "iconst",
+                "(I)Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_builder_iadd_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "iadd",
-            "()Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "iadd",
+                "()Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -1093,22 +1485,37 @@ mod classfile_api_tests {
     #[test]
     fn test_code_builder_new_label_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "newLabel",
-            "()Ljava/lang/classfile/Label;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "newLabel",
+                "()Ljava/lang/classfile/Label;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_builder_goto_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "goto_",
-            "(Ljava/lang/classfile/Label;)Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "goto_",
+                "(Ljava/lang/classfile/Label;)Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_builder_return_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "return_",
-            "()Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "return_",
+                "()Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -1121,8 +1528,13 @@ mod classfile_api_tests {
     #[test]
     fn test_code_builder_block_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeBuilder", "block",
-            "(Ljava/util/function/Consumer;)Ljava/lang/classfile/CodeBuilder;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeBuilder",
+                "block",
+                "(Ljava/util/function/Consumer;)Ljava/lang/classfile/CodeBuilder;"
+            )
+            .is_some());
     }
 
     // --- ClassTransform registration ---
@@ -1130,22 +1542,37 @@ mod classfile_api_tests {
     #[test]
     fn test_class_transform_of_stateful_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassTransform", "ofStateful",
-            "(Ljava/util/function/Supplier;)Ljava/lang/classfile/ClassTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassTransform",
+                "ofStateful",
+                "(Ljava/util/function/Supplier;)Ljava/lang/classfile/ClassTransform;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_class_transform_dropping_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassTransform", "dropping",
-            "(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassTransform",
+                "dropping",
+                "(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_class_transform_accept_all_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/ClassTransform", "ACCEPT_ALL",
-            "()Ljava/lang/classfile/ClassTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/ClassTransform",
+                "ACCEPT_ALL",
+                "()Ljava/lang/classfile/ClassTransform;"
+            )
+            .is_some());
     }
 
     // --- CodeTransform registration ---
@@ -1153,22 +1580,37 @@ mod classfile_api_tests {
     #[test]
     fn test_code_transform_of_stateful_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeTransform", "ofStateful",
-            "(Ljava/util/function/Supplier;)Ljava/lang/classfile/CodeTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeTransform",
+                "ofStateful",
+                "(Ljava/util/function/Supplier;)Ljava/lang/classfile/CodeTransform;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_transform_and_then_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeTransform", "andThen",
-            "(Ljava/lang/classfile/CodeTransform;)Ljava/lang/classfile/CodeTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeTransform",
+                "andThen",
+                "(Ljava/lang/classfile/CodeTransform;)Ljava/lang/classfile/CodeTransform;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_code_transform_accept_all_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/CodeTransform", "ACCEPT_ALL",
-            "()Ljava/lang/classfile/CodeTransform;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/CodeTransform",
+                "ACCEPT_ALL",
+                "()Ljava/lang/classfile/CodeTransform;"
+            )
+            .is_some());
     }
 
     // --- Attribute registration ---
@@ -1176,15 +1618,25 @@ mod classfile_api_tests {
     #[test]
     fn test_attribute_name_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/Attribute", "attributeName",
-            "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/Attribute",
+                "attributeName",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_attribute_mapper_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/Attribute", "attributeMapper",
-            "()Ljava/lang/classfile/AttributeMapper;").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/Attribute",
+                "attributeMapper",
+                "()Ljava/lang/classfile/AttributeMapper;"
+            )
+            .is_some());
     }
 
     // --- ConstantPool registration ---
@@ -1192,18 +1644,36 @@ mod classfile_api_tests {
     #[test]
     fn test_constant_pool_entry_count_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/constantpool/ConstantPool", "entryCount", "()I").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/constantpool/ConstantPool",
+                "entryCount",
+                "()I"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_constant_pool_size_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/constantpool/ConstantPool", "size", "()I").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/constantpool/ConstantPool",
+                "size",
+                "()I"
+            )
+            .is_some());
     }
 
     #[test]
     fn test_constant_pool_bootstrap_method_count_registered() {
         let r = make_registry();
-        assert!(r.find("java/lang/classfile/constantpool/ConstantPool", "bootstrapMethodCount", "()I").is_some());
+        assert!(r
+            .find(
+                "java/lang/classfile/constantpool/ConstantPool",
+                "bootstrapMethodCount",
+                "()I"
+            )
+            .is_some());
     }
 }

@@ -209,8 +209,8 @@ pub fn source_file_of_class(class: &Class) -> Option<Arc<str>> {
 mod tests {
     use super::*;
     use cratonvm_reader::attribute::{Attribute, CodeAttribute, LineNumberEntry};
-    use cratonvm_reader::method::ClassFileMethod;
     use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::method::ClassFileMethod;
 
     fn make_method_with_line_table(entries: Vec<LineNumberEntry>) -> ClassFileMethod {
         let code = CodeAttribute {
@@ -233,9 +233,18 @@ mod tests {
     #[test]
     fn line_table_picks_largest_start_leq_bci() {
         let method = make_method_with_line_table(vec![
-            LineNumberEntry { start_pc: 0, line_number: 10 },
-            LineNumberEntry { start_pc: 5, line_number: 20 },
-            LineNumberEntry { start_pc: 9, line_number: 30 },
+            LineNumberEntry {
+                start_pc: 0,
+                line_number: 10,
+            },
+            LineNumberEntry {
+                start_pc: 5,
+                line_number: 20,
+            },
+            LineNumberEntry {
+                start_pc: 9,
+                line_number: 30,
+            },
         ]);
         // Reimplement the core scan logic here against the method directly
         // (the `line_number_for_bci` entry point requires a ClassStore and

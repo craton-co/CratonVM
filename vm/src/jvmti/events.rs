@@ -45,21 +45,63 @@ pub enum JvmtiEvent {
 /// Data associated with each event type.
 #[derive(Debug, Clone)]
 pub enum EventData {
-    VMInit { thread_id: u64 },
+    VMInit {
+        thread_id: u64,
+    },
     VMDeath,
-    ThreadStart { thread_id: u64, name: String },
-    ThreadEnd { thread_id: u64 },
-    ClassLoad { class_id: u64, name: String },
-    ClassPrepare { class_id: u64, name: String },
-    Breakpoint { thread_id: u64, class_id: u64, method_id: u64, location: u64 },
-    MethodEntry { thread_id: u64, class_id: u64, method_id: u64 },
-    MethodExit { thread_id: u64, class_id: u64, method_id: u64, return_value: Option<i64> },
-    Exception { thread_id: u64, class_id: u64, method_id: u64, location: u64, exception_class: String },
+    ThreadStart {
+        thread_id: u64,
+        name: String,
+    },
+    ThreadEnd {
+        thread_id: u64,
+    },
+    ClassLoad {
+        class_id: u64,
+        name: String,
+    },
+    ClassPrepare {
+        class_id: u64,
+        name: String,
+    },
+    Breakpoint {
+        thread_id: u64,
+        class_id: u64,
+        method_id: u64,
+        location: u64,
+    },
+    MethodEntry {
+        thread_id: u64,
+        class_id: u64,
+        method_id: u64,
+    },
+    MethodExit {
+        thread_id: u64,
+        class_id: u64,
+        method_id: u64,
+        return_value: Option<i64>,
+    },
+    Exception {
+        thread_id: u64,
+        class_id: u64,
+        method_id: u64,
+        location: u64,
+        exception_class: String,
+    },
     GarbageCollectionStart,
     GarbageCollectionFinish,
-    MonitorWait { thread_id: u64, object_id: u64, timeout: i64 },
-    MonitorContendedEnter { thread_id: u64, object_id: u64 },
-    ObjectFree { tag: i64 },
+    MonitorWait {
+        thread_id: u64,
+        object_id: u64,
+        timeout: i64,
+    },
+    MonitorContendedEnter {
+        thread_id: u64,
+        object_id: u64,
+    },
+    ObjectFree {
+        tag: i64,
+    },
 }
 
 /// Callback function type for JVMTI events.
@@ -272,7 +314,10 @@ mod tests {
         // Enabled but no callback registered — should not crash.
         mgr.fire_event(
             JvmtiEvent::ThreadStart,
-            &EventData::ThreadStart { thread_id: 42, name: "main".into() },
+            &EventData::ThreadStart {
+                thread_id: 42,
+                name: "main".into(),
+            },
         );
     }
 
@@ -282,21 +327,54 @@ mod tests {
         let variants: Vec<EventData> = vec![
             EventData::VMInit { thread_id: 1 },
             EventData::VMDeath,
-            EventData::ThreadStart { thread_id: 2, name: "worker".into() },
+            EventData::ThreadStart {
+                thread_id: 2,
+                name: "worker".into(),
+            },
             EventData::ThreadEnd { thread_id: 2 },
-            EventData::ClassLoad { class_id: 10, name: "java/lang/Object".into() },
-            EventData::ClassPrepare { class_id: 10, name: "java/lang/Object".into() },
-            EventData::Breakpoint { thread_id: 1, class_id: 10, method_id: 5, location: 0 },
-            EventData::MethodEntry { thread_id: 1, class_id: 10, method_id: 5 },
-            EventData::MethodExit { thread_id: 1, class_id: 10, method_id: 5, return_value: Some(42) },
+            EventData::ClassLoad {
+                class_id: 10,
+                name: "java/lang/Object".into(),
+            },
+            EventData::ClassPrepare {
+                class_id: 10,
+                name: "java/lang/Object".into(),
+            },
+            EventData::Breakpoint {
+                thread_id: 1,
+                class_id: 10,
+                method_id: 5,
+                location: 0,
+            },
+            EventData::MethodEntry {
+                thread_id: 1,
+                class_id: 10,
+                method_id: 5,
+            },
+            EventData::MethodExit {
+                thread_id: 1,
+                class_id: 10,
+                method_id: 5,
+                return_value: Some(42),
+            },
             EventData::Exception {
-                thread_id: 1, class_id: 10, method_id: 5, location: 3,
+                thread_id: 1,
+                class_id: 10,
+                method_id: 5,
+                location: 3,
                 exception_class: "java/lang/NullPointerException".into(),
             },
             EventData::GarbageCollectionStart,
             EventData::GarbageCollectionFinish,
-            EventData::MonitorWait { thread_id: 1, object_id: 100, timeout: 5000 },
-            EventData::MonitorContendedEnter { thread_id: 1, object_id: 100 },
+            EventData::MonitorWait {
+                thread_id: 1,
+                object_id: 100,
+                timeout: 5000,
+            },
+            EventData::MonitorContendedEnter {
+                thread_id: 1,
+                object_id: 100,
+            },
             EventData::ObjectFree { tag: 77 },
         ];
         for v in &variants {
@@ -315,7 +393,12 @@ mod tests {
             location: 128,
         };
         match &data {
-            EventData::Breakpoint { thread_id, class_id, method_id, location } => {
+            EventData::Breakpoint {
+                thread_id,
+                class_id,
+                method_id,
+                location,
+            } => {
                 assert_eq!(*thread_id, 7);
                 assert_eq!(*class_id, 42);
                 assert_eq!(*method_id, 3);
@@ -343,8 +426,14 @@ mod tests {
         mgr.set_event_notification_mode(JvmtiEvent::GarbageCollectionStart, true);
         mgr.set_event_notification_mode(JvmtiEvent::GarbageCollectionFinish, true);
 
-        mgr.fire_event(JvmtiEvent::GarbageCollectionStart, &EventData::GarbageCollectionStart);
-        mgr.fire_event(JvmtiEvent::GarbageCollectionFinish, &EventData::GarbageCollectionFinish);
+        mgr.fire_event(
+            JvmtiEvent::GarbageCollectionStart,
+            &EventData::GarbageCollectionStart,
+        );
+        mgr.fire_event(
+            JvmtiEvent::GarbageCollectionFinish,
+            &EventData::GarbageCollectionFinish,
+        );
 
         assert_eq!(counter.load(Ordering::SeqCst), 11);
     }

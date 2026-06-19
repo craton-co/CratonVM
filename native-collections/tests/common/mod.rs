@@ -18,17 +18,21 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cratonvm_native_api::{
-    AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata,
+    ffi::UpcallEntry, AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata,
     NativeContext, NativeMethodRegistry, StackTraceEntry,
-    ffi::UpcallEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 /// One heap entry — either a plain object (fields) or an array (elements).
 enum HeapEntry {
-    Object { class_id: ClassId, fields: Vec<Value> },
-    Array { elements: Vec<Value> },
+    Object {
+        class_id: ClassId,
+        fields: Vec<Value>,
+    },
+    Array {
+        elements: Vec<Value>,
+    },
 }
 
 /// A heap-backed mock NativeContext.
@@ -59,7 +63,9 @@ pub struct MockCtx {
 }
 
 impl Default for MockCtx {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Process-wide pointer-namespace counter.
@@ -119,7 +125,9 @@ impl MockCtx {
 
     pub fn set_invoke_virtual_result(&self, r: MethodCallResult) {
         // SAFETY: single-threaded test code.
-        unsafe { *self.invoke_virtual_result.get() = Some(r); }
+        unsafe {
+            *self.invoke_virtual_result.get() = Some(r);
+        }
     }
 
     fn heap_mut(&self) -> &mut Vec<HeapEntry> {
@@ -174,7 +182,9 @@ impl MockCtx {
     /// Snapshot the next pointer the mock will hand out. Useful for
     /// the GC-relocation test to capture an address before allocating
     /// a fresh object on top of it.
-    pub fn peek_next_ptr(&self) -> usize { self.next_ptr }
+    pub fn peek_next_ptr(&self) -> usize {
+        self.next_ptr
+    }
 
     /// Convenience wrapper around `NativeContext::alloc_object` for tests
     /// that don't care about field count. Used by the GC-relocation
@@ -198,7 +208,9 @@ impl MockCtx {
     /// keyed by raw pointer would lose state.
     pub fn relocate_object(&mut self, old: ObjectRef) -> ObjectRef {
         let old_key = old.as_ptr() as usize;
-        let entry_idx = *self.ptr_map_ref().get(&old_key)
+        let entry_idx = *self
+            .ptr_map_ref()
+            .get(&old_key)
             .expect("relocate_object: stale ObjectRef");
         // Mint a fresh slot.
         let new_ptr_val = self.next_ptr;
@@ -226,7 +238,9 @@ impl NativeContext for MockCtx {
     // Class loading / dispatch — synthetic class registry only.
     // ------------------------------------------------------------------
 
-    fn load_class(&mut self, _name: &str) -> MethodCallResult { Ok(None) }
+    fn load_class(&mut self, _name: &str) -> MethodCallResult {
+        Ok(None)
+    }
 
     fn new_object(&mut self, class_name: &str) -> MethodCallResult {
         let cid = self.ensure_class_initialized(class_name)?;
@@ -266,8 +280,7 @@ impl NativeContext for MockCtx {
             // exactly the layout `tree_key_to_value` produces, so a reboxed
             // TreeMap key round-trips to the correct wrapper class.
             (
-                "java/lang/Character" | "java/lang/Byte" | "java/lang/Short"
-                | "java/lang/Boolean",
+                "java/lang/Character" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Boolean",
                 "valueOf",
             ) => {
                 if let Some(Value::Int(v)) = a.first().copied() {
@@ -312,8 +325,12 @@ impl NativeContext for MockCtx {
         }
     }
 
-    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
+    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+        None
+    }
 
     // ------------------------------------------------------------------
     // Field access — real heap-backed.
@@ -381,14 +398,18 @@ impl NativeContext for MockCtx {
             _ => None,
         }
     }
-    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool { false }
+    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+        false
+    }
 
     // ------------------------------------------------------------------
     // Arrays — real heap-backed.
     // ------------------------------------------------------------------
 
     fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Array { elements: vec![Value::Int(0); length] })
+        self.alloc_entry(HeapEntry::Array {
+            elements: vec![Value::Int(0); length],
+        })
     }
 
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
@@ -478,19 +499,31 @@ impl NativeContext for MockCtx {
     }
 
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
-        let name = self.class_names.get(&class_id.as_u32()).cloned()
+        let name = self
+            .class_names
+            .get(&class_id.as_u32())
+            .cloned()
             .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
         let name_obj = self.create_string(&name);
         self.alloc_entry(HeapEntry::Object {
             class_id: ClassId::new(0),
-            fields: vec![Value::Int(class_id.as_u32() as i32), Value::Object(Some(name_obj))],
+            fields: vec![
+                Value::Int(class_id.as_u32() as i32),
+                Value::Object(Some(name_obj)),
+            ],
         })
     }
 
     fn record_printed_line(&mut self, _t: String) {}
-    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
-    fn get_system_property(&self, _k: &str) -> Option<String> { None }
-    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> { None }
+    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+        None
+    }
+    fn get_system_property(&self, _k: &str) -> Option<String> {
+        None
+    }
+    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+        None
+    }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Object {
@@ -511,20 +544,37 @@ impl NativeContext for MockCtx {
     }
 
     fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
-        self.ensure_class_initialized(name).unwrap_or(ClassId::new(0))
+        self.ensure_class_initialized(name)
+            .unwrap_or(ClassId::new(0))
     }
 
-    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool { c == p }
-    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> { None }
-    fn is_interface_class(&self, _c: ClassId) -> bool { false }
+    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool {
+        c == p
+    }
+    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
+        None
+    }
+    fn is_interface_class(&self, _c: ClassId) -> bool {
+        false
+    }
     fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
         self.name_to_id.get(name).copied().map(ClassId::new)
     }
-    fn loader_id_of_class(&self, _c: ClassId) -> i32 { 2 }
-    fn is_record_class(&self, _c: ClassId) -> bool { false }
-    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> { Vec::new() }
-    fn is_sealed_class(&self, _c: ClassId) -> bool { false }
-    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> { Vec::new() }
+    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+        2
+    }
+    fn is_record_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn is_sealed_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+        Vec::new()
+    }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
         match self.entry_index(obj) {
@@ -540,33 +590,69 @@ impl NativeContext for MockCtx {
     // Threading — single-threaded stubs.
     // ------------------------------------------------------------------
 
-    fn thread_id(&self) -> u64 { 1 }
+    fn thread_id(&self) -> u64 {
+        1
+    }
     fn monitor_enter(&mut self, _o: ObjectRef) {}
     fn monitor_exit(&mut self, _o: ObjectRef) {}
-    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult { Ok(None) }
-    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_is_alive(&self, _o: ObjectRef) -> bool { false }
+    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_is_alive(&self, _o: ObjectRef) -> bool {
+        false
+    }
     fn current_thread_object(&mut self) -> ObjectRef {
         self.alloc_object(ClassId::new(0), 2)
     }
     fn thread_interrupt(&mut self, _o: ObjectRef) {}
-    fn is_interrupted(&self, _c: bool) -> bool { false }
-    fn active_thread_count(&self) -> i32 { 1 }
-    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> { Vec::new() }
+    fn is_interrupted(&self, _c: bool) -> bool {
+        false
+    }
+    fn active_thread_count(&self) -> i32 {
+        1
+    }
+    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
+        Vec::new()
+    }
 
-    fn heap_allocated_bytes(&self) -> usize { 0 }
-    fn loaded_class_count(&self) -> usize { 0 }
-    fn gc_collection_count(&self) -> u64 { 0 }
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+    fn loaded_class_count(&self) -> usize {
+        0
+    }
+    fn gc_collection_count(&self) -> u64 {
+        0
+    }
     fn force_gc(&mut self) {}
 
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> { Vec::new() }
-    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> { Vec::new() }
-    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> { Vec::new() }
-    fn class_access_flags(&self, _c: ClassId) -> u16 { 0 }
-    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
+    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+        Vec::new()
+    }
+    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+        Vec::new()
+    }
+    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
+        Vec::new()
+    }
+    fn class_access_flags(&self, _c: ClassId) -> u16 {
+        0
+    }
+    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
+        Value::Int(0)
+    }
     fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
     fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
         let name_obj = self.create_string(name);
@@ -589,7 +675,11 @@ impl NativeContext for MockCtx {
         self.set_field(obj, index, value)
     }
     fn compare_and_swap_field(
-        &mut self, obj: ObjectRef, index: usize, expected: Value, new_val: Value,
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        expected: Value,
+        new_val: Value,
     ) -> bool {
         let current = self.get_field(obj, index);
         if current == expected {
@@ -607,28 +697,50 @@ impl NativeContext for MockCtx {
         Some(self.alloc_object(cid, 4))
     }
 
-    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> { Vec::new() }
+    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+        Vec::new()
+    }
     fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
         Vec::new()
     }
-    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> { Vec::new() }
+    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
     fn method_parameter_annotations(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Vec<Vec<AnnotationData>> { Vec::new() }
-    fn class_signature(&self, _c: ClassId) -> Option<String> { None }
-    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> { None }
-    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+    fn class_signature(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+        None
+    }
+    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+        None
+    }
     fn method_annotation_default(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Option<AnnotationElementValue> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Option<AnnotationElementValue> {
+        None
+    }
 
-    fn invoke_virtual(
-        &mut self, r: ObjectRef, m: &str, d: &str, a: &[Value],
-    ) -> MethodCallResult {
+    fn invoke_virtual(&mut self, r: ObjectRef, m: &str, d: &str, a: &[Value]) -> MethodCallResult {
         // SAFETY: single-threaded test code.
         unsafe {
-            (*self.invoke_virtual_log.get())
-                .push((r.as_ptr() as usize, m.to_string(), d.to_string(), a.to_vec()));
+            (*self.invoke_virtual_log.get()).push((
+                r.as_ptr() as usize,
+                m.to_string(),
+                d.to_string(),
+                a.to_vec(),
+            ));
         }
         let slot = unsafe { &mut *self.invoke_virtual_result.get() };
         if let Some(r) = slot.take() {
@@ -638,39 +750,71 @@ impl NativeContext for MockCtx {
         }
     }
 
-    fn get_scoped_value(&self, _k: u64) -> Option<Value> { None }
+    fn get_scoped_value(&self, _k: u64) -> Option<Value> {
+        None
+    }
     fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
     fn pop_scoped_value(&mut self) {}
-    fn scoped_value_depth(&self) -> usize { 0 }
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
 
-    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> { None }
+    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
+        None
+    }
     fn free_native_memory(&mut self, _a: i64) {}
-    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
-    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
-    fn register_upcall(&mut self, _e: UpcallEntry) -> usize { 0 }
-    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
+    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> {
+        Ok(0)
+    }
+    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> {
+        None
+    }
+    fn register_upcall(&mut self, _e: UpcallEntry) -> usize {
+        0
+    }
+    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
+        None
+    }
 
-    fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
-    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }
-    fn list_application_class_names(&self) -> Vec<String> { Vec::new() }
+    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn list_application_class_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> { None }
-    fn define_class_with_loader(
-        &mut self, _n: &str, _b: &[u8], _l: u32,
-    ) -> Option<ClassId> { None }
-    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> { None }
-    fn allocate_loader_id(&mut self) -> u32 { 0 }
-    fn discover_reference(
-        &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
-    ) {}
+    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+        None
+    }
+    fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn allocate_loader_id(&mut self) -> u32 {
+        0
+    }
+    fn discover_reference(&mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>) {}
 
-    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool { true }
-    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
-    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool { true }
-    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
-    fn check_deep_reflection_access(
-        &self, _a: ClassId, _t: ClassId,
-    ) -> Result<(), String> { Ok(()) }
+    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
+    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
+    fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------
@@ -706,8 +850,15 @@ pub fn call(
 pub fn new_arraylist(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     let cid = ctx.ensure_class_initialized("java/util/ArrayList").unwrap();
     let al = ctx.alloc_object(cid, 4);
-    call(reg, ctx, "java/util/ArrayList", "<init>", "()V",
-         &[Value::Object(Some(al))]).unwrap();
+    call(
+        reg,
+        ctx,
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(al))],
+    )
+    .unwrap();
     al
 }
 
@@ -715,28 +866,54 @@ pub fn new_arraylist(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef
 pub fn new_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     let cid = ctx.ensure_class_initialized("java/util/HashMap").unwrap();
     let hm = ctx.alloc_object(cid, 6);
-    call(reg, ctx, "java/util/HashMap", "<init>", "()V",
-         &[Value::Object(Some(hm))]).unwrap();
+    call(
+        reg,
+        ctx,
+        "java/util/HashMap",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(hm))],
+    )
+    .unwrap();
     hm
 }
 
 /// Allocate a fresh `java/util/LinkedHashMap`. `access_order = true` builds
 /// it via the `(IFZ)V` ctor with capacity 16, load factor 0.75.
 pub fn new_linked_hashmap(
-    reg: &NativeMethodRegistry, ctx: &mut MockCtx, access_order: bool,
+    reg: &NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    access_order: bool,
 ) -> ObjectRef {
-    let cid = ctx.ensure_class_initialized("java/util/LinkedHashMap").unwrap();
+    let cid = ctx
+        .ensure_class_initialized("java/util/LinkedHashMap")
+        .unwrap();
     let lhm = ctx.alloc_object(cid, 8);
     if access_order {
-        call(reg, ctx, "java/util/LinkedHashMap", "<init>", "(IFZ)V", &[
-            Value::Object(Some(lhm)),
-            Value::Int(16),
-            Value::Float(0.75),
-            Value::Int(1),
-        ]).unwrap();
+        call(
+            reg,
+            ctx,
+            "java/util/LinkedHashMap",
+            "<init>",
+            "(IFZ)V",
+            &[
+                Value::Object(Some(lhm)),
+                Value::Int(16),
+                Value::Float(0.75),
+                Value::Int(1),
+            ],
+        )
+        .unwrap();
     } else {
-        call(reg, ctx, "java/util/LinkedHashMap", "<init>", "()V",
-             &[Value::Object(Some(lhm))]).unwrap();
+        call(
+            reg,
+            ctx,
+            "java/util/LinkedHashMap",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(lhm))],
+        )
+        .unwrap();
     }
     lhm
 }
@@ -745,8 +922,15 @@ pub fn new_linked_hashmap(
 pub fn new_treemap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
     let cid = ctx.ensure_class_initialized("java/util/TreeMap").unwrap();
     let tm = ctx.alloc_object(cid, 4);
-    call(reg, ctx, "java/util/TreeMap", "<init>", "()V",
-         &[Value::Object(Some(tm))]).unwrap();
+    call(
+        reg,
+        ctx,
+        "java/util/TreeMap",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
     tm
 }
 

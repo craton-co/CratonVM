@@ -472,7 +472,10 @@ fn buf_overflow(msg: impl Into<String>) -> RuntimeError {
 }
 
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -618,8 +621,7 @@ pub fn sink_channel_write(
     let short = remaining - n;
     if short > 0 {
         // Round-9 HIGH-2: AcqRel — single-variable counter.
-        ch.buffered_bytes
-            .fetch_add(short as u64, Ordering::AcqRel);
+        ch.buffered_bytes.fetch_add(short as u64, Ordering::AcqRel);
     }
     let new_pos = bb_position(ctx, buf) + n;
     bb_set_position(ctx, buf, new_pos);
@@ -836,14 +838,20 @@ fn native_source_transfer_to(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     Ok(Some(Value::Long(0)))
 }
 
-fn native_source_set_read_listener(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_source_set_read_listener(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let listener = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(this, SRC_FIELD_READ_LISTENER, listener);
     Ok(None)
 }
 
-fn native_source_get_read_listener(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_source_get_read_listener(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = ctx.get_field(this, SRC_FIELD_READ_LISTENER);
     Ok(Some(v))
@@ -1055,7 +1063,12 @@ pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef
 /// Register every T19.7.d native with the method registry.
 pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
     // ---- ConduitStreamSourceChannel ----
-    r.register(CLS_SOURCE, "read", "(Ljava/nio/ByteBuffer;)I", native_source_read);
+    r.register(
+        CLS_SOURCE,
+        "read",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_source_read,
+    );
     r.register(
         CLS_SOURCE,
         "read",
@@ -1081,11 +1094,26 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         native_source_get_read_listener,
     );
     r.register(CLS_SOURCE, "resumeReads", "()V", native_source_resume_reads);
-    r.register(CLS_SOURCE, "suspendReads", "()V", native_source_suspend_reads);
-    r.register(CLS_SOURCE, "shutdownReads", "()V", native_source_shutdown_reads);
+    r.register(
+        CLS_SOURCE,
+        "suspendReads",
+        "()V",
+        native_source_suspend_reads,
+    );
+    r.register(
+        CLS_SOURCE,
+        "shutdownReads",
+        "()V",
+        native_source_shutdown_reads,
+    );
 
     // ---- ConduitStreamSinkChannel ----
-    r.register(CLS_SINK, "write", "(Ljava/nio/ByteBuffer;)I", native_sink_write);
+    r.register(
+        CLS_SINK,
+        "write",
+        "(Ljava/nio/ByteBuffer;)I",
+        native_sink_write,
+    );
     r.register(
         CLS_SINK,
         "write",
@@ -1325,7 +1353,11 @@ mod tests {
             .read_suspended
             .store(false, Ordering::Release);
         let listener = ctx.create_string("listener");
-        ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
+        ctx.set_field(
+            ch_obj,
+            SRC_FIELD_READ_LISTENER,
+            Value::Object(Some(listener)),
+        );
 
         let key = FakeKey {
             ready: OP_READ,
@@ -1356,7 +1388,11 @@ mod tests {
             .read_suspended
             .store(false, Ordering::Release);
         let listener = ctx.create_string("listener");
-        ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
+        ctx.set_field(
+            ch_obj,
+            SRC_FIELD_READ_LISTENER,
+            Value::Object(Some(listener)),
+        );
 
         // Install an invoke_virtual result that panics.
         let slot = ctx.invoke_virtual_result.get();
@@ -1397,7 +1433,11 @@ mod tests {
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
         let ch_obj = alloc_source_channel_obj(&mut ctx, id);
         let listener = ctx.create_string("listener");
-        ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
+        ctx.set_field(
+            ch_obj,
+            SRC_FIELD_READ_LISTENER,
+            Value::Object(Some(listener)),
+        );
         native_source_suspend_reads(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
 
         let key = FakeKey {
@@ -1419,13 +1459,20 @@ mod tests {
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
         let ch_obj = alloc_source_channel_obj(&mut ctx, id);
         let listener = ctx.create_string("listener");
-        ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
+        ctx.set_field(
+            ch_obj,
+            SRC_FIELD_READ_LISTENER,
+            Value::Object(Some(listener)),
+        );
 
         // Suspend then resume.
         native_source_suspend_reads(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
         native_source_resume_reads(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
 
-        assert_eq!(ctx.get_field(ch_obj, SRC_FIELD_READ_SUSPENDED), Value::Int(0));
+        assert_eq!(
+            ctx.get_field(ch_obj, SRC_FIELD_READ_SUSPENDED),
+            Value::Int(0)
+        );
         let reg = get_source_channel(id).unwrap();
         assert!(!reg.read_suspended.load(Ordering::Acquire));
 
@@ -1505,7 +1552,11 @@ mod tests {
         let ch_obj = alloc_source_channel_obj(&mut ctx, id);
         // Build a Setter tied to SRC_FIELD_READ_LISTENER on ch_obj.
         let setter = alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS);
-        ctx.set_field(setter, SETTER_FIELD_CHANNEL_HANDLE, Value::Object(Some(ch_obj)));
+        ctx.set_field(
+            setter,
+            SETTER_FIELD_CHANNEL_HANDLE,
+            Value::Object(Some(ch_obj)),
+        );
         ctx.set_field(
             setter,
             SETTER_FIELD_LISTENER_SLOT_INDEX,
@@ -1570,7 +1621,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let total = r.as_long().unwrap();
-        assert!(total > 0 && total <= 11, "total bytes in [1..=11], got {total}");
+        assert!(
+            total > 0 && total <= 11,
+            "total bytes in [1..=11], got {total}"
+        );
         drop_source_channel(id);
     }
 }

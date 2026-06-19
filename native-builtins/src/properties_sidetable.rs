@@ -144,7 +144,10 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
     }
     // 3. New object for this hash (or a genuine 32-bit collision): fresh slot.
     let generation = slots.len() as u32;
-    slots.push(ObjKeyEntry { last_ptr: ptr, generation });
+    slots.push(ObjKeyEntry {
+        last_ptr: ptr,
+        generation,
+    });
     pack_obj_key(hash, generation)
 }
 
@@ -182,10 +185,7 @@ fn is_system_props(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// Read all bytes from an InputStream by repeatedly invoking `read([B,
 /// I, I)I` on the input.  Returns `None` if the stream is null, the
 /// total exceeds `MAX_LOAD_BYTES`, or a read errors out.
-fn drain_input_stream(
-    ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
-) -> Option<Vec<u8>> {
+fn drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<Vec<u8>> {
     // The InputStream allocated by `Class.getResourceAsStream` and
     // `URL.openStream` is a ByteArrayInputStream with `buf` (byte[]),
     // `pos` (int), `count` (int) fields populated.  Read directly to
@@ -231,7 +231,10 @@ fn drain_input_stream(
                     out.push(b as u8);
                 }
             }
-            props_diag_eprintln!("[DRAIN-DBG] drain_input_stream: by-name read {} bytes", out.len());
+            props_diag_eprintln!(
+                "[DRAIN-DBG] drain_input_stream: by-name read {} bytes",
+                out.len()
+            );
             return Some(out);
         }
     }
@@ -263,7 +266,10 @@ fn drain_input_stream(
                     out.push(b as u8);
                 }
             }
-            props_diag_eprintln!("[DRAIN-DBG] drain_input_stream: by-index read {} bytes", out.len());
+            props_diag_eprintln!(
+                "[DRAIN-DBG] drain_input_stream: by-index read {} bytes",
+                out.len()
+            );
             return Some(out);
         }
     }
@@ -344,10 +350,7 @@ fn parse_properties(bytes: &[u8]) -> Vec<(String, String)> {
             joined
         } else {
             // Skip blank lines and comments.
-            if trimmed.is_empty()
-                || trimmed.starts_with('#')
-                || trimmed.starts_with('!')
-            {
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
                 continue;
             }
             trimmed.to_string()
@@ -509,8 +512,7 @@ fn unescape(s: &str) -> String {
                     // into one Rust `char` (the previous code dropped BOTH
                     // halves because each lone half failed `char::from_u32`).
                     if let Some(low) = peek_low_surrogate(&mut chars) {
-                        let cp = 0x10000
-                            + (((code - 0xD800) << 10) | (low - 0xDC00));
+                        let cp = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
                         if let Some(ch) = char::from_u32(cp) {
                             out.push(ch);
                             continue;
@@ -563,9 +565,7 @@ fn unescape(s: &str) -> String {
 /// decide how loudly to react. We deliberately read *only* what's present
 /// rather than over-consuming, so a non-hex follow-on character (and any
 /// subsequent escapes) is still processed by the caller.
-fn read_u_escape<I: Iterator<Item = char>>(
-    chars: &mut std::iter::Peekable<I>,
-) -> (u32, u32) {
+fn read_u_escape<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) -> (u32, u32) {
     let mut code = 0u32;
     let mut seen = 0u32;
     while seen < 4 {
@@ -681,10 +681,7 @@ pub fn snapshot_sidetable(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(Strin
 }
 
 /// Public re-export of `drain_input_stream` for use from `lib.rs`.
-pub fn drain_input_stream_pub(
-    ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
-) -> Option<Vec<u8>> {
+pub fn drain_input_stream_pub(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<Vec<u8>> {
     drain_input_stream(ctx, stream)
 }
 
@@ -862,11 +859,7 @@ fn mirror_loaded_entries_to_properties_backend(
 /// runtime class IS `java/util/Properties`; for genuine subclasses,
 /// dispatch each entry through `put` (a non-overriding subclass lands
 /// back on the registered Properties.put native, same net effect).
-fn store_parsed_entries(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    parsed: &[(String, String)],
-) {
+fn store_parsed_entries(ctx: &mut dyn NativeContext, this: ObjectRef, parsed: &[(String, String)]) {
     let cid = ctx.class_id_of_object(this);
     let is_exact = ctx
         .class_name_of_id(cid)
@@ -902,10 +895,7 @@ fn store_parsed_entries(
 /// Native `Properties.load(InputStream)` — drains the stream, parses
 /// the bytes as a Java `.properties` file, and populates the side-
 /// table for `this`.
-fn native_properties_load(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -922,15 +912,28 @@ fn native_properties_load(
         return Ok(None);
     }
     let parsed = parse_properties(&bytes);
-    props_diag_eprintln!("[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes", parsed.len(), bytes.len());
+    props_diag_eprintln!(
+        "[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes",
+        parsed.len(),
+        bytes.len()
+    );
     for (k, v) in &parsed {
         if k.contains("ApplicationContext") || k.contains("ContextFactory") {
             let preview_len = v.len().min(80);
-            props_diag_eprintln!("[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}", k, v.len(), &v[..preview_len]);
+            props_diag_eprintln!(
+                "[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}",
+                k,
+                v.len(),
+                &v[..preview_len]
+            );
         }
     }
     store_parsed_entries(ctx, this, &parsed);
-    props_diag_eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(ctx, this), this);
+    props_diag_eprintln!(
+        "[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}",
+        count_kv(ctx, this),
+        this
+    );
     Ok(None)
 }
 
@@ -968,10 +971,7 @@ fn iso_8859_1_bytes(s: &str) -> Vec<u8> {
 /// same back-half as the InputStream overload.  We deliberately do
 /// not call `Reader.close()` (the caller owns the stream lifecycle,
 /// matching real JDK `Properties.load(Reader)`).
-fn native_properties_load_reader(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -999,7 +999,11 @@ fn native_properties_load_reader(
             reader,
             "read",
             "([CII)I",
-            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(CHUNK as i32)],
+            &[
+                Value::Object(Some(buf)),
+                Value::Int(0),
+                Value::Int(CHUNK as i32),
+            ],
         )?;
         let n = match res {
             Some(Value::Int(n)) => n,
@@ -1123,10 +1127,7 @@ fn native_properties_get_property_2(
 /// finds it) and in the VM's system-property store (matching the
 /// historical behaviour of the previous override that mirrored to
 /// `System.setProperty`).
-fn native_properties_set_property(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1195,10 +1196,7 @@ fn native_properties_set_property(
 /// `ASN1Integer`'s `Properties.isOverrideSet(...)` reads back stale
 /// `false`, so the loose-validation bypass never engages and
 /// "malformed integer" throws on inputs the test expects to accept.
-fn native_properties_put(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1246,21 +1244,31 @@ fn put_non_string_into_chm(
     let chm = match ctx.get_field_by_name(this, "map") {
         Value::Object(Some(m)) => m,
         _ => {
-            let Ok(Some(Value::Object(Some(m)))) = ctx.new_object("java/util/concurrent/ConcurrentHashMap") else {
+            let Ok(Some(Value::Object(Some(m)))) =
+                ctx.new_object("java/util/concurrent/ConcurrentHashMap")
+            else {
                 return Value::Object(None);
             };
-            let _ = ctx.invoke("java/util/concurrent/ConcurrentHashMap", "<init>", "()V",
-                &[Value::Object(Some(m))]);
+            let _ = ctx.invoke(
+                "java/util/concurrent/ConcurrentHashMap",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(m))],
+            );
             ctx.set_field_by_name(this, "map", Value::Object(Some(m)));
             m
         }
     };
-    let prev = ctx.invoke_virtual(
-        chm,
-        "put",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[key_v, val_v],
-    ).ok().flatten().unwrap_or(Value::Object(None));
+    let prev = ctx
+        .invoke_virtual(
+            chm,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key_v, val_v],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
     prev
 }
 
@@ -1279,10 +1287,7 @@ fn put_non_string_into_chm(
 /// `getAndRemoveProperty` (which previously got the same null-return
 /// behaviour via the no-op stub this replaces — empty side-table for
 /// jdk.module.* keys keeps that path unchanged).
-fn native_properties_remove(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1352,10 +1357,7 @@ fn native_properties_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 /// Native `Properties.containsKey(Object)` — consults the side-table.
 /// Symmetric with `getProperty`.
-fn native_properties_contains_key(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -1400,10 +1402,7 @@ fn native_properties_contains_key(
 ///
 /// Returns `null` when the key is absent — matches `Hashtable.get`
 /// semantics.
-fn native_properties_get(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1448,10 +1447,7 @@ fn native_properties_get(
 /// `ConcurrentHashMap<Object,Object> map` field that's null on our
 /// synthetic Properties — the bytecode NPEs.  Route the read through
 /// the side-table; objects we never wrote to report 0.
-fn native_properties_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -1467,10 +1463,7 @@ fn native_properties_size(
 }
 
 /// Native `Properties.isEmpty()Z` — symmetric companion to `size()`.
-fn native_properties_is_empty(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
@@ -1526,7 +1519,10 @@ fn build_string_collection(
 /// given Properties object.  Returns an empty HashSet if the object isn't
 /// tracked.
 fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    let keys: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(k, _v)| k).collect();
+    let keys: Vec<String> = snapshot_kv(ctx, this)
+        .into_iter()
+        .map(|(k, _v)| k)
+        .collect();
     build_string_collection(ctx, "java/util/HashSet", keys)
 }
 
@@ -1534,7 +1530,10 @@ fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
 /// the given Properties object.  ArrayList is a `Collection` — sufficient for
 /// `Properties.values()`'s declared return type.
 fn build_value_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    let vals: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(_k, v)| v).collect();
+    let vals: Vec<String> = snapshot_kv(ctx, this)
+        .into_iter()
+        .map(|(_k, v)| v)
+        .collect();
     build_string_collection(ctx, "java/util/ArrayList", vals)
 }
 
@@ -1559,7 +1558,12 @@ fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectR
     };
     let pin = ctx.pin_native_root(vec);
     if ctx
-        .invoke("java/util/Vector", "<init>", "()V", &[Value::Object(Some(vec))])
+        .invoke(
+            "java/util/Vector",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(vec))],
+        )
         .is_err()
     {
         ctx.unpin_native_roots(pin);
@@ -1610,10 +1614,7 @@ fn native_properties_string_property_names(
 /// HashSet populated from the side-table.  Spring's
 /// `SpringIterableConfigurationPropertySource` walks this once it
 /// recognises the source as enumerable.
-fn native_properties_key_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1639,10 +1640,7 @@ fn native_properties_key_set(
 
 /// Native `Properties.values()Ljava/util/Collection;` — returns a
 /// synthetic ArrayList populated from the side-table.
-fn native_properties_values(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1659,12 +1657,7 @@ fn native_properties_values(
     // not duplicated.
     let side = side_key_set(ctx, this);
     for (_key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
-        let _ = ctx.invoke_virtual(
-            list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[value],
-        );
+        let _ = ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[value]);
     }
     Ok(Some(Value::Object(Some(list))))
 }
@@ -1672,10 +1665,7 @@ fn native_properties_values(
 /// Native `Properties.entrySet()Ljava/util/Set;` — returns a synthetic
 /// HashSet of `AbstractMap.SimpleImmutableEntry` objects.  Spring's
 /// binder iterates this to enumerate `(key,value)` pairs.
-fn native_properties_entry_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1684,9 +1674,16 @@ fn native_properties_entry_set(
         }
     };
     let snapshot = snapshot_kv(ctx, this);
-    props_diag_eprintln!("[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}", snapshot.len(), this);
+    props_diag_eprintln!(
+        "[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}",
+        snapshot.len(),
+        this
+    );
     if snapshot.is_empty() {
-        props_diag_eprintln!("[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}", this);
+        props_diag_eprintln!(
+            "[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}",
+            this
+        );
     }
     for (k, _v) in snapshot.iter().take(5) {
         props_diag_eprintln!("[PROPS-DBG]   entry key={}", k);
@@ -1715,11 +1712,8 @@ fn native_properties_entry_set(
         &[Value::Object(Some(set))],
     );
     for (k, v) in &snapshot {
-        let entry = crate::alloc_concurrent_synthetic(
-            ctx,
-            "java/util/AbstractMap$SimpleImmutableEntry",
-            2,
-        );
+        let entry =
+            crate::alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2);
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
         // Use field-by-name to handle any inherited-field offset (real-JDK
@@ -1741,11 +1735,8 @@ fn native_properties_entry_set(
     let side_keys: std::collections::HashSet<String> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
     for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side_keys) {
-        let entry = crate::alloc_concurrent_synthetic(
-            ctx,
-            "java/util/AbstractMap$SimpleImmutableEntry",
-            2,
-        );
+        let entry =
+            crate::alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2);
         ctx.set_field_by_name(entry, "key", Value::Object(Some(key_obj)));
         ctx.set_field_by_name(entry, "value", value);
         let _ = ctx.invoke_virtual(
@@ -1766,15 +1757,20 @@ fn native_properties_entry_set(
 /// legacy `keys()`/`elements()`/`propertyNames()` enumeration API rather
 /// than `keySet().iterator()` (e.g. `Collections.list(props.keys())`,
 /// `new TreeSet<>(props.keySet())`-style copies).
-fn native_properties_keys(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(Some(build_enumeration(ctx, Vec::new()))))),
+        _ => {
+            return Ok(Some(Value::Object(Some(build_enumeration(
+                ctx,
+                Vec::new(),
+            )))))
+        }
     };
-    let mut keys: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(k, _v)| k).collect();
+    let mut keys: Vec<String> = snapshot_kv(ctx, this)
+        .into_iter()
+        .map(|(k, _v)| k)
+        .collect();
     // Include String keys of CHM-exclusive (non-String-valued) entries.
     let side = side_key_set(ctx, this);
     for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
@@ -1787,10 +1783,7 @@ fn native_properties_keys(
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
 /// `keys()`, enumerating the side-table values.
-fn native_properties_elements(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let vals: Vec<String> = match args.first() {
         Some(Value::Object(Some(o))) => snapshot_kv(ctx, *o).into_iter().map(|(_k, v)| v).collect(),
         _ => Vec::new(),
@@ -1801,10 +1794,7 @@ fn native_properties_elements(
 /// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.
 /// JDK 25 forwards to `map.contains(value)`.  Returns true iff the
 /// side-table holds a string-equal value for any key.
-fn native_properties_contains(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -1855,10 +1845,7 @@ fn native_properties_contains_value(
 /// calls `properties.forEach(BiConsumer)` once per Properties source
 /// (System, env, .properties file) during `StatusLogger$Config.<clinit>`.
 /// Without this override, WildFly fails to bootstrap the status logger.
-fn native_properties_for_each(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -2081,7 +2068,12 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
     // size/isEmpty/keySet/values/entrySet/keys/elements/contains
     // through the side-table so the synthetic Properties behaves as a
     // properly-empty (or populated) Map for real JDK callers.
-    registry.register("java/util/Properties", "size", "()I", native_properties_size);
+    registry.register(
+        "java/util/Properties",
+        "size",
+        "()I",
+        native_properties_size,
+    );
     registry.register(
         "java/util/Properties",
         "isEmpty",
@@ -2179,10 +2171,7 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
 /// generic walk sees zero entries and the destination Properties stays
 /// empty.  This override snapshots the source side-table and stores each
 /// `(k,v)` into the destination via `put_kv`.
-fn native_properties_put_all(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -2345,10 +2334,7 @@ mod tests {
     #[test]
     fn parse_continuation_line() {
         let p = parse_properties(b"key=long\\\n    value\n");
-        assert_eq!(
-            p,
-            vec![("key".to_string(), "longvalue".to_string())]
-        );
+        assert_eq!(p, vec![("key".to_string(), "longvalue".to_string())]);
     }
 
     #[test]
@@ -2434,8 +2420,8 @@ mod tests {
         // character survives — the value is not silently lost.
         assert_eq!(unescape("\\uD800"), "\u{FFFD}"); // lone high
         assert_eq!(unescape("\\uDC00"), "\u{FFFD}"); // lone low
-        // High surrogate followed by a NON-low escape: the high is replaced,
-        // and the trailing 'A' (A) is preserved.
+                                                     // High surrogate followed by a NON-low escape: the high is replaced,
+                                                     // and the trailing 'A' (A) is preserved.
         assert_eq!(unescape("\\uD800\\u0041"), "\u{FFFD}A");
     }
 
@@ -2445,7 +2431,7 @@ mod tests {
         // digits actually present rather than silently swallowing them.
         assert_eq!(unescape("\\u41"), "A"); // 0x41 from 2 digits
         assert_eq!(unescape("\\u41Z"), "AZ"); // stops at non-hex 'Z'
-        // `\u` with no hex digit at all: preserve the 'u' literally.
+                                              // `\u` with no hex digit at all: preserve the 'u' literally.
         assert_eq!(unescape("\\u"), "u");
         assert_eq!(unescape("\\uZ"), "uZ");
     }

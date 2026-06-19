@@ -36,10 +36,10 @@ pub struct TlabConfig {
 impl Default for TlabConfig {
     fn default() -> Self {
         Self {
-            initial_size: 512 * 1024,       // 512 KB
-            max_size: 4 * 1024 * 1024,      // 4 MB
-            refill_waste_fraction: 64,       // allow 1/64 waste before refill
-            min_size: 2 * 1024,             // 2 KB
+            initial_size: 512 * 1024,  // 512 KB
+            max_size: 4 * 1024 * 1024, // 4 MB
+            refill_waste_fraction: 64, // allow 1/64 waste before refill
+            min_size: 2 * 1024,        // 2 KB
         }
     }
 }
@@ -125,10 +125,19 @@ impl Tlab {
 /// Result of an object/array allocation attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AllocationResult {
-    TlabFastPath { address: usize },
-    TlabRefill { address: usize, new_tlab_size: usize },
-    SlowPath { address: usize },
-    OutOfMemory { requested: usize },
+    TlabFastPath {
+        address: usize,
+    },
+    TlabRefill {
+        address: usize,
+        new_tlab_size: usize,
+    },
+    SlowPath {
+        address: usize,
+    },
+    OutOfMemory {
+        requested: usize,
+    },
 }
 
 /// Tracks allocation-path statistics and drives the TLAB/slow-path decision.
@@ -1005,9 +1014,18 @@ mod tests {
         let stacks = vec![ThreadStack {
             thread_id: 1,
             frames: vec![
-                StackSlot { address: 0x100, slot_type: SlotType::Reference },
-                StackSlot { address: 0x200, slot_type: SlotType::Primitive },
-                StackSlot { address: 0x300, slot_type: SlotType::Reference },
+                StackSlot {
+                    address: 0x100,
+                    slot_type: SlotType::Reference,
+                },
+                StackSlot {
+                    address: 0x200,
+                    slot_type: SlotType::Primitive,
+                },
+                StackSlot {
+                    address: 0x300,
+                    slot_type: SlotType::Reference,
+                },
             ],
         }];
         let roots = GcRootScanner::scan_thread_stacks(&stacks);
@@ -1019,9 +1037,10 @@ mod tests {
     fn scan_thread_stacks_skips_null() {
         let stacks = vec![ThreadStack {
             thread_id: 1,
-            frames: vec![
-                StackSlot { address: 0, slot_type: SlotType::Reference },
-            ],
+            frames: vec![StackSlot {
+                address: 0,
+                slot_type: SlotType::Reference,
+            }],
         }];
         let roots = GcRootScanner::scan_thread_stacks(&stacks);
         assert_eq!(roots.len(), 0);
@@ -1030,8 +1049,14 @@ mod tests {
     #[test]
     fn scan_jni_handles_local_and_global() {
         let handles = vec![
-            JniHandle { address: 0x100, is_global: false },
-            JniHandle { address: 0x200, is_global: true },
+            JniHandle {
+                address: 0x100,
+                is_global: false,
+            },
+            JniHandle {
+                address: 0x200,
+                is_global: true,
+            },
         ];
         let roots = GcRootScanner::scan_jni_handles(&handles);
         assert_eq!(roots.len(), 2);
@@ -1041,7 +1066,10 @@ mod tests {
 
     #[test]
     fn scan_jni_handles_skips_null() {
-        let handles = vec![JniHandle { address: 0, is_global: false }];
+        let handles = vec![JniHandle {
+            address: 0,
+            is_global: false,
+        }];
         let roots = GcRootScanner::scan_jni_handles(&handles);
         assert_eq!(roots.len(), 0);
     }
@@ -1073,17 +1101,28 @@ mod tests {
     #[test]
     fn scan_interned_strings() {
         let strings = vec![
-            InternedString { hash: 42, address: 0x600 },
-            InternedString { hash: 99, address: 0x700 },
+            InternedString {
+                hash: 42,
+                address: 0x600,
+            },
+            InternedString {
+                hash: 99,
+                address: 0x700,
+            },
         ];
         let roots = GcRootScanner::scan_interned_strings(&strings);
         assert_eq!(roots.len(), 2);
-        assert!(roots.iter().all(|r| r.root_type == GcRootType::InternedString));
+        assert!(roots
+            .iter()
+            .all(|r| r.root_type == GcRootType::InternedString));
     }
 
     #[test]
     fn scan_interned_strings_skips_null() {
-        let strings = vec![InternedString { hash: 1, address: 0 }];
+        let strings = vec![InternedString {
+            hash: 1,
+            address: 0,
+        }];
         let roots = GcRootScanner::scan_interned_strings(&strings);
         assert_eq!(roots.len(), 0);
     }
@@ -1093,21 +1132,24 @@ mod tests {
         let root_set = RootSet {
             stacks: vec![ThreadStack {
                 thread_id: 1,
-                frames: vec![
-                    StackSlot { address: 0x100, slot_type: SlotType::Reference },
-                ],
+                frames: vec![StackSlot {
+                    address: 0x100,
+                    slot_type: SlotType::Reference,
+                }],
             }],
-            jni_handles: vec![
-                JniHandle { address: 0x200, is_global: false },
-            ],
+            jni_handles: vec![JniHandle {
+                address: 0x200,
+                is_global: false,
+            }],
             class_statics: vec![StaticField {
                 class_name: "A".into(),
                 field_name: "x".into(),
                 address: 0x300,
             }],
-            interned_strings: vec![
-                InternedString { hash: 1, address: 0x400 },
-            ],
+            interned_strings: vec![InternedString {
+                hash: 1,
+                address: 0x400,
+            }],
         };
         let result = GcRootScanner::scan_all(&root_set);
         assert_eq!(result.total_roots, 4);
@@ -1130,15 +1172,22 @@ mod tests {
         let stacks = vec![
             ThreadStack {
                 thread_id: 1,
-                frames: vec![
-                    StackSlot { address: 0x100, slot_type: SlotType::Reference },
-                ],
+                frames: vec![StackSlot {
+                    address: 0x100,
+                    slot_type: SlotType::Reference,
+                }],
             },
             ThreadStack {
                 thread_id: 2,
                 frames: vec![
-                    StackSlot { address: 0x200, slot_type: SlotType::Reference },
-                    StackSlot { address: 0x300, slot_type: SlotType::Reference },
+                    StackSlot {
+                        address: 0x200,
+                        slot_type: SlotType::Reference,
+                    },
+                    StackSlot {
+                        address: 0x300,
+                        slot_type: SlotType::Reference,
+                    },
                 ],
             },
         ];
@@ -1168,13 +1217,19 @@ mod tests {
     #[test]
     fn allocation_result_variants() {
         let fast = AllocationResult::TlabFastPath { address: 0x1000 };
-        let refill = AllocationResult::TlabRefill { address: 0x2000, new_tlab_size: 512 };
+        let refill = AllocationResult::TlabRefill {
+            address: 0x2000,
+            new_tlab_size: 512,
+        };
         let slow = AllocationResult::SlowPath { address: 0x3000 };
         let oom = AllocationResult::OutOfMemory { requested: 999 };
         assert!(matches!(fast, AllocationResult::TlabFastPath { .. }));
         assert!(matches!(refill, AllocationResult::TlabRefill { .. }));
         assert!(matches!(slow, AllocationResult::SlowPath { .. }));
-        assert!(matches!(oom, AllocationResult::OutOfMemory { requested: 999 }));
+        assert!(matches!(
+            oom,
+            AllocationResult::OutOfMemory { requested: 999 }
+        ));
     }
 
     #[test]

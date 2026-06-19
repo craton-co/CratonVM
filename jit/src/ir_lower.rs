@@ -958,7 +958,7 @@ impl<'a> Lowerer<'a> {
         let fn_addr = ir_deopt_entry as *const () as u64;
         self.emit_mov_reg_imm64(RAX, fn_addr);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-        // Epilogue (RAX holds the sentinel returned by ir_deopt_entry).
+                                      // Epilogue (RAX holds the sentinel returned by ir_deopt_entry).
         self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
         self.buf.emit(&self.frame_size.to_le_bytes());
         self.buf.emit_byte(0x5D); // pop rbp
@@ -1565,7 +1565,7 @@ mod tests {
         let cm = compile_via_ir(&code, 4, 2, 2).expect("div compiles via IR");
 
         let _ = take_last_deopt(); // clear any stale state
-        // divisor != 0 → normal result, no deopt.
+                                   // divisor != 0 → normal result, no deopt.
         let ok = unsafe { cm.try_call(&[20, 4]).expect("call (b != 0)") };
         assert_eq!(ok, 5, "20 / 4 = 5");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");

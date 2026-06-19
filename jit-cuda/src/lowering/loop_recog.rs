@@ -229,9 +229,7 @@ fn classify_counted_loop(
     }
 
     let exit_if_pc = exit_if_pc.ok_or_else(|| {
-        LoweringError::UnsupportedNode(
-            "no loop-exit comparison found inside loop body".into(),
-        )
+        LoweringError::UnsupportedNode("no loop-exit comparison found inside loop body".into())
     })?;
     let exit_pc = exit_pc.unwrap();
     let exit_op = bytes[exit_if_pc];
@@ -263,8 +261,8 @@ fn classify_counted_loop(
 
     // Find the induction variable's `iinc` in the loop body and read
     // its stride.
-    let iv_stride = find_iv_stride(bytes, header_pc, back_branch_pc, iv_slot)?
-        .ok_or_else(|| {
+    let iv_stride =
+        find_iv_stride(bytes, header_pc, back_branch_pc, iv_slot)?.ok_or_else(|| {
             LoweringError::UnsupportedNode(format!(
                 "no `iinc` for induction-variable slot {iv_slot} found in the \
                  loop body — induction variable is not a simple counter"
@@ -370,11 +368,7 @@ fn find_iv_stride(
 ///
 /// Errors (rejects the loop) if the start value is missing, is not a
 /// literal `0`, or comes from anything other than `iconst_0`.
-fn verify_zero_start(
-    bytes: &[u8],
-    header_pc: usize,
-    iv_slot: u16,
-) -> Result<(), LoweringError> {
+fn verify_zero_start(bytes: &[u8], header_pc: usize, iv_slot: u16) -> Result<(), LoweringError> {
     // Walk the pre-loop, remembering the most recent constant pushed
     // and the most recent `istore` to `iv_slot`. The canonical prelude
     // ends `... iconst_0; istore iv` right before the header.
@@ -488,7 +482,11 @@ pub(crate) fn instr_size(bytes: &[u8], pc: usize) -> Result<usize, LoweringError
             let sub = *bytes
                 .get(pc + 1)
                 .ok_or_else(|| LoweringError::UnsupportedNode("truncated wide".into()))?;
-            if sub == 0x84 { 6 } else { 4 }
+            if sub == 0x84 {
+                6
+            } else {
+                4
+            }
         }
         0xAA | 0xAB => {
             // Switches: analyzer rejected, but be defensive.

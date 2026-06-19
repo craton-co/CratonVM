@@ -277,10 +277,7 @@ pub fn analyze_with_annotations(
     // This shape check runs AFTER the opcode scan above so a method
     // that is rejected for a more specific opcode reason keeps that
     // reason.
-    if return_kind.is_scalar()
-        && param_kinds.iter().any(|k| k.is_array())
-        && !is_dot_reduction
-    {
+    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) && !is_dot_reduction {
         return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
     }
 
@@ -422,12 +419,8 @@ fn scan_bytecode(
                 }
             }
         } else if op == 0xC8 && pc + 5 <= bytes.len() {
-            let off = i32::from_be_bytes([
-                bytes[pc + 1],
-                bytes[pc + 2],
-                bytes[pc + 3],
-                bytes[pc + 4],
-            ]);
+            let off =
+                i32::from_be_bytes([bytes[pc + 1], bytes[pc + 2], bytes[pc + 3], bytes[pc + 4]]);
             if off < 0 {
                 has_backward = true;
             }
@@ -524,8 +517,8 @@ enum OpClass {
 fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
     match op {
         // Specific rejects come first.
-        0x32 | 0x53 => OpClass::Reject(Reason::RefArrayOp),    // aaload, aastore
-        0xA5 | 0xA6 => OpClass::Reject(Reason::TypeCheck),     // if_acmpeq, if_acmpne
+        0x32 | 0x53 => OpClass::Reject(Reason::RefArrayOp), // aaload, aastore
+        0xA5 | 0xA6 => OpClass::Reject(Reason::TypeCheck),  // if_acmpeq, if_acmpne
         0xA8 | 0xA9 | 0xC9 => OpClass::Reject(Reason::JsrRet), // jsr, ret, jsr_w
         0xAA | 0xAB => OpClass::Reject(Reason::Switch),
         // AUDIT 2026-05-24 (C31): `ldc` / `ldc_w` / `ldc2_w` were
@@ -554,9 +547,7 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // does not cover object allocation or reference-component
         // arrays. Only primitive `newarray` (0xBC) is loosened, and
         // only when the size came from `iload <n>` (see prev_op).
-        0xBC if matches!(hint, AdmissionHint::AllowAllocation)
-            && is_iload_family(prev_op) =>
-        {
+        0xBC if matches!(hint, AdmissionHint::AllowAllocation) && is_iload_family(prev_op) => {
             OpClass::Ok
         }
         0xBB | 0xBC | 0xBD | 0xC5 => OpClass::Reject(Reason::Allocation),
@@ -571,8 +562,14 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // which already fall in the permitted `0x60..=0x83` band. The
         // hint is still threaded through so Phase-2 lowering can pick
         // it up without re-plumbing the analyzer.
-        0x00..=0x31 | 0x33..=0x52 | 0x54..=0xA4 | 0xA7 | 0xAC..=0xB1
-        | 0xBE | 0xC4 | 0xC6..=0xC8 => OpClass::Ok,
+        0x00..=0x31
+        | 0x33..=0x52
+        | 0x54..=0xA4
+        | 0xA7
+        | 0xAC..=0xB1
+        | 0xBE
+        | 0xC4
+        | 0xC6..=0xC8 => OpClass::Ok,
         other => OpClass::Reject(Reason::UnknownOpcode(other)),
     }
 }
@@ -686,7 +683,11 @@ mod tests {
             OffloadVerdict::Eligible(sig) => {
                 assert_eq!(
                     sig.param_kinds,
-                    vec![ParamKind::I32Array, ParamKind::I32Array, ParamKind::I32Array]
+                    vec![
+                        ParamKind::I32Array,
+                        ParamKind::I32Array,
+                        ParamKind::I32Array
+                    ]
                 );
                 assert_eq!(sig.return_kind, ParamKind::Void);
                 // A void-returning per-element map (`out[i] = a[i] + b[i]`)
@@ -710,7 +711,12 @@ mod tests {
             OffloadVerdict::Eligible(sig) => {
                 assert_eq!(
                     sig.param_kinds,
-                    vec![ParamKind::F32, ParamKind::F32Array, ParamKind::F32Array, ParamKind::F32Array]
+                    vec![
+                        ParamKind::F32,
+                        ParamKind::F32Array,
+                        ParamKind::F32Array,
+                        ParamKind::F32Array
+                    ]
                 );
                 assert_eq!(sig.return_kind, ParamKind::Void);
                 // saxpy (`out[i] = a*x[i] + y[i]`) is a map, not a reduction.
@@ -743,7 +749,10 @@ mod tests {
     #[test]
     fn reject_allocation() {
         let method = load_method("RejectAllocation", "build", "(I)[I");
-        assert_eq!(analyze(&method), OffloadVerdict::Rejected(Reason::Allocation));
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(Reason::Allocation)
+        );
     }
 
     #[test]
@@ -866,9 +875,7 @@ mod tests {
                 assert_eq!(sig.param_kinds, vec![ParamKind::I32]);
                 assert_eq!(sig.return_kind, ParamKind::I32Array);
             }
-            v => panic!(
-                "expected Eligible under AllowAllocation, got {v:?}"
-            ),
+            v => panic!("expected Eligible under AllowAllocation, got {v:?}"),
         }
     }
 
@@ -900,10 +907,7 @@ mod tests {
         // test is scoped to the Invoke loosening only.)
         if let OffloadVerdict::Rejected(Reason::Invoke) = strict_verdict {
             assert!(
-                !matches!(
-                    loose_verdict,
-                    OffloadVerdict::Rejected(Reason::Invoke)
-                ),
+                !matches!(loose_verdict, OffloadVerdict::Rejected(Reason::Invoke)),
                 "AllowIntrinsicCalls must not emit Reason::Invoke; got {loose_verdict:?}"
             );
         }
@@ -919,8 +923,7 @@ mod tests {
         let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
 
         let baseline = analyze(&method);
-        let with_default =
-            analyze_with_annotations(&method, &MethodAnnotations::default());
+        let with_default = analyze_with_annotations(&method, &MethodAnnotations::default());
 
         assert_eq!(
             baseline, with_default,

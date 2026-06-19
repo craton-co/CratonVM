@@ -194,7 +194,12 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     // matching Utf8 already exists in the CP, but we want the indices
     // for the field_info entries.
     let m_field_meta: Vec<(u16, u16)> = (0..spec.methods.len())
-        .map(|i| (cp.add_utf8(&format!("m_{i}")), cp.add_utf8(method_field_desc)))
+        .map(|i| {
+            (
+                cp.add_utf8(&format!("m_{i}")),
+                cp.add_utf8(method_field_desc),
+            )
+        })
         .collect();
 
     // Emit method blobs.
@@ -211,7 +216,12 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     ));
 
     // 2) `<clinit>` — populate every `m_<i>` static slot.
-    method_blobs.push(emit_clinit(spec, &mut cp, code_attr_name_idx, &m_field_refs)?);
+    method_blobs.push(emit_clinit(
+        spec,
+        &mut cp,
+        code_attr_name_idx,
+        &m_field_refs,
+    )?);
 
     // 3) One body per declared method.
     for (i, m) in spec.methods.iter().enumerate() {
@@ -326,21 +336,23 @@ pub enum ReturnKind {
 pub fn descriptor_param_slots(desc: &str) -> Result<Vec<DescKind>, ClassFileError> {
     let bytes = desc.as_bytes();
     let mut out = Vec::new();
-    let start = bytes
-        .iter()
-        .position(|&b| b == b'(')
-        .ok_or_else(|| ClassFileError::InvalidClassFile {
-            class_name: String::new(),
-            message: format!("method descriptor '{desc}' missing '('"),
-        })?
-        + 1;
-    let end = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .ok_or_else(|| ClassFileError::InvalidClassFile {
-            class_name: String::new(),
-            message: format!("method descriptor '{desc}' missing ')'"),
-        })?;
+    let start =
+        bytes
+            .iter()
+            .position(|&b| b == b'(')
+            .ok_or_else(|| ClassFileError::InvalidClassFile {
+                class_name: String::new(),
+                message: format!("method descriptor '{desc}' missing '('"),
+            })?
+            + 1;
+    let end =
+        bytes
+            .iter()
+            .position(|&b| b == b')')
+            .ok_or_else(|| ClassFileError::InvalidClassFile {
+                class_name: String::new(),
+                message: format!("method descriptor '{desc}' missing ')'"),
+            })?;
     let mut i = start;
     while i < end {
         let (kind, advanced) = parse_one_field(desc, i)?;
@@ -360,13 +372,14 @@ pub fn descriptor_param_slots(desc: &str) -> Result<Vec<DescKind>, ClassFileErro
 /// [`ClassFileError::InvalidClassFile`] instead of panicking.
 pub fn descriptor_return(desc: &str) -> Result<ReturnKind, ClassFileError> {
     let bytes = desc.as_bytes();
-    let close = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .ok_or_else(|| ClassFileError::InvalidClassFile {
-            class_name: String::new(),
-            message: format!("method descriptor '{desc}' missing ')'"),
-        })?;
+    let close =
+        bytes
+            .iter()
+            .position(|&b| b == b')')
+            .ok_or_else(|| ClassFileError::InvalidClassFile {
+                class_name: String::new(),
+                message: format!("method descriptor '{desc}' missing ')'"),
+            })?;
     let after = close + 1;
     if after >= bytes.len() {
         return Ok(ReturnKind::Void);
@@ -390,10 +403,12 @@ pub fn descriptor_return(desc: &str) -> Result<ReturnKind, ClassFileError> {
 /// [`ClassFileError::InvalidClassFile`] rather than panicking the VM.
 fn parse_one_field(desc: &str, i: usize) -> Result<(DescKind, usize), ClassFileError> {
     let bytes = desc.as_bytes();
-    let byte = *bytes.get(i).ok_or_else(|| ClassFileError::InvalidClassFile {
-        class_name: String::new(),
-        message: format!("descriptor '{desc}' truncated at index {i}"),
-    })?;
+    let byte = *bytes
+        .get(i)
+        .ok_or_else(|| ClassFileError::InvalidClassFile {
+            class_name: String::new(),
+            message: format!("descriptor '{desc}' truncated at index {i}"),
+        })?;
     match byte {
         b'B' | b'C' | b'I' | b'S' | b'Z' => Ok((DescKind::Int, i + 1)),
         b'J' => Ok((DescKind::Long, i + 1)),
@@ -719,8 +734,7 @@ impl CodeBuilder {
     pub fn emit_iconst(&mut self, n: i32) {
         if (-1..=5).contains(&n) {
             self.bytes.push(
-                (op::ICONST_0 as i32 + n)
-                    .clamp(op::ICONST_M1 as i32, op::ICONST_5 as i32) as u8,
+                (op::ICONST_0 as i32 + n).clamp(op::ICONST_M1 as i32, op::ICONST_5 as i32) as u8,
             );
         } else if (i8::MIN as i32..=i8::MAX as i32).contains(&n) {
             self.bytes.push(op::BIPUSH);
@@ -1155,10 +1169,7 @@ fn emit_clinit(
 fn descriptor_param_byte_at(desc: &str, j: usize) -> u8 {
     let bytes = desc.as_bytes();
     let start = bytes.iter().position(|&b| b == b'(').unwrap_or(0) + 1;
-    let end = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .unwrap_or(bytes.len());
+    let end = bytes.iter().position(|&b| b == b')').unwrap_or(bytes.len());
     let mut i = start;
     let mut k = 0usize;
     while i < end {
@@ -1220,10 +1231,7 @@ fn int_family_param_letter(desc: &str, j: usize) -> &'static str {
 fn wrapper_for_int_letter(desc: &str, j: usize) -> &'static str {
     let bytes = desc.as_bytes();
     let start = bytes.iter().position(|&b| b == b'(').unwrap_or(0) + 1;
-    let end = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .unwrap_or(bytes.len());
+    let end = bytes.iter().position(|&b| b == b')').unwrap_or(bytes.len());
     let mut i = start;
     let mut k = 0usize;
     while i < end {
@@ -1329,11 +1337,8 @@ mod tests {
             .interfaces
             .iter()
             .any(|s| &**s == "java/util/function/Supplier"));
-        assert!(cf
-            .methods
-            .iter()
-            .any(|m| &*m.name == "<init>"
-                && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"));
+        assert!(cf.methods.iter().any(|m| &*m.name == "<init>"
+            && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"));
         assert!(cf
             .methods
             .iter()
@@ -1368,8 +1373,7 @@ mod tests {
         // …and NOT the synthetic 2-arg form.
         assert!(
             !cf.methods.iter().any(|m| &*m.name == "<init>"
-                && &*m.descriptor
-                    == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"),
+                && &*m.descriptor == "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V"),
             "real-super proxy must not carry the synthetic 2-arg <init>"
         );
         // The interface method is still emitted.
@@ -1409,10 +1413,7 @@ mod tests {
         };
         let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("two-iface emitted class file must parse");
-        assert!(cf
-            .interfaces
-            .iter()
-            .any(|s| &**s == "java/lang/Runnable"));
+        assert!(cf.interfaces.iter().any(|s| &**s == "java/lang/Runnable"));
         assert!(cf
             .interfaces
             .iter()
@@ -1666,7 +1667,8 @@ mod tests {
                     code.exception_table.is_empty(),
                     "WP2.5-v3 item 4: method {} of {} must have empty \
                      exception_table to skip StackMapTable",
-                    m.name, spec.gen_class_name,
+                    m.name,
+                    spec.gen_class_name,
                 );
                 if let Some((op, pc)) = scan_for_branch(&code.code) {
                     panic!(
@@ -1698,14 +1700,20 @@ mod tests {
                 | 0xc6        // ifnull
                 | 0xc7        // ifnonnull
                 | 0xc8        // goto_w
-                | 0xc9        // jsr_w
+                | 0xc9 // jsr_w
             ) {
                 return Some((op, pc));
             }
             pc += match op {
                 0xaa => return Some((op, pc)),
                 0xab => return Some((op, pc)),
-                0xc4 => if pc + 1 < code.len() && code[pc + 1] == 0x84 { 6 } else { 4 },
+                0xc4 => {
+                    if pc + 1 < code.len() && code[pc + 1] == 0x84 {
+                        6
+                    } else {
+                        4
+                    }
+                }
                 0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
                 0x11 | 0x13 | 0x14 | 0xb2..=0xb8 | 0xbb | 0xbd | 0xc0 | 0xc1 | 0x84 => 3,
                 0xc5 => 4,
@@ -1815,7 +1823,9 @@ mod tests {
                  loader (canonical path), not fall back to the synthetic shim",
             );
 
-        let defined = cm.get_class(cid).expect("defined proxy class must be retrievable");
+        let defined = cm
+            .get_class(cid)
+            .expect("defined proxy class must be retrievable");
 
         // It is the REAL generated `$ProxyN`, not the synthetic shim:
         //   * its name is the generated `com/sun/proxy/$Proxy0`,

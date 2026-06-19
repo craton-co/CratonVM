@@ -47,8 +47,7 @@ use cratonvm_jit::x64::compile;
 use cratonvm_jit::JitDirectCall;
 use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::{
-    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_TAG_OFFSET, HEADER_SIZE,
-    SLOT_SIZE,
+    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,7 +288,9 @@ fn compile_update_byte(entry: usize, guard_class_id: u32) -> impl Fn(*mut u8, i3
         // the first C argument is the heap pointer (unused by the intrinsic;
         // 0 is fine — no helper is called).
         unsafe {
-            compiled.try_call(&[0, recv as i64, b as i64]).expect("test JIT call");
+            compiled
+                .try_call(&[0, recv as i64, b as i64])
+                .expect("test JIT call");
         }
     }
 }
@@ -339,7 +340,9 @@ fn compile_update_bytes(entry: usize, guard_class_id: u32) -> impl Fn(*mut u8, *
     move |recv: *mut u8, arr: *mut u8, off: i32, len: i32| {
         // SAFETY: see `compile_update_byte`.
         unsafe {
-            compiled.try_call(&[0, recv as i64, arr as i64, off as i64, len as i64]).expect("test JIT call");
+            compiled
+                .try_call(&[0, recv as i64, arr as i64, off as i64, len as i64])
+                .expect("test JIT call");
         }
     }
 }
@@ -404,7 +407,11 @@ fn crc32c_update_byte_matches_oracle() {
     let r2 = FakeReceiver::new(CRC_CLASS_ID, 0xFFFF_FFFF);
     f(r1.ptr(), 0x41); // 'A'
     f(r2.ptr(), 0x41 | 0x7F00); // high bits must be ignored
-    assert_eq!(r1.crc(), r2.crc(), "update(I) must fold only the low 8 bits");
+    assert_eq!(
+        r1.crc(),
+        r2.crc(),
+        "update(I) must fold only the low 8 bits"
+    );
 }
 
 #[test]
@@ -429,7 +436,11 @@ fn crc32c_update_bytes_matches_oracle() {
         let recv = FakeReceiver::new(CRC_CLASS_ID, 0xFFFF_FFFF);
         f(recv.ptr(), arr.ptr(), 0, data.len() as i32);
         let oracle = ref_crc32c_step(0xFFFF_FFFF, data);
-        assert_eq!(recv.crc(), oracle, "CRC32C.update([BII) full-array mismatch");
+        assert_eq!(
+            recv.crc(),
+            oracle,
+            "CRC32C.update([BII) full-array mismatch"
+        );
     }
 
     // Sub-range: fold bytes [3, 3+5) of a longer array.
@@ -496,7 +507,11 @@ fn crc32_ieee_update_byte_matches_oracle() {
     let r2 = FakeReceiver::new(CRC_CLASS_ID, 0xFFFF_FFFF);
     f(r1.ptr(), 0xAB);
     f(r2.ptr(), (-1i32 & !0xFF) | 0xAB); // 0xFFFFFFAB — same low byte
-    assert_eq!(r1.crc(), r2.crc(), "update(I) must fold only the low 8 bits");
+    assert_eq!(
+        r1.crc(),
+        r2.crc(),
+        "update(I) must fold only the low 8 bits"
+    );
 }
 
 #[test]
@@ -623,7 +638,14 @@ fn empty_range_is_a_noop() {
         let arr = FakeByteArray::new(b"payload");
         let recv = FakeReceiver::new(CRC_CLASS_ID, 0x1234_5678);
         f(recv.ptr(), arr.ptr(), 4, 0);
-        assert!(!DEOPT_TRIPPED.load(Ordering::SeqCst), "empty range must not deopt");
-        assert_eq!(recv.crc(), 0x1234_5678, "empty range must leave crc unchanged");
+        assert!(
+            !DEOPT_TRIPPED.load(Ordering::SeqCst),
+            "empty range must not deopt"
+        );
+        assert_eq!(
+            recv.crc(),
+            0x1234_5678,
+            "empty range must leave crc unchanged"
+        );
     }
 }

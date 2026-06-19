@@ -76,8 +76,7 @@ const PREALLOC_CAP: usize = 1024;
 use std::sync::LazyLock;
 macro_rules! canon {
     ($name:ident, $s:expr) => {
-        static $name: LazyLock<Arc<str>> =
-            LazyLock::new(|| cratonvm_types::intern_arc($s));
+        static $name: LazyLock<Arc<str>> = LazyLock::new(|| cratonvm_types::intern_arc($s));
     };
 }
 canon!(CANON_CODE, "Code");
@@ -95,14 +94,32 @@ canon!(CANON_DEPRECATED, "Deprecated");
 canon!(CANON_SYNTHETIC, "Synthetic");
 canon!(CANON_NEST_HOST, "NestHost");
 canon!(CANON_NEST_MEMBERS, "NestMembers");
-canon!(CANON_RUNTIME_VISIBLE_ANNOTATIONS, "RuntimeVisibleAnnotations");
-canon!(CANON_RUNTIME_INVISIBLE_ANNOTATIONS, "RuntimeInvisibleAnnotations");
+canon!(
+    CANON_RUNTIME_VISIBLE_ANNOTATIONS,
+    "RuntimeVisibleAnnotations"
+);
+canon!(
+    CANON_RUNTIME_INVISIBLE_ANNOTATIONS,
+    "RuntimeInvisibleAnnotations"
+);
 canon!(CANON_METHOD_PARAMETERS, "MethodParameters");
 canon!(CANON_ENCLOSING_METHOD, "EnclosingMethod");
-canon!(CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS, "RuntimeVisibleParameterAnnotations");
-canon!(CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS, "RuntimeInvisibleParameterAnnotations");
-canon!(CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS, "RuntimeVisibleTypeAnnotations");
-canon!(CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS, "RuntimeInvisibleTypeAnnotations");
+canon!(
+    CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS,
+    "RuntimeVisibleParameterAnnotations"
+);
+canon!(
+    CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS,
+    "RuntimeInvisibleParameterAnnotations"
+);
+canon!(
+    CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS,
+    "RuntimeVisibleTypeAnnotations"
+);
+canon!(
+    CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS,
+    "RuntimeInvisibleTypeAnnotations"
+);
 canon!(CANON_ANNOTATION_DEFAULT, "AnnotationDefault");
 canon!(CANON_MODULE, "Module");
 canon!(CANON_RECORD, "Record");
@@ -564,7 +581,11 @@ impl LazyAttribute {
             "LazyAttribute::new_raw_in: empty/inverted range {:?}",
             range
         );
-        LazyAttribute::Raw { name, source, range }
+        LazyAttribute::Raw {
+            name,
+            source,
+            range,
+        }
     }
 
     /// Construct from owned attribute body bytes.
@@ -609,17 +630,19 @@ impl LazyAttribute {
     /// The constant pool is required because most attribute bodies contain
     /// indices into the constant pool that the decoder resolves to string
     /// values during parsing (e.g. `SourceFile`, `Signature`).
-    pub fn decode(
-        &mut self,
-        constant_pool: &ConstantPool,
-    ) -> Result<&Attribute, ClassReaderError> {
+    pub fn decode(&mut self, constant_pool: &ConstantPool) -> Result<&Attribute, ClassReaderError> {
         // Two-phase to satisfy the borrow checker: read the name + source +
         // range first (immutable borrow of `self`), drop that borrow, then
         // assign the Decoded variant back into `self`. We hold cloned
         // `Arc<str>` + `Arc<[u8]>` (refcount bumps, no allocation) and a
         // snapshot of the range; all remain valid for the duration of
         // `decode_attribute_with_source`.
-        if let LazyAttribute::Raw { name, source, range } = self {
+        if let LazyAttribute::Raw {
+            name,
+            source,
+            range,
+        } = self
+        {
             let name = name.clone();
             let source = Arc::clone(source);
             let range = range.clone();
@@ -627,8 +650,7 @@ impl LazyAttribute {
             // entrypoint so the body dispatch can use `Arc::ptr_eq`
             // against canonical interned names — skips one intern
             // lookup per lazy decode (the hot path on bootstrap).
-            let decoded =
-                decode_attribute_with_source_arc(&name, &source, range, constant_pool)?;
+            let decoded = decode_attribute_with_source_arc(&name, &source, range, constant_pool)?;
             *self = LazyAttribute::Decoded(decoded);
         }
         match self {
@@ -693,10 +715,7 @@ pub fn force_decode_all(
 /// benefit from it. For `Code` the walk recurses into nested attributes
 /// (since their shape is part of the `Code` body's well-formedness) but
 /// still only performs the same shallow per-kind checks.
-pub fn validate_attribute_shape(
-    name: &str,
-    body: &[u8],
-) -> Result<(), ClassReaderError> {
+pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassReaderError> {
     match name {
         // Fixed-size 2-byte cp-index attributes (JVMS §4.7.2 / §4.7.27 /
         // §4.7.28). HotSpot rejects mismatched attribute_length here with
@@ -1062,17 +1081,19 @@ fn decode_attribute_body(
             let source_file_index = buf.read_u16()?;
             // Fetch the interned `Arc<str>` straight from the constant pool —
             // refcount bump on the shared pool allocation, no fresh String.
-            let source_file = cp
-                .get_utf8_arc(source_file_index)
-                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+            let source_file = cp.get_utf8_arc(source_file_index).ok_or_else(|| {
+                ClassReaderError::InvalidConstantPool {
                     index: source_file_index,
                     message: "SourceFile must reference a valid Utf8 entry".to_string(),
-                })?;
+                }
+            })?;
             Attribute::SourceFile(source_file)
         }
         "ConstantValue" => {
             let constant_value_index = buf.read_u16()?;
-            Attribute::ConstantValue { constant_value_index }
+            Attribute::ConstantValue {
+                constant_value_index,
+            }
         }
         "Deprecated" => Attribute::Deprecated,
         "Synthetic" => Attribute::Synthetic,
@@ -1130,12 +1151,12 @@ fn decode_attribute_body(
         "Signature" => {
             let signature_index = buf.read_u16()?;
             // Refcount-bump clone of the pool-interned signature string.
-            let signature = cp
-                .get_utf8_arc(signature_index)
-                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+            let signature = cp.get_utf8_arc(signature_index).ok_or_else(|| {
+                ClassReaderError::InvalidConstantPool {
                     index: signature_index,
                     message: "Signature must reference a valid Utf8 entry".to_string(),
-                })?;
+                }
+            })?;
             Attribute::Signature(signature)
         }
         "StackMapTable" => {
@@ -1160,8 +1181,7 @@ fn decode_attribute_body(
             // `try_new` so an OOB range surfaces as `InvalidClassData`
             // rather than panicking (round-11 off-by-`buf.position()`
             // regression).
-            let entries =
-                ByteView::try_new(Arc::clone(source), start..start + length)?;
+            let entries = ByteView::try_new(Arc::clone(source), start..start + length)?;
             Attribute::StackMapTable { entries }
         }
         "BootstrapMethods" => {
@@ -1291,8 +1311,7 @@ fn decode_attribute_body(
             for _ in 0..provides_count {
                 let provides_index = buf.read_u16()?;
                 let with_count = buf.read_u16()?;
-                let mut provides_with =
-                    Vec::with_capacity((with_count as usize).min(PREALLOC_CAP));
+                let mut provides_with = Vec::with_capacity((with_count as usize).min(PREALLOC_CAP));
                 for _ in 0..with_count {
                     provides_with.push(buf.read_u16()?);
                 }
@@ -1453,8 +1472,7 @@ fn decode_attribute_body(
             let _ = buf.read_bytes(length)?;
             // Defense-in-depth: see `StackMapTable` arm — runtime-
             // derived offset/length must not panic on OOB.
-            let data =
-                ByteView::try_new(Arc::clone(source), start..start + length)?;
+            let data = ByteView::try_new(Arc::clone(source), start..start + length)?;
             // Round 7 audit fix (MED #7): `name` is already an
             // interned `Arc<str>` (the caller passed in the canonical
             // pool-interned arc); just refcount-bump instead of
@@ -1509,12 +1527,12 @@ fn decode_attributes_vec(
         let name_index = buf.read_u16()?;
         // Refcount-bump clone of the pool-interned attribute name — no
         // fresh String per nested attribute.
-        let name = cp
-            .get_utf8_arc(name_index)
-            .ok_or_else(|| ClassReaderError::InvalidConstantPool {
-                index: name_index,
-                message: "nested attribute name must reference a valid Utf8 entry".to_string(),
-            })?;
+        let name =
+            cp.get_utf8_arc(name_index)
+                .ok_or_else(|| ClassReaderError::InvalidConstantPool {
+                    index: name_index,
+                    message: "nested attribute name must reference a valid Utf8 entry".to_string(),
+                })?;
         let length = buf.read_u32()? as usize;
         if length > buf.remaining() {
             return Err(ClassReaderError::InvalidClassData {
@@ -1602,8 +1620,7 @@ fn decode_code_body(
     // code_length` range goes through `try_new` so a malformed Code
     // body produces `InvalidClassData` instead of aborting the process
     // (the round-11 panic shipped from this very call site).
-    let code =
-        ByteView::try_new(Arc::clone(source), code_start..code_start + code_length)?;
+    let code = ByteView::try_new(Arc::clone(source), code_start..code_start + code_length)?;
 
     // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse of the
     // ExceptionTable — replaces four per-`u16` `read_u16()` calls per
@@ -1614,8 +1631,7 @@ fn decode_code_body(
     let exception_table_length = buf.read_u16()? as usize;
     const ET_ENTRY_SIZE: usize = 8; // four u16 fields
     let et_bytes = buf.read_bytes(exception_table_length * ET_ENTRY_SIZE)?;
-    let mut exception_table =
-        Vec::with_capacity(exception_table_length.min(PREALLOC_CAP));
+    let mut exception_table = Vec::with_capacity(exception_table_length.min(PREALLOC_CAP));
     for chunk in et_bytes.chunks_exact(ET_ENTRY_SIZE) {
         exception_table.push(ExceptionTableEntry {
             start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -1685,9 +1701,7 @@ fn decode_annotation_depth(
 }
 
 /// Decode an `element_value` structure (JVM spec 4.7.16.1).
-fn decode_element_value(
-    buf: &mut ClassFileBuffer<'_>,
-) -> Result<ElementValue, ClassReaderError> {
+fn decode_element_value(buf: &mut ClassFileBuffer<'_>) -> Result<ElementValue, ClassReaderError> {
     decode_element_value_depth(buf, 0)
 }
 
@@ -1837,9 +1851,7 @@ fn decode_target_info(
 }
 
 /// Decode a type_path structure (JVM spec 4.7.20.2).
-fn decode_type_path(
-    buf: &mut ClassFileBuffer<'_>,
-) -> Result<Vec<TypePathEntry>, ClassReaderError> {
+fn decode_type_path(buf: &mut ClassFileBuffer<'_>) -> Result<Vec<TypePathEntry>, ClassReaderError> {
     let path_length = buf.read_u8()?;
     let mut path = Vec::with_capacity((path_length as usize).min(PREALLOC_CAP));
     for _ in 0..path_length {
@@ -3007,7 +3019,10 @@ mod tests {
         let (cp, body) = fixture_cp_and_sourcefile_body();
         let mut lazy = LazyAttribute::new_raw(Arc::from("SourceFile"), body);
 
-        assert!(!lazy.is_decoded(), "freshly-built Raw must report not decoded");
+        assert!(
+            !lazy.is_decoded(),
+            "freshly-built Raw must report not decoded"
+        );
         let _ = lazy.decode(&cp).expect("decode should succeed");
         assert!(lazy.is_decoded(), "post-decode must report decoded");
         assert!(lazy.as_decoded().is_some());
@@ -3120,8 +3135,8 @@ mod tests {
     fn decode_code_with_nested_stack_map_table_does_not_overshoot() {
         // CP: [0]=Tombstone, [1]=Utf8("StackMapTable")
         let cp = ConstantPool::new(vec![
-                ConstantPoolEntry::Tombstone,
-                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
         ]);
 
         // Build the Code body bytes:
@@ -3137,7 +3152,7 @@ mod tests {
         body.extend_from_slice(&[0x2A, 0xB7, 0x00, 0xB1]); // code
         body.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
         body.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
-        // Nested StackMapTable
+                                                     // Nested StackMapTable
         body.extend_from_slice(&1u16.to_be_bytes()); // name_index -> "StackMapTable"
         body.extend_from_slice(&3u32.to_be_bytes()); // length
         body.extend_from_slice(&[0xFF, 0x00, 0x42]); // stack map entries
@@ -3147,13 +3162,8 @@ mod tests {
         // We exercise it through `decode_attribute_with_source` which is
         // the canonical entry used by the class reader.
         let source: Arc<[u8]> = Arc::from(body.as_slice());
-        let attr = decode_attribute_with_source(
-            "Code",
-            &source,
-            0..source.len(),
-            &cp,
-        )
-        .expect("Code with nested StackMapTable must decode");
+        let attr = decode_attribute_with_source("Code", &source, 0..source.len(), &cp)
+            .expect("Code with nested StackMapTable must decode");
 
         match attr {
             Attribute::Code(code) => {
@@ -3170,9 +3180,7 @@ mod tests {
                         // returned.
                         assert_eq!(&**entries, &[0xFF, 0x00, 0x42][..]);
                     }
-                    other => panic!(
-                        "Expected nested StackMapTable, got {other:?}"
-                    ),
+                    other => panic!("Expected nested StackMapTable, got {other:?}"),
                 }
             }
             other => panic!("Expected Code, got {other:?}"),
@@ -3188,8 +3196,8 @@ mod tests {
     #[test]
     fn nested_stack_map_table_lands_at_correct_absolute_offset() {
         let cp = ConstantPool::new(vec![
-                ConstantPoolEntry::Tombstone,
-                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
         ]);
 
         // Build the Code body bytes (same shape as above), but place it
@@ -3285,13 +3293,8 @@ mod tests {
         // verify the happy path still works (regression that the `?`
         // didn't accidentally short-circuit a valid decode).
         let range = 0..source.len();
-        let attr = decode_attribute_with_source(
-            "CustomVendorAttr",
-            &source,
-            range,
-            &cp,
-        )
-        .expect("valid Unknown body must decode");
+        let attr = decode_attribute_with_source("CustomVendorAttr", &source, range, &cp)
+            .expect("valid Unknown body must decode");
         match attr {
             Attribute::Unknown { name, data } => {
                 assert_eq!(&*name, "CustomVendorAttr");
@@ -3321,12 +3324,7 @@ mod tests {
         bogus_code.extend_from_slice(&9999u32.to_be_bytes()); // code_length
         bogus_code.extend_from_slice(&[0x2A, 0xB1]); // only 2 code bytes present
         let bogus_source: Arc<[u8]> = Arc::from(bogus_code.as_slice());
-        let res = decode_attribute_with_source(
-            "Code",
-            &bogus_source,
-            0..bogus_source.len(),
-            &cp,
-        );
+        let res = decode_attribute_with_source("Code", &bogus_source, 0..bogus_source.len(), &cp);
         assert!(
             res.is_err(),
             "malformed Code body must return Err, never panic",

@@ -73,11 +73,9 @@ pub fn enter() -> usize {
 /// release version saturates at 0 so a stray pop never wraps the counter.
 pub fn leave() -> usize {
     LEAVE_COUNT.fetch_add(1, Ordering::Relaxed);
-    let prev = JIT_ACTIVE_DEPTH.fetch_update(
-        Ordering::Release,
-        Ordering::Acquire,
-        |d| Some(d.saturating_sub(1)),
-    );
+    let prev = JIT_ACTIVE_DEPTH.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+        Some(d.saturating_sub(1))
+    });
     match prev {
         Ok(p) => p.saturating_sub(1),
         Err(_) => 0,

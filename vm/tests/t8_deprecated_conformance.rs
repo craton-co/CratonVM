@@ -27,7 +27,9 @@ fn full_registry() -> NativeMethodRegistry {
 fn t8_1_1_thread_stop_registered() {
     let r = full_registry();
     assert!(r.find("java/lang/Thread", "stop", "()V").is_some());
-    assert!(r.find("java/lang/Thread", "stop0", "(Ljava/lang/Object;)V").is_some());
+    assert!(r
+        .find("java/lang/Thread", "stop0", "(Ljava/lang/Object;)V")
+        .is_some());
     eprintln!("[t8] T8.1.1 Thread.stop: registered");
 }
 
@@ -49,7 +51,9 @@ fn t8_1_3_thread_destroy_registered() {
 #[test]
 fn t8_1_4_thread_count_stack_frames_registered() {
     let r = full_registry();
-    assert!(r.find("java/lang/Thread", "countStackFrames", "()I").is_some());
+    assert!(r
+        .find("java/lang/Thread", "countStackFrames", "()I")
+        .is_some());
     eprintln!("[t8] T8.1.4 Thread.countStackFrames: registered");
 }
 
@@ -58,48 +62,88 @@ fn t8_1_5_finalization_tracker() {
     // FinalizationTracker is tested extensively in native-builtins unit tests.
     // Here we just verify the global registration exists.
     let r = full_registry();
-    assert!(r.find("java/lang/Runtime", "runFinalization", "()V").is_some());
+    assert!(r
+        .find("java/lang/Runtime", "runFinalization", "()V")
+        .is_some());
     eprintln!("[t8] T8.1.5 Object.finalize tracking: OK (via FinalizationTracker)");
 }
 
 #[test]
 fn t8_1_6_run_finalization_registered() {
     let r = full_registry();
-    assert!(r.find("java/lang/Runtime", "runFinalization", "()V").is_some());
-    assert!(r.find("java/lang/System", "runFinalization", "()V").is_some());
+    assert!(r
+        .find("java/lang/Runtime", "runFinalization", "()V")
+        .is_some());
+    assert!(r
+        .find("java/lang/System", "runFinalization", "()V")
+        .is_some());
     eprintln!("[t8] T8.1.6 runFinalization: registered");
 }
 
 #[test]
 fn t8_1_7_run_finalizers_on_exit_registered() {
     let r = full_registry();
-    assert!(r.find("java/lang/System", "runFinalizersOnExit", "(Z)V").is_some());
+    assert!(r
+        .find("java/lang/System", "runFinalizersOnExit", "(Z)V")
+        .is_some());
     eprintln!("[t8] T8.1.7 runFinalizersOnExit: registered");
 }
 
 #[test]
 fn t8_1_8_security_manager_registered() {
     let r = full_registry();
-    assert!(r.find("java/lang/SecurityManager", "checkPermission", "(Ljava/security/Permission;)V").is_some());
-    assert!(r.find("java/security/AccessController", "doPrivileged", "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;").is_some());
+    assert!(r
+        .find(
+            "java/lang/SecurityManager",
+            "checkPermission",
+            "(Ljava/security/Permission;)V"
+        )
+        .is_some());
+    assert!(r
+        .find(
+            "java/security/AccessController",
+            "doPrivileged",
+            "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;"
+        )
+        .is_some());
     eprintln!("[t8] T8.1.8 SecurityManager + AccessController: registered");
 }
 
 #[test]
 fn t8_1_9_classloader_define_class_3arg() {
     let r = full_registry();
-    assert!(r.find("java/lang/ClassLoader", "defineClass", "([BII)Ljava/lang/Class;").is_some());
+    assert!(r
+        .find(
+            "java/lang/ClassLoader",
+            "defineClass",
+            "([BII)Ljava/lang/Class;"
+        )
+        .is_some());
     eprintln!("[t8] T8.1.9 ClassLoader.defineClass(byte[],int,int): registered");
 }
 
 #[test]
 fn t8_1_10_compiler_class() {
     let r = full_registry();
-    assert!(r.find("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z").is_some());
-    assert!(r.find("java/lang/Compiler", "compileClasses", "(Ljava/lang/String;)Z").is_some());
+    assert!(r
+        .find("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z")
+        .is_some());
+    assert!(r
+        .find(
+            "java/lang/Compiler",
+            "compileClasses",
+            "(Ljava/lang/String;)Z"
+        )
+        .is_some());
     assert!(r.find("java/lang/Compiler", "enable", "()V").is_some());
     assert!(r.find("java/lang/Compiler", "disable", "()V").is_some());
-    assert!(r.find("java/lang/Compiler", "command", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some());
+    assert!(r
+        .find(
+            "java/lang/Compiler",
+            "command",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        )
+        .is_some());
     eprintln!("[t8] T8.1.10 Compiler: all 5 methods registered");
 }
 
@@ -119,7 +163,15 @@ fn t8_2_1_date_constructors() {
 #[test]
 fn t8_2_2_date_getters() {
     let r = full_registry();
-    for method in &["getYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes", "getSeconds"] {
+    for method in &[
+        "getYear",
+        "getMonth",
+        "getDate",
+        "getDay",
+        "getHours",
+        "getMinutes",
+        "getSeconds",
+    ] {
         assert!(
             r.find("java/util/Date", method, "()I").is_some(),
             "Date.{method} should be registered"
@@ -145,8 +197,12 @@ fn t8_2_4_string_get_bytes_deprecated() {
 #[test]
 fn t8_2_5_character_deprecated() {
     let r = full_registry();
-    assert!(r.find("java/lang/Character", "isJavaLetter", "(C)Z").is_some());
-    assert!(r.find("java/lang/Character", "isJavaLetterOrDigit", "(C)Z").is_some());
+    assert!(r
+        .find("java/lang/Character", "isJavaLetter", "(C)Z")
+        .is_some());
+    assert!(r
+        .find("java/lang/Character", "isJavaLetterOrDigit", "(C)Z")
+        .is_some());
     assert!(r.find("java/lang/Character", "isSpace", "(C)Z").is_some());
     eprintln!("[t8] T8.2.5 Character deprecated methods: registered");
 }
@@ -154,7 +210,9 @@ fn t8_2_5_character_deprecated() {
 #[test]
 fn t8_2_6_class_new_instance() {
     let r = full_registry();
-    assert!(r.find("java/lang/Class", "newInstance", "()Ljava/lang/Object;").is_some());
+    assert!(r
+        .find("java/lang/Class", "newInstance", "()Ljava/lang/Object;")
+        .is_some());
     eprintln!("[t8] T8.2.6 Class.newInstance(): registered");
 }
 
@@ -181,7 +239,8 @@ fn t8_2_6_class_new_instance_wp6_5_mirror_decoded() {
     let r = full_registry();
     // The native must be registered in real-JDK mode (essential natives only).
     assert!(
-        r.find("java/lang/Class", "newInstance", "()Ljava/lang/Object;").is_some(),
+        r.find("java/lang/Class", "newInstance", "()Ljava/lang/Object;")
+            .is_some(),
         "Class.newInstance must be registered for real-JDK BC startup",
     );
     eprintln!("[t8] WP6.5 Class.newInstance mirror_class_id wiring: registered");
@@ -190,32 +249,56 @@ fn t8_2_6_class_new_instance_wp6_5_mirror_decoded() {
 #[test]
 fn t8_2_10_string_buffer_input_stream() {
     let r = full_registry();
-    assert!(r.find("java/io/StringBufferInputStream", "read", "()I").is_some());
-    assert!(r.find("java/io/StringBufferInputStream", "available", "()I").is_some());
-    assert!(r.find("java/io/StringBufferInputStream", "reset", "()V").is_some());
+    assert!(r
+        .find("java/io/StringBufferInputStream", "read", "()I")
+        .is_some());
+    assert!(r
+        .find("java/io/StringBufferInputStream", "available", "()I")
+        .is_some());
+    assert!(r
+        .find("java/io/StringBufferInputStream", "reset", "()V")
+        .is_some());
     eprintln!("[t8] T8.2.10 StringBufferInputStream: registered");
 }
 
 #[test]
 fn t8_2_11_line_number_input_stream() {
     let r = full_registry();
-    assert!(r.find("java/io/LineNumberInputStream", "getLineNumber", "()I").is_some());
-    assert!(r.find("java/io/LineNumberInputStream", "setLineNumber", "(I)V").is_some());
-    assert!(r.find("java/io/LineNumberInputStream", "read", "()I").is_some());
+    assert!(r
+        .find("java/io/LineNumberInputStream", "getLineNumber", "()I")
+        .is_some());
+    assert!(r
+        .find("java/io/LineNumberInputStream", "setLineNumber", "(I)V")
+        .is_some());
+    assert!(r
+        .find("java/io/LineNumberInputStream", "read", "()I")
+        .is_some());
     eprintln!("[t8] T8.2.11 LineNumberInputStream: registered");
 }
 
 #[test]
 fn t8_2_13_url_decoder_single_arg() {
     let r = full_registry();
-    assert!(r.find("java/net/URLDecoder", "decode", "(Ljava/lang/String;)Ljava/lang/String;").is_some());
+    assert!(r
+        .find(
+            "java/net/URLDecoder",
+            "decode",
+            "(Ljava/lang/String;)Ljava/lang/String;"
+        )
+        .is_some());
     eprintln!("[t8] T8.2.13 URLDecoder.decode(String): registered");
 }
 
 #[test]
 fn t8_2_14_url_encoder_single_arg() {
     let r = full_registry();
-    assert!(r.find("java/net/URLEncoder", "encode", "(Ljava/lang/String;)Ljava/lang/String;").is_some());
+    assert!(r
+        .find(
+            "java/net/URLEncoder",
+            "encode",
+            "(Ljava/lang/String;)Ljava/lang/String;"
+        )
+        .is_some());
     eprintln!("[t8] T8.2.14 URLEncoder.encode(String): registered");
 }
 
@@ -226,20 +309,26 @@ fn t8_2_14_url_encoder_single_arg() {
 #[test]
 fn t8_3_1_beans_instantiate() {
     let r = full_registry();
-    assert!(r.find(
-        "java/beans/Beans", "instantiate",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;",
-    ).is_some());
+    assert!(r
+        .find(
+            "java/beans/Beans",
+            "instantiate",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;",
+        )
+        .is_some());
     eprintln!("[t8] T8.3.1 Beans.instantiate: registered");
 }
 
 #[test]
 fn t8_3_2_remote_ref_get_ref_class() {
     let r = full_registry();
-    assert!(r.find(
-        "java/rmi/server/RemoteRef", "getRefClass",
-        "(Ljava/io/ObjectOutput;)Ljava/lang/String;",
-    ).is_some());
+    assert!(r
+        .find(
+            "java/rmi/server/RemoteRef",
+            "getRefClass",
+            "(Ljava/io/ObjectOutput;)Ljava/lang/String;",
+        )
+        .is_some());
     eprintln!("[t8] T8.3.2 RemoteRef.getRefClass: registered");
 }
 
@@ -247,10 +336,13 @@ fn t8_3_2_remote_ref_get_ref_class() {
 fn t8_3_3_rmi_activation() {
     let r = full_registry();
     // At least ActivationGroup.getSystem should be registered
-    assert!(r.find(
-        "java/rmi/activation/ActivationGroup", "getSystem",
-        "()Ljava/rmi/activation/ActivationSystem;",
-    ).is_some());
+    assert!(r
+        .find(
+            "java/rmi/activation/ActivationGroup",
+            "getSystem",
+            "()Ljava/rmi/activation/ActivationSystem;",
+        )
+        .is_some());
     eprintln!("[t8] T8.3.3 RMI activation: registered");
 }
 
@@ -271,23 +363,39 @@ fn t8_4_1_unsafe_define_class() {
 #[test]
 fn t8_4_2_unsafe_memory() {
     let r = full_registry();
-    assert!(r.find("sun/misc/Unsafe", "allocateMemory", "(J)J").is_some());
+    assert!(r
+        .find("sun/misc/Unsafe", "allocateMemory", "(J)J")
+        .is_some());
     assert!(r.find("sun/misc/Unsafe", "freeMemory", "(J)V").is_some());
-    assert!(r.find("sun/misc/Unsafe", "reallocateMemory", "(JJ)J").is_some());
+    assert!(r
+        .find("sun/misc/Unsafe", "reallocateMemory", "(JJ)J")
+        .is_some());
     eprintln!("[t8] T8.4.2 Unsafe memory ops: registered");
 }
 
 #[test]
 fn t8_4_3_reflection_get_caller_class() {
     let r = full_registry();
-    assert!(r.find("sun/reflect/Reflection", "getCallerClass", "(I)Ljava/lang/Class;").is_some());
+    assert!(r
+        .find(
+            "sun/reflect/Reflection",
+            "getCallerClass",
+            "(I)Ljava/lang/Class;"
+        )
+        .is_some());
     eprintln!("[t8] T8.4.3 Reflection.getCallerClass(int): registered");
 }
 
 #[test]
 fn t8_4_4_sun_misc_signal() {
     let r = full_registry();
-    assert!(r.find("sun/misc/Signal", "handle", "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;").is_some());
+    assert!(r
+        .find(
+            "sun/misc/Signal",
+            "handle",
+            "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;"
+        )
+        .is_some());
     eprintln!("[t8] T8.4.4 sun.misc.Signal: registered");
 }
 
@@ -301,12 +409,36 @@ fn t8_5_1_deprecated_api_count() {
     let total = r.len();
     eprintln!("[t8] Total native methods (including deprecated): {total}");
     // Spot-check: all deprecated sub-sections should be present
-    assert!(r.find("java/lang/Thread", "destroy", "()V").is_some(), "T8.1.3 missing");
-    assert!(r.find("java/util/Date", "getYear", "()I").is_some(), "T8.2.2 missing");
-    assert!(r.find("java/lang/Character", "isSpace", "(C)Z").is_some(), "T8.2.5 missing");
-    assert!(r.find("java/beans/Beans", "instantiate",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;").is_some(), "T8.3.1 missing");
-    assert!(r.find("sun/reflect/Reflection", "getCallerClass", "(I)Ljava/lang/Class;").is_some(), "T8.4.3 missing");
+    assert!(
+        r.find("java/lang/Thread", "destroy", "()V").is_some(),
+        "T8.1.3 missing"
+    );
+    assert!(
+        r.find("java/util/Date", "getYear", "()I").is_some(),
+        "T8.2.2 missing"
+    );
+    assert!(
+        r.find("java/lang/Character", "isSpace", "(C)Z").is_some(),
+        "T8.2.5 missing"
+    );
+    assert!(
+        r.find(
+            "java/beans/Beans",
+            "instantiate",
+            "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;"
+        )
+        .is_some(),
+        "T8.3.1 missing"
+    );
+    assert!(
+        r.find(
+            "sun/reflect/Reflection",
+            "getCallerClass",
+            "(I)Ljava/lang/Class;"
+        )
+        .is_some(),
+        "T8.4.3 missing"
+    );
 }
 
 #[test]
@@ -315,5 +447,8 @@ fn t8_5_4_readiness_measurement() {
     let total = r.len();
     eprintln!("[t8] T8 readiness: {total} total native methods registered");
     eprintln!("[t8] T8 deprecated API tier is functional");
-    assert!(total >= 200, "Expected >= 200 total natives for T8 readiness");
+    assert!(
+        total >= 200,
+        "Expected >= 200 total natives for T8 readiness"
+    );
 }

@@ -120,7 +120,6 @@ impl std::fmt::Debug for FrameInner {
 #[derive(Debug)]
 pub struct Frame {
     // ── Hot fields (touched on every opcode) ────────────────────────────
-
     /// The class that declares this method.
     pub class_id: ClassId,
 
@@ -180,7 +179,6 @@ pub struct Frame {
     pub seq: u64,
 
     // ── Cold fields (metadata, rarely-mutated state) ────────────────────
-
     /// Cold-path metadata (method name, descriptor, exception table, etc.).
     inner: FrameInner,
 
@@ -444,9 +442,7 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
         }
         CompactTag::Null => (0, VTAG_NULL),
         CompactTag::Uninitialized => (0, VTAG_UNINIT),
-        CompactTag::ReturnAddress => {
-            (cv.as_return_address().unwrap_or(0) as u64, VTAG_RETADDR)
-        }
+        CompactTag::ReturnAddress => (cv.as_return_address().unwrap_or(0) as u64, VTAG_RETADDR),
     }
 }
 
@@ -535,9 +531,7 @@ impl Frame {
         // `checked_shl` defends against overflow if `OSR_MAX_ATTEMPTS` is
         // ever bumped large enough to push past u32::MAX.
         let shift = attempts;
-        let backoff = osr_threshold
-            .checked_shl(shift)
-            .unwrap_or(u32::MAX);
+        let backoff = osr_threshold.checked_shl(shift).unwrap_or(u32::MAX);
         bc >= backoff
     }
 
@@ -849,7 +843,12 @@ impl Frame {
     /// pooled `Vec<u8>`, and `init_locals_pooled` overwrites it on reuse.
     pub fn take_pool_parts(self) -> (Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>) {
         let (stack_vals, stack_tags) = self.stack.into_inner();
-        (compact_vec_to_u64(self.locals), self.local_kinds, stack_vals, stack_tags)
+        (
+            compact_vec_to_u64(self.locals),
+            self.local_kinds,
+            stack_vals,
+            stack_tags,
+        )
     }
 
     // ── Cold-path accessors (method metadata, exception table) ──────────
@@ -1105,7 +1104,9 @@ impl Frame {
     /// Clone the exception table Arc (cold path — for continuation freeze).
     pub fn exception_table_arc(&self) -> Arc<[ExceptionTableEntry]> {
         match &self.inner {
-            FrameInner::Owned { exception_table, .. } => exception_table.clone(),
+            FrameInner::Owned {
+                exception_table, ..
+            } => exception_table.clone(),
             FrameInner::Cached(cm) => cm.exception_table.clone(),
         }
     }
@@ -1168,10 +1169,18 @@ impl Frame {
     /// Panics if the FrozenFrame lacks restoration metadata (code, class_id, etc.).
     pub fn from_frozen_frame(frozen: crate::threading::virtual_threads::FrozenFrame) -> Self {
         let code = frozen.code.expect("FrozenFrame missing code for thaw");
-        let class_id = frozen.class_id.expect("FrozenFrame missing class_id for thaw");
-        let max_stack = frozen.max_stack.expect("FrozenFrame missing max_stack for thaw");
-        let max_locals = frozen.max_locals.expect("FrozenFrame missing max_locals for thaw");
-        let exception_table = frozen.exception_table.expect("FrozenFrame missing exception_table for thaw");
+        let class_id = frozen
+            .class_id
+            .expect("FrozenFrame missing class_id for thaw");
+        let max_stack = frozen
+            .max_stack
+            .expect("FrozenFrame missing max_stack for thaw");
+        let max_locals = frozen
+            .max_locals
+            .expect("FrozenFrame missing max_locals for thaw");
+        let exception_table = frozen
+            .exception_table
+            .expect("FrozenFrame missing exception_table for thaw");
 
         let stack = ValueStack::from_snapshot(frozen.stack, frozen.stack_tags, max_stack as usize);
 
@@ -2135,5 +2144,4 @@ mod tests {
         assert_eq!(frame.pc, 0);
         assert_eq!(frame.backward_count, 0);
     }
-
 }

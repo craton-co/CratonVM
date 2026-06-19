@@ -66,10 +66,7 @@ fn test_resources_dir() -> String {
 }
 
 fn fixture_compiled() -> bool {
-    let path = format!(
-        "{}/cratonvm/Wp72JdbcCoreTypes.class",
-        test_resources_dir()
-    );
+    let path = format!("{}/cratonvm/Wp72JdbcCoreTypes.class", test_resources_dir());
     std::path::Path::new(&path).exists()
 }
 
@@ -464,9 +461,7 @@ fn jdbc_core_types_load_and_reflect() {
             Ok(n) => failures.push(format!(
                 "{java_name}: probe '{method}' returned unexpected value {n}"
             )),
-            Err(e) => failures.push(format!(
-                "{java_name}: probe '{method}' errored: {e}"
-            )),
+            Err(e) => failures.push(format!("{java_name}: probe '{method}' errored: {e}")),
         }
     }
 
@@ -494,9 +489,7 @@ fn jdbc_core_types_load_and_reflect() {
 #[test]
 fn connection_methods_carry_signatures() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping connection_methods_carry_signatures: fixture not staged"
-        );
+        eprintln!("Skipping connection_methods_carry_signatures: fixture not staged");
         return;
     }
 
@@ -507,9 +500,7 @@ fn connection_methods_carry_signatures() {
              (expected 1) — `Connection.class.getDeclaredMethods()` regressed; \
              check `synthetic_jdk_method_decls(\"java/sql/Connection\")`."
         ),
-        Err(e) => panic!(
-            "WP7.2: connection_methods_have_signatures errored: {e}"
-        ),
+        Err(e) => panic!("WP7.2: connection_methods_have_signatures errored: {e}"),
     }
 }
 
@@ -520,9 +511,7 @@ fn connection_methods_carry_signatures() {
 #[test]
 fn result_set_next_reflects_with_boolean_return() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping result_set_next_reflects_with_boolean_return: fixture not staged"
-        );
+        eprintln!("Skipping result_set_next_reflects_with_boolean_return: fixture not staged");
         return;
     }
 
@@ -533,9 +522,7 @@ fn result_set_next_reflects_with_boolean_return() {
              `ResultSet.class.getDeclaredMethods()` regressed; \
              check `synthetic_jdk_method_decls(\"java/sql/ResultSet\")`."
         ),
-        Err(e) => panic!(
-            "WP7.2: resultSet_next_is_boolean errored: {e}"
-        ),
+        Err(e) => panic!("WP7.2: resultSet_next_is_boolean errored: {e}"),
     }
 }
 
@@ -547,9 +534,7 @@ fn result_set_next_reflects_with_boolean_return() {
 #[test]
 fn jdbc_core_class_literals_resolve_at_runtime() {
     if !fixture_compiled() {
-        eprintln!(
-            "Skipping jdbc_core_class_literals_resolve_at_runtime: fixture not staged"
-        );
+        eprintln!("Skipping jdbc_core_class_literals_resolve_at_runtime: fixture not staged");
         return;
     }
 
@@ -577,14 +562,8 @@ fn fixture_class_file_is_staged() {
     // build script logs a cargo warning and the integration tests skip.
     // We only fail loudly if the fixture .java exists but the .class does
     // not, which would mean the build pipeline regressed.
-    let java = format!(
-        "{}/cratonvm/Wp72JdbcCoreTypes.java",
-        test_resources_dir()
-    );
-    let class = format!(
-        "{}/cratonvm/Wp72JdbcCoreTypes.class",
-        test_resources_dir()
-    );
+    let java = format!("{}/cratonvm/Wp72JdbcCoreTypes.java", test_resources_dir());
+    let class = format!("{}/cratonvm/Wp72JdbcCoreTypes.class", test_resources_dir());
     assert!(
         std::path::Path::new(&java).exists(),
         "Wp72JdbcCoreTypes.java fixture must exist at {java}"

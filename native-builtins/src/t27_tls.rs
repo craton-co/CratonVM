@@ -210,8 +210,16 @@ fn b64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -351,10 +359,7 @@ impl ResolvesServerCert for SniCertResolver {
 impl SniCertResolver {
     /// Build a `CertifiedKey` from PEM blobs. Uses rustls's ring-backed
     /// signer, which covers RSA 2048/3072/4096 and ECDSA P-256/P-384.
-    fn certified_key_from_pem(
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> Result<Arc<CertifiedKey>, String> {
+    fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, String> {
         let chain = parse_cert_chain_pem(cert_pem)?;
         let key = parse_private_key_pem(key_pem)?;
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
@@ -515,7 +520,10 @@ pub(crate) fn build_server_config_sni(
         }
         map.insert(host.to_ascii_lowercase(), ck);
     }
-    let resolver = Arc::new(SniCertResolver { hosts: map, fallback });
+    let resolver = Arc::new(SniCertResolver {
+        hosts: map,
+        fallback,
+    });
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
@@ -834,14 +842,9 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
         "()[Ljava/security/cert/X509Certificate;",
         |ctx, _args| {
             let ders = accepted_issuer_ders();
-            let arr =
-                ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
             for (i, der) in ders.iter().enumerate() {
-                let cert = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/security/cert/X509Certificate",
-                    4,
-                );
+                let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
                 // Best-effort CN extraction via the existing DER parser.
                 let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
                     .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
@@ -850,10 +853,7 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
                 ctx.set_field(cert, 0, Value::Object(Some(sub)));
                 ctx.set_field(cert, 1, Value::Object(Some(iss)));
                 ctx.set_field(cert, 2, Value::Long(0));
-                let der_arr = ctx.new_array(
-                    cratonvm_types::ArrayElementType::Byte,
-                    der.len(),
-                );
+                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
                 for (j, &b) in der.iter().enumerate() {
                     ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
                 }
@@ -907,10 +907,11 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             )
             .map_err(|e| RuntimeError::IOException { message: e })?;
 
-            let listener = TcpListener::bind(("0.0.0.0", port as u16))
-                .map_err(|e| RuntimeError::IOException {
+            let listener = TcpListener::bind(("0.0.0.0", port as u16)).map_err(|e| {
+                RuntimeError::IOException {
                     message: format!("bind 0.0.0.0:{}: {}", port, e),
-                })?;
+                }
+            })?;
             let local_port = match listener.local_addr() {
                 Ok(a) => a.port(),
                 Err(_) => port as u16,
@@ -928,11 +929,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                 id
             };
 
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLServerSocket",
-                SSS_FIELDS,
-            );
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
             ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
             ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
             ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
@@ -997,30 +994,24 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let stream_id = rustls_server_accept(id)
-            .map_err(|e| RuntimeError::IOException { message: e })?;
+        let stream_id =
+            rustls_server_accept(id).map_err(|e| RuntimeError::IOException { message: e })?;
 
         // Build an SSLSocket wrapper. Reuses the existing SSLSocket/
         // SSLSocketInputStream/SSLSocketOutputStream classes but puts
         // the rustls stream id into field 2. The stream I/O natives
         // dispatch on stream-id-table membership (rustls tables first,
         // then fall back to native-tls).
-        let sock = alloc_concurrent_synthetic(
-            ctx,
-            "javax/net/ssl/SSLSocket",
-            SSS_SOCK_FIELDS,
-        );
+        let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", SSS_SOCK_FIELDS);
         let (proto, cipher, alpn, sni) = rustls_session_info(stream_id)
             .unwrap_or_else(|| ("TLSv1.3".into(), "UNKNOWN".into(), None, None));
-        let host_str =
-            ctx.create_string(sni.as_deref().unwrap_or("server"));
+        let host_str = ctx.create_string(sni.as_deref().unwrap_or("server"));
         ctx.set_field(sock, SSS_SOCK_HOST, Value::Object(Some(host_str)));
         ctx.set_field(sock, SSS_SOCK_PORT, Value::Int(0));
         ctx.set_field(sock, SSS_SOCK_TLSID, Value::Int(stream_id));
         ctx.set_field(sock, SSS_SOCK_CLOSED, Value::Int(0));
 
-        let session =
-            alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
         ctx.set_field(session, 0, Value::Object(Some(p)));
@@ -1295,14 +1286,10 @@ fn register_self_test(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, _args| {
             let result = match runtime_tls_identity() {
-                Some(id) => run_loopback_self_test(
-                    &id.cert_pem,
-                    &id.key_pem,
-                    id.client_ca_pem.as_deref(),
-                ),
-                None => Err(
-                    "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string(),
-                ),
+                Some(id) => {
+                    run_loopback_self_test(&id.cert_pem, &id.key_pem, id.client_ca_pem.as_deref())
+                }
+                None => Err("No TLS key/cert configured; set javax.net.ssl.keyStore".to_string()),
             };
             let s = match result {
                 Ok(msg) => ctx.create_string(&msg),
@@ -1334,8 +1321,8 @@ pub(crate) fn run_loopback_self_test(
         false,
         None,
     )?;
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| format!("bind loopback: {}", e))?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind loopback: {}", e))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {}", e))?
@@ -1343,9 +1330,7 @@ pub(crate) fn run_loopback_self_test(
 
     let server_cfg_clone = server_config.clone();
     let server_thread = std::thread::spawn(move || -> Result<String, String> {
-        let (tcp, _peer) = listener
-            .accept()
-            .map_err(|e| format!("accept: {}", e))?;
+        let (tcp, _peer) = listener.accept().map_err(|e| format!("accept: {}", e))?;
         let conn = ServerConnection::new(server_cfg_clone)
             .map_err(|e| format!("ServerConnection: {}", e))?;
         let mut stream = StreamOwned::new(conn, tcp);
@@ -1388,9 +1373,7 @@ pub(crate) fn run_loopback_self_test(
     let mut roots = RootCertStore::empty();
     if let Some(ca) = trust_pem {
         for cert in parse_cert_chain_pem(ca)? {
-            roots
-                .add(cert)
-                .map_err(|e| format!("add CA: {}", e))?;
+            roots.add(cert).map_err(|e| format!("add CA: {}", e))?;
         }
     } else {
         // No explicit trust supplied: fall back to the host's native trust
@@ -1401,10 +1384,9 @@ pub(crate) fn run_loopback_self_test(
         }
     }
     let client_config = build_client_config(roots, &["h2", "http/1.1"], None)?;
-    let tcp = TcpStream::connect(("127.0.0.1", port))
-        .map_err(|e| format!("client connect: {}", e))?;
-    let sni = ServerName::try_from("localhost".to_string())
-        .map_err(|e| format!("sni: {}", e))?;
+    let tcp =
+        TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("client connect: {}", e))?;
+    let sni = ServerName::try_from("localhost".to_string()).map_err(|e| format!("sni: {}", e))?;
     let conn = ClientConnection::new(client_config, sni)
         .map_err(|e| format!("ClientConnection: {}", e))?;
     let mut stream = StreamOwned::new(conn, tcp);
@@ -1512,18 +1494,14 @@ mod tests {
         fn install(identity: super::RuntimeTlsIdentity) -> Self {
             // `lock()` can fail only if the mutex is poisoned by a panicking
             // test; recover the guard so we still serialize.
-            let lock = IDENTITY_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let lock = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let prev = super::runtime_tls_identity();
             super::set_runtime_tls_identity(Some(identity));
             IdentityGuard { _lock: lock, prev }
         }
 
         fn install_none() -> Self {
-            let lock = IDENTITY_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let lock = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let prev = super::runtime_tls_identity();
             super::set_runtime_tls_identity(None);
             IdentityGuard { _lock: lock, prev }
@@ -1671,11 +1649,20 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut stream.sock).map_err(|e| e.to_string())?;
-                    stream.conn.process_new_packets().map_err(|e| e.to_string())?;
+                    stream
+                        .conn
+                        .read_tls(&mut stream.sock)
+                        .map_err(|e| e.to_string())?;
+                    stream
+                        .conn
+                        .process_new_packets()
+                        .map_err(|e| e.to_string())?;
                 }
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut stream.sock).map_err(|e| e.to_string())?;
+                    stream
+                        .conn
+                        .write_tls(&mut stream.sock)
+                        .map_err(|e| e.to_string())?;
                 }
             }
             let mut buf = [0u8; 2];
@@ -1690,12 +1677,8 @@ mod tests {
         for c in parse_cert_chain_pem(CA_CRT_PEM).unwrap() {
             roots.add(c).unwrap();
         }
-        let client_config = build_client_config(
-            roots,
-            &["h2"],
-            Some((CLIENT_CRT_PEM, CLIENT_KEY_PEM)),
-        )
-        .unwrap();
+        let client_config =
+            build_client_config(roots, &["h2"], Some((CLIENT_CRT_PEM, CLIENT_KEY_PEM))).unwrap();
         let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let sni = ServerName::try_from("localhost".to_string()).unwrap();
         let conn = ClientConnection::new(client_config, sni).unwrap();
@@ -1741,11 +1724,20 @@ mod tests {
                 let mut stream = StreamOwned::new(conn, tcp);
                 while stream.conn.is_handshaking() {
                     if stream.conn.wants_read() {
-                        stream.conn.read_tls(&mut stream.sock).map_err(|e| e.to_string())?;
-                        stream.conn.process_new_packets().map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .read_tls(&mut stream.sock)
+                            .map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .process_new_packets()
+                            .map_err(|e| e.to_string())?;
                     }
                     if stream.conn.wants_write() {
-                        stream.conn.write_tls(&mut stream.sock).map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .write_tls(&mut stream.sock)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 stream.conn.send_close_notify();
@@ -1781,10 +1773,12 @@ mod tests {
             // server1 cert has `CN=foo.test`, server2 has `CN=bar.test`.
             let bytes = leaf.as_ref();
             let needle = expect_cn.as_bytes();
-            let found = bytes
-                .windows(needle.len())
-                .any(|w| w == needle);
-            assert!(found, "SNI {} did not get leaf containing {}", sni_name, expect_cn);
+            let found = bytes.windows(needle.len()).any(|w| w == needle);
+            assert!(
+                found,
+                "SNI {} did not get leaf containing {}",
+                sni_name, expect_cn
+            );
             stream.conn.send_close_notify();
             let _ = stream.flush();
         };
@@ -1812,12 +1806,12 @@ mod tests {
         let roots = load_native_root_store().expect("system roots load");
         // Only offer http/1.1 — we send a plaintext HTTP/1.1 request, and
         // offering h2 would cause the server to speak HTTP/2 binary framing.
-        let config = build_client_config(roots, &["http/1.1"], None)
-            .expect("client config");
-        let tcp = TcpStream::connect("www.google.com:443")
-            .expect("TCP connect");
-        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-        tcp.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
+        let config = build_client_config(roots, &["http/1.1"], None).expect("client config");
+        let tcp = TcpStream::connect("www.google.com:443").expect("TCP connect");
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        tcp.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
         let sni = ServerName::try_from("www.google.com".to_string()).unwrap();
         let conn = ClientConnection::new(config, sni).unwrap();
         let mut stream = StreamOwned::new(conn, tcp);
@@ -1834,15 +1828,14 @@ mod tests {
         // Verify negotiated protocol is TLS 1.2 or 1.3.
         let proto = stream.conn.protocol_version().expect("protocol version");
         assert!(
-            proto == rustls::ProtocolVersion::TLSv1_3
-                || proto == rustls::ProtocolVersion::TLSv1_2,
+            proto == rustls::ProtocolVersion::TLSv1_3 || proto == rustls::ProtocolVersion::TLSv1_2,
             "unexpected protocol: {:?}",
             proto,
         );
         // Send a minimal HTTP/1.1 GET.
-        stream.write_all(
-            b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n",
-        ).unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n")
+            .unwrap();
         // Read the status line.
         let mut response = vec![0u8; 4096];
         let n = stream.read(&mut response).expect("read");
@@ -1862,14 +1855,9 @@ mod tests {
     /// rustls's built-in TLS 1.3 ticket-based resumption cache is active.
     #[test]
     fn t27_session_resumption() {
-        let server_config = build_server_config_single_cert(
-            SERVER_CRT_PEM,
-            SERVER_KEY_PEM,
-            &[],
-            false,
-            None,
-        )
-        .unwrap();
+        let server_config =
+            build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
+                .unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let scfg = server_config.clone();
@@ -1882,11 +1870,20 @@ mod tests {
                 let mut stream = StreamOwned::new(conn, tcp);
                 while stream.conn.is_handshaking() {
                     if stream.conn.wants_read() {
-                        stream.conn.read_tls(&mut stream.sock).map_err(|e| e.to_string())?;
-                        stream.conn.process_new_packets().map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .read_tls(&mut stream.sock)
+                            .map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .process_new_packets()
+                            .map_err(|e| e.to_string())?;
                     }
                     if stream.conn.wants_write() {
-                        stream.conn.write_tls(&mut stream.sock).map_err(|e| e.to_string())?;
+                        stream
+                            .conn
+                            .write_tls(&mut stream.sock)
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 stream.conn.send_close_notify();
@@ -1908,7 +1905,9 @@ mod tests {
             let conn = ClientConnection::new(config.clone(), sni).unwrap();
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
-                if stream.conn.wants_write() { stream.conn.write_tls(&mut stream.sock).unwrap(); }
+                if stream.conn.wants_write() {
+                    stream.conn.write_tls(&mut stream.sock).unwrap();
+                }
                 if stream.conn.wants_read() {
                     stream.conn.read_tls(&mut stream.sock).unwrap();
                     stream.conn.process_new_packets().unwrap();
@@ -1928,7 +1927,9 @@ mod tests {
             let conn = ClientConnection::new(config.clone(), sni).unwrap();
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
-                if stream.conn.wants_write() { stream.conn.write_tls(&mut stream.sock).unwrap(); }
+                if stream.conn.wants_write() {
+                    stream.conn.write_tls(&mut stream.sock).unwrap();
+                }
                 if stream.conn.wants_read() {
                     stream.conn.read_tls(&mut stream.sock).unwrap();
                     stream.conn.process_new_packets().unwrap();
@@ -2016,18 +2017,10 @@ mod tests {
             .find(cls, "getSession", "()Ljavax/net/ssl/SSLSession;")
             .is_some());
         assert!(r
-            .find(
-                cls,
-                "getApplicationProtocol",
-                "()Ljava/lang/String;"
-            )
+            .find(cls, "getApplicationProtocol", "()Ljava/lang/String;")
             .is_some());
         assert!(r
-            .find(
-                cls,
-                "setApplicationProtocols",
-                "([Ljava/lang/String;)V"
-            )
+            .find(cls, "setApplicationProtocols", "([Ljava/lang/String;)V")
             .is_some());
         assert!(r
             .find(cls, "setEnabledProtocols", "([Ljava/lang/String;)V")
@@ -2116,7 +2109,11 @@ mod tests {
         let _guard = install_test_identity();
         let alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
         let cfg = super::default_engine_server_config(&alpn, false);
-        assert!(cfg.is_ok(), "expected Ok with identity installed: {:?}", cfg.err());
+        assert!(
+            cfg.is_ok(),
+            "expected Ok with identity installed: {:?}",
+            cfg.err()
+        );
         let cfg = cfg.unwrap();
         assert_eq!(cfg.alpn_protocols, alpn);
     }
@@ -2499,9 +2496,7 @@ fn engine_id_or_alloc(obj: ObjectRef) -> i32 {
     let id = engine_alloc_id();
     tab.insert(key, id);
     drop(tab);
-    engine_registry()
-        .write()
-        .insert(id, EngineState::default());
+    engine_registry().write().insert(id, EngineState::default());
     id
 }
 
@@ -2739,17 +2734,12 @@ fn default_engine_server_config(
         .filter_map(|p| std::str::from_utf8(p).ok())
         .collect();
     let identity = runtime_tls_identity()
-        .ok_or_else(|| {
-            "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string()
-        })?;
+        .ok_or_else(|| "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string())?;
     let client_ca = if need_client_auth {
         match identity.client_ca_pem.as_deref() {
             Some(ca) => Some(ca.to_string()),
             None => {
-                return Err(
-                    "setNeedClientAuth(true) requires javax.net.ssl.trustStore"
-                        .to_string(),
-                );
+                return Err("setNeedClientAuth(true) requires javax.net.ssl.trustStore".to_string());
             }
         }
     } else {
@@ -2779,8 +2769,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             .peer_host
             .clone()
             .unwrap_or_else(|| "localhost".to_string());
-        let server_name = ServerName::try_from(host)
-            .map_err(|e| format!("invalid SNI hostname: {}", e))?;
+        let server_name =
+            ServerName::try_from(host).map_err(|e| format!("invalid SNI hostname: {}", e))?;
         let cc = ClientConnection::new(config, server_name)
             .map_err(|e| format!("ClientConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Client(cc));
@@ -2789,8 +2779,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             Some(c) => c,
             None => default_engine_server_config(&state.alpn_protocols, state.need_client_auth)?,
         };
-        let sc = ServerConnection::new(config)
-            .map_err(|e| format!("ServerConnection::new: {}", e))?;
+        let sc =
+            ServerConnection::new(config).map_err(|e| format!("ServerConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Server(sc));
     }
     Ok(())
@@ -2834,10 +2824,7 @@ fn engine_wrap_pump(
 
 /// Push inbound TLS bytes into rustls, process packets, then drain plaintext
 /// into the dsts (returned as `Vec<u8>`). Returns (consumed_from_src, plaintext_out).
-fn engine_unwrap_pump(
-    state: &mut EngineState,
-    inbound: &[u8],
-) -> Result<(usize, Vec<u8>), String> {
+fn engine_unwrap_pump(state: &mut EngineState, inbound: &[u8]) -> Result<(usize, Vec<u8>), String> {
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return Ok((0, Vec::new())),
@@ -3029,9 +3016,8 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(this);
-            let list = with_engine(id, |s| s.enabled_protocols.clone()).unwrap_or_else(|| {
-                vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]
-            });
+            let list = with_engine(id, |s| s.enabled_protocols.clone())
+                .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
             for (i, p) in list.iter().enumerate() {
                 let s = ctx.create_string(p);
@@ -3266,7 +3252,13 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                 let alpn = s.negotiated_alpn.clone().unwrap_or_default();
                 (proto.to_string(), cipher, alpn)
             })
-            .unwrap_or_else(|| ("TLSv1.3".into(), "TLS_AES_256_GCM_SHA384".into(), String::new()));
+            .unwrap_or_else(|| {
+                (
+                    "TLSv1.3".into(),
+                    "TLS_AES_256_GCM_SHA384".into(),
+                    String::new(),
+                )
+            });
             // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
             let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
             let cipher_s = ctx.create_string(&cipher);
@@ -3478,7 +3470,10 @@ fn do_wrap(
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
     let needs_app_data = with_engine(id, |s| {
-        s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+        s.conn
+            .as_ref()
+            .map(|c| !c.is_handshaking())
+            .unwrap_or(false)
     })
     .unwrap_or(false);
     if needs_app_data {
@@ -3803,8 +3798,10 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(this);
             if let Some(Value::Object(Some(p))) = args.get(1) {
-                if let Some(list) =
-                    sslparams_alpn_table().lock().get(&engine_objref_key(*p)).cloned()
+                if let Some(list) = sslparams_alpn_table()
+                    .lock()
+                    .get(&engine_objref_key(*p))
+                    .cloned()
                 {
                     with_engine(id, |s| {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();

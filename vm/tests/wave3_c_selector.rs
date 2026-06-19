@@ -39,7 +39,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -48,7 +52,10 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     // Workspace shared target — when the worktree shares the parent
     // workspace's target dir.
-    let shared = worktree_root().parent().and_then(|p| p.parent()).map(|p| p.join("target"));
+    let shared = worktree_root()
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("target"));
     if let Some(t) = shared {
         for profile in &["release", "debug"] {
             let candidate = t.join(profile).join(exe);
@@ -140,7 +147,9 @@ fn selector_probe_loopback_echo() {
         rc,
         Some(0),
         "wave3-c: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     assert!(
         stdout.lines().any(|l| l.starts_with("server.port=")),

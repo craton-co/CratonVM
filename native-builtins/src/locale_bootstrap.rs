@@ -18,10 +18,10 @@
 //! branch of `JRELocaleProviderAdapter.getLocaleServiceProvider` so code
 //! paths that still reach it get `null` instead of an `InternalError`.
 
-use parking_lot::Mutex;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -35,7 +35,8 @@ fn cached_default_locale() -> &'static Mutex<Option<ObjectRef>> {
 
 /// Map from synthetic Locale ObjectRef → (language, country, language_tag).
 /// Used by the getLanguage/getCountry/toLanguageTag native overrides.
-fn synthetic_locale_data() -> &'static Mutex<HashMap<ObjectRef, (&'static str, &'static str, &'static str)>> {
+fn synthetic_locale_data(
+) -> &'static Mutex<HashMap<ObjectRef, (&'static str, &'static str, &'static str)>> {
     static MAP: OnceLock<Mutex<HashMap<ObjectRef, (&'static str, &'static str, &'static str)>>> =
         OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
@@ -179,9 +180,15 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let region_o = base_locale_field(ctx, *this, "region");
         let variant_o = base_locale_field(ctx, *this, "variant");
         let lang = lang_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
-        let script = script_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
-        let region = region_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
-        let variant = variant_o.and_then(|s| ctx.read_string(s)).unwrap_or_default();
+        let script = script_o
+            .and_then(|s| ctx.read_string(s))
+            .unwrap_or_default();
+        let region = region_o
+            .and_then(|s| ctx.read_string(s))
+            .unwrap_or_default();
+        let variant = variant_o
+            .and_then(|s| ctx.read_string(s))
+            .unwrap_or_default();
 
         // language[-script][-region][-variant…]; empty language => "und".
         let mut tag = if lang.is_empty() {
@@ -310,60 +317,156 @@ fn locale_variant(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// the base-locale fields without CLDR data (see `essential_quarkus_locale_convert`).
 const AVAILABLE_LOCALES: &[(&str, &str)] = &[
     ("", ""),
-    ("ar", ""), ("ar", "AE"), ("ar", "BH"), ("ar", "DZ"), ("ar", "EG"),
-    ("ar", "IQ"), ("ar", "JO"), ("ar", "KW"), ("ar", "LB"), ("ar", "LY"),
-    ("ar", "MA"), ("ar", "OM"), ("ar", "QA"), ("ar", "SA"), ("ar", "SD"),
-    ("ar", "SY"), ("ar", "TN"), ("ar", "YE"),
-    ("be", ""), ("be", "BY"),
-    ("bg", ""), ("bg", "BG"),
-    ("ca", ""), ("ca", "ES"),
-    ("cs", ""), ("cs", "CZ"),
-    ("da", ""), ("da", "DK"),
-    ("de", ""), ("de", "AT"), ("de", "CH"), ("de", "DE"), ("de", "LU"),
-    ("el", ""), ("el", "CY"), ("el", "GR"),
-    ("en", ""), ("en", "AU"), ("en", "CA"), ("en", "GB"), ("en", "IE"),
-    ("en", "IN"), ("en", "MT"), ("en", "NZ"), ("en", "PH"), ("en", "SG"),
-    ("en", "US"), ("en", "ZA"),
-    ("es", ""), ("es", "AR"), ("es", "BO"), ("es", "CL"), ("es", "CO"),
-    ("es", "CR"), ("es", "DO"), ("es", "EC"), ("es", "ES"), ("es", "GT"),
-    ("es", "HN"), ("es", "MX"), ("es", "NI"), ("es", "PA"), ("es", "PE"),
-    ("es", "PR"), ("es", "PY"), ("es", "SV"), ("es", "US"), ("es", "UY"),
+    ("ar", ""),
+    ("ar", "AE"),
+    ("ar", "BH"),
+    ("ar", "DZ"),
+    ("ar", "EG"),
+    ("ar", "IQ"),
+    ("ar", "JO"),
+    ("ar", "KW"),
+    ("ar", "LB"),
+    ("ar", "LY"),
+    ("ar", "MA"),
+    ("ar", "OM"),
+    ("ar", "QA"),
+    ("ar", "SA"),
+    ("ar", "SD"),
+    ("ar", "SY"),
+    ("ar", "TN"),
+    ("ar", "YE"),
+    ("be", ""),
+    ("be", "BY"),
+    ("bg", ""),
+    ("bg", "BG"),
+    ("ca", ""),
+    ("ca", "ES"),
+    ("cs", ""),
+    ("cs", "CZ"),
+    ("da", ""),
+    ("da", "DK"),
+    ("de", ""),
+    ("de", "AT"),
+    ("de", "CH"),
+    ("de", "DE"),
+    ("de", "LU"),
+    ("el", ""),
+    ("el", "CY"),
+    ("el", "GR"),
+    ("en", ""),
+    ("en", "AU"),
+    ("en", "CA"),
+    ("en", "GB"),
+    ("en", "IE"),
+    ("en", "IN"),
+    ("en", "MT"),
+    ("en", "NZ"),
+    ("en", "PH"),
+    ("en", "SG"),
+    ("en", "US"),
+    ("en", "ZA"),
+    ("es", ""),
+    ("es", "AR"),
+    ("es", "BO"),
+    ("es", "CL"),
+    ("es", "CO"),
+    ("es", "CR"),
+    ("es", "DO"),
+    ("es", "EC"),
+    ("es", "ES"),
+    ("es", "GT"),
+    ("es", "HN"),
+    ("es", "MX"),
+    ("es", "NI"),
+    ("es", "PA"),
+    ("es", "PE"),
+    ("es", "PR"),
+    ("es", "PY"),
+    ("es", "SV"),
+    ("es", "US"),
+    ("es", "UY"),
     ("es", "VE"),
-    ("et", ""), ("et", "EE"),
-    ("fi", ""), ("fi", "FI"),
-    ("fr", ""), ("fr", "BE"), ("fr", "CA"), ("fr", "CH"), ("fr", "FR"),
+    ("et", ""),
+    ("et", "EE"),
+    ("fi", ""),
+    ("fi", "FI"),
+    ("fr", ""),
+    ("fr", "BE"),
+    ("fr", "CA"),
+    ("fr", "CH"),
+    ("fr", "FR"),
     ("fr", "LU"),
-    ("ga", ""), ("ga", "IE"),
-    ("he", ""), ("he", "IL"),
-    ("hi", ""), ("hi", "IN"),
-    ("hr", ""), ("hr", "HR"),
-    ("hu", ""), ("hu", "HU"),
-    ("id", ""), ("id", "ID"),
-    ("is", ""), ("is", "IS"),
-    ("it", ""), ("it", "CH"), ("it", "IT"),
-    ("ja", ""), ("ja", "JP"),
-    ("ko", ""), ("ko", "KR"),
-    ("lt", ""), ("lt", "LT"),
-    ("lv", ""), ("lv", "LV"),
-    ("mk", ""), ("mk", "MK"),
-    ("ms", ""), ("ms", "MY"),
-    ("mt", ""), ("mt", "MT"),
-    ("nl", ""), ("nl", "BE"), ("nl", "NL"),
-    ("no", ""), ("no", "NO"),
-    ("pl", ""), ("pl", "PL"),
-    ("pt", ""), ("pt", "BR"), ("pt", "PT"),
-    ("ro", ""), ("ro", "RO"),
-    ("ru", ""), ("ru", "RU"),
-    ("sk", ""), ("sk", "SK"),
-    ("sl", ""), ("sl", "SI"),
-    ("sq", ""), ("sq", "AL"),
-    ("sr", ""), ("sr", "BA"), ("sr", "CS"), ("sr", "ME"), ("sr", "RS"),
-    ("sv", ""), ("sv", "SE"),
-    ("th", ""), ("th", "TH"),
-    ("tr", ""), ("tr", "TR"),
-    ("uk", ""), ("uk", "UA"),
-    ("vi", ""), ("vi", "VN"),
-    ("zh", ""), ("zh", "CN"), ("zh", "HK"), ("zh", "SG"), ("zh", "TW"),
+    ("ga", ""),
+    ("ga", "IE"),
+    ("he", ""),
+    ("he", "IL"),
+    ("hi", ""),
+    ("hi", "IN"),
+    ("hr", ""),
+    ("hr", "HR"),
+    ("hu", ""),
+    ("hu", "HU"),
+    ("id", ""),
+    ("id", "ID"),
+    ("is", ""),
+    ("is", "IS"),
+    ("it", ""),
+    ("it", "CH"),
+    ("it", "IT"),
+    ("ja", ""),
+    ("ja", "JP"),
+    ("ko", ""),
+    ("ko", "KR"),
+    ("lt", ""),
+    ("lt", "LT"),
+    ("lv", ""),
+    ("lv", "LV"),
+    ("mk", ""),
+    ("mk", "MK"),
+    ("ms", ""),
+    ("ms", "MY"),
+    ("mt", ""),
+    ("mt", "MT"),
+    ("nl", ""),
+    ("nl", "BE"),
+    ("nl", "NL"),
+    ("no", ""),
+    ("no", "NO"),
+    ("pl", ""),
+    ("pl", "PL"),
+    ("pt", ""),
+    ("pt", "BR"),
+    ("pt", "PT"),
+    ("ro", ""),
+    ("ro", "RO"),
+    ("ru", ""),
+    ("ru", "RU"),
+    ("sk", ""),
+    ("sk", "SK"),
+    ("sl", ""),
+    ("sl", "SI"),
+    ("sq", ""),
+    ("sq", "AL"),
+    ("sr", ""),
+    ("sr", "BA"),
+    ("sr", "CS"),
+    ("sr", "ME"),
+    ("sr", "RS"),
+    ("sv", ""),
+    ("sv", "SE"),
+    ("th", ""),
+    ("th", "TH"),
+    ("tr", ""),
+    ("tr", "TR"),
+    ("uk", ""),
+    ("uk", "UA"),
+    ("vi", ""),
+    ("vi", "VN"),
+    ("zh", ""),
+    ("zh", "CN"),
+    ("zh", "HK"),
+    ("zh", "SG"),
+    ("zh", "TW"),
 ];
 
 /// `java.util.Locale.getAvailableLocales()` — return a non-empty `Locale[]`.
@@ -500,24 +603,16 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let lang: String = match ctx.invoke_virtual(
-                this,
-                "getLanguage",
-                "()Ljava/lang/String;",
-                &[],
-            )? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let country: String = match ctx.invoke_virtual(
-                this,
-                "getCountry",
-                "()Ljava/lang/String;",
-                &[],
-            )? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
+            let lang: String =
+                match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+            let country: String =
+                match ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
             let display = if country.is_empty() {
                 lang
             } else {
@@ -535,24 +630,16 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let lang: String = match ctx.invoke_virtual(
-                this,
-                "getLanguage",
-                "()Ljava/lang/String;",
-                &[],
-            )? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let country: String = match ctx.invoke_virtual(
-                this,
-                "getCountry",
-                "()Ljava/lang/String;",
-                &[],
-            )? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
+            let lang: String =
+                match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+            let country: String =
+                match ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
             let display = if country.is_empty() {
                 lang
             } else {

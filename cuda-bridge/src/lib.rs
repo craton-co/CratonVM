@@ -490,8 +490,7 @@ pub struct DeviceBuffer<T> {
 }
 
 /// Shared handle to a buffer's last-write event. See [`DeviceBuffer`].
-pub(crate) type LastWriteSlot =
-    std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Event>>>>;
+pub(crate) type LastWriteSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Event>>>>;
 
 /// Allocate a fresh empty [`LastWriteSlot`].
 pub(crate) fn new_last_write_slot() -> LastWriteSlot {
@@ -549,10 +548,7 @@ pub trait DeviceElem:
 /// there is no driver, so the bound collapses to `bytemuck::Pod + Send +
 /// Sync + 'static`.
 #[cfg(not(feature = "cuda"))]
-pub trait DeviceElem:
-    bytemuck::Pod + Send + Sync + 'static + device_elem_seal::Sealed
-{
-}
+pub trait DeviceElem: bytemuck::Pod + Send + Sync + 'static + device_elem_seal::Sealed {}
 
 #[cfg(feature = "cuda")]
 impl<T> device_elem_seal::Sealed for T where
@@ -687,9 +683,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
             bytes: std::mem::size_of_val(host),
         });
         let last_write = new_last_write_slot();
-        *last_write
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(event);
+        *last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(event);
         Ok(Self { inner, last_write })
     }
 
@@ -829,9 +823,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         });
         let inner = backend::DeviceBufferInner::from_host(&ctx.0, host)?;
         let last_write = new_last_write_slot();
-        *last_write
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(event);
+        *last_write.lock().unwrap_or_else(|p| p.into_inner()) = Some(event);
         Ok(Self { inner, last_write })
     }
 

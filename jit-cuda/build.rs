@@ -74,10 +74,7 @@ fn compile_top_level_fixtures(sources_dir: &Path) {
     let java_files: Vec<PathBuf> = match std::fs::read_dir(sources_dir) {
         Ok(it) => it
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().is_file()
-                    && e.path().extension().is_some_and(|ext| ext == "java")
-            })
+            .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))
             .map(|e| e.path())
             .collect(),
         Err(e) => {
@@ -101,10 +98,8 @@ fn compile_top_level_fixtures(sources_dir: &Path) {
     // craton-gpu annotations classpath if `craton-gpu`'s build.rs
     // produced one. Same env-var-fallback rules as
     // `compile_annotation_fixtures`.
-    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR")
-        .unwrap_or_default();
-    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR")
-        .unwrap_or_default();
+    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default();
+    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR").unwrap_or_default();
     let classpath: Option<String> = match (cp_jar.is_empty(), cp_dir.is_empty()) {
         (false, false) => Some(format!("{cp_jar}{}{cp_dir}", classpath_separator())),
         (false, true) => Some(cp_jar),
@@ -153,10 +148,7 @@ fn compile_annotation_fixtures(sources_dir: &Path) {
     let java_files: Vec<PathBuf> = match std::fs::read_dir(&annotations_dir) {
         Ok(it) => it
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().is_file()
-                    && e.path().extension().is_some_and(|ext| ext == "java")
-            })
+            .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))
             .map(|e| e.path())
             .collect(),
         Err(e) => {
@@ -178,10 +170,8 @@ fn compile_annotation_fixtures(sources_dir: &Path) {
     // Both come in as cargo-mangled `DEP_<LINKS>_<KEY>` env vars;
     // they're empty strings (not unset) when `craton-gpu`'s build.rs
     // couldn't run javac/jar — hence the explicit `is_empty()` checks.
-    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR")
-        .unwrap_or_default();
-    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR")
-        .unwrap_or_default();
+    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default();
+    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR").unwrap_or_default();
 
     let classpath: String = match (cp_jar.is_empty(), cp_dir.is_empty()) {
         (false, false) => format!("{cp_jar}{}{cp_dir}", classpath_separator()),
@@ -217,9 +207,7 @@ fn compile_annotation_fixtures(sources_dir: &Path) {
         .expect("failed to invoke javac despite -version probe succeeding");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        println!(
-            "cargo:warning=javac failed compiling GPU annotation fixtures:\n{stderr}"
-        );
+        println!("cargo:warning=javac failed compiling GPU annotation fixtures:\n{stderr}");
     }
 }
 

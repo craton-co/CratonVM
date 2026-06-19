@@ -60,12 +60,7 @@ macro_rules! require_class_files {
 fn clinit_super_before_sub() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/ClinitOrder",
-        "testSuperBeforeSub",
-        "()V",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/ClinitOrder", "testSuperBeforeSub", "()V", &[]);
     assert!(result.is_ok(), "testSuperBeforeSub failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
@@ -75,12 +70,7 @@ fn clinit_super_before_sub() {
 fn clinit_reentrant_noop() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/ClinitOrder",
-        "testReentrantClinit",
-        "()V",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/ClinitOrder", "testReentrantClinit", "()V", &[]);
     assert!(result.is_ok(), "testReentrantClinit failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
@@ -90,12 +80,7 @@ fn clinit_reentrant_noop() {
 fn clinit_diamond_init() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/ClinitOrder",
-        "testDiamondInit",
-        "()V",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/ClinitOrder", "testDiamondInit", "()V", &[]);
     assert!(result.is_ok(), "testDiamondInit failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
@@ -131,12 +116,7 @@ fn clinit_error_marks_unusable() {
 fn clinit_init_chain() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/ClinitOrder",
-        "testInitChain",
-        "()V",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/ClinitOrder", "testInitChain", "()V", &[]);
     assert!(result.is_ok(), "testInitChain failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2, 3, 4]);
 }
@@ -148,9 +128,9 @@ fn clinit_init_chain() {
 fn clinit_concurrent_init() {
     require_class_files!();
 
-    use std::sync::Arc;
     use cratonvm_vm::threading::ThreadId;
     use cratonvm_vm::vm::invoke_shared;
+    use std::sync::Arc;
 
     let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
     let shared = Arc::new(cratonvm_vm::vm::SharedVm::new(config));
@@ -167,26 +147,46 @@ fn clinit_concurrent_init() {
 
     let t1 = std::thread::spawn(move || {
         let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(1), "thread-1");
-        shared1.thread_registry.register(ThreadId(1), "thread-1", None);
+        shared1
+            .thread_registry
+            .register(ThreadId(1), "thread-1", None);
         b1.wait(); // sync start
         let result = invoke_shared(
-            &shared1, &mut thread,
-            "cratonvm/ClinitOrder", "testConcurrentInit", "()V", &[],
+            &shared1,
+            &mut thread,
+            "cratonvm/ClinitOrder",
+            "testConcurrentInit",
+            "()V",
+            &[],
         );
         assert!(result.is_ok(), "thread-1 failed: {result:?}");
-        thread.printed.iter().filter_map(|v| v.as_int()).collect::<Vec<_>>()
+        thread
+            .printed
+            .iter()
+            .filter_map(|v| v.as_int())
+            .collect::<Vec<_>>()
     });
 
     let t2 = std::thread::spawn(move || {
         let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(2), "thread-2");
-        shared2.thread_registry.register(ThreadId(2), "thread-2", None);
+        shared2
+            .thread_registry
+            .register(ThreadId(2), "thread-2", None);
         b2.wait(); // sync start
         let result = invoke_shared(
-            &shared2, &mut thread,
-            "cratonvm/ClinitOrder", "testConcurrentInit", "()V", &[],
+            &shared2,
+            &mut thread,
+            "cratonvm/ClinitOrder",
+            "testConcurrentInit",
+            "()V",
+            &[],
         );
         assert!(result.is_ok(), "thread-2 failed: {result:?}");
-        thread.printed.iter().filter_map(|v| v.as_int()).collect::<Vec<_>>()
+        thread
+            .printed
+            .iter()
+            .filter_map(|v| v.as_int())
+            .collect::<Vec<_>>()
     });
 
     let r1 = t1.join().expect("thread-1 panicked");
@@ -197,8 +197,8 @@ fn clinit_concurrent_init() {
     assert!(r2.contains(&42), "thread-2 should see VALUE=42, got {r2:?}");
 
     // The clinit marker (1) should appear exactly once across both threads
-    let total_clinit_markers = r1.iter().filter(|&&v| v == 1).count()
-        + r2.iter().filter(|&&v| v == 1).count();
+    let total_clinit_markers =
+        r1.iter().filter(|&&v| v == 1).count() + r2.iter().filter(|&&v| v == 1).count();
     assert_eq!(
         total_clinit_markers, 1,
         "clinit should run exactly once, but ran {total_clinit_markers} times (t1={r1:?}, t2={r2:?})"
@@ -217,6 +217,9 @@ fn clinit_constant_field_skips_init() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testConstantFieldSkipsInit failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testConstantFieldSkipsInit failed: {result:?}"
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }

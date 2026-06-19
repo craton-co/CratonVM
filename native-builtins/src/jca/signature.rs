@@ -45,8 +45,8 @@
 #![allow(clippy::collapsible_if)]
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
@@ -96,27 +96,21 @@ const SIG_PRIVATE_SLOTS: usize = 6;
 // from `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs`).
 // ---------------------------------------------------------------------------
 
-fn sig_algo_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn sig_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_state_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn sig_state_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_keyid_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>> {
+fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -286,7 +280,12 @@ fn read_byte_array_full(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> 
     out
 }
 
-fn read_byte_array_range(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, len: usize) -> Vec<u8> {
+fn read_byte_array_range(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    off: usize,
+    len: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     let arr_len = ctx.array_length(arr);
     let end = (off + len).min(arr_len);
@@ -343,7 +342,11 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
         Value::Int(n) => n,
         _ => 0,
     };
-    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(cur + data.len() as i32));
+    ctx.set_field(
+        this,
+        base + SIG_OFF_PENDING,
+        Value::Int(cur + data.len() as i32),
+    );
     let key = ctx.identity_hash_code(this);
     crypto_impl::sig_data_append_h(key, data);
 }
@@ -359,9 +362,10 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
 /// `update()` still resolves to `Ok(Vec::new())`.  A silent empty-buffer
 /// fallback at this layer would have produced a valid-looking signature
 /// over `b""` — precisely the failure mode C18 fixes.
-fn take_data(ctx: &mut dyn NativeContext, this: ObjectRef)
-    -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed>
-{
+fn take_data(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     let key = ctx.identity_hash_code(this);
@@ -491,14 +495,23 @@ fn drive_real_ecdsa(
             spi,
             "engineUpdate",
             "([BII)V",
-            &[Value::Object(Some(arr)), Value::Int(0), Value::Int(data.len() as i32)],
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(data.len() as i32),
+            ],
         )?;
         let spi = ctx.read_native_pin(spi_pin, spi);
         match verify_sig {
             Some(sig_bytes) => {
                 let sigarr = alloc_byte_array(ctx, &sig_bytes);
                 let spi = ctx.read_native_pin(spi_pin, spi);
-                let ok = ctx.invoke_virtual(spi, "engineVerify", "([B)Z", &[Value::Object(Some(sigarr))])?;
+                let ok = ctx.invoke_virtual(
+                    spi,
+                    "engineVerify",
+                    "([B)Z",
+                    &[Value::Object(Some(sigarr))],
+                )?;
                 // Normalize to Int(0/1) so the caller's Z return is well-formed.
                 Ok(match ok {
                     Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
@@ -639,15 +652,23 @@ fn drive_real_mldsa(
             spi,
             "engineUpdate",
             "([BII)V",
-            &[Value::Object(Some(arr)), Value::Int(0), Value::Int(data.len() as i32)],
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(data.len() as i32),
+            ],
         )?;
         let spi = ctx.read_native_pin(spi_pin, spi);
         match verify_sig {
             Some(sig_bytes) => {
                 let sigarr = alloc_byte_array(ctx, &sig_bytes);
                 let spi = ctx.read_native_pin(spi_pin, spi);
-                let ok =
-                    ctx.invoke_virtual(spi, "engineVerify", "([B)Z", &[Value::Object(Some(sigarr))])?;
+                let ok = ctx.invoke_virtual(
+                    spi,
+                    "engineVerify",
+                    "([B)Z",
+                    &[Value::Object(Some(sigarr))],
+                )?;
                 Ok(match ok {
                     Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
                     _ => Some(Value::Int(0)),
@@ -668,11 +689,7 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let obj = alloc_concurrent_synthetic(
-        ctx,
-        "java/security/Signature",
-        base + SIG_PRIVATE_SLOTS,
-    );
+    let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS);
     // SigProbe fix: side-table is the authoritative store; the base-offset
     // slot writes remain for any synthetic-mode caller that goes through
     // slot indexing.  C15: keyed on identity hash code so GC compaction
@@ -776,9 +793,10 @@ fn sig_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// either never produced by our `getInstance` or — pre-fix — was orphaned
 /// by GC compaction; either way, silently returning `STATE_UNINIT` masks
 /// the underlying defect.
-fn require_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef)
-    -> Result<i32, cratonvm_types::error::MethodCallFailed>
-{
+fn require_sig_state(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if let Some(st) = get_sig_state(ctx, this) {
         return Ok(st);
     }
@@ -788,9 +806,10 @@ fn require_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef)
     .into())
 }
 
-fn require_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef)
-    -> Result<i32, cratonvm_types::error::MethodCallFailed>
-{
+fn require_sig_algo(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if let Some(a) = get_sig_algo(ctx, this) {
         return Ok(a);
     }
@@ -946,10 +965,11 @@ fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // still get *some* answer instead of an exception cascade.  The loud
     // error path is reserved for the cryptographic operations above.
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let idx = get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
-        Value::Int(i) => i,
-        _ => -1,
-    });
+    let idx =
+        get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+            Value::Int(i) => i,
+            _ => -1,
+        });
     let s = ctx.create_string(algo_name(idx));
     Ok(Some(Value::Object(Some(s))))
 }
@@ -975,7 +995,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
     }
     let cls = "java/security/Signature";
 
-    r.register(cls, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;", sig_get_instance);
+    r.register(
+        cls,
+        "getInstance",
+        "(Ljava/lang/String;)Ljava/security/Signature;",
+        sig_get_instance,
+    );
     r.register(
         cls,
         "getInstance",
@@ -989,14 +1014,24 @@ pub fn register(r: &mut NativeMethodRegistry) {
         sig_get_instance,
     );
 
-    r.register(cls, "initSign", "(Ljava/security/PrivateKey;)V", sig_init_sign);
+    r.register(
+        cls,
+        "initSign",
+        "(Ljava/security/PrivateKey;)V",
+        sig_init_sign,
+    );
     r.register(
         cls,
         "initSign",
         "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V",
         sig_init_sign,
     );
-    r.register(cls, "initVerify", "(Ljava/security/PublicKey;)V", sig_init_verify);
+    r.register(
+        cls,
+        "initVerify",
+        "(Ljava/security/PublicKey;)V",
+        sig_init_verify,
+    );
     r.register(
         cls,
         "initVerify",
@@ -1007,7 +1042,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(cls, "update", "(B)V", sig_update_byte);
     r.register(cls, "update", "([B)V", sig_update_bytes);
     r.register(cls, "update", "([BII)V", sig_update_bytes_off_len);
-    r.register(cls, "update", "(Ljava/nio/ByteBuffer;)V", sig_update_bytebuffer);
+    r.register(
+        cls,
+        "update",
+        "(Ljava/nio/ByteBuffer;)V",
+        sig_update_bytebuffer,
+    );
 
     r.register(cls, "sign", "()[B", sig_sign);
     r.register(cls, "sign", "([BII)I", sig_sign_into);
@@ -1015,8 +1055,18 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(cls, "verify", "([B)Z", sig_verify);
     r.register(cls, "verify", "([BII)Z", sig_verify_off_len);
 
-    r.register(cls, "getAlgorithm", "()Ljava/lang/String;", sig_get_algorithm);
-    r.register(cls, "getProvider", "()Ljava/security/Provider;", sig_get_provider_null);
+    r.register(
+        cls,
+        "getAlgorithm",
+        "()Ljava/lang/String;",
+        sig_get_algorithm,
+    );
+    r.register(
+        cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        sig_get_provider_null,
+    );
 
     r.register(
         cls,
@@ -1024,7 +1074,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/security/spec/AlgorithmParameterSpec;)V",
         sig_set_parameter,
     );
-    r.register(cls, "setParameter", "(Ljava/lang/String;Ljava/lang/Object;)V", sig_set_parameter);
+    r.register(
+        cls,
+        "setParameter",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        sig_set_parameter,
+    );
 
     // `sun.security.util.SignatureUtil.{initVerify,initSign}WithParam` —
     // the real JDK indirects through `SharedSecrets.getJavaSecuritySignatureAccess()`
@@ -1103,7 +1158,12 @@ fn sigutil_init_verify_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn sigutil_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    sigutil_drive(ctx, args, "initVerify", "(Ljava/security/cert/Certificate;)V")
+    sigutil_drive(
+        ctx,
+        args,
+        "initVerify",
+        "(Ljava/security/cert/Certificate;)V",
+    )
 }
 
 fn sigutil_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

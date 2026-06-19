@@ -335,12 +335,7 @@ impl ReferenceProcessor {
         // still closes the common single-hop case (a weak/soft ref whose
         // referent *is* a finalizable object) by treating the direct
         // finalizer referents as live for Phases 1-2.
-        self.process_references_with_finalizer_trace(
-            is_marked,
-            None,
-            free_heap_mb,
-            current_time_ms,
-        )
+        self.process_references_with_finalizer_trace(is_marked, None, free_heap_mb, current_time_ms)
     }
 
     /// Process all reference types in HotSpot order, recomputing the
@@ -413,9 +408,7 @@ impl ReferenceProcessor {
         // "live" if the collector already marked it OR it is reachable from a
         // to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
         // snapshot so finalizers/phantoms are still discovered correctly.
-        let is_live = |addr: usize| -> bool {
-            is_marked(addr) || finalizer_live.contains(&addr)
-        };
+        let is_live = |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
 
         // Phase 1-2 (soft, weak) honour the finalizer-reachable closure.
         self.process_soft_refs(&is_live, free_heap_mb, current_time_ms);
@@ -488,8 +481,9 @@ impl ReferenceProcessor {
         free_heap_mb: usize,
         current_time_ms: u64,
     ) {
-        let threshold_ms =
-            self.soft_ref_lru_policy_ms_per_mb.saturating_mul(free_heap_mb as u64);
+        let threshold_ms = self
+            .soft_ref_lru_policy_ms_per_mb
+            .saturating_mul(free_heap_mb as u64);
 
         // Use the BTreeMap index to efficiently find soft refs whose
         // last_access_time is old enough to exceed the idle threshold.
@@ -525,8 +519,7 @@ impl ReferenceProcessor {
                     // Double-check LRU policy (the BTreeMap range is an
                     // approximation since we key on insertion time; re-verify the
                     // exact idle window).
-                    let idle_ms =
-                        current_time_ms.saturating_sub(entry.last_access_time_ms);
+                    let idle_ms = current_time_ms.saturating_sub(entry.last_access_time_ms);
                     if idle_ms > threshold_ms {
                         entry.cleared = true;
                         self.stats.soft_refs_cleared += 1;
@@ -677,10 +670,7 @@ impl ReferenceProcessor {
                         if new_q != 0 {
                             e.queue_addr = Some(new_q);
                         } else {
-                            tracing::warn!(
-                                "update_after_gc: null target for queue 0x{:x}",
-                                q
-                            );
+                            tracing::warn!("update_after_gc: null target for queue 0x{:x}", q);
                         }
                     }
                 }
@@ -760,10 +750,14 @@ impl ReferenceProcessor {
     pub fn cleared_ref_objects(&self) -> Vec<usize> {
         let mut result = Vec::new();
         for e in &self.soft_refs {
-            if e.cleared { result.push(e.reference_obj); }
+            if e.cleared {
+                result.push(e.reference_obj);
+            }
         }
         for e in &self.weak_refs {
-            if e.cleared { result.push(e.reference_obj); }
+            if e.cleared {
+                result.push(e.reference_obj);
+            }
         }
         // Phantom refs: Java 9+ does NOT clear the referent, but we enqueue them.
         // Cleaners: cleared flag used for cleaner actions, already handled.
@@ -1522,7 +1516,7 @@ mod tests {
         // Simulate GC: only 200 is still live
         ft.cleanup_collected(&|addr| addr == 200);
         assert!(!ft.was_finalized(100)); // cleaned up
-        assert!(ft.was_finalized(200));  // still tracked
+        assert!(ft.was_finalized(200)); // still tracked
     }
 
     // 40. FinalizerThread timeout constant
@@ -1552,7 +1546,10 @@ mod tests {
         // Should return immediately, not wait
         let start = std::time::Instant::now();
         let val = q.remove_timeout(5000);
-        assert!(start.elapsed().as_millis() < 100, "should return immediately");
+        assert!(
+            start.elapsed().as_millis() < 100,
+            "should return immediately"
+        );
         assert_eq!(val, Some(42));
     }
 
@@ -1564,7 +1561,10 @@ mod tests {
         let val = q.remove_timeout(50); // 50ms timeout
         let elapsed = start.elapsed().as_millis();
         assert!(val.is_none());
-        assert!(elapsed >= 40, "should wait close to timeout duration: {elapsed}ms");
+        assert!(
+            elapsed >= 40,
+            "should wait close to timeout duration: {elapsed}ms"
+        );
     }
 
     // 44. update_after_gc skips null target addresses (pointer validation)
@@ -1645,7 +1645,7 @@ mod tests {
         ft.enqueue(0xB);
         ft.dequeue(); // finalizes 0xA
         ft.dequeue(); // finalizes 0xB
-        // Both resurrections blocked
+                      // Both resurrections blocked
         assert!(!ft.enqueue(0xA));
         assert!(!ft.enqueue(0xB));
         // New objects still accepted
@@ -1702,12 +1702,8 @@ mod tests {
             out
         };
 
-        let result = proc.process_references_with_finalizer_trace(
-            &always_dead,
-            Some(&trace),
-            64,
-            0,
-        );
+        let result =
+            proc.process_references_with_finalizer_trace(&always_dead, Some(&trace), 64, 0);
 
         assert_eq!(result.stats.finalizer_refs_enqueued, 1);
         // Transitively reachable referent must not be cleared this cycle.

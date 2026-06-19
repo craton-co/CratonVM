@@ -87,9 +87,9 @@ unsafe fn jit_run_no_args(code: &[u8], descriptor: &str, num_locals: usize) -> i
     let compiled = compile(
         code,
         code_len,
-        0,            // num_params
+        0, // num_params
         num_locals,
-        false,        // needs_heap
+        false, // needs_heap
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -135,35 +135,23 @@ fn double_sum_loop_n10() -> Vec<u8> {
         // local 1 while every dload_0 (0x26) read local 0, so `s` never
         // updated and the JIT (correctly) returned the initial 0.0. dstore_0
         // is 0x47.
-        0x47,
-        // 2:  iconst_0          ; push 0
-        0x03,
-        // 3:  istore_2          ; i = 0
-        0x3d,
-        // Loop head (PC 4):
+        0x47, // 2:  iconst_0          ; push 0
+        0x03, // 3:  istore_2          ; i = 0
+        0x3d, // Loop head (PC 4):
         // 4:  iload_2           ; push i
-        0x1c,
-        // 5:  bipush 10         ; push 10
-        0x10, 0x0a,
-        // 7:  if_icmpge +14 → exit at PC 21
-        0xa2, 0x00, 0x0e,
-        // 10: dload_0           ; push s
-        0x26,
-        // 11: iload_2           ; push i
-        0x1c,
-        // 12: i2d               ; (double)i
-        0x87,
-        // 13: dadd              ; s + (double)i
+        0x1c, // 5:  bipush 10         ; push 10
+        0x10, 0x0a, // 7:  if_icmpge +14 → exit at PC 21
+        0xa2, 0x00, 0x0e, // 10: dload_0           ; push s
+        0x26, // 11: iload_2           ; push i
+        0x1c, // 12: i2d               ; (double)i
+        0x87, // 13: dadd              ; s + (double)i
         0x63,
         // 14: dstore_0          ; s = ...
         0x47, // FIX: was 0x48 (dstore_1) — see note at PC 1.
         // 15: iinc 2 1          ; i++
-        0x84, 0x02, 0x01,
-        // 18: goto -14 → PC 4
-        0xa7, 0xff, 0xf2,
-        // 21: dload_0           ; return s
-        0x26,
-        // 22: dreturn
+        0x84, 0x02, 0x01, // 18: goto -14 → PC 4
+        0xa7, 0xff, 0xf2, // 21: dload_0           ; return s
+        0x26, // 22: dreturn
         0xaf,
     ]
 }
@@ -173,19 +161,19 @@ fn double_sum_loop_n10() -> Vec<u8> {
 /// expected 0.0 (since s starts at 0.0 and we add 0.0).
 fn double_loop_body_once() -> Vec<u8> {
     vec![
-        0x0e,  // dconst_0
-        0x47,  // dstore_0   FIX: was 0x48 (dstore_1) — accumulator must use local 0.
-        0x03,  // iconst_0
-        0x3d,  // istore_2
+        0x0e, // dconst_0
+        0x47, // dstore_0   FIX: was 0x48 (dstore_1) — accumulator must use local 0.
+        0x03, // iconst_0
+        0x3d, // istore_2
         // Body
-        0x26,  // dload_0
-        0x1c,  // iload_2
-        0x87,  // i2d
-        0x63,  // dadd
-        0x47,  // dstore_0   FIX: was 0x48 (dstore_1).
+        0x26, // dload_0
+        0x1c, // iload_2
+        0x87, // i2d
+        0x63, // dadd
+        0x47, // dstore_0   FIX: was 0x48 (dstore_1).
         // Return
-        0x26,  // dload_0
-        0xaf,  // dreturn
+        0x26, // dload_0
+        0xaf, // dreturn
     ]
 }
 
@@ -194,18 +182,21 @@ fn diagnostic_loop_body_once() {
     let code = double_loop_body_once();
     let raw = unsafe { jit_run_no_args(&code, "()D", 3) };
     let actual = f64::from_bits(raw as u64);
-    println!("diagnostic: body-once returned {actual} (bits: {:016x})", raw as u64);
+    println!(
+        "diagnostic: body-once returned {actual} (bits: {:016x})",
+        raw as u64
+    );
     assert_eq!(actual, 0.0);
 }
 
 /// Diagnostic: i=5; return (double)i + 0.0 to verify i2d works.
 fn double_i2d_simple() -> Vec<u8> {
     vec![
-        0x08,  // iconst_5
-        0x3d,  // istore_2
-        0x1c,  // iload_2
-        0x87,  // i2d
-        0xaf,  // dreturn
+        0x08, // iconst_5
+        0x3d, // istore_2
+        0x1c, // iload_2
+        0x87, // i2d
+        0xaf, // dreturn
     ]
 }
 
@@ -214,7 +205,10 @@ fn diagnostic_i2d() {
     let code = double_i2d_simple();
     let raw = unsafe { jit_run_no_args(&code, "()D", 3) };
     let actual = f64::from_bits(raw as u64);
-    println!("diagnostic: i2d returned {actual} (bits: {:016x})", raw as u64);
+    println!(
+        "diagnostic: i2d returned {actual} (bits: {:016x})",
+        raw as u64
+    );
     assert_eq!(actual, 5.0);
 }
 
@@ -222,22 +216,22 @@ fn diagnostic_i2d() {
 /// Locals 0=s, 1=i.
 fn int_sum_loop_n10() -> Vec<u8> {
     vec![
-        0x03,             // 0: iconst_0
-        0x3b,             // 1: istore_0  (s=0)
-        0x03,             // 2: iconst_0
-        0x3c,             // 3: istore_1  (i=0)
+        0x03, // 0: iconst_0
+        0x3b, // 1: istore_0  (s=0)
+        0x03, // 2: iconst_0
+        0x3c, // 3: istore_1  (i=0)
         // Loop head (PC 4):
-        0x1b,             // 4: iload_1
-        0x10, 0x0a,       // 5: bipush 10
+        0x1b, // 4: iload_1
+        0x10, 0x0a, // 5: bipush 10
         0xa2, 0x00, 0x0d, // 7: if_icmpge +13 → 20
-        0x1a,             // 10: iload_0  (s)
-        0x1b,             // 11: iload_1  (i)
-        0x60,             // 12: iadd
-        0x3b,             // 13: istore_0
+        0x1a, // 10: iload_0  (s)
+        0x1b, // 11: iload_1  (i)
+        0x60, // 12: iadd
+        0x3b, // 13: istore_0
         0x84, 0x01, 0x01, // 14: iinc 1, 1
         0xa7, 0xff, 0xf3, // 17: goto -13 → 4
-        0x1a,             // 20: iload_0
-        0xac,             // 21: ireturn
+        0x1a, // 20: iload_0
+        0xac, // 21: ireturn
     ]
 }
 
@@ -281,33 +275,21 @@ fn double_product_loop_n6() -> Vec<u8> {
         // 1: dstore_0            ; s = 1.0
         0x47, // FIX: was 0x48 (dstore_1) — typo; dstore_0 is 0x47 (see sum-loop note).
         // 2: iconst_1            ; push 1
-        0x04,
-        // 3: istore_2            ; i = 1
-        0x3d,
-        // Loop head (PC 4):
+        0x04, // 3: istore_2            ; i = 1
+        0x3d, // Loop head (PC 4):
         // 4: iload_2
-        0x1c,
-        // 5: bipush 7            ; bound: i < 7  (so i goes 1..6)
-        0x10, 0x07,
-        // 7: if_icmpge +14 → PC 21
-        0xa2, 0x00, 0x0e,
-        // 10: dload_0
-        0x26,
-        // 11: iload_2
-        0x1c,
-        // 12: i2d
-        0x87,
-        // 13: dmul
-        0x6b,
-        // 14: dstore_0
+        0x1c, // 5: bipush 7            ; bound: i < 7  (so i goes 1..6)
+        0x10, 0x07, // 7: if_icmpge +14 → PC 21
+        0xa2, 0x00, 0x0e, // 10: dload_0
+        0x26, // 11: iload_2
+        0x1c, // 12: i2d
+        0x87, // 13: dmul
+        0x6b, // 14: dstore_0
         0x47, // FIX: was 0x48 (dstore_1) — see PC 1.
         // 15: iinc 2 1
-        0x84, 0x02, 0x01,
-        // 18: goto -14 → PC 4
-        0xa7, 0xff, 0xf2,
-        // 21: dload_0
-        0x26,
-        // 22: dreturn
+        0x84, 0x02, 0x01, // 18: goto -14 → PC 4
+        0xa7, 0xff, 0xf2, // 21: dload_0
+        0x26, // 22: dreturn
         0xaf,
     ]
 }
@@ -343,24 +325,15 @@ fn double_chain() -> Vec<u8> {
     // Locals: 0=s (double, slots 0-1)
     vec![
         // iconst_3, i2d
-        0x06, 0x87,
-        // iconst_2, i2d
-        0x05, 0x87,
-        // dadd                 ; 5.0
-        0x63,
-        // iconst_4, i2d
-        0x07, 0x87,
-        // dmul                 ; 20.0
-        0x6b,
-        // iconst_1, i2d
-        0x04, 0x87,
-        // dsub                 ; 19.0
-        0x67,
-        // iconst_2, i2d
-        0x05, 0x87,
-        // ddiv                 ; 9.5
-        0x6f,
-        // dreturn
+        0x06, 0x87, // iconst_2, i2d
+        0x05, 0x87, // dadd                 ; 5.0
+        0x63, // iconst_4, i2d
+        0x07, 0x87, // dmul                 ; 20.0
+        0x6b, // iconst_1, i2d
+        0x04, 0x87, // dsub                 ; 19.0
+        0x67, // iconst_2, i2d
+        0x05, 0x87, // ddiv                 ; 9.5
+        0x6f, // dreturn
         0xaf,
     ]
 }

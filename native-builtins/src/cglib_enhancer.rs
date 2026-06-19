@@ -78,7 +78,9 @@ struct ClassWriter {
 impl ClassWriter {
     fn new() -> Self {
         // JVMS §4.4.1: constant_pool[0] is unused; valid indices start at 1.
-        ClassWriter { cp: vec![Vec::new()] }
+        ClassWriter {
+            cp: vec![Vec::new()],
+        }
     }
 
     /// 1-based index of the next entry to be inserted.
@@ -248,8 +250,13 @@ fn emit_default_ctor(
     //   aload_0          (0x2A)
     //   invokespecial #super_init_methodref (0xB7, u16)
     //   return           (0xB1)
-    let code: [u8; 5] = [0x2A, 0xB7, (super_init_methodref >> 8) as u8,
-                         (super_init_methodref & 0xFF) as u8, 0xB1];
+    let code: [u8; 5] = [
+        0x2A,
+        0xB7,
+        (super_init_methodref >> 8) as u8,
+        (super_init_methodref & 0xFF) as u8,
+        0xB1,
+    ];
 
     let mut code_attr = Vec::new();
     code_attr.extend_from_slice(&1u16.to_be_bytes()); // max_stack
@@ -482,8 +489,7 @@ fn build_enhancer_class(
     // `EnhancedConfiguration` extends `BeanFactoryAware`. Now stores into the
     // `$$beanFactory` field (was a no-op).
     let set_bf_name_idx = cw.add_utf8("setBeanFactory");
-    let set_bf_desc_idx =
-        cw.add_utf8("(Lorg/springframework/beans/factory/BeanFactory;)V");
+    let set_bf_desc_idx = cw.add_utf8("(Lorg/springframework/beans/factory/BeanFactory;)V");
 
     let ctor = emit_default_ctor(
         init_name_idx,
@@ -504,8 +510,7 @@ fn build_enhancer_class(
 
     if !bean_methods.is_empty() {
         // Shared constant-pool refs used by every @Bean override.
-        let beanfactory_cast_idx =
-            cw.add_class("org/springframework/beans/factory/BeanFactory");
+        let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
         let issingleton_ref = cw.add_interface_methodref(
             beanfactory_cast_idx,
             "isSingleton",
@@ -516,8 +521,8 @@ fn build_enhancer_class(
             "getBean",
             "(Ljava/lang/String;)Ljava/lang/Object;",
         );
-        let dsbr_cast_idx = cw
-            .add_class("org/springframework/beans/factory/support/DefaultSingletonBeanRegistry");
+        let dsbr_cast_idx =
+            cw.add_class("org/springframework/beans/factory/support/DefaultSingletonBeanRegistry");
         let in_creation_ref = cw.add_methodref(
             dsbr_cast_idx,
             "isSingletonCurrentlyInCreation",
@@ -528,8 +533,7 @@ fn build_enhancer_class(
             let name_idx = cw.add_utf8(&bm.name);
             let desc_idx = cw.add_utf8(&bm.descriptor);
             let name_string_idx = cw.add_string(&bm.name);
-            let super_method_ref =
-                cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
+            let super_method_ref = cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
             let rettype_cast_idx = cw.add_class(&bm.return_internal);
             let override_method = emit_bean_override(
                 name_idx,
@@ -579,7 +583,9 @@ fn coerce_class_arg(v: Value) -> Value {
     match v {
         Value::Long(bits) => {
             if let Some(p) = cratonvm_types::jlong_bits_as_aligned_object_ptr(bits as u64) {
-                Value::Object(Some(unsafe { cratonvm_types::ObjectRef::from_raw(p as *mut u8) }))
+                Value::Object(Some(unsafe {
+                    cratonvm_types::ObjectRef::from_raw(p as *mut u8)
+                }))
             } else {
                 Value::Object(None)
             }
@@ -598,7 +604,10 @@ const BEAN_ANNOTATION_DESC: &str = "Lorg/springframework/context/annotation/Bean
 /// static/final/private modifiers are left un-overridden (they run the real
 /// body directly, i.e. the `proxyBeanMethods=false` trade-off), which never
 /// regresses behaviour relative to the previous no-override enhancer.
-fn scan_bean_methods(ctx: &mut dyn NativeContext, class_id: cratonvm_types::ClassId) -> Vec<BeanMethod> {
+fn scan_bean_methods(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> Vec<BeanMethod> {
     const ACC_STATIC: u16 = 0x0008;
     const ACC_PRIVATE: u16 = 0x0002;
     const ACC_FINAL: u16 = 0x0010;
@@ -665,9 +674,7 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let cls_mirror = match cls_val {
         Value::Object(Some(m)) => m,
         _ => {
-            eprintln!(
-                "[CCE] enhance: class arg was not an object — falling back to identity",
-            );
+            eprintln!("[CCE] enhance: class arg was not an object — falling back to identity",);
             return Ok(Some(cls_val));
         }
     };

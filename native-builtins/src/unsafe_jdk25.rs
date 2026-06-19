@@ -25,19 +25,13 @@ use crate::{unsafe_obj, unsafe_offset};
 
 /// `Unsafe.addressSize0()` — returns the size of a native pointer in bytes.
 /// We model a 64-bit VM, so this is always 8.
-fn native_unsafe_address_size0(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_address_size0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(8)))
 }
 
 /// `Unsafe.isBigEndian0()` — returns whether the platform is big-endian.
 /// x86-64 and ARM64 (in standard mode) are little-endian.
-fn native_unsafe_is_big_endian0(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_is_big_endian0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(0)))
 }
 
@@ -219,9 +213,19 @@ pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register(class, "addressSize0", "()I", native_unsafe_address_size0);
     registry.register(class, "isBigEndian0", "()Z", native_unsafe_is_big_endian0);
-    registry.register(class, "unalignedAccess0", "()Z", native_unsafe_unaligned_access0);
+    registry.register(
+        class,
+        "unalignedAccess0",
+        "()Z",
+        native_unsafe_unaligned_access0,
+    );
     registry.register(class, "loadLoadFence", "()V", native_unsafe_load_load_fence);
-    registry.register(class, "storeStoreFence", "()V", native_unsafe_store_store_fence);
+    registry.register(
+        class,
+        "storeStoreFence",
+        "()V",
+        native_unsafe_store_store_fence,
+    );
     // copySwapMemory0 is registered in lib.rs (replacing the previous stub)
     // so we do NOT re-register it here to avoid double-registration.
     registry.set_category(__prev_cat);
@@ -237,12 +241,10 @@ mod tests {
     use crate::test_utils::MockNativeContext;
     use crate::{
         native_unsafe_allocate_memory, native_unsafe_allocate_memory_realloc,
-        native_unsafe_get_int, native_unsafe_put_int,
-        native_unsafe_get_long, native_unsafe_put_long,
-        native_unsafe_get_int_volatile, native_unsafe_put_int_volatile,
-        native_unsafe_cas_int,
-        native_unsafe_fence,
-        native_unsafe_array_base_offset, native_unsafe_array_index_scale,
+        native_unsafe_array_base_offset, native_unsafe_array_index_scale, native_unsafe_cas_int,
+        native_unsafe_fence, native_unsafe_get_int, native_unsafe_get_int_volatile,
+        native_unsafe_get_long, native_unsafe_put_int, native_unsafe_put_int_volatile,
+        native_unsafe_put_long,
     };
     use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -267,10 +269,8 @@ mod tests {
     fn t12_unsafe_alloc_free_round_trip() {
         let mut ctx = MockNativeContext::new();
         // allocateMemory(this, size=64)
-        let result = native_unsafe_allocate_memory(
-            &mut ctx,
-            &[dummy_this(), Value::Long(64)],
-        ).unwrap();
+        let result =
+            native_unsafe_allocate_memory(&mut ctx, &[dummy_this(), Value::Long(64)]).unwrap();
         let addr = match result {
             Some(Value::Long(a)) => a,
             other => panic!("expected Long, got {:?}", other),
@@ -281,7 +281,8 @@ mod tests {
         let result2 = native_unsafe_allocate_memory_realloc(
             &mut ctx,
             &[dummy_this(), Value::Long(addr), Value::Long(128)],
-        ).unwrap();
+        )
+        .unwrap();
         let addr2 = match result2 {
             Some(Value::Long(a)) => a,
             other => panic!("expected Long from realloc, got {:?}", other),
@@ -300,27 +301,41 @@ mod tests {
         // Put Int(42) at offset 2
         native_unsafe_put_int(
             &mut ctx,
-            &[dummy_this(), Value::Object(Some(obj)), Value::Long(2), Value::Int(42)],
-        ).unwrap();
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(2),
+                Value::Int(42),
+            ],
+        )
+        .unwrap();
 
         // Get it back
         let result = native_unsafe_get_int(
             &mut ctx,
             &[dummy_this(), Value::Object(Some(obj)), Value::Long(2)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, Some(Value::Int(42)));
 
         // Put Long(123456789) at offset 1
         native_unsafe_put_long(
             &mut ctx,
-            &[dummy_this(), Value::Object(Some(obj)), Value::Long(1), Value::Long(123_456_789)],
-        ).unwrap();
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(1),
+                Value::Long(123_456_789),
+            ],
+        )
+        .unwrap();
 
         // Get it back
         let result2 = native_unsafe_get_long(
             &mut ctx,
             &[dummy_this(), Value::Object(Some(obj)), Value::Long(1)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result2, Some(Value::Long(123_456_789)));
     }
 
@@ -335,14 +350,21 @@ mod tests {
         // Volatile put Int(99) at offset 0
         native_unsafe_put_int_volatile(
             &mut ctx,
-            &[dummy_this(), Value::Object(Some(obj)), Value::Long(0), Value::Int(99)],
-        ).unwrap();
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Int(99),
+            ],
+        )
+        .unwrap();
 
         // Volatile read
         let result = native_unsafe_get_int_volatile(
             &mut ctx,
             &[dummy_this(), Value::Object(Some(obj)), Value::Long(0)],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, Some(Value::Int(99)));
     }
 
@@ -358,8 +380,15 @@ mod tests {
         // CAS expected=10, update=20 => should succeed (return 1)
         let result = native_unsafe_cas_int(
             &mut ctx,
-            &[dummy_this(), Value::Object(Some(obj)), Value::Long(0), Value::Int(10), Value::Int(20)],
-        ).unwrap();
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Int(10),
+                Value::Int(20),
+            ],
+        )
+        .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
 
         // Verify field is now 20
@@ -368,8 +397,15 @@ mod tests {
         // CAS expected=10 (wrong), update=30 => should fail (return 0)
         let result2 = native_unsafe_cas_int(
             &mut ctx,
-            &[dummy_this(), Value::Object(Some(obj)), Value::Long(0), Value::Int(10), Value::Int(30)],
-        ).unwrap();
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Int(10),
+                Value::Int(30),
+            ],
+        )
+        .unwrap();
         assert_eq!(result2, Some(Value::Int(0)));
 
         // Field should still be 20
@@ -440,10 +476,9 @@ mod tests {
         let mirror = ctx.alloc_object(ClassId::new(0), 2);
         ctx.set_field(mirror, 0, Value::Int(0));
         ctx.set_field(mirror, 1, Value::Object(Some(name_obj)));
-        let scale = native_unsafe_array_index_scale(
-            &mut ctx,
-            &[dummy_this(), Value::Object(Some(mirror))],
-        ).unwrap();
+        let scale =
+            native_unsafe_array_index_scale(&mut ctx, &[dummy_this(), Value::Object(Some(mirror))])
+                .unwrap();
         assert_eq!(scale, Some(Value::Int(8)));
 
         // And for int[] → 4.
@@ -454,7 +489,8 @@ mod tests {
         let int_scale = native_unsafe_array_index_scale(
             &mut ctx,
             &[dummy_this(), Value::Object(Some(int_mirror))],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(int_scale, Some(Value::Int(4)));
 
         // byte[] → 1.
@@ -465,7 +501,8 @@ mod tests {
         let byte_scale = native_unsafe_array_index_scale(
             &mut ctx,
             &[dummy_this(), Value::Object(Some(byte_mirror))],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(byte_scale, Some(Value::Int(1)));
     }
 
@@ -525,7 +562,8 @@ mod tests {
                 Value::Long(4), // bytes (= element count in our model)
                 Value::Long(4), // elemSize = 4 bytes (i32 swap)
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, None);
 
         // Verify dest has byte-swapped values
@@ -536,7 +574,9 @@ mod tests {
                 ctx.get_field(dst, i),
                 Value::Int(expected),
                 "field {} mismatch: expected swap_bytes({}) = {}",
-                i, original, expected
+                i,
+                original,
+                expected
             );
         }
     }
@@ -560,7 +600,8 @@ mod tests {
                 Value::Long(16),
                 Value::Long(4),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, None);
     }
 
@@ -624,16 +665,27 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         crate::phases_late::register_p58_charset_coder(&mut r);
         let total = r.len();
-        assert!(total > 10, "expected > 10 charset coder natives, got {total}");
-        assert!(r.find(
-            "java/nio/charset/Charset",
-            "newDecoder",
-            "()Ljava/nio/charset/CharsetDecoder;",
-        ).is_some(), "newDecoder must be registered");
-        assert!(r.find(
-            "java/nio/charset/Charset",
-            "newEncoder",
-            "()Ljava/nio/charset/CharsetEncoder;",
-        ).is_some(), "newEncoder must be registered");
+        assert!(
+            total > 10,
+            "expected > 10 charset coder natives, got {total}"
+        );
+        assert!(
+            r.find(
+                "java/nio/charset/Charset",
+                "newDecoder",
+                "()Ljava/nio/charset/CharsetDecoder;",
+            )
+            .is_some(),
+            "newDecoder must be registered"
+        );
+        assert!(
+            r.find(
+                "java/nio/charset/Charset",
+                "newEncoder",
+                "()Ljava/nio/charset/CharsetEncoder;",
+            )
+            .is_some(),
+            "newEncoder must be registered"
+        );
     }
 }

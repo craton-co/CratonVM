@@ -60,8 +60,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use super::asn1;
 
@@ -442,10 +442,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("X500Principal: this is null".into()),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("X500Principal: this is null".into()),
+                }
+                .into())
             }
-            .into()),
         };
         let dn = read_string(ctx, args, 1).unwrap_or_default();
         init_from_string(ctx, this, &dn);
@@ -462,10 +464,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
-                _ => return Err(RuntimeError::NullPointerException {
-                    message: Some("X500Principal: this is null".into()),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("X500Principal: this is null".into()),
+                    }
+                    .into())
                 }
-                .into()),
             };
             let dn = read_string(ctx, args, 1).unwrap_or_default();
             init_from_string(ctx, this, &dn);
@@ -477,10 +481,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "([B)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("X500Principal: this is null".into()),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("X500Principal: this is null".into()),
+                }
+                .into())
             }
-            .into()),
         };
         let der = read_byte_array(ctx, args, 1).unwrap_or_default();
         init_from_der(ctx, this, &der);
@@ -490,18 +496,13 @@ pub fn register(r: &mut NativeMethodRegistry) {
     // <init>(InputStream) — read all bytes, then parse DER.  We don't
     // hit this path in the probe but downstream KeyStore-loading flows
     // do, so include it for completeness.
-    r.register(
-        cls,
-        "<init>",
-        "(Ljava/io/InputStream;)V",
-        |_ctx, _args| {
-            // Without a real InputStream pump we cannot actually slurp
-            // the bytes; the caller will see an empty principal and
-            // every comparison fails.  Returning Ok keeps probes that
-            // never pass through this constructor unaffected.
-            Ok(None)
-        },
-    );
+    r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |_ctx, _args| {
+        // Without a real InputStream pump we cannot actually slurp
+        // the bytes; the caller will see an empty principal and
+        // every comparison fails.  Returning Ok keeps probes that
+        // never pass through this constructor unaffected.
+        Ok(None)
+    });
 
     // getEncoded() -> byte[]
     //

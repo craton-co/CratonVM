@@ -85,7 +85,10 @@ fn alloc_walker(
     let cid = ctx.class_id_of_object(walker);
     let opt_idx = ctx
         .resolve_field_index("java/lang/StackWalker", "options")
-        .or_else(|| ctx.class_name_of_id(cid).and_then(|n| ctx.resolve_field_index(&n, "options")))
+        .or_else(|| {
+            ctx.class_name_of_id(cid)
+                .and_then(|n| ctx.resolve_field_index(&n, "options"))
+        })
         .unwrap_or(FIELD_OPTIONS);
     let depth_idx = ctx
         .resolve_field_index("java/lang/StackWalker", "estimateDepth")
@@ -124,7 +127,12 @@ pub(crate) fn native_get_instance_default(
 /// option set is queryable via standard `Set.contains` without NPE.
 fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectRef {
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0);
-    let _ = ctx.invoke("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
     for opt in opts {
         let _ = ctx.invoke(
             "java/util/HashSet",
@@ -237,9 +245,15 @@ pub(crate) fn native_get_caller_class(
         .filter(|n| !is_internal(n))
         .collect();
     if std::env::var("CRATONVM_DBG_CALLER").is_ok() {
-        eprintln!("[DBG_CALLER] getCallerClass trace ({} frames):", trace.len());
+        eprintln!(
+            "[DBG_CALLER] getCallerClass trace ({} frames):",
+            trace.len()
+        );
         for (i, e) in trace.iter().enumerate() {
-            eprintln!("  [{}] {}::{} bci={}", i, e.class_name, e.method_name, e.byte_code_index);
+            eprintln!(
+                "  [{}] {}::{} bci={}",
+                i, e.class_name, e.method_name, e.byte_code_index
+            );
         }
     }
 
@@ -279,7 +293,12 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sw = "java/lang/StackWalker";
-    registry.register(sw, "getInstance", "()Ljava/lang/StackWalker;", native_get_instance_default);
+    registry.register(
+        sw,
+        "getInstance",
+        "()Ljava/lang/StackWalker;",
+        native_get_instance_default,
+    );
     registry.register(
         sw,
         "getInstance",
@@ -300,7 +319,9 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
             let option_set_arg = args.first().copied().unwrap_or(Value::Object(None));
             if matches!(option_set_arg, Value::Object(None)) {
                 return Err(RuntimeError::NullPointerException {
-                    message: Some("StackWalker.getInstance: options Set must not be null".to_string()),
+                    message: Some(
+                        "StackWalker.getInstance: options Set must not be null".to_string(),
+                    ),
                 }
                 .into());
             }
@@ -308,7 +329,12 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(walker))))
         },
     );
-    registry.register(sw, "getCallerClass", "()Ljava/lang/Class;", native_get_caller_class);
+    registry.register(
+        sw,
+        "getCallerClass",
+        "()Ljava/lang/Class;",
+        native_get_caller_class,
+    );
 
     // WP1.9 — `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z`.
     //
@@ -487,12 +513,8 @@ mod tests {
         // Idempotent meaning: repeated calls always yield valid non-null
         // walkers whose options and retainClassRef fields are consistent.
         let mut ctx = MockNativeContext::new();
-        let r1 = native_get_instance_default(&mut ctx, &[])
-            .unwrap()
-            .unwrap();
-        let r2 = native_get_instance_default(&mut ctx, &[])
-            .unwrap()
-            .unwrap();
+        let r1 = native_get_instance_default(&mut ctx, &[]).unwrap().unwrap();
+        let r2 = native_get_instance_default(&mut ctx, &[]).unwrap().unwrap();
         for r in [r1, r2] {
             if let Value::Object(Some(walker)) = r {
                 match ctx.get_field(walker, FIELD_ESTIMATE_DEPTH) {
@@ -608,9 +630,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         // Ensure Object is a loadable class in the mock.
         let _ = ctx.ensure_class_initialized("java/lang/Object");
-        let result = native_get_caller_class(&mut ctx, &[])
-            .unwrap()
-            .unwrap();
+        let result = native_get_caller_class(&mut ctx, &[]).unwrap().unwrap();
         // Either non-null (fallback fired) or null (Object class not
         // loadable in mock). Both are acceptable; the key invariant is
         // no panic / no error.

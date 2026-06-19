@@ -12,10 +12,9 @@
 
 use std::collections::HashMap;
 
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
-
 
 // ===========================================================================
 // 15.5  Module Import Declarations (JEP 511)
@@ -97,10 +96,7 @@ impl Default for ModuleImportResolver {
 // Native methods — jdk/internal/module/ModuleImports
 // ---------------------------------------------------------------------------
 
-fn module_imports_resolve(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn module_imports_resolve(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // resolveModuleImport(String) -> boolean (as int)
     // We accept any string; known modules return 1.
     let resolver = ModuleImportResolver::new();
@@ -128,10 +124,7 @@ fn module_imports_get_exported_packages(
     Ok(Some(Value::Int(count)))
 }
 
-fn module_imports_is_supported(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn module_imports_is_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
 
@@ -266,10 +259,10 @@ impl MainMethodCandidate {
             return None;
         }
         match (self.is_static, has_args, no_args) {
-            (true, true, _) => Some(1),   // static main(String[])
-            (true, _, true) => Some(3),    // static main()
-            (false, true, _) => Some(4),   // instance main(String[])
-            (false, _, true) => Some(6),   // instance main()
+            (true, true, _) => Some(1),  // static main(String[])
+            (true, _, true) => Some(3),  // static main()
+            (false, true, _) => Some(4), // instance main(String[])
+            (false, _, true) => Some(6), // instance main()
             _ => None,
         }
     }
@@ -335,10 +328,7 @@ impl MainMethodSelection {
 // Native methods — jdk/internal/misc/ImplicitClasses
 // ---------------------------------------------------------------------------
 
-fn implicit_classes_is_implicit(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn implicit_classes_is_implicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let flags = match args.get(0) {
         Some(Value::Int(f)) => *f as u16,
         _ => 0,
@@ -348,10 +338,7 @@ fn implicit_classes_is_implicit(
     Ok(Some(Value::Int(if implicit { 1 } else { 0 })))
 }
 
-fn implicit_classes_select_main(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn implicit_classes_select_main(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Given a candidate count, return 0 (first/best candidate).
     let _count = match args.get(0) {
         Some(Value::Int(c)) => *c,
@@ -382,18 +369,43 @@ pub(crate) fn register_jdk25_language_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mi = "jdk/internal/module/ModuleImports";
-    r.register(mi, "resolveModuleImport", "(Ljava/lang/String;)Z", module_imports_resolve);
-    r.register(mi, "getExportedPackages", "(Ljava/lang/String;)I", module_imports_get_exported_packages);
+    r.register(
+        mi,
+        "resolveModuleImport",
+        "(Ljava/lang/String;)Z",
+        module_imports_resolve,
+    );
+    r.register(
+        mi,
+        "getExportedPackages",
+        "(Ljava/lang/String;)I",
+        module_imports_get_exported_packages,
+    );
     r.register(mi, "isSupported", "()Z", module_imports_is_supported);
 
     let fc = "jdk/internal/vm/FlexibleConstructors";
-    r.register(fc, "isPreSuperAllowed", "()Z", flexible_constructors_is_pre_super_allowed);
-    r.register(fc, "validatePreSuperStatement", "(I)Z", flexible_constructors_validate);
+    r.register(
+        fc,
+        "isPreSuperAllowed",
+        "()Z",
+        flexible_constructors_is_pre_super_allowed,
+    );
+    r.register(
+        fc,
+        "validatePreSuperStatement",
+        "(I)Z",
+        flexible_constructors_validate,
+    );
 
     let ic = "jdk/internal/misc/ImplicitClasses";
     r.register(ic, "isImplicitClass", "(I)Z", implicit_classes_is_implicit);
     r.register(ic, "selectMainMethod", "(I)I", implicit_classes_select_main);
-    r.register(ic, "isInstanceMainAllowed", "()Z", implicit_classes_is_instance_main_allowed);
+    r.register(
+        ic,
+        "isInstanceMainAllowed",
+        "()Z",
+        implicit_classes_is_instance_main_allowed,
+    );
     r.register(ic, "isSupported", "()Z", implicit_classes_is_supported);
     r.set_category(__prev_cat);
 }
@@ -526,20 +538,29 @@ mod jdk25_language_tests {
     #[test]
     fn test_validator_empty_is_valid() {
         let v = FlexibleConstructorValidator::new();
-        assert_eq!(v.validate_pre_super_statements(&[]), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&[]),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
     fn test_validator_default() {
         let v = FlexibleConstructorValidator::default();
-        assert_eq!(v.validate_pre_super_statements(&[]), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&[]),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
     fn test_validator_local_assign_allowed() {
         let v = FlexibleConstructorValidator::new();
         let stmts = vec![PreSuperStatement::LocalAssign(1, Value::Int(42))];
-        assert_eq!(v.validate_pre_super_statements(&stmts), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&stmts),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
@@ -549,20 +570,28 @@ mod jdk25_language_tests {
             "java/util/Objects".to_string(),
             "requireNonNull".to_string(),
         )];
-        assert_eq!(v.validate_pre_super_statements(&stmts), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&stmts),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
     fn test_validator_argument_check_allowed() {
         let v = FlexibleConstructorValidator::new();
         let stmts = vec![PreSuperStatement::ArgumentCheck(0)];
-        assert_eq!(v.validate_pre_super_statements(&stmts), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&stmts),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
     fn test_validator_disallowed_rejected() {
         let v = FlexibleConstructorValidator::new();
-        let stmts = vec![PreSuperStatement::Disallowed("this.field write".to_string())];
+        let stmts = vec![PreSuperStatement::Disallowed(
+            "this.field write".to_string(),
+        )];
         assert_eq!(
             v.validate_pre_super_statements(&stmts),
             ValidationResult::Invalid("this.field write".to_string())
@@ -591,7 +620,10 @@ mod jdk25_language_tests {
             PreSuperStatement::StaticCall("Foo".to_string(), "bar".to_string()),
             PreSuperStatement::ArgumentCheck(2),
         ];
-        assert_eq!(v.validate_pre_super_statements(&stmts), ValidationResult::Valid);
+        assert_eq!(
+            v.validate_pre_super_statements(&stmts),
+            ValidationResult::Valid
+        );
     }
 
     #[test]
@@ -666,7 +698,10 @@ mod jdk25_language_tests {
 
     #[test]
     fn test_is_implicit_class_with_flag_and_main() {
-        assert!(ImplicitClassDetector::is_implicit_class(0x1000, &["main", "helper"]));
+        assert!(ImplicitClassDetector::is_implicit_class(
+            0x1000,
+            &["main", "helper"]
+        ));
     }
 
     #[test]
@@ -676,7 +711,10 @@ mod jdk25_language_tests {
 
     #[test]
     fn test_is_not_implicit_class_without_main() {
-        assert!(!ImplicitClassDetector::is_implicit_class(0x1000, &["run", "helper"]));
+        assert!(!ImplicitClassDetector::is_implicit_class(
+            0x1000,
+            &["run", "helper"]
+        ));
     }
 
     #[test]
@@ -687,11 +725,14 @@ mod jdk25_language_tests {
     #[test]
     fn test_find_main_selects_highest_priority() {
         let candidates = vec![
-            MainMethodCandidate::new("main", "()V", false),            // prio 6
-            MainMethodCandidate::new("main", "([Ljava/lang/String;)V", true),  // prio 1
-            MainMethodCandidate::new("main", "()V", true),             // prio 3
+            MainMethodCandidate::new("main", "()V", false), // prio 6
+            MainMethodCandidate::new("main", "([Ljava/lang/String;)V", true), // prio 1
+            MainMethodCandidate::new("main", "()V", true),  // prio 3
         ];
-        assert_eq!(ImplicitClassDetector::find_main_method(&candidates), Some(1));
+        assert_eq!(
+            ImplicitClassDetector::find_main_method(&candidates),
+            Some(1)
+        );
     }
 
     #[test]
@@ -699,7 +740,10 @@ mod jdk25_language_tests {
         let candidates = vec![
             MainMethodCandidate::new("main", "()V", false), // prio 6
         ];
-        assert_eq!(ImplicitClassDetector::find_main_method(&candidates), Some(0));
+        assert_eq!(
+            ImplicitClassDetector::find_main_method(&candidates),
+            Some(0)
+        );
     }
 
     #[test]
@@ -721,10 +765,13 @@ mod jdk25_language_tests {
     fn test_find_main_instance_over_no_args() {
         // instance main(String[]) (prio 4) beats instance main() (prio 6)
         let candidates = vec![
-            MainMethodCandidate::new("main", "()V", false),                    // prio 6
+            MainMethodCandidate::new("main", "()V", false), // prio 6
             MainMethodCandidate::new("main", "([Ljava/lang/String;)V", false), // prio 4
         ];
-        assert_eq!(ImplicitClassDetector::find_main_method(&candidates), Some(1));
+        assert_eq!(
+            ImplicitClassDetector::find_main_method(&candidates),
+            Some(1)
+        );
     }
 
     #[test]
@@ -734,7 +781,10 @@ mod jdk25_language_tests {
             MainMethodCandidate::new("main", "([Ljava/lang/String;)V", false), // prio 4
             MainMethodCandidate::new("main", "()V", true),                     // prio 3
         ];
-        assert_eq!(ImplicitClassDetector::find_main_method(&candidates), Some(1));
+        assert_eq!(
+            ImplicitClassDetector::find_main_method(&candidates),
+            Some(1)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -837,11 +887,19 @@ mod jdk25_language_tests {
     fn test_flexible_constructor_pre_super() {
         // JEP 513: statements before super() call
         // Verify that field assignment before super() is valid
-        struct Base { x: i32 }
-        struct Child { base: Base, y: i32 }
+        struct Base {
+            x: i32,
+        }
+        struct Child {
+            base: Base,
+            y: i32,
+        }
         // Simulate: int y = validate(arg); super(y);
         let validated = 42;
-        let child = Child { base: Base { x: validated }, y: validated };
+        let child = Child {
+            base: Base { x: validated },
+            y: validated,
+        };
         assert_eq!(child.y, 42);
     }
 
@@ -880,11 +938,17 @@ mod jdk25_language_tests {
     fn test_stable_value_thread_safe() {
         use std::sync::{Arc, OnceLock};
         let stable = Arc::new(OnceLock::new());
-        let handles: Vec<_> = (0..10).map(|i| {
-            let s = stable.clone();
-            std::thread::spawn(move || { let _ = s.set(i); })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = stable.clone();
+                std::thread::spawn(move || {
+                    let _ = s.set(i);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
         // Exactly one thread wins
         assert!(stable.get().is_some());
     }
@@ -893,7 +957,10 @@ mod jdk25_language_tests {
     fn test_record_basic() {
         // Java records: record Point(int x, int y) {}
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-        struct PointRecord { x: i32, y: i32 }
+        struct PointRecord {
+            x: i32,
+            y: i32,
+        }
         let p = PointRecord { x: 1, y: 2 };
         let q = PointRecord { x: 1, y: 2 };
         // Records have equals, hashCode, toString
@@ -904,7 +971,10 @@ mod jdk25_language_tests {
     #[test]
     fn test_record_canonical_constructor() {
         #[derive(Debug, PartialEq)]
-        struct Range { lo: i32, hi: i32 }
+        struct Range {
+            lo: i32,
+            hi: i32,
+        }
         impl Range {
             fn new(lo: i32, hi: i32) -> Self {
                 // Compact canonical constructor validates
@@ -921,7 +991,10 @@ mod jdk25_language_tests {
     #[should_panic(expected = "lo must be <= hi")]
     fn test_record_canonical_constructor_validation() {
         #[derive(Debug)]
-        struct Range { lo: i32, hi: i32 }
+        struct Range {
+            lo: i32,
+            hi: i32,
+        }
         impl Range {
             fn new(lo: i32, hi: i32) -> Self {
                 assert!(lo <= hi, "lo must be <= hi");
@@ -935,7 +1008,11 @@ mod jdk25_language_tests {
     fn test_sealed_class_hierarchy() {
         // sealed interface Shape permits Circle, Rectangle
         // Only permitted subclasses can extend
-        enum Shape { Circle(f64), Rectangle(f64, f64), Triangle(f64, f64, f64) }
+        enum Shape {
+            Circle(f64),
+            Rectangle(f64, f64),
+            Triangle(f64, f64, f64),
+        }
         let shapes: Vec<Shape> = vec![
             Shape::Circle(5.0),
             Shape::Rectangle(3.0, 4.0),
@@ -946,7 +1023,11 @@ mod jdk25_language_tests {
 
     #[test]
     fn test_sealed_exhaustive_switch() {
-        enum Color { Red, Green, Blue }
+        enum Color {
+            Red,
+            Green,
+            Blue,
+        }
         let c = Color::Green;
         let name = match c {
             Color::Red => "red",

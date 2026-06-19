@@ -4,8 +4,8 @@
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
 use cratonvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
-use cratonvm_types::{ClassId, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use crate::obj_arg;
-use crate::lang_math::alloc_wrapper;
 use crate::alloc_concurrent_synthetic;
+use crate::lang_math::alloc_wrapper;
+use crate::obj_arg;
 
 // ---------------------------------------------------------------------------
 // Cached `CRATONVM_DBG_BB` env-var lookup
@@ -116,7 +116,10 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
         return arc;
     }
     let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
-    let after_dollar = after_slash_or_dot.rsplit('$').next().unwrap_or(after_slash_or_dot);
+    let after_dollar = after_slash_or_dot
+        .rsplit('$')
+        .next()
+        .unwrap_or(after_slash_or_dot);
     let simple: Arc<str> = Arc::from(after_dollar);
     cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
 }
@@ -159,9 +162,7 @@ pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
 // ---------------------------------------------------------------------------
 
 use cratonvm_types::access_flags::{
-    ACC_PUBLIC_I32 as ACC_PUBLIC,
-    ACC_STATIC_I32 as ACC_STATIC,
-    ACC_FINAL_I32 as ACC_FINAL,
+    ACC_FINAL_I32 as ACC_FINAL, ACC_PUBLIC_I32 as ACC_PUBLIC, ACC_STATIC_I32 as ACC_STATIC,
     ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
 
@@ -190,23 +191,27 @@ fn check_final_for_set(
     let is_static = (modifiers & ACC_STATIC) != 0;
     // Static-final: hard-disallowed regardless of `setAccessible`.
     if is_static {
-        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-            message: format!(
-                "Can not set static final field via Field.set: {}",
-                member_desc,
-            ),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!(
+                    "Can not set static final field via Field.set: {}",
+                    member_desc,
+                ),
+            }
+            .into(),
+        );
     }
     // Instance-final: requires `setAccessible(true)`.
     if !accessible {
-        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-            message: format!(
-                "Can not set final field without setAccessible(true): {}",
-                member_desc,
-            ),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!(
+                    "Can not set final field without setAccessible(true): {}",
+                    member_desc,
+                ),
+            }
+            .into(),
+        );
     }
     Ok(())
 }
@@ -247,17 +252,23 @@ fn volatile_store_fence_post(modifiers: i32) {
 /// AccessibleObject (stored in field 7 for Method, field 6 for Field,
 /// field 5 for Constructor).
 /// Returns Ok(()) if access is allowed, Err(IllegalAccessException) otherwise.
-fn check_access(modifiers: i32, accessible: bool, member_desc: &str) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+fn check_access(
+    modifiers: i32,
+    accessible: bool,
+    member_desc: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
         return Ok(());
     }
-    Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-        message: format!(
-            "cannot access member: modifiers 0x{:04x}, {}",
-            modifiers, member_desc,
-        ),
-    }
-    .into())
+    Err(
+        cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "cannot access member: modifiers 0x{:04x}, {}",
+                modifiers, member_desc,
+            ),
+        }
+        .into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -470,10 +481,12 @@ fn enforce_module_check_from_mirror(
     };
     if let Some(name) = target_class_name {
         if let Err(msg) = check_reflection_module_access(ctx, &name, accessible) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!("{operation}: {name}: {msg}"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: format!("{operation}: {name}: {msg}"),
+                }
+                .into(),
+            );
         }
     }
     Ok(())
@@ -505,10 +518,12 @@ fn enforce_module_check_on_field(
     };
     if let Some(name) = target_class_name {
         if let Err(msg) = check_reflection_module_access(ctx, &name, accessible) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!("{operation}: {name}: {msg}"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: format!("{operation}: {name}: {msg}"),
+                }
+                .into(),
+            );
         }
     }
     Ok(())
@@ -543,7 +558,10 @@ fn is_lambda_proxy_id(class_id: ClassId) -> bool {
     class_id.as_u32() >= 0x8000_0000
 }
 
-pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0] = this (Class mirror object)
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -561,7 +579,11 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
     if let Some(class_id) = mirror_class_id(ctx, this) {
         if let Some(lname) = lambda_proxy_class_name(ctx, class_id) {
             if dbg_bb {
-                eprintln!("[bb-dbg] getName(id={}) -> {:?} [lambda]", class_id.as_u32(), lname);
+                eprintln!(
+                    "[bb-dbg] getName(id={}) -> {:?} [lambda]",
+                    class_id.as_u32(),
+                    lname
+                );
             }
             let name_obj = ctx.create_string(&lname);
             return Ok(Some(Value::Object(Some(name_obj))));
@@ -634,7 +656,11 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
                 name
             };
             if dbg_bb {
-                eprintln!("[bb-dbg] getName(id={}) -> {:?}", class_id.as_u32(), dotted_name);
+                eprintln!(
+                    "[bb-dbg] getName(id={}) -> {:?}",
+                    class_id.as_u32(),
+                    dotted_name
+                );
             }
             let name_obj = ctx.create_string(&dotted_name);
             Ok(Some(Value::Object(Some(name_obj))))
@@ -727,7 +753,10 @@ pub(crate) fn mirror_class_id(
 /// that encode `ClassId` only as `int` field 0 and put the internal name in
 /// slot 1), trust slot 1 first; only if it is missing do we fall back to
 /// [`mirror_class_id`] + `class_name_of_id`.
-pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: cratonvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mirror_class_name(
+    ctx: &dyn NativeContext,
+    mirror: cratonvm_types::ObjectRef,
+) -> Option<String> {
     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
         return ctx.class_name_of_id(cid);
     }
@@ -781,7 +810,10 @@ pub(crate) fn mirror_class_name_strict(
     mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
 }
 
-pub(crate) fn native_class_is_record(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_record(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let is_rec = mirror_class_id(ctx, this)
         .map(|cid| ctx.is_record_class(cid))
@@ -789,7 +821,10 @@ pub(crate) fn native_class_is_record(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(if is_rec { 1 } else { 0 })))
 }
 
-pub(crate) fn native_class_is_sealed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_sealed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let is_sealed = mirror_class_id(ctx, this)
         .map(|cid| ctx.is_sealed_class(cid))
@@ -1048,8 +1083,7 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
     }
     let mut parts = suffix.split('_');
     let lang = parts.next().unwrap_or("");
-    let is_lang = (2..=3).contains(&lang.len())
-        && lang.chars().all(|c| c.is_ascii_lowercase());
+    let is_lang = (2..=3).contains(&lang.len()) && lang.chars().all(|c| c.is_ascii_lowercase());
     if !is_lang {
         return false;
     }
@@ -1058,8 +1092,7 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
         Some(country) => {
             // `_$logger_<lang>_<country>` (no further parts; variant possible
             // but rare — accept country=2 upper or 2-3 alphanum).
-            let ok = country.len() == 2
-                && country.chars().all(|c| c.is_ascii_uppercase());
+            let ok = country.len() == 2 && country.chars().all(|c| c.is_ascii_uppercase());
             ok && parts.next().is_none()
         }
     }
@@ -1235,7 +1268,7 @@ fn wf7_build_minimal_main_class(class_name_internal: &str) -> Vec<u8> {
     bytes.extend_from_slice(&[0x00, 0x01]);
     // -- Code attribute --
     bytes.extend_from_slice(&[0x00, 0x0B]); // attribute_name_index = "Code"
-    // Body: return (0xB1) — len = 1
+                                            // Body: return (0xB1) — len = 1
     let main_code: [u8; 1] = [0xB1];
     let main_attr_len: u32 = 2 + 2 + 4 + (main_code.len() as u32) + 2 + 2;
     bytes.extend_from_slice(&main_attr_len.to_be_bytes());
@@ -1280,7 +1313,10 @@ fn wf7_synthesise_entry_class_if_missing(
         return None;
     }
     // Only synthesise for names we explicitly recognise.
-    if !WF7_ENTRY_FRAGMENTS.iter().any(|f| internal_name.contains(f)) {
+    if !WF7_ENTRY_FRAGMENTS
+        .iter()
+        .any(|f| internal_name.contains(f))
+    {
         return None;
     }
     // If the class is already loaded, defer to the real one — synthesis is
@@ -1293,7 +1329,10 @@ fn wf7_synthesise_entry_class_if_missing(
     Some(ctx.get_class_mirror(cid))
 }
 
-pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_for_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -1332,10 +1371,12 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     // language and (optional) country tokens look like locale codes
     // returns CNFE immediately without calling out to loader.loadClass.
     if i18n_logger_locale_suffix(&dotted_name) {
-        return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: dotted_name,
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name,
+            }
+            .into(),
+        );
     }
 
     // RKC16N.12 — when `Class.forName` is invoked with an explicit non-null
@@ -1358,7 +1399,11 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             let cid = ctx.class_id_of_object(*loader);
             ctx.class_name_of_id(cid).unwrap_or_default()
         };
-        s111_dbg!("[S111-DBG] Class.forName({}) loader={}", dotted_name, loader_class_name_debug);
+        s111_dbg!(
+            "[S111-DBG] Class.forName({}) loader={}",
+            dotted_name,
+            loader_class_name_debug
+        );
         let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
             *loader,
@@ -1367,7 +1412,10 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             &invoke_args[1..],
         ) {
             Ok(Some(mirror)) => {
-                s111_dbg!("[S111-DBG] loadClass({}) succeeded via invoke_virtual", dotted_name);
+                s111_dbg!(
+                    "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
+                    dotted_name
+                );
                 return Ok(Some(mirror));
             }
             // ClassLoader.loadClass returning null is technically illegal
@@ -1378,9 +1426,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 // function for the rationale: synthesise an entry-class
                 // stub when the module loader yields nothing for a name
                 // we recognise as a WildFly / Keycloak boot entry.
-                if let Some(mirror) =
-                    wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
-                {
+                if let Some(mirror) = wf7_synthesise_entry_class_if_missing(ctx, &internal_name) {
                     tracing::warn!(
                         target: "wf7",
                         "[wf-shim] Class.forName synthesised stub for {} (loader returned null)",
@@ -1388,10 +1434,12 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     );
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
-                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                    class_name: dotted_name,
-                }
-                .into())
+                return Err(
+                    cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                        class_name: dotted_name,
+                    }
+                    .into(),
+                );
             }
             // S111r12 — NSME on `loader.loadClass` rescue. Spring Boot 2's
             // SB2 launcher path delivers a `LaunchedURLClassLoader`
@@ -1406,7 +1454,10 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     cratonvm_types::error::LinkageError::NoSuchMethodError { .. },
                 ),
             )) => {
-                s111_dbg!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
+                s111_dbg!(
+                    "[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback",
+                    dotted_name
+                );
                 // Fall through to bootstrap-style ensure_class_initialized below.
             }
             // S111r20 — Spring Boot 2.x LaunchedURLClassLoader.loadClass
@@ -1432,7 +1483,10 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     || loader_class_name.contains("launch/LaunchedURLClassLoader")
                     || loader_class_name == "java/net/URLClassLoader";
                 if is_launched_url_cl {
-                    s111_dbg!("[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback", dotted_name);
+                    s111_dbg!(
+                        "[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback",
+                        dotted_name
+                    );
                     // Fall through to ensure_class_initialized below.
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
@@ -1443,8 +1497,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     // real `Main` (KC16 + WF deliver it via a different path
                     // CratonVM doesn't reproduce). Synthesising a stub here is
                     // the whole point of WF7 — let the bootstrap finish.
-                    if let Some(mirror) =
-                        wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
+                    if let Some(mirror) = wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
                     {
                         tracing::warn!(
                             target: "wf7",
@@ -1458,18 +1511,25 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     // class (CNFE/NCDFE), and for any other failure type the
                     // raw exception is more informative than a synthesized
                     // CNFE(dotted_name). Matches HotSpot's behaviour.
-                    return Err(
-                        cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref),
-                    );
+                    return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                        exc_ref,
+                    ));
                 }
             }
             // Propagate internal VM errors without re-wrapping.
             Err(e) => {
-                s111_dbg!("[S111-DBG] loadClass({}) -> InternalError {:?}, propagating", dotted_name, e);
+                s111_dbg!(
+                    "[S111-DBG] loadClass({}) -> InternalError {:?}, propagating",
+                    dotted_name,
+                    e
+                );
                 return Err(e);
             }
         }
-        s111_dbg!("[S111-DBG] falling through to ensure_class_initialized({})", dotted_name);
+        s111_dbg!(
+            "[S111-DBG] falling through to ensure_class_initialized({})",
+            dotted_name
+        );
     }
 
     match ctx.ensure_class_initialized(&internal_name) {
@@ -1479,10 +1539,12 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // `Class.forName` must throw ClassNotFoundException for them
             // even though they are loaded.
             if ctx.is_class_hidden(class_id) {
-                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                    class_name: dotted_name,
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                        class_name: dotted_name,
+                    }
+                    .into(),
+                );
             }
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
@@ -1495,7 +1557,12 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
-                s111_dbg!("[FORNAME-ERR] name={} exc_class={} msg={}", dotted_name, exc_class, msg);
+                s111_dbg!(
+                    "[FORNAME-ERR] name={} exc_class={} msg={}",
+                    dotted_name,
+                    exc_class,
+                    msg
+                );
             } else {
                 s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
             }
@@ -1509,9 +1576,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // *appears* loaded by the time `getDeclaredMethod` runs (it just
             // doesn't have a `main`); by injecting a real class earlier we
             // sidestep that path entirely.
-            if let Some(mirror) =
-                wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
-            {
+            if let Some(mirror) = wf7_synthesise_entry_class_if_missing(ctx, &internal_name) {
                 tracing::warn!(
                     target: "wf7",
                     "[wf-shim] Class.forName synthesised stub for {}",
@@ -1535,15 +1600,20 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             }
             // No Java exception was raised — the class file simply could not
             // be located on any source on the classpath. Throw `CNFE(dotted)`.
-            Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                class_name: dotted_name,
-            }
-            .into())
-        },
+            Err(
+                cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                    class_name: dotted_name,
+                }
+                .into(),
+            )
+        }
     }
 }
 
-pub(crate) fn native_class_for_name_3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_for_name_3(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Same as forName(String) but ignores initialize flag and classLoader
     native_class_for_name(ctx, args)
 }
@@ -1623,7 +1693,10 @@ pub(crate) fn native_class_for_name_module(
     }
 }
 
-pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_instance(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -1677,8 +1750,8 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
         if target_name == "java/lang/annotation/AnnotationProxy" {
             if let Value::Object(Some(type_mirror)) = ctx.get_field(target, ANN_PROXY_TYPE_MIRROR) {
                 if let Some(ann_cid) = mirror_class_id(ctx, type_mirror) {
-                    let proxy_matches = ann_cid == this_class_id
-                        || ctx.is_subclass(ann_cid, this_class_id);
+                    let proxy_matches =
+                        ann_cid == this_class_id || ctx.is_subclass(ann_cid, this_class_id);
                     if proxy_matches {
                         return Ok(Some(Value::Int(1)));
                     }
@@ -1722,9 +1795,7 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
                         _ => continue,
                     };
                     if let Some(iface_cid) = mirror_class_id(ctx, mirror) {
-                        if iface_cid == this_class_id
-                            || ctx.is_subclass(iface_cid, this_class_id)
-                        {
+                        if iface_cid == this_class_id || ctx.is_subclass(iface_cid, this_class_id) {
                             return Ok(Some(Value::Int(1)));
                         }
                     }
@@ -1745,7 +1816,10 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
 /// pub(crate): also used by the Object.toString native (lib.rs) so the
 /// default `Name@hash` rendering of arrays matches HotSpot
 /// (`[Ljava.lang.Class;@…`, not the component class name).
-pub(crate) fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+pub(crate) fn array_descriptor_for(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> String {
     use cratonvm_types::ArrayElementType;
     let et = ctx.heap_element_type_of(obj);
     match et {
@@ -1876,116 +1950,127 @@ pub(crate) fn native_class_is_assignable_from(
     }
     // RAII-style depth restore around the original body.
     let result = (|| -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let other = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Class.isAssignableFrom: argument is null".to_string()),
-            }
-            .into())
-        }
-    };
-
-    // S111r17 — Array-aware isAssignableFrom.  Same root cause as
-    // `native_class_is_instance` above: when `this` represents an array
-    // Class (descriptor like `[Lfoo;` recoverable from the mirror's
-    // name field) and `other` represents an array Class, the simple
-    // `is_subclass` walk doesn't traverse JVM-level array covariance
-    // (e.g. `String[] -> Object[]`, `AnnotationProxy[] ->
-    // Annotation[]`).  Reuse the same descriptor / assignability
-    // helpers we added for `isInstance`.  Spring 5.x's
-    // `Assert.isAssignable(supertype, subtype)` is the visible caller
-    // — it throws `IllegalArgumentException` from
-    // `assignableCheckFailed` when this returns false, masking the
-    // underlying type-system gap.
-    let this_name = mirror_class_name(ctx, this).unwrap_or_default();
-    let other_name = mirror_class_name(ctx, other).unwrap_or_default();
-    if this_name.starts_with('[') || other_name.starts_with('[') {
-        // Build descriptors. Non-array Class mirrors get an `L...;`
-        // wrap to match the array_is_assignable contract; array
-        // mirrors keep their leading `[`.
-        let to_desc = |n: &str| -> String {
-            if n.starts_with('[') {
-                n.to_string()
-            } else if n.is_empty() {
-                "Ljava/lang/Object;".to_string()
-            } else {
-                format!("L{};", n)
+        let this = match args.first() {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let other = match args.get(1) {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Class.isAssignableFrom: argument is null".to_string()),
+                }
+                .into())
             }
         };
-        let other_desc = to_desc(&other_name);
-        let this_desc = to_desc(&this_name);
-        // For arrays, dispatch to array_is_assignable (which expects
-        // a target that may be an array name, raw class name, or
-        // Object/Serializable/Cloneable). Pass other's full descriptor
-        // as src and this's name (NOT descriptor) as target.
-        if other_desc.starts_with('[') && array_is_assignable(ctx, &other_desc, &this_name) {
-            return Ok(Some(Value::Int(1)));
-        }
-        if this_desc.starts_with('[') && other_desc == this_desc {
-            return Ok(Some(Value::Int(1)));
-        }
-        // Fall through to id-based check below for non-array vs array
-        // mismatches (e.g. `String.class.isAssignableFrom(stringArray.class)`
-        // → false, handled by the legacy is_subclass which always
-        // returns false for these).
-    }
 
-    // bytebuddy_probe + WildFly: primitive Class mirrors (`int.class`,
-    // `boolean.class`, etc.) don't have a real ClassId — `mirror_class_id`
-    // returns None. Falling through returned 0, breaking
-    // `int.class.isAssignableFrom(int.class)`, which ByteBuddy uses to
-    // validate proxy return types, and WildFly uses for reflection
-    // sanity checks during early module-loader bootstrap.
-    //
-    // Fix: name-based equality for same-name primitives BEFORE the
-    // class-id lookup. Two mirrors with identical primitive names are
-    // assignable (they ARE the same primitive type). For reference
-    // types we still go through the class-id / subclass path.
-    if !this_name.is_empty()
-        && this_name == other_name
-        && matches!(
-            this_name.as_str(),
-            "int" | "long" | "boolean" | "byte" | "short"
-                | "char" | "float" | "double" | "void"
-        )
-    {
-        return Ok(Some(Value::Int(1)));
-    }
-
-    let this_class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => {
-            // Fallback: same non-empty name → assignable. Handles missing
-            // class_id for primitives and synthetic mirrors.
-            if !this_name.is_empty() && this_name == other_name {
+        // S111r17 — Array-aware isAssignableFrom.  Same root cause as
+        // `native_class_is_instance` above: when `this` represents an array
+        // Class (descriptor like `[Lfoo;` recoverable from the mirror's
+        // name field) and `other` represents an array Class, the simple
+        // `is_subclass` walk doesn't traverse JVM-level array covariance
+        // (e.g. `String[] -> Object[]`, `AnnotationProxy[] ->
+        // Annotation[]`).  Reuse the same descriptor / assignability
+        // helpers we added for `isInstance`.  Spring 5.x's
+        // `Assert.isAssignable(supertype, subtype)` is the visible caller
+        // — it throws `IllegalArgumentException` from
+        // `assignableCheckFailed` when this returns false, masking the
+        // underlying type-system gap.
+        let this_name = mirror_class_name(ctx, this).unwrap_or_default();
+        let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+        if this_name.starts_with('[') || other_name.starts_with('[') {
+            // Build descriptors. Non-array Class mirrors get an `L...;`
+            // wrap to match the array_is_assignable contract; array
+            // mirrors keep their leading `[`.
+            let to_desc = |n: &str| -> String {
+                if n.starts_with('[') {
+                    n.to_string()
+                } else if n.is_empty() {
+                    "Ljava/lang/Object;".to_string()
+                } else {
+                    format!("L{};", n)
+                }
+            };
+            let other_desc = to_desc(&other_name);
+            let this_desc = to_desc(&this_name);
+            // For arrays, dispatch to array_is_assignable (which expects
+            // a target that may be an array name, raw class name, or
+            // Object/Serializable/Cloneable). Pass other's full descriptor
+            // as src and this's name (NOT descriptor) as target.
+            if other_desc.starts_with('[') && array_is_assignable(ctx, &other_desc, &this_name) {
                 return Ok(Some(Value::Int(1)));
             }
-            return Ok(Some(Value::Int(0)));
-        }
-    };
-    let other_class_id = match mirror_class_id(ctx, other) {
-        Some(id) => id,
-        None => {
-            if !this_name.is_empty() && this_name == other_name {
+            if this_desc.starts_with('[') && other_desc == this_desc {
                 return Ok(Some(Value::Int(1)));
             }
-            return Ok(Some(Value::Int(0)));
+            // Fall through to id-based check below for non-array vs array
+            // mismatches (e.g. `String.class.isAssignableFrom(stringArray.class)`
+            // → false, handled by the legacy is_subclass which always
+            // returns false for these).
         }
-    };
-    let result = other_class_id == this_class_id || ctx.is_subclass(other_class_id, this_class_id);
-    Ok(Some(Value::Int(if result { 1 } else { 0 })))
+
+        // bytebuddy_probe + WildFly: primitive Class mirrors (`int.class`,
+        // `boolean.class`, etc.) don't have a real ClassId — `mirror_class_id`
+        // returns None. Falling through returned 0, breaking
+        // `int.class.isAssignableFrom(int.class)`, which ByteBuddy uses to
+        // validate proxy return types, and WildFly uses for reflection
+        // sanity checks during early module-loader bootstrap.
+        //
+        // Fix: name-based equality for same-name primitives BEFORE the
+        // class-id lookup. Two mirrors with identical primitive names are
+        // assignable (they ARE the same primitive type). For reference
+        // types we still go through the class-id / subclass path.
+        if !this_name.is_empty()
+            && this_name == other_name
+            && matches!(
+                this_name.as_str(),
+                "int"
+                    | "long"
+                    | "boolean"
+                    | "byte"
+                    | "short"
+                    | "char"
+                    | "float"
+                    | "double"
+                    | "void"
+            )
+        {
+            return Ok(Some(Value::Int(1)));
+        }
+
+        let this_class_id = match mirror_class_id(ctx, this) {
+            Some(id) => id,
+            None => {
+                // Fallback: same non-empty name → assignable. Handles missing
+                // class_id for primitives and synthetic mirrors.
+                if !this_name.is_empty() && this_name == other_name {
+                    return Ok(Some(Value::Int(1)));
+                }
+                return Ok(Some(Value::Int(0)));
+            }
+        };
+        let other_class_id = match mirror_class_id(ctx, other) {
+            Some(id) => id,
+            None => {
+                if !this_name.is_empty() && this_name == other_name {
+                    return Ok(Some(Value::Int(1)));
+                }
+                return Ok(Some(Value::Int(0)));
+            }
+        };
+        let result =
+            other_class_id == this_class_id || ctx.is_subclass(other_class_id, this_class_id);
+        Ok(Some(Value::Int(if result { 1 } else { 0 })))
     })();
     // Restore depth on every exit path (success or error).
     IS_ASSIGNABLE_DEPTH.with(|d| d.set(prev_depth));
     result
 }
 
-pub(crate) fn native_class_is_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -1995,7 +2080,10 @@ pub(crate) fn native_class_is_array(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-pub(crate) fn native_class_is_interface(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_interface(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2008,7 +2096,10 @@ pub(crate) fn native_class_is_interface(ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-pub(crate) fn native_class_is_primitive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_primitive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2036,7 +2127,10 @@ pub(crate) fn native_class_is_primitive(ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_superclass(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2073,7 +2167,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early-strict]", this_name);
+            eprintln!(
+                "[bb-dbg] getSuperclass({}) -> null [object-early-strict]",
+                this_name
+            );
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -2085,12 +2182,18 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
         if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
             let mirror = ctx.get_class_mirror(obj_id);
             if dbg_bb {
-                eprintln!("[bb-dbg] getSuperclass({}) -> java/lang/Object [array]", this_name);
+                eprintln!(
+                    "[bb-dbg] getSuperclass({}) -> java/lang/Object [array]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(Some(mirror))));
         }
         if dbg_bb {
-            eprintln!("[bb-dbg] getSuperclass({}) -> null [array no-obj-id]", this_name);
+            eprintln!(
+                "[bb-dbg] getSuperclass({}) -> null [array no-obj-id]",
+                this_name
+            );
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -2099,7 +2202,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
         Some(id) => id,
         None => {
             if dbg_bb {
-                eprintln!("[bb-dbg] getSuperclass({}) -> null [no-class-id]", this_name);
+                eprintln!(
+                    "[bb-dbg] getSuperclass({}) -> null [no-class-id]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -2114,7 +2220,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
         if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
             let mirror = ctx.get_class_mirror(obj_id);
             if dbg_bb {
-                eprintln!("[bb-dbg] getSuperclass({}) -> java/lang/Object [lambda]", this_name);
+                eprintln!(
+                    "[bb-dbg] getSuperclass({}) -> java/lang/Object [lambda]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(Some(mirror))));
         }
@@ -2128,7 +2237,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
         if class_id == obj_id {
             if dbg_bb {
-                eprintln!("[bb-dbg] getSuperclass({}) -> null [object-by-id]", this_name);
+                eprintln!(
+                    "[bb-dbg] getSuperclass({}) -> null [object-by-id]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -2167,8 +2279,11 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
             // and lets the walk terminate cleanly.
             if parent_id == class_id {
                 if dbg_bb {
-                    eprintln!("[bb-dbg] getSuperclass({}) -> null [self-cycle id={}]",
-                        this_name, class_id.as_u32());
+                    eprintln!(
+                        "[bb-dbg] getSuperclass({}) -> null [self-cycle id={}]",
+                        this_name,
+                        class_id.as_u32()
+                    );
                 }
                 return Ok(Some(Value::Object(None)));
             }
@@ -2185,8 +2300,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
                         || this_name == "java.lang.Object")
                 {
                     if dbg_bb {
-                        eprintln!("[bb-dbg] getSuperclass({}) -> null [parent=Object name-split]",
-                            this_name);
+                        eprintln!(
+                            "[bb-dbg] getSuperclass({}) -> null [parent=Object name-split]",
+                            this_name
+                        );
                     }
                     return Ok(Some(Value::Object(None)));
                 }
@@ -2207,7 +2324,10 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     }
 }
 
-pub(crate) fn native_class_get_simple_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_simple_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2245,7 +2365,10 @@ pub(crate) fn native_class_get_simple_name(ctx: &mut dyn NativeContext, args: &[
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_new_instance(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2289,7 +2412,10 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
 ///
 /// Handles primitives ("I" → int.class), object types ("Ljava/lang/String;" → String.class),
 /// array types ("[I" → int[].class), and void ("V" → void.class).
-pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str) -> cratonvm_types::ObjectRef {
+pub(crate) fn descriptor_to_class_mirror(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+) -> cratonvm_types::ObjectRef {
     match desc {
         "I" => ctx.primitive_class_mirror("int"),
         "Z" => ctx.primitive_class_mirror("boolean"),
@@ -2350,7 +2476,11 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_t
     // than what bytecode expects.
     let num_fields = {
         let n = ctx.class_num_total_fields(class_class_id);
-        if n >= 19 { n } else { 19 }
+        if n >= 19 {
+            n
+        } else {
+            19
+        }
     };
     let mirror = ctx.alloc_object(class_class_id, num_fields);
     ctx.set_field(mirror, 0, Value::Object(None));
@@ -2660,24 +2790,20 @@ pub(crate) fn coerce_arg_strict(
                     // Cross-category coercion (e.g. int → long, int → double):
                     // honour JLS §5.1.2 widening; narrowing is rejected.
                     let src = primitive_tag_of(value);
-                    widen_primitive_value(value, src, expected_desc)
-                        .ok_or_else(|| illegal_arg_exc(
-                            format!(
-                                "{context}: cannot convert {src} to {expected_desc}"
-                            ),
+                    widen_primitive_value(value, src, expected_desc).ok_or_else(|| {
+                        illegal_arg_exc(format!(
+                            "{context}: cannot convert {src} to {expected_desc}"
                         ))
+                    })
                 }
                 Value::Object(Some(obj)) => {
                     let wrapper_cid = ctx.class_id_of_object(obj);
-                    let wrapper_name = ctx
-                        .class_name_of_id(wrapper_cid)
-                        .unwrap_or_default();
-                    let src_prim = wrapper_to_prim_desc(&wrapper_name)
-                        .ok_or_else(|| illegal_arg_exc(
-                            format!(
-                                "{context}: expected primitive {expected_desc}, got {wrapper_name}"
-                            ),
-                        ))?;
+                    let wrapper_name = ctx.class_name_of_id(wrapper_cid).unwrap_or_default();
+                    let src_prim = wrapper_to_prim_desc(&wrapper_name).ok_or_else(|| {
+                        illegal_arg_exc(format!(
+                            "{context}: expected primitive {expected_desc}, got {wrapper_name}"
+                        ))
+                    })?;
                     if !wrapper_matches_primitive(&wrapper_name, expected_desc)
                         && !widening_allowed(src_prim, expected_desc)
                     {
@@ -2696,11 +2822,11 @@ pub(crate) fn coerce_arg_strict(
                         Value::Object(None) => by_slot0,
                         v => v,
                     };
-                    widen_primitive_value(raw, src_prim, expected_desc).ok_or_else(
-                        || illegal_arg_exc(format!(
+                    widen_primitive_value(raw, src_prim, expected_desc).ok_or_else(|| {
+                        illegal_arg_exc(format!(
                             "{context}: cannot widen {src_prim} to {expected_desc}"
-                        )),
-                    )
+                        ))
+                    })
                 }
                 Value::Object(None) => Err(illegal_arg_exc(format!(
                     "{context}: null argument not assignable to primitive {expected_desc}"
@@ -2766,7 +2892,10 @@ pub(crate) fn wrap_as_invocation_target_exception(
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        eprintln!("[wrap_ITE] original exception: {} \"{}\"", exc_class_name, msg);
+        eprintln!(
+            "[wrap_ITE] original exception: {} \"{}\"",
+            exc_class_name, msg
+        );
     }
 
     // When `InvocationTargetException` is still a synthetic JDK stub (no
@@ -2786,11 +2915,7 @@ pub(crate) fn wrap_as_invocation_target_exception(
             "()V",
             &[Value::Object(Some(wrapper))],
         );
-        let _ = ctx.set_field_by_name(
-            wrapper,
-            "target",
-            Value::Object(Some(original)),
-        );
+        let _ = ctx.set_field_by_name(wrapper, "target", Value::Object(Some(original)));
         return MethodCallFailed::ExceptionThrown(wrapper);
     }
 
@@ -2808,10 +2933,7 @@ pub(crate) fn wrap_as_invocation_target_exception(
         target_class,
         "<init>",
         "(Ljava/lang/Throwable;)V",
-        &[
-            Value::Object(Some(wrapper)),
-            Value::Object(Some(original)),
-        ],
+        &[Value::Object(Some(wrapper)), Value::Object(Some(original))],
     );
     match init_result {
         Ok(_) => MethodCallFailed::ExceptionThrown(wrapper),
@@ -2862,23 +2984,22 @@ fn set_accessible_impl(
             Value::Object(Some(m)) => Some(m),
             _ => None,
         };
-        let target_class_name =
-            declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
+        let target_class_name = declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
 
         if let Some(target_class_name) = target_class_name {
             // JEP 403: setAccessible(true) is where the check is paid,
             // so we pass accessible_override=false even though the caller
             // is trying to *become* accessible.
-            if let Err(msg) =
-                check_reflection_module_access(ctx, &target_class_name, false)
-            {
-                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                    message: format!(
-                        "Unable to make {member_label} accessible: {msg} \
+            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
+                return Err(
+                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+                        message: format!(
+                            "Unable to make {member_label} accessible: {msg} \
                          (use --add-opens to grant access)"
-                    ),
-                }
-                .into());
+                        ),
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -2914,16 +3035,16 @@ pub(crate) fn native_field_set_accessible(
             _ => None,
         };
         if let Some(target_class_name) = target_class_name {
-            if let Err(msg) =
-                check_reflection_module_access(ctx, &target_class_name, false)
-            {
-                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                    message: format!(
-                        "Unable to make field accessible: {msg} \
+            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
+                return Err(
+                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+                        message: format!(
+                            "Unable to make field accessible: {msg} \
                          (use --add-opens to grant access)"
-                    ),
-                }
-                .into());
+                        ),
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -2988,19 +3109,18 @@ fn set_method_like_accessible_impl(
             Value::Object(Some(m)) => Some(m),
             _ => None,
         };
-        let target_class_name =
-            declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
+        let target_class_name = declaring_mirror.and_then(|m| mirror_class_name(ctx, m));
         if let Some(target_class_name) = target_class_name {
-            if let Err(msg) =
-                check_reflection_module_access(ctx, &target_class_name, false)
-            {
-                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
-                    message: format!(
-                        "Unable to make {member_label} accessible: {msg} \
+            if let Err(msg) = check_reflection_module_access(ctx, &target_class_name, false) {
+                return Err(
+                    cratonvm_types::error::RuntimeError::InaccessibleObjectException {
+                        message: format!(
+                            "Unable to make {member_label} accessible: {msg} \
                          (use --add-opens to grant access)"
-                    ),
-                }
-                .into());
+                        ),
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -3041,7 +3161,10 @@ const FIELD_NUM_FIELDS: usize = FIELD_NUM_FIELDS_LEGACY_FLOOR;
 
 /// Helper: absolute slot for the first extra-metadata slot on a Field obj.
 fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
-    core::cmp::max(FIELD_NUM_FIELDS_LEGACY_FLOOR, ctx.class_num_total_fields(class_id))
+    core::cmp::max(
+        FIELD_NUM_FIELDS_LEGACY_FLOOR,
+        ctx.class_num_total_fields(class_id),
+    )
 }
 
 /// Create a Field reflection object from metadata.
@@ -3081,7 +3204,11 @@ fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// pinned array, stays reachable and is remapped by subsequent collections.
 /// There is no allocation between `make` returning an element and the store, so
 /// the just-built element cannot be collected before it is rooted by the array.
-fn build_mirror_array<F>(ctx: &mut dyn NativeContext, len: usize, make: F) -> cratonvm_types::ObjectRef
+fn build_mirror_array<F>(
+    ctx: &mut dyn NativeContext,
+    len: usize,
+    make: F,
+) -> cratonvm_types::ObjectRef
 where
     F: FnMut(&mut dyn NativeContext, usize) -> cratonvm_types::ObjectRef,
 {
@@ -3117,7 +3244,8 @@ pub(crate) fn create_field_object(
     ctx: &mut dyn NativeContext,
     meta: &FieldMetadata,
 ) -> cratonvm_types::ObjectRef {
-    let class_id = ctx.ensure_class_initialized("java/lang/reflect/Field")
+    let class_id = ctx
+        .ensure_class_initialized("java/lang/reflect/Field")
         .unwrap_or(ClassId::new(0));
 
     // Allocate JDK-layout width + our extra metadata slots.
@@ -3141,8 +3269,16 @@ pub(crate) fn create_field_object(
     ctx.set_field_by_name(obj, "trustedFinal", Value::Int(0));
 
     // --- CratonVM extra metadata (append after JDK layout) ---
-    ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_DESC, Value::Object(Some(desc_str)));
-    ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_RJ_SLOT, Value::Int(meta.slot_index as i32));
+    ctx.set_field(
+        obj,
+        base + FIELD_EXTRA_OFFSET_DESC,
+        Value::Object(Some(desc_str)),
+    );
+    ctx.set_field(
+        obj,
+        base + FIELD_EXTRA_OFFSET_RJ_SLOT,
+        Value::Int(meta.slot_index as i32),
+    );
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
 
     obj
@@ -3169,12 +3305,7 @@ pub(crate) fn read_field_meta(
         let mirror = match ctx.get_field_by_name(field_obj, "clazz") {
             Value::Object(Some(m)) => m,
             _ => {
-                return (
-                    false,
-                    cratonvm_types::ClassId::new(0),
-                    0,
-                    String::new(),
-                );
+                return (false, cratonvm_types::ClassId::new(0), 0, String::new());
             }
         };
         mirror_class_id(ctx, mirror).unwrap_or(cratonvm_types::ClassId::new(0))
@@ -3237,10 +3368,9 @@ fn read_field_rj_slot(
             // Walk the two known bases (7 for the legacy floor and the
             // current JDK layout width) and return the first Int we find.
             for candidate_base in [FIELD_NUM_FIELDS_LEGACY_FLOOR, 14, 15, 16] {
-                if let Value::Int(v) = ctx.get_field(
-                    field_obj,
-                    candidate_base + FIELD_EXTRA_OFFSET_RJ_SLOT,
-                ) {
+                if let Value::Int(v) =
+                    ctx.get_field(field_obj, candidate_base + FIELD_EXTRA_OFFSET_RJ_SLOT)
+                {
                     if v >= 0 {
                         return Some(v as usize);
                     }
@@ -3265,10 +3395,7 @@ fn read_field_descriptor(
 }
 
 /// Read the CratonVM-specific `accessible` extra slot from a Field object.
-fn read_field_accessible(
-    ctx: &dyn NativeContext,
-    field_obj: cratonvm_types::ObjectRef,
-) -> bool {
+fn read_field_accessible(ctx: &dyn NativeContext, field_obj: cratonvm_types::ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(field_obj);
     let base = field_extra_base(ctx, class_id);
     match ctx.get_field(field_obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE) {
@@ -3304,7 +3431,10 @@ pub(crate) fn write_field_accessible_external(
 
 // --- Field getters (simple field reads) ---
 
-pub(crate) fn native_field_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3312,7 +3442,10 @@ pub(crate) fn native_field_get_name(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(ctx.get_field_by_name(this, "name")))
 }
 
-pub(crate) fn native_field_get_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3320,7 +3453,10 @@ pub(crate) fn native_field_get_type(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(ctx.get_field_by_name(this, "type")))
 }
 
-pub(crate) fn native_field_get_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_modifiers(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3360,7 +3496,10 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // Access control: read modifiers from JDK layout, accessible from
     // the CratonVM extra slot.
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.get({})", descriptor))?;
     // NEW-19: module-level opens check (JPMS)
@@ -3374,9 +3513,12 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let raw_value = if is_static {
         ctx.get_static_field(class_id, slot)
     } else {
-        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.get: null receiver for instance field".to_string()),
-        })?;
+        let recv =
+            receiver.ok_or_else(
+                || cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Field.get: null receiver for instance field".to_string()),
+                },
+            )?;
         ctx.get_field(recv, slot)
     };
 
@@ -3405,7 +3547,10 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // Access control: read modifiers from JDK layout, accessible from
     // the CratonVM extra slot.
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
     // WP2.1-field — final-field write check (must run AFTER access check
@@ -3424,9 +3569,12 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
-        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.set: null receiver for instance field".to_string()),
-        })?;
+        let recv =
+            receiver.ok_or_else(
+                || cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Field.set: null receiver for instance field".to_string()),
+                },
+            )?;
         ctx.set_field(recv, slot, coerced);
     }
     volatile_store_fence_post(modifiers);
@@ -3493,7 +3641,10 @@ fn field_get_raw(
     let (is_static, class_id, slot, _descriptor) = read_field_meta(ctx, this);
 
     // Access control
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, "Field typed getter")?;
     // NEW-19: module-level opens check (JPMS).
@@ -3508,14 +3659,22 @@ fn field_get_raw(
     if is_static {
         Ok(ctx.get_static_field(class_id, slot))
     } else {
-        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field typed getter: null receiver for instance field".to_string()),
-        })?;
+        let recv =
+            receiver.ok_or_else(
+                || cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some(
+                        "Field typed getter: null receiver for instance field".to_string(),
+                    ),
+                },
+            )?;
         Ok(ctx.get_field(recv, slot))
     }
 }
 
-pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Field.getInt accepts byte/short/char/int fields (all represented as
     // Value::Int on our stack) — but NOT long, float, or double, per
     // `java.lang.reflect.Field.getInt` javadoc (IllegalArgumentException on
@@ -3526,9 +3685,12 @@ pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) 
     // the variant-only check. Validate the field *descriptor* first.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getInt: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getInt: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"BSCI", "getInt")?;
@@ -3541,13 +3703,19 @@ pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 }
 
-pub(crate) fn native_field_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Accepts byte/short/char/int/long (widening). Rejects boolean/float/double/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getLong: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getLong: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"BSCIJ", "getLong")?;
@@ -3561,13 +3729,19 @@ pub(crate) fn native_field_get_long(ctx: &mut dyn NativeContext, args: &[Value])
     }
 }
 
-pub(crate) fn native_field_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Accepts byte/short/char/int/long/float (widening). Rejects boolean/double/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getFloat: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getFloat: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"BSCIJF", "getFloat")?;
@@ -3582,13 +3756,19 @@ pub(crate) fn native_field_get_float(ctx: &mut dyn NativeContext, args: &[Value]
     }
 }
 
-pub(crate) fn native_field_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Accepts every numeric primitive (widening to double). Rejects boolean/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getDouble: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getDouble: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"BSCIJFD", "getDouble")?;
@@ -3604,7 +3784,10 @@ pub(crate) fn native_field_get_double(ctx: &mut dyn NativeContext, args: &[Value
     }
 }
 
-pub(crate) fn native_field_get_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // getBoolean only accepts boolean fields (per javadoc — no widening).
     // We detect non-boolean fields by reading the descriptor alongside.
     let this = match args.first() {
@@ -3663,7 +3846,10 @@ fn field_set_raw(
     let (is_static, class_id, slot, descriptor) = read_field_meta(ctx, this);
 
     // Access control
-    let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
+    let modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, "Field typed setter")?;
     // WP2.1-field — final-field write check (matches Field.set on the
@@ -3682,40 +3868,60 @@ fn field_set_raw(
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
-        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field typed setter: null receiver for instance field".to_string()),
-        })?;
+        let recv =
+            receiver.ok_or_else(
+                || cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some(
+                        "Field typed setter: null receiver for instance field".to_string(),
+                    ),
+                },
+            )?;
         ctx.set_field(recv, slot, coerced);
     }
     volatile_store_fence_post(modifiers);
     Ok(())
 }
 
-pub(crate) fn native_field_set_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Int(0));
     field_set_raw(ctx, args, val)?;
     Ok(None)
 }
 
-pub(crate) fn native_field_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Long(0));
     field_set_raw(ctx, args, val)?;
     Ok(None)
 }
 
-pub(crate) fn native_field_set_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Float(0.0));
     field_set_raw(ctx, args, val)?;
     Ok(None)
 }
 
-pub(crate) fn native_field_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Double(0.0));
     field_set_raw(ctx, args, val)?;
     Ok(None)
 }
 
-pub(crate) fn native_field_set_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Int(0));
     field_set_raw(ctx, args, val)?;
     Ok(None)
@@ -3723,13 +3929,19 @@ pub(crate) fn native_field_set_boolean(ctx: &mut dyn NativeContext, args: &[Valu
 
 // --- Remaining typed Field getters: byte / short / char ---
 
-pub(crate) fn native_field_get_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Field.getByte: only `B` is JLS-legal (no widening from C/S/I — those throw IAE).
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getByte: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getByte: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"B", "getByte")?;
@@ -3742,14 +3954,20 @@ pub(crate) fn native_field_get_byte(ctx: &mut dyn NativeContext, args: &[Value])
     }
 }
 
-pub(crate) fn native_field_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Field.getShort: accepts byte (widening) or short. Rejects char (JLS forbids
     // char→short narrowing without explicit cast), int, long, boolean, refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getShort: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getShort: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"BS", "getShort")?;
@@ -3762,14 +3980,20 @@ pub(crate) fn native_field_get_short(ctx: &mut dyn NativeContext, args: &[Value]
     }
 }
 
-pub(crate) fn native_field_get_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_char(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Field.getChar: only `C` is legal — char is unsigned 16-bit and JLS does
     // not permit widening into it from byte/short/int.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Field.getChar: null Field".to_string()),
-        }.into()),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Field.getChar: null Field".to_string()),
+            }
+            .into())
+        }
     };
     let (_, _, _, descriptor) = read_field_meta(ctx, this);
     validate_field_descriptor(&descriptor, b"C", "getChar")?;
@@ -3783,7 +4007,10 @@ pub(crate) fn native_field_get_char(ctx: &mut dyn NativeContext, args: &[Value])
     }
 }
 
-pub(crate) fn native_field_set_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let raw = args.get(2).copied().unwrap_or(Value::Int(0));
     let val = match raw {
         Value::Int(v) => Value::Int((v as i8) as i32),
@@ -3797,7 +4024,10 @@ pub(crate) fn native_field_set_byte(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(None)
 }
 
-pub(crate) fn native_field_set_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let raw = args.get(2).copied().unwrap_or(Value::Int(0));
     let val = match raw {
         Value::Int(v) => Value::Int((v as i16) as i32),
@@ -3811,7 +4041,10 @@ pub(crate) fn native_field_set_short(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(None)
 }
 
-pub(crate) fn native_field_set_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_set_char(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let raw = args.get(2).copied().unwrap_or(Value::Int(0));
     let val = match raw {
         Value::Int(v) => Value::Int((v as u16) as i32),
@@ -4020,7 +4253,8 @@ pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
 ) -> cratonvm_types::ObjectRef {
-    let class_id = ctx.ensure_class_initialized("java/lang/reflect/Method")
+    let class_id = ctx
+        .ensure_class_initialized("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
 
     // Allocate JDK-layout width + our extra metadata slots.
@@ -4057,11 +4291,8 @@ pub(crate) fn create_method_object(
     // attribute when present, so `Method.getExceptionTypes()` (which the
     // JDK Java code implements by `return exceptionTypes.clone();`)
     // returns the actual throws-clause types instead of always-empty.
-    let exception_names = ctx.method_exceptions(
-        meta.declaring_class_id,
-        &meta.name,
-        &meta.descriptor,
-    );
+    let exception_names =
+        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     // Build a Class<T> mirror for each thrown checked exception via the L-form
@@ -4094,9 +4325,17 @@ pub(crate) fn create_method_object(
     // checks (e.g. `AnnotationParser.parseAnnotations` reads `arr.length`).
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_byte_arr)));
     let empty_byte_arr2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-    ctx.set_field_by_name(obj, "parameterAnnotations", Value::Object(Some(empty_byte_arr2)));
+    ctx.set_field_by_name(
+        obj,
+        "parameterAnnotations",
+        Value::Object(Some(empty_byte_arr2)),
+    );
     let empty_byte_arr3 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-    ctx.set_field_by_name(obj, "annotationDefault", Value::Object(Some(empty_byte_arr3)));
+    ctx.set_field_by_name(
+        obj,
+        "annotationDefault",
+        Value::Object(Some(empty_byte_arr3)),
+    );
 
     // WP2.1: populate the JDK `signature` field from the JVMS §4.7.9 Signature
     // attribute when the method is generic. The real JDK `Method.getGenericReturnType()`
@@ -4126,11 +4365,7 @@ pub(crate) fn create_method_object(
         base + METHOD_EXTRA_OFFSET_PARAM_COUNT,
         Value::Int(param_descs.len() as i32),
     );
-    ctx.set_field(
-        obj,
-        base + METHOD_EXTRA_OFFSET_ACCESSIBLE,
-        Value::Int(0),
-    );
+    ctx.set_field(obj, base + METHOD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
 
     obj
 }
@@ -4259,10 +4494,7 @@ pub(crate) fn method_descriptor_for_invoke(
 }
 
 /// Read the CratonVM-specific cached parameter count extra slot.
-fn read_method_param_count(
-    ctx: &dyn NativeContext,
-    method_obj: cratonvm_types::ObjectRef,
-) -> i32 {
+fn read_method_param_count(ctx: &dyn NativeContext, method_obj: cratonvm_types::ObjectRef) -> i32 {
     let class_id = ctx.class_id_of_object(method_obj);
     let base = method_extra_base(ctx, class_id);
     match ctx.get_field(method_obj, base + METHOD_EXTRA_OFFSET_PARAM_COUNT) {
@@ -4287,10 +4519,7 @@ fn read_method_param_count(
 ///      extra slot — e.g. internal write helpers).
 ///
 /// Either being truthy is enough to treat the Method as accessible.
-fn read_method_accessible(
-    ctx: &dyn NativeContext,
-    method_obj: cratonvm_types::ObjectRef,
-) -> bool {
+fn read_method_accessible(ctx: &dyn NativeContext, method_obj: cratonvm_types::ObjectRef) -> bool {
     // Check the JDK `override` field first — this is what JDK 25's
     // AccessibleObject.setAccessible writes via Java bytecode.
     if let Value::Int(v) = ctx.get_field_by_name(method_obj, "override") {
@@ -4333,7 +4562,10 @@ pub(crate) fn write_method_accessible_external(
 
 // --- Method getters ---
 
-pub(crate) fn native_method_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -4341,7 +4573,10 @@ pub(crate) fn native_method_get_name(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(ctx.get_field_by_name(this, "name")))
 }
 
-pub(crate) fn native_method_get_return_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_get_return_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -4360,7 +4595,10 @@ pub(crate) fn native_method_get_parameter_types(
     Ok(Some(ctx.get_field_by_name(this, "parameterTypes")))
 }
 
-pub(crate) fn native_method_get_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_get_modifiers(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -4415,8 +4653,11 @@ fn args_match_descriptor_exactly(
             // Primitive tags must match the descriptor exactly. The
             // wrapper-class boxed forms always arrive as `Value::Object`
             // and fall through to coercion.
-            (Value::Int(_), "I") | (Value::Int(_), "Z") | (Value::Int(_), "B")
-            | (Value::Int(_), "S") | (Value::Int(_), "C") => {}
+            (Value::Int(_), "I")
+            | (Value::Int(_), "Z")
+            | (Value::Int(_), "B")
+            | (Value::Int(_), "S")
+            | (Value::Int(_), "C") => {}
             (Value::Long(_), "J") => {}
             (Value::Float(_), "F") => {}
             (Value::Double(_), "D") => {}
@@ -4443,7 +4684,10 @@ fn args_match_descriptor_exactly(
     true
 }
 
-pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_invoke(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -4485,7 +4729,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Method.invoke: no declaring class".to_string()),
             }
-            .into())
+            .into());
         }
     };
     let class_name = mirror_class_name(ctx, declaring_mirror).unwrap_or_default();
@@ -4498,7 +4742,11 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
 
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
-    check_access(modifiers, accessible, &format!("Method.invoke: {}.{}", class_name, method_name))?;
+    check_access(
+        modifiers,
+        accessible,
+        &format!("Method.invoke: {}.{}", class_name, method_name),
+    )?;
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
     // the override flag short-circuits the deep check (JEP 403).
     //
@@ -4509,10 +4757,12 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let is_public = (modifiers & 0x0001) != 0;
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
+                }
+                .into(),
+            );
         }
     }
 
@@ -4540,9 +4790,12 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
 
     if !is_static {
         // Instance method: receiver is first arg
-        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some("Method.invoke: null receiver for instance method".to_string()),
-        })?;
+        let recv =
+            receiver.ok_or_else(
+                || cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Method.invoke: null receiver for instance method".to_string()),
+                },
+            )?;
         invoke_args.push(Value::Object(Some(recv)));
     }
 
@@ -4671,8 +4924,13 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         };
         let virtual_args: &[Value] = &invoke_args[1..];
         if std::env::var_os("CRATONVM_BD_DEBUG").is_some() {
-            eprintln!("[Method.invoke] virtual class={} method={} desc={} recv={:p}",
-                      class_name, method_name, descriptor, recv.as_ptr());
+            eprintln!(
+                "[Method.invoke] virtual class={} method={} desc={} recv={:p}",
+                class_name,
+                method_name,
+                descriptor,
+                recv.as_ptr()
+            );
         }
         match ctx.invoke_virtual(recv, &method_name, &descriptor, virtual_args) {
             Ok(v) => v,
@@ -5353,36 +5611,36 @@ pub(crate) fn native_class_get_declared_methods(
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Class.getDeclaredMethods on null".to_string()),
+        let this = match args.first() {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Class.getDeclaredMethods on null".to_string()),
+                }
+                .into())
             }
-            .into())
-        }
-    };
-    let class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => {
-            // Primitive or array type
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(arr))));
-        }
-    };
+        };
+        let class_id = match mirror_class_id(ctx, this) {
+            Some(id) => id,
+            None => {
+                // Primitive or array type
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                return Ok(Some(Value::Object(Some(arr))));
+            }
+        };
 
-    let methods = declared_methods_with_synthetic(ctx, class_id);
-    // Filter out <init> and <clinit>
-    let visible: Vec<&MethodMetadata> = methods
-        .iter()
-        .filter(|m| m.name != "<init>" && m.name != "<clinit>")
-        .collect();
+        let methods = declared_methods_with_synthetic(ctx, class_id);
+        // Filter out <init> and <clinit>
+        let visible: Vec<&MethodMetadata> = methods
+            .iter()
+            .filter(|m| m.name != "<init>" && m.name != "<clinit>")
+            .collect();
 
-    // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
-    let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
-        create_method_object(ctx, visible[i])
-    });
-    Ok(Some(Value::Object(Some(arr))))
+        // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
+        let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
+            create_method_object(ctx, visible[i])
+        });
+        Ok(Some(Value::Object(Some(arr))))
     })();
     // Restore depth on every exit path (success or error).
     GET_DECLARED_METHODS_DEPTH.with(|d| d.set(prev_depth));
@@ -5426,12 +5684,9 @@ pub(crate) fn native_class_get_declared_method(
             // for known WildFly/Keycloak entry-class `main(String[])` lookups so
             // that jboss-modules' bootstrap progresses past the NoSuchMethod
             // wall. Fall through to the existing NSME otherwise.
-            if let Some(method_obj) = wf_shim_synth_main_method(
-                ctx,
-                this,
-                &target_name,
-                param_types_arr,
-            ) {
+            if let Some(method_obj) =
+                wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+            {
                 return Ok(Some(Value::Object(Some(method_obj))));
             }
             return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
@@ -5572,9 +5827,7 @@ pub(crate) fn native_class_get_declared_method(
     // class file's own method table — which is still empty for the synthetic
     // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
     // can invoke it (the invoke is intercepted natively elsewhere).
-    if let Some(method_obj) =
-        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
-    {
+    if let Some(method_obj) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -5722,7 +5975,9 @@ fn register_constructor_mirror_side(
     accessible: bool,
 ) {
     let key = obj.as_ptr() as usize;
-    let mut g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = constructor_mirror_side_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     g.insert(
         key,
         ConstructorMirrorSideMeta {
@@ -5735,7 +5990,9 @@ fn register_constructor_mirror_side(
 
 fn peek_constructor_mirror_side(obj: ObjectRef) -> Option<ConstructorMirrorSideMeta> {
     let key = obj.as_ptr() as usize;
-    let g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+    let g = constructor_mirror_side_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     g.get(&key).cloned()
 }
 
@@ -5774,7 +6031,8 @@ pub(crate) fn create_constructor_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
 ) -> cratonvm_types::ObjectRef {
-    let class_id = ctx.ensure_class_initialized("java/lang/reflect/Constructor")
+    let class_id = ctx
+        .ensure_class_initialized("java/lang/reflect/Constructor")
         .unwrap_or(ClassId::new(0));
 
     let jdk_layout_fields = ctx.class_num_total_fields(class_id);
@@ -5798,11 +6056,8 @@ pub(crate) fn create_constructor_object(
     // Enhancer.emitConstructors calls this on every superclass constructor
     // during proxy class generation — see ReflectUtils.getExceptionTypes
     // (ReflectUtils.java:133/605).
-    let exception_names = ctx.method_exceptions(
-        meta.declaring_class_id,
-        &meta.name,
-        &meta.descriptor,
-    );
+    let exception_names =
+        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     let exception_arr = build_mirror_array(ctx, exception_names.len(), |ctx, i| {
@@ -6008,7 +6263,9 @@ pub(crate) fn write_constructor_accessible(
 ) {
     let key = ctor_obj.as_ptr() as usize;
     {
-        let mut g = constructor_mirror_side_table().lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = constructor_mirror_side_table()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(m) = g.get_mut(&key) {
             m.accessible = value;
         }
@@ -6189,10 +6446,12 @@ pub(crate) fn native_constructor_new_instance(
     let ctor_is_public = (ctor_modifiers & 0x0001) != 0;
     if !ctor_is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: format!("Constructor.newInstance: {class_name}: {msg}"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: format!("Constructor.newInstance: {class_name}: {msg}"),
+                }
+                .into(),
+            );
         }
     }
 
@@ -6303,10 +6562,7 @@ pub(crate) fn native_class_get_declared_constructors(
     let methods = ctx.declared_methods(class_id);
     let constructors: Vec<&MethodMetadata> = methods
         .iter()
-        .filter(|m| {
-            m.name == "<init>"
-                && (!public_only || (m.access_flags & 0x0001) != 0)
-        })
+        .filter(|m| m.name == "<init>" && (!public_only || (m.access_flags & 0x0001) != 0))
         .collect();
 
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
@@ -6498,7 +6754,10 @@ fn collect_public_methods(
     result
 }
 
-pub(crate) fn native_class_get_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_fields(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -6523,7 +6782,10 @@ pub(crate) fn native_class_get_fields(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(arr))))
 }
 
-pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_field(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -6612,7 +6874,10 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
     .into())
 }
 
-pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_methods(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // bytebuddy_probe stack-overflow guard (agent15) — see comment on
     // GET_DECLARED_METHODS_DEPTH above. `getMethods` walks the super/iface
     // chain (collect_public_methods) so it can recurse even more deeply
@@ -6629,34 +6894,37 @@ pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Valu
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Class.getMethods on null".to_string()),
+        let this = match args.first() {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Class.getMethods on null".to_string()),
+                }
+                .into())
             }
-            .into())
+        };
+        let class_id = match mirror_class_id(ctx, this) {
+            Some(id) => id,
+            None => {
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                return Ok(Some(Value::Object(Some(arr))));
+            }
+        };
+        let method_objs = collect_public_methods(ctx, class_id);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), method_objs.len());
+        for (i, mobj) in method_objs.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
         }
-    };
-    let class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(arr))));
-        }
-    };
-    let method_objs = collect_public_methods(ctx, class_id);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), method_objs.len());
-    for (i, mobj) in method_objs.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
-    }
-    Ok(Some(Value::Object(Some(arr))))
+        Ok(Some(Value::Object(Some(arr))))
     })();
     GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
     result
 }
 
-pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_method(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -6688,12 +6956,9 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
             // `main(String[])` Method for jboss-modules / WildFly /
             // Keycloak entry-class lookups so the launcher progresses past
             // the NoSuchMethod wall instead of fataling.
-            if let Some(method_obj) = wf_shim_synth_main_method(
-                ctx,
-                this,
-                &target_name,
-                param_types_arr,
-            ) {
+            if let Some(method_obj) =
+                wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+            {
                 return Ok(Some(Value::Object(Some(method_obj))));
             }
             return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
@@ -6827,9 +7092,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     // launcher path occasionally hits `getMethod` instead of
     // `getDeclaredMethod`; both must produce a usable Method mirror for the
     // boot to continue.
-    if let Some(method_obj) =
-        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
-    {
+    if let Some(method_obj) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -6839,7 +7102,10 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     .into())
 }
 
-pub(crate) fn native_class_get_constructors(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_constructors(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -6871,7 +7137,10 @@ pub(crate) fn native_class_get_constructors(ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Object(Some(arr))))
 }
 
-pub(crate) fn native_class_get_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_constructor(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -6944,7 +7213,10 @@ pub(crate) fn native_class_get_constructor(ctx: &mut dyn NativeContext, args: &[
 
 // --- Class.getInterfaces / Class.getModifiers ---
 
-pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_interfaces(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -7000,7 +7272,10 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early-strict]", this_name);
+            eprintln!(
+                "[bb-dbg] getInterfaces({}) -> [] [object-early-strict]",
+                this_name
+            );
         }
         let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(empty))));
@@ -7030,7 +7305,10 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
             let arr = ctx.new_ref_array(elem, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
             if dbg_bb {
-                eprintln!("[bb-dbg] getInterfaces({}) -> [{}] [lambda]", this_name, iface_name);
+                eprintln!(
+                    "[bb-dbg] getInterfaces({}) -> [{}] [lambda]",
+                    this_name, iface_name
+                );
             }
             return Ok(Some(Value::Object(Some(arr))));
         }
@@ -7090,7 +7368,10 @@ fn array_element_access_bits(ctx: &mut dyn NativeContext, name: &str) -> i32 {
     }
 }
 
-pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_modifiers(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -7154,16 +7435,14 @@ pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Va
             let comp = name.trim_start_matches('[');
             // Object element → use the element class's accessibility bits;
             // primitive element (B/I/J/…) → public.
-            let access = if let Some(stripped) = comp
-                .strip_prefix('L')
-                .and_then(|s| s.strip_suffix(';'))
-            {
-                ctx.class_id_by_name(stripped)
-                    .map(|cid| ctx.class_access_flags(cid) & 0x0007)
-                    .unwrap_or(0x0001)
-            } else {
-                0x0001
-            };
+            let access =
+                if let Some(stripped) = comp.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                    ctx.class_id_by_name(stripped)
+                        .map(|cid| ctx.class_access_flags(cid) & 0x0007)
+                        .unwrap_or(0x0001)
+                } else {
+                    0x0001
+                };
             // | ACC_FINAL (0x10) | ACC_ABSTRACT (0x400)
             return Ok(Some(Value::Int((access | 0x0410) as i32)));
         }
@@ -7424,7 +7703,11 @@ fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
-    let proxy = alloc_concurrent_synthetic(ctx, "java/lang/annotation/AnnotationProxy", ANN_PROXY_FIELDS);
+    let proxy = alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/annotation/AnnotationProxy",
+        ANN_PROXY_FIELDS,
+    );
     let desc_str = ctx.create_string(&ann.type_descriptor);
     ctx.set_field(proxy, ANN_PROXY_TYPE_DESC, Value::Object(Some(desc_str)));
 
@@ -7497,7 +7780,9 @@ fn create_annotation_proxy(
             if m.name.starts_with('<') {
                 continue;
             }
-            if let Some(default_val) = ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor) {
+            if let Some(default_val) =
+                ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor)
+            {
                 let ret_desc = m.descriptor.strip_prefix("()").map(|s| s.to_string());
                 all_elements.push((m.name.clone(), default_val, ret_desc));
             }
@@ -7527,12 +7812,15 @@ fn create_annotation_proxy(
     for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
-        let java_val =
-            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref());
+        let java_val = annotation_element_to_java_typed(ctx, val, ret_desc.as_deref());
         ctx.set_array_element(values_arr, i, java_val);
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
-    ctx.set_field(proxy, ANN_PROXY_ELEM_VALUES, Value::Object(Some(values_arr)));
+    ctx.set_field(
+        proxy,
+        ANN_PROXY_ELEM_VALUES,
+        Value::Object(Some(values_arr)),
+    );
 
     // CRATONVM_REAL_ANNOTATIONS: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
@@ -7591,10 +7879,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // `@SpringBootApplication` and ultimately surfacing as
             // `MissingWebServerFactoryBeanException`.
             let (wrapper, value) = match return_type_desc {
-                Some("Z") => (
-                    "java/lang/Boolean",
-                    Value::Int(if *v != 0 { 1 } else { 0 }),
-                ),
+                Some("Z") => ("java/lang/Boolean", Value::Int(if *v != 0 { 1 } else { 0 })),
                 Some("B") => ("java/lang/Byte", Value::Int(*v as i8 as i32)),
                 Some("C") => ("java/lang/Character", Value::Int(*v & 0xFFFF)),
                 Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
@@ -7654,10 +7939,16 @@ pub(crate) fn annotation_element_to_java_typed(
                     "java/lang/Enum",
                     "valueOf",
                     "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
-                    &[Value::Object(Some(class_mirror)), Value::Object(Some(name_str))],
+                    &[
+                        Value::Object(Some(class_mirror)),
+                        Value::Object(Some(name_str)),
+                    ],
                 );
                 if iae_trace {
-                    eprintln!("ANN-ENUM class={class_name} const={const_name} ok={}", invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false));
+                    eprintln!(
+                        "ANN-ENUM class={class_name} const={const_name} ok={}",
+                        invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
+                    );
                 }
                 if let Ok(Some(val)) = invoke_res {
                     return val;
@@ -7684,15 +7975,24 @@ pub(crate) fn annotation_element_to_java_typed(
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
                     let mirror = ctx.get_class_mirror(cid);
-                    if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok"); }
+                    if iae_trace_cls {
+                        eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
+                    }
                     return Value::Object(Some(mirror));
                 }
                 let load_res = ctx.load_class(class_name);
-                if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} load-ok={}", load_res.as_ref().map(|v| v.is_some()).unwrap_or(false)); }
+                if iae_trace_cls {
+                    eprintln!(
+                        "ANN-CLASS desc={desc} class={class_name} load-ok={}",
+                        load_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
+                    );
+                }
                 if let Ok(Some(val)) = load_res {
                     return val;
                 }
-                if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL"); }
+                if iae_trace_cls {
+                    eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
+                }
                 // Unloadable object class — preserve the existing null return.
                 return Value::Object(None);
             }
@@ -7705,7 +8005,11 @@ pub(crate) fn annotation_element_to_java_typed(
             // null TypeDescription) inside Hibernate's BytecodeProvider init.
             // `descriptor_to_class_mirror` maps `V` -> the `void` primitive
             // Class mirror, `[I` -> the canonical `int[]` mirror, etc.
-            if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"); }
+            if iae_trace_cls {
+                eprintln!(
+                    "ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"
+                );
+            }
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
@@ -7812,11 +8116,11 @@ pub(crate) fn annotation_element_to_java_typed(
             let comp_name_owned: String = match elems.first() {
                 Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
                 Some(AEV::Class(_)) => "java/lang/Class".to_string(),
-                Some(AEV::Annotation(nested)) => annotation_desc_to_class_name(
-                    &nested.type_descriptor,
-                )
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string()),
+                Some(AEV::Annotation(nested)) => {
+                    annotation_desc_to_class_name(&nested.type_descriptor)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string())
+                }
                 Some(AEV::Enum(type_desc, _)) => type_desc
                     .strip_prefix('L')
                     .and_then(|s| s.strip_suffix(';'))
@@ -7917,7 +8221,10 @@ pub(crate) fn annotation_element_to_java_typed(
 /// used by Hibernate's `BytecodeProviderImpl`) throws a `ClassCastException`.
 fn annotation_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     ctx.class_id_by_name("java/lang/annotation/Annotation")
-        .or_else(|| ctx.ensure_class_initialized("java/lang/annotation/Annotation").ok())
+        .or_else(|| {
+            ctx.ensure_class_initialized("java/lang/annotation/Annotation")
+                .ok()
+        })
         .unwrap_or(ClassId::new(0))
 }
 
@@ -8012,7 +8319,10 @@ fn build_class_annotation_array(
 }
 
 /// Class.getDeclaredAnnotations() — only this class's own annotations.
-pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_declared_annotations(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -8030,9 +8340,14 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
     let annotations = ctx.class_annotations(class_id);
     if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
-        if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") || cn.contains("SpringBootConfiguration") {
+        if cn.contains("SpringBootApplication")
+            || cn.contains("EnableAutoConfiguration")
+            || cn.contains("SpringBootConfiguration")
+        {
             eprintln!("[GDA] {} -> {} annotations", cn, annotations.len());
-            for a in &annotations { eprintln!("    {}", a.type_descriptor); }
+            for a in &annotations {
+                eprintln!("    {}", a.type_descriptor);
+            }
         }
     }
     let arr = build_class_annotation_array(ctx, class_id, &annotations);
@@ -8040,7 +8355,10 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
 }
 
 /// Class.getAnnotations() — includes @Inherited annotations from superclasses.
-pub(crate) fn native_class_get_annotations(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_annotations(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -8059,7 +8377,10 @@ pub(crate) fn native_class_get_annotations(ctx: &mut dyn NativeContext, args: &[
     let mut annotations = ctx.class_annotations(class_id);
 
     // Collect type descriptors already present on this class
-    let mut seen: std::collections::HashSet<String> = annotations.iter().map(|a| a.type_descriptor.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = annotations
+        .iter()
+        .map(|a| a.type_descriptor.clone())
+        .collect();
 
     // Walk superclass chain for @Inherited annotations
     let mut current = ctx.superclass_of(class_id);
@@ -8099,11 +8420,16 @@ fn is_inherited_annotation(ctx: &mut dyn NativeContext, ann_type_desc: &str) -> 
         }
     };
     let meta_annotations = ctx.class_annotations(ann_class_id);
-    meta_annotations.iter().any(|a| a.type_descriptor == "Ljava/lang/annotation/Inherited;")
+    meta_annotations
+        .iter()
+        .any(|a| a.type_descriptor == "Ljava/lang/annotation/Inherited;")
 }
 
 /// Class.getDeclaredAnnotation(Class) — only this class's own annotations.
-pub(crate) fn native_class_get_declared_annotation(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_declared_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -8136,7 +8462,10 @@ pub(crate) fn native_class_get_declared_annotation(ctx: &mut dyn NativeContext, 
 }
 
 /// Class.getAnnotation(Class) — searches superclass chain for @Inherited.
-pub(crate) fn native_class_get_annotation(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -8237,7 +8566,10 @@ pub(crate) fn native_class_is_annotation_present(
 }
 
 /// Class.isAnnotation() — checks if the class itself is an annotation type
-pub(crate) fn native_class_is_annotation(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -8315,17 +8647,25 @@ pub(crate) fn native_class_get_annotations_by_type(
             // The @Repeatable annotation has a single element "value" which is a Class
             // descriptor for the container annotation type.
             if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
-                repeatable_ann.elements.iter().find(|(name, _)| name == "value")
+                repeatable_ann
+                    .elements
+                    .iter()
+                    .find(|(name, _)| name == "value")
             {
                 // Find the container annotation on the target class
                 for ann in &annotations {
                     if ann.type_descriptor == *container_desc {
                         // The container's value() element is an Array of nested annotations
-                        if let Some((_, cratonvm_native_api::AnnotationElementValue::Array(elems))) =
-                            ann.elements.iter().find(|(name, _)| name == "value")
+                        if let Some((
+                            _,
+                            cratonvm_native_api::AnnotationElementValue::Array(elems),
+                        )) = ann.elements.iter().find(|(name, _)| name == "value")
                         {
                             for elem in elems {
-                                if let cratonvm_native_api::AnnotationElementValue::Annotation(nested) = elem {
+                                if let cratonvm_native_api::AnnotationElementValue::Annotation(
+                                    nested,
+                                ) = elem
+                                {
                                     if nested.type_descriptor == target_desc {
                                         matching.push(nested.clone());
                                     }
@@ -8402,15 +8742,23 @@ pub(crate) fn native_method_get_annotations_by_type(
             .find(|a| a.type_descriptor == repeatable_desc)
         {
             if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
-                repeatable_ann.elements.iter().find(|(name, _)| name == "value")
+                repeatable_ann
+                    .elements
+                    .iter()
+                    .find(|(name, _)| name == "value")
             {
                 for ann in &annotations {
                     if ann.type_descriptor == *container_desc {
-                        if let Some((_, cratonvm_native_api::AnnotationElementValue::Array(elems))) =
-                            ann.elements.iter().find(|(name, _)| name == "value")
+                        if let Some((
+                            _,
+                            cratonvm_native_api::AnnotationElementValue::Array(elems),
+                        )) = ann.elements.iter().find(|(name, _)| name == "value")
                         {
                             for elem in elems {
-                                if let cratonvm_native_api::AnnotationElementValue::Annotation(nested) = elem {
+                                if let cratonvm_native_api::AnnotationElementValue::Annotation(
+                                    nested,
+                                ) = elem
+                                {
                                     if nested.type_descriptor == target_desc {
                                         matching.push(nested.clone());
                                     }
@@ -8499,7 +8847,10 @@ pub(crate) fn method_class_name_desc(
 }
 
 /// Field.getAnnotations() / Field.getDeclaredAnnotations()
-pub(crate) fn native_field_get_annotations(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_annotations(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -8551,7 +8902,10 @@ pub(crate) fn native_field_is_annotation_present(
 }
 
 /// Field.getAnnotation(Class) — returns a single annotation proxy or null.
-pub(crate) fn native_field_get_annotation(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_field_get_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -8584,7 +8938,10 @@ pub(crate) fn native_field_get_annotation(ctx: &mut dyn NativeContext, args: &[V
 }
 
 /// Method.getAnnotations() / Method.getDeclaredAnnotations()
-pub(crate) fn native_method_get_annotations(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_get_annotations(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -8603,7 +8960,13 @@ pub(crate) fn native_method_get_annotations(ctx: &mut dyn NativeContext, args: &
     if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") {
-            eprintln!("[MGA] {}.{}{} -> {} method-anns", cn, method_name, method_desc, annotations.len());
+            eprintln!(
+                "[MGA] {}.{}{} -> {} method-anns",
+                cn,
+                method_name,
+                method_desc,
+                annotations.len()
+            );
             for a in &annotations {
                 eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
                 for (en, ev) in &a.elements {
@@ -8648,7 +9011,10 @@ pub(crate) fn native_method_is_annotation_present(
 }
 
 /// Method.getAnnotation(Class)
-pub(crate) fn native_method_get_annotation(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_method_get_annotation(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -8674,7 +9040,14 @@ pub(crate) fn native_method_get_annotation(ctx: &mut dyn NativeContext, args: &[
     if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication") {
-            eprintln!("[GMA] {}.{}{} target={} -> {} method-anns", cn, method_name, method_desc, target_desc, annotations.len());
+            eprintln!(
+                "[GMA] {}.{}{} target={} -> {} method-anns",
+                cn,
+                method_name,
+                method_desc,
+                target_desc,
+                annotations.len()
+            );
             for a in &annotations {
                 eprintln!("    {} elements={}", a.type_descriptor, a.elements.len());
                 for (en, ev) in &a.elements {
@@ -8860,7 +9233,10 @@ pub(crate) fn native_class_get_generic_superclass(
     let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early-strict]", this_name);
+            eprintln!(
+                "[bb-dbg] getGenericSuperclass({}) -> null [object-early-strict]",
+                this_name
+            );
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -8868,7 +9244,10 @@ pub(crate) fn native_class_get_generic_superclass(
         Some(id) => id,
         None => {
             if dbg_bb {
-                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-class-id]", this_name);
+                eprintln!(
+                    "[bb-dbg] getGenericSuperclass({}) -> null [no-class-id]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -8877,7 +9256,10 @@ pub(crate) fn native_class_get_generic_superclass(
     if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
         if class_id == obj_id {
             if dbg_bb {
-                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-by-id]", this_name);
+                eprintln!(
+                    "[bb-dbg] getGenericSuperclass({}) -> null [object-by-id]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -8885,7 +9267,10 @@ pub(crate) fn native_class_get_generic_superclass(
     // Interfaces and arrays both report null for getGenericSuperclass per JLS.
     if ctx.is_interface_class(class_id) {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [interface]", this_name);
+            eprintln!(
+                "[bb-dbg] getGenericSuperclass({}) -> null [interface]",
+                this_name
+            );
         }
         return Ok(Some(Value::Object(None)));
     }
@@ -8927,7 +9312,10 @@ pub(crate) fn native_class_get_generic_superclass(
             // If signature resolution succeeded, return it
             if !matches!(val, Value::Object(None)) {
                 if dbg_bb {
-                    eprintln!("[bb-dbg] getGenericSuperclass({}) -> <signature>", this_name);
+                    eprintln!(
+                        "[bb-dbg] getGenericSuperclass({}) -> <signature>",
+                        this_name
+                    );
                 }
                 return Ok(Some(val));
             }
@@ -8938,19 +9326,28 @@ pub(crate) fn native_class_get_generic_superclass(
         // Self-cycle guard — symmetric with native_class_get_superclass.
         if super_id == class_id {
             if dbg_bb {
-                eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [self-cycle]", this_name);
+                eprintln!(
+                    "[bb-dbg] getGenericSuperclass({}) -> null [self-cycle]",
+                    this_name
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
         let mirror = ctx.get_class_mirror(super_id);
         if dbg_bb {
             let parent_name = ctx.class_name_of_id(super_id).unwrap_or_default();
-            eprintln!("[bb-dbg] getGenericSuperclass({}) -> {}", this_name, parent_name);
+            eprintln!(
+                "[bb-dbg] getGenericSuperclass({}) -> {}",
+                this_name, parent_name
+            );
         }
         Ok(Some(Value::Object(Some(mirror))))
     } else {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [no-super]", this_name);
+            eprintln!(
+                "[bb-dbg] getGenericSuperclass({}) -> null [no-super]",
+                this_name
+            );
         }
         Ok(Some(Value::Object(None)))
     }
@@ -8979,7 +9376,10 @@ pub(crate) fn native_class_get_generic_interfaces(
     let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
-            eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early-strict]", this_name);
+            eprintln!(
+                "[bb-dbg] getGenericInterfaces({}) -> [] [object-early-strict]",
+                this_name
+            );
         }
         let arr = ctx.new_ref_array(ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(arr))));
@@ -9127,7 +9527,8 @@ pub(crate) fn native_method_get_type_parameters(
                 let arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
                 for (i, tp) in method_sig.type_params.iter().enumerate() {
                     // genericDeclaration = the declaring Method/Constructor (`this`).
-                    let tv = crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+                    let tv =
+                        crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
                     ctx.set_array_element(arr, i, tv);
                 }
                 return Ok(Some(Value::Object(Some(arr))));
@@ -9224,7 +9625,11 @@ pub(crate) fn native_record_component_get_generic_type(
 
 // --- java.lang.reflect.Modifier ---
 
-pub(crate) fn modifier_check(_ctx: &mut dyn NativeContext, args: &[Value], mask: i32) -> MethodCallResult {
+pub(crate) fn modifier_check(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+    mask: i32,
+) -> MethodCallResult {
     let flags = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -9232,40 +9637,64 @@ pub(crate) fn modifier_check(_ctx: &mut dyn NativeContext, args: &[Value], mask:
     Ok(Some(Value::Int(if (flags & mask) != 0 { 1 } else { 0 })))
 }
 
-pub(crate) fn native_modifier_is_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_public(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0001)
 }
 
-pub(crate) fn native_modifier_is_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_private(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0002)
 }
 
-pub(crate) fn native_modifier_is_protected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_protected(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0004)
 }
 
-pub(crate) fn native_modifier_is_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_static(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0008)
 }
 
-pub(crate) fn native_modifier_is_final(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_final(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0010)
 }
 
-pub(crate) fn native_modifier_is_abstract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_abstract(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0400)
 }
 
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_temp_print_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_temp_print_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(&value) = args.first() {
         ctx.record_printed_value(value);
     }
     Ok(None)
 }
 
-pub(crate) fn native_temp_print_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_temp_print_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(&value) = args.first() {
         ctx.record_printed_value(value);
     }
@@ -9283,27 +9712,45 @@ pub(crate) fn native_modifier_is_synchronized(
     modifier_check(ctx, args, 0x0020)
 }
 
-pub(crate) fn native_modifier_is_volatile(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_volatile(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0040)
 }
 
-pub(crate) fn native_modifier_is_transient(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_transient(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0080)
 }
 
-pub(crate) fn native_modifier_is_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0100)
 }
 
-pub(crate) fn native_modifier_is_interface(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_interface(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0200)
 }
 
-pub(crate) fn native_modifier_is_strict(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_is_strict(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     modifier_check(ctx, args, 0x0800)
 }
 
-pub(crate) fn native_modifier_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_modifier_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let flags = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -9440,7 +9887,8 @@ pub(crate) fn native_class_get_component_type(
         };
         // Primitive types don't have loadable classes — use primitive_class_mirror
         match comp_name {
-            "int" | "long" | "float" | "double" | "boolean" | "byte" | "char" | "short" | "void" => {
+            "int" | "long" | "float" | "double" | "boolean" | "byte" | "char" | "short"
+            | "void" => {
                 let mirror = ctx.primitive_class_mirror(comp_name);
                 return Ok(Some(Value::Object(Some(mirror))));
             }
@@ -9454,7 +9902,9 @@ pub(crate) fn native_class_get_component_type(
                 // `array.componentType() != null` (Spring's
                 // `ConstructorResolver.resolveAutowiredArgument` does
                 // `Array.newInstance(type.componentType(), 0)`) do not NPE.
-                return Ok(Some(Value::Object(Some(synthetic_class_mirror(ctx, comp_name)))));
+                return Ok(Some(Value::Object(Some(synthetic_class_mirror(
+                    ctx, comp_name,
+                )))));
             }
         }
     }
@@ -9484,15 +9934,15 @@ pub(crate) fn native_class_array_type(
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     // Primitive component → "[I", "[J", … ; object/array component → "[L<name>;" or "[<arrayname>".
     let array_name = match name.as_str() {
-        "int"     => "[I".to_string(),
-        "long"    => "[J".to_string(),
-        "float"   => "[F".to_string(),
-        "double"  => "[D".to_string(),
+        "int" => "[I".to_string(),
+        "long" => "[J".to_string(),
+        "float" => "[F".to_string(),
+        "double" => "[D".to_string(),
         "boolean" => "[Z".to_string(),
-        "byte"    => "[B".to_string(),
-        "char"    => "[C".to_string(),
-        "short"   => "[S".to_string(),
-        "void"    => return Ok(Some(Value::Object(None))),
+        "byte" => "[B".to_string(),
+        "char" => "[C".to_string(),
+        "short" => "[S".to_string(),
+        "void" => return Ok(Some(Value::Object(None))),
         other if other.starts_with('[') => format!("[{other}"),
         other => format!("[L{};", other),
     };
@@ -9521,7 +9971,10 @@ pub(crate) fn native_class_array_type(
     Ok(Some(Value::Object(Some(mirror))))
 }
 
-pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_package_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -9819,14 +10272,15 @@ pub(crate) fn native_class_get_package(
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
     // Manifest-derived attributes.
-    let write_optional = |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
-        let obj = match val {
-            Some(s) => Value::Object(Some(ctx.create_string(&s))),
-            None => Value::Object(None),
+    let write_optional =
+        |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
+            let obj = match val {
+                Some(s) => Value::Object(Some(ctx.create_string(&s))),
+                None => Value::Object(None),
+            };
+            ctx.set_field(pkg, slot, obj);
+            ctx.set_field_by_name(pkg, field, obj);
         };
-        ctx.set_field(pkg, slot, obj);
-        ctx.set_field_by_name(pkg, field, obj);
-    };
     write_optional(ctx, 1, "specTitle", spec_title);
     write_optional(ctx, 2, "specVersion", spec_version);
     write_optional(ctx, 3, "specVendor", spec_vendor);
@@ -10009,14 +10463,15 @@ pub(crate) fn i2_classloader_define_package_class(
             (None, None, None, None, None, None)
         };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
-    let write_optional = |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
-        let obj = match val {
-            Some(s) => Value::Object(Some(ctx.create_string(&s))),
-            None => Value::Object(None),
+    let write_optional =
+        |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
+            let obj = match val {
+                Some(s) => Value::Object(Some(ctx.create_string(&s))),
+                None => Value::Object(None),
+            };
+            ctx.set_field(pkg, slot, obj);
+            ctx.set_field_by_name(pkg, field, obj);
         };
-        ctx.set_field(pkg, slot, obj);
-        ctx.set_field_by_name(pkg, field, obj);
-    };
     write_optional(ctx, 1, "specTitle", spec_title);
     write_optional(ctx, 2, "specVersion", spec_version);
     write_optional(ctx, 3, "specVendor", spec_vendor);
@@ -10030,9 +10485,7 @@ pub(crate) fn i2_classloader_define_package_class(
 /// `lang_invoke::register_t28_method_handle_completeness` so they land in
 /// both real-JDK and synthetic-jdk registration paths without any
 /// edits to `lib.rs` / `vm_init.rs` (per I2 surface rules).
-pub fn i2_register_classloader_package_natives(
-    r: &mut cratonvm_native_api::NativeMethodRegistry,
-) {
+pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::NativeMethodRegistry) {
     let cl = "java/lang/ClassLoader";
     r.register(
         cl,
@@ -10108,7 +10561,10 @@ pub(crate) fn i2_classloader_check_certs(
     Ok(None)
 }
 
-pub(crate) fn native_class_is_enum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_is_enum(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -10152,7 +10608,10 @@ pub(crate) fn native_class_get_canonical_name(
     Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
 }
 
-pub(crate) fn native_class_get_type_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_get_type_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -10179,7 +10638,11 @@ pub(crate) fn native_class_get_type_name(ctx: &mut dyn NativeContext, args: &[Va
         }
     }
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let type_name = if name.contains('/') { name.replace('/', ".") } else { name };
+    let type_name = if name.contains('/') {
+        name.replace('/', ".")
+    } else {
+        name
+    };
     Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
 }
 
@@ -10234,7 +10697,10 @@ pub(crate) fn native_class_get_enum_constants(
     {
         Some(i) => i,
         None => {
-            tracing::warn!("native_class_get_enum_constants: no $VALUES/ENUM$VALUES field for class={}", class_name);
+            tracing::warn!(
+                "native_class_get_enum_constants: no $VALUES/ENUM$VALUES field for class={}",
+                class_name
+            );
             return Ok(Some(Value::Object(None)));
         }
     };
@@ -10242,7 +10708,10 @@ pub(crate) fn native_class_get_enum_constants(
     let src_arr = match values_val {
         Value::Object(Some(a)) => a,
         _ => {
-            tracing::warn!("native_class_get_enum_constants: $VALUES is null/non-object for class={}", class_name);
+            tracing::warn!(
+                "native_class_get_enum_constants: $VALUES is null/non-object for class={}",
+                class_name
+            );
             return Ok(Some(Value::Object(None)));
         }
     };
@@ -10370,12 +10839,18 @@ pub(crate) fn native_class_get_class_loader(
     Ok(Some(Value::Object(Some(cl))))
 }
 
-pub(crate) fn native_class_as_subclass(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_as_subclass(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Return this class
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
 }
 
-pub(crate) fn native_class_descriptor_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_class_descriptor_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -10819,7 +11294,11 @@ pub(crate) fn native_class_get_record_components(
     // Allocate with the JDK-layout total field count, falling back to a
     // 3-slot floor for synthetic mode where the class is unknown.
     let jdk_layout_fields = ctx.class_num_total_fields(rc_class_id);
-    let num_fields = if jdk_layout_fields >= 3 { jdk_layout_fields } else { 3 };
+    let num_fields = if jdk_layout_fields >= 3 {
+        jdk_layout_fields
+    } else {
+        3
+    };
 
     // Resolve declared methods once so we can build the per-component
     // accessor link without re-querying the class manager per component.
@@ -10830,7 +11309,10 @@ pub(crate) fn native_class_get_record_components(
     // component descriptor.
     let declared = ctx.declared_methods(class_id);
 
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, components.len());
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        components.len(),
+    );
     for (i, (name, descriptor)) in components.iter().enumerate() {
         let rc_obj = ctx.alloc_object(rc_class_id, num_fields);
         let name_str = ctx.create_string(name);
@@ -10944,7 +11426,10 @@ pub(crate) fn native_class_get_annotated_superclass(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    Ok(Some(Value::Object(Some(make_annotated_type(ctx, super_mirror)))))
+    Ok(Some(Value::Object(Some(make_annotated_type(
+        ctx,
+        super_mirror,
+    )))))
 }
 
 /// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
@@ -11001,7 +11486,9 @@ fn make_annotated_type(
     // Try the impl class first (real-JDK layout); fall back to the
     // interface name (synthetic-mode placeholder).
     let cid = ctx
-        .ensure_class_initialized("sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl")
+        .ensure_class_initialized(
+            "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        )
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
         .unwrap_or(cratonvm_types::ClassId::new(0));
 
@@ -11296,7 +11783,11 @@ mod tests {
     use cratonvm_native_api::NativeContext;
 
     /// Helper: create a Class mirror object with the given class_id and name.
-    fn make_class_mirror(ctx: &mut crate::test_utils::MockNativeContext, class_id: u32, name: &str) -> ObjectRef {
+    fn make_class_mirror(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        class_id: u32,
+        name: &str,
+    ) -> ObjectRef {
         let name_obj = ctx.create_string(name);
         let mirror = ctx.alloc_object(ClassId::new(0), 2);
         ctx.set_field(mirror, 0, Value::Int(class_id as i32));
@@ -11364,15 +11855,17 @@ mod tests {
     fn non_jdk_caller_never_trusted() {
         // Even a Bootstrap-loaded class with a non-JDK name is not trusted
         // (defensive — should not normally occur).
-        assert!(!caller_is_jdk_internal(Some("com/acme/App"), LOADER_ID_BOOTSTRAP));
+        assert!(!caller_is_jdk_internal(
+            Some("com/acme/App"),
+            LOADER_ID_BOOTSTRAP
+        ));
         assert!(!caller_is_jdk_internal(None, LOADER_ID_BOOTSTRAP));
         assert!(!caller_is_jdk_internal(Some("com/acme/App"), 2));
     }
 
     #[test]
     fn parse_descriptor_mixed_params() {
-        let (params, ret) =
-            parse_descriptor_param_and_return("(ILjava/lang/String;D)V");
+        let (params, ret) = parse_descriptor_param_and_return("(ILjava/lang/String;D)V");
         assert_eq!(params, vec!["I", "Ljava/lang/String;", "D"]);
         assert_eq!(ret, "V");
     }
@@ -11386,8 +11879,7 @@ mod tests {
 
     #[test]
     fn parse_descriptor_object_return() {
-        let (params, ret) =
-            parse_descriptor_param_and_return("()Ljava/lang/String;");
+        let (params, ret) = parse_descriptor_param_and_return("()Ljava/lang/String;");
         assert!(params.is_empty());
         assert_eq!(ret, "Ljava/lang/String;");
     }
@@ -11441,9 +11933,13 @@ mod tests {
         // and returns a fresh Object[] with 7 non-null elements.
         use cratonvm_types::ArrayElementType;
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("java/util/concurrent/TimeUnit").unwrap();
+        let cid = ctx
+            .ensure_class_initialized("java/util/concurrent/TimeUnit")
+            .unwrap();
         // Flag the class as an enum (ACC_ENUM = 0x4000).
-        unsafe { (*ctx.class_flags_override.get()).insert(cid.as_u32(), 0x4000); }
+        unsafe {
+            (*ctx.class_flags_override.get()).insert(cid.as_u32(), 0x4000);
+        }
         // Populate a synthetic `$VALUES` array with 7 non-null entries —
         // one per TimeUnit constant (NANOSECONDS .. DAYS).
         let values_arr = ctx.new_array(ArrayElementType::Reference, 7);
@@ -11451,7 +11947,9 @@ mod tests {
             let elem = make_class_mirror(&mut ctx, cid.as_u32(), &format!("TimeUnit{i}"));
             ctx.set_array_element(values_arr, i, Value::Object(Some(elem)));
         }
-        unsafe { (*ctx.enum_values_override.get()).insert(cid.as_u32(), values_arr); }
+        unsafe {
+            (*ctx.enum_values_override.get()).insert(cid.as_u32(), values_arr);
+        }
 
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/util/concurrent/TimeUnit");
         let r = native_class_get_enum_constants(&mut ctx, &[Value::Object(Some(mirror))]);
@@ -12007,13 +12505,8 @@ mod tests {
     fn coerce_arg_strict_reference_passes_through() {
         let mut ctx = mock_ctx();
         let obj = ctx.alloc_object(ClassId::new(0), 0);
-        let v = coerce_arg_strict(
-            &ctx,
-            Value::Object(Some(obj)),
-            "Ljava/lang/Object;",
-            "test",
-        )
-        .unwrap();
+        let v = coerce_arg_strict(&ctx, Value::Object(Some(obj)), "Ljava/lang/Object;", "test")
+            .unwrap();
         assert_eq!(v, Value::Object(Some(obj)));
         // null is legal for a reference type.
         let v = coerce_arg_strict(&ctx, Value::Object(None), "Ljava/lang/String;", "test").unwrap();
@@ -12057,10 +12550,7 @@ mod tests {
         // Allocate with room for the synthetic layout (slots 0..=6) plus
         // the CratonVM extra-metadata slots (descriptor, rj_slot,
         // accessible) that the production readers now consult.
-        let obj = ctx.alloc_object(
-            ClassId::new(0),
-            FIELD_NUM_FIELDS + FIELD_EXTRA_SLOTS,
-        );
+        let obj = ctx.alloc_object(ClassId::new(0), FIELD_NUM_FIELDS + FIELD_EXTRA_SLOTS);
         // field 0: declaring class mirror (class_id = 1 arbitrary)
         let mirror = make_class_mirror(ctx, 1, "cratonvm/test/Fixture");
         ctx.set_field(obj, 0, Value::Object(Some(mirror)));
@@ -12072,7 +12562,7 @@ mod tests {
         let desc_s = ctx.create_string(descriptor);
         ctx.set_field(obj, 5, Value::Object(Some(desc_s)));
         ctx.set_field(obj, 6, Value::Int(1)); // accessible = true, bypass JPMS
-        // Extra-slot metadata (matches create_field_object's layout).
+                                              // Extra-slot metadata (matches create_field_object's layout).
         let base = FIELD_NUM_FIELDS;
         ctx.set_field(
             obj,
@@ -12084,11 +12574,7 @@ mod tests {
             base + FIELD_EXTRA_OFFSET_RJ_SLOT,
             Value::Int(slot_index),
         );
-        ctx.set_field(
-            obj,
-            base + FIELD_EXTRA_OFFSET_ACCESSIBLE,
-            Value::Int(1),
-        );
+        ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(1));
         obj
     }
 
@@ -12246,36 +12732,30 @@ mod tests {
 
         // getDeclaringClass → should return the String class mirror whose
         // name is "java/lang/String", NOT "java/lang/Object".
-        let r = native_field_get_declaring_class(
-            &mut ctx,
-            &[Value::Object(Some(field_obj))],
-        )
-        .unwrap();
+        let r =
+            native_field_get_declaring_class(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
         let mirror = match r {
             Some(Value::Object(Some(m))) => m,
             other => panic!("expected declaring class mirror, got {other:?}"),
         };
         let name = mirror_class_name(&ctx, mirror).unwrap_or_default();
-        assert_eq!(name, "java/lang/String",
-            "C5: Field.getDeclaringClass must resolve to the declared class");
+        assert_eq!(
+            name, "java/lang/String",
+            "C5: Field.getDeclaringClass must resolve to the declared class"
+        );
 
         // getModifiers → must read our access flags (verifies we don't
         // land on the wrong JDK Field slot, which would previously return
         // slot_index or 0).
-        let mods = native_field_get_modifiers(
-            &mut ctx,
-            &[Value::Object(Some(field_obj))],
-        )
-        .unwrap();
-        assert_eq!(mods, Some(Value::Int(0x1A)),
-            "C5: Field.getModifiers must return the original access flags");
+        let mods = native_field_get_modifiers(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
+        assert_eq!(
+            mods,
+            Some(Value::Int(0x1A)),
+            "C5: Field.getModifiers must return the original access flags"
+        );
 
         // getName → "serialVersionUID".
-        let n = native_field_get_name(
-            &mut ctx,
-            &[Value::Object(Some(field_obj))],
-        )
-        .unwrap();
+        let n = native_field_get_name(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
         let name_obj = match n {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected name String, got {other:?}"),
@@ -12327,54 +12807,45 @@ mod tests {
 
         // getDeclaringClass → returns the String class mirror (name
         // "java/lang/String"), NOT java/lang/Object.
-        let r = native_method_get_declaring_class(
-            &mut ctx,
-            &[Value::Object(Some(method_obj))],
-        )
-        .unwrap();
+        let r = native_method_get_declaring_class(&mut ctx, &[Value::Object(Some(method_obj))])
+            .unwrap();
         let mirror = match r {
             Some(Value::Object(Some(m))) => m,
             other => panic!("expected declaring class mirror, got {other:?}"),
         };
         let name = mirror_class_name(&ctx, mirror).unwrap_or_default();
-        assert_eq!(name, "java/lang/String",
-            "C6: Method.getDeclaringClass must resolve to the declared class");
+        assert_eq!(
+            name, "java/lang/String",
+            "C6: Method.getDeclaringClass must resolve to the declared class"
+        );
 
         // getModifiers → ACC_PUBLIC.
-        let mods = native_method_get_modifiers(
-            &mut ctx,
-            &[Value::Object(Some(method_obj))],
-        )
-        .unwrap();
-        assert_eq!(mods, Some(Value::Int(0x1)),
-            "C6: Method.getModifiers must return the original access flags");
+        let mods =
+            native_method_get_modifiers(&mut ctx, &[Value::Object(Some(method_obj))]).unwrap();
+        assert_eq!(
+            mods,
+            Some(Value::Int(0x1)),
+            "C6: Method.getModifiers must return the original access flags"
+        );
 
         // getName → "length".
-        let n = native_method_get_name(
-            &mut ctx,
-            &[Value::Object(Some(method_obj))],
-        )
-        .unwrap();
+        let n = native_method_get_name(&mut ctx, &[Value::Object(Some(method_obj))]).unwrap();
         let name_obj = match n {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected name String, got {other:?}"),
         };
-        assert_eq!(
-            ctx.read_string(name_obj).as_deref(),
-            Some("length"),
-        );
+        assert_eq!(ctx.read_string(name_obj).as_deref(), Some("length"),);
 
         // CratonVM extra-slot descriptor must round-trip.
         let desc = read_method_descriptor(&ctx, method_obj).unwrap_or_default();
-        assert_eq!(desc, "()I",
-            "C6: Method raw descriptor must survive in the extra slot");
+        assert_eq!(
+            desc, "()I",
+            "C6: Method raw descriptor must survive in the extra slot"
+        );
 
         // Parameter count is 0.
-        let pc = native_method_get_parameter_count(
-            &mut ctx,
-            &[Value::Object(Some(method_obj))],
-        )
-        .unwrap();
+        let pc = native_method_get_parameter_count(&mut ctx, &[Value::Object(Some(method_obj))])
+            .unwrap();
         assert_eq!(pc, Some(Value::Int(0)));
     }
 
@@ -12393,13 +12864,13 @@ mod tests {
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("java/lang/Object").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/lang/Object");
-        let r = native_class_get_protection_domain0(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "bootstrap class (no CodeSource URL) must return null PD");
+        let r =
+            native_class_get_protection_domain0(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "bootstrap class (no CodeSource URL) must return null PD"
+        );
     }
 
     #[test]
@@ -12412,17 +12883,13 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Signed").unwrap();
         // Seed overrides for this class.
         unsafe {
-            (*ctx.code_base_override.get())
-                .insert(cid.as_u32(), "file:/opt/app.jar".to_string());
+            (*ctx.code_base_override.get()).insert(cid.as_u32(), "file:/opt/app.jar".to_string());
             (*ctx.code_source_certs_override.get())
                 .insert(cid.as_u32(), vec![vec![1, 2, 3], vec![4, 5]]);
         }
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Signed");
-        let r = native_class_get_protection_domain0(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .unwrap();
+        let r =
+            native_class_get_protection_domain0(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
         let pd = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected ProtectionDomain, got {other:?}"),
@@ -12437,30 +12904,37 @@ mod tests {
             Value::Object(Some(s)) => s,
             other => panic!("expected location String at cs[0], got {other:?}"),
         };
-        assert_eq!(ctx.read_string(loc).as_deref(), Some("file:/opt/app.jar"),
-            "CodeSource.location must equal the class code base URL");
+        assert_eq!(
+            ctx.read_string(loc).as_deref(),
+            Some("file:/opt/app.jar"),
+            "CodeSource.location must equal the class code base URL"
+        );
         // CS.certs (slot 1) must be a 2-element Object[]
         let certs_arr = match ctx.get_field(cs, 1) {
             Value::Object(Some(a)) => a,
             other => panic!("expected certs array at cs[1], got {other:?}"),
         };
-        assert_eq!(ctx.array_length(certs_arr), 2,
-            "CodeSource.certs must have 2 elements matching the override");
+        assert_eq!(
+            ctx.array_length(certs_arr),
+            2,
+            "CodeSource.certs must have 2 elements matching the override"
+        );
     }
 
     #[test]
     fn t19_n1_class_get_signers_unsigned_returns_null() {
         // No cert override → unsigned class → getSigners returns null.
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("com/example/Unsigned").unwrap();
+        let cid = ctx
+            .ensure_class_initialized("com/example/Unsigned")
+            .unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Unsigned");
-        let r = native_class_get_signers(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "unsigned class must return null signers array");
+        let r = native_class_get_signers(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "unsigned class must return null signers array"
+        );
     }
 
     #[test]
@@ -12476,17 +12950,16 @@ mod tests {
                 .insert(cid.as_u32(), vec![cert_a.clone(), cert_b.clone()]);
         }
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Signed");
-        let r = native_class_get_signers(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .unwrap();
+        let r = native_class_get_signers(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
         let arr = match r {
             Some(Value::Object(Some(a))) => a,
             other => panic!("expected signers Object[], got {other:?}"),
         };
-        assert_eq!(ctx.array_length(arr), 2,
-            "signers array length must match cert count");
+        assert_eq!(
+            ctx.array_length(arr),
+            2,
+            "signers array length must match cert count"
+        );
         // Element 0: byte[] of cert_a
         let e0 = match ctx.get_array_element(arr, 0) {
             Value::Object(Some(b)) => b,
@@ -12494,8 +12967,11 @@ mod tests {
         };
         assert_eq!(ctx.array_length(e0), cert_a.len());
         for (i, &b) in cert_a.iter().enumerate() {
-            assert_eq!(ctx.get_array_element(e0, i), Value::Int(b as i8 as i32),
-                "signers[0][{i}] must match cert_a[{i}]");
+            assert_eq!(
+                ctx.get_array_element(e0, i),
+                Value::Int(b as i8 as i32),
+                "signers[0][{i}] must match cert_a[{i}]"
+            );
         }
         // Element 1: byte[] of cert_b
         let e1 = match ctx.get_array_element(arr, 1) {
@@ -12504,8 +12980,11 @@ mod tests {
         };
         assert_eq!(ctx.array_length(e1), cert_b.len());
         for (i, &b) in cert_b.iter().enumerate() {
-            assert_eq!(ctx.get_array_element(e1, i), Value::Int(b as i8 as i32),
-                "signers[1][{i}] must match cert_b[{i}]");
+            assert_eq!(
+                ctx.get_array_element(e1, i),
+                Value::Int(b as i8 as i32),
+                "signers[1][{i}] must match cert_b[{i}]"
+            );
         }
     }
 
@@ -12515,7 +12994,9 @@ mod tests {
         // panic / throw on a valid Class mirror + non-null signers array,
         // and does not perturb the getSigners result afterward.
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("com/example/SetSignersTarget").unwrap();
+        let cid = ctx
+            .ensure_class_initialized("com/example/SetSignersTarget")
+            .unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/SetSignersTarget");
         // Allocate a fake signers array to pass in.
         let signers = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
@@ -12531,13 +13012,12 @@ mod tests {
         assert_eq!(r, None, "setSigners returns void (None)");
         // After the documented-noop setSigners, getSigners still reflects
         // the (absent) override → null.
-        let g = native_class_get_signers(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .unwrap();
-        assert_eq!(g, Some(Value::Object(None)),
-            "setSigners is documented no-op; getSigners remains null");
+        let g = native_class_get_signers(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        assert_eq!(
+            g,
+            Some(Value::Object(None)),
+            "setSigners is documented no-op; getSigners remains null"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -12578,39 +13058,61 @@ mod tests {
 
     #[test]
     fn t19_h10_validate_resource_name_rejects_empty_and_oversize() {
-        assert!(t19_h10_validate_resource_name("").is_none(),
-            "empty name must be rejected");
+        assert!(
+            t19_h10_validate_resource_name("").is_none(),
+            "empty name must be rejected"
+        );
         let big = "a".repeat(257);
-        assert!(t19_h10_validate_resource_name(&big).is_none(),
-            "name >256 bytes must be rejected");
+        assert!(
+            t19_h10_validate_resource_name(&big).is_none(),
+            "name >256 bytes must be rejected"
+        );
         let edge = "a".repeat(256);
-        assert!(t19_h10_validate_resource_name(&edge).is_some(),
-            "name == 256 bytes must be accepted (boundary)");
+        assert!(
+            t19_h10_validate_resource_name(&edge).is_some(),
+            "name == 256 bytes must be accepted (boundary)"
+        );
     }
 
     #[test]
     fn t19_h10_validate_resource_name_rejects_traversal_and_backslash() {
-        assert!(t19_h10_validate_resource_name("../etc/passwd").is_none(),
-            "leading `..` segment must be rejected");
-        assert!(t19_h10_validate_resource_name("foo/../bar").is_none(),
-            "embedded `..` segment must be rejected");
-        assert!(t19_h10_validate_resource_name("foo\\bar").is_none(),
-            "backslash must be rejected (Windows-path-injection)");
+        assert!(
+            t19_h10_validate_resource_name("../etc/passwd").is_none(),
+            "leading `..` segment must be rejected"
+        );
+        assert!(
+            t19_h10_validate_resource_name("foo/../bar").is_none(),
+            "embedded `..` segment must be rejected"
+        );
+        assert!(
+            t19_h10_validate_resource_name("foo\\bar").is_none(),
+            "backslash must be rejected (Windows-path-injection)"
+        );
         // `..` substring inside a filename is fine — only the segment is.
-        assert!(t19_h10_validate_resource_name("foo..bar.txt").is_some(),
-            "`..` substring inside filename must be accepted");
+        assert!(
+            t19_h10_validate_resource_name("foo..bar.txt").is_some(),
+            "`..` substring inside filename must be accepted"
+        );
     }
 
     #[test]
     fn t19_h10_validate_resource_name_rejects_control_bytes() {
-        assert!(t19_h10_validate_resource_name("foo\0bar").is_none(),
-            "NUL byte must be rejected");
-        assert!(t19_h10_validate_resource_name("foo\nbar").is_none(),
-            "newline must be rejected");
-        assert!(t19_h10_validate_resource_name("foo\x7Fbar").is_none(),
-            "DEL byte must be rejected");
-        assert!(t19_h10_validate_resource_name("foo\x1Bbar").is_none(),
-            "ESC byte must be rejected");
+        assert!(
+            t19_h10_validate_resource_name("foo\0bar").is_none(),
+            "NUL byte must be rejected"
+        );
+        assert!(
+            t19_h10_validate_resource_name("foo\nbar").is_none(),
+            "newline must be rejected"
+        );
+        assert!(
+            t19_h10_validate_resource_name("foo\x7Fbar").is_none(),
+            "DEL byte must be rejected"
+        );
+        assert!(
+            t19_h10_validate_resource_name("foo\x1Bbar").is_none(),
+            "ESC byte must be rejected"
+        );
     }
 
     #[test]
@@ -12620,13 +13122,17 @@ mod tests {
         // blob keyed under `keycloak-version.properties`.
         let blob = b"version=26.2.4\nbuild-time=ok\n".to_vec();
         ctx.set_resource("keycloak-version.properties", blob.clone());
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("/keycloak-version.properties");
         let r = native_class_get_resource_as_stream(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
+        )
+        .unwrap();
         let stream = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null InputStream, got {other:?}"),
@@ -12647,15 +13153,22 @@ mod tests {
     #[test]
     fn t19_h10_get_resource_as_stream_returns_null_for_missing() {
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("/no-such-resource.txt");
         let r = native_class_get_resource_as_stream(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "missing resource must return null InputStream");
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "missing resource must return null InputStream"
+        );
     }
 
     #[test]
@@ -12665,15 +13178,22 @@ mod tests {
         // target, the validation gate must short-circuit BEFORE find_resource
         // is consulted.
         ctx.set_resource("../../../etc/passwd", b"oops".to_vec());
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("/../../../etc/passwd");
         let r = native_class_get_resource_as_stream(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "traversal name must be rejected, returning null");
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "traversal name must be rejected, returning null"
+        );
     }
 
     #[test]
@@ -12683,13 +13203,17 @@ mod tests {
         // is the package path joined with `bar.txt` — i.e. the same as
         // `Foo.class.getResourceAsStream("/org/keycloak/common/bar.txt")`.
         ctx.set_resource("org/keycloak/common/bar.txt", b"hello".to_vec());
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("bar.txt");
         let r = native_class_get_resource_as_stream(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
+        )
+        .unwrap();
         let stream = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null InputStream, got {other:?}"),
@@ -12702,13 +13226,17 @@ mod tests {
     fn t19_h10_get_resource_returns_url_for_present_resource() {
         let mut ctx = mock_ctx();
         ctx.set_resource("keycloak-version.properties", b"version=26.2.4".to_vec());
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("/keycloak-version.properties");
         let r = native_class_get_resource(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
+        )
+        .unwrap();
         let url = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null URL, got {other:?}"),
@@ -12723,26 +13251,33 @@ mod tests {
     #[test]
     fn t19_h10_get_resource_returns_null_for_missing() {
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
         let name = ctx.create_string("/no-such.properties");
         let r = native_class_get_resource(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
-        ).unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "absent resource must return null URL");
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "absent resource must return null URL"
+        );
     }
 
     #[test]
     fn t19_h10_get_package_returns_non_null_package_object() {
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized("org/keycloak/common/Version").unwrap();
-        let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
-        let r = native_class_get_package(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        ).unwrap();
+        let cid = ctx
+            .ensure_class_initialized("org/keycloak/common/Version")
+            .unwrap();
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "org/keycloak/common/Version");
+        let r = native_class_get_package(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
         let pkg = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null Package, got {other:?}"),
@@ -12762,10 +13297,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("Foo").unwrap();
         let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "Foo");
-        let r = native_class_get_package(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        ).unwrap();
+        let r = native_class_get_package(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
         let pkg = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null Package, got {other:?}"),
@@ -12774,8 +13306,11 @@ mod tests {
             Value::Object(Some(s)) => s,
             other => panic!("expected non-null name string, got {other:?}"),
         };
-        assert_eq!(ctx.read_string(name_obj).unwrap(), "",
-            "default package's name is the empty string");
+        assert_eq!(
+            ctx.read_string(name_obj).unwrap(),
+            "",
+            "default package's name is the empty string"
+        );
     }
 
     #[test]
@@ -12783,12 +13318,12 @@ mod tests {
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("[I").unwrap();
         let mirror = make_class_mirror_with_package(&mut ctx, cid.as_u32(), "[I");
-        let r = native_class_get_package(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        ).unwrap();
-        assert_eq!(r, Some(Value::Object(None)),
-            "primitive-component array has no Package");
+        let r = native_class_get_package(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        assert_eq!(
+            r,
+            Some(Value::Object(None)),
+            "primitive-component array has no Package"
+        );
     }
 
     #[test]
@@ -12859,9 +13394,9 @@ mod tests {
         let table = synthetic_jdk_method_decls("java/lang/ClassLoader");
         let target_desc =
             "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;";
-        let hit = table.iter().find(|(name, desc, _)| {
-            *name == "defineClass" && *desc == target_desc
-        });
+        let hit = table
+            .iter()
+            .find(|(name, desc, _)| *name == "defineClass" && *desc == target_desc);
         assert!(
             hit.is_some(),
             "F2: synthetic decls table must include the 5-arg \
@@ -12872,8 +13407,10 @@ mod tests {
     #[test]
     fn f2_synthetic_decls_table_returns_empty_for_unknown_class() {
         let table = synthetic_jdk_method_decls("com/example/UserClass");
-        assert!(table.is_empty(),
-            "F2: synthetic augmentation must NOT apply to user classes");
+        assert!(
+            table.is_empty(),
+            "F2: synthetic augmentation must NOT apply to user classes"
+        );
     }
 
     #[test]
@@ -12894,9 +13431,7 @@ mod tests {
                 Value::Object(Some(params)),
             ],
         )
-        .expect(
-            "F2: getDeclaredMethod must NOT throw NSME for ClassLoader.defineClass(5-arg)",
-        );
+        .expect("F2: getDeclaredMethod must NOT throw NSME for ClassLoader.defineClass(5-arg)");
 
         let method_obj = match r {
             Some(Value::Object(Some(m))) => m,
@@ -12906,8 +13441,7 @@ mod tests {
         // Spot-check the descriptor extra-slot round-trips.
         let desc = read_method_descriptor(&ctx, method_obj).unwrap_or_default();
         assert_eq!(
-            desc,
-            "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
+            desc, "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
             "F2: returned Method must carry the 5-arg descriptor",
         );
     }
@@ -12940,9 +13474,7 @@ mod tests {
                 Value::Object(Some(arr)),
             ],
         )
-        .expect(
-            "F2: getDeclaredMethod must find the 4-arg defineClass on ClassLoader",
-        );
+        .expect("F2: getDeclaredMethod must find the 4-arg defineClass on ClassLoader");
 
         let method_obj = match r {
             Some(Value::Object(Some(m))) => m,
@@ -12950,8 +13482,7 @@ mod tests {
         };
         let desc = read_method_descriptor(&ctx, method_obj).unwrap_or_default();
         assert_eq!(
-            desc,
-            "(Ljava/lang/String;[BII)Ljava/lang/Class;",
+            desc, "(Ljava/lang/String;[BII)Ljava/lang/Class;",
             "F2: returned Method must be the 4-arg overload",
         );
     }
@@ -12966,11 +13497,8 @@ mod tests {
             .expect("mock ensure_class_initialized must succeed");
         let mirror = make_class_mirror(&mut ctx, cl_cid.as_u32(), "java/lang/ClassLoader");
 
-        let r = native_class_get_declared_methods(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .expect("F2: getDeclaredMethods must succeed for ClassLoader");
+        let r = native_class_get_declared_methods(&mut ctx, &[Value::Object(Some(mirror))])
+            .expect("F2: getDeclaredMethods must succeed for ClassLoader");
 
         let arr = match r {
             Some(Value::Object(Some(a))) => a,
@@ -12999,7 +13527,9 @@ mod tests {
         }
 
         assert!(
-            define_class_descs.iter().any(|d| d == "([BII)Ljava/lang/Class;"),
+            define_class_descs
+                .iter()
+                .any(|d| d == "([BII)Ljava/lang/Class;"),
             "F2: legacy 3-arg defineClass([B,I,I) overload missing — got {:?}",
             define_class_descs,
         );
@@ -13039,9 +13569,8 @@ mod tests {
         // result must keep the real flags, not duplicate.
         let real_meta = MethodMetadata {
             name: "defineClass".to_string(),
-            descriptor:
-                "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;"
-                    .to_string(),
+            descriptor: "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;"
+                .to_string(),
             access_flags: 0x1, // ACC_PUBLIC, distinct from synthetic 0x14
             declaring_class_id: cl_cid,
             exceptions: Vec::new(),
@@ -13098,14 +13627,19 @@ mod tests {
         );
         let has_invoke = table.iter().any(|(name, desc, _)| {
             *name == "invoke"
-                && *desc
-                    == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+                && *desc == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
         });
-        assert!(has_invoke, "G2: Method.invoke must be in the synthetic decls table");
-        let has_get_name = table.iter().any(|(name, desc, _)| {
-            *name == "getName" && *desc == "()Ljava/lang/String;"
-        });
-        assert!(has_get_name, "G2: Method.getName must be in the synthetic decls table");
+        assert!(
+            has_invoke,
+            "G2: Method.invoke must be in the synthetic decls table"
+        );
+        let has_get_name = table
+            .iter()
+            .any(|(name, desc, _)| *name == "getName" && *desc == "()Ljava/lang/String;");
+        assert!(
+            has_get_name,
+            "G2: Method.getName must be in the synthetic decls table"
+        );
     }
 
     #[test]
@@ -13115,10 +13649,13 @@ mod tests {
             !table.is_empty(),
             "G2: synthetic decls table must include java/lang/reflect/Field",
         );
-        let has_get = table
-            .iter()
-            .any(|(name, desc, _)| *name == "get" && *desc == "(Ljava/lang/Object;)Ljava/lang/Object;");
-        assert!(has_get, "G2: Field.get must be in the synthetic decls table");
+        let has_get = table.iter().any(|(name, desc, _)| {
+            *name == "get" && *desc == "(Ljava/lang/Object;)Ljava/lang/Object;"
+        });
+        assert!(
+            has_get,
+            "G2: Field.get must be in the synthetic decls table"
+        );
     }
 
     #[test]
@@ -13129,8 +13666,7 @@ mod tests {
             "G2: synthetic decls table must include java/lang/reflect/Constructor",
         );
         let has_new_instance = table.iter().any(|(name, desc, _)| {
-            *name == "newInstance"
-                && *desc == "([Ljava/lang/Object;)Ljava/lang/Object;"
+            *name == "newInstance" && *desc == "([Ljava/lang/Object;)Ljava/lang/Object;"
         });
         assert!(
             has_new_instance,
@@ -13161,17 +13697,12 @@ mod tests {
             .expect("mock ensure_class_initialized must succeed");
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/lang/reflect/Method");
 
-        let r = native_class_get_declared_methods(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .expect("G2: getDeclaredMethods must NOT throw on Method class");
+        let r = native_class_get_declared_methods(&mut ctx, &[Value::Object(Some(mirror))])
+            .expect("G2: getDeclaredMethods must NOT throw on Method class");
 
         let arr = match r {
             Some(Value::Object(Some(a))) => a,
-            other => panic!(
-                "G2: getDeclaredMethods MUST return non-null array (was {other:?})",
-            ),
+            other => panic!("G2: getDeclaredMethods MUST return non-null array (was {other:?})",),
         };
         let len = ctx.array_length(arr);
         assert!(
@@ -13191,11 +13722,8 @@ mod tests {
             .expect("mock ensure_class_initialized must succeed");
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/lang/reflect/Method");
 
-        let r = native_class_get_declared_methods(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .expect("G2: getDeclaredMethods must succeed for Method class");
+        let r = native_class_get_declared_methods(&mut ctx, &[Value::Object(Some(mirror))])
+            .expect("G2: getDeclaredMethods must succeed for Method class");
 
         let arr = match r {
             Some(Value::Object(Some(a))) => a,
@@ -13222,8 +13750,14 @@ mod tests {
                 found_get_name = true;
             }
         }
-        assert!(found_invoke, "G2: Method.invoke must appear in getDeclaredMethods()");
-        assert!(found_get_name, "G2: Method.getName must appear in getDeclaredMethods()");
+        assert!(
+            found_invoke,
+            "G2: Method.invoke must appear in getDeclaredMethods()"
+        );
+        assert!(
+            found_get_name,
+            "G2: Method.getName must appear in getDeclaredMethods()"
+        );
     }
 
     #[test]
@@ -13235,14 +13769,10 @@ mod tests {
         let cid = ctx
             .ensure_class_initialized("com/example/UnknownClass")
             .expect("mock ensure_class_initialized must succeed");
-        let mirror =
-            make_class_mirror(&mut ctx, cid.as_u32(), "com/example/UnknownClass");
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/UnknownClass");
 
-        let r = native_class_get_declared_methods(
-            &mut ctx,
-            &[Value::Object(Some(mirror))],
-        )
-        .expect("G2: getDeclaredMethods must NOT error on unknown classes");
+        let r = native_class_get_declared_methods(&mut ctx, &[Value::Object(Some(mirror))])
+            .expect("G2: getDeclaredMethods must NOT error on unknown classes");
 
         match r {
             Some(Value::Object(Some(_))) => {}
@@ -13280,9 +13810,7 @@ mod tests {
                     "G2: empty exceptionTypes array must have length 0",
                 );
             }
-            other => panic!(
-                "G2: Method.exceptionTypes MUST be a non-null array (was {other:?})",
-            ),
+            other => panic!("G2: Method.exceptionTypes MUST be a non-null array (was {other:?})",),
         }
     }
 
@@ -13313,9 +13841,7 @@ mod tests {
                     "G2: parameterTypes for ()I must have length 0",
                 );
             }
-            other => panic!(
-                "G2: Method.parameterTypes MUST be a non-null array (was {other:?})",
-            ),
+            other => panic!("G2: Method.parameterTypes MUST be a non-null array (was {other:?})",),
         }
     }
 
@@ -13348,9 +13874,7 @@ mod tests {
                         "G2: {field} byte-array must be empty (length 0)",
                     );
                 }
-                other => panic!(
-                    "G2: Method.{field} MUST be non-null byte[] (was {other:?})",
-                ),
+                other => panic!("G2: Method.{field} MUST be non-null byte[] (was {other:?})",),
             }
         }
     }
@@ -13380,9 +13904,9 @@ mod tests {
             .expect("native_class_get_superclass must succeed for interface");
         match r {
             Some(Value::Object(None)) => {} // null — correct
-            other => panic!(
-                "G2: getSuperclass() on an interface MUST return null (was {other:?})",
-            ),
+            other => {
+                panic!("G2: getSuperclass() on an interface MUST return null (was {other:?})",)
+            }
         }
     }
 
@@ -13426,9 +13950,7 @@ mod tests {
         .expect("i2_classloader_get_defined_package must succeed");
         match r {
             Some(Value::Object(None)) => {} // null — correct
-            other => panic!(
-                "I2: getDefinedPackage MUST return null (was {other:?})",
-            ),
+            other => panic!("I2: getDefinedPackage MUST return null (was {other:?})",),
         }
     }
 
@@ -13452,9 +13974,7 @@ mod tests {
         .expect("i2_classloader_get_named_package must succeed");
         let pkg = match r {
             Some(Value::Object(Some(o))) => o,
-            other => panic!(
-                "I2: getNamedPackage MUST return a non-null Package (was {other:?})",
-            ),
+            other => panic!("I2: getNamedPackage MUST return a non-null Package (was {other:?})",),
         };
         // Verify slot 0 (and the by-name field) carry the package name.
         let stamped = ctx.get_field(pkg, 0);
@@ -13475,7 +13995,11 @@ mod tests {
         let mut ctx = mock_ctx();
         let r = i2_classloader_check_certs(
             &mut ctx,
-            &[Value::Object(None), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         )
         .expect("i2_classloader_check_certs must succeed");
         assert!(
@@ -13552,8 +14076,7 @@ mod tests {
         // Inject "real" `invoke` declaration with distinct flags.
         let real_meta = MethodMetadata {
             name: "invoke".to_string(),
-            descriptor: "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
-                .to_string(),
+            descriptor: "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
             access_flags: 0x09, // ACC_PUBLIC|ACC_STATIC, distinct from synthetic 0x81
             declaring_class_id: m_cid,
             exceptions: Vec::new(),
@@ -13565,8 +14088,7 @@ mod tests {
             .iter()
             .filter(|m| {
                 m.name == "invoke"
-                    && m.descriptor
-                        == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+                    && m.descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
             })
             .collect();
         assert_eq!(
@@ -13593,7 +14115,10 @@ mod tests {
         let name_str = ctx.create_string("java.lang.String");
         let r = native_class_for_name_module(
             &mut ctx,
-            &[Value::Object(Some(module_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(module_obj)),
+                Value::Object(Some(name_str)),
+            ],
         );
         match r.unwrap().unwrap() {
             Value::Object(Some(_mirror)) => {} // non-null Class mirror
@@ -13611,7 +14136,11 @@ mod tests {
         )
         .unwrap_err();
         let s = format!("{:?}", err);
-        assert!(s.contains("Null") || s.contains("null"), "expected NPE, got {}", s);
+        assert!(
+            s.contains("Null") || s.contains("null"),
+            "expected NPE, got {}",
+            s
+        );
     }
 
     #[test]
@@ -13624,7 +14153,11 @@ mod tests {
         )
         .unwrap_err();
         let s = format!("{:?}", err);
-        assert!(s.contains("Null") || s.contains("null"), "expected NPE, got {}", s);
+        assert!(
+            s.contains("Null") || s.contains("null"),
+            "expected NPE, got {}",
+            s
+        );
     }
 
     #[test]
@@ -13640,10 +14173,17 @@ mod tests {
         let name_str = ctx.create_string("non.existent.Bogus");
         let r = native_class_for_name_module(
             &mut ctx,
-            &[Value::Object(Some(module_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(module_obj)),
+                Value::Object(Some(name_str)),
+            ],
         );
         // Must NOT be an Err — never CNFE for this overload.
-        assert!(r.is_ok(), "Class.forName(Module, String) must not throw CNFE: {:?}", r);
+        assert!(
+            r.is_ok(),
+            "Class.forName(Module, String) must not throw CNFE: {:?}",
+            r
+        );
     }
 
     #[test]
@@ -13706,7 +14246,10 @@ mod tests {
         );
         match r.unwrap().unwrap() {
             Value::Object(Some(_)) => {}
-            other => panic!("expected Class mirror for java.lang.Object, got {:?}", other),
+            other => panic!(
+                "expected Class mirror for java.lang.Object, got {:?}",
+                other
+            ),
         }
     }
 
@@ -13757,7 +14300,7 @@ mod tests {
     #[test]
     fn wp21_field_check_final_static_final_always_throws() {
         let modifiers = ACC_PUBLIC | ACC_STATIC | ACC_FINAL; // 0x0019
-        // Without setAccessible.
+                                                             // Without setAccessible.
         assert!(
             check_final_for_set(modifiers, false, "K").is_err(),
             "static final without setAccessible MUST throw"
@@ -13800,4 +14343,3 @@ mod tests {
         volatile_store_fence_post(volatile_field);
     }
 }
-

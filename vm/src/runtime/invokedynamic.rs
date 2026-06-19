@@ -206,7 +206,11 @@ pub fn execute_invokedynamic(
         // Cache the StringConcat call site
         let site = ResolvedCallSite::StringConcat {
             recipe: Arc::from(info.recipe.clone()),
-            constant_args: info.constant_args.iter().map(|s| Arc::from(s.as_str())).collect(),
+            constant_args: info
+                .constant_args
+                .iter()
+                .map(|s| Arc::from(s.as_str()))
+                .collect(),
             target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
@@ -220,7 +224,9 @@ pub fn execute_invokedynamic(
         // Synthesize a recipe of all \u{0001} placeholders so the existing concat
         // logic works unchanged.
         let arg_types = parse_descriptor_args(&info.target_descriptor);
-        let synthetic_recipe: String = std::iter::repeat('\u{0001}').take(arg_types.len()).collect();
+        let synthetic_recipe: String = std::iter::repeat('\u{0001}')
+            .take(arg_types.len())
+            .collect();
         let patched_info = IndyInfo {
             bsm_class: info.bsm_class.clone(),
             bsm_method: info.bsm_method.clone(),
@@ -337,9 +343,11 @@ fn bootstrap_generic(
     // --- Re-resolve the BSM (with descriptor) + static args under the lock. ---
     let (bsm_class, bsm_method, bsm_desc, static_args) = {
         let cm = shared.class_manager.read();
-        let class = cm.get_class(current_class_id).ok_or_else(|| VmError::Internal {
-            message: format!("invokedynamic generic: class {current_class_id} not found"),
-        })?;
+        let class = cm
+            .get_class(current_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invokedynamic generic: class {current_class_id} not found"),
+            })?;
         let bsm_index = match class.constant_pool.get(cp_index) {
             Some(ConstantPoolEntry::InvokeDynamic {
                 bootstrap_method_attr_index,
@@ -347,7 +355,9 @@ fn bootstrap_generic(
             }) => *bootstrap_method_attr_index,
             _ => {
                 return Err(VmError::Internal {
-                    message: format!("invokedynamic generic cp#{cp_index}: not an InvokeDynamic entry"),
+                    message: format!(
+                        "invokedynamic generic cp#{cp_index}: not an InvokeDynamic entry"
+                    ),
                 }
                 .into())
             }
@@ -406,7 +416,10 @@ fn bootstrap_generic(
 
     // 3. The call-site MethodType.
     let mt = {
-        let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+        let mut ctx = NativeContextImpl {
+            shared,
+            thread: &mut *thread,
+        };
         cratonvm_native_builtins::lang_invoke::build_method_type_from_descriptor(
             &mut ctx,
             &info.target_descriptor,
@@ -439,7 +452,10 @@ fn bootstrap_generic(
             StaticArg::Class(name) => {
                 let cid = shared.load_class_concurrent(name)?;
                 let m = {
-                    let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+                    let mut ctx = NativeContextImpl {
+                        shared,
+                        thread: &mut *thread,
+                    };
                     ctx.get_class_mirror(cid)
                 };
                 bsm_pins.push((pos, thread.native_pin_roots.len()));
@@ -448,7 +464,10 @@ fn bootstrap_generic(
             }
             StaticArg::MType(desc) => {
                 let m = {
-                    let mut ctx = NativeContextImpl { shared, thread: &mut *thread };
+                    let mut ctx = NativeContextImpl {
+                        shared,
+                        thread: &mut *thread,
+                    };
                     cratonvm_native_builtins::lang_invoke::build_method_type_from_descriptor(
                         &mut ctx, desc,
                     )
@@ -472,20 +491,24 @@ fn bootstrap_generic(
     }
 
     // --- Invoke the bootstrap method → CallSite. ---
-    let callsite_val =
-        crate::vm::invoke_shared(shared, thread, &bsm_class, &bsm_method, &bsm_desc, &bsm_args)?;
+    let callsite_val = crate::vm::invoke_shared(
+        shared,
+        thread,
+        &bsm_class,
+        &bsm_method,
+        &bsm_desc,
+        &bsm_args,
+    )?;
     thread.native_pin_roots.truncate(pin_base); // bootstrap args no longer needed
 
     let callsite = match callsite_val {
         Some(Value::Object(Some(cs))) => cs,
-        _ => {
-            return Err(VmError::Internal {
-                message: format!(
-                    "invokedynamic generic: bootstrap {bsm_class}.{bsm_method} returned a non-CallSite"
-                ),
-            }
-            .into())
+        _ => return Err(VmError::Internal {
+            message: format!(
+                "invokedynamic generic: bootstrap {bsm_class}.{bsm_method} returned a non-CallSite"
+            ),
         }
+        .into()),
     };
     // Pin the CallSite across getTarget().
     thread.native_pin_roots.push(callsite);
@@ -810,16 +833,19 @@ fn allocate_lambda_proxy(
         None => {
             thread.tlab.retire();
             super::interpreter::maybe_gc_forced_pub(shared, thread);
-            shared.heap.try_alloc_object(proxy_class_id, num_captures).ok_or_else(|| {
-                MethodCallFailed::InternalError(crate::error::VmError::Runtime(
-                    crate::error::RuntimeError::OutOfMemoryError {
-                        message: format!(
-                            "Java heap space (lambda proxy with {} captures)",
-                            num_captures,
-                        ),
-                    },
-                ))
-            })?
+            shared
+                .heap
+                .try_alloc_object(proxy_class_id, num_captures)
+                .ok_or_else(|| {
+                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                        crate::error::RuntimeError::OutOfMemoryError {
+                            message: format!(
+                                "Java heap space (lambda proxy with {} captures)",
+                                num_captures,
+                            ),
+                        },
+                    ))
+                })?
         }
     };
     for (i, val) in captures.iter().enumerate() {
@@ -1200,19 +1226,24 @@ fn value_to_string(
             // Arrays must NOT take this path: num_slots is the array LENGTH,
             // so a length-1 array would masquerade as a wrapper and packed
             // primitive arrays would read a garbage Value slot.
-            let is_array = shared.heap.kind_of(*obj_ref)
-                == crate::memory::heap::ObjectKind::Array;
+            let is_array = shared.heap.kind_of(*obj_ref) == crate::memory::heap::ObjectKind::Array;
             let nf = shared.heap.get_header(*obj_ref).num_slots as usize;
             if nf == 1 && !is_array {
                 match shared.heap.get_field(*obj_ref, 0) {
                     Value::Int(v) => {
                         let class_id = shared.heap.class_id_of(*obj_ref);
-                        let name = shared.class_manager.read()
+                        let name = shared
+                            .class_manager
+                            .read()
                             .get_class(class_id)
                             .map(|c| c.name.clone())
                             .unwrap_or_default();
                         if name.contains("Boolean") {
-                            return if v != 0 { "true".to_string() } else { "false".to_string() };
+                            return if v != 0 {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            };
                         } else if name.contains("Character") {
                             return char::from_u32(v as u32).unwrap_or('?').to_string();
                         }
@@ -1231,7 +1262,9 @@ fn value_to_string(
                 use cratonvm_native_api::NativeContext;
                 match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(str_ref)))) => {
-                        return ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string());
+                        return ctx
+                            .read_string(str_ref)
+                            .unwrap_or_else(|| "null".to_string());
                     }
                     _ => {}
                 }
@@ -1362,7 +1395,10 @@ fn bootstrap_type_switch(
                         .to_string();
                     raw.push(RawSwitchLabel::Str(s));
                 }
-                Some(ConstantPoolEntry::Dynamic { name_and_type_index, .. }) => {
+                Some(ConstantPoolEntry::Dynamic {
+                    name_and_type_index,
+                    ..
+                }) => {
                     // JDK 25 primitive patterns (JEP 507): Dynamic constant that
                     // resolves via ConstantBootstraps.primitiveClass to a primitive
                     // Class (int.class, long.class, etc.). The name in the
@@ -1476,30 +1512,22 @@ pub fn execute_type_switch(
                 start_index,
             )
         }
-        Value::Int(v) => primitive_match(
-            labels,
-            start_index,
-            |l| matches!(l, SwitchLabel::Int(e) if *e == v)
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "I" || &**d == "Z" || &**d == "B" || &**d == "S" || &**d == "C"),
-        ),
-        Value::Long(v) => primitive_match(
-            labels,
-            start_index,
-            |l| matches!(l, SwitchLabel::Long(e) if *e == v)
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "J"),
-        ),
-        Value::Float(v) => primitive_match(
-            labels,
-            start_index,
-            |l| matches!(l, SwitchLabel::Float(e) if e.to_bits() == v.to_bits())
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "F"),
-        ),
-        Value::Double(v) => primitive_match(
-            labels,
-            start_index,
-            |l| matches!(l, SwitchLabel::Double(e) if e.to_bits() == v.to_bits())
-                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "D"),
-        ),
+        Value::Int(v) => primitive_match(labels, start_index, |l| {
+            matches!(l, SwitchLabel::Int(e) if *e == v)
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "I" || &**d == "Z" || &**d == "B" || &**d == "S" || &**d == "C")
+        }),
+        Value::Long(v) => primitive_match(labels, start_index, |l| {
+            matches!(l, SwitchLabel::Long(e) if *e == v)
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "J")
+        }),
+        Value::Float(v) => primitive_match(labels, start_index, |l| {
+            matches!(l, SwitchLabel::Float(e) if e.to_bits() == v.to_bits())
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "F")
+        }),
+        Value::Double(v) => primitive_match(labels, start_index, |l| {
+            matches!(l, SwitchLabel::Double(e) if e.to_bits() == v.to_bits())
+                || matches!(l, SwitchLabel::PrimitiveClass(d) if &**d == "D")
+        }),
         // Any other (non-target) value matches no label → default arm.
         _ => labels.len() as i32,
     };
@@ -1547,9 +1575,14 @@ fn type_switch_match(
             SwitchLabel::PrimitiveClass(desc) => {
                 // JEP 507: primitive type pattern matches boxed wrapper types.
                 match &**desc {
-                    "I" | "Z" | "B" | "S" | "C" => matches!(obj_class_name,
-                        "java/lang/Integer" | "java/lang/Boolean" | "java/lang/Byte"
-                        | "java/lang/Short" | "java/lang/Character"),
+                    "I" | "Z" | "B" | "S" | "C" => matches!(
+                        obj_class_name,
+                        "java/lang/Integer"
+                            | "java/lang/Boolean"
+                            | "java/lang/Byte"
+                            | "java/lang/Short"
+                            | "java/lang/Character"
+                    ),
                     "J" => obj_class_name == "java/lang/Long",
                     "F" => obj_class_name == "java/lang/Float",
                     "D" => obj_class_name == "java/lang/Double",
@@ -1579,13 +1612,14 @@ fn primitive_pattern_match(
 ) -> bool {
     // Extract the numeric value from the source wrapper.
     let source_value = match obj_class_name {
-        "java/lang/Byte" | "java/lang/Short" | "java/lang/Integer"
-        | "java/lang/Character" | "java/lang/Boolean" => {
-            match shared.heap.get_field(obj_ref, 0) {
-                Value::Int(v) => NumericValue::Int(v),
-                _ => return false,
-            }
-        }
+        "java/lang/Byte"
+        | "java/lang/Short"
+        | "java/lang/Integer"
+        | "java/lang/Character"
+        | "java/lang/Boolean" => match shared.heap.get_field(obj_ref, 0) {
+            Value::Int(v) => NumericValue::Int(v),
+            _ => return false,
+        },
         "java/lang/Long" => match shared.heap.get_field(obj_ref, 0) {
             Value::Long(v) => NumericValue::Long(v),
             _ => return false,
@@ -1622,13 +1656,15 @@ fn primitive_pattern_match(
             NumericValue::Int(_) => true, // same type always matches
             NumericValue::Long(v) => v >= i32::MIN as i64 && v <= i32::MAX as i64,
             NumericValue::Float(v) => {
-                !v.is_nan() && !v.is_infinite()
+                !v.is_nan()
+                    && !v.is_infinite()
                     && v >= i32::MIN as f32
                     && v <= i32::MAX as f32
                     && v == (v as i32) as f32
             }
             NumericValue::Double(v) => {
-                !v.is_nan() && !v.is_infinite()
+                !v.is_nan()
+                    && !v.is_infinite()
                     && v >= i32::MIN as f64
                     && v <= i32::MAX as f64
                     && v == (v as i32) as f64
@@ -1642,13 +1678,15 @@ fn primitive_pattern_match(
             }
             NumericValue::Long(_) => true,
             NumericValue::Float(v) => {
-                !v.is_nan() && !v.is_infinite()
+                !v.is_nan()
+                    && !v.is_infinite()
                     && v >= i64::MIN as f32
                     && v <= i64::MAX as f32
                     && v == (v as i64) as f32
             }
             NumericValue::Double(v) => {
-                !v.is_nan() && !v.is_infinite()
+                !v.is_nan()
+                    && !v.is_infinite()
                     && v >= i64::MIN as f64
                     && v <= i64::MAX as f64
                     && v == (v as i64) as f64
@@ -2111,10 +2149,7 @@ fn values_equal_deep(
 
 /// Hash one record component like the JDK's generated record `hashCode`:
 /// primitives by their wrapper hash, references via the VIRTUAL `hashCode`.
-fn value_hash_deep(
-    ctx: &mut NativeContextImpl<'_>,
-    v: &Value,
-) -> Result<i32, MethodCallFailed> {
+fn value_hash_deep(ctx: &mut NativeContextImpl<'_>, v: &Value) -> Result<i32, MethodCallFailed> {
     match v {
         Value::Object(Some(obj)) => {
             let cid = ctx.shared.heap.class_id_of(*obj);
@@ -2223,7 +2258,9 @@ fn value_hash(shared: &SharedVm, v: &Value) -> i32 {
                 .map(|c| c.name.clone());
             if name.as_deref() == Some("java/lang/String") {
                 if let Some(s) = read_java_string(&shared.heap, *obj) {
-                    return s.bytes().fold(0i32, |h, b| h.wrapping_mul(31).wrapping_add(b as i32));
+                    return s
+                        .bytes()
+                        .fold(0i32, |h, b| h.wrapping_mul(31).wrapping_add(b as i32));
                 }
             }
             obj.as_ptr() as i32
@@ -2238,7 +2275,11 @@ fn format_field_value(shared: &SharedVm, v: &Value, descriptor: &str) -> String 
     match v {
         Value::Int(n) => {
             if descriptor == "Z" {
-                if *n != 0 { "true".to_string() } else { "false".to_string() }
+                if *n != 0 {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
             } else if descriptor == "C" {
                 format!("{}", char::from_u32(*n as u32).unwrap_or('?'))
             } else {
@@ -2382,14 +2423,14 @@ mod tests {
     fn resolve_concat_constant_all_kinds() {
         use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
         let entries = vec![
-            CPE::Tombstone,                               // 0 (unused)
-            CPE::Utf8("lit".to_string().into()),          // 1
-            CPE::StringReference { string_index: 1 },     // 2  -> "lit"
-            CPE::Integer(42),                             // 3  -> "42"
-            CPE::Long(123456789012345),                   // 4  -> decimal
-            CPE::Float(1.0),                              // 5  -> "1.0"
-            CPE::Double(2.5),                             // 6  -> "2.5"
-            CPE::Utf8("verbatim".to_string().into()),     // 7  -> "verbatim"
+            CPE::Tombstone,                           // 0 (unused)
+            CPE::Utf8("lit".to_string().into()),      // 1
+            CPE::StringReference { string_index: 1 }, // 2  -> "lit"
+            CPE::Integer(42),                         // 3  -> "42"
+            CPE::Long(123456789012345),               // 4  -> decimal
+            CPE::Float(1.0),                          // 5  -> "1.0"
+            CPE::Double(2.5),                         // 6  -> "2.5"
+            CPE::Utf8("verbatim".to_string().into()), // 7  -> "verbatim"
         ];
         let cp = ConstantPool::new(entries);
 
@@ -2435,7 +2476,10 @@ mod tests {
             value_to_string(&shared, None, &Value::Long(123456789), 'J'),
             "123456789"
         );
-        assert_eq!(value_to_string(&shared, None, &Value::Object(None), 'L'), "null");
+        assert_eq!(
+            value_to_string(&shared, None, &Value::Object(None), 'L'),
+            "null"
+        );
     }
 
     #[test]
@@ -2456,11 +2500,11 @@ mod tests {
         use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
 
         let entries = vec![
-            CPE::Tombstone,                                         // 0 (unused)
-            CPE::Utf8("com/example/Foo".to_string().into()),        // 1
-            CPE::ClassReference { name_index: 1 },                  // 2
-            CPE::Utf8("doStuff".to_string().into()),                // 3
-            CPE::Utf8("(I)Ljava/lang/String;".to_string().into()),  // 4
+            CPE::Tombstone,                                        // 0 (unused)
+            CPE::Utf8("com/example/Foo".to_string().into()),       // 1
+            CPE::ClassReference { name_index: 1 },                 // 2
+            CPE::Utf8("doStuff".to_string().into()),               // 3
+            CPE::Utf8("(I)Ljava/lang/String;".to_string().into()), // 4
             CPE::NameAndType {
                 name_index: 3,
                 descriptor_index: 4,
@@ -2567,31 +2611,51 @@ mod tests {
     #[test]
     fn ppm_int_to_long_widening() {
         // int 42 should match long pattern (widening).
-        assert!(test_ppm("java/lang/Integer", Value::Int(42), "java/lang/Long"));
+        assert!(test_ppm(
+            "java/lang/Integer",
+            Value::Int(42),
+            "java/lang/Long"
+        ));
     }
 
     #[test]
     fn ppm_int_to_double_widening() {
         // int 42 should match double pattern (widening).
-        assert!(test_ppm("java/lang/Integer", Value::Int(42), "java/lang/Double"));
+        assert!(test_ppm(
+            "java/lang/Integer",
+            Value::Int(42),
+            "java/lang/Double"
+        ));
     }
 
     #[test]
     fn ppm_int_to_byte_narrowing_in_range() {
         // int 5 is in byte range [-128, 127], should match byte pattern.
-        assert!(test_ppm("java/lang/Integer", Value::Int(5), "java/lang/Byte"));
+        assert!(test_ppm(
+            "java/lang/Integer",
+            Value::Int(5),
+            "java/lang/Byte"
+        ));
     }
 
     #[test]
     fn ppm_int_to_byte_narrowing_out_of_range() {
         // int 200 is NOT in byte range, should NOT match.
-        assert!(!test_ppm("java/lang/Integer", Value::Int(200), "java/lang/Byte"));
+        assert!(!test_ppm(
+            "java/lang/Integer",
+            Value::Int(200),
+            "java/lang/Byte"
+        ));
     }
 
     #[test]
     fn ppm_long_to_int_narrowing_in_range() {
         // long 42 is in int range, should match.
-        assert!(test_ppm("java/lang/Long", Value::Long(42), "java/lang/Integer"));
+        assert!(test_ppm(
+            "java/lang/Long",
+            Value::Long(42),
+            "java/lang/Integer"
+        ));
     }
 
     #[test]
@@ -2607,7 +2671,11 @@ mod tests {
     #[test]
     fn ppm_int_to_char_narrowing_in_range() {
         // int 65 ('A') is in char range [0, 65535], should match.
-        assert!(test_ppm("java/lang/Integer", Value::Int(65), "java/lang/Character"));
+        assert!(test_ppm(
+            "java/lang/Integer",
+            Value::Int(65),
+            "java/lang/Character"
+        ));
     }
 
     #[test]
@@ -2623,7 +2691,11 @@ mod tests {
     #[test]
     fn ppm_string_to_long_no_match() {
         // Non-numeric class should never match a numeric pattern.
-        assert!(!test_ppm("java/lang/String", Value::Int(0), "java/lang/Long"));
+        assert!(!test_ppm(
+            "java/lang/String",
+            Value::Int(0),
+            "java/lang/Long"
+        ));
     }
 
     #[test]

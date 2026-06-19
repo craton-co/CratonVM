@@ -163,10 +163,7 @@ impl EventRepository {
     /// Round-5: this is the allocation-free primary API. Use `events_by_type`
     /// only when a `Vec` is genuinely required (e.g. by `.len()` from older
     /// test code). Callers that just iterate should call this directly.
-    pub fn iter_by_type(
-        &self,
-        type_id: EventTypeId,
-    ) -> impl Iterator<Item = &EventInstance> {
+    pub fn iter_by_type(&self, type_id: EventTypeId) -> impl Iterator<Item = &EventInstance> {
         // `into_iter` of `Option<&VecDeque<usize>>` -> flatten yields the
         // empty iterator when no indices exist for this type, avoiding the
         // allocation that the old `Vec::new()` branch required.
@@ -338,7 +335,11 @@ impl ThreadEventRing {
 #[inline]
 fn next_power_of_two(n: usize) -> usize {
     let n = n.max(1);
-    if n.is_power_of_two() { n } else { n.next_power_of_two() }
+    if n.is_power_of_two() {
+        n
+    } else {
+        n.next_power_of_two()
+    }
 }
 
 /// A single-producer / serialized-consumer bounded ring of `EventInstance`s.
@@ -553,7 +554,9 @@ impl SpscEventRing {
             // consumer's freed slots.
             let real_tail = self.tail.load(Ordering::Acquire);
             // SAFETY: producer-only field (see above).
-            unsafe { *self.cached_tail.get() = real_tail; }
+            unsafe {
+                *self.cached_tail.get() = real_tail;
+            }
             real_tail
         } else {
             cached_tail
@@ -1468,7 +1471,9 @@ mod tests {
         let mut drained: Vec<EventInstance> = Vec::new();
         shard.drain_into(&mut drained);
         assert!(
-            drained.iter().any(|e| e.start_time == unique_start && e.type_id == EventTypeId(7)),
+            drained
+                .iter()
+                .any(|e| e.start_time == unique_start && e.type_id == EventTypeId(7)),
             "expected pushed event to be visible in this thread's shard (drained {} events)",
             drained.len(),
         );
@@ -1483,13 +1488,21 @@ mod tests {
         // 3 actually gives 4. Verify the first 4 events make it in and the
         // 5th is dropped.
         let ring = SpscEventRing::new(3);
-        assert_eq!(ring.capacity(), 4, "capacity should round up to a power of two");
+        assert_eq!(
+            ring.capacity(),
+            4,
+            "capacity should round up to a power of two"
+        );
         for i in 0..4u64 {
-            ring.push(make_event(EventTypeId(1), i * 100, i * 100 + 50)).expect("not full yet");
+            ring.push(make_event(EventTypeId(1), i * 100, i * 100 + 50))
+                .expect("not full yet");
         }
         // 5th push should fail (drop-newest).
         let rejected = ring.push(make_event(EventTypeId(1), 4 * 100, 4 * 100 + 50));
-        assert!(rejected.is_err(), "ring should be full after `capacity` pushes");
+        assert!(
+            rejected.is_err(),
+            "ring should be full after `capacity` pushes"
+        );
 
         let mut out = Vec::new();
         ring.drain_into(&mut out);
@@ -1564,8 +1577,12 @@ mod tests {
                 let ring = reg.register_current_thread();
                 // Each thread pushes a unique-tagged event into its own SPSC
                 // shard (single producer = this thread).
-                ring.push(make_event(EventTypeId(t as u32 + 1), 1000 + t as u64, 2000 + t as u64))
-                    .expect("SPSC ring should have room for one event");
+                ring.push(make_event(
+                    EventTypeId(t as u32 + 1),
+                    1000 + t as u64,
+                    2000 + t as u64,
+                ))
+                .expect("SPSC ring should have room for one event");
             }));
         }
         for h in handles {
@@ -1582,7 +1599,11 @@ mod tests {
         for t in 0..n_threads {
             let expected = EventTypeId(t as u32 + 1);
             let count = drained.iter().filter(|e| e.type_id == expected).count();
-            assert_eq!(count, 1, "expected exactly one event for type {:?}", expected);
+            assert_eq!(
+                count, 1,
+                "expected exactly one event for type {:?}",
+                expected
+            );
         }
     }
 
@@ -1593,8 +1614,8 @@ mod tests {
 
     #[test]
     fn drop_with_wedged_consumer_finishes_within_timeout() {
-        use std::sync::Arc;
         use std::sync::atomic::Ordering;
+        use std::sync::Arc;
 
         // Use a short timeout so the test runs quickly. The default 1s is
         // fine for production but inflates CI time unnecessarily for tests.
@@ -1654,8 +1675,8 @@ mod tests {
 
     #[test]
     fn drop_with_active_consumer_drains_all_events() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
         // Active-consumer happy path: a consumer thread continually
@@ -1677,9 +1698,7 @@ mod tests {
             // Spin-drain until told to stop AND the ring is empty.
             loop {
                 consumer_ring.drain_into(&mut local);
-                if consumer_stop.load(Ordering::Acquire)
-                    && consumer_ring.is_empty()
-                {
+                if consumer_stop.load(Ordering::Acquire) && consumer_ring.is_empty() {
                     break;
                 }
                 thread::yield_now();
@@ -1703,7 +1722,8 @@ mod tests {
                 start_time: i,
                 end_time: i + 1,
                 thread_id: 1,
-                fields: smallvec![EventValue::String(Arc::from(format!("ev-{}", i)))] as EventFields,
+                fields: smallvec![EventValue::String(Arc::from(format!("ev-{}", i)))]
+                    as EventFields,
             };
             loop {
                 match ring.push(next) {
@@ -1742,7 +1762,12 @@ mod tests {
             let i = ev.start_time;
             match &ev.fields[0] {
                 EventValue::String(s) => {
-                    assert_eq!(&**s, format!("ev-{}", i), "payload corrupted for event {}", i);
+                    assert_eq!(
+                        &**s,
+                        format!("ev-{}", i),
+                        "payload corrupted for event {}",
+                        i
+                    );
                 }
                 other => panic!("unexpected field variant: {:?}", other),
             }
@@ -1776,7 +1801,11 @@ mod tests {
         // First drain takes the dead shard's event. The shard is now retired
         // AND empty, so this same `drain_all` reclaims it.
         let drained = registry.drain_all();
-        assert_eq!(drained.len(), 1, "the dead shard's event must still be drained");
+        assert_eq!(
+            drained.len(),
+            1,
+            "the dead shard's event must still be drained"
+        );
         assert_eq!(
             registry.registered_thread_count(),
             1,
@@ -1811,7 +1840,11 @@ mod tests {
             .is_ok());
 
         let drained = registry.drain_all();
-        assert_eq!(drained.len(), 0, "gate is held, so nothing drains this pass");
+        assert_eq!(
+            drained.len(),
+            0,
+            "gate is held, so nothing drains this pass"
+        );
         assert_eq!(
             registry.registered_thread_count(),
             1,
@@ -1822,7 +1855,11 @@ mod tests {
         // reclaim the now-empty retired shard.
         dead.consumer_busy.store(false, Ordering::Release);
         let drained2 = registry.drain_all();
-        assert_eq!(drained2.len(), 1, "event must survive and drain on the next pass");
+        assert_eq!(
+            drained2.len(),
+            1,
+            "event must survive and drain on the next pass"
+        );
         assert_eq!(
             registry.registered_thread_count(),
             0,

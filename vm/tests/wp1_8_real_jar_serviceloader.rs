@@ -69,10 +69,7 @@ fn fixture_class_bytes() -> Option<(Vec<u8>, Vec<u8>)> {
 /// Uses `zip::ZipWriter` (already a `vm` crate dep — see
 /// `vm/src/runtime/agent_loader.rs` for the established pattern) so the
 /// test does NOT depend on a `jar` binary being on PATH.
-fn make_spi_classpath_jar(
-    outer_class: &[u8],
-    inner_class: &[u8],
-) -> std::path::PathBuf {
+fn make_spi_classpath_jar(outer_class: &[u8], inner_class: &[u8]) -> std::path::PathBuf {
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
@@ -81,8 +78,8 @@ fn make_spi_classpath_jar(
 
     let file = std::fs::File::create(&jar_path).expect("create jar file");
     let mut zip = ZipWriter::new(file);
-    let opts: SimpleFileOptions = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts: SimpleFileOptions =
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     // 1. The SPI descriptor — load-bearing for ServiceLoader discovery.
     zip.start_file("META-INF/services/java.sql.Driver", opts)
@@ -177,9 +174,7 @@ fn driver_discovered_from_jar_on_classpath() {
              check Class.forName / BufferedReader.<init> resolution \
              when the fixture classes themselves are loaded from the JAR.",
         ),
-        other => panic!(
-            "serviceLoaderIteratorCount expected Ok(Some(Int(n>0))), got: {other:?}",
-        ),
+        other => panic!("serviceLoaderIteratorCount expected Ok(Some(Int(n>0))), got: {other:?}",),
     }
 }
 

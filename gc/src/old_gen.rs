@@ -107,7 +107,8 @@ fn min_satisfying_bucket(size: usize) -> usize {
     }
     // floor(log2(size)) - MIN_BUCKET_SHIFT — same formula as `bucket_for`.
     let lg = (usize::BITS - 1 - size.leading_zeros()) as usize;
-    lg.saturating_sub(MIN_BUCKET_SHIFT as usize).min(NUM_BUCKETS - 1)
+    lg.saturating_sub(MIN_BUCKET_SHIFT as usize)
+        .min(NUM_BUCKETS - 1)
 }
 
 /// Non-moving free-list allocator for the old generation.
@@ -186,7 +187,10 @@ impl OldGen {
         }
         let mut buckets: Vec<Vec<FreeBlock>> = (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
         // Seed the initial block in the bucket that fits the full capacity.
-        let initial = FreeBlock { offset: 0, size: capacity };
+        let initial = FreeBlock {
+            offset: 0,
+            size: capacity,
+        };
         buckets[bucket_for(capacity)].push(initial);
         Self {
             data,
@@ -541,10 +545,7 @@ impl OldGen {
                 break;
             }
             // Collect only if the object's start lands in a dirty card.
-            if dirty_ranges
-                .iter()
-                .any(|&(s, e)| offset >= s && offset < e)
-            {
+            if dirty_ranges.iter().any(|&(s, e)| offset >= s && offset < e) {
                 objects.push((ptr, total_size));
             }
             offset += total_size;
@@ -573,8 +574,9 @@ impl OldGen {
                 break;
             }
             let total_size = if header.kind == ObjectKind::Array {
-                HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
-                    .expect("array_data_size overflow in old_gen scan")
+                HEADER_SIZE
+                    + array_data_size(header.array_length as usize, header.element_type)
+                        .expect("array_data_size overflow in old_gen scan")
             } else {
                 HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
             };
@@ -798,9 +800,8 @@ impl OldGen {
             for &(obj_ptr, _size) in objects {
                 // Snapshot the marked bit; don't hold a header borrow while the
                 // closure below may write the same header (self-loop case).
-                let is_marked = unsafe {
-                    (*(obj_ptr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0
-                };
+                let is_marked =
+                    unsafe { (*(obj_ptr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 };
                 if !is_marked {
                     continue; // only trace *live* referrers
                 }
@@ -852,8 +853,7 @@ impl OldGen {
                         let ref_ptr = raw as usize;
                         // Only update references within old gen bounds
                         if ref_ptr >= data_start && ref_ptr < data_end {
-                            let ref_header =
-                                unsafe { &*(ref_ptr as *const ObjectHeader) };
+                            let ref_header = unsafe { &*(ref_ptr as *const ObjectHeader) };
                             if !ref_header.forwarding_ptr.is_null() {
                                 if seedhunt_enabled()
                                     && (ref_header.forwarding_ptr as usize) < 0x1000
@@ -898,17 +898,17 @@ impl OldGen {
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr() as usize;
                     if ref_ptr >= data_start && ref_ptr < data_end {
-                        let ref_header =
-                            unsafe { &*(ref_ptr as *const ObjectHeader) };
+                        let ref_header = unsafe { &*(ref_ptr as *const ObjectHeader) };
                         if !ref_header.forwarding_ptr.is_null() {
-                            if seedhunt_enabled()
-                                && (ref_header.forwarding_ptr as usize) < 0x1000
-                            {
+                            if seedhunt_enabled() && (ref_header.forwarding_ptr as usize) < 0x1000 {
                                 eprintln!(
                                     "[gcfwd] OBJ write small fwd: holder@0x{:x} cid={} fld[{}] \
                                      referent@0x{:x} cid={} marked={} fwd=0x{:x}",
-                                    obj_ptr as usize, header.class_id.as_u32(), slot_idx,
-                                    ref_ptr, ref_header.class_id.as_u32(),
+                                    obj_ptr as usize,
+                                    header.class_id.as_u32(),
+                                    slot_idx,
+                                    ref_ptr,
+                                    ref_header.class_id.as_u32(),
                                     ref_header.gc_flags & GC_FLAG_MARKED != 0,
                                     ref_header.forwarding_ptr as usize,
                                 );
@@ -1163,9 +1163,9 @@ mod tests {
 
         // A is the lowest-address live object, so it stays put (no map entry);
         // B must have been promoted and relocated, hence present in the map.
-        let b_new = *map.get(&(b as usize)).expect(
-            "unmarked target reachable from a live ref must be promoted + relocated",
-        );
+        let b_new = *map
+            .get(&(b as usize))
+            .expect("unmarked target reachable from a live ref must be promoted + relocated");
 
         unsafe {
             // A's field must now point at B's NEW location, in-bounds.
@@ -1175,14 +1175,18 @@ mod tests {
                 panic!("A's reference field was clobbered: {field_val:?}");
             };
             assert_eq!(
-                target.as_ptr() as usize, b_new,
+                target.as_ptr() as usize,
+                b_new,
                 "A's field must be forwarded to B's new location, not left dangling",
             );
 
             // The forwarded B must still hold real B data (tag preserved),
             // proving we did not leave the slot pointing at zeroed memory.
             let b_hdr = &*(b_new as *const ObjectHeader);
-            assert_eq!(b_hdr.identity_hash_code, B_TAG, "B data lost across compaction");
+            assert_eq!(
+                b_hdr.identity_hash_code, B_TAG,
+                "B data lost across compaction"
+            );
             // GC metadata cleared on the survivor.
             assert!(b_hdr.forwarding_ptr.is_null());
             assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);

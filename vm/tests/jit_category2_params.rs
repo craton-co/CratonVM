@@ -66,20 +66,40 @@ fn call_long(method: &str) -> i64 {
 fn cold_long_params_not_dropped() {
     require_class_files!();
     // a + b — the 2nd long must not be read as 0.
-    assert_eq!(call_long("addOnce"), 123, "addLongs(100,23): 2nd long dropped");
+    assert_eq!(
+        call_long("addOnce"),
+        123,
+        "addLongs(100,23): 2nd long dropped"
+    );
     // returns the 2nd param directly — the canonical "2nd cat-2 arg lost" probe.
-    assert_eq!(call_long("secondOnce"), 23, "secondLong(100,23): 2nd long read as 0");
+    assert_eq!(
+        call_long("secondOnce"),
+        23,
+        "secondLong(100,23): 2nd long read as 0"
+    );
     // 3rd of three longs — slot index 4, must survive.
-    assert_eq!(call_long("thirdOnce"), 3, "threeLongs(1,2,3): 3rd long dropped");
+    assert_eq!(
+        call_long("thirdOnce"),
+        3,
+        "threeLongs(1,2,3): 3rd long dropped"
+    );
 }
 
 #[test]
 fn hot_long_params_not_dropped() {
     require_class_files!();
     // 500 * 123 — any per-call dropped arg shifts the aggregate.
-    assert_eq!(call_long("driveAdd"), 61_500, "driveAdd aggregate wrong (long arg dropped)");
+    assert_eq!(
+        call_long("driveAdd"),
+        61_500,
+        "driveAdd aggregate wrong (long arg dropped)"
+    );
     // 500 * 23.
-    assert_eq!(call_long("driveSecond"), 11_500, "driveSecond aggregate wrong (2nd long read as 0)");
+    assert_eq!(
+        call_long("driveSecond"),
+        11_500,
+        "driveSecond aggregate wrong (2nd long read as 0)"
+    );
 }
 
 #[test]

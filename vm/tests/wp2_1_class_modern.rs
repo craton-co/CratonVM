@@ -52,10 +52,7 @@ fn test_resources_dir() -> String {
 }
 
 fn fixture_compiled() -> bool {
-    let path = format!(
-        "{}/cratonvm/Wp21ClassModern.class",
-        test_resources_dir()
-    );
+    let path = format!("{}/cratonvm/Wp21ClassModern.class", test_resources_dir());
     std::path::Path::new(&path).exists()
 }
 
@@ -117,7 +114,10 @@ fn class_modern_natives_registered() {
     for (name, desc) in [
         ("getNestHost0", "()Ljava/lang/Class;"),
         ("getPermittedSubclasses0", "()[Ljava/lang/Class;"),
-        ("getRecordComponents0", "()[Ljava/lang/reflect/RecordComponent;"),
+        (
+            "getRecordComponents0",
+            "()[Ljava/lang/reflect/RecordComponent;",
+        ),
         (
             "getDeclaredMethod",
             "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
@@ -209,14 +209,8 @@ fn get_type_annotations_probe() {
 
 #[test]
 fn fixture_class_file_is_staged() {
-    let java = format!(
-        "{}/cratonvm/Wp21ClassModern.java",
-        test_resources_dir()
-    );
-    let class = format!(
-        "{}/cratonvm/Wp21ClassModern.class",
-        test_resources_dir()
-    );
+    let java = format!("{}/cratonvm/Wp21ClassModern.java", test_resources_dir());
+    let class = format!("{}/cratonvm/Wp21ClassModern.class", test_resources_dir());
     assert!(
         std::path::Path::new(&java).exists(),
         "Wp21ClassModern.java fixture must exist at {java}"

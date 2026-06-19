@@ -90,8 +90,14 @@ fn check_safety_comments(path: &str) -> (usize, usize) {
 fn t11_1_gen_heap_safety_comments() {
     let p = ws("gc/src/gen_heap.rs");
     let (total, documented) = check_safety_comments(&p);
-    let coverage = if total > 0 { documented * 100 / total } else { 100 };
-    eprintln!("[t11] T11.1 gen_heap.rs: {documented}/{total} unsafe blocks documented ({coverage}%)");
+    let coverage = if total > 0 {
+        documented * 100 / total
+    } else {
+        100
+    };
+    eprintln!(
+        "[t11] T11.1 gen_heap.rs: {documented}/{total} unsafe blocks documented ({coverage}%)"
+    );
     assert!(
         coverage >= 90,
         "gen_heap.rs SAFETY coverage {coverage}% < 90% ({documented}/{total})"
@@ -102,7 +108,11 @@ fn t11_1_gen_heap_safety_comments() {
 fn t11_1_x64_safety_comments() {
     let p = ws("jit/src/x64.rs");
     let (total, documented) = check_safety_comments(&p);
-    let coverage = if total > 0 { documented * 100 / total } else { 100 };
+    let coverage = if total > 0 {
+        documented * 100 / total
+    } else {
+        100
+    };
     eprintln!("[t11] T11.1 x64.rs: {documented}/{total} unsafe blocks documented ({coverage}%)");
     assert!(
         coverage >= 90,
@@ -114,8 +124,14 @@ fn t11_1_x64_safety_comments() {
 fn t11_1_helpers_safety_comments() {
     let p = ws("vm/src/jit/helpers.rs");
     let (total, documented) = check_safety_comments(&p);
-    let coverage = if total > 0 { documented * 100 / total } else { 100 };
-    eprintln!("[t11] T11.1 helpers.rs: {documented}/{total} unsafe blocks documented ({coverage}%)");
+    let coverage = if total > 0 {
+        documented * 100 / total
+    } else {
+        100
+    };
+    eprintln!(
+        "[t11] T11.1 helpers.rs: {documented}/{total} unsafe blocks documented ({coverage}%)"
+    );
     assert!(
         coverage >= 90,
         "helpers.rs SAFETY coverage {coverage}% < 90% ({documented}/{total})"
@@ -126,8 +142,14 @@ fn t11_1_helpers_safety_comments() {
 fn t11_1_interpreter_safety_comments() {
     let p = ws("vm/src/runtime/interpreter.rs");
     let (total, documented) = check_safety_comments(&p);
-    let coverage = if total > 0 { documented * 100 / total } else { 100 };
-    eprintln!("[t11] T11.1 interpreter.rs: {documented}/{total} unsafe blocks documented ({coverage}%)");
+    let coverage = if total > 0 {
+        documented * 100 / total
+    } else {
+        100
+    };
+    eprintln!(
+        "[t11] T11.1 interpreter.rs: {documented}/{total} unsafe blocks documented ({coverage}%)"
+    );
     assert!(
         coverage >= 90,
         "interpreter.rs SAFETY coverage {coverage}% < 90% ({documented}/{total})"
@@ -255,7 +277,11 @@ fn count_unguarded_casts(path: &str) -> (usize, usize) {
 fn t11_3_interpreter_casts_annotated() {
     let p = ws("vm/src/runtime/interpreter.rs");
     let (total, annotated) = count_unguarded_casts(&p);
-    let coverage = if total > 0 { annotated * 100 / total } else { 100 };
+    let coverage = if total > 0 {
+        annotated * 100 / total
+    } else {
+        100
+    };
     eprintln!("[t11] T11.3 interpreter.rs: {annotated}/{total} casts annotated ({coverage}%)");
     assert!(
         coverage >= 70,
@@ -267,7 +293,11 @@ fn t11_3_interpreter_casts_annotated() {
 fn t11_3_x64_casts_annotated() {
     let p = ws("jit/src/x64.rs");
     let (total, annotated) = count_unguarded_casts(&p);
-    let coverage = if total > 0 { annotated * 100 / total } else { 100 };
+    let coverage = if total > 0 {
+        annotated * 100 / total
+    } else {
+        100
+    };
     eprintln!("[t11] T11.3 x64.rs: {annotated}/{total} casts annotated ({coverage}%)");
     assert!(
         coverage >= 70,
@@ -320,7 +350,11 @@ fn check_leak_docs(path: &str) -> (usize, usize) {
 fn t11_4_jit_leaks_documented() {
     let p = ws("jit/src/x64.rs");
     let (total, documented) = check_leak_docs(&p);
-    let coverage = if total > 0 { documented * 100 / total } else { 100 };
+    let coverage = if total > 0 {
+        documented * 100 / total
+    } else {
+        100
+    };
     eprintln!("[t11] T11.4 x64.rs: {documented}/{total} leak patterns documented ({coverage}%)");
     assert!(
         coverage >= 80,
@@ -387,7 +421,10 @@ fn t11_6_lock_order_module_declared() {
     let mod_rs = std::fs::read_to_string(&p).expect("failed to read runtime/mod.rs");
     let declared = mod_rs.contains("pub mod lock_order");
     eprintln!("[t11] T11.6 lock_order declared in mod.rs: {declared}");
-    assert!(declared, "lock_order module must be declared in runtime/mod.rs");
+    assert!(
+        declared,
+        "lock_order module must be declared in runtime/mod.rs"
+    );
 }
 
 #[test]
@@ -397,10 +434,19 @@ fn t11_6_lock_order_has_required_types() {
         Ok(c) => c,
         Err(e) => panic!("Cannot read lock_order.rs: {e}"),
     };
-    assert!(contents.contains("OrderedMutex"), "must define OrderedMutex");
-    assert!(contents.contains("OrderedRwLock"), "must define OrderedRwLock");
+    assert!(
+        contents.contains("OrderedMutex"),
+        "must define OrderedMutex"
+    );
+    assert!(
+        contents.contains("OrderedRwLock"),
+        "must define OrderedRwLock"
+    );
     assert!(contents.contains("LockLevel"), "must define LockLevel");
-    assert!(contents.contains("thread_local!"), "must use thread_local for debug tracking");
+    assert!(
+        contents.contains("thread_local!"),
+        "must use thread_local for debug tracking"
+    );
     eprintln!("[t11] T11.6 lock_order.rs contains all required types");
 }
 

@@ -54,8 +54,8 @@
 #![allow(clippy::collapsible_if)]
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
@@ -105,19 +105,15 @@ fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize
 // below are kept as a secondary store for synthetic-mode callers.
 // ---------------------------------------------------------------------------
 
-fn kpg_algo_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+fn kpg_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn kpg_keysize_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+fn kpg_keysize_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -155,7 +151,11 @@ fn set_kpg_bcprov(this: ObjectRef, bc: bool) {
 }
 
 fn get_kpg_bcprov(this: ObjectRef) -> bool {
-    kpg_bcprov_table().lock().get(&this).copied().unwrap_or(false)
+    kpg_bcprov_table()
+        .lock()
+        .get(&this)
+        .copied()
+        .unwrap_or(false)
 }
 
 /// Resolve the requested provider name from `getInstance`'s 2nd argument, which
@@ -556,14 +556,12 @@ fn real_rsa_keypair(
 /// for any other algorithm (the caller then mirrors BouncyCastle's own
 /// "no converter -> null" behaviour). The RSA key is bridged for fast verify via
 /// the identity map; EC verifies through the real key object directly.
-fn real_public_key_from_x509_der(
-    ctx: &mut dyn NativeContext,
-    der: &[u8],
-) -> MethodCallResult {
+fn real_public_key_from_x509_der(ctx: &mut dyn NativeContext, der: &[u8]) -> MethodCallResult {
     // OID TLVs as they appear inside the AlgorithmIdentifier SEQUENCE.
     const EC_OID: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
-    const RSA_OID: &[u8] =
-        &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]; // 1.2.840.113549.1.1.1
+    const RSA_OID: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ]; // 1.2.840.113549.1.1.1
     let has = |needle: &[u8]| der.windows(needle.len()).any(|w| w == needle);
     if has(EC_OID) && crate::route_ec_to_real() {
         let arr = alloc_byte_array(ctx, der);
@@ -615,10 +613,7 @@ fn real_public_key_from_x509_der(
 /// flows). Reconstruct EC/RSA keys from the SPKI's X.509 DER via the real
 /// KeyFactories instead. (RSA already worked via BC, but routing it here too is
 /// equivalent — a real `RSAPublicKeyImpl`, matching HotSpot's no-provider path.)
-fn bc_provider_get_public_key(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn bc_provider_get_public_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let spki = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -737,7 +732,11 @@ fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) 
         return;
     }
     // Non-CRT private keys expose no public exponent — default to F4 (65537).
-    let e = if e.is_empty() { vec![0x01, 0x00, 0x01] } else { e };
+    let e = if e.is_empty() {
+        vec![0x01, 0x00, 0x01]
+    } else {
+        e
+    };
     let key_id = crypto_impl::rsa_key_next_id();
     crypto_impl::rsa_key_store(
         key_id,
@@ -1047,7 +1046,13 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
     // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
     set_kpg_bcprov(kpg, is_bc);
-    let default_bits = if idx == ALGO_RSA { 2048 } else if idx == ALGO_EC { 256 } else { 0 };
+    let default_bits = if idx == ALGO_RSA {
+        2048
+    } else if idx == ALGO_EC {
+        256
+    } else {
+        0
+    };
     set_kpg_keysize(kpg, default_bits);
     // Also write the algorithm string to the real-JDK named field so the
     // bytecode-side `getAlgorithm()` (if ever reached on this receiver)
@@ -1085,18 +1090,27 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // keygen drive (`drive_real_ec_keypair`) honours the requested curve.
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let cur = get_kpg_keysize(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
-        Value::Int(n) => n,
-        _ => 0,
+    let cur = get_kpg_keysize(this).unwrap_or_else(|| {
+        match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+            Value::Int(n) => n,
+            _ => 0,
+        }
     });
-    let algo = get_kpg_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
-        Value::Int(i) => i,
-        _ => -1,
-    });
+    let algo =
+        get_kpg_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
+            Value::Int(i) => i,
+            _ => -1,
+        });
     if let Some(Value::Object(Some(spec))) = args.get(1) {
         ctx.set_field(this, base + KPG_OFF_SPEC, Value::Object(Some(*spec)));
     }
-    let bits = if algo == ALGO_EC { 256 } else if cur == 0 { 2048 } else { cur };
+    let bits = if algo == ALGO_EC {
+        256
+    } else if cur == 0 {
+        2048
+    } else {
+        cur
+    };
     set_kpg_keysize(this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
@@ -1118,10 +1132,12 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     });
     let algo = match algo {
         Some(i) => i,
-        None => return Err(RuntimeError::NotImplemented {
-            feature: "KeyPairGenerator with no algorithm".into(),
+        None => {
+            return Err(RuntimeError::NotImplemented {
+                feature: "KeyPairGenerator with no algorithm".into(),
+            }
+            .into())
         }
-        .into()),
     };
     let bits = get_kpg_keysize(this)
         .filter(|n| *n > 0)
@@ -1163,7 +1179,9 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         let pub_obj = alloc_public_key(ctx, ALGO_RSA, bits as i32, &pk_der, key_id);
         let priv_obj = alloc_private_key(ctx, ALGO_RSA, bits as i32, &sk_der, key_id);
-        return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
+        return Ok(Some(Value::Object(Some(alloc_keypair(
+            ctx, pub_obj, priv_obj,
+        )))));
     }
 
     if algo == ALGO_EC {
@@ -1186,7 +1204,9 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         );
         let pub_obj = alloc_public_key(ctx, ALGO_EC, 256, &pk_der, key_id);
         let priv_obj = alloc_private_key(ctx, ALGO_EC, 256, &sk_bytes, key_id);
-        return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
+        return Ok(Some(Value::Object(Some(alloc_keypair(
+            ctx, pub_obj, priv_obj,
+        )))));
     }
 
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyPairGenerator SPI (SUN /
@@ -1227,11 +1247,7 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let kf = alloc_concurrent_synthetic(
-        ctx,
-        "java/security/KeyFactory",
-        base + KF_PRIVATE_SLOTS,
-    );
+    let kf = alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS);
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
     Ok(Some(Value::Object(Some(kf))))
 }
@@ -1362,8 +1378,7 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // BC consumers); verify stays on the fast crypto_impl path via the
             // identity bridge. CRATONVM_SYNTHETIC_RSA=1 → bare-interface key.
             if crate::route_rsa_to_real() {
-                if let Ok(key) =
-                    real_rsa_key_from_components(ctx, &n_bytes, &e_bytes, key_id, true)
+                if let Ok(key) = real_rsa_key_from_components(ctx, &n_bytes, &e_bytes, key_id, true)
                 {
                     return Ok(Some(Value::Object(Some(key))));
                 }
@@ -1693,7 +1708,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
         return;
     }
     let kpg = "java/security/KeyPairGenerator";
-    r.register(kpg, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_get_instance);
+    r.register(
+        kpg,
+        "getInstance",
+        "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
+        kpg_get_instance,
+    );
     r.register(
         kpg,
         "getInstance",
@@ -1707,17 +1727,42 @@ pub fn register(r: &mut NativeMethodRegistry) {
         kpg_get_instance,
     );
     r.register(kpg, "initialize", "(I)V", kpg_initialize_int);
-    r.register(kpg, "initialize", "(ILjava/security/SecureRandom;)V", kpg_initialize_int_random);
-    r.register(kpg, "initialize", "(Ljava/security/spec/AlgorithmParameterSpec;)V", kpg_initialize_spec);
+    r.register(
+        kpg,
+        "initialize",
+        "(ILjava/security/SecureRandom;)V",
+        kpg_initialize_int_random,
+    );
+    r.register(
+        kpg,
+        "initialize",
+        "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+        kpg_initialize_spec,
+    );
     r.register(
         kpg,
         "initialize",
         "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
         kpg_initialize_spec_random,
     );
-    r.register(kpg, "generateKeyPair", "()Ljava/security/KeyPair;", kpg_generate_key_pair);
-    r.register(kpg, "genKeyPair", "()Ljava/security/KeyPair;", kpg_generate_key_pair);
-    r.register(kpg, "getAlgorithm", "()Ljava/lang/String;", kpg_get_algorithm);
+    r.register(
+        kpg,
+        "generateKeyPair",
+        "()Ljava/security/KeyPair;",
+        kpg_generate_key_pair,
+    );
+    r.register(
+        kpg,
+        "genKeyPair",
+        "()Ljava/security/KeyPair;",
+        kpg_generate_key_pair,
+    );
+    r.register(
+        kpg,
+        "getAlgorithm",
+        "()Ljava/lang/String;",
+        kpg_get_algorithm,
+    );
     // <clinit> shim — the JDK-25 KeyPairGenerator.<clinit> reads
     // `sun.security.util.Debug.getInstance("jca", "KeyPairGenerator")`
     // which we already shim, but defensively no-op the whole clinit so
@@ -1725,7 +1770,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(kpg, "<clinit>", "()V", clinit_noop);
 
     let kf = "java/security/KeyFactory";
-    r.register(kf, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;", kf_get_instance);
+    r.register(
+        kf,
+        "getInstance",
+        "(Ljava/lang/String;)Ljava/security/KeyFactory;",
+        kf_get_instance,
+    );
     r.register(
         kf,
         "getInstance",
@@ -1754,8 +1804,18 @@ pub fn register(r: &mut NativeMethodRegistry) {
     r.register(kf, "<clinit>", "()V", clinit_noop);
 
     let kp = "java/security/KeyPair";
-    r.register(kp, "getPublic", "()Ljava/security/PublicKey;", keypair_get_public);
-    r.register(kp, "getPrivate", "()Ljava/security/PrivateKey;", keypair_get_private);
+    r.register(
+        kp,
+        "getPublic",
+        "()Ljava/security/PublicKey;",
+        keypair_get_public,
+    );
+    r.register(
+        kp,
+        "getPrivate",
+        "()Ljava/security/PrivateKey;",
+        keypair_get_private,
+    );
 
     // BouncyCastle's static key reconstructor. Its EC converter is unregistered
     // (EC$Mappings.configure is no-op'd), so the real BC getPublicKey returns
@@ -1777,24 +1837,64 @@ pub fn register(r: &mut NativeMethodRegistry) {
     // class's method table.  That works because the registry is keyed
     // by class name and our synthetic class is named
     // `java/security/PublicKey`.
-    r.register("java/security/PublicKey", "getAlgorithm", "()Ljava/lang/String;", key_get_algorithm);
-    r.register("java/security/PublicKey", "getEncoded", "()[B", key_get_encoded);
-    r.register("java/security/PublicKey", "getFormat", "()Ljava/lang/String;", pubkey_get_format);
-    r.register("java/security/PrivateKey", "getAlgorithm", "()Ljava/lang/String;", key_get_algorithm);
-    r.register("java/security/PrivateKey", "getEncoded", "()[B", key_get_encoded);
-    r.register("java/security/PrivateKey", "getFormat", "()Ljava/lang/String;", privkey_get_format);
+    r.register(
+        "java/security/PublicKey",
+        "getAlgorithm",
+        "()Ljava/lang/String;",
+        key_get_algorithm,
+    );
+    r.register(
+        "java/security/PublicKey",
+        "getEncoded",
+        "()[B",
+        key_get_encoded,
+    );
+    r.register(
+        "java/security/PublicKey",
+        "getFormat",
+        "()Ljava/lang/String;",
+        pubkey_get_format,
+    );
+    r.register(
+        "java/security/PrivateKey",
+        "getAlgorithm",
+        "()Ljava/lang/String;",
+        key_get_algorithm,
+    );
+    r.register(
+        "java/security/PrivateKey",
+        "getEncoded",
+        "()[B",
+        key_get_encoded,
+    );
+    r.register(
+        "java/security/PrivateKey",
+        "getFormat",
+        "()Ljava/lang/String;",
+        privkey_get_format,
+    );
 
     // <clinit> shim for sun.security.jca.GetInstance — the bytecode-side
     // helper that throws our NPE.  No-opping is safe because we never
     // dispatch into this class once getInstance() is intercepted.
-    r.register("sun/security/jca/GetInstance", "<clinit>", "()V", clinit_noop);
+    r.register(
+        "sun/security/jca/GetInstance",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
     r.register("sun/security/jca/JCAUtil", "<clinit>", "()V", clinit_noop);
 
     // Signature also goes through `Signature.<clinit>` -> Debug; shim it
     // too so jca::signature can fire its overrides without the bytecode
     // running first.
     r.register("java/security/Signature", "<clinit>", "()V", clinit_noop);
-    r.register("java/security/MessageDigest", "<clinit>", "()V", clinit_noop);
+    r.register(
+        "java/security/MessageDigest",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
 
     // ECGenParameterSpec.<init>(String) — no-op except for stashing the
     // curve name so initialize(spec) can inspect it.  We intentionally
@@ -1852,7 +1952,15 @@ mod tests {
     /// empty-DER / `key_id == 0` key, presenting failed keygen as success.
     #[test]
     fn unimplemented_algorithm_keygen_throws_not_empty_key() {
-        for algo in ["ML-KEM-512", "ML-KEM-768", "ML-DSA-44", "ML-DSA-65", "X25519", "Ed25519", "Totally-Bogus"] {
+        for algo in [
+            "ML-KEM-512",
+            "ML-KEM-768",
+            "ML-DSA-44",
+            "ML-DSA-65",
+            "X25519",
+            "Ed25519",
+            "Totally-Bogus",
+        ] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let name = ctx.create_string(algo);
             let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
@@ -1908,7 +2016,10 @@ mod tests {
         );
         match ctx.get_field(pubk, KEY_FIELD_DER) {
             Value::Object(Some(der)) => {
-                assert!(ctx.array_length(der) > 0, "RSA public DER must be non-empty")
+                assert!(
+                    ctx.array_length(der) > 0,
+                    "RSA public DER must be non-empty"
+                )
             }
             other => panic!("expected DER byte[], got {other:?}"),
         }
@@ -1933,7 +2044,10 @@ mod tests {
         let spec = alloc_concurrent_synthetic(ctx, "java/security/spec/X509EncodedKeySpec", 1);
         let der_arr = alloc_byte_array(ctx, der);
         ctx.set_field(spec, 0, Value::Object(Some(der_arr)));
-        method(ctx, &[Value::Object(Some(kf_ref)), Value::Object(Some(spec))])
+        method(
+            ctx,
+            &[Value::Object(Some(kf_ref)), Value::Object(Some(spec))],
+        )
     }
 
     /// No-synthetic-stubs policy on the KeyFactory import path: when no usable
@@ -1944,10 +2058,17 @@ mod tests {
     #[test]
     fn keyfactory_unproducible_key_throws_not_dead_key() {
         // generatePublic: unimplemented algorithms.
-        for algo in ["ML-KEM-512", "ML-DSA-65", "X25519", "Ed25519", "Totally-Bogus"] {
+        for algo in [
+            "ML-KEM-512",
+            "ML-DSA-65",
+            "X25519",
+            "Ed25519",
+            "Totally-Bogus",
+        ] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
-            let err = kf_call(&mut ctx, algo, kf_generate_public, &[1, 2, 3])
-                .expect_err(&format!("{algo} generatePublic must throw, not return a dead key"));
+            let err = kf_call(&mut ctx, algo, kf_generate_public, &[1, 2, 3]).expect_err(&format!(
+                "{algo} generatePublic must throw, not return a dead key"
+            ));
             assert!(
                 matches!(err, MethodCallFailed::ExceptionThrown(_)),
                 "{algo} generatePublic: expected ExceptionThrown(InvalidKeySpecException), got {err:?}"
@@ -1956,16 +2077,25 @@ mod tests {
         // generatePublic: RSA with an unparseable spec.
         {
             let mut ctx = crate::test_utils::MockNativeContext::new();
-            let err = kf_call(&mut ctx, "RSA", kf_generate_public, &[0xDE, 0xAD, 0xBE, 0xEF])
-                .expect_err("RSA generatePublic with garbage DER must throw");
-            assert!(matches!(err, MethodCallFailed::ExceptionThrown(_)), "got {err:?}");
+            let err = kf_call(
+                &mut ctx,
+                "RSA",
+                kf_generate_public,
+                &[0xDE, 0xAD, 0xBE, 0xEF],
+            )
+            .expect_err("RSA generatePublic with garbage DER must throw");
+            assert!(
+                matches!(err, MethodCallFailed::ExceptionThrown(_)),
+                "got {err:?}"
+            );
         }
         // generatePrivate: no private-key importer exists for RSA (or anything
         // but the real-SunEC EC path) → must throw.
         for algo in ["RSA", "ML-DSA-65"] {
             let mut ctx = crate::test_utils::MockNativeContext::new();
-            let err = kf_call(&mut ctx, algo, kf_generate_private, &[1, 2, 3])
-                .expect_err(&format!("{algo} generatePrivate must throw, not return a dead key"));
+            let err = kf_call(&mut ctx, algo, kf_generate_private, &[1, 2, 3]).expect_err(
+                &format!("{algo} generatePrivate must throw, not return a dead key"),
+            );
             assert!(
                 matches!(err, MethodCallFailed::ExceptionThrown(_)),
                 "{algo} generatePrivate: expected ExceptionThrown(InvalidKeySpecException), got {err:?}"

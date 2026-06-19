@@ -56,10 +56,9 @@ fn missing_main_class_fails_with_clear_error() {
     );
 
     let combined = format!("{stdout}{stderr}");
-    let has_canonical_phrase =
-        combined.contains("Could not find or load main class")
-            || combined.contains("ClassNotFoundException")
-            || combined.contains("class not found");
+    let has_canonical_phrase = combined.contains("Could not find or load main class")
+        || combined.contains("ClassNotFoundException")
+        || combined.contains("class not found");
     assert!(
         has_canonical_phrase,
         "expected a clear missing-class error message on stdout or stderr; \

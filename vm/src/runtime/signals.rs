@@ -311,11 +311,7 @@ impl NpeMessageGenerator {
     /// Given a method's bytecode, a bytecode index, and stack depth,
     /// produce a human-readable NPE message or `None` if the bytecode
     /// cannot be decoded.
-    pub fn generate_message(
-        bytecode: &[u8],
-        bci: usize,
-        _stack_depth: usize,
-    ) -> Option<String> {
+    pub fn generate_message(bytecode: &[u8], bci: usize, _stack_depth: usize) -> Option<String> {
         let result = Self::analyze(bytecode, bci)?;
         Some(result.reason)
     }
@@ -362,8 +358,7 @@ impl NpeMessageGenerator {
                 entity_type: NpeEntityType::Monitor,
                 entity_name: None,
                 class_name: None,
-                reason: "Cannot enter synchronized block because \"<local>\" is null"
-                    .into(),
+                reason: "Cannot enter synchronized block because \"<local>\" is null".into(),
             }),
             _ => None,
         }
@@ -396,10 +391,7 @@ impl NpeMessageGenerator {
             entity_type: NpeEntityType::Field,
             entity_name: Some(field_name.clone()),
             class_name: None,
-            reason: format!(
-                "{} \"{}\" because \"objectRef\" is null",
-                verb, field_name
-            ),
+            reason: format!("{} \"{}\" because \"objectRef\" is null", verb, field_name),
         })
     }
 
@@ -426,15 +418,14 @@ impl NpeMessageGenerator {
         } else {
             "Cannot read field"
         };
-        format!("{} \"{}\" because \"{}\" is null", verb, field_name, object_ref)
+        format!(
+            "{} \"{}\" because \"{}\" is null",
+            verb, field_name, object_ref
+        )
     }
 
     /// Produce a message for a virtual/interface invoke NPE with known names.
-    pub fn invoke_npe_message(
-        class_name: &str,
-        method_name: &str,
-        object_ref: &str,
-    ) -> String {
+    pub fn invoke_npe_message(class_name: &str, method_name: &str, object_ref: &str) -> String {
         format!(
             "Cannot invoke \"{}.{}()\" because \"{}\" is null",
             class_name, method_name, object_ref
@@ -673,10 +664,7 @@ mod tests {
     fn hook_state_equality() {
         assert_eq!(HookState::Registered, HookState::Registered);
         assert_ne!(HookState::Running, HookState::Completed);
-        assert_eq!(
-            HookState::Failed("x".into()),
-            HookState::Failed("x".into())
-        );
+        assert_eq!(HookState::Failed("x".into()), HookState::Failed("x".into()));
     }
 
     // ── ThreadDumper ────────────────────────────────────────────────────
@@ -964,37 +952,25 @@ mod tests {
     #[test]
     fn array_length_npe_msg() {
         let msg = NpeMessageGenerator::array_length_npe_message("arr");
-        assert_eq!(
-            msg,
-            "Cannot read the array length because \"arr\" is null"
-        );
+        assert_eq!(msg, "Cannot read the array length because \"arr\" is null");
     }
 
     #[test]
     fn array_load_npe_msg() {
         let msg = NpeMessageGenerator::array_load_npe_message("data");
-        assert_eq!(
-            msg,
-            "Cannot load from array because \"data\" is null"
-        );
+        assert_eq!(msg, "Cannot load from array because \"data\" is null");
     }
 
     #[test]
     fn array_store_npe_msg() {
         let msg = NpeMessageGenerator::array_store_npe_message("buf");
-        assert_eq!(
-            msg,
-            "Cannot store to array because \"buf\" is null"
-        );
+        assert_eq!(msg, "Cannot store to array because \"buf\" is null");
     }
 
     #[test]
     fn throw_npe_msg() {
         let msg = NpeMessageGenerator::throw_npe_message("ex");
-        assert_eq!(
-            msg,
-            "Cannot throw exception because \"ex\" is null"
-        );
+        assert_eq!(msg, "Cannot throw exception because \"ex\" is null");
     }
 
     #[test]

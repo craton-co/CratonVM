@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 
-use cratonvm_types::{ClassId, ObjectRef, ArrayElementType, ObjectKind};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef};
 
 use crate::runtime::serviceability::HprofWriter;
 use crate::vm::SharedVm;
@@ -58,10 +58,15 @@ pub fn dump_heap(vm: &Arc<SharedVm>, path: &str) -> Result<u64, String> {
     let file = std::fs::File::create(path).map_err(|e| format!("cannot create {}: {}", path, e))?;
     let mut w = BufWriter::new(file);
     let mut dumper = HprofDumper::new(vm);
-    dumper.write_all(&mut w).map_err(|e| format!("write error: {}", e))?;
+    dumper
+        .write_all(&mut w)
+        .map_err(|e| format!("write error: {}", e))?;
     w.flush().map_err(|e| format!("flush error: {}", e))?;
-    let size = w.into_inner().map_err(|e| format!("flush error: {}", e))?
-        .metadata().map_err(|e| format!("metadata error: {}", e))?
+    let size = w
+        .into_inner()
+        .map_err(|e| format!("flush error: {}", e))?
+        .metadata()
+        .map_err(|e| format!("metadata error: {}", e))?
         .len();
     Ok(size)
 }
@@ -192,7 +197,12 @@ impl<'a> HprofDumper<'a> {
             let serial = self.class_serials[&class.id];
             let class_obj_id = class_obj_id_for(class.id);
             let name_id = self.strings[&*class.name];
-            w.write_all(&HprofWriter::write_load_class(serial, class_obj_id, 0, name_id))?;
+            w.write_all(&HprofWriter::write_load_class(
+                serial,
+                class_obj_id,
+                0,
+                name_id,
+            ))?;
         }
         Ok(())
     }
@@ -247,12 +257,10 @@ impl<'a> HprofDumper<'a> {
 
             match header.kind {
                 ObjectKind::Object => self.write_instance_dump_with_values(&mut seg, obj),
-                ObjectKind::Array => {
-                    match header.element_type {
-                        ArrayElementType::Reference => self.write_obj_array_dump(&mut seg, obj),
-                        _ => self.write_prim_array_dump(&mut seg, obj),
-                    }
-                }
+                ObjectKind::Array => match header.element_type {
+                    ArrayElementType::Reference => self.write_obj_array_dump(&mut seg, obj),
+                    _ => self.write_prim_array_dump(&mut seg, obj),
+                },
                 // Round-9 gc CRIT-1: humongous-continuation filler is a
                 // walker sentinel, never a real object. Skip from heap
                 // dumps.
@@ -326,30 +334,24 @@ impl<'a> HprofDumper<'a> {
 
         for class in cm.class_store.iter() {
             let class_obj_id = class_obj_id_for(class.id);
-            let super_obj_id = class.superclass
-                .map(class_obj_id_for)
-                .unwrap_or(0);
+            let super_obj_id = class.superclass.map(class_obj_id_for).unwrap_or(0);
 
             // Compute instance size in HPROF terms (sum of field byte sizes)
-            let instance_fields: Vec<_> = class.fields.iter()
-                .filter(|f| !f.is_static())
-                .collect();
-            let static_fields: Vec<_> = class.fields.iter()
-                .filter(|f| f.is_static())
-                .collect();
+            let instance_fields: Vec<_> = class.fields.iter().filter(|f| !f.is_static()).collect();
+            let static_fields: Vec<_> = class.fields.iter().filter(|f| f.is_static()).collect();
 
             // Instance size: all inherited + own instance fields' byte sizes
             let instance_byte_size = compute_instance_byte_size(class.id, &cm.class_store);
 
             seg.push_u8(GC_CLASS_DUMP);
-            seg.push_u64(class_obj_id);           // class object ID
-            seg.push_u32(0);                       // stack trace serial
-            seg.push_u64(super_obj_id);            // super class object ID
-            seg.push_u64(0);                       // classloader object ID
-            seg.push_u64(0);                       // signers object ID
-            seg.push_u64(0);                       // protection domain object ID
-            seg.push_u64(0);                       // reserved1
-            seg.push_u64(0);                       // reserved2
+            seg.push_u64(class_obj_id); // class object ID
+            seg.push_u32(0); // stack trace serial
+            seg.push_u64(super_obj_id); // super class object ID
+            seg.push_u64(0); // classloader object ID
+            seg.push_u64(0); // signers object ID
+            seg.push_u64(0); // protection domain object ID
+            seg.push_u64(0); // reserved1
+            seg.push_u64(0); // reserved2
             seg.push_u32(instance_byte_size as u32); // instance size (bytes)
 
             // Constant pool (empty)
@@ -390,13 +392,17 @@ impl<'a> HprofDumper<'a> {
         let class_id = header.class_id;
 
         seg.push_u8(GC_OBJ_ARRAY_DUMP);
-        seg.push_u64(obj.as_ptr() as u64);           // array object ID
-        seg.push_u32(0);                              // stack trace serial
-        seg.push_u32(length as u32);                  // num elements
-        seg.push_u64(class_obj_id_for(class_id));    // array class object ID
+        seg.push_u64(obj.as_ptr() as u64); // array object ID
+        seg.push_u32(0); // stack trace serial
+        seg.push_u32(length as u32); // num elements
+        seg.push_u64(class_obj_id_for(class_id)); // array class object ID
 
         for i in 0..length {
-            let val = self.vm.heap.get_array_element(obj, i).unwrap_or(cratonvm_types::Value::Object(None));
+            let val = self
+                .vm
+                .heap
+                .get_array_element(obj, i)
+                .unwrap_or(cratonvm_types::Value::Object(None));
             match val {
                 cratonvm_types::Value::Object(Some(r)) => seg.push_u64(r.as_ptr() as u64),
                 _ => seg.push_u64(0),
@@ -413,13 +419,16 @@ impl<'a> HprofDumper<'a> {
         let hprof_type = array_element_to_hprof(elem_type);
 
         seg.push_u8(GC_PRIM_ARRAY_DUMP);
-        seg.push_u64(obj.as_ptr() as u64);           // array object ID
-        seg.push_u32(0);                              // stack trace serial
-        seg.push_u32(length as u32);                  // num elements
-        seg.push_u8(hprof_type);                      // element type
+        seg.push_u64(obj.as_ptr() as u64); // array object ID
+        seg.push_u32(0); // stack trace serial
+        seg.push_u32(length as u32); // num elements
+        seg.push_u8(hprof_type); // element type
 
         for i in 0..length {
-            let val = self.vm.heap.get_array_element(obj, i)
+            let val = self
+                .vm
+                .heap
+                .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Int(0));
             match elem_type {
                 ArrayElementType::Boolean | ArrayElementType::Byte => {
@@ -459,7 +468,9 @@ struct SegmentBuilder {
 
 impl SegmentBuilder {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(1 << 20) }
+        Self {
+            buf: Vec::with_capacity(1 << 20),
+        }
     }
 
     fn len(&self) -> usize {
@@ -493,7 +504,7 @@ impl SegmentBuilder {
         }
         // Record header: tag(1) + timestamp(4) + body_length(4)
         w.write_all(&[HprofWriter::HPROF_HEAP_DUMP_SEGMENT])?;
-        w.write_all(&0u32.to_be_bytes())?;  // timestamp
+        w.write_all(&0u32.to_be_bytes())?; // timestamp
         w.write_all(&(self.buf.len() as u32).to_be_bytes())?;
         w.write_all(&self.buf)?;
         self.buf.clear();
@@ -530,13 +541,13 @@ fn descriptor_to_hprof_type(desc: &str) -> u8 {
 fn array_element_to_hprof(et: ArrayElementType) -> u8 {
     match et {
         ArrayElementType::Boolean => HPROF_BOOLEAN,
-        ArrayElementType::Char    => HPROF_CHAR,
-        ArrayElementType::Float   => HPROF_FLOAT,
-        ArrayElementType::Double  => HPROF_DOUBLE,
-        ArrayElementType::Byte    => HPROF_BYTE,
-        ArrayElementType::Short   => HPROF_SHORT,
-        ArrayElementType::Int     => HPROF_INT,
-        ArrayElementType::Long    => HPROF_LONG,
+        ArrayElementType::Char => HPROF_CHAR,
+        ArrayElementType::Float => HPROF_FLOAT,
+        ArrayElementType::Double => HPROF_DOUBLE,
+        ArrayElementType::Byte => HPROF_BYTE,
+        ArrayElementType::Short => HPROF_SHORT,
+        ArrayElementType::Int => HPROF_INT,
+        ArrayElementType::Long => HPROF_LONG,
         ArrayElementType::Reference => HPROF_OBJECT,
     }
 }
@@ -545,8 +556,8 @@ fn array_element_to_hprof(et: ArrayElementType) -> u8 {
 fn hprof_type_size(t: u8) -> usize {
     match t {
         HPROF_BOOLEAN | HPROF_BYTE => 1,
-        HPROF_CHAR | HPROF_SHORT   => 2,
-        HPROF_INT | HPROF_FLOAT    => 4,
+        HPROF_CHAR | HPROF_SHORT => 2,
+        HPROF_INT | HPROF_FLOAT => 4,
         HPROF_LONG | HPROF_DOUBLE | HPROF_OBJECT => 8,
         _ => 8,
     }
@@ -573,12 +584,10 @@ fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &cratonvm_type
         HPROF_DOUBLE => {
             seg.push_u64(val.as_double().unwrap_or(0.0).to_bits());
         }
-        HPROF_OBJECT => {
-            match val.as_object() {
-                Some(r) => seg.push_u64(r.as_ptr() as u64),
-                None => seg.push_u64(0),
-            }
-        }
+        HPROF_OBJECT => match val.as_object() {
+            Some(r) => seg.push_u64(r.as_ptr() as u64),
+            None => seg.push_u64(0),
+        },
         _ => seg.push_u64(0),
     }
 }
@@ -586,7 +595,10 @@ fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &cratonvm_type
 /// Compute total instance byte size for a class (all inherited + own fields).
 /// This is the sum of hprof_type_size for each instance field walking up
 /// the hierarchy.
-fn compute_instance_byte_size(class_id: ClassId, store: &cratonvm_classloading::ClassStore) -> usize {
+fn compute_instance_byte_size(
+    class_id: ClassId,
+    store: &cratonvm_classloading::ClassStore,
+) -> usize {
     let chain = class_hierarchy_chain(class_id, store);
     let mut size = 0usize;
     for cid in &chain {
@@ -602,7 +614,10 @@ fn compute_instance_byte_size(class_id: ClassId, store: &cratonvm_classloading::
 }
 
 /// Build class hierarchy chain from leaf class up to java/lang/Object, then reverse.
-fn class_hierarchy_chain(class_id: ClassId, store: &cratonvm_classloading::ClassStore) -> Vec<ClassId> {
+fn class_hierarchy_chain(
+    class_id: ClassId,
+    store: &cratonvm_classloading::ClassStore,
+) -> Vec<ClassId> {
     let mut chain = Vec::new();
     let mut current = Some(class_id);
     while let Some(cid) = current {
@@ -679,12 +694,10 @@ fn write_value_to_vec(buf: &mut Vec<u8>, htype: u8, val: &cratonvm_types::Value)
         HPROF_DOUBLE => {
             buf.extend_from_slice(&val.as_double().unwrap_or(0.0).to_bits().to_be_bytes());
         }
-        HPROF_OBJECT => {
-            match val.as_object() {
-                Some(r) => buf.extend_from_slice(&(r.as_ptr() as u64).to_be_bytes()),
-                None => buf.extend_from_slice(&0u64.to_be_bytes()),
-            }
-        }
+        HPROF_OBJECT => match val.as_object() {
+            Some(r) => buf.extend_from_slice(&(r.as_ptr() as u64).to_be_bytes()),
+            None => buf.extend_from_slice(&0u64.to_be_bytes()),
+        },
         _ => buf.extend_from_slice(&0u64.to_be_bytes()),
     }
 }
@@ -715,11 +728,20 @@ mod tests {
 
     #[test]
     fn s42_array_element_to_hprof() {
-        assert_eq!(array_element_to_hprof(ArrayElementType::Boolean), HPROF_BOOLEAN);
+        assert_eq!(
+            array_element_to_hprof(ArrayElementType::Boolean),
+            HPROF_BOOLEAN
+        );
         assert_eq!(array_element_to_hprof(ArrayElementType::Int), HPROF_INT);
         assert_eq!(array_element_to_hprof(ArrayElementType::Long), HPROF_LONG);
-        assert_eq!(array_element_to_hprof(ArrayElementType::Double), HPROF_DOUBLE);
-        assert_eq!(array_element_to_hprof(ArrayElementType::Reference), HPROF_OBJECT);
+        assert_eq!(
+            array_element_to_hprof(ArrayElementType::Double),
+            HPROF_DOUBLE
+        );
+        assert_eq!(
+            array_element_to_hprof(ArrayElementType::Reference),
+            HPROF_OBJECT
+        );
     }
 
     #[test]
@@ -791,7 +813,11 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_long() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_LONG, &cratonvm_types::Value::Long(123456789012345));
+        write_value_for_type(
+            &mut seg,
+            HPROF_LONG,
+            &cratonvm_types::Value::Long(123456789012345),
+        );
         assert_eq!(seg.len(), 8);
         assert_eq!(&seg.buf, &(123456789012345u64).to_be_bytes());
     }
@@ -862,7 +888,13 @@ mod tests {
         ] {
             let mut buf = Vec::new();
             write_value_to_vec(&mut buf, htype, &val);
-            assert_eq!(buf.len(), expected_size, "type={} expected size={}", htype, expected_size);
+            assert_eq!(
+                buf.len(),
+                expected_size,
+                "type={} expected size={}",
+                htype,
+                expected_size
+            );
         }
     }
 
@@ -929,7 +961,10 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == HprofWriter::HPROF_UTF8 {
                 found_string = true;
@@ -937,7 +972,10 @@ mod tests {
             }
             pos += 9 + body_len;
         }
-        assert!(found_string, "Dump should contain at least one STRING_IN_UTF8 record");
+        assert!(
+            found_string,
+            "Dump should contain at least one STRING_IN_UTF8 record"
+        );
     }
 
     #[test]
@@ -954,14 +992,20 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == HprofWriter::HPROF_LOAD_CLASS {
                 load_class_count += 1;
             }
             pos += 9 + body_len;
         }
-        assert!(load_class_count > 0, "Dump should contain LOAD_CLASS records");
+        assert!(
+            load_class_count > 0,
+            "Dump should contain LOAD_CLASS records"
+        );
     }
 
     #[test]
@@ -978,7 +1022,10 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == HprofWriter::HPROF_HEAP_DUMP_SEGMENT {
                 found_segment = true;
@@ -986,7 +1033,10 @@ mod tests {
             }
             pos += 9 + body_len;
         }
-        assert!(found_segment, "Dump should contain at least one HEAP_DUMP_SEGMENT");
+        assert!(
+            found_segment,
+            "Dump should contain at least one HEAP_DUMP_SEGMENT"
+        );
     }
 
     #[test]
@@ -1004,7 +1054,10 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == HprofWriter::HPROF_HEAP_DUMP_SEGMENT && body_len > 0 {
                 // Scan sub-records in segment body
@@ -1029,7 +1082,10 @@ mod tests {
             }
             pos += 9 + body_len;
         }
-        assert!(found_class_dump, "Dump should contain CLASS_DUMP sub-records in HEAP_DUMP_SEGMENT");
+        assert!(
+            found_class_dump,
+            "Dump should contain CLASS_DUMP sub-records in HEAP_DUMP_SEGMENT"
+        );
     }
 
     #[test]
@@ -1046,7 +1102,10 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == HprofWriter::HPROF_TRACE {
                 found_trace = true;
@@ -1054,7 +1113,10 @@ mod tests {
             }
             pos += 9 + body_len;
         }
-        assert!(found_trace, "Dump should contain at least one STACK_TRACE record");
+        assert!(
+            found_trace,
+            "Dump should contain at least one STACK_TRACE record"
+        );
     }
 
     #[test]
@@ -1090,7 +1152,10 @@ mod tests {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos + 5], output[pos + 6], output[pos + 7], output[pos + 8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             tags.push(tag);
             pos += 9 + body_len;
@@ -1100,8 +1165,10 @@ mod tests {
         assert_eq!(*tags.last().unwrap(), HprofWriter::HPROF_HEAP_DUMP_END);
 
         // Must contain at least one HEAP_DUMP_SEGMENT
-        assert!(tags.contains(&HprofWriter::HPROF_HEAP_DUMP_SEGMENT),
-            "Must contain HEAP_DUMP_SEGMENT");
+        assert!(
+            tags.contains(&HprofWriter::HPROF_HEAP_DUMP_SEGMENT),
+            "Must contain HEAP_DUMP_SEGMENT"
+        );
 
         // First tags should be STRING records
         assert_eq!(tags[0], HprofWriter::HPROF_UTF8);

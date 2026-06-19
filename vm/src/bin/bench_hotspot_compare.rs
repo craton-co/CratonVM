@@ -106,10 +106,9 @@ pub struct CompareReport {
 }
 
 fn load_baseline(path: &Path) -> Result<Baseline, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid json in {}: {e}", path.display()))
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("invalid json in {}: {e}", path.display()))
 }
 
 /// Pure comparator — called by tests and the CLI.
@@ -129,7 +128,11 @@ pub fn compare(rust: &Baseline, hotspot: &Baseline, threshold: f64) -> CompareRe
 
     for key in keys {
         let r = rust.metrics.get(&key).map(|m| m.median_ns).unwrap_or(0.0);
-        let h = hotspot.metrics.get(&key).map(|m| m.median_ns).unwrap_or(0.0);
+        let h = hotspot
+            .metrics
+            .get(&key)
+            .map(|m| m.median_ns)
+            .unwrap_or(0.0);
 
         let (ratio, status) = match (r, h) {
             (0.0, 0.0) => (None, RatioStatus::RustjvmBootstrap),
@@ -231,15 +234,21 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<CliArgs, String> 
     while let Some(a) = it.next() {
         match a.as_str() {
             "--rust-baseline" => {
-                let v = it.next().ok_or_else(|| "--rust-baseline needs a value".to_string())?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--rust-baseline needs a value".to_string())?;
                 out.rust_baseline = Some(PathBuf::from(v));
             }
             "--hotspot-baseline" => {
-                let v = it.next().ok_or_else(|| "--hotspot-baseline needs a value".to_string())?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--hotspot-baseline needs a value".to_string())?;
                 out.hotspot_baseline = Some(PathBuf::from(v));
             }
             "--threshold" => {
-                let v = it.next().ok_or_else(|| "--threshold needs a value".to_string())?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--threshold needs a value".to_string())?;
                 let t: f64 = v.parse().map_err(|e| format!("--threshold: {e}"))?;
                 if t <= 0.0 || !t.is_finite() {
                     return Err(format!("--threshold must be > 0, got {t}"));
@@ -247,7 +256,9 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<CliArgs, String> 
                 out.threshold = Some(t);
             }
             "--report" => {
-                let v = it.next().ok_or_else(|| "--report needs a value".to_string())?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--report needs a value".to_string())?;
                 out.report = Some(PathBuf::from(v));
             }
             "--help" | "-h" => {
@@ -501,10 +512,7 @@ mod tests {
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.host, "ubuntu-latest");
         assert_eq!(parsed.metrics.len(), 3);
-        assert_eq!(
-            parsed.metrics.get("vm_startup").unwrap().median_ns,
-            1234.0
-        );
+        assert_eq!(parsed.metrics.get("vm_startup").unwrap().median_ns, 1234.0);
         assert_eq!(
             parsed
                 .metrics
@@ -646,8 +654,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.clone(), v.median_ns / ratio))
             .collect();
-        let borrowed: Vec<(&str, f64)> =
-            pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let borrowed: Vec<(&str, f64)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         bl(&borrowed)
     }
 
@@ -708,17 +715,15 @@ mod tests {
             };
             hs_pairs.push((k.clone(), rv / target_ratio));
         }
-        let borrowed: Vec<(&str, f64)> =
-            hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let borrowed: Vec<(&str, f64)> = hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let hotspot = bl(&borrowed);
 
         let rep = compare(&rust, &hotspot, 1.5);
         // All entries measured (same keys on both sides).
-        assert!(
-            rep.entries
-                .iter()
-                .all(|e| e.status == RatioStatus::Measured),
-        );
+        assert!(rep
+            .entries
+            .iter()
+            .all(|e| e.status == RatioStatus::Measured),);
         // Sanity: at least one ratio is below 1.0 (cratonvm faster).
         assert!(rep.entries.iter().any(|e| e.ratio.unwrap() < 1.0));
         // And at least one near 1.4×.
@@ -757,8 +762,7 @@ mod tests {
             let target_ratio = if i == 0 { 500.0 } else { 1.2 };
             hs_pairs.push((k.clone(), rv / target_ratio));
         }
-        let borrowed: Vec<(&str, f64)> =
-            hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let borrowed: Vec<(&str, f64)> = hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let hotspot = bl(&borrowed);
 
         let rep = compare(&rust, &hotspot, 1.5);
@@ -812,8 +816,7 @@ mod tests {
                 hs_pairs.push((k.clone(), 0.0));
             }
         }
-        let borrowed: Vec<(&str, f64)> =
-            hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let borrowed: Vec<(&str, f64)> = hs_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let hotspot = bl(&borrowed);
 
         let rep = compare(&rust, &hotspot, 1.5);
@@ -856,11 +859,15 @@ mod tests {
         let mut rust = realistic_cratonvm();
         rust.metrics.insert(
             "future_bench_a".into(),
-            MetricEntry { median_ns: 999_999.0 },
+            MetricEntry {
+                median_ns: 999_999.0,
+            },
         );
         rust.metrics.insert(
             "future_bench_b".into(),
-            MetricEntry { median_ns: 123_456.0 },
+            MetricEntry {
+                median_ns: 123_456.0,
+            },
         );
         // HotSpot mirrors only the original keys, at a clean 1.1×.
         let hotspot = realistic_hotspot_at_ratio(1.1);

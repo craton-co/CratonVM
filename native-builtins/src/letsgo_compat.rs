@@ -19,9 +19,9 @@ use cratonvm_native_api::NativeMethodRegistry;
 #[cfg(feature = "synthetic-jdk")]
 use cratonvm_native_api::NativeContext;
 #[cfg(feature = "synthetic-jdk")]
-use cratonvm_types::Value;
-#[cfg(feature = "synthetic-jdk")]
 use cratonvm_types::error::MethodCallResult;
+#[cfg(feature = "synthetic-jdk")]
+use cratonvm_types::Value;
 // synthetic-stub removed: `ArrayElementType`, `alloc_concurrent_synthetic`, and
 // the `alloc_letsgo_wrapper` helper were only used by the deleted wrapper-boxing
 // and hardcoded-`Security.getAlgorithms` stubs.
@@ -117,14 +117,34 @@ fn register_blocking_queue_drain_to(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
-    r.register(lbq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_lbq_bounded);
+    r.register(
+        lbq,
+        "drainTo",
+        "(Ljava/util/Collection;I)I",
+        drain_to_lbq_bounded,
+    );
 
     let abq = "java/util/concurrent/ArrayBlockingQueue";
-    r.register(abq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_abq_bounded);
+    r.register(
+        abq,
+        "drainTo",
+        "(Ljava/util/Collection;I)I",
+        drain_to_abq_bounded,
+    );
 
     let bq = "java/util/concurrent/BlockingQueue";
-    r.register(bq, "drainTo", "(Ljava/util/Collection;)I", drain_to_iface_unbounded);
-    r.register(bq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_iface_bounded);
+    r.register(
+        bq,
+        "drainTo",
+        "(Ljava/util/Collection;)I",
+        drain_to_iface_unbounded,
+    );
+    r.register(
+        bq,
+        "drainTo",
+        "(Ljava/util/Collection;I)I",
+        drain_to_iface_bounded,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -138,15 +158,24 @@ fn drain_to_lbq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let max = match args.get(2) { Some(Value::Int(n)) => *n, _ => i32::MAX };
+    let max = match args.get(2) {
+        Some(Value::Int(n)) => *n,
+        _ => i32::MAX,
+    };
     if max <= 0 {
         return Ok(Some(Value::Int(0)));
     }
     ctx.monitor_enter(this);
-    let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => 0 };
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(a)) => a,
-        _ => { ctx.monitor_exit(this); return Ok(Some(Value::Int(0))); }
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     let n = size.min(max);
     for i in 0..n as usize {
@@ -175,18 +204,30 @@ fn drain_to_abq_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let max = match args.get(2) { Some(Value::Int(n)) => *n, _ => i32::MAX };
+    let max = match args.get(2) {
+        Some(Value::Int(n)) => *n,
+        _ => i32::MAX,
+    };
     if max <= 0 {
         return Ok(Some(Value::Int(0)));
     }
     ctx.monitor_enter(this);
-    let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => 0 };
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(a)) => a,
-        _ => { ctx.monitor_exit(this); return Ok(Some(Value::Int(0))); }
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     let cap = ctx.array_length(arr) as i32;
-    let head = match ctx.get_field(this, 2) { Value::Int(n) => n, _ => 0 };
+    let head = match ctx.get_field(this, 2) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
     let n = size.min(max);
     for i in 0..n {
         let idx = ((head + i) % cap.max(1)) as usize;
@@ -226,7 +267,10 @@ fn drain_to_iface_bounded(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(c))) => Value::Object(Some(*c)),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let max = match args.get(2) { Some(Value::Int(n)) => Value::Int(*n), _ => Value::Int(i32::MAX) };
+    let max = match args.get(2) {
+        Some(Value::Int(n)) => Value::Int(*n),
+        _ => Value::Int(i32::MAX),
+    };
     let r = ctx.invoke_virtual(this, "drainTo", "(Ljava/util/Collection;I)I", &[coll, max])?;
     Ok(r.or(Some(Value::Int(0))))
 }

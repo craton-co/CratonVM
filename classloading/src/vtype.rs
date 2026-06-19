@@ -190,7 +190,10 @@ impl VType {
                 // must NOT panic on the slice — fall back to Top so
                 // verification fails cleanly later, matching the
                 // `_ => VType::Top` arm below.
-                match descriptor.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                match descriptor
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                {
                     Some(class_name) => VType::ObjectRef(Arc::from(class_name)),
                     None => VType::Top, // malformed object descriptor
                 }
@@ -303,7 +306,6 @@ impl VType {
             // the top of this function already covers the sound cases.
             // The arms accepting `Uninitialized*` → `ObjectRef` are
             // therefore removed.
-
             _ => false,
         }
     }
@@ -983,8 +985,7 @@ mod tests {
         assert!(VType::Int.is_assignable_to(&VType::Top, &h));
         assert!(VType::Long.is_assignable_to(&VType::Top, &h));
         assert!(VType::Null.is_assignable_to(&VType::Top, &h));
-        assert!(VType::ObjectRef(Arc::from("java/lang/String"))
-            .is_assignable_to(&VType::Top, &h));
+        assert!(VType::ObjectRef(Arc::from("java/lang/String")).is_assignable_to(&VType::Top, &h));
         assert!(VType::ArrayRef(Arc::from("[I")).is_assignable_to(&VType::Top, &h));
     }
 

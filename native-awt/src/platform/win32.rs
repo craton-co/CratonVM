@@ -247,8 +247,7 @@ struct DirectWriteRenderer {
 
 impl DirectWriteRenderer {
     fn new() -> WinResult<Self> {
-        let factory: IDWriteFactory =
-            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let factory: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         Ok(Self {
             factory,
             text_format_cache: Mutex::new(HashMap::new()),
@@ -307,8 +306,7 @@ impl DirectWriteRenderer {
         bold: bool,
         italic: bool,
     ) -> WinResult<IDWriteTextLayout> {
-        let format =
-            self.get_or_create_format(font_family, font_size, bold, italic)?;
+        let format = self.get_or_create_format(font_family, font_size, bold, italic)?;
         let text_wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             self.factory
@@ -537,10 +535,7 @@ impl PlatformBackend for Win32Backend {
         height: u32,
     ) -> Result<WindowId, PlatformError> {
         self.ensure_class_registered()?;
-        let tw: Vec<u16> = title
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let tw: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -584,28 +579,16 @@ impl PlatformBackend for Win32Backend {
     }
 
     fn show_window(&mut self, id: WindowId, visible: bool) -> Result<(), PlatformError> {
-        let info = self
-            .windows
-            .get(&id)
-            .ok_or(PlatformError::WindowNotFound)?;
+        let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         unsafe {
-            let _ = ShowWindow(
-                info.hwnd(),
-                if visible { SW_SHOW } else { SW_HIDE },
-            );
+            let _ = ShowWindow(info.hwnd(), if visible { SW_SHOW } else { SW_HIDE });
         }
         Ok(())
     }
 
     fn set_window_title(&mut self, id: WindowId, title: &str) -> Result<(), PlatformError> {
-        let info = self
-            .windows
-            .get(&id)
-            .ok_or(PlatformError::WindowNotFound)?;
-        let w: Vec<u16> = title
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
+        let w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let _ = unsafe { SetWindowTextW(info.hwnd(), PCWSTR(w.as_ptr())) };
         Ok(())
     }
@@ -629,10 +612,7 @@ impl PlatformBackend for Win32Backend {
     }
 
     fn get_window_bounds(&self, id: WindowId) -> Result<(i32, i32, u32, u32), PlatformError> {
-        let info = self
-            .windows
-            .get(&id)
-            .ok_or(PlatformError::WindowNotFound)?;
+        let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         let mut rect = RECT::default();
         let _ = unsafe { GetWindowRect(info.hwnd(), &mut rect) };
         Ok((
@@ -644,10 +624,7 @@ impl PlatformBackend for Win32Backend {
     }
 
     fn request_repaint(&mut self, id: WindowId) -> Result<(), PlatformError> {
-        let info = self
-            .windows
-            .get(&id)
-            .ok_or(PlatformError::WindowNotFound)?;
+        let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         let _ = unsafe { InvalidateRect(info.hwnd(), None, FALSE) };
         Ok(())
     }
@@ -659,10 +636,7 @@ impl PlatformBackend for Win32Backend {
         width: u32,
         height: u32,
     ) -> Result<(), PlatformError> {
-        let info = self
-            .windows
-            .get(&id)
-            .ok_or(PlatformError::WindowNotFound)?;
+        let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
         let hwnd = info.hwnd();
 
         // width*height drives both the DIB allocation (via the BITMAPINFO
@@ -674,7 +648,11 @@ impl PlatformBackend for Win32Backend {
         // cocoa backend's `blit_buffer` guard.
         let pixel_count = match (width as usize).checked_mul(height as usize) {
             Some(n) if n <= pixels.len() => n,
-            _ => return Err(PlatformError::CreationFailed("pixel buffer too small".into())),
+            _ => {
+                return Err(PlatformError::CreationFailed(
+                    "pixel buffer too small".into(),
+                ))
+            }
         };
         unsafe {
             // BeginPaint -> EndPaint pair. If we bail with `?` below the
@@ -686,9 +664,8 @@ impl PlatformBackend for Win32Backend {
             let hdc = paint.hdc();
 
             // CreateCompatibleDC -> DeleteDC pair.
-            let mem_dc = DcGuard::new(CreateCompatibleDC(hdc)).ok_or_else(|| {
-                PlatformError::CreationFailed("CreateCompatibleDC failed".into())
-            })?;
+            let mem_dc = DcGuard::new(CreateCompatibleDC(hdc))
+                .ok_or_else(|| PlatformError::CreationFailed("CreateCompatibleDC failed".into()))?;
             let hdc_mem = mem_dc.hdc();
 
             let bmi = BITMAPINFO {
@@ -715,9 +692,7 @@ impl PlatformBackend for Win32Backend {
                 HANDLE::default(),
                 0,
             )
-            .map_err(|_| {
-                PlatformError::CreationFailed("CreateDIBSection failed".into())
-            })?;
+            .map_err(|_| PlatformError::CreationFailed("CreateDIBSection failed".into()))?;
             let hbm_guard = GdiObjectGuard::new(hbm);
 
             // SelectObject -> restore-previous pair.
@@ -727,10 +702,7 @@ impl PlatformBackend for Win32Backend {
                 // usize` computed above; it matches the DIB allocation
                 // (32bpp, width*height pixels) exactly, so the slice can
                 // never extend past the real allocation.
-                let dst = std::slice::from_raw_parts_mut(
-                    bits as *mut u32,
-                    pixel_count,
-                );
+                let dst = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
                 for (i, &px) in pixels.iter().enumerate() {
                     if i >= dst.len() {
                         break;
@@ -869,12 +841,11 @@ impl PlatformBackend for Win32Backend {
                 Err(_) => return empty,
             }
         } else {
-            let factory: IDWriteFactory = match unsafe {
-                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
-            } {
-                Ok(f) => f,
-                Err(_) => return empty,
-            };
+            let factory: IDWriteFactory =
+                match unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) } {
+                    Ok(f) => f,
+                    Err(_) => return empty,
+                };
 
             let family_wide: Vec<u16> = font_family
                 .encode_utf16()
@@ -907,9 +878,7 @@ impl PlatformBackend for Win32Backend {
             };
 
             let text_wide: Vec<u16> = text.encode_utf16().collect();
-            match unsafe {
-                factory.CreateTextLayout(&text_wide, &format, 10000.0, 10000.0)
-            } {
+            match unsafe { factory.CreateTextLayout(&text_wide, &format, 10000.0, 10000.0) } {
                 Ok(l) => l,
                 Err(_) => return empty,
             }
@@ -1026,16 +995,14 @@ impl PlatformBackend for Win32Backend {
                 // `raster_px` is the checked `tw as usize * th as usize`; the
                 // DIB above is 32bpp with the same clamped tw/th, so this
                 // slice never extends past the real allocation.
-                let src =
-                    std::slice::from_raw_parts(bits as *const u32, raster_px);
+                let src = std::slice::from_raw_parts(bits as *const u32, raster_px);
                 for (i, &px) in src.iter().enumerate() {
                     let pb = (px >> 16) & 0xFF;
                     let pg = (px >> 8) & 0xFF;
                     let pr = px & 0xFF;
                     let lum = (pr * 77 + pg * 150 + pb * 29) / 256;
                     if lum > 0 {
-                        px_out[i] =
-                            (ca * lum / 255) << 24 | (cr << 16) | (cg << 8) | cb;
+                        px_out[i] = (ca * lum / 255) << 24 | (cr << 16) | (cg << 8) | cb;
                     }
                 }
             }
@@ -1091,10 +1058,7 @@ impl PlatformBackend for Win32Backend {
         use windows::Win32::System::DataExchange::*;
         use windows::Win32::System::Ole::CF_UNICODETEXT;
 
-        let wide: Vec<u16> = text
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
 
         unsafe {
             // GlobalAlloc -> GlobalFree pair. If `OpenClipboard` below fails
@@ -1107,9 +1071,7 @@ impl PlatformBackend for Win32Backend {
             let ptr = GlobalLock(hmem) as *mut u16;
             if ptr.is_null() {
                 // hmem_guard's Drop runs here -> GlobalFree.
-                return Err(PlatformError::ClipboardError(
-                    "GlobalLock failed".into(),
-                ));
+                return Err(PlatformError::ClipboardError("GlobalLock failed".into()));
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(hmem);
@@ -1142,20 +1104,9 @@ impl PlatformBackend for Win32Backend {
         None
     }
 
-    fn show_message_dialog(
-        &mut self,
-        title: &str,
-        message: &str,
-        msg_type: MessageDialogType,
-    ) {
-        let tw: Vec<u16> = title
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mw: Vec<u16> = message
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+    fn show_message_dialog(&mut self, title: &str, message: &str, msg_type: MessageDialogType) {
+        let tw: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let mw: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
         let flags = match msg_type {
             MessageDialogType::Info => MB_OK | MB_ICONINFORMATION,
             MessageDialogType::Warning => MB_OK | MB_ICONWARNING,

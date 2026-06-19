@@ -57,7 +57,10 @@ fn test_finally_on_normal_return() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testFinallyOnNormalReturn failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testFinallyOnNormalReturn failed: {result:?}"
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
 
@@ -175,7 +178,10 @@ fn test_catch_all_after_specific() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testCatchAllAfterSpecific failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testCatchAllAfterSpecific failed: {result:?}"
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
 
@@ -203,7 +209,10 @@ fn test_rethrow_preserves_identity() {
         "()V",
         &[],
     );
-    assert!(result.is_ok(), "testRethrowPreservesIdentity failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "testRethrowPreservesIdentity failed: {result:?}"
+    );
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
 
@@ -257,10 +266,10 @@ fn test_chained_exceptions() {
 fn test_refs_equal_same_object() {
     use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
-    let obj = vm.shared.heap.alloc_object(
-        cratonvm_vm::classloading::ClassId::new(0),
-        0,
-    );
+    let obj = vm
+        .shared
+        .heap
+        .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(Some(obj));
     let b = Value::Object(Some(obj));
     assert!(test_refs_equal(&a, &b), "same object should be equal");
@@ -270,17 +279,20 @@ fn test_refs_equal_same_object() {
 fn test_refs_equal_different_objects() {
     use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
-    let obj1 = vm.shared.heap.alloc_object(
-        cratonvm_vm::classloading::ClassId::new(0),
-        0,
-    );
-    let obj2 = vm.shared.heap.alloc_object(
-        cratonvm_vm::classloading::ClassId::new(0),
-        0,
-    );
+    let obj1 = vm
+        .shared
+        .heap
+        .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
+    let obj2 = vm
+        .shared
+        .heap
+        .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(Some(obj1));
     let b = Value::Object(Some(obj2));
-    assert!(!test_refs_equal(&a, &b), "different objects should not be equal");
+    assert!(
+        !test_refs_equal(&a, &b),
+        "different objects should not be equal"
+    );
 }
 
 #[test]
@@ -295,14 +307,20 @@ fn test_refs_equal_both_null() {
 fn test_refs_equal_null_vs_nonnull() {
     use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
-    let obj = vm.shared.heap.alloc_object(
-        cratonvm_vm::classloading::ClassId::new(0),
-        0,
-    );
+    let obj = vm
+        .shared
+        .heap
+        .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(None);
     let b = Value::Object(Some(obj));
-    assert!(!test_refs_equal(&a, &b), "null vs non-null should not be equal");
-    assert!(!test_refs_equal(&b, &a), "non-null vs null should not be equal");
+    assert!(
+        !test_refs_equal(&a, &b),
+        "null vs non-null should not be equal"
+    );
+    assert!(
+        !test_refs_equal(&b, &a),
+        "non-null vs null should not be equal"
+    );
 }
 
 #[test]
@@ -310,5 +328,8 @@ fn test_refs_equal_int_zero_vs_null() {
     use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let a = Value::Int(0);
     let b = Value::Object(None);
-    assert!(test_refs_equal(&a, &b), "Int(0) should equal null in autoboxed context");
+    assert!(
+        test_refs_equal(&a, &b),
+        "Int(0) should equal null in autoboxed context"
+    );
 }

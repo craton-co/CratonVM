@@ -691,11 +691,7 @@ fn can_start(
 
 /// After `name` transitions `Up`, walk its dependents and queue any
 /// that are now start-eligible.
-fn schedule_dependents_of(
-    state: &mut ContainerState,
-    name: &Arc<ServiceName>,
-    pool_cv: &Condvar,
-) {
+fn schedule_dependents_of(state: &mut ContainerState, name: &Arc<ServiceName>, pool_cv: &Condvar) {
     let dep_names: Vec<Arc<ServiceName>> = match state.services.get(name) {
         Some(c) => c.dependents.clone(),
         None => return,
@@ -787,10 +783,7 @@ pub fn global_container() -> &'static Arc<ServiceContainer> {
 fn worker_loop(container: Arc<ServiceContainer>) {
     loop {
         let task = {
-            let mut state = container
-                .inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if state.shutdown && state.task_queue.is_empty() {
                     return;
@@ -812,10 +805,7 @@ fn worker_loop(container: Arc<ServiceContainer>) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match task {
             Task::Start(id) => container2.run_start_local(id),
             Task::Stop(id) => {
-                let mut state = container2
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut state = container2.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(name) = state.by_id.get(&id).cloned() {
                     if let Some(c) = state.services.get_mut(&name) {
                         c.state = ServiceState::Down;
@@ -828,10 +818,7 @@ fn worker_loop(container: Arc<ServiceContainer>) {
             // Which id failed?  We no longer know — the closure
             // already consumed `task`.  Scan for any `Starting`
             // service and flag it so the error is surfaced.
-            let mut state = container
-                .inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<u64> = state
                 .services
                 .values()
@@ -940,7 +927,9 @@ pub(crate) fn alloc_java_service_name(
     // JDK's `calculateHashCode` — `ServiceName.equals` compares both
     // sides' `hashCode` fields, so as long as two mirrors of the same
     // canonical name produce the same value we're good.
-    let h: i32 = canonical_text.bytes().fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
+    let h: i32 = canonical_text
+        .bytes()
+        .fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
     ctx.set_field_by_name(obj, "hashCode", Value::Int(h));
     obj
 }
@@ -948,10 +937,7 @@ pub(crate) fn alloc_java_service_name(
 /// Read an `Arc<ServiceName>` back out of a Java `ServiceName` object
 /// by interning its canonical string.  Returns `None` if the canonical
 /// field is missing/null.
-fn read_java_service_name(
-    ctx: &dyn NativeContext,
-    obj: ObjectRef,
-) -> Option<Arc<ServiceName>> {
+fn read_java_service_name(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Arc<ServiceName>> {
     let val = ctx.get_field(obj, SN_FIELD_CANONICAL);
     match val {
         Value::Object(Some(s)) => {
@@ -972,10 +958,7 @@ fn reflect_controller(
     container: &ServiceContainer,
     id: u64,
 ) {
-    let state = container
-        .inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
     let name = match state.by_id.get(&id) {
         Some(n) => n.clone(),
         None => return,
@@ -989,10 +972,7 @@ fn reflect_controller(
     ctx.set_field(obj, SC_FIELD_ID, Value::Long(id as i64));
 }
 
-fn native_service_name_of_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_service_name_of_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
@@ -1001,10 +981,7 @@ fn native_service_name_of_string(
     Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
 }
 
-fn native_service_name_of_varargs(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_service_name_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Signature: static ServiceName.of(String[] segments)
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1030,10 +1007,7 @@ fn native_service_name_of_varargs(
     Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
 }
 
-fn native_service_name_append(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_service_name_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let seg = match args.get(1).copied() {
         Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
@@ -1044,7 +1018,9 @@ fn native_service_name_append(
         None => ServiceName::of(std::iter::empty::<&str>()),
     };
     let child = parent.append(&seg);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &child)))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &child,
+    )))))
 }
 
 fn native_service_name_get_canonical(
@@ -1059,10 +1035,7 @@ fn native_service_name_get_canonical(
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn native_service_name_get_parent(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_service_name_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let sn = read_java_service_name(ctx, this);
     let parent_obj = match sn.and_then(|s| s.parent()) {
@@ -1089,7 +1062,10 @@ fn native_service_container_add_service(
     // Signature: addService(ServiceName, Service) -> ServiceController
     if args.len() < 3 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
-            message: format!("ServiceContainer.addService: expected 3 args, got {}", args.len()),
+            message: format!(
+                "ServiceContainer.addService: expected 3 args, got {}",
+                args.len()
+            ),
         }));
     }
     let _this = obj_arg(args, 0)?;
@@ -1119,19 +1095,18 @@ fn native_service_container_add_service(
     let container = global_container().clone();
     let id = container
         .add_service(name.clone(), Vec::new(), Mode::Active, service_obj)
-        .map_err(|msg| {
-            MethodCallFailed::InternalError(VmError::Internal { message: msg })
-        })?;
+        .map_err(|msg| MethodCallFailed::InternalError(VmError::Internal { message: msg }))?;
 
     // Build the Java-side ServiceController mirror.
-    let ctrl_obj = alloc_concurrent_synthetic(
-        ctx,
-        "org/jboss/msc/service/ServiceController",
-        SC_NUM_SLOTS,
-    );
+    let ctrl_obj =
+        alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_obj)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(Mode::Active.ordinal()));
-    ctx.set_field(ctrl_obj, SC_FIELD_STATE, Value::Int(ServiceState::Down.ordinal()));
+    ctx.set_field(
+        ctrl_obj,
+        SC_FIELD_STATE,
+        Value::Int(ServiceState::Down.ordinal()),
+    );
     ctx.set_field(ctrl_obj, SC_FIELD_VALUE, Value::Object(None));
     ctx.set_field(ctrl_obj, SC_FIELD_ID, Value::Long(id as i64));
 
@@ -1170,10 +1145,7 @@ fn native_service_controller_set_mode(
     };
     let container = global_container().clone();
     {
-        let mut state = container
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(name) = state.by_id.get(&id).cloned() {
             if let Some(c) = state.services.get_mut(&name) {
                 c.mode = new_mode;
@@ -1232,10 +1204,7 @@ fn native_start_context_asynchronous(
     Ok(None)
 }
 
-fn native_start_context_complete(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_start_context_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let id = match ctx.get_field(this, CTX_FIELD_CONTROLLER_ID) {
         Value::Long(l) => l as u64,
@@ -1261,10 +1230,7 @@ fn native_service_container_shutdown(
 /// set. There is no other thread to call `notify()`, so `Object.wait()` blocks
 /// forever. Since all "concurrent" task execution happens on one thread, locking
 /// is unnecessary: shim acquire/release to no-ops so MSC boot proceeds.
-fn native_lockable_lock_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_lockable_lock_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
@@ -1392,10 +1358,7 @@ fn ihs_iter_refresh_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
     Some(table)
 }
 
-fn native_ihs_iter_has_next(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_ihs_iter_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // If we've already advanced and have a cached hit, return it.
     if let Value::Int(1) = ctx.get_field_by_name(this, "hasNext") {
@@ -1425,10 +1388,7 @@ fn native_ihs_iter_has_next(
     Ok(Some(Value::Int(0)))
 }
 
-fn native_ihs_iter_next(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_ihs_iter_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Re-sync table + expectedCount; advance to a non-null slot.
     let cached_has = matches!(ctx.get_field_by_name(this, "hasNext"), Value::Int(1));
@@ -1509,11 +1469,7 @@ fn native_ihs_iter_next(
 /// controller id (used by T19.2 subsystem glue to hand a pre-built
 /// controller back to the interpreter).
 #[allow(dead_code)]
-pub fn bind_controller_id(
-    ctx: &dyn NativeContext,
-    obj: ObjectRef,
-    id: u64,
-) {
+pub fn bind_controller_id(ctx: &dyn NativeContext, obj: ObjectRef, id: u64) {
     ctx.set_field(obj, SC_FIELD_ID, Value::Long(id as i64));
 }
 
@@ -1562,9 +1518,14 @@ fn service_roots() -> &'static Mutex<HashMap<u64, ServiceRoots>> {
 pub fn gc_scan_msc_service_roots(out: &mut Vec<ObjectRef>) {
     let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
     for r in map.values() {
-        for o in [r.service, r.controller_mirror, r.child_target, r.start_context]
-            .into_iter()
-            .flatten()
+        for o in [
+            r.service,
+            r.controller_mirror,
+            r.child_target,
+            r.start_context,
+        ]
+        .into_iter()
+        .flatten()
         {
             out.push(o);
         }
@@ -1924,7 +1885,10 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         Ok(id) => id,
         Err(msg) => {
             if msc_dbg() {
-                eprintln!("[msc] install {}: add_service error: {msg}", name.canonical());
+                eprintln!(
+                    "[msc] install {}: add_service error: {msg}",
+                    name.canonical()
+                );
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -1932,16 +1896,17 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // Build the synthetic ServiceController mirror (returned to the caller and
     // from StartContext.getController()).
-    let ctrl_obj = alloc_concurrent_synthetic(
-        ctx,
-        "org/jboss/msc/service/ServiceController",
-        SC_NUM_SLOTS,
-    );
+    let ctrl_obj =
+        alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
     if let Some(sn) = sn_obj {
         ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn)));
     }
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
-    ctx.set_field(ctrl_obj, SC_FIELD_STATE, Value::Int(ServiceState::Down.ordinal()));
+    ctx.set_field(
+        ctrl_obj,
+        SC_FIELD_STATE,
+        Value::Int(ServiceState::Down.ordinal()),
+    );
     ctx.set_field(ctrl_obj, SC_FIELD_VALUE, Value::Object(None));
     ctx.set_field(ctrl_obj, SC_FIELD_ID, Value::Long(id as i64));
 
@@ -2105,12 +2070,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "(Lorg/jboss/msc/service/ServiceName;Lorg/jboss/msc/Service;)Lorg/jboss/msc/service/ServiceController;",
         native_service_container_add_service,
     );
-    r.register(
-        cont,
-        "shutdown",
-        "()V",
-        native_service_container_shutdown,
-    );
+    r.register(cont, "shutdown", "()V", native_service_container_shutdown);
 
     let ctrl = "org/jboss/msc/service/ServiceController";
     r.register(
@@ -2140,12 +2100,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "()V",
         native_start_context_asynchronous,
     );
-    r.register(
-        start_ctx,
-        "complete",
-        "()V",
-        native_start_context_complete,
-    );
+    r.register(start_ctx, "complete", "()V", native_start_context_complete);
 
     // R63: silence the boot-banner NPE inside SCI<clinit>. The bytecode
     // calls `ServiceLogger_$logger.greeting(String)` via invokeinterface
@@ -2197,9 +2152,24 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     // suppressing level-guarded log calls on real loggers (e.g. Hibernate's
     // testing DelegatingLogger, whose isDebugEnabled gates HHH90030006).
     let dbl = "org/jboss/logging/DelegatingBasicLogger";
-    r.register(dbl, "isTraceEnabled", "()Z", native_delegating_logger_is_trace_enabled);
-    r.register(dbl, "isDebugEnabled", "()Z", native_delegating_logger_is_debug_enabled);
-    r.register(dbl, "isInfoEnabled", "()Z", native_delegating_logger_is_info_enabled);
+    r.register(
+        dbl,
+        "isTraceEnabled",
+        "()Z",
+        native_delegating_logger_is_trace_enabled,
+    );
+    r.register(
+        dbl,
+        "isDebugEnabled",
+        "()Z",
+        native_delegating_logger_is_debug_enabled,
+    );
+    r.register(
+        dbl,
+        "isInfoEnabled",
+        "()Z",
+        native_delegating_logger_is_info_enabled,
+    );
 
     // R79 (WildFly): replace MSC IdentityHashSet's iterator with a
     // CME-tolerant native implementation. Eager worker scheduling in
@@ -2209,7 +2179,12 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     // re-syncs expectedCount on every call. See native_ihs_iter_next.
     let ihs_iter = "org/jboss/msc/service/IdentityHashSet$IdentityHashSetIterator";
     r.register(ihs_iter, "hasNext", "()Z", native_ihs_iter_has_next);
-    r.register(ihs_iter, "next", "()Ljava/lang/Object;", native_ihs_iter_next);
+    r.register(
+        ihs_iter,
+        "next",
+        "()Ljava/lang/Object;",
+        native_ihs_iter_next,
+    );
 
     // R84 (WildFly): natively implement `org.jboss.logging.Logger.getMessageLogger`
     // overloads. The real implementation goes through `MethodHandles.lookup() +
@@ -2251,7 +2226,11 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+            Ok(Some(native_construct_message_logger(
+                ctx,
+                intf_mirror,
+                &category,
+            )))
         },
     );
     r.register(
@@ -2267,7 +2246,11 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            Ok(Some(native_construct_message_logger(ctx, intf_mirror, &category)))
+            Ok(Some(native_construct_message_logger(
+                ctx,
+                intf_mirror,
+                &category,
+            )))
         },
     );
     r.register(
@@ -2606,8 +2589,10 @@ mod tests {
         let b = name("t19_1_trans.b");
         let d = name("t19_1_trans.d");
         c.add_service(a.clone(), vec![], Mode::Active, 1).unwrap();
-        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 2).unwrap();
-        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 3).unwrap();
+        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 2)
+            .unwrap();
+        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 3)
+            .unwrap();
         c.drain_tasks_locally();
         // Keep draining: scheduling dependents may enqueue fresh work.
         for _ in 0..8 {
@@ -2649,8 +2634,10 @@ mod tests {
         let b = name("t19_1_shut.b");
         let d = name("t19_1_shut.d");
         c.add_service(a.clone(), vec![], Mode::Active, 1).unwrap();
-        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 2).unwrap();
-        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 3).unwrap();
+        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 2)
+            .unwrap();
+        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 3)
+            .unwrap();
         for _ in 0..6 {
             c.drain_tasks_locally();
         }
@@ -2667,7 +2654,8 @@ mod tests {
         let a = name("t19_1_cycle.a");
         let b = name("t19_1_cycle.b");
         c.add_service(a.clone(), vec![], Mode::Active, 0).unwrap();
-        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 0).unwrap();
+        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 0)
+            .unwrap();
         // Now adding a->[b] would cycle.  Installing a second `a`
         // isn't possible (duplicate name), so install `c` that depends
         // on `b`, then try to add a fresh `x` depending on c whose
@@ -2694,8 +2682,10 @@ mod tests {
         let b = name("t19_1_topo.b");
         let d = name("t19_1_topo.d");
         c.add_service(a.clone(), vec![], Mode::Active, 0).unwrap();
-        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 0).unwrap();
-        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 0).unwrap();
+        c.add_service(b.clone(), vec![a.clone()], Mode::Active, 0)
+            .unwrap();
+        c.add_service(d.clone(), vec![b.clone()], Mode::Active, 0)
+            .unwrap();
         let state = c.inner.lock().unwrap();
         let order = reverse_topo_order(&state.services);
         // Every name appears exactly once.
@@ -2713,9 +2703,7 @@ mod tests {
     fn t19_1_record_failure_transitions_to_failed() {
         let c = ServiceContainer::new();
         let n = name("t19_1_fail.svc");
-        let id = c
-            .add_service(n.clone(), vec![], Mode::Active, 0)
-            .unwrap();
+        let id = c.add_service(n.clone(), vec![], Mode::Active, 0).unwrap();
         // Force into Starting then fail.
         {
             let mut st = c.inner.lock().unwrap();

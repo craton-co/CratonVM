@@ -702,17 +702,35 @@ mod tests {
     fn test_helpers_all_fields_distinct() {
         let h = make_helpers();
         let ptrs = [
-            h.newarray, h.new_object, h.anewarray_object,
-            h.baload, h.bastore, h.iaload, h.iastore,
-            h.aaload, h.aastore, h.multianewarray_2d,
-            h.arraylength, h.getfield,
-            h.putfield_int, h.putfield_long, h.putfield_float,
-            h.putfield_double, h.putfield_object,
+            h.newarray,
+            h.new_object,
+            h.anewarray_object,
+            h.baload,
+            h.bastore,
+            h.iaload,
+            h.iastore,
+            h.aaload,
+            h.aastore,
+            h.multianewarray_2d,
+            h.arraylength,
+            h.getfield,
+            h.putfield_int,
+            h.putfield_long,
+            h.putfield_float,
+            h.putfield_double,
+            h.putfield_object,
             h.getstatic,
-            h.putstatic_int, h.putstatic_long, h.putstatic_float,
-            h.putstatic_double, h.putstatic_object,
-            h.checkcast, h.instanceof_check, h.throw_aioobe,
-            h.invoke_dispatch, h.invoke_virtual_mic, h.write_barrier,
+            h.putstatic_int,
+            h.putstatic_long,
+            h.putstatic_float,
+            h.putstatic_double,
+            h.putstatic_object,
+            h.checkcast,
+            h.instanceof_check,
+            h.throw_aioobe,
+            h.invoke_dispatch,
+            h.invoke_virtual_mic,
+            h.write_barrier,
             h.satb_pre_write_barrier,
         ];
         // All addresses should be unique
@@ -808,9 +826,24 @@ mod tests {
     #[test]
     fn test_cached_method_multiple_exception_entries() {
         let entries = vec![
-            ExceptionTableEntry { start_pc: 0, end_pc: 5, handler_pc: 10, catch_type: 1 },
-            ExceptionTableEntry { start_pc: 5, end_pc: 15, handler_pc: 20, catch_type: 2 },
-            ExceptionTableEntry { start_pc: 0, end_pc: 15, handler_pc: 30, catch_type: 0 }, // finally
+            ExceptionTableEntry {
+                start_pc: 0,
+                end_pc: 5,
+                handler_pc: 10,
+                catch_type: 1,
+            },
+            ExceptionTableEntry {
+                start_pc: 5,
+                end_pc: 15,
+                handler_pc: 20,
+                catch_type: 2,
+            },
+            ExceptionTableEntry {
+                start_pc: 0,
+                end_pc: 15,
+                handler_pc: 30,
+                catch_type: 0,
+            }, // finally
         ];
         let m = CachedBytecodeMethod {
             exception_table: Arc::from(entries.as_slice()),
@@ -939,48 +972,204 @@ mod tests {
         // checked against `all_fields()` so a field rename (which the
         // offset_of! invocation would silently follow) is caught too.
         let probes: [(usize, &'static str, usize); JitRuntimeHelpers::NUM_FIELDS] = [
-            (0,  "newarray",                     std::mem::offset_of!(JitRuntimeHelpers, newarray)),
-            (1,  "new_object",                   std::mem::offset_of!(JitRuntimeHelpers, new_object)),
-            (2,  "anewarray_object",             std::mem::offset_of!(JitRuntimeHelpers, anewarray_object)),
-            (3,  "baload",                       std::mem::offset_of!(JitRuntimeHelpers, baload)),
-            (4,  "bastore",                      std::mem::offset_of!(JitRuntimeHelpers, bastore)),
-            (5,  "iaload",                       std::mem::offset_of!(JitRuntimeHelpers, iaload)),
-            (6,  "iastore",                      std::mem::offset_of!(JitRuntimeHelpers, iastore)),
-            (7,  "aaload",                       std::mem::offset_of!(JitRuntimeHelpers, aaload)),
-            (8,  "aastore",                      std::mem::offset_of!(JitRuntimeHelpers, aastore)),
-            (9,  "multianewarray_2d",            std::mem::offset_of!(JitRuntimeHelpers, multianewarray_2d)),
-            (10, "arraylength",                  std::mem::offset_of!(JitRuntimeHelpers, arraylength)),
-            (11, "getfield",                     std::mem::offset_of!(JitRuntimeHelpers, getfield)),
-            (12, "putfield_int",                 std::mem::offset_of!(JitRuntimeHelpers, putfield_int)),
-            (13, "putfield_long",                std::mem::offset_of!(JitRuntimeHelpers, putfield_long)),
-            (14, "putfield_float",               std::mem::offset_of!(JitRuntimeHelpers, putfield_float)),
-            (15, "putfield_double",              std::mem::offset_of!(JitRuntimeHelpers, putfield_double)),
-            (16, "putfield_object",              std::mem::offset_of!(JitRuntimeHelpers, putfield_object)),
-            (17, "getstatic",                    std::mem::offset_of!(JitRuntimeHelpers, getstatic)),
-            (18, "putstatic_int",                std::mem::offset_of!(JitRuntimeHelpers, putstatic_int)),
-            (19, "putstatic_long",               std::mem::offset_of!(JitRuntimeHelpers, putstatic_long)),
-            (20, "putstatic_float",              std::mem::offset_of!(JitRuntimeHelpers, putstatic_float)),
-            (21, "putstatic_double",             std::mem::offset_of!(JitRuntimeHelpers, putstatic_double)),
-            (22, "putstatic_object",             std::mem::offset_of!(JitRuntimeHelpers, putstatic_object)),
-            (23, "checkcast",                    std::mem::offset_of!(JitRuntimeHelpers, checkcast)),
-            (24, "instanceof_check",             std::mem::offset_of!(JitRuntimeHelpers, instanceof_check)),
-            (25, "throw_aioobe",                 std::mem::offset_of!(JitRuntimeHelpers, throw_aioobe)),
-            (26, "invoke_dispatch",              std::mem::offset_of!(JitRuntimeHelpers, invoke_dispatch)),
-            (27, "invoke_virtual_mic",           std::mem::offset_of!(JitRuntimeHelpers, invoke_virtual_mic)),
-            (28, "write_barrier",                std::mem::offset_of!(JitRuntimeHelpers, write_barrier)),
-            (29, "satb_pre_write_barrier",       std::mem::offset_of!(JitRuntimeHelpers, satb_pre_write_barrier)),
-            (30, "uncommon_trap",                std::mem::offset_of!(JitRuntimeHelpers, uncommon_trap)),
-            (31, "math_fma_double",              std::mem::offset_of!(JitRuntimeHelpers, math_fma_double)),
-            (32, "math_fma_float",               std::mem::offset_of!(JitRuntimeHelpers, math_fma_float)),
-            (33, "tlab_cursor_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, tlab_cursor_offset_in_thread)),
-            (34, "tlab_end_offset_in_thread",    std::mem::offset_of!(JitRuntimeHelpers, tlab_end_offset_in_thread)),
-            (35, "class_id_offset_in_obj",       std::mem::offset_of!(JitRuntimeHelpers, class_id_offset_in_obj)),
-            (36, "get_current_thread",           std::mem::offset_of!(JitRuntimeHelpers, get_current_thread)),
-            (37, "tlab_post_init",               std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init)),
-            (38, "frame_record",                 std::mem::offset_of!(JitRuntimeHelpers, frame_record)),
-            (39, "shadow_stack_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread)),
-            (40, "throw_exception",              std::mem::offset_of!(JitRuntimeHelpers, throw_exception)),
-            (41, "jit_npe_with_action",          std::mem::offset_of!(JitRuntimeHelpers, jit_npe_with_action)),
+            (
+                0,
+                "newarray",
+                std::mem::offset_of!(JitRuntimeHelpers, newarray),
+            ),
+            (
+                1,
+                "new_object",
+                std::mem::offset_of!(JitRuntimeHelpers, new_object),
+            ),
+            (
+                2,
+                "anewarray_object",
+                std::mem::offset_of!(JitRuntimeHelpers, anewarray_object),
+            ),
+            (3, "baload", std::mem::offset_of!(JitRuntimeHelpers, baload)),
+            (
+                4,
+                "bastore",
+                std::mem::offset_of!(JitRuntimeHelpers, bastore),
+            ),
+            (5, "iaload", std::mem::offset_of!(JitRuntimeHelpers, iaload)),
+            (
+                6,
+                "iastore",
+                std::mem::offset_of!(JitRuntimeHelpers, iastore),
+            ),
+            (7, "aaload", std::mem::offset_of!(JitRuntimeHelpers, aaload)),
+            (
+                8,
+                "aastore",
+                std::mem::offset_of!(JitRuntimeHelpers, aastore),
+            ),
+            (
+                9,
+                "multianewarray_2d",
+                std::mem::offset_of!(JitRuntimeHelpers, multianewarray_2d),
+            ),
+            (
+                10,
+                "arraylength",
+                std::mem::offset_of!(JitRuntimeHelpers, arraylength),
+            ),
+            (
+                11,
+                "getfield",
+                std::mem::offset_of!(JitRuntimeHelpers, getfield),
+            ),
+            (
+                12,
+                "putfield_int",
+                std::mem::offset_of!(JitRuntimeHelpers, putfield_int),
+            ),
+            (
+                13,
+                "putfield_long",
+                std::mem::offset_of!(JitRuntimeHelpers, putfield_long),
+            ),
+            (
+                14,
+                "putfield_float",
+                std::mem::offset_of!(JitRuntimeHelpers, putfield_float),
+            ),
+            (
+                15,
+                "putfield_double",
+                std::mem::offset_of!(JitRuntimeHelpers, putfield_double),
+            ),
+            (
+                16,
+                "putfield_object",
+                std::mem::offset_of!(JitRuntimeHelpers, putfield_object),
+            ),
+            (
+                17,
+                "getstatic",
+                std::mem::offset_of!(JitRuntimeHelpers, getstatic),
+            ),
+            (
+                18,
+                "putstatic_int",
+                std::mem::offset_of!(JitRuntimeHelpers, putstatic_int),
+            ),
+            (
+                19,
+                "putstatic_long",
+                std::mem::offset_of!(JitRuntimeHelpers, putstatic_long),
+            ),
+            (
+                20,
+                "putstatic_float",
+                std::mem::offset_of!(JitRuntimeHelpers, putstatic_float),
+            ),
+            (
+                21,
+                "putstatic_double",
+                std::mem::offset_of!(JitRuntimeHelpers, putstatic_double),
+            ),
+            (
+                22,
+                "putstatic_object",
+                std::mem::offset_of!(JitRuntimeHelpers, putstatic_object),
+            ),
+            (
+                23,
+                "checkcast",
+                std::mem::offset_of!(JitRuntimeHelpers, checkcast),
+            ),
+            (
+                24,
+                "instanceof_check",
+                std::mem::offset_of!(JitRuntimeHelpers, instanceof_check),
+            ),
+            (
+                25,
+                "throw_aioobe",
+                std::mem::offset_of!(JitRuntimeHelpers, throw_aioobe),
+            ),
+            (
+                26,
+                "invoke_dispatch",
+                std::mem::offset_of!(JitRuntimeHelpers, invoke_dispatch),
+            ),
+            (
+                27,
+                "invoke_virtual_mic",
+                std::mem::offset_of!(JitRuntimeHelpers, invoke_virtual_mic),
+            ),
+            (
+                28,
+                "write_barrier",
+                std::mem::offset_of!(JitRuntimeHelpers, write_barrier),
+            ),
+            (
+                29,
+                "satb_pre_write_barrier",
+                std::mem::offset_of!(JitRuntimeHelpers, satb_pre_write_barrier),
+            ),
+            (
+                30,
+                "uncommon_trap",
+                std::mem::offset_of!(JitRuntimeHelpers, uncommon_trap),
+            ),
+            (
+                31,
+                "math_fma_double",
+                std::mem::offset_of!(JitRuntimeHelpers, math_fma_double),
+            ),
+            (
+                32,
+                "math_fma_float",
+                std::mem::offset_of!(JitRuntimeHelpers, math_fma_float),
+            ),
+            (
+                33,
+                "tlab_cursor_offset_in_thread",
+                std::mem::offset_of!(JitRuntimeHelpers, tlab_cursor_offset_in_thread),
+            ),
+            (
+                34,
+                "tlab_end_offset_in_thread",
+                std::mem::offset_of!(JitRuntimeHelpers, tlab_end_offset_in_thread),
+            ),
+            (
+                35,
+                "class_id_offset_in_obj",
+                std::mem::offset_of!(JitRuntimeHelpers, class_id_offset_in_obj),
+            ),
+            (
+                36,
+                "get_current_thread",
+                std::mem::offset_of!(JitRuntimeHelpers, get_current_thread),
+            ),
+            (
+                37,
+                "tlab_post_init",
+                std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init),
+            ),
+            (
+                38,
+                "frame_record",
+                std::mem::offset_of!(JitRuntimeHelpers, frame_record),
+            ),
+            (
+                39,
+                "shadow_stack_offset_in_thread",
+                std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread),
+            ),
+            (
+                40,
+                "throw_exception",
+                std::mem::offset_of!(JitRuntimeHelpers, throw_exception),
+            ),
+            (
+                41,
+                "jit_npe_with_action",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_npe_with_action),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1025,8 +1214,14 @@ mod tests {
         // deliberate, reviewed change.
         let h = make_helpers();
         let f = h.all_fields();
-        let req = f.iter().filter(|e| e.kind == FieldKind::RequiredPtr).count();
-        let opt = f.iter().filter(|e| e.kind == FieldKind::OptionalPtr).count();
+        let req = f
+            .iter()
+            .filter(|e| e.kind == FieldKind::RequiredPtr)
+            .count();
+        let opt = f
+            .iter()
+            .filter(|e| e.kind == FieldKind::OptionalPtr)
+            .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 35, "required-pointer count drifted");
         assert_eq!(opt, 3, "optional-pointer count drifted");

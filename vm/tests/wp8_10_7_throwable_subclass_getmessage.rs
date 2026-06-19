@@ -31,12 +31,12 @@
 //!   5. `getMessage()` and `printStackTrace(PrintStream)` are registered
 //!      across the full Throwable subclass family (registry-only check).
 
+use cratonvm_native_api::NativeMethodRegistry;
 use cratonvm_vm::classloading::ClassId;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm};
-use cratonvm_native_api::NativeMethodRegistry;
 use std::sync::Arc;
 
 fn build_registry() -> NativeMethodRegistry {
@@ -53,7 +53,10 @@ fn build_registry() -> NativeMethodRegistry {
 
 /// Allocate a synthetic Throwable-shaped object with 2 fields (message, cause)
 /// and populate `field 0` (detailMessage) with `message` if `Some`.
-fn alloc_synthetic_throwable(shared: &SharedVm, message: Option<&str>) -> cratonvm_types::ObjectRef {
+fn alloc_synthetic_throwable(
+    shared: &SharedVm,
+    message: Option<&str>,
+) -> cratonvm_types::ObjectRef {
     // ClassId is irrelevant for the native — the dispatch is keyed by the
     // *registered* class-name string at lookup time, not the heap object's
     // ClassId.  We only need the object to have ≥1 field so `get_field(this, 0)`
@@ -176,7 +179,10 @@ fn print_stack_trace_to_stream_does_not_npe() {
     // The native records via `record_printed_line` regardless of the stream
     // argument — confirm the recorded line contains the message.
     assert!(
-        thread.printed_lines.iter().any(|line| line.contains("trace-target")),
+        thread
+            .printed_lines
+            .iter()
+            .any(|line| line.contains("trace-target")),
         "expected printed_lines to contain the throwable message; got {:?}",
         thread.printed_lines,
     );

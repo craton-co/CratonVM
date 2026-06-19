@@ -127,7 +127,10 @@ pub fn read_packet<R: Read>(reader: &mut R) -> io::Result<JdwpPacket> {
     if length < HEADER_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("packet length {} is less than header size {}", length, HEADER_SIZE),
+            format!(
+                "packet length {} is less than header size {}",
+                length, HEADER_SIZE
+            ),
         ));
     }
     let id = read_u32_be(reader)?;
@@ -326,7 +329,10 @@ impl<'a> PayloadReader<'a> {
 
     pub fn read_u8(&mut self) -> io::Result<u8> {
         if self.remaining() < 1 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short",
+            ));
         }
         let v = self.data[self.pos];
         self.pos += 1;
@@ -335,7 +341,10 @@ impl<'a> PayloadReader<'a> {
 
     pub fn read_u16_be(&mut self) -> io::Result<u16> {
         if self.remaining() < 2 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short",
+            ));
         }
         let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
@@ -344,7 +353,10 @@ impl<'a> PayloadReader<'a> {
 
     pub fn read_u32_be(&mut self) -> io::Result<u32> {
         if self.remaining() < 4 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short",
+            ));
         }
         let v = u32::from_be_bytes([
             self.data[self.pos],
@@ -358,7 +370,10 @@ impl<'a> PayloadReader<'a> {
 
     pub fn read_u64_be(&mut self) -> io::Result<u64> {
         if self.remaining() < 8 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short",
+            ));
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 8]);
@@ -369,7 +384,10 @@ impl<'a> PayloadReader<'a> {
     pub fn read_string(&mut self) -> io::Result<String> {
         let len = self.read_u32_be()? as usize;
         if self.remaining() < len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "payload too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short",
+            ));
         }
         let s = String::from_utf8(self.data[self.pos..self.pos + len].to_vec())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -431,7 +449,11 @@ mod tests {
     fn ok_reply_helper() {
         let pkt = JdwpPacket::ok_reply(5, vec![0xFF]);
         match &pkt {
-            JdwpPacket::Reply { id, error_code, data } => {
+            JdwpPacket::Reply {
+                id,
+                error_code,
+                data,
+            } => {
                 assert_eq!(*id, 5);
                 assert_eq!(*error_code, 0);
                 assert_eq!(data, &[0xFF]);
@@ -500,10 +522,10 @@ mod tests {
         // stream provides no payload bytes at all.
         let mut buf = Vec::new();
         write_u32_be(&mut buf, u32::MAX).unwrap(); // length = 0xFFFFFFFF
-        write_u32_be(&mut buf, 1).unwrap();        // id
-        buf.push(0);                               // flags (command)
-        buf.push(0);                               // command_set
-        buf.push(0);                               // command
+        write_u32_be(&mut buf, 1).unwrap(); // id
+        buf.push(0); // flags (command)
+        buf.push(0); // command_set
+        buf.push(0); // command
 
         let mut cursor = Cursor::new(&buf);
         let err = read_packet(&mut cursor).unwrap_err();
@@ -518,11 +540,11 @@ mod tests {
         let data_len = MAX_PACKET_DATA;
         let mut buf = Vec::new();
         write_u32_be(&mut buf, HEADER_SIZE + data_len).unwrap(); // length
-        write_u32_be(&mut buf, 1).unwrap();                      // id
-        buf.push(0);                                             // flags
-        buf.push(0);                                             // command_set
-        buf.push(0);                                             // command
-        buf.extend_from_slice(&[1, 2, 3]);                       // only 3 of N bytes
+        write_u32_be(&mut buf, 1).unwrap(); // id
+        buf.push(0); // flags
+        buf.push(0); // command_set
+        buf.push(0); // command
+        buf.extend_from_slice(&[1, 2, 3]); // only 3 of N bytes
 
         let mut cursor = Cursor::new(&buf);
         let err = read_packet(&mut cursor).unwrap_err();
@@ -559,8 +581,9 @@ mod tests {
         let mut buf = Vec::new();
         write_u32_be(&mut buf, 5).unwrap(); // length
         write_u32_be(&mut buf, 1).unwrap(); // id
-        buf.push(0);                        // flags
-        buf.push(0); buf.push(0);           // cmd set + cmd
+        buf.push(0); // flags
+        buf.push(0);
+        buf.push(0); // cmd set + cmd
 
         let mut cursor = Cursor::new(&buf);
         assert!(read_packet(&mut cursor).is_err());

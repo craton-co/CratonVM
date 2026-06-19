@@ -349,8 +349,7 @@ fn sanitize_load_class_name(s: &str) -> Option<String> {
         return None;
     }
     for ch in s.chars() {
-        let ok = ch.is_ascii_alphanumeric()
-            || matches!(ch, '.' | '$' | '_' | '/' | '-');
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '$' | '_' | '/' | '-');
         if !ok {
             return None;
         }
@@ -389,10 +388,12 @@ fn native_runner_class_loader_load_class(
     };
     let name_raw = ctx.read_string(name_obj).unwrap_or_default();
     let Some(cleaned) = sanitize_load_class_name(&name_raw) else {
-        return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: name_raw,
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: name_raw,
+            }
+            .into(),
+        );
     };
     let internal = cleaned.replace('.', "/");
     match ctx.ensure_class_initialized(&internal) {
@@ -400,10 +401,12 @@ fn native_runner_class_loader_load_class(
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Err(_) => Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: cleaned,
-        }
-        .into()),
+        Err(_) => Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: cleaned,
+            }
+            .into(),
+        ),
     }
 }
 
@@ -433,8 +436,7 @@ fn sanitize_main_class_candidate(s: &str) -> Option<String> {
         return None;
     }
     for ch in s.chars() {
-        let ok = ch.is_ascii_alphanumeric()
-            || matches!(ch, '.' | '$' | '_' | '/' | '-');
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '$' | '_' | '/' | '-');
         if !ok {
             return None;
         }
@@ -599,12 +601,7 @@ fn register_startup_context(registry: &mut NativeMethodRegistry) {
         "()V",
         native_sc_run_all_in_startup_context,
     );
-    registry.register(
-        CLS_STARTUP_CONTEXT,
-        "close",
-        "()V",
-        native_sc_close,
-    );
+    registry.register(CLS_STARTUP_CONTEXT, "close", "()V", native_sc_close);
     registry.register(
         CLS_STARTUP_CONTEXT,
         "getValue",
@@ -739,9 +736,24 @@ fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
 fn register_timing(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    registry.register(CLS_TIMING, "staticInitStarted", "(Z)V", native_timing_static_init_started);
-    registry.register(CLS_TIMING, "staticInitStarted", "(Ljava/lang/ClassLoader;Z)V", native_timing_static_init_started_cl);
-    registry.register(CLS_TIMING, "staticInitStopped", "()V", native_timing_static_init_stopped);
+    registry.register(
+        CLS_TIMING,
+        "staticInitStarted",
+        "(Z)V",
+        native_timing_static_init_started,
+    );
+    registry.register(
+        CLS_TIMING,
+        "staticInitStarted",
+        "(Ljava/lang/ClassLoader;Z)V",
+        native_timing_static_init_started_cl,
+    );
+    registry.register(
+        CLS_TIMING,
+        "staticInitStopped",
+        "()V",
+        native_timing_static_init_stopped,
+    );
     registry.register(CLS_TIMING, "mainStarted", "()V", native_timing_main_started);
     registry.register(CLS_TIMING, "restart", "()V", native_timing_no_op);
     registry.register(
@@ -814,7 +826,9 @@ fn now_nanos() -> i64 {
 /// No-arg `RuntimeValue()` — both fields null. Rarely hit in real
 /// Quarkus bytecode but some test paths construct via this form.
 fn native_rv_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     ctx.set_field(this, RV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(this, RV_FIELD_SUPPLIER, Value::Object(None));
     Ok(None)
@@ -824,7 +838,9 @@ fn native_rv_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// Since the value is already materialized, `supplier` is left null so
 /// future `getValue` bypasses the supplier path entirely.
 fn native_rv_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     let value = arg_value(args, 1);
     ctx.set_field(this, RV_FIELD_VALUE, value);
     ctx.set_field(this, RV_FIELD_SUPPLIER, Value::Object(None));
@@ -834,7 +850,9 @@ fn native_rv_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `RuntimeValue(Supplier supplier)` — lazy form. `supplier.get()` is
 /// invoked on first `getValue`.
 fn native_rv_init_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     let supplier = arg_value(args, 1);
     ctx.set_field(this, RV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(this, RV_FIELD_SUPPLIER, supplier);
@@ -932,7 +950,9 @@ fn native_rv_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// `sc_key` to index the correct state bucket, avoiding the
 /// ObjectRef-address collisions that break parallel unit tests.
 fn native_sc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     let tasks_key = startup_context_next_key();
     let values_key = startup_context_next_key();
     ctx.set_field(this, SC_FIELD_SHUTDOWN_TASKS, Value::Long(tasks_key as i64));
@@ -955,8 +975,12 @@ fn native_sc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 /// `StartupContext.addShutdownTask(Runnable task)`.
 fn native_sc_add_shutdown_task(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
-    let Some(task) = arg_obj(args, 1) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
+    let Some(task) = arg_obj(args, 1) else {
+        return Ok(None);
+    };
     let key = sc_key(ctx, this, SC_FIELD_SHUTDOWN_TASKS);
     if key == 0 {
         return Ok(None);
@@ -983,7 +1007,9 @@ fn native_sc_run_all_in_startup_context(
 /// `StartupContext.close()` — run shutdown tasks in reverse registration
 /// order, catching panics so one failure doesn't skip remaining tasks.
 fn native_sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     let tasks_key = sc_key(ctx, this, SC_FIELD_SHUTDOWN_TASKS);
     let values_key = sc_key(ctx, this, SC_FIELD_VALUES);
     let drained: Vec<ObjectRef> = if tasks_key == 0 {
@@ -1002,9 +1028,7 @@ fn native_sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                tracing::error!(
-                    "StartupContext shutdown task returned error: {:?}", e
-                );
+                tracing::error!("StartupContext shutdown task returned error: {:?}", e);
             }
             Err(_) => {
                 tracing::error!(
@@ -1046,8 +1070,12 @@ fn native_sc_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_sc_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
-    let Some(name) = arg_string(ctx, args, 1) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
+    let Some(name) = arg_string(ctx, args, 1) else {
+        return Ok(None);
+    };
     let value = arg_value(args, 2);
     let key = sc_key(ctx, this, SC_FIELD_VALUES);
     if key == 0 {
@@ -1065,14 +1093,18 @@ fn native_sc_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ---------------------------------------------------------------------------
 
 fn native_ac_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     ctx.set_field(this, AC_FIELD_NAME, Value::Object(None));
     ctx.set_field(this, AC_FIELD_VERSION, Value::Object(None));
     Ok(None)
 }
 
 fn native_ac_init_with_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     let name = arg_value(args, 1);
     let version = arg_value(args, 2);
     ctx.set_field(this, AC_FIELD_NAME, name);
@@ -1112,7 +1144,9 @@ fn native_ac_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn native_dsrc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else { return Ok(None) };
+    let Some(this) = this_ref(args) else {
+        return Ok(None);
+    };
     for slot in [
         DSRC_FIELD_JDBC_URL,
         DSRC_FIELD_USERNAME,
@@ -1172,10 +1206,7 @@ fn native_dsrc_driver(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// `RUST_LOG=cratonvm_native_builtins=debug` or filter on this target) so a
 /// run that depends on these hooks is never silently mistaken for a fully
 /// started application.
-fn native_app_lifecycle_no_op(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_app_lifecycle_no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::debug!(
         target: "cratonvm_native_builtins::quarkus",
         "io.quarkus.runtime.Application lifecycle hook elided (compatibility \
@@ -1245,7 +1276,9 @@ fn ensure_timing_singleton(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
 }
 
 fn update_timing_slot(ctx: &mut dyn NativeContext, slot: usize) {
-    let Some(obj) = ensure_timing_singleton(ctx) else { return };
+    let Some(obj) = ensure_timing_singleton(ctx) else {
+        return;
+    };
     let ts = now_nanos();
     ctx.set_field(obj, slot, Value::Long(ts));
     let key = obj.as_ptr() as u64;
@@ -1257,19 +1290,28 @@ fn update_timing_slot(ctx: &mut dyn NativeContext, slot: usize) {
     }
 }
 
-fn native_timing_static_init_started(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_timing_static_init_started(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     update_timing_slot(ctx, TIMING_FIELD_BOOT_START);
     tracing::info!("quarkus static-init started");
     Ok(None)
 }
 
-fn native_timing_static_init_started_cl(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_timing_static_init_started_cl(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     update_timing_slot(ctx, TIMING_FIELD_BOOT_START);
     tracing::info!("quarkus static-init started (class-loader arg)");
     Ok(None)
 }
 
-fn native_timing_static_init_stopped(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_timing_static_init_stopped(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     update_timing_slot(ctx, TIMING_FIELD_BOOT_STOP);
     tracing::info!("quarkus static-init stopped");
     Ok(None)
@@ -1285,7 +1327,10 @@ fn native_timing_no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     Ok(None)
 }
 
-fn native_timing_print_startup_time(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_timing_print_startup_time(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     update_timing_slot(ctx, TIMING_FIELD_MAIN_STOP);
     // Try to emit a diagnostic about elapsed boot time.
     if let Some(obj) = ensure_timing_singleton(ctx) {
@@ -1350,15 +1395,23 @@ mod tests {
         register_quarkus_staticinit_natives(&mut r);
 
         // Representative entries across each sub-class.
-        assert!(r.find(CLS_RUNTIME_VALUE, "getValue", "()Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(CLS_RUNTIME_VALUE, "getValue", "()Ljava/lang/Object;")
+            .is_some());
         assert!(r
             .find(CLS_RUNTIME_VALUE, "<init>", "(Ljava/lang/Object;)V")
             .is_some());
         assert!(r.find(CLS_STARTUP_CONTEXT, "<init>", "()V").is_some());
         assert!(r
-            .find(CLS_STARTUP_CONTEXT, "addShutdownTask", "(Ljava/lang/Runnable;)V")
+            .find(
+                CLS_STARTUP_CONTEXT,
+                "addShutdownTask",
+                "(Ljava/lang/Runnable;)V"
+            )
             .is_some());
-        assert!(r.find(CLS_APPLICATION_CONFIG, "name", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(CLS_APPLICATION_CONFIG, "name", "()Ljava/lang/String;")
+            .is_some());
         assert!(r
             .find(CLS_DATASOURCE_CONFIG, "jdbcUrl", "()Ljava/lang/String;")
             .is_some());
@@ -1374,10 +1427,7 @@ mod tests {
 
         native_rv_init_value(
             &mut ctx,
-            &[
-                Value::Object(Some(rv)),
-                Value::Object(Some(payload)),
-            ],
+            &[Value::Object(Some(rv)), Value::Object(Some(payload))],
         )
         .unwrap();
 
@@ -1401,16 +1451,12 @@ mod tests {
         // Prime invoke_virtual to return a specific String on first call.
         let supplier_result = ctx.create_string("lazy-materialized");
         unsafe {
-            *ctx.invoke_virtual_result.get() =
-                Some(Ok(Some(Value::Object(Some(supplier_result)))));
+            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(Some(supplier_result)))));
         }
 
         native_rv_init_supplier(
             &mut ctx,
-            &[
-                Value::Object(Some(rv)),
-                Value::Object(Some(supplier_obj)),
-            ],
+            &[Value::Object(Some(rv)), Value::Object(Some(supplier_obj))],
         )
         .unwrap();
 
@@ -1441,16 +1487,12 @@ mod tests {
         // expect the second call to be short-circuited and never dispatch.
         let first_result = ctx.create_string("first");
         unsafe {
-            *ctx.invoke_virtual_result.get() =
-                Some(Ok(Some(Value::Object(Some(first_result)))));
+            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(Some(first_result)))));
         }
 
         native_rv_init_supplier(
             &mut ctx,
-            &[
-                Value::Object(Some(rv)),
-                Value::Object(Some(supplier_obj)),
-            ],
+            &[Value::Object(Some(rv)), Value::Object(Some(supplier_obj))],
         )
         .unwrap();
 
@@ -1463,15 +1505,17 @@ mod tests {
         // should hit the cached value, we end up with the first result.
         let second_result = ctx.create_string("second");
         unsafe {
-            *ctx.invoke_virtual_result.get() =
-                Some(Ok(Some(Value::Object(Some(second_result)))));
+            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(Some(second_result)))));
         }
 
         let second = native_rv_get_value(&mut ctx, &[Value::Object(Some(rv))])
             .unwrap()
             .unwrap();
 
-        assert_eq!(first, second, "second getValue must return cached first result");
+        assert_eq!(
+            first, second,
+            "second getValue must return cached first result"
+        );
         // And the queued second_result is still waiting (never consumed).
         let queued = unsafe { &*ctx.invoke_virtual_result.get() };
         assert!(
@@ -1491,21 +1535,12 @@ mod tests {
         let b = make_runnable(&mut ctx);
         let c = make_runnable(&mut ctx);
 
-        native_sc_add_shutdown_task(
-            &mut ctx,
-            &[Value::Object(Some(sc)), Value::Object(Some(a))],
-        )
-        .unwrap();
-        native_sc_add_shutdown_task(
-            &mut ctx,
-            &[Value::Object(Some(sc)), Value::Object(Some(b))],
-        )
-        .unwrap();
-        native_sc_add_shutdown_task(
-            &mut ctx,
-            &[Value::Object(Some(sc)), Value::Object(Some(c))],
-        )
-        .unwrap();
+        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(a))])
+            .unwrap();
+        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(b))])
+            .unwrap();
+        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(c))])
+            .unwrap();
 
         // Inspect the registered order directly via the SC's stored
         // salt key (not the raw ObjectRef pointer — that would collide
@@ -1583,7 +1618,9 @@ mod tests {
     fn t19_3_application_config_defaults_from_env_fallback() {
         reset_supplier_state();
         let mut ctx = mock_ctx();
-        let cid = ctx.ensure_class_initialized(CLS_APPLICATION_CONFIG).unwrap();
+        let cid = ctx
+            .ensure_class_initialized(CLS_APPLICATION_CONFIG)
+            .unwrap();
         let ac = ctx.alloc_object(cid, 2);
         native_ac_init(&mut ctx, &[Value::Object(Some(ac))]).unwrap();
 
@@ -1679,33 +1716,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            native_timing_static_init_stopped(&mut ctx, &[])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            native_timing_main_started(&mut ctx, &[])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            native_timing_print_startup_time(
-                &mut ctx,
-                &[
-                    Value::Object(None),
-                    Value::Object(None),
-                    Value::Object(None),
-                    Value::Object(None),
-                    Value::Object(None),
-                    Value::Object(None),
-                    Value::Int(0),
-                    Value::Int(0),
-                ]
-            )
+        assert!(native_timing_static_init_stopped(&mut ctx, &[])
             .unwrap()
-            .is_none()
-        );
+            .is_none());
+        assert!(native_timing_main_started(&mut ctx, &[]).unwrap().is_none());
+        assert!(native_timing_print_startup_time(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(0),
+            ]
+        )
+        .unwrap()
+        .is_none());
 
         // Timing singleton must be populated with a boot-start timestamp.
         let singleton_key = timing_singleton()
@@ -1750,15 +1779,11 @@ mod tests {
         let supplier_obj = ctx.alloc_object(supplier_cid, 1);
 
         unsafe {
-            *ctx.invoke_virtual_result.get() =
-                Some(Ok(Some(Value::Object(None))));
+            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(None))));
         }
         native_rv_init_supplier(
             &mut ctx,
-            &[
-                Value::Object(Some(rv)),
-                Value::Object(Some(supplier_obj)),
-            ],
+            &[Value::Object(Some(rv)), Value::Object(Some(supplier_obj))],
         )
         .unwrap();
 
@@ -1811,24 +1836,18 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let mc = native_serialized_application_get_main_class(
-            &mut ctx,
-            &[Value::Object(Some(sa))],
-        )
-        .unwrap()
-        .unwrap();
+        let mc = native_serialized_application_get_main_class(&mut ctx, &[Value::Object(Some(sa))])
+            .unwrap()
+            .unwrap();
         let name = match mc {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => panic!(),
         };
         assert_eq!(name, "org.keycloak.quarkus.runtime.KeycloakMain");
 
-        let cl = native_serialized_application_get_runner_cl(
-            &mut ctx,
-            &[Value::Object(Some(sa))],
-        )
-        .unwrap()
-        .unwrap();
+        let cl = native_serialized_application_get_runner_cl(&mut ctx, &[Value::Object(Some(sa))])
+            .unwrap()
+            .unwrap();
         assert!(matches!(cl, Value::Object(Some(_))));
     }
 
@@ -1842,11 +1861,9 @@ mod tests {
         let cid = ctx.ensure_class_initialized(CLS_SERIALIZED_APP).unwrap();
         let sa = ctx.alloc_object(cid, 2);
         // Leave both slots at default (Value::Int(0) from MockNativeContext).
-        let err = native_serialized_application_get_main_class(
-            &mut ctx,
-            &[Value::Object(Some(sa))],
-        )
-        .unwrap_err();
+        let err =
+            native_serialized_application_get_main_class(&mut ctx, &[Value::Object(Some(sa))])
+                .unwrap_err();
         match err {
             cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -1928,7 +1945,9 @@ mod tests {
     fn t19_h5_runner_class_loader_load_class_happy_path_returns_mirror() {
         let mut ctx = mock_ctx();
         // Allocate a fake RunnerClassLoader instance (the `this` arg).
-        let rcl_cid = ctx.ensure_class_initialized(CLS_RUNNER_CLASSLOADER).unwrap();
+        let rcl_cid = ctx
+            .ensure_class_initialized(CLS_RUNNER_CLASSLOADER)
+            .unwrap();
         let rcl = ctx.alloc_object(rcl_cid, 1);
         // Pre-load a class in the mock so ensure_class_initialized returns Ok.
         ctx.ensure_class_initialized("com/example/App").unwrap();
@@ -1945,10 +1964,7 @@ mod tests {
                 match ctx.get_field(mirror, 1) {
                     Value::Object(Some(s)) => {
                         // Mock's get_class_mirror stores the internal name.
-                        assert_eq!(
-                            ctx.read_string(s).as_deref(),
-                            Some("com/example/App")
-                        );
+                        assert_eq!(ctx.read_string(s).as_deref(), Some("com/example/App"));
                     }
                     _ => panic!("mirror name slot empty"),
                 }
@@ -1960,7 +1976,9 @@ mod tests {
     #[test]
     fn t19_h5_runner_class_loader_load_class_null_name_throws_npe() {
         let mut ctx = mock_ctx();
-        let rcl_cid = ctx.ensure_class_initialized(CLS_RUNNER_CLASSLOADER).unwrap();
+        let rcl_cid = ctx
+            .ensure_class_initialized(CLS_RUNNER_CLASSLOADER)
+            .unwrap();
         let rcl = ctx.alloc_object(rcl_cid, 1);
         let err = native_runner_class_loader_load_class(
             &mut ctx,
@@ -1980,7 +1998,9 @@ mod tests {
     #[test]
     fn t19_h5_runner_class_loader_load_class_rejects_bad_name() {
         let mut ctx = mock_ctx();
-        let rcl_cid = ctx.ensure_class_initialized(CLS_RUNNER_CLASSLOADER).unwrap();
+        let rcl_cid = ctx
+            .ensure_class_initialized(CLS_RUNNER_CLASSLOADER)
+            .unwrap();
         let rcl = ctx.alloc_object(rcl_cid, 1);
         let bad = ctx.create_string("../../etc/passwd");
         let err = native_runner_class_loader_load_class(
@@ -2005,7 +2025,9 @@ mod tests {
         // The internal VM uses slash-delimited names; the input uses dots.
         // Verify the translation happens before ensure_class_initialized.
         let mut ctx = mock_ctx();
-        let rcl_cid = ctx.ensure_class_initialized(CLS_RUNNER_CLASSLOADER).unwrap();
+        let rcl_cid = ctx
+            .ensure_class_initialized(CLS_RUNNER_CLASSLOADER)
+            .unwrap();
         let rcl = ctx.alloc_object(rcl_cid, 1);
         // Pre-load using the slash form.
         ctx.ensure_class_initialized("org/keycloak/quarkus/runtime/KeycloakMain")
@@ -2021,7 +2043,9 @@ mod tests {
     #[test]
     fn t19_h5_runner_class_loader_load_class_with_resolve_delegates() {
         let mut ctx = mock_ctx();
-        let rcl_cid = ctx.ensure_class_initialized(CLS_RUNNER_CLASSLOADER).unwrap();
+        let rcl_cid = ctx
+            .ensure_class_initialized(CLS_RUNNER_CLASSLOADER)
+            .unwrap();
         let rcl = ctx.alloc_object(rcl_cid, 1);
         ctx.ensure_class_initialized("a/b/C").unwrap();
         let name = ctx.create_string("a.b.C");

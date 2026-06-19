@@ -17,28 +17,25 @@
 //! See [`ThreadEventRing`] for the local (non-registered) ring type, and
 //! [`ThreadRingRegistry`] for the multi-thread aggregator used by the dumper.
 
-pub mod event;
+pub mod builtin;
 pub mod dump;
+pub mod event;
 pub mod recording;
 pub mod repository;
-pub mod builtin;
 pub mod stream;
 
+pub use dump::{dump_to_file, read_events, read_jfr_header, JfrDumpError, JfrFileHeader};
 pub use event::*;
 pub use recording::*;
 pub use repository::*;
-pub use dump::{JfrDumpError, JfrFileHeader, dump_to_file, read_events, read_jfr_header};
 pub use stream::EventStream;
 
 // Explicit re-exports of the per-thread ring API. These are also covered by
 // the blanket `pub use repository::*;` above, but listing them here documents
 // the public surface and guards against accidental removal from the glob.
 pub use repository::{
+    global_ring_registry, push_to_thread_ring, ThreadEventRing, ThreadRingRegistry,
     DEFAULT_THREAD_RING_CAPACITY,
-    ThreadEventRing,
-    ThreadRingRegistry,
-    global_ring_registry,
-    push_to_thread_ring,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,7 +274,10 @@ mod tests {
     #[test]
     fn test_builtin_gc_event_exists() {
         let fr = create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.GarbageCollection").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .is_some());
     }
 
     #[test]
@@ -293,7 +293,9 @@ mod tests {
     fn test_recording_threshold_filtering() {
         let tid = EventTypeId(1);
         let mut settings = RecordingSettings::new("threshold-test");
-        settings.event_thresholds.insert(tid, Duration::from_nanos(500));
+        settings
+            .event_thresholds
+            .insert(tid, Duration::from_nanos(500));
 
         let mut rec = Recording::new(1, settings);
         rec.start();
@@ -438,7 +440,10 @@ mod tests {
         let fr = create_flight_recorder();
         assert!(fr.type_registry.find_by_name("jdk.ClassLoad").is_some());
         assert!(fr.type_registry.find_by_name("jdk.CPULoad").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.ExecutionSample").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.ExecutionSample")
+            .is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -469,7 +474,10 @@ mod tests {
         // (1) Toggle the global enable flag through the public API.
         let prior = is_enabled();
         set_enabled(true);
-        assert!(is_enabled(), "set_enabled(true) should make is_enabled() return true");
+        assert!(
+            is_enabled(),
+            "set_enabled(true) should make is_enabled() return true"
+        );
 
         // (2) Push a uniquely-tagged event through the public function.
         let unique_start: u64 = 0xCAFE_F00D_DEAD_BEEF;

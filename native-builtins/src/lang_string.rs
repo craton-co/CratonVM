@@ -4,9 +4,9 @@
 //! String, StringBuilder, and StringBuffer native method implementations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::intern_arc;
+use cratonvm_types::Value;
 
 use crate::{compile_java_regex, native_noop_with_this, obj_arg};
 
@@ -116,11 +116,7 @@ fn decode_string_chars(
 /// Fill the given `Vec<u16>` with the characters of the String object's
 /// underlying value (char[] or compact-string byte[]). The vector is
 /// cleared first.
-fn fill_string_chars(
-    ctx: &dyn NativeContext,
-    obj: cratonvm_types::ObjectRef,
-    dst: &mut Vec<u16>,
-) {
+fn fill_string_chars(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef, dst: &mut Vec<u16>) {
     decode_string_chars(ctx, obj, dst);
 }
 
@@ -611,10 +607,7 @@ pub(crate) fn string_char_array(
 /// Number of UTF-16 code units (== `String.length()`) for a String object,
 /// accounting for the JDK 9+ compact layout: a UTF-16-coded `byte[]` value
 /// holds `2 * length` bytes, so the raw array length must be halved.
-pub(crate) fn string_char_count(
-    ctx: &dyn NativeContext,
-    this: cratonvm_types::ObjectRef,
-) -> usize {
+pub(crate) fn string_char_count(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> usize {
     let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => return 0,
@@ -630,7 +623,10 @@ pub(crate) fn string_char_count(
     }
 }
 
-pub(crate) fn native_string_intern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_intern(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -659,7 +655,10 @@ pub(crate) fn native_string_intern(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Object(Some(interned))))
 }
 
-pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -679,11 +678,12 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
     let hash_field_index: usize = match HASH_SLOT.get() {
         Some(i) => *i,
         None => {
-            let slot = match string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr)) {
-                Some(cratonvm_types::ArrayElementType::Byte)
-                | Some(cratonvm_types::ArrayElementType::Boolean) => 2,
-                _ => 1,
-            };
+            let slot =
+                match string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr)) {
+                    Some(cratonvm_types::ArrayElementType::Byte)
+                    | Some(cratonvm_types::ArrayElementType::Boolean) => 2,
+                    _ => 1,
+                };
             let _ = HASH_SLOT.set(slot);
             slot
         }
@@ -707,8 +707,7 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
     // For compact strings (byte[] value), inspect the `coder` byte
     // (field 1) to know whether the bytes are LATIN-1 (one byte per char,
     // unsigned-extended) or UTF-16 (big-endian u16 pairs).
-    let is_utf16 = is_byte_array
-        && matches!(ctx.get_field(this, 1), Value::Int(1));
+    let is_utf16 = is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1));
 
     // Strategy: drain the array into a thread-local i32 scratch buffer in
     // ONE tight virtual-dispatch loop (per element, but at least the loop
@@ -789,7 +788,10 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Int(hash)))
 }
 
-pub(crate) fn native_string_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -802,7 +804,10 @@ pub(crate) fn native_string_length(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(len)))
 }
 
-pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_char_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -821,7 +826,8 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
         Some(v) => v,
         None => {
             return Err(
-                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }
+                    .into(),
             )
         }
     };
@@ -834,7 +840,9 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
     let char_count = if is_utf16 { raw_len / 2 } else { raw_len };
 
     if index < 0 || index >= char_count as i32 {
-        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+        );
     }
 
     let i = index as usize;
@@ -862,7 +870,10 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(ch))
 }
 
-pub(crate) fn native_string_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))), // null != anything
@@ -898,7 +909,10 @@ pub(crate) fn native_string_equals(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(if equal { 1 } else { 0 })))
 }
 
-pub(crate) fn native_string_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_index_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
@@ -914,7 +928,10 @@ pub(crate) fn native_string_index_of(ctx: &mut dyn NativeContext, args: &[Value]
     // calls when the haystack is long.
     let needle = (ch & 0xFFFF) as u16;
     let pos = with_string_chars_scratch(ctx, this, |buf| {
-        buf.iter().position(|&c| c == needle).map(|i| i as i32).unwrap_or(-1)
+        buf.iter()
+            .position(|&c| c == needle)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
     });
     Ok(Some(Value::Int(pos)))
 }
@@ -1007,7 +1024,10 @@ pub(crate) fn native_string_last_index_of_from(
 // from `lib.rs`. They are left untouched; the T2 census recorded both
 // items as pre-existing.
 
-pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_substring(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -1039,7 +1059,11 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
             );
             let (char_count, is_utf16) = if is_byte_array {
                 let utf16 = matches!(ctx.get_field(this, 1), Value::Int(1));
-                if utf16 { (total_len / 2, true) } else { (total_len, false) }
+                if utf16 {
+                    (total_len / 2, true)
+                } else {
+                    (total_len, false)
+                }
             } else {
                 (total_len, false)
             };
@@ -1101,7 +1125,10 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Static method: args[0] = int value
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1198,7 +1225,11 @@ pub(crate) fn sb_ensure_capacity(
 }
 
 /// Helper: append a slice of u16 chars to a StringBuilder.
-pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
+pub(crate) fn sb_append_chars(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    chars: &[u16],
+) {
     let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
@@ -1209,12 +1240,19 @@ pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: cratonvm_types:
 }
 
 /// Helper: append a Rust string to a StringBuilder.
-pub(crate) fn sb_append_str(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, text: &str) {
+pub(crate) fn sb_append_str(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    text: &str,
+) {
     let chars: Vec<u16> = text.encode_utf16().collect();
     sb_append_chars(ctx, this, &chars);
 }
 
-pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_init_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1231,7 +1269,10 @@ pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(None)
 }
 
-pub(crate) fn native_sb_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_init_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1298,7 +1339,10 @@ pub(crate) fn native_sb_init_charsequence(
     Ok(None)
 }
 
-pub(crate) fn native_sb_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_init_capacity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1329,7 +1373,10 @@ pub(crate) fn native_sb_init_capacity(ctx: &mut dyn NativeContext, args: &[Value
     Ok(None)
 }
 
-pub(crate) fn native_sb_append_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1343,7 +1390,10 @@ pub(crate) fn native_sb_append_string(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1356,7 +1406,10 @@ pub(crate) fn native_sb_append_int(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_char(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1394,10 +1447,12 @@ pub(crate) fn native_sb_repeat_codepoint(
         _ => 0,
     };
     if count < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("count is negative: {count}"),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("count is negative: {count}"),
+            }
+            .into(),
+        );
     }
     if count == 0 {
         return Ok(Some(Value::Object(Some(this))));
@@ -1414,10 +1469,12 @@ pub(crate) fn native_sb_repeat_codepoint(
         let v = cp - 0x1_0000;
         vec![0xD800 + (v >> 10) as u16, 0xDC00 + (v & 0x3FF) as u16]
     } else {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("Not a valid Unicode code point: 0x{cp:X}"),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Not a valid Unicode code point: 0x{cp:X}"),
+            }
+            .into(),
+        );
     };
     let total = unit.len().saturating_mul(count as usize);
     let mut chars: Vec<u16> = Vec::with_capacity(total);
@@ -1492,7 +1549,10 @@ pub(crate) fn native_sb_append_char_array(
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1505,7 +1565,10 @@ pub(crate) fn native_sb_append_boolean(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1524,7 +1587,10 @@ pub(crate) fn native_sb_append_long(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1540,7 +1606,10 @@ pub(crate) fn native_sb_append_double(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(this))))
 }
 
-pub(crate) fn native_sb_append_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1623,7 +1692,10 @@ pub(crate) fn invoke_to_string(
     }
 }
 
-pub(crate) fn native_sb_append_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_append_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1759,21 +1831,36 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let src_begin = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-    let src_end   = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
+    let src_begin = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let src_end = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
     let dst = match args.get(3) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
-    let dst_begin = match args.get(4) { Some(Value::Int(v)) => *v, _ => 0 };
+    let dst_begin = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
 
     let (buf, count) = sb_state(ctx, this);
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-            index: src_begin,
-        }.into());
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                index: src_begin,
+            }
+            .into(),
+        );
     }
-    let buf = match buf { Some(b) => b, None => return Ok(None) };
+    let buf = match buf {
+        Some(b) => b,
+        None => return Ok(None),
+    };
     let n = (src_end - src_begin) as usize;
     for i in 0..n {
         let ch = ctx.get_array_element(buf, src_begin as usize + i);
@@ -1802,7 +1889,9 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if index < 0 || index >= count {
-        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+        );
     }
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
@@ -1853,7 +1942,11 @@ pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::Objec
 }
 
 /// Helper: write a Vec<u16> back into a StringBuilder, replacing all content.
-pub(crate) fn sb_write_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
+pub(crate) fn sb_write_chars(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    chars: &[u16],
+) {
     let current_count = sb_state(ctx, this).1 as usize;
     let additional = chars.len().saturating_sub(current_count);
     let (this, buf) = sb_ensure_capacity(ctx, this, additional);
@@ -1864,7 +1957,10 @@ pub(crate) fn sb_write_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::
 }
 
 /// insert(int, String) — insert string at offset
-pub(crate) fn native_sb_insert_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_insert_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1890,7 +1986,10 @@ pub(crate) fn native_sb_insert_string(ctx: &mut dyn NativeContext, args: &[Value
 }
 
 /// insert(int, char) — insert single char
-pub(crate) fn native_sb_insert_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_insert_char(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1914,7 +2013,10 @@ pub(crate) fn native_sb_insert_char(ctx: &mut dyn NativeContext, args: &[Value])
 }
 
 /// insert(int, int) — insert int as string
-pub(crate) fn native_sb_insert_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_insert_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1939,7 +2041,10 @@ pub(crate) fn native_sb_insert_int(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 /// insert(int, Object) — insert Object via toString
-pub(crate) fn native_sb_insert_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_insert_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1993,7 +2098,10 @@ pub(crate) fn native_sb_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// deleteCharAt(int) — remove single char
-pub(crate) fn native_sb_delete_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_delete_char_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2042,7 +2150,10 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 /// setCharAt(int, char) — set char at index
-pub(crate) fn native_sb_set_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_set_char_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -2065,7 +2176,10 @@ pub(crate) fn native_sb_set_char_at(ctx: &mut dyn NativeContext, args: &[Value])
 }
 
 /// setLength(int) — truncate or extend with null chars
-pub(crate) fn native_sb_set_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_set_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -2120,7 +2234,10 @@ pub(crate) fn native_sb_index_of(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 /// indexOf(String, int) — find substring from offset
-pub(crate) fn native_sb_index_of_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_index_of_from(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2180,13 +2297,19 @@ pub(crate) fn native_sb_last_index_of(
         _ => return Ok(Some(Value::Int(-1))),
     };
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => {
-            ctx.read_string(*obj).unwrap_or_default().encode_utf16().collect()
-        }
+        Some(Value::Object(Some(obj))) => ctx
+            .read_string(*obj)
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect(),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
-    Ok(Some(Value::Int(u16_last_index_of(&chars, &target, chars.len() as i32))))
+    Ok(Some(Value::Int(u16_last_index_of(
+        &chars,
+        &target,
+        chars.len() as i32,
+    ))))
 }
 
 /// lastIndexOf(String, int) — last occurrence at a start index <= fromIndex.
@@ -2199,9 +2322,11 @@ pub(crate) fn native_sb_last_index_of_from(
         _ => return Ok(Some(Value::Int(-1))),
     };
     let target: Vec<u16> = match args.get(1) {
-        Some(Value::Object(Some(obj))) => {
-            ctx.read_string(*obj).unwrap_or_default().encode_utf16().collect()
-        }
+        Some(Value::Object(Some(obj))) => ctx
+            .read_string(*obj)
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect(),
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -2230,7 +2355,10 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 /// substring(int, int) — substring [start, end)
-pub(crate) fn native_sb_substring_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_substring_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2264,7 +2392,10 @@ pub(crate) fn native_sb_capacity(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 /// ensureCapacity(int) — grow if needed
-pub(crate) fn native_sb_ensure_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sb_ensure_cap(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -2308,7 +2439,10 @@ pub(crate) fn format_float(v: f32) -> String {
 /// Performance-critical binary callers (compareTo, indexOf, startsWith,
 /// endsWith, contains, replace) should prefer `with_string_chars_scratch`
 /// or `with_two_string_chars_scratches` to avoid this allocation entirely.
-pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Vec<u16> {
+pub(crate) fn read_string_chars(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Vec<u16> {
     // Layout-aware decode: handles legacy char[] values as well as JDK 9+
     // compact byte[] values in either LATIN-1 or UTF-16 coding. Reading the
     // raw byte[] length as a char count (or each byte as a char) silently
@@ -2318,7 +2452,10 @@ pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: cratonvm_types::Ob
     chars
 }
 
-pub(crate) fn native_string_to_char_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_to_char_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2338,7 +2475,10 @@ pub(crate) fn native_string_to_char_array(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(arr))))
 }
 
-pub(crate) fn native_string_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_contains(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2359,7 +2499,10 @@ pub(crate) fn native_string_contains(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
-pub(crate) fn native_string_starts_with(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_starts_with(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2400,7 +2543,10 @@ pub(crate) fn native_string_starts_with_offset(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
-pub(crate) fn native_string_ends_with(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_ends_with(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2426,7 +2572,10 @@ pub(crate) fn native_string_trim(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_replace(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2455,7 +2604,10 @@ pub(crate) fn native_string_replace(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_to_lower_case(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_to_lower_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2466,7 +2618,10 @@ pub(crate) fn native_string_to_lower_case(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_to_upper_case(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_to_upper_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2477,7 +2632,10 @@ pub(crate) fn native_string_to_upper_case(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_is_empty(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -2489,7 +2647,10 @@ pub(crate) fn native_string_is_empty(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(if len == 0 { 1 } else { 0 })))
 }
 
-pub(crate) fn native_string_value_of_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -2498,7 +2659,10 @@ pub(crate) fn native_string_value_of_long(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v != 0,
         _ => false,
@@ -2507,7 +2671,10 @@ pub(crate) fn native_string_value_of_boolean(ctx: &mut dyn NativeContext, args: 
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -2516,7 +2683,10 @@ pub(crate) fn native_string_value_of_double(ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_char(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let ch = match args.first() {
         Some(Value::Int(v)) => char::from_u32(*v as u32).unwrap_or('\0'),
         _ => '\0',
@@ -2525,7 +2695,10 @@ pub(crate) fn native_string_value_of_char(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -2534,7 +2707,10 @@ pub(crate) fn native_string_value_of_float(ctx: &mut dyn NativeContext, args: &[
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_value_of_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_value_of_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let text = match args.first() {
         Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
         Some(Value::Object(None)) => "null".to_string(),
@@ -2544,7 +2720,10 @@ pub(crate) fn native_string_value_of_object(ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2571,7 +2750,10 @@ pub(crate) fn native_string_compare_to(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Int(result)))
 }
 
-pub(crate) fn native_string_index_of_str(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_index_of_str(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2597,7 +2779,10 @@ pub(crate) fn native_string_index_of_str(ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Int(result)))
 }
 
-pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_substring_one(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -2623,7 +2808,11 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
             );
             let (char_count, is_utf16) = if is_byte_array {
                 let utf16 = matches!(ctx.get_field(this, 1), Value::Int(1));
-                if utf16 { (total_len / 2, true) } else { (total_len, false) }
+                if utf16 {
+                    (total_len / 2, true)
+                } else {
+                    (total_len, false)
+                }
             } else {
                 (total_len, false)
             };
@@ -2635,7 +2824,8 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
 
     if begin < 0 || begin > end {
         return Err(
-            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }.into(),
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }
+                .into(),
         );
     }
 
@@ -2680,7 +2870,10 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_get_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_get_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2695,7 +2888,10 @@ pub(crate) fn native_string_get_bytes(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(Some(arr))))
 }
 
-pub(crate) fn native_string_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_concat(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2724,7 +2920,10 @@ pub(crate) fn native_string_split(ctx: &mut dyn NativeContext, args: &[Value]) -
     native_string_split_impl(ctx, args, -1)
 }
 
-pub(crate) fn native_string_split_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_split_limit(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let limit = match args.get(2) {
         Some(Value::Int(n)) => *n,
         _ => -1,
@@ -2750,7 +2949,10 @@ pub(crate) fn native_string_split_impl(
 
     let parts: Vec<String> = if delim.is_empty() {
         // Empty delimiter: split each character (like Java regex "")
-        s.split("").filter(|p| !p.is_empty()).map(|p| p.to_string()).collect()
+        s.split("")
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect()
     } else if let Ok(re) = compile_java_regex(&delim, 0) {
         if limit > 0 {
             re.splitn(&s, limit as usize)
@@ -2758,7 +2960,9 @@ pub(crate) fn native_string_split_impl(
             re.split(&s)
         }
     } else if limit > 0 {
-        s.splitn(limit as usize, delim.as_str()).map(|p| p.to_string()).collect()
+        s.splitn(limit as usize, delim.as_str())
+            .map(|p| p.to_string())
+            .collect()
     } else {
         s.split(delim.as_str()).map(|p| p.to_string()).collect()
     };
@@ -2814,7 +3018,10 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(ctx.create_string(&joined)))))
 }
 
-pub(crate) fn native_string_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_replace_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2836,7 +3043,10 @@ pub(crate) fn native_string_replace_all(ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
-pub(crate) fn native_string_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_replace_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2858,7 +3068,10 @@ pub(crate) fn native_string_replace_first(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
-pub(crate) fn native_string_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_matches(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -2996,7 +3209,10 @@ pub(crate) fn native_string_last_index_of_str(
     Ok(Some(Value::Int(result)))
 }
 
-pub(crate) fn native_string_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_get_chars(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -3039,7 +3255,10 @@ pub(crate) fn native_string_strip(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Object(Some(ctx.create_string(s.trim())))))
 }
 
-pub(crate) fn native_string_strip_leading(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_strip_leading(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3048,7 +3267,10 @@ pub(crate) fn native_string_strip_leading(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(ctx.create_string(s.trim_start())))))
 }
 
-pub(crate) fn native_string_strip_trailing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_strip_trailing(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3057,7 +3279,10 @@ pub(crate) fn native_string_strip_trailing(ctx: &mut dyn NativeContext, args: &[
     Ok(Some(Value::Object(Some(ctx.create_string(s.trim_end())))))
 }
 
-pub(crate) fn native_string_copy_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_copy_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Static method: args[0] = char[]
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3080,7 +3305,10 @@ pub(crate) fn native_string_copy_value_of(ctx: &mut dyn NativeContext, args: &[V
 // Phase 14 Step 3: String extras
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_string_code_point_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_code_point_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3098,10 +3326,12 @@ pub(crate) fn native_string_code_point_at(ctx: &mut dyn NativeContext, args: &[V
     let s = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = s.encode_utf16().collect();
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
-            index: index_i32,
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                index: index_i32,
+            }
+            .into(),
+        );
     }
     let index = index_i32 as usize;
     let ch = chars[index];
@@ -3116,7 +3346,10 @@ pub(crate) fn native_string_code_point_at(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Int(ch as i32)))
 }
 
-pub(crate) fn native_string_code_point_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_code_point_count(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3253,7 +3486,10 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Object(Some(stream))))
 }
 
-pub(crate) fn native_string_indent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_indent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3285,7 +3521,10 @@ pub(crate) fn native_string_indent(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-pub(crate) fn native_string_transform(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_transform(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3302,10 +3541,12 @@ pub(crate) fn native_string_transform(ctx: &mut dyn NativeContext, args: &[Value
     )
 }
 
-
 // --- String.format (basic %s/%d/%f support) ---
 
-pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_format(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Static: args[0] = format String, args[1] = Object[] array
     let fmt_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3343,10 +3584,12 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             // UnknownFormatConversionException (an IllegalFormatException,
             // which extends IllegalArgumentException).
             if i + 1 >= chars.len() {
-                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Format string ends with a lone '%'".to_string(),
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "Format string ends with a lone '%'".to_string(),
+                    }
+                    .into(),
+                );
             }
             i += 1;
             // Check for %% and %n first
@@ -3477,10 +3720,12 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             } else {
                 // Reached end of string after consuming flags/width/precision
                 // with no conversion character — a truncated specifier.
-                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "Format string ends with an incomplete conversion".to_string(),
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "Format string ends with an incomplete conversion".to_string(),
+                    }
+                    .into(),
+                );
             }
         } else {
             result.push(chars[i]);
@@ -3797,7 +4042,10 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
 // ---------------------------------------------------------------------------
 
 /// repeat(int) — "ab".repeat(3) → "ababab"
-pub(crate) fn native_string_repeat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_repeat(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -3813,7 +4061,10 @@ pub(crate) fn native_string_repeat(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 /// isBlank() — true if empty or all whitespace
-pub(crate) fn native_string_is_blank(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_is_blank(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
@@ -3915,7 +4166,10 @@ fn code_unit_eq_ignore_case(a: u16, b: u16) -> bool {
 }
 
 /// regionMatches(int toffset, String other, int ooffset, int len) — case-sensitive
-pub(crate) fn native_string_region_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_region_matches(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -3958,7 +4212,10 @@ pub(crate) fn native_string_region_matches(ctx: &mut dyn NativeContext, args: &[
 /// formatted(Object[]) — instance method: this.formatted(args) → String.format(this, args)
 /// String.format(Locale, String, Object...) — static method with Locale (ignored for now).
 /// args[0] = Locale, args[1] = format String, args[2] = Object[]
-pub(crate) fn native_string_format_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_format_locale(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Skip the Locale argument (args[0]) and delegate to the main format impl
     let format_args = [
         args.get(1).cloned().unwrap_or(Value::Object(None)),
@@ -3967,7 +4224,10 @@ pub(crate) fn native_string_format_locale(ctx: &mut dyn NativeContext, args: &[V
     native_string_format(ctx, &format_args)
 }
 
-pub(crate) fn native_string_formatted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_string_formatted(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0] = this (the format string), args[1] = Object[]
     let format_args = [
         args.first().cloned().unwrap_or(Value::Object(None)),
@@ -3975,7 +4235,6 @@ pub(crate) fn native_string_formatted(ctx: &mut dyn NativeContext, args: &[Value
     ];
     native_string_format(ctx, &format_args)
 }
-
 
 // ---------------------------------------------------------------------------
 // java.lang.StringUTF16 — static helpers used during <clinit>
@@ -4111,10 +4370,8 @@ pub(crate) fn native_string_check_bounds_off_count(
     // Overflow-safe `offset + count > length`: rearranged as
     // `offset > length - count` when both `length` and `count` are
     // non-negative; outside that window the negative-arg check fires first.
-    let bad_size = offset < 0
-        || count < 0
-        || length < 0
-        || (offset as i64 + count as i64) > length as i64;
+    let bad_size =
+        offset < 0 || count < 0 || length < 0 || (offset as i64 + count as i64) > length as i64;
     if bad_size {
         let index = if offset < 0 { offset } else { count };
         return Err(
@@ -4324,7 +4581,12 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
     r.register(sb, "<init>", "()V", native_sb_init_default);
     r.register(sb, "<init>", "(I)V", native_sb_init_capacity);
     r.register(sb, "<init>", "(Ljava/lang/String;)V", native_sb_init_string);
-    r.register(sb, "<init>", "(Ljava/lang/CharSequence;)V", native_sb_init_charsequence);
+    r.register(
+        sb,
+        "<init>",
+        "(Ljava/lang/CharSequence;)V",
+        native_sb_init_charsequence,
+    );
     r.register(
         sb,
         "append",
@@ -4597,7 +4859,11 @@ mod tests {
         let s = ctx.create_string("abcabc");
         let r = native_string_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('b' as i32), Value::Int(2)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('b' as i32),
+                Value::Int(2),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(4)));
     }
@@ -4608,7 +4874,11 @@ mod tests {
         let s = ctx.create_string("abc");
         let r = native_string_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('a' as i32), Value::Int(-100)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('a' as i32),
+                Value::Int(-100),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(0)));
     }
@@ -4619,7 +4889,11 @@ mod tests {
         let s = ctx.create_string("abc");
         let r = native_string_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('a' as i32), Value::Int(10)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('a' as i32),
+                Value::Int(10),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(-1)));
     }
@@ -4630,7 +4904,11 @@ mod tests {
         let s = ctx.create_string("abcdef");
         let r = native_string_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('z' as i32), Value::Int(0)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('z' as i32),
+                Value::Int(0),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(-1)));
     }
@@ -4641,7 +4919,11 @@ mod tests {
         let s = ctx.create_string("abcabc");
         let r = native_string_last_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('b' as i32), Value::Int(4)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('b' as i32),
+                Value::Int(4),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(4)));
     }
@@ -4654,7 +4936,11 @@ mod tests {
         // at index 4.
         let r = native_string_last_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('b' as i32), Value::Int(2)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('b' as i32),
+                Value::Int(2),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(1)));
     }
@@ -4665,7 +4951,11 @@ mod tests {
         let s = ctx.create_string("abc");
         let r = native_string_last_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('a' as i32), Value::Int(-1)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('a' as i32),
+                Value::Int(-1),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(-1)));
     }
@@ -4676,7 +4966,11 @@ mod tests {
         let s = ctx.create_string("");
         let r = native_string_last_index_of_from(
             &mut ctx,
-            &[Value::Object(Some(s)), Value::Int('a' as i32), Value::Int(0)],
+            &[
+                Value::Object(Some(s)),
+                Value::Int('a' as i32),
+                Value::Int(0),
+            ],
         );
         assert_eq!(r.unwrap(), Some(Value::Int(-1)));
     }
@@ -4889,10 +5183,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let a = ctx.create_string("hello ");
         let b = ctx.create_string("world");
-        let r = native_string_concat(
-            &mut ctx,
-            &[Value::Object(Some(a)), Value::Object(Some(b))],
-        );
+        let r = native_string_concat(&mut ctx, &[Value::Object(Some(a)), Value::Object(Some(b))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected Object, got {other:?}"),
@@ -4943,7 +5234,9 @@ mod tests {
     // allocations inside `Formatter.format`.
 
     fn make_sb(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
-        let cid = ctx.ensure_class_initialized("java/lang/StringBuilder").unwrap();
+        let cid = ctx
+            .ensure_class_initialized("java/lang/StringBuilder")
+            .unwrap();
         // Allocate enough slots to match real JDK layout width (value/coder/count ≈ 3).
         let sb = ctx.alloc_object(cid, 4);
         native_sb_init_default(ctx, &[Value::Object(Some(sb))]).unwrap();
@@ -4961,7 +5254,9 @@ mod tests {
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
         let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
-        let Some(Value::Object(Some(out_obj))) = out_r else { panic!() };
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "hello");
     }
 
@@ -4975,7 +5270,9 @@ mod tests {
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
         let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
-        let Some(Value::Object(Some(out_obj))) = out_r else { panic!() };
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "null");
     }
 
@@ -4995,7 +5292,9 @@ mod tests {
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
         let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
-        let Some(Value::Object(Some(out_obj))) = out_r else { panic!() };
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "cde");
     }
 
@@ -5016,7 +5315,9 @@ mod tests {
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
         let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
-        let Some(Value::Object(Some(out_obj))) = out_r else { panic!() };
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "abc");
     }
 
@@ -5036,7 +5337,9 @@ mod tests {
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
         let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
-        let Some(Value::Object(Some(out_obj))) = out_r else { panic!() };
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "");
     }
 
@@ -5089,7 +5392,9 @@ mod tests {
     #[test]
     fn t18_k6_string_utf16_is_big_endian_returns_false() {
         let mut ctx = mock_ctx();
-        let result = native_string_utf16_is_big_endian(&mut ctx, &[]).unwrap().unwrap();
+        let result = native_string_utf16_is_big_endian(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
         // Little-endian on x86-64: isBigEndian() is false.
         let expected_int = if cfg!(target_endian = "big") { 1 } else { 0 };
         assert_eq!(result, Value::Int(expected_int));
@@ -5109,12 +5414,9 @@ mod tests {
         // The Java verifier guarantees correct arity at the call site, but
         // our impl should not panic if called with unexpected trailing args.
         let mut ctx = mock_ctx();
-        let r = native_string_utf16_is_big_endian(
-            &mut ctx,
-            &[Value::Int(0), Value::Int(42)],
-        )
-        .unwrap()
-        .unwrap();
+        let r = native_string_utf16_is_big_endian(&mut ctx, &[Value::Int(0), Value::Int(42)])
+            .unwrap()
+            .unwrap();
         let expected_int = if cfg!(target_endian = "big") { 1 } else { 0 };
         assert_eq!(r, Value::Int(expected_int));
     }
@@ -5129,8 +5431,12 @@ mod tests {
             cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(re),
             ) => match re {
-                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => "sioobe",
-                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { .. } => "aioobe",
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => {
+                    "sioobe"
+                }
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { .. } => {
+                    "aioobe"
+                }
                 _ => "other-runtime",
             },
             _ => "other-failed",
@@ -5268,11 +5574,8 @@ mod tests {
         // handlers fire correctly.
         let mut ctx = mock_ctx();
         let s = ctx.create_string("hi");
-        let err = native_string_code_point_at(
-            &mut ctx,
-            &[Value::Object(Some(s)), Value::Int(-1)],
-        )
-        .unwrap_err();
+        let err = native_string_code_point_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(-1)])
+            .unwrap_err();
         assert_eq!(err_kind(&err), "sioobe");
     }
 
@@ -5280,12 +5583,8 @@ mod tests {
     fn f4_code_point_at_too_large_throws_sioobe_not_aioobe() {
         let mut ctx = mock_ctx();
         let s = ctx.create_string("hi");
-        let err = native_string_code_point_at(
-            &mut ctx,
-            &[Value::Object(Some(s)), Value::Int(99)],
-        )
-        .unwrap_err();
+        let err = native_string_code_point_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(99)])
+            .unwrap_err();
         assert_eq!(err_kind(&err), "sioobe");
     }
 }
-

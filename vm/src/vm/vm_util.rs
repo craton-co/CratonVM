@@ -105,39 +105,39 @@ fn clinit_swallow_has_recovery(class_name: &str) -> bool {
         return false;
     }
     // (1) Classes with an explicit `post_clinit_fixup` recovery arm.
-    let has_fixup_arm = matches!(class_name,
+    let has_fixup_arm = matches!(
+        class_name,
         "java/util/logging/LogManager"
-        | "jdk/internal/icu/text/NormalizerBase$NFCModeImpl"
-        | "jdk/internal/icu/text/NormalizerBase$NFDModeImpl"
-        | "jdk/internal/icu/text/NormalizerBase$NFKCModeImpl"
-        | "jdk/internal/icu/text/NormalizerBase$NFKDModeImpl"
-        | "jdk/internal/icu/text/NormalizerBase$NFKC32ModeImpl"
-        | "java/lang/invoke/VarHandleInts$Array"
-        | "java/lang/invoke/VarHandleLongs$Array"
-        | "java/lang/invoke/VarHandleShorts$Array"
-        | "java/lang/invoke/VarHandleBytes$Array"
-        | "java/lang/invoke/VarHandleBooleans$Array"
-        | "java/lang/invoke/VarHandleChars$Array"
-        | "java/lang/invoke/VarHandleFloats$Array"
-        | "java/lang/invoke/VarHandleDoubles$Array"
-        | "java/lang/invoke/VarHandleReferences$Array"
-        | "io/quarkus/bootstrap/logging/InitialConfigurator"
-        | "org/jboss/modules/DefaultBootModuleLoaderHolder"
-        | "java/math/BigInteger"
-        | "java/nio/file/attribute/PosixFilePermission"
-        | "java/math/BigDecimal"
-        | "org/springframework/core/metrics/ApplicationStartup"
-        | "org/jboss/msc/service/ServiceContainerImpl"
-        | "org/wildfly/security/auth/server/_private/ElytronMessages"
-        | "org/jboss/msc/service/ServiceLogger"
+            | "jdk/internal/icu/text/NormalizerBase$NFCModeImpl"
+            | "jdk/internal/icu/text/NormalizerBase$NFDModeImpl"
+            | "jdk/internal/icu/text/NormalizerBase$NFKCModeImpl"
+            | "jdk/internal/icu/text/NormalizerBase$NFKDModeImpl"
+            | "jdk/internal/icu/text/NormalizerBase$NFKC32ModeImpl"
+            | "java/lang/invoke/VarHandleInts$Array"
+            | "java/lang/invoke/VarHandleLongs$Array"
+            | "java/lang/invoke/VarHandleShorts$Array"
+            | "java/lang/invoke/VarHandleBytes$Array"
+            | "java/lang/invoke/VarHandleBooleans$Array"
+            | "java/lang/invoke/VarHandleChars$Array"
+            | "java/lang/invoke/VarHandleFloats$Array"
+            | "java/lang/invoke/VarHandleDoubles$Array"
+            | "java/lang/invoke/VarHandleReferences$Array"
+            | "io/quarkus/bootstrap/logging/InitialConfigurator"
+            | "org/jboss/modules/DefaultBootModuleLoaderHolder"
+            | "java/math/BigInteger"
+            | "java/nio/file/attribute/PosixFilePermission"
+            | "java/math/BigDecimal"
+            | "org/springframework/core/metrics/ApplicationStartup"
+            | "org/jboss/msc/service/ServiceContainerImpl"
+            | "org/wildfly/security/auth/server/_private/ElytronMessages"
+            | "org/jboss/msc/service/ServiceLogger"
     );
     if has_fixup_arm {
         return true;
     }
     // (2) SLF4J/logback binder packages — recovered by native binder stubs,
     // not by `post_clinit_fixup`. See doc comment above.
-    class_name.starts_with("org/slf4j/impl/")
-        || class_name.starts_with("ch/qos/logback/")
+    class_name.starts_with("org/slf4j/impl/") || class_name.starts_with("ch/qos/logback/")
 }
 
 /// Lazily allocate and cache the canonical `System.in` `FileInputStream` (stdin fd 0).
@@ -202,8 +202,7 @@ pub fn ensure_system_stdin_object(
     let (fd_field_idx, handle_field_idx) = {
         let cm = shared.class_manager.read();
         let fd_idx = find_field_recursive(fd_class_id, "fd", &cm.class_store).map(|(i, _, _)| i);
-        let h_idx =
-            find_field_recursive(fd_class_id, "handle", &cm.class_store).map(|(i, _, _)| i);
+        let h_idx = find_field_recursive(fd_class_id, "handle", &cm.class_store).map(|(i, _, _)| i);
         (fd_idx, h_idx)
     };
     if let Some(idx) = fd_field_idx {
@@ -219,7 +218,9 @@ pub fn ensure_system_stdin_object(
         find_field_recursive(fis_class_id, "fd", &cm.class_store).map(|(i, _, _)| i)
     };
     if let Some(idx) = fis_fd_slot {
-        shared.heap.set_field(in_obj, idx, Value::Object(Some(fd_obj)));
+        shared
+            .heap
+            .set_field(in_obj, idx, Value::Object(Some(fd_obj)));
     } else {
         // Fall back to the legacy slot-1 encoding if reflection fails.
         shared.heap.set_field(in_obj, 1, Value::Int(1));
@@ -274,10 +275,18 @@ pub fn ensure_class_initialized_shared(
     // load needs no lock because the embedded atomic lives inside the
     // `Class` we just borrowed.
     if crate::runtime::env_cache::modstatic_dbg() {
-        let nm = shared.class_manager.read().get_class(class_id).map(|c| c.name.to_string());
+        let nm = shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.name.to_string());
         if nm.as_deref() == Some("org/jboss/modules/Module") {
             let fast = is_class_initialized_via_manager(shared, class_id);
-            let st = shared.class_manager.read().get_class(class_id).map(|c| c.state);
+            let st = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.state);
             eprintln!("MODSTATIC: ensure_init(Module) fast_initialized={fast} state={st:?}");
         }
     }
@@ -360,11 +369,7 @@ pub fn ensure_class_initialized_shared(
                 // other thread, then release LC and block the current thread
                 // until informed that the in-progress initialization has
                 // completed."
-                let waiter = shared
-                    .class_init_waiters
-                    .lock()
-                    .get(&class_id)
-                    .cloned();
+                let waiter = shared.class_init_waiters.lock().get(&class_id).cloned();
                 if let Some(pair) = waiter {
                     let (lock, cvar) = &*pair;
                     // GC-safety (the H2 TestScript three-way STW deadlock):
@@ -376,8 +381,7 @@ pub fn ensure_class_initialized_shared(
                     // Run the full blocking-site protocol: deposit roots,
                     // mark GC-blocked (collections proceed and fold our
                     // frame fixups), wait, then re-sync on wake.
-                    let mut ctx =
-                        crate::vm::vm_exec::NativeContextImpl { shared, thread };
+                    let mut ctx = crate::vm::vm_exec::NativeContextImpl { shared, thread };
                     ctx.deposit_root_snapshot();
                     let blk = shared.gc_barrier.enter_blocked();
                     if blk.pre_stw {
@@ -390,8 +394,7 @@ pub fn ensure_class_initialized_shared(
                     // (no Result wrapper) since it cannot fail.
                     let mut guard = lock.lock();
                     // Wait with timeout to avoid deadlock on misconfigured init
-                    let _result = cvar
-                        .wait_for(&mut guard, std::time::Duration::from_secs(30));
+                    let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
                     drop(guard);
                     drop(blk);
                     ctx.check_post_block_gc();
@@ -794,15 +797,26 @@ fn initialize_class_shared(
         if in_class {
             true
         } else {
-            let class_name = shared.class_manager.read()
-                .get_class(class_id).map(|c| c.name.clone()).unwrap_or_default();
-            shared.native_methods.find(&class_name, "<clinit>", "()V").is_some()
+            let class_name = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            shared
+                .native_methods
+                .find(&class_name, "<clinit>", "()V")
+                .is_some()
         }
     };
 
     // Get class name once before clinit (avoids lock ordering issues)
-    let class_name_for_jfr = shared.class_manager.read()
-        .get_class(class_id).map(|c| c.name.clone()).unwrap_or_default();
+    let class_name_for_jfr = shared
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
     let init_start = std::time::Instant::now();
 
     // AOT training: record class load event for pre-linking
@@ -826,10 +840,7 @@ fn initialize_class_shared(
             // UNINITIALIZED so the fast path always falls through to
             // the slow path which converts it to `NoClassDefFoundError`.
             if matches!(new_state, ClassState::Initialized) {
-                cm.set_class_init_state(
-                    class_id,
-                    cratonvm_classloading::CLASS_INIT_INITIALIZED,
-                );
+                cm.set_class_init_state(class_id, cratonvm_classloading::CLASS_INIT_INITIALIZED);
             }
         }
         // Remove waiter and notify all blocked threads
@@ -909,7 +920,10 @@ fn initialize_class_shared(
                 // index mismatch can leave the enum constants null even after a
                 // nominally successful `<clinit>` — mirror the BigInteger success
                 // hook and backfill the nine constants from the real class layout.
-                if matches!(&*class_name_for_jfr, "java/nio/file/attribute/PosixFilePermission") {
+                if matches!(
+                    &*class_name_for_jfr,
+                    "java/nio/file/attribute/PosixFilePermission"
+                ) {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
@@ -956,15 +970,20 @@ fn initialize_class_shared(
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_nanos() as u64;
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
                 let duration_ns = init_start.elapsed().as_nanos() as u64;
                 let mut jfr = shared.flight_recorder.lock();
                 // Round-9 HIGH-5 fix (2026-05-17): use `_arc` to skip the
                 // per-event `Arc::from(&str)` clone — `class_name_for_jfr`
                 // is already `Arc<str>` (cloned from `Class.name`).
                 cratonvm_jfr::builtin::emit_class_load_event_arc(
-                    &mut jfr, class_name_for_jfr.clone(), "app", "app",
-                    now_ns.saturating_sub(duration_ns), duration_ns,
+                    &mut jfr,
+                    class_name_for_jfr.clone(),
+                    "app",
+                    "app",
+                    now_ns.saturating_sub(duration_ns),
+                    duration_ns,
                 );
                 Ok(())
             }
@@ -1038,8 +1057,12 @@ fn initialize_class_shared(
                 let is_swallowable = if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                     let eid = shared.heap.class_id_of(*exc_ref);
                     let cm = shared.class_manager.read();
-                    let exc_name = cm.get_class(eid).map(|c| c.name.clone()).unwrap_or_default();
-                    let is_swallowable_type = matches!(&*exc_name,
+                    let exc_name = cm
+                        .get_class(eid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    let is_swallowable_type = matches!(
+                        &*exc_name,
                         "java/lang/ClassCastException"
                         | "java/lang/NullPointerException"
                         | "java/lang/UnsupportedOperationException"
@@ -1092,7 +1115,8 @@ fn initialize_class_shared(
                     // null statics. Gate it on the same `clinit_swallow_has_recovery`
                     // allowlist as the thrown-exception branch so only classes
                     // with a documented recovery path are tolerated.
-                    let is_swallowable_internal = matches!(&e,
+                    let is_swallowable_internal = matches!(
+                        &e,
                         MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::ClassCastException { .. }
                         )) | MethodCallFailed::InternalError(VmError::Runtime(
@@ -1125,17 +1149,24 @@ fn initialize_class_shared(
                     let exc_detail = match &e {
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
                             let exc_cid = shared.heap.class_id_of(*exc_ref);
-                            let exc_class = shared.class_manager.read()
+                            let exc_class = shared
+                                .class_manager
+                                .read()
                                 .get_class(exc_cid)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_else(|| format!("class_id={}", exc_cid.as_u32()));
                             let msg = match shared.heap.get_field(*exc_ref, 0) {
-                                crate::types::Value::Object(Some(s)) =>
+                                crate::types::Value::Object(Some(s)) => {
                                     crate::vm::vm_object::read_java_string(&shared.heap, s)
-                                        .unwrap_or_default(),
+                                        .unwrap_or_default()
+                                }
                                 _ => String::new(),
                             };
-                            if msg.is_empty() { exc_class } else { format!("{}: {}", exc_class, msg) }
+                            if msg.is_empty() {
+                                exc_class
+                            } else {
+                                format!("{}: {}", exc_class, msg)
+                            }
                         }
                         other => format!("{:?}", other),
                     };
@@ -1156,10 +1187,9 @@ fn initialize_class_shared(
                     // error(s)" tally remains accurate.
                     let recoverable_silent = &*class_name_for_jfr == "java/math/BigDecimal";
                     if recoverable_silent {
-                        shared.swallow_counter.fetch_add(
-                            1,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        shared
+                            .swallow_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if crate::runtime::env_cache::strict_swallows() {
                             panic!(
                                 "CRATONVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
@@ -1212,12 +1242,17 @@ fn initialize_class_shared(
                             } else {
                                 let cm = shared.class_manager.read();
                                 for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
-                                    let cn = cm.get_class(f.class_id)
+                                    let cn = cm
+                                        .get_class(f.class_id)
                                         .map(|c| c.name.to_string())
                                         .unwrap_or_default();
                                     tracing::warn!(
                                         "  [SWALLOW-LIVE {}] class={} {}.{} pc={}",
-                                        i, class_name_for_jfr, cn, f.method_name(), f.pc,
+                                        i,
+                                        class_name_for_jfr,
+                                        cn,
+                                        f.method_name(),
+                                        f.pc,
                                     );
                                 }
                             }
@@ -1245,7 +1280,9 @@ fn initialize_class_shared(
                     let exc_ty = match &e {
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
                             let eid = shared.heap.class_id_of(*exc_ref);
-                            shared.class_manager.read()
+                            shared
+                                .class_manager
+                                .read()
                                 .get_class(eid)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_else(|| format!("class_id={}", eid.as_u32()))
@@ -1284,8 +1321,11 @@ fn initialize_class_shared(
                             // signal. Read failure (e.g. stale ref or layout
                             // drift) falls back to empty string.
                             {
-                                let cause_class = shared.class_manager.read()
-                                    .get_class(exc_class_id).map(|c| c.name.clone())
+                                let cause_class = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(exc_class_id)
+                                    .map(|c| c.name.clone())
                                     .unwrap_or_default();
                                 // Read detailMessage by walking the field
                                 // hierarchy by name — slot index varies because
@@ -1303,21 +1343,31 @@ fn initialize_class_shared(
                                         let Some(cls) = cm.get_class(cid) else { break };
                                         let mut inst = 0usize;
                                         for f in &cls.fields {
-                                            if f.is_static() { continue; }
+                                            if f.is_static() {
+                                                continue;
+                                            }
                                             if &*f.name == "detailMessage" {
                                                 let idx = cls.first_field_index + inst;
-                                                if let crate::types::Value::Object(Some(s)) = shared.heap.get_field(*exc_ref, idx) {
+                                                if let crate::types::Value::Object(Some(s)) =
+                                                    shared.heap.get_field(*exc_ref, idx)
+                                                {
                                                     found = Some(s);
                                                 }
                                                 break;
                                             }
                                             inst += 1;
                                         }
-                                        if found.is_some() { break; }
+                                        if found.is_some() {
+                                            break;
+                                        }
                                         walk = cls.superclass;
                                     }
                                     drop(cm);
-                                    found.and_then(|s| crate::vm::vm_object::read_java_string(&shared.heap, s)).unwrap_or_default()
+                                    found
+                                        .and_then(|s| {
+                                            crate::vm::vm_object::read_java_string(&shared.heap, s)
+                                        })
+                                        .unwrap_or_default()
                                 };
                                 tracing::warn!(
                                     class = %class_name_for_jfr,
@@ -1352,12 +1402,16 @@ fn initialize_class_shared(
                                     // beats no info at all.
                                     let cm = shared.class_manager.read();
                                     for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                                        let cn = cm.get_class(f.class_id)
+                                        let cn = cm
+                                            .get_class(f.class_id)
                                             .map(|c| c.name.to_string())
                                             .unwrap_or_default();
                                         tracing::warn!(
                                             "  [CLINIT-LIVE {}] at {}.{} pc={}",
-                                            i, cn, f.method_name(), f.pc,
+                                            i,
+                                            cn,
+                                            f.method_name(),
+                                            f.pc,
                                         );
                                     }
                                 }
@@ -1367,53 +1421,71 @@ fn initialize_class_shared(
                                 {
                                     let cm = shared.class_manager.read();
                                     // Resolve Throwable.cause field index by name
-                                    let cause_idx_of = |obj: crate::types::ObjectRef| -> Option<usize> {
-                                        let mut walk = Some(shared.heap.class_id_of(obj));
-                                        while let Some(k) = walk {
-                                            if let Some(cls) = cm.get_class(k) {
-                                                let mut inst = 0usize;
-                                                for f in &cls.fields {
-                                                    if !f.is_static() {
-                                                        if &*f.name == "cause" {
-                                                            return Some(cls.first_field_index + inst);
+                                    let cause_idx_of =
+                                        |obj: crate::types::ObjectRef| -> Option<usize> {
+                                            let mut walk = Some(shared.heap.class_id_of(obj));
+                                            while let Some(k) = walk {
+                                                if let Some(cls) = cm.get_class(k) {
+                                                    let mut inst = 0usize;
+                                                    for f in &cls.fields {
+                                                        if !f.is_static() {
+                                                            if &*f.name == "cause" {
+                                                                return Some(
+                                                                    cls.first_field_index + inst,
+                                                                );
+                                                            }
+                                                            inst += 1;
                                                         }
-                                                        inst += 1;
                                                     }
+                                                    walk = cls.superclass;
+                                                } else {
+                                                    break;
                                                 }
-                                                walk = cls.superclass;
-                                            } else { break; }
-                                        }
-                                        None
-                                    };
+                                            }
+                                            None
+                                        };
                                     let mut cur = *exc_ref;
                                     for depth in 0..4 {
-                                        let Some(ci) = cause_idx_of(cur) else { break; };
+                                        let Some(ci) = cause_idx_of(cur) else {
+                                            break;
+                                        };
                                         let cause_val = shared.heap.get_field(cur, ci);
                                         let cause_obj = match cause_val {
                                             Value::Object(Some(o)) if o != cur => o,
                                             _ => break,
                                         };
                                         let cause_cid = shared.heap.class_id_of(cause_obj);
-                                        let cause_name = cm.get_class(cause_cid)
-                                            .map(|c| c.name.to_string()).unwrap_or_default();
+                                        let cause_name = cm
+                                            .get_class(cause_cid)
+                                            .map(|c| c.name.to_string())
+                                            .unwrap_or_default();
                                         let cause_msg = match shared.heap.get_field(cause_obj, 0) {
-                                            Value::Object(Some(s)) =>
-                                                crate::vm::vm_object::read_java_string(&shared.heap, s)
-                                                    .unwrap_or_default(),
+                                            Value::Object(Some(s)) => {
+                                                crate::vm::vm_object::read_java_string(
+                                                    &shared.heap,
+                                                    s,
+                                                )
+                                                .unwrap_or_default()
+                                            }
                                             _ => String::new(),
                                         };
                                         tracing::warn!(
                                             "  [CLINIT-CAUSE depth={}] {}: {}",
-                                            depth, cause_name, cause_msg,
+                                            depth,
+                                            cause_name,
+                                            cause_msg,
                                         );
                                         let ch = shared.heap.identity_hash_code(cause_obj);
                                         if let Some(frames) = thread.throwable_stacks.get(&ch) {
                                             for (i, f) in frames.iter().enumerate().take(15) {
                                                 tracing::warn!(
                                                     "    [CAUSE-TRACE {}] at {}.{} ({}:{}) bci={}",
-                                                    i, f.class_name, f.method_name,
+                                                    i,
+                                                    f.class_name,
+                                                    f.method_name,
                                                     f.source_file.as_deref().unwrap_or("?"),
-                                                    f.line_number, f.byte_code_index,
+                                                    f.line_number,
+                                                    f.byte_code_index,
                                                 );
                                             }
                                         }
@@ -1440,20 +1512,29 @@ fn initialize_class_shared(
                                                 for f in &cls.fields {
                                                     if !f.is_static() {
                                                         if &*f.name == "cause" {
-                                                            found = Some(cls.first_field_index + inst);
+                                                            found =
+                                                                Some(cls.first_field_index + inst);
                                                             break;
                                                         }
                                                         inst += 1;
                                                     }
                                                 }
-                                                if found.is_some() { break; }
+                                                if found.is_some() {
+                                                    break;
+                                                }
                                                 walk = cls.superclass;
-                                            } else { break; }
+                                            } else {
+                                                break;
+                                            }
                                         }
                                         found
                                     };
                                     if let Some(i) = cause_idx {
-                                        shared.heap.set_field(eiie_ref, i, Value::Object(Some(cause_ref)));
+                                        shared.heap.set_field(
+                                            eiie_ref,
+                                            i,
+                                            Value::Object(Some(cause_ref)),
+                                        );
                                     }
                                     let _ = super::invoke_on_class_shared(
                                         shared,
@@ -1461,7 +1542,10 @@ fn initialize_class_shared(
                                         shared.heap.class_id_of(eiie_ref),
                                         "initCause",
                                         "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
-                                        &[Value::Object(Some(eiie_ref)), Value::Object(Some(cause_ref))],
+                                        &[
+                                            Value::Object(Some(eiie_ref)),
+                                            Value::Object(Some(cause_ref)),
+                                        ],
                                     );
                                     Err(MethodCallFailed::ExceptionThrown(eiie_ref))
                                 }
@@ -1500,14 +1584,19 @@ fn initialize_class_shared(
         // Record JFR class load event
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_nanos() as u64;
+            .unwrap_or_default()
+            .as_nanos() as u64;
         let duration_ns = init_start.elapsed().as_nanos() as u64;
         let mut jfr = shared.flight_recorder.lock();
         // Round-9 HIGH-5 fix (2026-05-17): use `_arc` variant — name is
         // already `Arc<str>` from `Class.name.clone()`.
         cratonvm_jfr::builtin::emit_class_load_event_arc(
-            &mut jfr, class_name_for_jfr.clone(), "app", "app",
-            now_ns.saturating_sub(duration_ns), duration_ns,
+            &mut jfr,
+            class_name_for_jfr.clone(),
+            "app",
+            "app",
+            now_ns.saturating_sub(duration_ns),
+            duration_ns,
         );
         Ok(())
     }
@@ -1548,16 +1637,14 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         for field in class.fields.iter() {
             if field.is_static() {
                 let cv_index = field.constant_value_index();
-                let seed = cv_index.and_then(|cp_index| {
-                    match class.constant_pool.get(cp_index)? {
+                let seed =
+                    cv_index.and_then(|cp_index| match class.constant_pool.get(cp_index)? {
                         ConstantPoolEntry::Integer(v) => Some(CvSeed::Primitive(Value::Int(*v))),
                         ConstantPoolEntry::Float(v) => Some(CvSeed::Primitive(Value::Float(*v))),
                         ConstantPoolEntry::Long(v) => Some(CvSeed::Primitive(Value::Long(*v))),
                         ConstantPoolEntry::Double(v) => Some(CvSeed::Primitive(Value::Double(*v))),
                         ConstantPoolEntry::StringReference { string_index } => {
-                            if let Some(units) =
-                                class.constant_pool.get_utf8_wide(*string_index)
-                            {
+                            if let Some(units) = class.constant_pool.get_utf8_wide(*string_index) {
                                 Some(CvSeed::StringUtf16(units.to_vec()))
                             } else {
                                 class
@@ -1567,8 +1654,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
                             }
                         }
                         _ => None,
-                    }
-                });
+                    });
                 info.push((field.descriptor.to_string(), seed));
             }
         }
@@ -1592,8 +1678,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             Some(CvSeed::StringUtf16(units)) => {
-                let str_ref =
-                    super::vm_object::create_java_string_from_units(shared, units);
+                let str_ref = super::vm_object::create_java_string_from_units(shared, units);
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             None => {}
@@ -1903,7 +1988,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if let Some(hid) = handler_id {
                 if let Some(handler) = shared.heap.try_alloc_object(hid, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
-                        tracing::warn!("Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated");
+                        tracing::warn!(
+                            "Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated"
+                        );
                     }
                 }
             } else {
@@ -1982,7 +2069,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         if f.is_static() {
                             if &*f.name == name {
                                 drop(cm);
-                                match super::vm_object::get_static_shared(shared, class_id, static_idx) {
+                                match super::vm_object::get_static_shared(
+                                    shared, class_id, static_idx,
+                                ) {
                                     Value::Object(Some(o)) => return Some(o),
                                     _ => return None,
                                 }
@@ -2000,8 +2089,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 let make_or_patch_bi = |existing: Option<crate::types::ObjectRef>,
                                         signum: i32,
                                         mag_words: &[i32]|
-                    -> Option<crate::types::ObjectRef>
-                {
+                 -> Option<crate::types::ObjectRef> {
                     let bi = if let Some(e) = existing {
                         e
                     } else {
@@ -2016,7 +2104,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         let _ = shared.heap.set_array_element(mag_arr, i, Value::Int(*w));
                     }
                     shared.heap.set_field(bi, sig_i, Value::Int(signum));
-                    shared.heap.set_field(bi, mag_i, Value::Object(Some(mag_arr)));
+                    shared
+                        .heap
+                        .set_field(bi, mag_i, Value::Object(Some(mag_arr)));
                     Some(bi)
                 };
                 let zero = make_or_patch_bi(lookup_existing("ZERO"), 0, &[]);
@@ -2060,9 +2150,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger fixup skipped — signum/mag field indices not resolved"
                 );
-                crate::dispatch_trace::record_note(
-                    "Post-clinit fixup: BigInteger fixup skipped",
-                );
+                crate::dispatch_trace::record_note("Post-clinit fixup: BigInteger fixup skipped");
             }
         }
         // Spring Boot nested-JAR loaders: `PosixFilePermission.OWNER_READ` etc.
@@ -2158,7 +2246,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             let num_fields = {
                 let cm = shared.class_manager.read();
-                cm.get_class(class_id).map(|c| c.num_total_fields).unwrap_or(0)
+                cm.get_class(class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0)
             };
             let (Some(ord_idx), Some(name_idx)) = (ord_idx, name_idx) else {
                 tracing::warn!(
@@ -2168,18 +2258,13 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             let mut filled = 0usize;
             for (ord, &name) in NAMES.iter().enumerate() {
-                if matches!(
-                    read_static_named(name),
-                    Some(Value::Object(Some(_)))
-                ) {
+                if matches!(read_static_named(name), Some(Value::Object(Some(_)))) {
                     continue;
                 }
                 let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) else {
                     continue;
                 };
-                shared
-                    .heap
-                    .set_field(obj, ord_idx, Value::Int(ord as i32));
+                shared.heap.set_field(obj, ord_idx, Value::Int(ord as i32));
                 let nm = super::vm_object::create_java_string(shared, name);
                 shared
                     .heap
@@ -2197,16 +2282,17 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // `EnumSet` / `Class.getEnumConstants` read the synthetic `$VALUES`
             // array. Without it, `EnumSet.of(OWNER_READ, ...)` throws CCE
             // ("not an enum") even when the named static fields are populated.
-            if let Some(values_arr) = shared.heap.try_alloc_array(
-                class_id,
-                ArrayElementType::Reference,
-                NAMES.len(),
-            ) {
+            if let Some(values_arr) =
+                shared
+                    .heap
+                    .try_alloc_array(class_id, ArrayElementType::Reference, NAMES.len())
+            {
                 for (i, &name) in NAMES.iter().enumerate() {
                     if let Some(Value::Object(Some(o))) = read_static_named(name) {
-                        let _ = shared
-                            .heap
-                            .set_array_element(values_arr, i, Value::Object(Some(o)));
+                        let _ =
+                            shared
+                                .heap
+                                .set_array_element(values_arr, i, Value::Object(Some(o)));
                     }
                 }
                 if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {
@@ -2273,8 +2359,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     if f.is_static() {
                         if &*f.name == name {
                             drop(cm);
-                            match super::vm_object::get_static_shared(shared, bi_cid, static_idx)
-                            {
+                            match super::vm_object::get_static_shared(shared, bi_cid, static_idx) {
                                 Value::Object(Some(o)) => return Some(o),
                                 _ => return None,
                             }
@@ -2356,8 +2441,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if crate::runtime::env_cache::real_spring_startup() {
                 return;
             }
-            let def_startup =
-                "org/springframework/core/metrics/DefaultApplicationStartup";
+            let def_startup = "org/springframework/core/metrics/DefaultApplicationStartup";
             let def_startup_id = {
                 let cm = shared.class_manager.read();
                 cm.find_class_by_name(def_startup)
@@ -2372,9 +2456,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         for f in &cls.fields {
                             if f.is_static() {
                                 if &*f.name == "DEFAULT" {
-                                    let v = super::get_static_shared(
-                                        shared, class_id, static_idx,
-                                    );
+                                    let v = super::get_static_shared(shared, class_id, static_idx);
                                     is_null = matches!(v, Value::Object(None));
                                     break;
                                 }
@@ -2588,9 +2670,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::config::VmConfig;
     use crate::threading::jvm_thread::ThreadId;
+    use std::sync::Arc;
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
@@ -2766,7 +2848,9 @@ mod tests {
     fn hierarchy_same_class_is_subclass() {
         let shared = test_shared();
         let cm = shared.class_manager.read();
-        let hierarchy = ClassStoreHierarchy { store: &cm.class_store };
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
         use crate::classloading::vtype::ClassHierarchy;
         assert!(hierarchy.is_subclass("java/lang/Object", "java/lang/Object"));
     }
@@ -2775,7 +2859,9 @@ mod tests {
     fn hierarchy_everything_is_subclass_of_object() {
         let shared = test_shared();
         let cm = shared.class_manager.read();
-        let hierarchy = ClassStoreHierarchy { store: &cm.class_store };
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
         use crate::classloading::vtype::ClassHierarchy;
         assert!(hierarchy.is_subclass("java/lang/String", "java/lang/Object"));
         assert!(hierarchy.is_subclass("java/io/PrintStream", "java/lang/Object"));
@@ -2785,7 +2871,9 @@ mod tests {
     fn hierarchy_common_superclass_same() {
         let shared = test_shared();
         let cm = shared.class_manager.read();
-        let hierarchy = ClassStoreHierarchy { store: &cm.class_store };
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
         use crate::classloading::vtype::ClassHierarchy;
         assert_eq!(
             hierarchy.common_superclass("java/lang/Object", "java/lang/Object"),
@@ -2797,7 +2885,9 @@ mod tests {
     fn hierarchy_common_superclass_unknown_returns_object() {
         let shared = test_shared();
         let cm = shared.class_manager.read();
-        let hierarchy = ClassStoreHierarchy { store: &cm.class_store };
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
         use crate::classloading::vtype::ClassHierarchy;
         // For unknown classes, common superclass should be Object
         assert_eq!(
@@ -2810,7 +2900,9 @@ mod tests {
     fn hierarchy_is_interface_unknown() {
         let shared = test_shared();
         let cm = shared.class_manager.read();
-        let hierarchy = ClassStoreHierarchy { store: &cm.class_store };
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
         use crate::classloading::vtype::ClassHierarchy;
         // Unknown class should not be considered an interface
         assert!(!hierarchy.is_interface("com/unknown/Foo"));
@@ -2965,10 +3057,7 @@ mod tests {
     /// and end-to-end tests. Uses FINAL+ABSTRACT (a JVMS Г‚В§4.1
     /// "cannot be both" violation) so that if structural verification
     /// runs it will surface a `LinkageError::ClassFormatError`.
-    fn make_malformed_class(
-        name: &str,
-        loader_id: cratonvm_types::ClassLoaderId,
-    ) -> Class {
+    fn make_malformed_class(name: &str, loader_id: cratonvm_types::ClassLoaderId) -> Class {
         use cratonvm_reader::class_access_flags::ClassAccessFlags;
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::ConstantPool;
@@ -3028,8 +3117,7 @@ mod tests {
     fn skip_predicate_bootstrap_java_lang_string_is_eligible() {
         // Real bootstrap-loaded JDK class: skip is the documented
         // perf invariant (HotSpot -Xverify:remote behaviour).
-        let c =
-            make_malformed_class("java/lang/String", cratonvm_types::ClassLoaderId::Bootstrap);
+        let c = make_malformed_class("java/lang/String", cratonvm_types::ClassLoaderId::Bootstrap);
         assert!(
             verifier_skip_eligible(&c),
             "bootstrap-loaded java/lang/String must remain eligible for skip"
@@ -3039,8 +3127,7 @@ mod tests {
     #[test]
     fn skip_predicate_bootstrap_application_class_is_not_eligible() {
         // Untrusted prefix even though loaded by bootstrap: skip refuses.
-        let c =
-            make_malformed_class("com/example/Foo", cratonvm_types::ClassLoaderId::Bootstrap);
+        let c = make_malformed_class("com/example/Foo", cratonvm_types::ClassLoaderId::Bootstrap);
         assert!(!verifier_skip_eligible(&c));
     }
 
@@ -3077,9 +3164,9 @@ mod tests {
         let err = result.expect_err("verifier MUST reject user-classpath java/lang/EvilString");
         match err {
             MethodCallFailed::InternalError(VmError::Linkage(_)) => { /* expected */ }
-            other => panic!(
-                "expected MethodCallFailed::InternalError(VmError::Linkage), got {other:?}"
-            ),
+            other => {
+                panic!("expected MethodCallFailed::InternalError(VmError::Linkage), got {other:?}")
+            }
         }
     }
 
@@ -3177,8 +3264,12 @@ mod tests {
             );
         }
         // SLF4J/logback binder packages — recovered by native binder stubs.
-        assert!(clinit_swallow_has_recovery("org/slf4j/impl/StaticLoggerBinder"));
-        assert!(clinit_swallow_has_recovery("ch/qos/logback/classic/util/ContextSelectorStaticBinder"));
+        assert!(clinit_swallow_has_recovery(
+            "org/slf4j/impl/StaticLoggerBinder"
+        ));
+        assert!(clinit_swallow_has_recovery(
+            "ch/qos/logback/classic/util/ContextSelectorStaticBinder"
+        ));
     }
 
     #[test]

@@ -25,8 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use parking_lot::Mutex;
 
 use crate::heap::{
-    ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
-    SLOT_SIZE,
+    ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -93,8 +92,7 @@ impl ConcurrentGcState {
     #[inline]
     pub fn is_marking_active(&self) -> bool {
         let p = self.phase.load(Ordering::Acquire);
-        p == ConcurrentGcPhase::ConcurrentMark as u8
-            || p == ConcurrentGcPhase::Remark as u8
+        p == ConcurrentGcPhase::ConcurrentMark as u8 || p == ConcurrentGcPhase::Remark as u8
     }
 }
 
@@ -256,8 +254,7 @@ impl MarkQueue {
         // Done under the shard lock so the bit is set before the lock
         // (and therefore the queued pointer) becomes visible to a
         // concurrent `pop`.
-        self.nonempty_shards
-            .fetch_or(1u8 << idx, Ordering::Release);
+        self.nonempty_shards.fetch_or(1u8 << idx, Ordering::Release);
     }
 
     /// Round-9 gc HIGH-5 — true iff any push since the last
@@ -576,9 +573,7 @@ impl ConcurrentMarker {
         while self.queue.has_overflowed() {
             // Reset before the rescan so a fresh overflow in this pass
             // is observable. Push/pop happen-before this load: STW.
-            self.queue
-                .overflowed
-                .store(false, Ordering::Relaxed);
+            self.queue.overflowed.store(false, Ordering::Relaxed);
             rescan_passes += 1;
             if rescan_passes > 8 {
                 // Hard guard: if we somehow can't converge, abandon
@@ -686,11 +681,7 @@ impl ConcurrentMarker {
     /// are coordinated by the GC barrier with STW pauses at phase 1 and 3.
     ///
     /// Returns (objects_marked, objects_swept).
-    pub fn full_cycle(
-        &self,
-        roots: &[*mut u8],
-        old_gen: &mut OldGen,
-    ) -> (usize, usize) {
+    pub fn full_cycle(&self, roots: &[*mut u8], old_gen: &mut OldGen) -> (usize, usize) {
         let initial = self.initial_mark(roots, old_gen);
         let concurrent = self.concurrent_mark(old_gen);
         let remark = self.remark(roots, old_gen);
@@ -717,7 +708,7 @@ impl std::fmt::Debug for ConcurrentMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::{ObjectHeader, ObjectKind, ArrayElementType, HEADER_SIZE, SLOT_SIZE};
+    use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE};
     use cratonvm_types::{ClassId, ObjectRef, Value};
 
     fn make_old_gen_with_object(num_slots: u32) -> (OldGen, *mut u8) {
@@ -1153,9 +1144,15 @@ mod tests {
     fn phase_from_u8_all_valid() {
         assert_eq!(ConcurrentGcPhase::from(0), ConcurrentGcPhase::Idle);
         assert_eq!(ConcurrentGcPhase::from(1), ConcurrentGcPhase::InitialMark);
-        assert_eq!(ConcurrentGcPhase::from(2), ConcurrentGcPhase::ConcurrentMark);
+        assert_eq!(
+            ConcurrentGcPhase::from(2),
+            ConcurrentGcPhase::ConcurrentMark
+        );
         assert_eq!(ConcurrentGcPhase::from(3), ConcurrentGcPhase::Remark);
-        assert_eq!(ConcurrentGcPhase::from(4), ConcurrentGcPhase::ConcurrentSweep);
+        assert_eq!(
+            ConcurrentGcPhase::from(4),
+            ConcurrentGcPhase::ConcurrentSweep
+        );
     }
 
     #[test]

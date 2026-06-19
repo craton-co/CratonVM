@@ -44,7 +44,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -56,9 +60,7 @@ fn cratonvm_binary() -> Option<PathBuf> {
 
 fn ensure_probe_compiled() -> bool {
     let classes = probe_classes_dir();
-    if classes.join("FjpProbe.class").exists()
-        && classes.join("FjpProbe$SumTask.class").exists()
-    {
+    if classes.join("FjpProbe.class").exists() && classes.join("FjpProbe$SumTask.class").exists() {
         return true;
     }
     let _ = std::fs::create_dir_all(&classes);
@@ -121,9 +123,7 @@ fn fjp_probe_recursive_returns_correct_sum() {
     let jdk = match jdk_home() {
         Some(j) => j,
         None => {
-            eprintln!(
-                "[fjp_recursive] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
-            );
+            eprintln!("[fjp_recursive] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping");
             return;
         }
     };

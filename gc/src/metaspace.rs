@@ -366,7 +366,10 @@ impl Metaspace {
         if self.total_capacity + new_chunk_size > self.config.max_metaspace_size {
             return Err(MetaspaceError::OutOfMetaspace {
                 requested: size,
-                available: self.config.max_metaspace_size.saturating_sub(self.total_capacity),
+                available: self
+                    .config
+                    .max_metaspace_size
+                    .saturating_sub(self.total_capacity),
                 max: self.config.max_metaspace_size,
             });
         }
@@ -451,10 +454,13 @@ impl Metaspace {
         // the first has free space, merge the second into the first.
         let mut i = 0;
         while i + 1 < self.chunks.len() {
-            let same_loader =
-                self.chunks[i].owner_loader_id == self.chunks[i + 1].owner_loader_id;
+            let same_loader = self.chunks[i].owner_loader_id == self.chunks[i + 1].owner_loader_id;
             let first_has_space = self.chunks[i].next_free_offset < self.chunks[i].size;
-            if same_loader && first_has_space && !self.chunks[i].is_free && !self.chunks[i + 1].is_free {
+            if same_loader
+                && first_has_space
+                && !self.chunks[i].is_free
+                && !self.chunks[i + 1].is_free
+            {
                 let second_used = self.chunks[i + 1].used;
                 let second_size = self.chunks[i + 1].size;
                 self.chunks[i].size += second_size;
@@ -1220,7 +1226,10 @@ mod tests {
         };
         assert!(matches!(
             Metaspace::new(cfg).unwrap_err(),
-            MetaspaceConfigError::RatioOutOfRange { name: "min_free_ratio", .. }
+            MetaspaceConfigError::RatioOutOfRange {
+                name: "min_free_ratio",
+                ..
+            }
         ));
 
         let cfg2 = MetaspaceConfig {
@@ -1229,7 +1238,10 @@ mod tests {
         };
         assert!(matches!(
             Metaspace::new(cfg2).unwrap_err(),
-            MetaspaceConfigError::RatioOutOfRange { name: "max_free_ratio", .. }
+            MetaspaceConfigError::RatioOutOfRange {
+                name: "max_free_ratio",
+                ..
+            }
         ));
     }
 

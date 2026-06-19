@@ -91,9 +91,7 @@ fn assert_pass(method: &str) {
     let result = vm.invoke(CLASS, method, "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!(
-            "{CLASS}::{method} — expected Ok(Some(Int(1))), got: {other:?}"
-        ),
+        other => panic!("{CLASS}::{method} — expected Ok(Some(Int(1))), got: {other:?}"),
     }
 }
 
@@ -162,9 +160,7 @@ fn invoke_long(method: &str) -> i64 {
     let mut vm = test_vm();
     match vm.invoke(CLASS, method, "()J", &[]) {
         Ok(Some(Value::Long(n))) => n,
-        other => panic!(
-            "{CLASS}::{method} — expected Ok(Some(Long(_))), got: {other:?}"
-        ),
+        other => panic!("{CLASS}::{method} — expected Ok(Some(Long(_))), got: {other:?}"),
     }
 }
 

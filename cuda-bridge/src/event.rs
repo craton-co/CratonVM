@@ -161,9 +161,11 @@ impl Event {
     /// event was never recorded.
     #[cfg(not(feature = "cuda"))]
     pub fn synchronize(&self) -> Result<()> {
-        let guard = self.inner.recorded_on.lock().map_err(|_| {
-            DeviceError::Driver("event recorded_on mutex poisoned".to_string())
-        })?;
+        let guard = self
+            .inner
+            .recorded_on
+            .lock()
+            .map_err(|_| DeviceError::Driver("event recorded_on mutex poisoned".to_string()))?;
         if guard.is_none() {
             // The spec mandates: stub `synchronize` errors with
             // NoDriver if not recorded. Once recorded, the stub
@@ -202,9 +204,11 @@ impl Event {
     /// otherwise.
     #[cfg(not(feature = "cuda"))]
     pub fn query(&self) -> Result<bool> {
-        let guard = self.inner.recorded_on.lock().map_err(|_| {
-            DeviceError::Driver("event recorded_on mutex poisoned".to_string())
-        })?;
+        let guard = self
+            .inner
+            .recorded_on
+            .lock()
+            .map_err(|_| DeviceError::Driver("event recorded_on mutex poisoned".to_string()))?;
         Ok(guard.is_some())
     }
 
@@ -252,9 +256,11 @@ impl Stream {
         // Update the event's recorded-on field first so a concurrent
         // observer that sees the op-log entry will also see the
         // event's state.
-        let mut guard = event.inner.recorded_on.lock().map_err(|_| {
-            DeviceError::Driver("event recorded_on mutex poisoned".to_string())
-        })?;
+        let mut guard = event
+            .inner
+            .recorded_on
+            .lock()
+            .map_err(|_| DeviceError::Driver("event recorded_on mutex poisoned".to_string()))?;
         *guard = Some(self.id());
         drop(guard);
         self.record_op(crate::StreamOp::EventRecord {
@@ -279,10 +285,8 @@ impl Stream {
         // stream's command queue. Subsequent `cuEventQuery` /
         // `cuEventSynchronize` calls observe completion of any work
         // ahead of this point on the stream.
-        unsafe {
-            cudarc::driver::result::event::record(event.inner.cu_event, self.raw())
-        }
-        .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
+        unsafe { cudarc::driver::result::event::record(event.inner.cu_event, self.raw()) }
+            .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
     }
 
     /// Make this stream wait for `event`. All subsequent work on this
@@ -371,12 +375,7 @@ mod tests {
         stream.record_event(&ev).expect("record_event");
         // After recording: recorded_on holds the stream's id,
         // and query flips to true.
-        let recorded = ev
-            .inner
-            .recorded_on
-            .lock()
-            .unwrap()
-            .clone();
+        let recorded = ev.inner.recorded_on.lock().unwrap().clone();
         assert_eq!(recorded, Some(stream.id()));
         assert_eq!(ev.query().unwrap(), true);
     }

@@ -312,9 +312,7 @@ pub(crate) fn get_or_init_container() -> Arc<ArcContainerInner> {
     container_cell()
         .get_or_init(|| {
             let inner = ArcContainerInner::new(next_container_id());
-            inner
-                .initialized
-                .store(true, Ordering::Release);
+            inner.initialized.store(true, Ordering::Release);
             Arc::new(inner)
         })
         .clone()
@@ -420,12 +418,7 @@ fn register_arc_container(registry: &mut NativeMethodRegistry) {
             "()Ljavax/enterprise/inject/spi/BeanManager;",
             native_container_bean_manager,
         );
-        registry.register(
-            cls,
-            "isRunning",
-            "()Z",
-            native_container_is_running,
-        );
+        registry.register(cls, "isRunning", "()Z", native_container_is_running);
         registry.register(
             cls,
             "requestContext",
@@ -527,10 +520,7 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
 /// wire those consistently, so we prefer the high-level accessors
 /// (`class_id_of_object` / `class_name_of_id`) when available and fall
 /// back to reading the slot-1 name string otherwise.
-fn class_key_from_class_mirror(
-    ctx: &dyn NativeContext,
-    mirror: ObjectRef,
-) -> Option<ClassKey> {
+fn class_key_from_class_mirror(ctx: &dyn NativeContext, mirror: ObjectRef) -> Option<ClassKey> {
     // Preferred: every Class mirror has a backing ClassId. Works in
     // production and in the mock where `get_class_mirror` populates it.
     let cid_from_object = ctx.class_id_of_object(mirror);
@@ -588,18 +578,23 @@ fn alloc_instance_handle(
         .ensure_class_initialized(CLS_INSTANCE_HANDLE_IMPL)
         .unwrap_or_else(|_| ClassId::new(0));
     let obj = ctx.alloc_object(cid, 2);
-    ctx.set_field(obj, INSTANCE_FIELD_CONTAINER_ID, Value::Long(container_id as i64));
-    ctx.set_field(obj, INSTANCE_FIELD_BEAN_KEY, Value::Object(Some(bean_key_marker)));
+    ctx.set_field(
+        obj,
+        INSTANCE_FIELD_CONTAINER_ID,
+        Value::Long(container_id as i64),
+    );
+    ctx.set_field(
+        obj,
+        INSTANCE_FIELD_BEAN_KEY,
+        Value::Object(Some(bean_key_marker)),
+    );
     obj
 }
 
 /// Build an `UnsatisfiedResolutionException` - or fall back to a
 /// platform-level `IllegalStateException` when the CDI class isn't
 /// available.
-fn throw_unsatisfied_resolution(
-    ctx: &mut dyn NativeContext,
-    message: &str,
-) -> MethodCallFailed {
+fn throw_unsatisfied_resolution(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
     // Preferred: real CDI exception via new_object. Many deployments ship
     // this class as part of jakarta.enterprise-api.
     for name in [
@@ -695,7 +690,10 @@ fn discover_inject_fields(
             discovered.push(InjectField::new(slot, target_type));
         }
     }
-    inner.inject_fields.write().insert(key.clone(), discovered.clone());
+    inner
+        .inject_fields
+        .write()
+        .insert(key.clone(), discovered.clone());
     discovered
 }
 
@@ -754,7 +752,10 @@ fn native_arc_shutdown(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     if let Some(inner) = container_cell().get() {
         inner.app_scoped.write().clear();
         inner.request_scoped.write().clear();
-        tracing::info!("quarkus.arc.Arc.shutdown: container id={} caches drained", inner.id());
+        tracing::info!(
+            "quarkus.arc.Arc.shutdown: container id={} caches drained",
+            inner.id()
+        );
     }
     Ok(None)
 }
@@ -836,10 +837,7 @@ fn native_container_instance_class_simple(
 }
 
 /// String-keyed lookup - used by `@Named` bean lookup in older Quarkus.
-fn native_container_instance_name(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_container_instance_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match arg_obj(args, 0) {
         Some(o) => o,
         None => {
@@ -870,20 +868,14 @@ fn native_container_instance_name(
 
 /// `ArcContainer.select(Class<T>)` - returns an `Instance<T>` which in
 /// our implementation is the same synthetic object as an InstanceHandle.
-fn native_container_select(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_container_select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_container_instance_class_simple(ctx, args)
 }
 
 /// `ArcContainer.beanManager()` - returns a synthetic BeanManager object.
 /// Same container id is embedded so downstream dispatches find the
 /// container state.
-fn native_container_bean_manager(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_container_bean_manager(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match arg_obj(args, 0) {
         Some(o) => o,
         None => {
@@ -904,10 +896,7 @@ fn native_container_bean_manager(
 }
 
 /// `ArcContainer.isRunning()`
-fn native_container_is_running(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_container_is_running(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let running = container_cell()
         .get()
         .map(|inner| inner.is_initialized())
@@ -1051,10 +1040,7 @@ fn populate_inject_fields(
 // ---------------------------------------------------------------------------
 
 /// `InstanceHandle.get()` - unwraps the stored bean.
-fn native_instance_handle_get(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_instance_handle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match arg_obj(args, 0) {
         Some(o) => o,
         None => {
@@ -1091,10 +1077,7 @@ fn native_instance_handle_available(
 /// container owns the lifecycle so we ignore the request. Dependent
 /// beans would need per-handle teardown, but since our boot path doesn't
 /// keep dependent state we treat this as a graceful no-op.
-fn native_instance_handle_no_op(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_instance_handle_no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
@@ -1131,10 +1114,7 @@ fn native_bean_manager_create_instance(
 
 /// `BeanManager.getBeans(Type, Annotation...)` - returns an empty Set
 /// (ArC injection is name-based, so the bytecode rarely iterates this).
-fn native_bean_manager_get_beans(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_bean_manager_get_beans(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Return a fresh empty HashSet - Keycloak mostly uses this for
     // discovering qualifiers on beans and is tolerant of empty results.
     match ctx.new_object("java/util/HashSet") {
@@ -1171,10 +1151,7 @@ fn native_bean_manager_get_reference(
 // InjectableBean natives
 // ---------------------------------------------------------------------------
 
-fn native_injectable_bean_get(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_injectable_bean_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Same as InstanceHandle.get - the injectable bean holds the same
     // kind of handle with a bean key.
     native_instance_handle_get(ctx, args)
@@ -1259,10 +1236,18 @@ mod tests {
         // Container entries (both interface + impl)
         for cls in [CLS_ARC_CONTAINER, CLS_ARC_CONTAINER_IMPL] {
             assert!(r
-                .find(cls, "instance", "(Ljava/lang/Class;)Lio/quarkus/arc/InstanceHandle;")
+                .find(
+                    cls,
+                    "instance",
+                    "(Ljava/lang/Class;)Lio/quarkus/arc/InstanceHandle;"
+                )
                 .is_some());
             assert!(r
-                .find(cls, "beanManager", "()Ljakarta/enterprise/inject/spi/BeanManager;")
+                .find(
+                    cls,
+                    "beanManager",
+                    "()Ljakarta/enterprise/inject/spi/BeanManager;"
+                )
                 .is_some());
         }
         // Handle dispatches
@@ -1333,7 +1318,11 @@ mod tests {
         let id_field = ctx.get_field(container_obj, CONTAINER_FIELD_ID);
         match id_field {
             Value::Long(v) => {
-                assert_eq!(v as u64, get_or_init_container().id(), "embedded id matches");
+                assert_eq!(
+                    v as u64,
+                    get_or_init_container().id(),
+                    "embedded id matches"
+                );
             }
             other => panic!("expected Long id slot, got {:?}", other),
         }
@@ -1354,7 +1343,10 @@ mod tests {
 
         let h1 = match native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()
@@ -1372,7 +1364,10 @@ mod tests {
 
         let h2 = match native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()
@@ -1414,7 +1409,10 @@ mod tests {
         let b1 = {
             let h = match native_container_instance_class_simple(
                 &mut ctx,
-                &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+                &[
+                    Value::Object(Some(container_obj)),
+                    Value::Object(Some(mirror)),
+                ],
             )
             .unwrap()
             .unwrap()
@@ -1433,7 +1431,10 @@ mod tests {
         let b2 = {
             let h = match native_container_instance_class_simple(
                 &mut ctx,
-                &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+                &[
+                    Value::Object(Some(container_obj)),
+                    Value::Object(Some(mirror)),
+                ],
             )
             .unwrap()
             .unwrap()
@@ -1478,7 +1479,10 @@ mod tests {
         let empty = ctx.create_string("");
         let result = native_container_instance_name(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(empty))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(empty)),
+            ],
         );
         assert!(result.is_err(), "empty name must surface as error");
 
@@ -1506,7 +1510,10 @@ mod tests {
 
         let handle_val = native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap();
@@ -1544,12 +1551,9 @@ mod tests {
         native_arc_initialize(&mut ctx, &[]).unwrap();
 
         let (id, container_obj) = make_arc_container(&mut ctx);
-        let bm_val = native_container_bean_manager(
-            &mut ctx,
-            &[Value::Object(Some(container_obj))],
-        )
-        .unwrap()
-        .unwrap();
+        let bm_val = native_container_bean_manager(&mut ctx, &[Value::Object(Some(container_obj))])
+            .unwrap()
+            .unwrap();
         let bm = match bm_val {
             Value::Object(Some(o)) => o,
             _ => panic!("bm"),
@@ -1599,12 +1603,18 @@ mod tests {
         let mirror = make_class_mirror_for(&mut ctx, "com/example/Counted");
         native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap();
         native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap();
         let after = get_or_init_container().resolution_count();
@@ -1622,7 +1632,10 @@ mod tests {
         let mirror = make_class_mirror_for(&mut ctx, "com/example/Closeable");
         let handle = match native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()
@@ -1650,7 +1663,10 @@ mod tests {
         let mirror = make_class_mirror_for(&mut ctx, "com/example/Wrapped");
         let handle = match native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()
@@ -1659,16 +1675,14 @@ mod tests {
             _ => panic!("handle"),
         };
 
-        let bm = match native_container_bean_manager(
-            &mut ctx,
-            &[Value::Object(Some(container_obj))],
-        )
-        .unwrap()
-        .unwrap()
-        {
-            Value::Object(Some(o)) => o,
-            _ => panic!("bm"),
-        };
+        let bm =
+            match native_container_bean_manager(&mut ctx, &[Value::Object(Some(container_obj))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                _ => panic!("bm"),
+            };
 
         // getReference expects (null CreationalContext, handle, null)
         // - our impl reads args[1] only.
@@ -1714,7 +1728,11 @@ mod tests {
         let mut ids: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 1, "all threads must observe the same container id");
+        assert_eq!(
+            ids.len(),
+            1,
+            "all threads must observe the same container id"
+        );
     }
 
     #[test]
@@ -1753,7 +1771,10 @@ mod tests {
 
         let inst_handle = match native_container_instance_class_simple(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()
@@ -1763,7 +1784,10 @@ mod tests {
         };
         let sel_handle = match native_container_select(
             &mut ctx,
-            &[Value::Object(Some(container_obj)), Value::Object(Some(mirror))],
+            &[
+                Value::Object(Some(container_obj)),
+                Value::Object(Some(mirror)),
+            ],
         )
         .unwrap()
         .unwrap()

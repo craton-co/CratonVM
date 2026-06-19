@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
+use cratonvm_jfr::create_flight_recorder;
+use cratonvm_jfr::dump::{HEADER_SIZE, JFR_MAGIC, JFR_VERSION_MAJOR, JFR_VERSION_MINOR};
 use cratonvm_jfr::event::{EventInstance, EventTypeId, EventValue};
 use cratonvm_jfr::recording::{FlightRecorder, RecordingSettings, RecordingState};
-use cratonvm_jfr::dump::{JFR_MAGIC, JFR_VERSION_MAJOR, JFR_VERSION_MINOR, HEADER_SIZE};
 use cratonvm_jfr::stream::EventStream;
-use cratonvm_jfr::create_flight_recorder;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -97,9 +97,18 @@ fn t4_7_1_jfr_event_recording_start_stop() {
     // Phase 1: Create a new recording -- state should be New.
     let rid = fr.new_recording(RecordingSettings::new("t4_7_1_conformance"));
     {
-        let rec = fr.get_recording(rid).expect("recording should exist after creation");
-        assert_eq!(rec.state, RecordingState::New, "newly created recording must be in New state");
-        assert!(rec.start_time.is_none(), "start_time must be None before start()");
+        let rec = fr
+            .get_recording(rid)
+            .expect("recording should exist after creation");
+        assert_eq!(
+            rec.state,
+            RecordingState::New,
+            "newly created recording must be in New state"
+        );
+        assert!(
+            rec.start_time.is_none(),
+            "start_time must be None before start()"
+        );
         assert_eq!(rec.event_count(), 0, "no events should exist before start");
     }
 
@@ -107,15 +116,40 @@ fn t4_7_1_jfr_event_recording_start_stop() {
     fr.start_recording(rid);
     {
         let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.state, RecordingState::Running, "recording must be Running after start()");
-        assert!(rec.start_time.is_some(), "start_time must be set after start()");
+        assert_eq!(
+            rec.state,
+            RecordingState::Running,
+            "recording must be Running after start()"
+        );
+        assert!(
+            rec.start_time.is_some(),
+            "start_time must be set after start()"
+        );
     }
-    assert_eq!(fr.active_recording_count(), 1, "one recording should be active");
+    assert_eq!(
+        fr.active_recording_count(),
+        1,
+        "one recording should be active"
+    );
 
     // Phase 3: Record events via the built-in emitters.
     // Use the GC event as a representative built-in event.
-    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
-    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "G1 Evacuation Pause", 2_000_000, 300_000);
+    cratonvm_jfr::builtin::emit_gc_event(
+        &mut fr,
+        1,
+        "G1 Young",
+        "Allocation Failure",
+        1_000_000,
+        500_000,
+    );
+    cratonvm_jfr::builtin::emit_gc_event(
+        &mut fr,
+        2,
+        "G1 Mixed",
+        "G1 Evacuation Pause",
+        2_000_000,
+        300_000,
+    );
     cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 10, 3_000_000);
     cratonvm_jfr::builtin::emit_class_load_event(
         &mut fr,
@@ -128,20 +162,42 @@ fn t4_7_1_jfr_event_recording_start_stop() {
 
     {
         let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.event_count(), 4, "four events should have been recorded while running");
+        assert_eq!(
+            rec.event_count(),
+            4,
+            "four events should have been recorded while running"
+        );
     }
 
     // Phase 4: Stop the recording -- state transitions to Stopped.
     fr.stop_recording(rid);
     {
         let rec = fr.get_recording(rid).unwrap();
-        assert_eq!(rec.state, RecordingState::Stopped, "recording must be Stopped after stop()");
-        assert!(rec.stop_time.is_some(), "stop_time must be set after stop()");
+        assert_eq!(
+            rec.state,
+            RecordingState::Stopped,
+            "recording must be Stopped after stop()"
+        );
+        assert!(
+            rec.stop_time.is_some(),
+            "stop_time must be set after stop()"
+        );
     }
-    assert_eq!(fr.active_recording_count(), 0, "no recordings should be active after stop");
+    assert_eq!(
+        fr.active_recording_count(),
+        0,
+        "no recordings should be active after stop"
+    );
 
     // Phase 5: Events recorded while stopped must be dropped.
-    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1 Full", "System.gc()", 5_000_000, 1_000_000);
+    cratonvm_jfr::builtin::emit_gc_event(
+        &mut fr,
+        3,
+        "G1 Full",
+        "System.gc()",
+        5_000_000,
+        1_000_000,
+    );
     {
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(
@@ -159,8 +215,14 @@ fn t4_7_1_jfr_event_recording_start_stop() {
 
         // All events should have non-zero timestamps
         for (i, event) in events.iter().enumerate() {
-            assert!(event.start_time > 0, "event {i} must have a positive start_time");
-            assert!(event.end_time >= event.start_time, "event {i} end_time must be >= start_time");
+            assert!(
+                event.start_time > 0,
+                "event {i} must have a positive start_time"
+            );
+            assert!(
+                event.end_time >= event.start_time,
+                "event {i} end_time must be >= start_time"
+            );
         }
     }
 }
@@ -215,7 +277,14 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     fr.start_recording(rid);
 
     // Emit a representative set of events to produce a non-trivial dump.
-    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
+    cratonvm_jfr::builtin::emit_gc_event(
+        &mut fr,
+        1,
+        "G1 Young",
+        "Allocation Failure",
+        1_000_000,
+        500_000,
+    );
     cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
     cratonvm_jfr::builtin::emit_class_load_event(
         &mut fr,
@@ -249,7 +318,11 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
         .expect("dump_recording must succeed for a stopped recording with events");
 
     // Assertion 1: The file exists.
-    assert!(dump_path.exists(), "dump file must exist at {:?}", dump_path);
+    assert!(
+        dump_path.exists(),
+        "dump file must exist at {:?}",
+        dump_path
+    );
 
     // Assertion 2: File size is > 0.
     let metadata = std::fs::metadata(&dump_path).expect("must be able to stat the dump file");
@@ -262,7 +335,10 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
 
     // Assertion 3: Magic bytes are FLR\0.
     let raw = std::fs::read(&dump_path).expect("must be able to read dump file");
-    assert!(raw.len() >= 8, "dump file must be at least 8 bytes for magic + version");
+    assert!(
+        raw.len() >= 8,
+        "dump file must be at least 8 bytes for magic + version"
+    );
     assert_eq!(
         &raw[0..4],
         &JFR_MAGIC,
@@ -274,7 +350,10 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     let minor = u16::from_be_bytes([raw[6], raw[7]]);
     assert_eq!(major, JFR_VERSION_MAJOR, "JFR major version must be 2");
     // Round-5 JFR Fix 3: minor version is now 1 (delta-encoded timestamps).
-    assert_eq!(minor, JFR_VERSION_MINOR, "JFR minor version must match crate constant");
+    assert_eq!(
+        minor, JFR_VERSION_MINOR,
+        "JFR minor version must match crate constant"
+    );
 
     // Assertion 5: Parse the full header for structural validity.
     let header = cratonvm_jfr::read_jfr_header(&dump_path)
@@ -284,7 +363,10 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     assert_eq!(header.minor, 0);
     assert_eq!(header.file_size, bytes_written);
     assert_eq!(header.file_state, 1, "file_state must be COMPLETE (1)");
-    assert_eq!(header.ticks_per_second, 1_000_000_000, "ticks_per_second must be 1e9 (nanoseconds)");
+    assert_eq!(
+        header.ticks_per_second, 1_000_000_000,
+        "ticks_per_second must be 1e9 (nanoseconds)"
+    );
 
     // Structural: checkpoint is after the header, metadata is after checkpoint.
     assert!(
@@ -318,8 +400,13 @@ fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
     let dir = jfr_temp_dir("dump_empty");
     let dump_path = dir.join("empty.jfr");
 
-    let bytes_written = fr.dump_recording(rid, &dump_path).expect("empty dump must succeed");
-    assert!(bytes_written > 0, "even an empty dump must produce a non-zero file");
+    let bytes_written = fr
+        .dump_recording(rid, &dump_path)
+        .expect("empty dump must succeed");
+    assert!(
+        bytes_written > 0,
+        "even an empty dump must produce a non-zero file"
+    );
 
     let header = cratonvm_jfr::read_jfr_header(&dump_path).expect("header must be valid");
     assert_eq!(header.magic, JFR_MAGIC);
@@ -352,7 +439,9 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     // Look up a known built-in event type ID for filtering.
     // Verify that built-in event types are registered.
     assert!(
-        fr.type_registry.find_by_name("jdk.GarbageCollection").is_some(),
+        fr.type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .is_some(),
         "jdk.GarbageCollection must be registered in built-in events"
     );
 
@@ -369,7 +458,10 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
-        assert!(events.is_empty(), "stream should return no events before any are emitted");
+        assert!(
+            events.is_empty(),
+            "stream should return no events before any are emitted"
+        );
     }
 
     // Emit events into the recording.
@@ -381,14 +473,21 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
-        assert_eq!(events.len(), 3, "stream must deliver all 3 events emitted since creation");
+        assert_eq!(
+            events.len(),
+            3,
+            "stream must deliver all 3 events emitted since creation"
+        );
     }
 
     // Subsequent poll with no new events should return empty.
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
-        assert!(events.is_empty(), "poll with no new events must return empty");
+        assert!(
+            events.is_empty(),
+            "poll with no new events must return empty"
+        );
     }
 
     // Emit one more event, verify incremental delivery.
@@ -458,9 +557,16 @@ fn t4_7_3_jfr_event_stream_filtered_with_callback() {
     {
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
-        assert_eq!(events.len(), 2, "only GC events should pass the type filter");
+        assert_eq!(
+            events.len(),
+            2,
+            "only GC events should pass the type filter"
+        );
         for e in &events {
-            assert_eq!(e.type_id, gc_type_id, "filtered events must have the GC type ID");
+            assert_eq!(
+                e.type_id, gc_type_id,
+                "filtered events must have the GC type ID"
+            );
         }
     }
 

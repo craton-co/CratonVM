@@ -8,10 +8,10 @@
 //! stubs so that code targeting GraalVM's Substrate VM APIs can run on
 //! CratonVM without native-image.
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -100,7 +100,9 @@ impl ReflectionConfig {
             None => {
                 self.entries.push(ReflectionEntry::new(class_name));
                 // SAFETY: just pushed above, entries is non-empty
-                self.entries.last_mut().expect("entries non-empty after push")
+                self.entries
+                    .last_mut()
+                    .expect("entries non-empty after push")
             }
         }
     }
@@ -203,8 +205,11 @@ impl ReflectionConfig {
                     .methods
                     .iter()
                     .map(|m| {
-                        let params: Vec<String> =
-                            m.parameter_types.iter().map(|p| format!("\"{}\"", json_escape(p))).collect();
+                        let params: Vec<String> = m
+                            .parameter_types
+                            .iter()
+                            .map(|p| format!("\"{}\"", json_escape(p)))
+                            .collect();
                         format!(
                             "{{\"name\":\"{}\",\"parameterTypes\":[{}]}}",
                             json_escape(&m.name),
@@ -220,7 +225,10 @@ impl ReflectionConfig {
                     .iter()
                     .map(|f| {
                         if f.allow_write {
-                            format!("{{\"name\":\"{}\",\"allowWrite\":true}}", json_escape(&f.name))
+                            format!(
+                                "{{\"name\":\"{}\",\"allowWrite\":true}}",
+                                json_escape(&f.name)
+                            )
                         } else {
                             format!("{{\"name\":\"{}\"}}", json_escape(&f.name))
                         }
@@ -306,8 +314,8 @@ fn split_top_level_objects(s: &str) -> Result<Vec<String>, String> {
 
 /// Simplified parser for a single reflection entry JSON object.
 fn parse_reflection_entry(obj: &str) -> Result<ReflectionEntry, String> {
-    let name = extract_string_value(obj, "name")
-        .ok_or_else(|| "Missing 'name' field".to_string())?;
+    let name =
+        extract_string_value(obj, "name").ok_or_else(|| "Missing 'name' field".to_string())?;
     let mut entry = ReflectionEntry::new(&name);
     entry.all_public_methods = extract_bool_value(obj, "allPublicMethods");
     entry.all_public_fields = extract_bool_value(obj, "allPublicFields");
@@ -420,7 +428,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             }
             // Single star can't help, clear it.
             #[allow(unused_assignments)]
-            { star_pi = None; }
+            {
+                star_pi = None;
+            }
         }
         // Try double-star backtrack (can cross anything).
         if let Some(dp) = dstar_pi {
@@ -496,7 +506,11 @@ impl ResourceConfig {
             parts.push(format!("\"excludes\":[{}]", exc.join(",")));
         }
         if !self.bundles.is_empty() {
-            let bnd: Vec<String> = self.bundles.iter().map(|b| format!("\"{}\"", json_escape(b))).collect();
+            let bnd: Vec<String> = self
+                .bundles
+                .iter()
+                .map(|b| format!("\"{}\"", json_escape(b)))
+                .collect();
             parts.push(format!("\"bundles\":[{}]", bnd.join(",")));
         }
         format!("{{{}}}", parts.join(","))
@@ -541,7 +555,9 @@ impl JniConfig {
             None => {
                 self.entries.push(JniEntry::new(class_name));
                 // SAFETY: just pushed above, entries is non-empty
-                self.entries.last_mut().expect("entries non-empty after push")
+                self.entries
+                    .last_mut()
+                    .expect("entries non-empty after push")
             }
         }
     }
@@ -579,8 +595,11 @@ impl JniConfig {
                     .methods
                     .iter()
                     .map(|m| {
-                        let params: Vec<String> =
-                            m.parameter_types.iter().map(|p| format!("\"{}\"", json_escape(p))).collect();
+                        let params: Vec<String> = m
+                            .parameter_types
+                            .iter()
+                            .map(|p| format!("\"{}\"", json_escape(p)))
+                            .collect();
                         format!(
                             "{{\"name\":\"{}\",\"parameterTypes\":[{}]}}",
                             json_escape(&m.name),
@@ -591,8 +610,11 @@ impl JniConfig {
                 obj_parts.push(format!("\"methods\":[{}]", methods_json.join(",")));
             }
             if !entry.fields.is_empty() {
-                let fields_json: Vec<String> =
-                    entry.fields.iter().map(|f| format!("\"{}\"", json_escape(f))).collect();
+                let fields_json: Vec<String> = entry
+                    .fields
+                    .iter()
+                    .map(|f| format!("\"{}\"", json_escape(f)))
+                    .collect();
                 obj_parts.push(format!("\"fields\":[{}]", fields_json.join(",")));
             }
             parts.push(format!("{{{}}}", obj_parts.join(",")));
@@ -627,7 +649,10 @@ impl ProxyConfig {
             .proxy_classes
             .iter()
             .map(|ifaces| {
-                let items: Vec<String> = ifaces.iter().map(|i| format!("\"{}\"", json_escape(i))).collect();
+                let items: Vec<String> = ifaces
+                    .iter()
+                    .map(|i| format!("\"{}\"", json_escape(i)))
+                    .collect();
                 format!("[{}]", items.join(","))
             })
             .collect();
@@ -673,7 +698,8 @@ impl SerializationConfig {
                 if let Some(ref target) = e.custom_target_constructor_class {
                     format!(
                         "{{\"name\":\"{}\",\"customTargetConstructorClass\":\"{}\"}}",
-                        json_escape(&e.class_name), json_escape(target)
+                        json_escape(&e.class_name),
+                        json_escape(target)
                     )
                 } else {
                     format!("{{\"name\":\"{}\"}}", json_escape(&e.class_name))
@@ -845,7 +871,9 @@ pub fn init_graalvm_metadata() {
 /// Register a class for runtime reflection access.
 pub fn graalvm_register_reflection(class_name: &str, all_public: bool, all_declared: bool) {
     if let Some(ref mut config) = *GRAALVM_CONFIG.write() {
-        config.reflection.add_class(class_name, all_public, all_declared);
+        config
+            .reflection
+            .add_class(class_name, all_public, all_declared);
     }
 }
 
@@ -956,7 +984,11 @@ pub fn graalvm_is_reflection_allowed(class_name: &str) -> bool {
     let guard = GRAALVM_CONFIG.read();
     match guard.as_ref() {
         None => true, // No config → permissive (not running as native-image)
-        Some(config) => config.reflection.entries.iter().any(|e| e.class_name == class_name),
+        Some(config) => config
+            .reflection
+            .entries
+            .iter()
+            .any(|e| e.class_name == class_name),
     }
 }
 
@@ -981,7 +1013,11 @@ pub fn graalvm_is_jni_allowed(class_name: &str) -> bool {
     let guard = GRAALVM_CONFIG.read();
     match guard.as_ref() {
         None => true,
-        Some(config) => config.jni.entries.iter().any(|e| e.class_name == class_name),
+        Some(config) => config
+            .jni
+            .entries
+            .iter()
+            .any(|e| e.class_name == class_name),
     }
 }
 
@@ -990,7 +1026,11 @@ pub fn graalvm_is_serialization_allowed(class_name: &str) -> bool {
     let guard = GRAALVM_CONFIG.read();
     match guard.as_ref() {
         None => true,
-        Some(config) => config.serialization.entries.iter().any(|e| e.class_name == class_name),
+        Some(config) => config
+            .serialization
+            .entries
+            .iter()
+            .any(|e| e.class_name == class_name),
     }
 }
 
@@ -1127,10 +1167,7 @@ fn effective_image_mode(ctx: &dyn NativeContext) -> ImageCodeMode {
 // Native method implementations for GraalVM Substrate VM APIs
 // ===========================================================================
 
-fn graalvm_in_image_code(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn graalvm_in_image_code(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // True in either buildtime or runtime image modes.
     let in_image = effective_image_mode(ctx) != ImageCodeMode::Off;
     Ok(Some(Value::Int(if in_image { 1 } else { 0 })))
@@ -1144,35 +1181,23 @@ fn graalvm_in_image_buildtime_code(
     Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
-fn graalvm_in_image_runtime_code(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn graalvm_in_image_runtime_code(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let v = effective_image_mode(ctx) == ImageCodeMode::Runtime;
     Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
-fn graalvm_is_executable(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn graalvm_is_executable(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // A generated image is an executable only while it is running (runtime).
     let v = effective_image_mode(ctx) == ImageCodeMode::Runtime;
     Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
-fn graalvm_is_shared_library(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn graalvm_is_shared_library(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // CratonVM never produces a shared-library image form.
     Ok(Some(Value::Int(0)))
 }
 
-fn graalvm_platform_included_in(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_platform_included_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = Platform class (static), args[1] = Class to check
     // Detect the current platform and match against known GraalVM platform classes
     if let Some(Value::Object(Some(class_obj))) = args.get(1) {
@@ -1233,10 +1258,7 @@ fn graalvm_runtime_serialization_register(
     Ok(None)
 }
 
-fn graalvm_runtime_jni_register(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_runtime_jni_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(class_obj))) = args.first() {
         let class_id = ctx.class_id_of_object(*class_obj);
         if let Some(name) = ctx.class_name_of_id(class_id) {
@@ -1246,10 +1268,7 @@ fn graalvm_runtime_jni_register(
     Ok(None)
 }
 
-fn graalvm_feature_register(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_feature_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = Feature class object
     if let Some(Value::Object(Some(class_obj))) = args.first() {
         let class_id = ctx.class_id_of_object(*class_obj);
@@ -1282,10 +1301,7 @@ fn class_name_arg(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Option
     }
 }
 
-fn graalvm_singletons_contains(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_singletons_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // static contains(Class) — args[0] = key Class
     let present = class_name_arg(ctx, args, 0)
         .map(|name| graalvm_singleton_contains(&name))
@@ -1293,10 +1309,7 @@ fn graalvm_singletons_contains(
     Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
 
-fn graalvm_singletons_lookup(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_singletons_lookup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // static <T> lookup(Class<T>) — args[0] = key Class; returns the singleton.
     let Some(name) = class_name_arg(ctx, args, 0) else {
         return Ok(Some(Value::Object(None)));
@@ -1324,10 +1337,7 @@ fn graalvm_singletons_lookup(
     }
 }
 
-fn graalvm_singletons_add(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_singletons_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // static <T> add(Class<T> key, T value) — args[0] = key Class, args[1] = value.
     let Some(name) = class_name_arg(ctx, args, 0) else {
         return Ok(None);
@@ -1340,15 +1350,18 @@ fn graalvm_singletons_add(
     let pin_handle = ctx.pin_native_root(value);
     let raw_ptr = ctx.read_native_pin(pin_handle, value).as_ptr();
     if let Some(ref mut map) = *GRAALVM_SINGLETONS.write() {
-        map.insert(name, SingletonSlot { pin_handle, raw_ptr });
+        map.insert(
+            name,
+            SingletonSlot {
+                pin_handle,
+                raw_ptr,
+            },
+        );
     }
     Ok(None)
 }
 
-fn graalvm_dump_metadata(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn graalvm_dump_metadata(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = output directory path string
     // Returns: number of files written as Int
     let dir = if let Some(Value::Object(Some(path_ref))) = args.first() {
@@ -1987,9 +2000,16 @@ mod tests {
     #[test]
     fn test_substitution_register_and_lookup() {
         let mut reg = SubstitutionRegistry::new();
-        reg.register("sun.misc.Unsafe", "com.oracle.svm.core.UnsafeSubstitution", "Unsafe access");
+        reg.register(
+            "sun.misc.Unsafe",
+            "com.oracle.svm.core.UnsafeSubstitution",
+            "Unsafe access",
+        );
         let target = reg.lookup("sun.misc.Unsafe").unwrap();
-        assert_eq!(target.replacement_class, "com.oracle.svm.core.UnsafeSubstitution");
+        assert_eq!(
+            target.replacement_class,
+            "com.oracle.svm.core.UnsafeSubstitution"
+        );
         assert_eq!(target.reason, "Unsafe access");
         assert!(target.active);
     }
@@ -2458,7 +2478,9 @@ mod tests {
     /// `ImageSingletons` natives only need `class_id_of_object` →
     /// `class_name_of_id` to round-trip, which this satisfies.
     fn class_object(ctx: &mut MockNativeContext, class_name: &str) -> Value {
-        let cid = ctx.ensure_class_initialized(class_name).expect("class init");
+        let cid = ctx
+            .ensure_class_initialized(class_name)
+            .expect("class init");
         Value::Object(Some(ctx.alloc_object(cid, 0)))
     }
 
@@ -2493,12 +2515,27 @@ mod tests {
         reset_graalvm_globals();
         set_image_code_mode(ImageCodeMode::Runtime);
         let mut ctx = MockNativeContext::new();
-        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            graalvm_in_image_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
         // A running generated image is the executable form.
-        assert_eq!(graalvm_is_executable(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_is_shared_library(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            graalvm_is_executable(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_is_shared_library(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
         reset_graalvm_globals();
     }
 
@@ -2508,11 +2545,23 @@ mod tests {
         reset_graalvm_globals();
         set_image_code_mode(ImageCodeMode::Buildtime);
         let mut ctx = MockNativeContext::new();
-        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            graalvm_in_image_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
         // Build-time image generation is not the executable.
-        assert_eq!(graalvm_is_executable(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            graalvm_is_executable(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
         reset_graalvm_globals();
     }
 
@@ -2525,8 +2574,14 @@ mod tests {
         set_image_code_mode(ImageCodeMode::Off);
         let mut ctx = MockNativeContext::new();
         ctx.set_system_property("org.graalvm.nativeimage.imagecode", "runtime");
-        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
-        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(
+            graalvm_in_image_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(1))
+        );
         reset_graalvm_globals();
     }
 
@@ -2550,7 +2605,9 @@ mod tests {
 
         let key = class_object(&mut ctx, "com/example/MyServiceKey");
         // Value: any heap object standing in for the singleton instance.
-        let value_cid = ctx.ensure_class_initialized("com/example/MyServiceImpl").unwrap();
+        let value_cid = ctx
+            .ensure_class_initialized("com/example/MyServiceImpl")
+            .unwrap();
         let value = Value::Object(Some(ctx.alloc_object(value_cid, 2)));
 
         // Not present before add.
@@ -2630,8 +2687,16 @@ mod tests {
     fn test_register_image_singletons_natives() {
         let r = make_registry();
         const SINGLETONS: &str = "org/graalvm/nativeimage/ImageSingletons";
-        assert!(r.find(SINGLETONS, "contains", "(Ljava/lang/Class;)Z").is_some());
-        assert!(r.find(SINGLETONS, "lookup", "(Ljava/lang/Class;)Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(SINGLETONS, "contains", "(Ljava/lang/Class;)Z")
+            .is_some());
+        assert!(r
+            .find(
+                SINGLETONS,
+                "lookup",
+                "(Ljava/lang/Class;)Ljava/lang/Object;"
+            )
+            .is_some());
         assert!(r
             .find(SINGLETONS, "add", "(Ljava/lang/Class;Ljava/lang/Object;)V")
             .is_some());

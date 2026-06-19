@@ -394,7 +394,10 @@ pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnect
         }
     }
     Err(PolicyConnectError::Io(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "policy_connect: no addresses tried")
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "policy_connect: no addresses tried",
+        )
     })))
 }
 
@@ -504,7 +507,10 @@ mod tests {
             let _ = listener.accept();
         });
         let res = policy_connect(&target);
-        assert!(res.is_ok(), "default policy should allow localhost; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "default policy should allow localhost; got {res:?}"
+        );
     }
 
     #[test]
@@ -537,7 +543,10 @@ mod tests {
         assert_eq!(connect_timeout(), Duration::from_millis(1234));
         // ZERO acts as "reset to default" (still finite).
         set_connect_timeout(Duration::ZERO);
-        assert_eq!(connect_timeout(), Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS));
+        assert_eq!(
+            connect_timeout(),
+            Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)
+        );
         // Restore.
         set_connect_timeout(original);
     }
@@ -575,11 +584,20 @@ mod tests {
         // Unbracketed link-local and AWS-metadata IPv6 literals — these are
         // exactly the inputs the old `host_part` mangled into `Allow`.
         assert!(matches!(default_policy("fe80::1"), PolicyDecision::Deny(_)));
-        assert!(matches!(default_policy("fd00:ec2::254"), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            default_policy("fd00:ec2::254"),
+            PolicyDecision::Deny(_)
+        ));
         // The bracketed-with-port form must keep working too.
-        assert!(matches!(default_policy("[fd00:ec2::254]:80"), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            default_policy("[fd00:ec2::254]:80"),
+            PolicyDecision::Deny(_)
+        ));
         // A public IPv6 literal is still allowed (no false positives).
-        assert!(matches!(default_policy("2001:4860:4860::8888"), PolicyDecision::Allow));
+        assert!(matches!(
+            default_policy("2001:4860:4860::8888"),
+            PolicyDecision::Allow
+        ));
     }
 
     /// V2 (2026-06-10): the opt-in private-net classifier covers loopback
@@ -605,7 +623,10 @@ mod tests {
         ];
         for s in denied {
             let ip: IpAddr = s.parse().unwrap();
-            assert!(is_private_or_loopback_ip(&ip), "expected private/loopback: {s}");
+            assert!(
+                is_private_or_loopback_ip(&ip),
+                "expected private/loopback: {s}"
+            );
         }
         let allowed = [
             "8.8.8.8",

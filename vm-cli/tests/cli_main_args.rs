@@ -63,10 +63,7 @@ fn main_args_delivered_in_order() {
     // Use line-by-line comparison to be tolerant of any leading/trailing
     // diagnostic prints (there should not be any on stdout, but we
     // don't want a benign tracing line to flake the test).
-    let lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     assert!(
         lines.windows(3).any(|w| w == ["alpha", "beta", "gamma"]),
         "expected alpha/beta/gamma to appear in order on stdout; got lines={lines:?}"

@@ -68,10 +68,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use parking_lot::Mutex;
 use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::Mutex;
 
 use crate::alloc_concurrent_synthetic;
 use crate::jboss_module_xml::{parse_module_xml, ModuleXml};
@@ -83,8 +83,7 @@ use crate::jboss_module_xml::{parse_module_xml, ModuleXml};
 pub(crate) const CN_MODULE_LOADER: &str = "org/jboss/modules/LocalModuleLoader";
 pub(crate) const CN_MODULE: &str = "org/jboss/modules/Module";
 pub(crate) const CN_MODULE_CLASSLOADER: &str = "org/jboss/modules/ModuleClassLoader";
-pub(crate) const CN_DEFAULT_BOOT_HOLDER: &str =
-    "org/jboss/modules/DefaultBootModuleLoaderHolder";
+pub(crate) const CN_DEFAULT_BOOT_HOLDER: &str = "org/jboss/modules/DefaultBootModuleLoaderHolder";
 pub(crate) const CN_MODULE_NOT_FOUND: &str = "org/jboss/modules/ModuleNotFoundException";
 
 // ---------------------------------------------------------------------------
@@ -136,10 +135,7 @@ pub(crate) fn validate_module_name(name: &str) -> Result<(), RuntimeError> {
     }
     if name.len() > 256 {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!(
-                "module name too long: {} bytes (max 256)",
-                name.len()
-            ),
+            message: format!("module name too long: {} bytes (max 256)", name.len()),
         });
     }
     for b in name.bytes() {
@@ -308,7 +304,11 @@ pub(crate) fn locate_module_xml(root: &Path, name: &str) -> Option<PathBuf> {
         layers.push("base".to_string());
     }
     for layer in &layers {
-        let candidate = layers_root.join(layer).join(&rel).join("main").join("module.xml");
+        let candidate = layers_root
+            .join(layer)
+            .join(&rel)
+            .join("main")
+            .join("module.xml");
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -397,8 +397,7 @@ fn ensure_under_root(root: &Path, candidate: &Path) -> Result<(), RuntimeError> 
     // that doesn't exist (test tempdirs that were torn down, etc.) we keep the
     // non-canonical fallback so deterministic test roots still work. The
     // candidate, by contrast, is attacker-influenced and must fail closed.
-    let canonical_root = std::fs::canonicalize(root)
-        .unwrap_or_else(|_| root.to_path_buf());
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let canonical_candidate = match resolve_for_confinement(candidate) {
         Some(c) => c,
         None => {
@@ -428,24 +427,17 @@ fn ensure_under_root(root: &Path, candidate: &Path) -> Result<(), RuntimeError> 
 /// stays inside the root.
 pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, RuntimeError> {
     validate_module_name(name)?;
-    let module_xml_path = locate_module_xml(root, name).ok_or_else(|| {
-        RuntimeError::ClassNotFoundException {
+    let module_xml_path =
+        locate_module_xml(root, name).ok_or_else(|| RuntimeError::ClassNotFoundException {
             class_name: format!("module:{}", name),
-        }
-    })?;
+        })?;
     ensure_under_root(root, &module_xml_path)?;
     let module_dir = module_xml_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.to_path_buf());
-    let mx = parse_module_xml(&module_xml_path).map_err(|e| {
-        RuntimeError::IOException {
-            message: format!(
-                "failed to parse {}: {}",
-                module_xml_path.display(),
-                e
-            ),
-        }
+    let mx = parse_module_xml(&module_xml_path).map_err(|e| RuntimeError::IOException {
+        message: format!("failed to parse {}: {}", module_xml_path.display(), e),
     })?;
     // Resource roots are relative to module_dir.  Materialize each as
     // an absolute path and confirm it stays under the canonical root.
@@ -454,10 +446,7 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
         // Reject `..` segments at the input layer too — defense in depth.
         if rr.path.contains("..") {
             return Err(RuntimeError::SecurityException {
-                message: format!(
-                    "resource-root path {} contains traversal sequence",
-                    rr.path
-                ),
+                message: format!("resource-root path {} contains traversal sequence", rr.path),
             });
         }
         let absolute = module_dir.join(&rr.path);
@@ -504,9 +493,11 @@ pub(crate) fn resolve_module_in_roots(
             Err(other) => return Err(other),
         }
     }
-    Err(last_err.unwrap_or_else(|| RuntimeError::ClassNotFoundException {
-        class_name: format!("module:{}", name),
-    }))
+    Err(
+        last_err.unwrap_or_else(|| RuntimeError::ClassNotFoundException {
+            class_name: format!("module:{}", name),
+        }),
+    )
 }
 
 // ===========================================================================
@@ -624,10 +615,7 @@ pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> Object
 // Native: LocalModuleLoader.loadModule(String) → Module
 // ===========================================================================
 
-fn build_resource_root_array(
-    ctx: &mut dyn NativeContext,
-    paths: &[PathBuf],
-) -> ObjectRef {
+fn build_resource_root_array(ctx: &mut dyn NativeContext, paths: &[PathBuf]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
     for (i, p) in paths.iter().enumerate() {
         let s = ctx.create_string(&p.to_string_lossy());
@@ -669,10 +657,7 @@ fn build_module_object(
 }
 
 /// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
-fn throw_module_not_found(
-    ctx: &mut dyn NativeContext,
-    name: &str,
-) -> MethodCallFailed {
+fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
     let exc = alloc_concurrent_synthetic(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT);
     let msg = ctx.create_string(name);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
@@ -700,10 +685,7 @@ fn throw_module_not_found(
 ///
 /// Returns an empty Vec on any failure — the caller falls back to the
 /// process-wide `module_path_root()` resolution.
-fn extract_receiver_roots(
-    ctx: &mut dyn NativeContext,
-    receiver: ObjectRef,
-) -> Vec<PathBuf> {
+fn extract_receiver_roots(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Vec<PathBuf> {
     let finders_arr = read_finders_array(ctx, receiver);
     let finders_arr = match finders_arr {
         Some(a) => a,
@@ -751,11 +733,9 @@ fn extract_receiver_roots(
                 Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
                 _ => None,
             };
-            let path_str = path_str.or_else(|| {
-                match ctx.get_field_by_name(file, "path") {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                }
+            let path_str = path_str.or_else(|| match ctx.get_field_by_name(file, "path") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
             });
             if let Some(p) = path_str {
                 if !p.is_empty() {
@@ -774,10 +754,7 @@ fn extract_receiver_roots(
 /// Tries the virtual `getFinders()` accessor first (cheaper and survives
 /// any field-renaming), then falls back to a direct `finders` field
 /// read.  Returns the array ObjectRef or None.
-fn read_finders_array(
-    ctx: &mut dyn NativeContext,
-    receiver: ObjectRef,
-) -> Option<ObjectRef> {
+fn read_finders_array(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Option<ObjectRef> {
     if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
         receiver,
         "getFinders",
@@ -1059,47 +1036,49 @@ pub(crate) fn native_loader_load_module(
             // inside the opt-in branch below.
             let _ = build_synthetic_class_with_main;
         }
-        if allow_synth_bytecode { for synth_name in &entry_candidates {
-            let cid_pre = ctx.class_id_by_name(synth_name);
-            let main_exists_pre =
-                ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
-            // KC17 — critical fix.  Previously this guard only checked
-            // `class_id_by_name(...).is_some()` and skipped the synth when a
-            // class was loaded.  But `ensure_class_initialized` above can
-            // materialise a class stub that LACKS `main([Ljava/lang/String;)V`
-            // (e.g. a `NoClassDefFoundError`-stub or a partial class entry).
-            // The reflective `Class.forName(...).getDeclaredMethod("main",
-            // String[].class)` chain in jboss-modules then walks that stub's
-            // method table, finds no `main`, and throws
-            // `NoSuchMethodException`.  Skip the synth ONLY when the class is
-            // loaded AND already exposes a `main([Ljava/lang/String;)V`
-            // method.  Otherwise re-define so the reflective lookup resolves.
-            if cid_pre.is_some() && main_exists_pre {
-                continue;
+        if allow_synth_bytecode {
+            for synth_name in &entry_candidates {
+                let cid_pre = ctx.class_id_by_name(synth_name);
+                let main_exists_pre =
+                    ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
+                // KC17 — critical fix.  Previously this guard only checked
+                // `class_id_by_name(...).is_some()` and skipped the synth when a
+                // class was loaded.  But `ensure_class_initialized` above can
+                // materialise a class stub that LACKS `main([Ljava/lang/String;)V`
+                // (e.g. a `NoClassDefFoundError`-stub or a partial class entry).
+                // The reflective `Class.forName(...).getDeclaredMethod("main",
+                // String[].class)` chain in jboss-modules then walks that stub's
+                // method table, finds no `main`, and throws
+                // `NoSuchMethodException`.  Skip the synth ONLY when the class is
+                // loaded AND already exposes a `main([Ljava/lang/String;)V`
+                // method.  Otherwise re-define so the reflective lookup resolves.
+                if cid_pre.is_some() && main_exists_pre {
+                    continue;
+                }
+                let bytecode = build_synthetic_class_with_main(synth_name);
+                // WF8 — `define_class_from_bytes` is a strict "register new
+                // class" API: when a class with this name is ALREADY loaded
+                // (which is exactly the WildFly/Keycloak failure mode — a
+                // class stub got materialised earlier but lacks `main`), it
+                // bails out with `None`.  Instead, use `define_class_full`
+                // with `allow_redefine: true` so the synthetic bytecode
+                // physically REPLACES the incomplete class in place.  This
+                // ensures the post-condition `method_exists("main",
+                // "([Ljava/lang/String;)V") == true` holds for the trigger
+                // entry classes regardless of what got loaded first.
+                let force_opts = DefineClassFull {
+                    allow_redefine: true,
+                    ..Default::default()
+                };
+                if let Err(_e) = ctx.define_class_full(synth_name, &bytecode, 0, force_opts) {
+                    // Last-ditch fallback: try the legacy strict define
+                    // entry point.  Only useful when the class is NOT
+                    // already loaded (cid_pre.is_none()); otherwise the
+                    // strict define will also return None.
+                    let _ = ctx.define_class_from_bytes(synth_name, &bytecode);
+                }
             }
-            let bytecode = build_synthetic_class_with_main(synth_name);
-            // WF8 — `define_class_from_bytes` is a strict "register new
-            // class" API: when a class with this name is ALREADY loaded
-            // (which is exactly the WildFly/Keycloak failure mode — a
-            // class stub got materialised earlier but lacks `main`), it
-            // bails out with `None`.  Instead, use `define_class_full`
-            // with `allow_redefine: true` so the synthetic bytecode
-            // physically REPLACES the incomplete class in place.  This
-            // ensures the post-condition `method_exists("main",
-            // "([Ljava/lang/String;)V") == true` holds for the trigger
-            // entry classes regardless of what got loaded first.
-            let force_opts = DefineClassFull {
-                allow_redefine: true,
-                ..Default::default()
-            };
-            if let Err(_e) = ctx.define_class_full(synth_name, &bytecode, 0, force_opts) {
-                // Last-ditch fallback: try the legacy strict define
-                // entry point.  Only useful when the class is NOT
-                // already loaded (cid_pre.is_none()); otherwise the
-                // strict define will also return None.
-                let _ = ctx.define_class_from_bytes(synth_name, &bytecode);
-            }
-        } } // close `for synth_name` and `if allow_synth_bytecode`
+        } // close `for synth_name` and `if allow_synth_bytecode`
     }
 
     // Insert into cache, but check for race-loser.
@@ -1508,8 +1487,7 @@ fn collect_physical_main_dir_jars(start_module: &str) -> Vec<PathBuf> {
 /// Set of `(root, module)` pairs that have already had a brute-force layered
 /// jar scan run against them.  Each pair is scanned at most once per VM
 /// lifetime to keep `loadModule` calls cheap after the first hit.
-static BRUTE_FORCED_ROOTS: OnceLock<Mutex<std::collections::HashSet<String>>> =
-    OnceLock::new();
+static BRUTE_FORCED_ROOTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
 fn brute_forced_roots() -> &'static Mutex<std::collections::HashSet<String>> {
     BRUTE_FORCED_ROOTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -1577,10 +1555,7 @@ fn is_brute_force_trigger(name: &str) -> bool {
 ///
 /// Returns absolute paths of jar files (the caller passes them through
 /// `register_resource_roots` which dedupes against already-registered jars).
-fn brute_force_collect_layered_jars(
-    roots: &[PathBuf],
-    module_name: &str,
-) -> Vec<PathBuf> {
+fn brute_force_collect_layered_jars(roots: &[PathBuf], module_name: &str) -> Vec<PathBuf> {
     let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
     let mut jars: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -1590,10 +1565,7 @@ fn brute_force_collect_layered_jars(
             if !seen.insert(key.clone()) {
                 // Already scanned this (root, module) pair.
                 if dbg_wf {
-                    eprintln!(
-                        "[wildfly-brute-force] skip already-scanned key={}",
-                        key
-                    );
+                    eprintln!("[wildfly-brute-force] skip already-scanned key={}", key);
                 }
                 continue;
             }
@@ -1805,8 +1777,7 @@ pub(crate) fn native_module_load_class(
     match ctx.load_class(&internal) {
         Ok(Some(mirror)) => Ok(Some(mirror)),
         _ => {
-            let exc =
-                alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+            let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
             let msg = ctx.create_string(&class_name);
             ctx.set_field(exc, 0, Value::Object(Some(msg)));
             Err(MethodCallFailed::ExceptionThrown(exc))
@@ -1863,9 +1834,7 @@ pub(crate) fn native_module_classloader_load_class(
         Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some(
-                    "ModuleClassLoader.loadClass: receiver must not be null".to_string(),
-                ),
+                message: Some("ModuleClassLoader.loadClass: receiver must not be null".to_string()),
             }
             .into());
         }
@@ -1874,9 +1843,7 @@ pub(crate) fn native_module_classloader_load_class(
         Some(Value::Object(Some(s))) => *s,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some(
-                    "ModuleClassLoader.loadClass: name must not be null".to_string(),
-                ),
+                message: Some("ModuleClassLoader.loadClass: name must not be null".to_string()),
             }
             .into());
         }
@@ -1892,13 +1859,16 @@ pub(crate) fn native_module_classloader_load_class(
     // bootstrap loader (not the module's resource roots, even if a module
     // tries to ship a duplicate `java.*` class).
     if is_jdk_internal_class(&class_name) {
-        if dbg { eprintln!("[mcl.loadClass] jdk-internal path"); }
+        if dbg {
+            eprintln!("[mcl.loadClass] jdk-internal path");
+        }
         return match ctx.load_class(&internal) {
             Ok(Some(mirror)) => Ok(Some(mirror)),
             _ => {
-                if dbg { eprintln!("[mcl.loadClass] jdk-internal: load_class miss"); }
-                let exc =
-                    alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+                if dbg {
+                    eprintln!("[mcl.loadClass] jdk-internal: load_class miss");
+                }
+                let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
                 let msg = ctx.create_string(&class_name);
                 ctx.set_field(exc, 0, Value::Object(Some(msg)));
                 Err(MethodCallFailed::ExceptionThrown(exc))
@@ -1915,7 +1885,10 @@ pub(crate) fn native_module_classloader_load_class(
     if let Some(name) = module_name.as_deref() {
         let (modules, roots) = module_visibility_closure(name);
         if dbg {
-            eprintln!("[mcl.loadClass] module={name:?} closure={modules:?} root_count={}", roots.len());
+            eprintln!(
+                "[mcl.loadClass] module={name:?} closure={modules:?} root_count={}",
+                roots.len()
+            );
         }
         // Register every visible root on the shared dynamic classpath so
         // the system class loader can resolve once visibility passes.
@@ -1923,12 +1896,16 @@ pub(crate) fn native_module_classloader_load_class(
         register_resource_roots(ctx, &roots);
         if find_entry_in_roots(&roots, &entry_path).is_some() {
             visible = true;
-            if dbg { eprintln!("[mcl.loadClass] entry visible in closure"); }
+            if dbg {
+                eprintln!("[mcl.loadClass] entry visible in closure");
+            }
         } else if dbg {
             eprintln!("[mcl.loadClass] entry NOT in closure for {entry_path:?}");
         }
     } else {
-        if dbg { eprintln!("[mcl.loadClass] no module backref (defensive: visible=true)"); }
+        if dbg {
+            eprintln!("[mcl.loadClass] no module backref (defensive: visible=true)");
+        }
         // Defensive: if we don't have a module backref (synthetic or test
         // fixture), behave like a plain delegating loader so apps that
         // don't depend on isolation still work.
@@ -1945,9 +1922,10 @@ pub(crate) fn native_module_classloader_load_class(
     match ctx.load_class(&internal) {
         Ok(Some(mirror)) => Ok(Some(mirror)),
         other => {
-            if dbg { eprintln!("[mcl.loadClass] load_class miss after visible: {other:?}"); }
-            let exc =
-                alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+            if dbg {
+                eprintln!("[mcl.loadClass] load_class miss after visible: {other:?}");
+            }
+            let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
             let msg = ctx.create_string(&class_name);
             ctx.set_field(exc, 0, Value::Object(Some(msg)));
             Err(MethodCallFailed::ExceptionThrown(exc))
@@ -1971,9 +1949,7 @@ pub(crate) fn native_module_classloader_find_class(
         Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some(
-                    "ModuleClassLoader.findClass: receiver must not be null".to_string(),
-                ),
+                message: Some("ModuleClassLoader.findClass: receiver must not be null".to_string()),
             }
             .into());
         }
@@ -1982,9 +1958,7 @@ pub(crate) fn native_module_classloader_find_class(
         Some(Value::Object(Some(s))) => *s,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some(
-                    "ModuleClassLoader.findClass: name must not be null".to_string(),
-                ),
+                message: Some("ModuleClassLoader.findClass: name must not be null".to_string()),
             }
             .into());
         }
@@ -2570,10 +2544,7 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
 /// dead-symbol warning.  Real `org/jboss/as/server/Main.main` bytecode
 /// now runs.
 #[allow(dead_code)]
-fn native_wildfly_main_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_wildfly_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
@@ -2609,21 +2580,9 @@ fn native_jdk_module_logger_clinit(
         Some(idx) => ctx.get_static_field(level_cid, idx),
         None => Value::Object(None),
     };
-    ctx.set_static_field_by_name(
-        "org/jboss/modules/log/JDKModuleLogger",
-        "TRACE",
-        trace_val,
-    );
-    ctx.set_static_field_by_name(
-        "org/jboss/modules/log/JDKModuleLogger",
-        "DEBUG",
-        debug_val,
-    );
-    ctx.set_static_field_by_name(
-        "org/jboss/modules/log/JDKModuleLogger",
-        "WARN",
-        warn_val,
-    );
+    ctx.set_static_field_by_name("org/jboss/modules/log/JDKModuleLogger", "TRACE", trace_val);
+    ctx.set_static_field_by_name("org/jboss/modules/log/JDKModuleLogger", "DEBUG", debug_val);
+    ctx.set_static_field_by_name("org/jboss/modules/log/JDKModuleLogger", "WARN", warn_val);
     Ok(None)
 }
 
@@ -2657,8 +2616,7 @@ fn native_loader_load_module_by_identifier(
     };
     if name.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
-            message: "loadModule(ModuleIdentifier): identifier produced empty name"
-                .to_string(),
+            message: "loadModule(ModuleIdentifier): identifier produced empty name".to_string(),
         }
         .into());
     }
@@ -2803,7 +2761,11 @@ mod tests {
         let v = find_mp_argument();
         // With an empty env var and the cargo test harness's argv (which
         // never carries `-mp`), find_mp_argument() must return None.
-        assert!(v.is_none(), "empty env var must be treated as unset; got {:?}", v);
+        assert!(
+            v.is_none(),
+            "empty env var must be treated as unset; got {:?}",
+            v
+        );
         match prev {
             Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
             None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
@@ -2819,9 +2781,11 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mod_xml =
-            root.join("org/jboss/as/standalone/main/module.xml");
-        write(&mod_xml, &make_minimal_module_xml("org.jboss.as.standalone"));
+        let mod_xml = root.join("org/jboss/as/standalone/main/module.xml");
+        write(
+            &mod_xml,
+            &make_minimal_module_xml("org.jboss.as.standalone"),
+        );
         let r = resolve_module(root, "org.jboss.as.standalone").unwrap();
         assert_eq!(r.mx.name, "org.jboss.as.standalone");
         assert!(r.module_xml_path.ends_with("module.xml"));
@@ -2832,9 +2796,11 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mod_xml = root
-            .join("system/layers/base/org/jboss/as/standalone/main/module.xml");
-        write(&mod_xml, &make_minimal_module_xml("org.jboss.as.standalone"));
+        let mod_xml = root.join("system/layers/base/org/jboss/as/standalone/main/module.xml");
+        write(
+            &mod_xml,
+            &make_minimal_module_xml("org.jboss.as.standalone"),
+        );
         let r = resolve_module(root, "org.jboss.as.standalone").unwrap();
         assert_eq!(r.mx.name, "org.jboss.as.standalone");
     }
@@ -2845,8 +2811,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write(&root.join("layers.conf"), "layers=keycloak\n");
-        let mod_xml = root
-            .join("system/layers/keycloak/com/example/foo/main/module.xml");
+        let mod_xml = root.join("system/layers/keycloak/com/example/foo/main/module.xml");
         write(&mod_xml, &make_minimal_module_xml("com.example.foo"));
         let r = resolve_module(root, "com.example.foo").unwrap();
         assert_eq!(r.mx.name, "com.example.foo");
@@ -2946,10 +2911,7 @@ mod tests {
         let main_dir = root.join("org/jboss/as/standalone/main");
         write(
             &main_dir.join("module.xml"),
-            &make_module_xml_with_jars(
-                "org.jboss.as.standalone",
-                &["jboss-as-server.jar"],
-            ),
+            &make_module_xml_with_jars("org.jboss.as.standalone", &["jboss-as-server.jar"]),
         );
         write(&main_dir.join("jboss-as-server.jar"), "PK");
         setup_test_env(root);
@@ -3024,7 +2986,10 @@ mod tests {
         .unwrap_err();
         match err {
             MethodCallFailed::ExceptionThrown(_) => {}
-            other => panic!("expected ExceptionThrown(ModuleNotFoundException), got {:?}", other),
+            other => panic!(
+                "expected ExceptionThrown(ModuleNotFoundException), got {:?}",
+                other
+            ),
         }
     }
 
@@ -3111,10 +3076,9 @@ mod tests {
             Value::Object(Some(m)) => m,
             other => panic!("got {:?}", other),
         };
-        let result =
-            native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
-                .unwrap()
-                .unwrap();
+        let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
+            .unwrap()
+            .unwrap();
         if let Value::Object(Some(s)) = result {
             assert_eq!(ctx.read_string(s).as_deref(), Some("foo.bar"));
         } else {
@@ -3145,15 +3109,13 @@ mod tests {
             other => panic!("got {:?}", other),
         };
         // First call populates.
-        let r1 =
-            native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
-                .unwrap()
-                .unwrap();
+        let r1 = native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
+            .unwrap()
+            .unwrap();
         // Second call returns same instance.
-        let r2 =
-            native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
-                .unwrap()
-                .unwrap();
+        let r2 = native_module_get_class_loader(&mut ctx, &[Value::Object(Some(module))])
+            .unwrap()
+            .unwrap();
         match (r1, r2) {
             (Value::Object(Some(a)), Value::Object(Some(b))) => {
                 assert_eq!(a.as_ptr(), b.as_ptr());
@@ -3166,8 +3128,7 @@ mod tests {
     fn t19_h4_module_get_class_loader_null_receiver_throws_npe() {
         let _g = TEST_LOCK.lock();
         let mut ctx = MockNativeContext::new();
-        let err = native_module_get_class_loader(&mut ctx, &[Value::Object(None)])
-            .unwrap_err();
+        let err = native_module_get_class_loader(&mut ctx, &[Value::Object(None)]).unwrap_err();
         let s = format!("{:?}", err);
         assert!(s.contains("Null") || s.contains("null"), "got {}", s);
     }
@@ -3178,10 +3139,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let result =
-            native_module_get_module_loader(&mut ctx, &[Value::Object(None)])
-                .unwrap()
-                .unwrap();
+        let result = native_module_get_module_loader(&mut ctx, &[Value::Object(None)])
+            .unwrap()
+            .unwrap();
         match result {
             Value::Object(Some(_)) => {}
             other => panic!("expected non-null loader, got {:?}", other),
@@ -3410,12 +3370,9 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let mut ctx = MockNativeContext::new();
         let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
-        let result = native_module_get_property_names(
-            &mut ctx,
-            &[Value::Object(Some(this))],
-        )
-        .unwrap()
-        .unwrap();
+        let result = native_module_get_property_names(&mut ctx, &[Value::Object(Some(this))])
+            .unwrap()
+            .unwrap();
         match result {
             Value::Object(Some(_list)) => {}
             other => panic!("expected non-null List, got {:?}", other),
@@ -3427,8 +3384,7 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let xml = root
-            .join("system/add-ons/keycloak/com/extra/foo/main/module.xml");
+        let xml = root.join("system/add-ons/keycloak/com/extra/foo/main/module.xml");
         write(&xml, &make_minimal_module_xml("com.extra.foo"));
         let found = locate_module_xml(root, "com.extra.foo").unwrap();
         assert!(found.ends_with("module.xml"));
@@ -3472,12 +3428,7 @@ mod tests {
     }
 
     /// Helper: write a module with N jars under `<root>/<dotted-path>/main/`.
-    fn write_module_with_deps(
-        root: &Path,
-        name: &str,
-        jars: &[&str],
-        deps: &[(&str, bool, bool)],
-    ) {
+    fn write_module_with_deps(root: &Path, name: &str, jars: &[&str], deps: &[(&str, bool, bool)]) {
         let path: PathBuf = name.split('.').collect();
         let main_dir = root.join(&path).join("main");
         write(
@@ -3643,13 +3594,17 @@ mod tests {
             registered
         );
         assert!(
-            registered.iter().any(|p| p.ends_with("wildfly-controller.jar")),
+            registered
+                .iter()
+                .any(|p| p.ends_with("wildfly-controller.jar")),
             "must register direct dep jar so the verifier can find \
              classes referenced from JMX bytecode; got {:?}",
             registered
         );
         assert!(
-            registered.iter().any(|p| p.ends_with("wildfly-protocol.jar")),
+            registered
+                .iter()
+                .any(|p| p.ends_with("wildfly-protocol.jar")),
             "must register transitive dep jar so the verifier can find \
              second-hop class references; got {:?}",
             registered
@@ -3661,12 +3616,7 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write_module_with_deps(
-            root,
-            "a",
-            &["a.jar"],
-            &[("b", false, false)],
-        );
+        write_module_with_deps(root, "a", &["a.jar"], &[("b", false, false)]);
         write_module_with_deps(root, "b", &["b.jar"], &[]);
         setup_test_env(root);
 
@@ -3729,10 +3679,7 @@ mod tests {
         clear_module_cache_for_test();
         let _ = transitive_linkage_roots("x");
         let resolved = ensure_resolved("x").expect("module must resolve");
-        let hit = find_entry_in_roots(
-            &resolved.resource_roots,
-            "Outer$Inner.class",
-        );
+        let hit = find_entry_in_roots(&resolved.resource_roots, "Outer$Inner.class");
         assert!(
             hit.is_some(),
             "find_entry_in_roots must accept `$` in inner-class names"
@@ -3806,7 +3753,10 @@ mod tests {
             registered
         );
         assert_eq!(
-            registered.iter().filter(|p| p.ends_with("only.jar")).count(),
+            registered
+                .iter()
+                .filter(|p| p.ends_with("only.jar"))
+                .count(),
             1,
             "must register exactly once; got {:?}",
             registered
@@ -3823,18 +3773,8 @@ mod tests {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write_module_with_deps(
-            root,
-            "start",
-            &["s.jar"],
-            &[("direct", false, false)],
-        );
-        write_module_with_deps(
-            root,
-            "direct",
-            &["d.jar"],
-            &[("hidden", false, false)],
-        );
+        write_module_with_deps(root, "start", &["s.jar"], &[("direct", false, false)]);
+        write_module_with_deps(root, "direct", &["d.jar"], &[("hidden", false, false)]);
         write_module_with_deps(root, "hidden", &["h.jar"], &[]);
         setup_test_env(root);
 
@@ -3880,7 +3820,10 @@ mod tests {
         // Body should contain "main" and "([Ljava/lang/String;)V" as
         // raw substrings (Utf8 entries are plain UTF-8 payloads).
         let body = String::from_utf8_lossy(&bytes);
-        assert!(body.contains("main"), "expected 'main' in synthesised bytes");
+        assert!(
+            body.contains("main"),
+            "expected 'main' in synthesised bytes"
+        );
         assert!(
             body.contains("([Ljava/lang/String;)V"),
             "expected main descriptor in synthesised bytes"

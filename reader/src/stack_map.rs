@@ -701,8 +701,12 @@ mod tests {
     fn absolute_offsets_overflow_rejected_not_panic() {
         let table = StackMapTable {
             entries: vec![
-                StackMapFrame::SameFrameExtended { offset_delta: u16::MAX },
-                StackMapFrame::SameFrameExtended { offset_delta: u16::MAX },
+                StackMapFrame::SameFrameExtended {
+                    offset_delta: u16::MAX,
+                },
+                StackMapFrame::SameFrameExtended {
+                    offset_delta: u16::MAX,
+                },
             ],
         };
         let err = table.absolute_offsets().unwrap_err();

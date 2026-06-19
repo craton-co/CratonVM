@@ -46,7 +46,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -168,7 +172,9 @@ fn xml_probe_parses_servers_and_first_name() {
         rc,
         Some(0),
         "wave1-d: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     assert!(
         stdout.contains("servers=2"),

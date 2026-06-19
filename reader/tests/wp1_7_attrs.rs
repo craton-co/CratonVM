@@ -70,7 +70,10 @@ fn class_level_runtime_visible_annotation_is_parsed() {
         !anns.is_empty(),
         "AnnotationProbe class must carry RuntimeVisibleAnnotations"
     );
-    let descriptors: Vec<String> = anns.iter().map(|a| utf8(&cf, a.type_index).to_string()).collect();
+    let descriptors: Vec<String> = anns
+        .iter()
+        .map(|a| utf8(&cf, a.type_index).to_string())
+        .collect();
     assert!(
         descriptors.iter().any(|d| d == "LTest;"),
         "expected @Test in class annotations, got {descriptors:?}"
@@ -89,7 +92,11 @@ fn method_level_runtime_visible_annotation_is_parsed() {
         .find(|m| &*m.name == "m")
         .expect("method m() must exist");
     let anns = visible(&m.attributes);
-    assert_eq!(anns.len(), 1, "@Test should be the only method-level annotation on m()");
+    assert_eq!(
+        anns.len(),
+        1,
+        "@Test should be the only method-level annotation on m()"
+    );
     assert_eq!(utf8(&cf, anns[0].type_index), "LTest;");
 }
 
@@ -105,7 +112,11 @@ fn field_level_runtime_visible_annotation_is_parsed() {
         .find(|f| &*f.name == "f")
         .expect("field f must exist");
     let anns = visible(&f.attributes);
-    assert_eq!(anns.len(), 1, "@Test should be the only field-level annotation on f");
+    assert_eq!(
+        anns.len(),
+        1,
+        "@Test should be the only field-level annotation on f"
+    );
     assert_eq!(utf8(&cf, anns[0].type_index), "LTest;");
 }
 
@@ -130,7 +141,10 @@ fn class_annotation_element_values_cover_every_tag() {
 
     // string — value = "hello"
     match pairs.get("value") {
-        Some(ElementValue::Const { tag, const_value_index }) => {
+        Some(ElementValue::Const {
+            tag,
+            const_value_index,
+        }) => {
             assert_eq!(*tag, b's', "'value' must carry string tag");
             assert_eq!(utf8(&cf, *const_value_index), "hello");
         }
@@ -139,7 +153,10 @@ fn class_annotation_element_values_cover_every_tag() {
 
     // int — count = 42
     match pairs.get("count") {
-        Some(ElementValue::Const { tag, const_value_index }) => {
+        Some(ElementValue::Const {
+            tag,
+            const_value_index,
+        }) => {
             assert_eq!(*tag, b'I', "'count' must carry int tag");
             match cf.constant_pool.get(*const_value_index) {
                 Some(cratonvm_reader::constant_pool::ConstantPoolEntry::Integer(v)) => {
@@ -164,7 +181,10 @@ fn class_annotation_element_values_cover_every_tag() {
 
     // enum — level = RetentionPolicy.RUNTIME
     match pairs.get("level") {
-        Some(ElementValue::Enum { type_name_index, const_name_index }) => {
+        Some(ElementValue::Enum {
+            type_name_index,
+            const_name_index,
+        }) => {
             assert_eq!(
                 utf8(&cf, *type_name_index),
                 "Ljava/lang/annotation/RetentionPolicy;"
@@ -184,7 +204,10 @@ fn class_annotation_element_values_cover_every_tag() {
                 .find(|p| utf8(&cf, p.element_name_index) == "note")
                 .expect("@Inner must have note element");
             match &note_pair.value {
-                ElementValue::Const { tag, const_value_index } => {
+                ElementValue::Const {
+                    tag,
+                    const_value_index,
+                } => {
                     assert_eq!(*tag, b's');
                     assert_eq!(utf8(&cf, *const_value_index), "inner");
                 }
@@ -200,7 +223,10 @@ fn class_annotation_element_values_cover_every_tag() {
             assert_eq!(items.len(), 2, "tags array length");
             for (i, want) in ["a", "b"].iter().enumerate() {
                 match &items[i] {
-                    ElementValue::Const { tag, const_value_index } => {
+                    ElementValue::Const {
+                        tag,
+                        const_value_index,
+                    } => {
                         assert_eq!(*tag, b's');
                         assert_eq!(utf8(&cf, *const_value_index), *want);
                     }
@@ -231,7 +257,10 @@ fn annotation_default_on_annotation_type_method() {
     });
     let ev = default.expect("value() must carry AnnotationDefault");
     match ev {
-        ElementValue::Const { tag, const_value_index } => {
+        ElementValue::Const {
+            tag,
+            const_value_index,
+        } => {
             assert_eq!(*tag, b's', "default of String element must be 's'");
             assert_eq!(utf8(&cf, *const_value_index), "");
         }
@@ -260,7 +289,10 @@ fn retention_runtime_class_level_meta_annotation_present() {
         .find(|p| utf8(&cf, p.element_name_index) == "value")
         .expect("@Retention must have value");
     match &pair.value {
-        ElementValue::Enum { type_name_index, const_name_index } => {
+        ElementValue::Enum {
+            type_name_index,
+            const_name_index,
+        } => {
             assert_eq!(
                 utf8(&cf, *type_name_index),
                 "Ljava/lang/annotation/RetentionPolicy;"

@@ -23,9 +23,7 @@
 //! by the dedicated degradation tests inside `src/value.rs` and
 //! `src/compact_value.rs`.
 
-use cratonvm_types::{
-    decode_value, encode_value, CompactValue, ObjectRef, Value,
-};
+use cratonvm_types::{decode_value, encode_value, CompactValue, ObjectRef, Value};
 use proptest::prelude::*;
 
 /// A proptest strategy that yields every legal `Value` variant.  Object

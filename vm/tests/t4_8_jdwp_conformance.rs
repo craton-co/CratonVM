@@ -48,8 +48,8 @@ fn find_free_port() -> u16 {
 /// perform the handshake, and then process commands until disconnect.
 fn start_jdwp_listener(port: u16) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-            .expect("listener must bind");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("listener must bind");
         listener
             .set_nonblocking(false)
             .expect("listener must be blocking");
@@ -130,8 +130,8 @@ fn t4_8_1_jdwp_listening_transport() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Connect as a debugger client.
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .expect("must connect to JDWP listener");
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).expect("must connect to JDWP listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("must set read timeout");
@@ -211,14 +211,18 @@ fn t4_8_2_jdwp_breakpoint_request() {
     assert_eq!(req.suspend_policy, SuspendPolicy::All);
 
     // Check that the breakpoint does NOT match at a different offset.
-    let not_matched = state.events.check_breakpoint(class_id, method_id, offset + 1);
+    let not_matched = state
+        .events
+        .check_breakpoint(class_id, method_id, offset + 1);
     assert!(
         not_matched.is_none(),
         "breakpoint must not match at a different offset"
     );
 
     // Check that the breakpoint does NOT match at a different class.
-    let not_matched = state.events.check_breakpoint(class_id + 1, method_id, offset);
+    let not_matched = state
+        .events
+        .check_breakpoint(class_id + 1, method_id, offset);
     assert!(
         not_matched.is_none(),
         "breakpoint must not match at a different class"
@@ -258,7 +262,11 @@ fn t4_8_2_jdwp_breakpoint_request() {
             assert_eq!(*command_set, 64, "composite event command set must be 64");
             assert_eq!(*command, 100, "composite event command must be 100");
             // Data layout: suspend_policy(1) + count(4) + kind(1) + req_id(4) + thread_id(8) + location(25)
-            assert_eq!(data.len(), 43, "breakpoint composite event data must be 43 bytes");
+            assert_eq!(
+                data.len(),
+                43,
+                "breakpoint composite event data must be 43 bytes"
+            );
             assert_eq!(data[0], SuspendPolicy::All as u8);
         }
         _ => panic!("compose_event_packet must return a Command packet"),
@@ -463,10 +471,7 @@ fn t4_8_4_jdwp_thread_frames() {
     state.thread_frames.insert(thread_id, frames);
 
     // Verify frame count.
-    let frame_count = state
-        .thread_frames
-        .get(&thread_id)
-        .map_or(0, |f| f.len());
+    let frame_count = state.thread_frames.get(&thread_id).map_or(0, |f| f.len());
     assert_eq!(frame_count, 3, "thread must have 3 frames");
 
     // Verify individual frame fields match what was set.
@@ -532,19 +537,31 @@ fn t4_8_4_jdwp_thread_frames() {
     }
 
     // Verify specific method name resolutions.
-    let main_method = state.class_methods.get(&100).unwrap().iter().find(|m| {
-        m.method_id.0 == stored_frames[0].method_id
-    }).unwrap();
+    let main_method = state
+        .class_methods
+        .get(&100)
+        .unwrap()
+        .iter()
+        .find(|m| m.method_id.0 == stored_frames[0].method_id)
+        .unwrap();
     assert_eq!(main_method.name, "main");
 
-    let do_work_method = state.class_methods.get(&100).unwrap().iter().find(|m| {
-        m.method_id.0 == stored_frames[1].method_id
-    }).unwrap();
+    let do_work_method = state
+        .class_methods
+        .get(&100)
+        .unwrap()
+        .iter()
+        .find(|m| m.method_id.0 == stored_frames[1].method_id)
+        .unwrap();
     assert_eq!(do_work_method.name, "doWork");
 
-    let init_method = state.class_methods.get(&200).unwrap().iter().find(|m| {
-        m.method_id.0 == stored_frames[2].method_id
-    }).unwrap();
+    let init_method = state
+        .class_methods
+        .get(&200)
+        .unwrap()
+        .iter()
+        .find(|m| m.method_id.0 == stored_frames[2].method_id)
+        .unwrap();
     assert_eq!(init_method.name, "<init>");
 
     // Verify thread with no frames returns empty.

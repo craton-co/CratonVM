@@ -51,7 +51,10 @@ impl FieldType {
         Self::parse_partial_depth(descriptor, 0)
     }
 
-    fn parse_partial_depth(descriptor: &str, dimensions: usize) -> Result<(Self, &str), ClassReaderError> {
+    fn parse_partial_depth(
+        descriptor: &str,
+        dimensions: usize,
+    ) -> Result<(Self, &str), ClassReaderError> {
         let bytes = descriptor.as_bytes();
         if bytes.is_empty() {
             return Err(ClassReaderError::InvalidTypeDescriptor {

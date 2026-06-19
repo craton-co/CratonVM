@@ -357,8 +357,16 @@ fn build_updater(
 
     // Allocate the synthetic impl, populate slots.
     let impl_obj = alloc_impl(ctx, impl_class);
-    ctx.set_field(impl_obj, FU_SLOT_TCLASS_ID, Value::Int(tclass_id.as_u32() as i32));
-    ctx.set_field(impl_obj, FU_SLOT_FIELD_INDEX, Value::Int(meta.slot_index as i32));
+    ctx.set_field(
+        impl_obj,
+        FU_SLOT_TCLASS_ID,
+        Value::Int(tclass_id.as_u32() as i32),
+    );
+    ctx.set_field(
+        impl_obj,
+        FU_SLOT_FIELD_INDEX,
+        Value::Int(meta.slot_index as i32),
+    );
     ctx.set_field(impl_obj, FU_SLOT_DESC_TAG, Value::Int(tag));
     ctx.set_field(impl_obj, FU_SLOT_VCLASS_ID, Value::Int(vclass_id));
 
@@ -517,7 +525,12 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     loop {
         let prev = ctx.get_field_volatile(target, slot);
         let new_val = ctx
-            .invoke_virtual(op, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[prev])?
+            .invoke_virtual(
+                op,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[prev],
+            )?
             .unwrap_or(Value::Object(None));
         if ctx.compare_and_swap_field(target, slot, prev, new_val) {
             return Ok(Some(prev));
@@ -536,7 +549,12 @@ fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     loop {
         let prev = ctx.get_field_volatile(target, slot);
         let new_val = ctx
-            .invoke_virtual(op, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[prev])?
+            .invoke_virtual(
+                op,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[prev],
+            )?
             .unwrap_or(Value::Object(None));
         if ctx.compare_and_swap_field(target, slot, prev, new_val) {
             return Ok(Some(new_val));
@@ -585,12 +603,7 @@ fn native_aifu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    let ok = ctx.compare_and_swap_field(
-        target,
-        slot,
-        Value::Int(expected),
-        Value::Int(new_val),
-    );
+    let ok = ctx.compare_and_swap_field(target, slot, Value::Int(expected), Value::Int(new_val));
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -611,12 +624,7 @@ fn native_aifu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Value::Int(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Int(current),
-            Value::Int(new_val),
-        ) {
+        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(new_val)) {
             return Ok(Some(Value::Int(current)));
         }
     }
@@ -676,7 +684,12 @@ fn native_aifu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Value::Int(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(current.wrapping_add(1))) {
+        if ctx.compare_and_swap_field(
+            target,
+            slot,
+            Value::Int(current),
+            Value::Int(current.wrapping_add(1)),
+        ) {
             return Ok(Some(Value::Int(current)));
         }
     }
@@ -692,7 +705,12 @@ fn native_aifu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Value::Int(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(target, slot, Value::Int(current), Value::Int(current.wrapping_sub(1))) {
+        if ctx.compare_and_swap_field(
+            target,
+            slot,
+            Value::Int(current),
+            Value::Int(current.wrapping_sub(1)),
+        ) {
             return Ok(Some(Value::Int(current)));
         }
     }
@@ -761,12 +779,7 @@ fn native_alfu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    let ok = ctx.compare_and_swap_field(
-        target,
-        slot,
-        Value::Long(expected),
-        Value::Long(new_val),
-    );
+    let ok = ctx.compare_and_swap_field(target, slot, Value::Long(expected), Value::Long(new_val));
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -787,12 +800,7 @@ fn native_alfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Value::Long(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(
-            target,
-            slot,
-            Value::Long(current),
-            Value::Long(new_val),
-        ) {
+        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(new_val)) {
             return Ok(Some(Value::Long(current)));
         }
     }
@@ -825,7 +833,12 @@ fn native_alfu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Value::Long(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(current.wrapping_add(1))) {
+        if ctx.compare_and_swap_field(
+            target,
+            slot,
+            Value::Long(current),
+            Value::Long(current.wrapping_add(1)),
+        ) {
             return Ok(Some(Value::Long(current)));
         }
     }
@@ -841,7 +854,12 @@ fn native_alfu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Value::Long(v) => v,
             _ => 0,
         };
-        if ctx.compare_and_swap_field(target, slot, Value::Long(current), Value::Long(current.wrapping_sub(1))) {
+        if ctx.compare_and_swap_field(
+            target,
+            slot,
+            Value::Long(current),
+            Value::Long(current.wrapping_sub(1)),
+        ) {
             return Ok(Some(Value::Long(current)));
         }
     }
@@ -1028,9 +1046,24 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
     );
     // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
     for cls in [CLS_INT_FIELD_UPDATER_IMPL, CLS_INT_FIELD_UPDATER] {
-        r.register(cls, "getAndIncrement", "(Ljava/lang/Object;)I", native_aifu_get_and_increment);
-        r.register(cls, "getAndDecrement", "(Ljava/lang/Object;)I", native_aifu_get_and_decrement);
-        r.register(cls, "addAndGet", "(Ljava/lang/Object;I)I", native_aifu_add_and_get);
+        r.register(
+            cls,
+            "getAndIncrement",
+            "(Ljava/lang/Object;)I",
+            native_aifu_get_and_increment,
+        );
+        r.register(
+            cls,
+            "getAndDecrement",
+            "(Ljava/lang/Object;)I",
+            native_aifu_get_and_decrement,
+        );
+        r.register(
+            cls,
+            "addAndGet",
+            "(Ljava/lang/Object;I)I",
+            native_aifu_add_and_get,
+        );
     }
     // Also on the abstract base for virtual dispatch.
     r.register(
@@ -1130,9 +1163,24 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
     );
     // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
     for cls in [CLS_LONG_FIELD_UPDATER_IMPL, CLS_LONG_FIELD_UPDATER] {
-        r.register(cls, "getAndIncrement", "(Ljava/lang/Object;)J", native_alfu_get_and_increment);
-        r.register(cls, "getAndDecrement", "(Ljava/lang/Object;)J", native_alfu_get_and_decrement);
-        r.register(cls, "addAndGet", "(Ljava/lang/Object;J)J", native_alfu_add_and_get);
+        r.register(
+            cls,
+            "getAndIncrement",
+            "(Ljava/lang/Object;)J",
+            native_alfu_get_and_increment,
+        );
+        r.register(
+            cls,
+            "getAndDecrement",
+            "(Ljava/lang/Object;)J",
+            native_alfu_get_and_decrement,
+        );
+        r.register(
+            cls,
+            "addAndGet",
+            "(Ljava/lang/Object;J)J",
+            native_alfu_add_and_get,
+        );
     }
     r.register(
         CLS_LONG_FIELD_UPDATER,
@@ -1350,10 +1398,7 @@ mod tests {
         fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
             self.inner.alloc_object(class_id, num_fields)
         }
-        fn ensure_class_initialized(
-            &mut self,
-            name: &str,
-        ) -> Result<ClassId, MethodCallFailed> {
+        fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
             self.inner.ensure_class_initialized(name)
         }
         fn is_subclass(&self, c: ClassId, p: ClassId) -> bool {
@@ -1395,11 +1440,7 @@ mod tests {
         fn monitor_exit(&mut self, obj: ObjectRef) {
             self.inner.monitor_exit(obj)
         }
-        fn monitor_wait(
-            &mut self,
-            obj: ObjectRef,
-            timeout_ms: Option<u64>,
-        ) -> MethodCallResult {
+        fn monitor_wait(&mut self, obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
             self.inner.monitor_wait(obj, timeout_ms)
         }
         fn monitor_notify(&mut self, obj: ObjectRef) -> MethodCallResult {
@@ -1444,10 +1485,7 @@ mod tests {
                 None => Vec::new(),
             }
         }
-        fn declared_methods(
-            &self,
-            class_id: ClassId,
-        ) -> Vec<cratonvm_native_api::MethodMetadata> {
+        fn declared_methods(&self, class_id: ClassId) -> Vec<cratonvm_native_api::MethodMetadata> {
             self.inner.declared_methods(class_id)
         }
         fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
@@ -1459,12 +1497,7 @@ mod tests {
         fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
             self.inner.get_static_field(class_id, field_index)
         }
-        fn set_static_field(
-            &mut self,
-            class_id: ClassId,
-            field_index: usize,
-            value: Value,
-        ) {
+        fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
             self.inner.set_static_field(class_id, field_index, value)
         }
         fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
@@ -1486,7 +1519,8 @@ mod tests {
             expected: Value,
             new_val: Value,
         ) -> bool {
-            self.inner.compare_and_swap_field(obj, index, expected, new_val)
+            self.inner
+                .compare_and_swap_field(obj, index, expected, new_val)
         }
         fn park(&mut self, timeout: Option<std::time::Duration>) {
             self.inner.park(timeout)
@@ -1497,10 +1531,7 @@ mod tests {
         fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
             self.inner.allocate_instance(class_name)
         }
-        fn class_annotations(
-            &self,
-            class_id: ClassId,
-        ) -> Vec<cratonvm_native_api::AnnotationData> {
+        fn class_annotations(&self, class_id: ClassId) -> Vec<cratonvm_native_api::AnnotationData> {
             self.inner.class_annotations(class_id)
         }
         fn method_annotations(
@@ -1529,12 +1560,7 @@ mod tests {
         fn class_signature(&self, class_id: ClassId) -> Option<String> {
             self.inner.class_signature(class_id)
         }
-        fn method_signature(
-            &self,
-            class_id: ClassId,
-            m: &str,
-            d: &str,
-        ) -> Option<String> {
+        fn method_signature(&self, class_id: ClassId, m: &str, d: &str) -> Option<String> {
             self.inner.method_signature(class_id, m, d)
         }
         fn field_signature(&self, class_id: ClassId, f: &str) -> Option<String> {
@@ -1555,7 +1581,8 @@ mod tests {
             descriptor: &str,
             args: &[Value],
         ) -> MethodCallResult {
-            self.inner.invoke_virtual(receiver, method_name, descriptor, args)
+            self.inner
+                .invoke_virtual(receiver, method_name, descriptor, args)
         }
         fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
             self.inner.get_scoped_value(key_id)
@@ -1569,35 +1596,22 @@ mod tests {
         fn scoped_value_depth(&self) -> usize {
             self.inner.scoped_value_depth()
         }
-        fn allocate_native_memory(
-            &mut self,
-            size: usize,
-            align: usize,
-        ) -> Option<(i64, *mut u8)> {
+        fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
             self.inner.allocate_native_memory(size, align)
         }
         fn free_native_memory(&mut self, alloc_id: i64) {
             self.inner.free_native_memory(alloc_id)
         }
-        fn load_native_library(
-            &mut self,
-            path: &str,
-        ) -> Result<i64, MethodCallFailed> {
+        fn load_native_library(&mut self, path: &str) -> Result<i64, MethodCallFailed> {
             self.inner.load_native_library(path)
         }
         fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
             self.inner.find_native_symbol(lib_index, name)
         }
-        fn register_upcall(
-            &mut self,
-            entry: cratonvm_native_api::ffi::UpcallEntry,
-        ) -> usize {
+        fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
             self.inner.register_upcall(entry)
         }
-        fn get_upcall_info(
-            &self,
-            slot: usize,
-        ) -> Option<(ObjectRef, Vec<i32>, i32)> {
+        fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
             self.inner.get_upcall_info(slot)
         }
         fn module_name_of_class(&self, class_id: ClassId) -> Option<String> {
@@ -1612,11 +1626,7 @@ mod tests {
         fn register_dynamic_classpath(&mut self, paths: &[String]) {
             self.inner.register_dynamic_classpath(paths)
         }
-        fn define_class_from_bytes(
-            &mut self,
-            name: &str,
-            bytes: &[u8],
-        ) -> Option<ClassId> {
+        fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
             self.inner.define_class_from_bytes(name, bytes)
         }
         fn define_class_with_loader(
@@ -1627,11 +1637,7 @@ mod tests {
         ) -> Option<ClassId> {
             self.inner.define_class_with_loader(name, bytes, loader_id)
         }
-        fn class_id_by_name_and_loader(
-            &self,
-            name: &str,
-            loader_id: u32,
-        ) -> Option<ClassId> {
+        fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
             self.inner.class_id_by_name_and_loader(name, loader_id)
         }
         fn allocate_loader_id(&mut self) -> u32 {
@@ -1668,23 +1674,14 @@ mod tests {
         fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
             self.inner.is_package_exported_unqualified(module_name, pkg)
         }
-        fn is_package_exported_to(
-            &self,
-            module_name: &str,
-            pkg: &str,
-            to_module: &str,
-        ) -> bool {
-            self.inner.is_package_exported_to(module_name, pkg, to_module)
+        fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
+            self.inner
+                .is_package_exported_to(module_name, pkg, to_module)
         }
         fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
             self.inner.is_package_open_unqualified(module_name, pkg)
         }
-        fn is_package_open_to(
-            &self,
-            module_name: &str,
-            pkg: &str,
-            to_module: &str,
-        ) -> bool {
+        fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
             self.inner.is_package_open_to(module_name, pkg, to_module)
         }
         fn check_deep_reflection_access(
@@ -1777,7 +1774,11 @@ mod tests {
             )
             .is_some());
         assert!(r
-            .find(CLS_INT_FIELD_UPDATER_IMPL, "getAndAdd", "(Ljava/lang/Object;I)I")
+            .find(
+                CLS_INT_FIELD_UPDATER_IMPL,
+                "getAndAdd",
+                "(Ljava/lang/Object;I)I"
+            )
             .is_some());
     }
 
@@ -1815,7 +1816,10 @@ mod tests {
             Value::Int(tcid.as_u32() as i32),
         );
         assert_eq!(um.get_field(impl_obj, FU_SLOT_FIELD_INDEX), Value::Int(7));
-        assert_eq!(um.get_field(impl_obj, FU_SLOT_DESC_TAG), Value::Int(DESC_TAG_REF));
+        assert_eq!(
+            um.get_field(impl_obj, FU_SLOT_DESC_TAG),
+            Value::Int(DESC_TAG_REF)
+        );
         assert_eq!(
             um.get_field(impl_obj, FU_SLOT_VCLASS_ID),
             Value::Int(vcid.as_u32() as i32),
@@ -1984,7 +1988,10 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(um.get_field(impl_obj, FU_SLOT_FIELD_INDEX), Value::Int(3));
-        assert_eq!(um.get_field(impl_obj, FU_SLOT_DESC_TAG), Value::Int(DESC_TAG_INT));
+        assert_eq!(
+            um.get_field(impl_obj, FU_SLOT_DESC_TAG),
+            Value::Int(DESC_TAG_INT)
+        );
     }
 
     #[test]
@@ -2023,7 +2030,10 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(um.get_field(impl_obj, FU_SLOT_FIELD_INDEX), Value::Int(5));
-        assert_eq!(um.get_field(impl_obj, FU_SLOT_DESC_TAG), Value::Int(DESC_TAG_LONG));
+        assert_eq!(
+            um.get_field(impl_obj, FU_SLOT_DESC_TAG),
+            Value::Int(DESC_TAG_LONG)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2060,7 +2070,7 @@ mod tests {
             &[
                 Value::Object(Some(updater)),
                 Value::Object(Some(target)),
-                Value::Int(0),                         // expected: not Object(None) — see below
+                Value::Int(0), // expected: not Object(None) — see below
                 Value::Object(Some(some_value_obj)),
             ],
         )

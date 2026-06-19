@@ -38,11 +38,7 @@ use std::time::Duration;
 
 fn chm_basic_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .join("apps")
-        .join("chm_basic")
+    manifest.parent().unwrap().join("apps").join("chm_basic")
 }
 
 fn cratonvm_binary() -> Option<PathBuf> {
@@ -54,7 +50,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -168,10 +168,7 @@ fn chm_scale_pins_integer_valueof_jit_miscompile() {
     // that loses entries earlier (e.g. at the `<init>` complexity gate
     // change) should fire here too.
     for size in [16, 32, 64, 128, 256, 512] {
-        let expected = format!(
-            "size={s} mapSize={s} found={s} firstMiss=-1",
-            s = size
-        );
+        let expected = format!("size={s} mapSize={s} found={s} firstMiss=-1", s = size);
         assert!(
             combined.contains(&expected),
             "ChmScale size={size} stage must round-trip; got:\n{combined}"

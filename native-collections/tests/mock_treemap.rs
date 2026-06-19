@@ -26,30 +26,52 @@ fn inserted_50_keys_iterate_in_sorted_order() {
     let tm = new_treemap(&reg, &mut ctx);
 
     // Shuffled order (not 0..50 to make the sort test meaningful).
-    let shuffled: Vec<i32> = (0..50)
-        .map(|i| ((i * 17) % 50) as i32)
-        .collect();
+    let shuffled: Vec<i32> = (0..50).map(|i| ((i * 17) % 50) as i32).collect();
     // Sanity: every value in 0..50 appears exactly once.
     let mut sorted = shuffled.clone();
     sorted.sort();
-    assert_eq!(sorted, (0..50).collect::<Vec<_>>(),
-               "test setup error: not a permutation of 0..50");
+    assert_eq!(
+        sorted,
+        (0..50).collect::<Vec<_>>(),
+        "test setup error: not a permutation of 0..50"
+    );
 
     for &k in &shuffled {
         let kv = boxed_int(&mut ctx, k);
         let vv = boxed_int(&mut ctx, k * 100);
-        call(&reg, &mut ctx, TM, "put", PUT,
-             &[Value::Object(Some(tm)), kv, vv]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            TM,
+            "put",
+            PUT,
+            &[Value::Object(Some(tm)), kv, vv],
+        )
+        .unwrap();
     }
 
-    let size = call(&reg, &mut ctx, TM, "size", "()I",
-                    &[Value::Object(Some(tm))]).unwrap();
+    let size = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "size",
+        "()I",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
     assert_eq!(size, Some(Value::Int(50)));
 
     // Walk firstKey then higherKey(prev) until null.
     let mut walked: Vec<i32> = Vec::new();
-    let first = call(&reg, &mut ctx, TM, "firstKey", "()Ljava/lang/Object;",
-                     &[Value::Object(Some(tm))]).unwrap();
+    let first = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "firstKey",
+        "()Ljava/lang/Object;",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
     let mut cur = match first {
         Some(Value::Object(Some(o))) => Some(Value::Object(Some(o))),
         other => panic!("firstKey returned {:?}", other),
@@ -57,21 +79,25 @@ fn inserted_50_keys_iterate_in_sorted_order() {
     while let Some(k) = cur {
         // Extract the int value from the boxed Integer.
         let intval = match k {
-            Value::Object(Some(o)) => {
-                match ctx_get_int(&ctx, o) {
-                    Some(i) => i,
-                    None => panic!("non-boxed key {:?}", k),
-                }
-            }
+            Value::Object(Some(o)) => match ctx_get_int(&ctx, o) {
+                Some(i) => i,
+                None => panic!("non-boxed key {:?}", k),
+            },
             _ => panic!("non-object key {:?}", k),
         };
         walked.push(intval);
         if walked.len() > 200 {
             panic!("TreeMap iteration runaway");
         }
-        let next = call(&reg, &mut ctx, TM, "higherKey",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[Value::Object(Some(tm)), k]).unwrap();
+        let next = call(
+            &reg,
+            &mut ctx,
+            TM,
+            "higherKey",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(tm)), k],
+        )
+        .unwrap();
         cur = match next {
             Some(Value::Object(Some(o))) => Some(Value::Object(Some(o))),
             Some(Value::Object(None)) => None,
@@ -79,8 +105,11 @@ fn inserted_50_keys_iterate_in_sorted_order() {
         };
     }
 
-    assert_eq!(walked, (0..50).collect::<Vec<_>>(),
-               "TreeMap iteration must produce keys in ascending order");
+    assert_eq!(
+        walked,
+        (0..50).collect::<Vec<_>>(),
+        "TreeMap iteration must produce keys in ascending order"
+    );
 }
 
 #[test]
@@ -95,12 +124,26 @@ fn round_trip_get_after_insert() {
         let kv = boxed_int(&mut ctx, k);
         let vv = boxed_int(&mut ctx, v);
         key_objs.push((kv, vv));
-        call(&reg, &mut ctx, TM, "put", PUT,
-             &[Value::Object(Some(tm)), kv, vv]).unwrap();
+        call(
+            &reg,
+            &mut ctx,
+            TM,
+            "put",
+            PUT,
+            &[Value::Object(Some(tm)), kv, vv],
+        )
+        .unwrap();
     }
     for (k, v) in &key_objs {
-        let got = call(&reg, &mut ctx, TM, "get", GET,
-                       &[Value::Object(Some(tm)), *k]).unwrap();
+        let got = call(
+            &reg,
+            &mut ctx,
+            TM,
+            "get",
+            GET,
+            &[Value::Object(Some(tm)), *k],
+        )
+        .unwrap();
         assert_eq!(got, Some(*v), "round-trip mismatch on key {:?}", k);
     }
 }
@@ -118,11 +161,26 @@ fn character_key_preserves_wrapper_type_on_readback() {
 
     let k = boxed_char(&mut ctx, 'v');
     let v = boxed_int(&mut ctx, 42);
-    call(&reg, &mut ctx, TM, "put", PUT, &[Value::Object(Some(tm)), k, v]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "put",
+        PUT,
+        &[Value::Object(Some(tm)), k, v],
+    )
+    .unwrap();
 
     // firstKey() must come back as a Character, not an Integer.
-    let first = call(&reg, &mut ctx, TM, "firstKey", "()Ljava/lang/Object;",
-                     &[Value::Object(Some(tm))]).unwrap();
+    let first = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "firstKey",
+        "()Ljava/lang/Object;",
+        &[Value::Object(Some(tm))],
+    )
+    .unwrap();
     match first {
         Some(Value::Object(Some(o))) => {
             assert_eq!(
@@ -136,18 +194,39 @@ fn character_key_preserves_wrapper_type_on_readback() {
 
     // get with the SAME Character key must still find the value.
     let k_char = boxed_char(&mut ctx, 'v');
-    let got_char = call(&reg, &mut ctx, TM, "get", GET,
-                        &[Value::Object(Some(tm)), k_char]).unwrap();
-    assert_eq!(got_char, Some(v), "get(Character('v')) must return the stored value");
+    let got_char = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "get",
+        GET,
+        &[Value::Object(Some(tm)), k_char],
+    )
+    .unwrap();
+    assert_eq!(
+        got_char,
+        Some(v),
+        "get(Character('v')) must return the stored value"
+    );
 
     // get with a numerically-equal Integer(118) must NOT match (HotSpot
     // parity: TreeMap.compare casts to Comparable and Character.compareTo
     // rejects an Integer — keys are NOT compared as bare numbers).
     let k_int = boxed_int(&mut ctx, 118);
-    let got_int = call(&reg, &mut ctx, TM, "get", GET,
-                       &[Value::Object(Some(tm)), k_int]).unwrap();
-    assert_eq!(got_int, Some(Value::Object(None)),
-               "get(Integer(118)) must NOT match a stored Character('v')");
+    let got_int = call(
+        &reg,
+        &mut ctx,
+        TM,
+        "get",
+        GET,
+        &[Value::Object(Some(tm)), k_int],
+    )
+    .unwrap();
+    assert_eq!(
+        got_int,
+        Some(Value::Object(None)),
+        "get(Integer(118)) must NOT match a stored Character('v')"
+    );
 }
 
 /// Read the inner `Int` value from a boxed `java.lang.Integer` heap

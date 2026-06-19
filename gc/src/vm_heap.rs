@@ -87,8 +87,7 @@ pub enum GcBackend {
 /// the Phase 7 deferred-finalize path (which crosses thread
 /// boundaries and therefore can't use the `!Send` `SafepointToken`).
 #[cfg(feature = "gpu-offload")]
-pub static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+pub static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Spin-yield until every live `SafepointToken` has been dropped.
 ///
@@ -105,9 +104,7 @@ pub fn wait_for_gpu_critical_drain() {
         return;
     }
     let start = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(
-        crate::safepoint::GPU_CRITICAL_DEADLINE_SECS,
-    );
+    let deadline = std::time::Duration::from_secs(crate::safepoint::GPU_CRITICAL_DEADLINE_SECS);
     let mut warned = false;
     loop {
         std::thread::yield_now();
@@ -516,34 +513,17 @@ impl VmHeap {
     }
 
     /// Volatile descriptor-aware get.
-    pub fn get_field_volatile_as(
-        &self,
-        obj: ObjectRef,
-        index: usize,
-        desc_byte: u8,
-    ) -> Value {
+    pub fn get_field_volatile_as(&self, obj: ObjectRef, index: usize, desc_byte: u8) -> Value {
         dispatch!(self, get_field_volatile_as(obj, index, desc_byte))
     }
 
     /// Descriptor-aware set.
-    pub fn set_field_as(
-        &self,
-        obj: ObjectRef,
-        index: usize,
-        value: Value,
-        desc_byte: u8,
-    ) {
+    pub fn set_field_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
         dispatch!(self, set_field_as(obj, index, value, desc_byte))
     }
 
     /// Volatile descriptor-aware set.
-    pub fn set_field_volatile_as(
-        &self,
-        obj: ObjectRef,
-        index: usize,
-        value: Value,
-        desc_byte: u8,
-    ) {
+    pub fn set_field_volatile_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
         dispatch!(self, set_field_volatile_as(obj, index, value, desc_byte))
     }
 
@@ -783,9 +763,7 @@ impl VmHeap {
             VmHeap::Generational(h) => {
                 <GenerationalHeap as GarbageCollector>::write_barrier_pre(h, slot, old)
             }
-            VmHeap::G1(h) => {
-                <G1Collector as GarbageCollector>::write_barrier_pre(h, slot, old)
-            }
+            VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(h, slot, old),
         }
     }
 
@@ -953,7 +931,8 @@ impl VmHeap {
         match self {
             VmHeap::G1(g1) => {
                 // Check if old gen bytes exceed the G1 marking threshold (IHOP)
-                g1.old_gen_bytes() > g1.marking_threshold_bytes() && g1.marking_threshold_bytes() > 0
+                g1.old_gen_bytes() > g1.marking_threshold_bytes()
+                    && g1.marking_threshold_bytes() > 0
             }
             VmHeap::Generational(_) => false,
         }
@@ -993,7 +972,9 @@ impl VmHeap {
             // Order matters: phase must be ConcurrentMark before the
             // worker starts stepping.
             state.collector.start_concurrent_mark();
-            *slot = Some(ConcurrentMarkController::spawn(Arc::clone(&state.collector)));
+            *slot = Some(ConcurrentMarkController::spawn(Arc::clone(
+                &state.collector,
+            )));
         }
     }
 
@@ -1049,7 +1030,10 @@ impl VmHeap {
                         steps,
                         outcome.is_ok(),
                     );
-                    state.collector.gc_state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
+                    state
+                        .collector
+                        .gc_state
+                        .set_phase(ConcurrentGcPhase::ConcurrentSweep);
                     state.collector.cleanup();
                     state.collector.gc_state.set_phase(ConcurrentGcPhase::Idle);
                 }
@@ -1219,7 +1203,10 @@ mod concurrent_mark_controller_tests {
         // Start: phase flips to ConcurrentMark and a controller is
         // installed.
         heap.g1_start_concurrent_mark();
-        assert!(heap.g1_is_marking_active(), "phase must be ConcurrentMark after start");
+        assert!(
+            heap.g1_is_marking_active(),
+            "phase must be ConcurrentMark after start"
+        );
         assert!(
             g1_state(&heap).unwrap().has_active_controller(),
             "controller must be parked after g1_start_concurrent_mark",
@@ -1336,7 +1323,10 @@ mod concurrent_mark_controller_tests {
         // Before the overwrite, the SATB queue is empty (initial-mark
         // activated it but nothing was logged yet).
         let satb_queue = g1_state(&heap).unwrap().collector.satb_queue().clone();
-        assert!(satb_queue.is_active(), "SATB must be active during concurrent mark");
+        assert!(
+            satb_queue.is_active(),
+            "SATB must be active during concurrent mark"
+        );
         let before = satb_queue.len();
 
         // Simulate a mutator overwrite: barrier sees the old value.
@@ -1377,19 +1367,35 @@ mod concurrent_mark_controller_tests {
         // sure to cover the first region, the boundary, and the tail.
         let probe = |i: usize| -> u16 { ((i.wrapping_mul(2654435761)) & 0xFFFF) as u16 };
         let region_usable_chars = (1024 * 1024 - HEADER_SIZE) / 2;
-        let mut indices = vec![0, 1, region_usable_chars - 1, region_usable_chars, region_usable_chars + 1, len - 1];
+        let mut indices = vec![
+            0,
+            1,
+            region_usable_chars - 1,
+            region_usable_chars,
+            region_usable_chars + 1,
+            len - 1,
+        ];
         indices.dedup();
         for &i in &indices {
-            heap.set_array_element(arr, i, Value::Int(probe(i) as i32)).unwrap();
+            heap.set_array_element(arr, i, Value::Int(probe(i) as i32))
+                .unwrap();
         }
 
         let out = heap.read_char_array_bulk(arr);
         assert_eq!(out.len(), len, "bulk read must return all elements");
         for &i in &indices {
-            assert_eq!(out[i], probe(i), "code unit at index {i} (region-crossing read) corrupted");
+            assert_eq!(
+                out[i],
+                probe(i),
+                "code unit at index {i} (region-crossing read) corrupted"
+            );
         }
         // Indices we never wrote default to 0 (fresh zeroed payload).
-        assert_eq!(out[region_usable_chars / 2], 0, "untouched element must read as 0, not garbage");
+        assert_eq!(
+            out[region_usable_chars / 2],
+            0,
+            "untouched element must read as 0, not garbage"
+        );
     }
 
     /// Sanity: the ordinary (single-region) G1 char[] path still works through
@@ -1400,7 +1406,8 @@ mod concurrent_mark_controller_tests {
         let len = 8usize;
         let arr = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Char, len);
         for i in 0..len {
-            heap.set_array_element(arr, i, Value::Int((0x4100 + i) as i32)).unwrap();
+            heap.set_array_element(arr, i, Value::Int((0x4100 + i) as i32))
+                .unwrap();
         }
         let out = heap.read_char_array_bulk(arr);
         assert_eq!(out.len(), len);
@@ -1420,13 +1427,19 @@ mod concurrent_mark_controller_tests {
         // Ordinary single-region int[]: contiguous pointer is returned and
         // points just past the object header.
         let small = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 8);
-        let ptr = heap.array_data_ptr(small).expect("ordinary array must have a flat pointer");
+        let ptr = heap
+            .array_data_ptr(small)
+            .expect("ordinary array must have a flat pointer");
         let expected = unsafe { small.as_ptr().add(HEADER_SIZE) };
         assert_eq!(ptr, expected, "flat pointer must be obj + HEADER_SIZE");
 
         // Humongous int[] (~1.6 MB > 1 MiB region) spans multiple regions:
         // no contiguous pointer, so `array_data_ptr` returns `None`.
-        let large = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 400_000);
+        let large = heap.alloc_array(
+            cratonvm_types::ClassId::new(0),
+            ArrayElementType::Int,
+            400_000,
+        );
         assert!(
             heap.array_data_ptr(large).is_none(),
             "humongous array must not expose a flat data pointer",

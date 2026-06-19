@@ -375,12 +375,10 @@ impl ThreadLocalResolveCache {
     /// redefinition / hot-swap).
     pub fn invalidate_class(&mut self, class_id: u64) {
         self.methods.retain(|_, v| v.class_id != class_id);
-        self.method_order
-            .retain(|k| self.methods.contains_key(k));
+        self.method_order.retain(|k| self.methods.contains_key(k));
 
         self.fields.retain(|_, v| v.class_id != class_id);
-        self.field_order
-            .retain(|k| self.fields.contains_key(k));
+        self.field_order.retain(|k| self.fields.contains_key(k));
     }
 
     /// Remove every cached entry.
@@ -516,10 +514,7 @@ impl SharedResolutionState {
     /// guard, then upgrade to a write guard to remove it. Callers see
     /// `None` and fall through to the slow re-resolution which will
     /// promote a fresh entry.
-    pub fn get_promoted_invoke(
-        &self,
-        key: &PromotedInvokeKey,
-    ) -> Option<CachedInvokeTarget> {
+    pub fn get_promoted_invoke(&self, key: &PromotedInvokeKey) -> Option<CachedInvokeTarget> {
         let guard = self.promoted_invokes.read();
         let hit = guard.get(key).cloned();
         drop(guard);
@@ -546,11 +541,7 @@ impl SharedResolutionState {
     /// Promote a fully-built `CachedInvokeTarget` so sibling threads can
     /// populate their local invoke cache without repeating the slow
     /// resolution walk.  Acquires a write-lock.
-    pub fn insert_promoted_invoke(
-        &self,
-        key: PromotedInvokeKey,
-        target: CachedInvokeTarget,
-    ) {
+    pub fn insert_promoted_invoke(&self, key: PromotedInvokeKey, target: CachedInvokeTarget) {
         let mut guard = self.promoted_invokes.write();
         guard.insert(key, target);
         self.promoted_inserts.fetch_add(1, Ordering::Relaxed);
@@ -585,9 +576,7 @@ impl SharedResolutionState {
     /// matches `class_id` — used by CHA invalidation / class redefinition.
     pub fn invalidate_promoted_for_class(&self, class_id: ClassId) {
         let mut guard = self.promoted_invokes.write();
-        guard.retain(|(caller, _, _, rcv), _| {
-            *caller != class_id && *rcv != Some(class_id)
-        });
+        guard.retain(|(caller, _, _, rcv), _| *caller != class_id && *rcv != Some(class_id));
     }
 
     /// Number of cached method resolutions.
@@ -883,7 +872,9 @@ mod tests {
 
     // -- T10.4 promoted invoke cache --------------------------------------
 
-    fn sample_bytecode_method(class_id: u32) -> std::sync::Arc<cratonvm_jit_api::CachedBytecodeMethod> {
+    fn sample_bytecode_method(
+        class_id: u32,
+    ) -> std::sync::Arc<cratonvm_jit_api::CachedBytecodeMethod> {
         std::sync::Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
             declaring_class_id: ClassId::new(class_id),
             class_name: std::sync::Arc::from("A"),
@@ -919,7 +910,9 @@ mod tests {
         // and takes only a read-lock internally.
         let got = state.get_promoted_invoke(&key).expect("hit expected");
         match got {
-            CachedInvokeTarget::VirtualBytecode { receiver_class_id, .. } => {
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id, ..
+            } => {
                 assert_eq!(receiver_class_id, ClassId::new(20));
             }
             _ => panic!("wrong variant cached"),
@@ -948,13 +941,17 @@ mod tests {
         state.insert_promoted_invoke(k2, t2);
         assert_eq!(state.promoted_invoke_count(), 2);
         match state.get_promoted_invoke(&k1).unwrap() {
-            CachedInvokeTarget::VirtualBytecode { receiver_class_id, .. } => {
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id, ..
+            } => {
                 assert_eq!(receiver_class_id, ClassId::new(20));
             }
             _ => panic!("wrong variant"),
         }
         match state.get_promoted_invoke(&k2).unwrap() {
-            CachedInvokeTarget::VirtualBytecode { receiver_class_id, .. } => {
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id, ..
+            } => {
                 assert_eq!(receiver_class_id, ClassId::new(21));
             }
             _ => panic!("wrong variant"),

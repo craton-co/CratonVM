@@ -50,7 +50,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -146,7 +150,9 @@ fn reflect_probe_getdeclared_counts_match_hotspot() {
         rc,
         Some(0),
         "wave2_a: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     assert!(
         stdout.contains("fields=4"),
@@ -189,7 +195,10 @@ fn reflect_probe_signatures_have_modifiers_and_types() {
     // Field signatures: each must contain its declared type's simple name.
     assert!(stdout.contains("long sf1"), "expected `long sf1` field row");
     assert!(stdout.contains("int sf2"), "expected `int sf2` field row");
-    assert!(stdout.contains("String if1"), "expected `String if1` field row");
+    assert!(
+        stdout.contains("String if1"),
+        "expected `String if1` field row"
+    );
     assert!(stdout.contains("int if2"), "expected `int if2` field row");
 
     // Method signatures: each declared method appears with its return type

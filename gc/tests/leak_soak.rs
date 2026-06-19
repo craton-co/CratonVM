@@ -80,9 +80,7 @@ fn gc_soak_5min_no_leak() {
     // reclaim. The 16 here is arbitrary; what matters is that some
     // roots are pinned across the entire soak so we can verify their
     // payloads survive.
-    let mut perma_roots: Vec<ObjectRef> = (0..16)
-        .map(|_| heap.alloc_object(class_id, 4))
-        .collect();
+    let mut perma_roots: Vec<ObjectRef> = (0..16).map(|_| heap.alloc_object(class_id, 4)).collect();
     // Tag each permanent root with a known sentinel in field 0 so we
     // can verify GC did not corrupt its payload across cycles.
     for (i, r) in perma_roots.iter().enumerate() {
@@ -187,7 +185,12 @@ fn gc_soak_5min_no_leak() {
         total_allocs,
         live_samples.len(),
         warmup_mean,
-        live_samples.iter().skip(warmup_n).copied().max().unwrap_or(0),
+        live_samples
+            .iter()
+            .skip(warmup_n)
+            .copied()
+            .max()
+            .unwrap_or(0),
         leak_threshold,
     );
 }

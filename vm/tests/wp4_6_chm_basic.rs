@@ -73,9 +73,9 @@ fn test_chm_pre_resize_put_get() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!(
-            "ChmBasicProbe.testChmPreResizePutGet expected Ok(Some(Int(1))), got: {other:?}"
-        ),
+        other => {
+            panic!("ChmBasicProbe.testChmPreResizePutGet expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }
 
@@ -95,7 +95,9 @@ fn test_chm_basic_put_get() {
     let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmBasicPutGet", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("ChmBasicProbe.testChmBasicPutGet expected Ok(Some(Int(1))), got: {other:?}"),
+        other => {
+            panic!("ChmBasicProbe.testChmBasicPutGet expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }
 
@@ -109,7 +111,9 @@ fn test_chm_resize_path() {
     let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmResizePath", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("ChmBasicProbe.testChmResizePath expected Ok(Some(Int(1))), got: {other:?}"),
+        other => {
+            panic!("ChmBasicProbe.testChmResizePath expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }
 
@@ -122,7 +126,9 @@ fn test_chm_mutation_cycle() {
     let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmMutationCycle", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {other:?}"),
+        other => {
+            panic!("ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }
 
@@ -137,6 +143,8 @@ fn test_chm_clear_empty() {
     let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmClearEmpty", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("ChmBasicProbe.testChmClearEmpty expected Ok(Some(Int(1))), got: {other:?}"),
+        other => {
+            panic!("ChmBasicProbe.testChmClearEmpty expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }

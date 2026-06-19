@@ -159,8 +159,7 @@ impl Recording {
 
     /// Check if an event type is enabled. An empty `enabled_events` set means all events are enabled.
     pub fn is_event_enabled(&self, type_id: EventTypeId) -> bool {
-        self.settings.enabled_events.is_empty()
-            || self.settings.enabled_events.contains(&type_id)
+        self.settings.enabled_events.is_empty() || self.settings.enabled_events.contains(&type_id)
     }
 
     /// Round-9 CRIT-3 helper: full filter check (state + enabled + threshold)
@@ -305,7 +304,10 @@ impl FlightRecorder {
     /// Create a new recording and return its id.
     pub fn new_recording(&mut self, settings: RecordingSettings) -> u64 {
         let id = self.next_recording_id;
-        self.next_recording_id = self.next_recording_id.checked_add(1).expect("recording ID overflow");
+        self.next_recording_id = self
+            .next_recording_id
+            .checked_add(1)
+            .expect("recording ID overflow");
         self.recordings.insert(id, Recording::new(id, settings));
         id
     }
@@ -521,20 +523,30 @@ impl FlightRecorder {
         // recording owns its own copy of the just-drained events.
         self.drain_per_thread_into_repository();
 
-        let rec = self.recordings.get_mut(&id).ok_or(JfrDumpError::Io(
-            std::io::Error::new(std::io::ErrorKind::NotFound, "recording not found"),
-        ))?;
+        let rec = self
+            .recordings
+            .get_mut(&id)
+            .ok_or(JfrDumpError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "recording not found",
+            )))?;
 
         // Round-5: collapse three linear passes (min start_time, max end_time,
         // and the `make_contiguous` slice materialization that the old
         // `repository_mut().events()` call performed) into one fold over the
         // iterator. The downstream dumper consumes events via
         // `EventRepository::iter`, so a contiguous slice is not required.
-        let (start_time, end_time) = rec.repository().iter().fold(
-            (u64::MAX, 0u64),
-            |(min_s, max_e), e| (min_s.min(e.start_time), max_e.max(e.end_time)),
-        );
-        let start_time = if start_time == u64::MAX { 0 } else { start_time };
+        let (start_time, end_time) = rec
+            .repository()
+            .iter()
+            .fold((u64::MAX, 0u64), |(min_s, max_e), e| {
+                (min_s.min(e.start_time), max_e.max(e.end_time))
+            });
+        let start_time = if start_time == u64::MAX {
+            0
+        } else {
+            start_time
+        };
         let duration = end_time.saturating_sub(start_time);
 
         // `extra_events = Vec::new()` — the recording's repository already
@@ -636,7 +648,8 @@ mod tests {
     #[test]
     fn test_recording_settings_with_thresholds() {
         let mut s = RecordingSettings::new("threshold");
-        s.event_thresholds.insert(EventTypeId(1), Duration::from_millis(10));
+        s.event_thresholds
+            .insert(EventTypeId(1), Duration::from_millis(10));
         assert_eq!(
             s.event_thresholds.get(&EventTypeId(1)),
             Some(&Duration::from_millis(10))
@@ -770,7 +783,9 @@ mod tests {
     #[test]
     fn test_recording_threshold_accepts_above() {
         let mut settings = RecordingSettings::new("r");
-        settings.event_thresholds.insert(EventTypeId(1), Duration::from_nanos(100));
+        settings
+            .event_thresholds
+            .insert(EventTypeId(1), Duration::from_nanos(100));
         let mut rec = Recording::new(1, settings);
         rec.start();
         rec.record_event(make_event(EventTypeId(1), 1000, 1200)); // 200ns >= 100ns
@@ -780,7 +795,9 @@ mod tests {
     #[test]
     fn test_recording_threshold_rejects_below() {
         let mut settings = RecordingSettings::new("r");
-        settings.event_thresholds.insert(EventTypeId(1), Duration::from_nanos(500));
+        settings
+            .event_thresholds
+            .insert(EventTypeId(1), Duration::from_nanos(500));
         let mut rec = Recording::new(1, settings);
         rec.start();
         rec.record_event(make_event(EventTypeId(1), 1000, 1100)); // 100ns < 500ns
@@ -790,7 +807,9 @@ mod tests {
     #[test]
     fn test_recording_threshold_exact_boundary() {
         let mut settings = RecordingSettings::new("r");
-        settings.event_thresholds.insert(EventTypeId(1), Duration::from_nanos(100));
+        settings
+            .event_thresholds
+            .insert(EventTypeId(1), Duration::from_nanos(100));
         let mut rec = Recording::new(1, settings);
         rec.start();
         rec.record_event(make_event(EventTypeId(1), 1000, 1100)); // exactly 100ns
@@ -1085,7 +1104,10 @@ mod tests {
             .iter()
             .filter(|e| e.type_id == allowed)
             .count();
-        assert_eq!(allowed_in_rec, 1, "only the allowed-typed event should survive the filter");
+        assert_eq!(
+            allowed_in_rec, 1,
+            "only the allowed-typed event should survive the filter"
+        );
 
         // Filter-out count is at LEAST the three we pushed; could be higher
         // if another test pushed unrelated-type events into a sibling
@@ -1196,10 +1218,7 @@ mod tests {
         let idle = fr.get_recording(r_idle).unwrap();
         // At least our pushed event lands in the running recording.
         assert!(
-            running
-                .repository()
-                .iter()
-                .any(|e| e.type_id == unique),
+            running.repository().iter().any(|e| e.type_id == unique),
             "the running recording should receive our uniquely-typed event"
         );
         // Idle recording must see neither a kept event nor a filter-out

@@ -242,8 +242,7 @@ fn with_jni_context<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&SharedVm, &mut JvmThread) -> R,
 {
-    let shared_arc: Option<Arc<SharedVm>> =
-        JNI_SHARED_VM.with(|c| c.borrow().clone());
+    let shared_arc: Option<Arc<SharedVm>> = JNI_SHARED_VM.with(|c| c.borrow().clone());
     let thread_ptr = JNI_THREAD.with(|c| c.get());
     match (shared_arc, thread_ptr.is_null()) {
         (Some(ref arc), false) => {
@@ -357,10 +356,7 @@ fn parse_param_types_inner(descriptor: &str) -> Vec<u8> {
 /// Convert a slice of `JValue`s to `Value`s using the type tags from
 /// `parse_param_types`.  Returns `None` if `args` is null and `types` is
 /// non-empty.
-unsafe fn jvalues_to_values(
-    args: *const JValue,
-    types: &[u8],
-) -> Vec<Value> {
+unsafe fn jvalues_to_values(args: *const JValue, types: &[u8]) -> Vec<Value> {
     if args.is_null() {
         return Vec::new();
     }
@@ -394,11 +390,7 @@ unsafe fn jvalues_to_values(
 /// Perform a virtual instance method call from JNI.
 /// `obj` is the receiver; `mid` encodes (declaring_class_id, method_index);
 /// `args` is the JValue array (may be null for zero-arg methods).
-fn jni_call_instance(
-    obj: JObject,
-    mid: JMethodID,
-    args: *const JValue,
-) -> Option<Value> {
+fn jni_call_instance(obj: JObject, mid: JMethodID, args: *const JValue) -> Option<Value> {
     if obj == 0 || mid == 0 {
         return None;
     }
@@ -416,9 +408,16 @@ fn jni_call_instance(
         let mut jvm_args = Vec::with_capacity(1 + param_types.len());
         jvm_args.push(Value::Object(Some(oref)));
         jvm_args.extend(unsafe { jvalues_to_values(args, &param_types) });
-        invoke_on_class_shared(shared, thread, obj_class_id, &method_name, &descriptor, &jvm_args)
-            .ok()
-            .flatten()
+        invoke_on_class_shared(
+            shared,
+            thread,
+            obj_class_id,
+            &method_name,
+            &descriptor,
+            &jvm_args,
+        )
+        .ok()
+        .flatten()
     })
     .flatten()
 }
@@ -468,11 +467,7 @@ fn jni_call_nonvirtual(
 }
 
 /// Perform a static method call from JNI.
-fn jni_call_static(
-    clazz: JClass,
-    mid: JMethodID,
-    args: *const JValue,
-) -> Option<Value> {
+fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option<Value> {
     if mid == 0 {
         return None;
     }
@@ -491,9 +486,16 @@ fn jni_call_static(
         };
         let param_types = parse_param_types_cached(&descriptor);
         let jvm_args = unsafe { jvalues_to_values(args, &param_types) };
-        invoke_on_class_shared(shared, thread, class_id, &method_name, &descriptor, &jvm_args)
-            .ok()
-            .flatten()
+        invoke_on_class_shared(
+            shared,
+            thread,
+            class_id,
+            &method_name,
+            &descriptor,
+            &jvm_args,
+        )
+        .ok()
+        .flatten()
     })
     .flatten()
 }
@@ -928,11 +930,11 @@ fn modified_utf8_len(s: &str) -> usize {
     for ch in s.chars() {
         let cp = ch as u32;
         n += match cp {
-            0x0000 => 2,           // overlong NUL
-            0x0001..=0x007F => 1,  // ASCII
-            0x0080..=0x07FF => 2,  // two-byte
-            0x0800..=0xFFFF => 3,  // three-byte BMP
-            _ => 6,                // surrogate pair: two 3-byte sequences
+            0x0000 => 2,          // overlong NUL
+            0x0001..=0x007F => 1, // ASCII
+            0x0080..=0x07FF => 2, // two-byte
+            0x0800..=0xFFFF => 3, // three-byte BMP
+            _ => 6,               // surrogate pair: two 3-byte sequences
         };
     }
     n
@@ -1241,21 +1243,18 @@ extern "C" fn jni_get_method_id(
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
             let cm = shared.class_manager.read();
-            shared.link_resolver.resolve_or_compute(
-                class_id,
-                name_str,
-                sig_str,
-                || {
-                    let result = find_method_recursive(
-                        class_id, name_str, sig_str, &cm.class_store,
-                    )
-                    .and_then(|(_, declaring)| {
-                        let decl = cm.class_store.get(declaring)?;
-                        let idx = decl.methods.iter().position(|m| {
-                            &*m.name == name_str && &*m.descriptor == sig_str
-                        })?;
-                        Some((declaring, idx as u32))
-                    });
+            shared
+                .link_resolver
+                .resolve_or_compute(class_id, name_str, sig_str, || {
+                    let result =
+                        find_method_recursive(class_id, name_str, sig_str, &cm.class_store)
+                            .and_then(|(_, declaring)| {
+                                let decl = cm.class_store.get(declaring)?;
+                                let idx = decl.methods.iter().position(|m| {
+                                    &*m.name == name_str && &*m.descriptor == sig_str
+                                })?;
+                                Some((declaring, idx as u32))
+                            });
                     let resolved = match result {
                         Some((d, i)) => ResolvedMember::Method {
                             declaring_class_id: d,
@@ -1268,13 +1267,13 @@ extern "C" fn jni_get_method_id(
                         cratonvm_types::intern_arc(sig_str),
                         resolved,
                     )
-                },
-            )
+                })
         };
         match resolved {
-            ResolvedMember::Method { declaring_class_id, index } => {
-                Some(encode_method_id(declaring_class_id, index as u16))
-            }
+            ResolvedMember::Method {
+                declaring_class_id,
+                index,
+            } => Some(encode_method_id(declaring_class_id, index as u16)),
             _ => None,
         }
     })
@@ -1700,26 +1699,18 @@ extern "C" fn jni_get_field_id(
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
             let cm = shared.class_manager.read();
-            shared.link_resolver.resolve_or_compute(
-                class_id,
-                name_str,
-                sig_str,
-                || {
-                    let result = find_field_recursive(
-                        class_id, name_str, &cm.class_store,
-                    );
+            shared
+                .link_resolver
+                .resolve_or_compute(class_id, name_str, sig_str, || {
+                    let result = find_field_recursive(class_id, name_str, &cm.class_store);
                     let resolved = match result {
-                        Some((field_index, field, declaring)) => {
-                            ResolvedMember::Field {
-                                declaring_class_id: declaring,
-                                absolute_index: field_index as u32,
-                                is_static: field
-                                    .access_flags
-                                    .contains(
-                                        cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
-                                    ),
-                            }
-                        }
+                        Some((field_index, field, declaring)) => ResolvedMember::Field {
+                            declaring_class_id: declaring,
+                            absolute_index: field_index as u32,
+                            is_static: field.access_flags.contains(
+                                cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                            ),
+                        },
                         None => ResolvedMember::NotFound,
                     };
                     (
@@ -1727,13 +1718,14 @@ extern "C" fn jni_get_field_id(
                         cratonvm_types::intern_arc(sig_str),
                         resolved,
                     )
-                },
-            )
+                })
         };
         match resolved {
-            ResolvedMember::Field { declaring_class_id, absolute_index, .. } => {
-                Some(encode_field_id(declaring_class_id, absolute_index as usize))
-            }
+            ResolvedMember::Field {
+                declaring_class_id,
+                absolute_index,
+                ..
+            } => Some(encode_field_id(declaring_class_id, absolute_index as usize)),
             _ => None,
         }
     })
@@ -1854,12 +1846,7 @@ extern "C" fn jni_set_object_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
 }
 
 // ---- Index 105: SetBooleanField ----
-extern "C" fn jni_set_boolean_field(
-    _env: JNIEnv,
-    obj: JObject,
-    field_id: JFieldID,
-    val: JBoolean,
-) {
+extern "C" fn jni_set_boolean_field(_env: JNIEnv, obj: JObject, field_id: JFieldID, val: JBoolean) {
     set_int_field_raw(obj, field_id, val as i32);
 }
 
@@ -1891,9 +1878,7 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared
-            .heap
-            .set_field(oref, field_index, Value::Long(val));
+        shared.heap.set_field(oref, field_index, Value::Long(val));
         Some(())
     });
 }
@@ -1906,9 +1891,7 @@ extern "C" fn jni_set_float_field(_env: JNIEnv, obj: JObject, field_id: JFieldID
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared
-            .heap
-            .set_field(oref, field_index, Value::Float(val));
+        shared.heap.set_field(oref, field_index, Value::Float(val));
         Some(())
     });
 }
@@ -1921,9 +1904,7 @@ extern "C" fn jni_set_double_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared
-            .heap
-            .set_field(oref, field_index, Value::Double(val));
+        shared.heap.set_field(oref, field_index, Value::Double(val));
         Some(())
     });
 }
@@ -1979,19 +1960,11 @@ extern "C" fn jni_get_static_boolean_field(
     get_static_int_raw(clazz, field_id) as JBoolean
 }
 
-extern "C" fn jni_get_static_byte_field(
-    _env: JNIEnv,
-    clazz: JClass,
-    field_id: JFieldID,
-) -> JByte {
+extern "C" fn jni_get_static_byte_field(_env: JNIEnv, clazz: JClass, field_id: JFieldID) -> JByte {
     get_static_int_raw(clazz, field_id) as JByte
 }
 
-extern "C" fn jni_get_static_char_field(
-    _env: JNIEnv,
-    clazz: JClass,
-    field_id: JFieldID,
-) -> JChar {
+extern "C" fn jni_get_static_char_field(_env: JNIEnv, clazz: JClass, field_id: JFieldID) -> JChar {
     get_static_int_raw(clazz, field_id) as JChar
 }
 
@@ -2003,19 +1976,11 @@ extern "C" fn jni_get_static_short_field(
     get_static_int_raw(clazz, field_id) as JShort
 }
 
-extern "C" fn jni_get_static_int_field(
-    _env: JNIEnv,
-    clazz: JClass,
-    field_id: JFieldID,
-) -> JInt {
+extern "C" fn jni_get_static_int_field(_env: JNIEnv, clazz: JClass, field_id: JFieldID) -> JInt {
     get_static_int_raw(clazz, field_id)
 }
 
-extern "C" fn jni_get_static_long_field(
-    _env: JNIEnv,
-    clazz: JClass,
-    field_id: JFieldID,
-) -> JLong {
+extern "C" fn jni_get_static_long_field(_env: JNIEnv, clazz: JClass, field_id: JFieldID) -> JLong {
     if clazz == 0 || field_id == 0 {
         return 0;
     }
@@ -2240,11 +2205,7 @@ extern "C" fn jni_get_string_utf_chars(
 }
 
 // ---- Index 170: ReleaseStringUTFChars ----
-extern "C" fn jni_release_string_utf_chars(
-    _env: JNIEnv,
-    _str: JString,
-    chars: *const c_char,
-) {
+extern "C" fn jni_release_string_utf_chars(_env: JNIEnv, _str: JString, chars: *const c_char) {
     if !chars.is_null() {
         // Free the CString allocated by GetStringUTFChars
         unsafe {
@@ -2278,20 +2239,17 @@ extern "C" fn jni_new_object_array(
     }
     with_shared_vm(|shared| {
         let component_id = ClassId::new(clazz as u32);
-        let arr = shared.heap.alloc_array(
-            component_id,
-            ArrayElementType::Reference,
-            length as usize,
-        );
+        let arr =
+            shared
+                .heap
+                .alloc_array(component_id, ArrayElementType::Reference, length as usize);
         // Initialize elements if init is non-null
         if init != 0 {
             if let Some(init_ref) = jobject_to_obj(init) {
                 for i in 0..length as usize {
-                    let _ = shared.heap.set_array_element(
-                        arr,
-                        i,
-                        Value::Object(Some(init_ref)),
-                    );
+                    let _ = shared
+                        .heap
+                        .set_array_element(arr, i, Value::Object(Some(init_ref)));
                 }
             }
         }
@@ -2301,11 +2259,7 @@ extern "C" fn jni_new_object_array(
 }
 
 // ---- Index 173: GetObjectArrayElement ----
-extern "C" fn jni_get_object_array_element(
-    _env: JNIEnv,
-    array: JArray,
-    index: JSize,
-) -> JObject {
+extern "C" fn jni_get_object_array_element(_env: JNIEnv, array: JArray, index: JSize) -> JObject {
     if array == 0 || index < 0 {
         return 0;
     }
@@ -2349,11 +2303,9 @@ macro_rules! new_prim_array {
                 return 0;
             }
             with_shared_vm(|shared| {
-                let arr = shared.heap.alloc_array(
-                    ClassId::new(0),
-                    $elem_type,
-                    length as usize,
-                );
+                let arr = shared
+                    .heap
+                    .alloc_array(ClassId::new(0), $elem_type, length as usize);
                 obj_to_jobject(arr)
             })
             .unwrap_or(0)
@@ -2491,12 +2443,7 @@ get_array_elements!(jni_get_double_array_elements, JDouble, Double, 0.0); // 190
 // Frees the buffer allocated by Get<Type>ArrayElements and optionally copies back.
 macro_rules! release_array_elements {
     ($name:ident, $rust_type:ty, $value_constructor:expr) => {
-        extern "C" fn $name(
-            _env: JNIEnv,
-            array: JArray,
-            elems: *mut $rust_type,
-            mode: JInt,
-        ) {
+        extern "C" fn $name(_env: JNIEnv, array: JArray, elems: *mut $rust_type, mode: JInt) {
             if elems.is_null() {
                 return;
             }
@@ -2551,14 +2498,32 @@ macro_rules! release_array_elements {
     };
 }
 
-release_array_elements!(jni_release_boolean_array_elements, JBoolean, |v: JBoolean| Value::Int(v as i32)); // 191
-release_array_elements!(jni_release_byte_array_elements, JByte, |v: JByte| Value::Int(v as i32)); // 192
-release_array_elements!(jni_release_char_array_elements, JChar, |v: JChar| Value::Int(v as i32)); // 193
-release_array_elements!(jni_release_short_array_elements, JShort, |v: JShort| Value::Int(v as i32)); // 194
-release_array_elements!(jni_release_int_array_elements, JInt, |v: JInt| Value::Int(v)); // 195
-release_array_elements!(jni_release_long_array_elements, JLong, |v: JLong| Value::Long(v)); // 196
-release_array_elements!(jni_release_float_array_elements, JFloat, |v: JFloat| Value::Float(v)); // 197
-release_array_elements!(jni_release_double_array_elements, JDouble, |v: JDouble| Value::Double(v)); // 198
+release_array_elements!(
+    jni_release_boolean_array_elements,
+    JBoolean,
+    |v: JBoolean| Value::Int(v as i32)
+); // 191
+release_array_elements!(jni_release_byte_array_elements, JByte, |v: JByte| {
+    Value::Int(v as i32)
+}); // 192
+release_array_elements!(jni_release_char_array_elements, JChar, |v: JChar| {
+    Value::Int(v as i32)
+}); // 193
+release_array_elements!(jni_release_short_array_elements, JShort, |v: JShort| {
+    Value::Int(v as i32)
+}); // 194
+release_array_elements!(jni_release_int_array_elements, JInt, |v: JInt| Value::Int(
+    v
+)); // 195
+release_array_elements!(jni_release_long_array_elements, JLong, |v: JLong| {
+    Value::Long(v)
+}); // 196
+release_array_elements!(jni_release_float_array_elements, JFloat, |v: JFloat| {
+    Value::Float(v)
+}); // 197
+release_array_elements!(jni_release_double_array_elements, JDouble, |v: JDouble| {
+    Value::Double(v)
+}); // 198
 
 // ---------------------------------------------------------------------------
 // Region bounds-checking (JNI Get/Set<Type>ArrayRegion + string regions)
@@ -2583,22 +2548,23 @@ release_array_elements!(jni_release_double_array_elements, JDouble, |v: JDouble|
 /// is still flagged rather than silently dropped.
 fn raise_jni_aioobe(index: usize, length: usize) {
     let msg = format!("Index {index} out of bounds for length {length}");
-    let raised = with_jni_context(|shared, thread| {
-        match crate::runtime::exceptions::create_exception_object(
-            shared,
-            thread,
-            "java/lang/ArrayIndexOutOfBoundsException",
-            Some(&msg),
-        ) {
-            Ok(exc) => {
-                let handle = obj_to_jobject(exc);
-                JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
-                true
-            }
-            Err(_) => false,
-        }
-    })
-    .unwrap_or(false);
+    let raised =
+        with_jni_context(
+            |shared, thread| match crate::runtime::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/ArrayIndexOutOfBoundsException",
+                Some(&msg),
+            ) {
+                Ok(exc) => {
+                    let handle = obj_to_jobject(exc);
+                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .unwrap_or(false);
     if !raised {
         // No thread context or allocation failed: flag the pending-exception
         // sentinel so the condition is not silently swallowed.
@@ -2711,14 +2677,28 @@ macro_rules! set_array_region {
     };
 }
 
-set_array_region!(jni_set_boolean_array_region, JBoolean, |v: JBoolean| Value::Int(v as i32)); // 207
-set_array_region!(jni_set_byte_array_region, JByte, |v: JByte| Value::Int(v as i32)); // 208
-set_array_region!(jni_set_char_array_region, JChar, |v: JChar| Value::Int(v as i32)); // 209
-set_array_region!(jni_set_short_array_region, JShort, |v: JShort| Value::Int(v as i32)); // 210
+set_array_region!(jni_set_boolean_array_region, JBoolean, |v: JBoolean| {
+    Value::Int(v as i32)
+}); // 207
+set_array_region!(jni_set_byte_array_region, JByte, |v: JByte| Value::Int(
+    v as i32
+)); // 208
+set_array_region!(jni_set_char_array_region, JChar, |v: JChar| Value::Int(
+    v as i32
+)); // 209
+set_array_region!(jni_set_short_array_region, JShort, |v: JShort| Value::Int(
+    v as i32
+)); // 210
 set_array_region!(jni_set_int_array_region, JInt, |v: JInt| Value::Int(v)); // 211
 set_array_region!(jni_set_long_array_region, JLong, |v: JLong| Value::Long(v)); // 212
-set_array_region!(jni_set_float_array_region, JFloat, |v: JFloat| Value::Float(v)); // 213
-set_array_region!(jni_set_double_array_region, JDouble, |v: JDouble| Value::Double(v)); // 214
+set_array_region!(
+    jni_set_float_array_region,
+    JFloat,
+    |v: JFloat| Value::Float(v)
+); // 213
+set_array_region!(jni_set_double_array_region, JDouble, |v: JDouble| {
+    Value::Double(v)
+}); // 214
 
 // ---- Index 217: MonitorEnter ----
 extern "C" fn jni_monitor_enter(_env: JNIEnv, obj: JObject) -> JInt {
@@ -2885,8 +2865,12 @@ extern "C" fn jni_to_reflected_method(
             .get_class(method_class_id)
             .map_or(4, |c| c.num_total_fields.max(4));
         let obj = shared.heap.alloc_object(method_class_id, num_fields);
-        shared.heap.set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
-        shared.heap.set_field(obj, 1, Value::Int(method_index as i32));
+        shared
+            .heap
+            .set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
+        shared
+            .heap
+            .set_field(obj, 1, Value::Int(method_index as i32));
         obj_to_jobject(obj)
     })
     .unwrap_or(0)
@@ -2928,8 +2912,12 @@ extern "C" fn jni_to_reflected_field(
             .get_class(field_class_id)
             .map_or(4, |c| c.num_total_fields.max(4));
         let obj = shared.heap.alloc_object(field_class_id, num_fields);
-        shared.heap.set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
-        shared.heap.set_field(obj, 1, Value::Int(field_index as i32));
+        shared
+            .heap
+            .set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
+        shared
+            .heap
+            .set_field(obj, 1, Value::Int(field_index as i32));
         obj_to_jobject(obj)
     })
     .unwrap_or(0)
@@ -2959,11 +2947,7 @@ extern "C" fn jni_get_string_region(
         let start = start as usize;
         let len = len as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                utf16[start..start + len].as_ptr(),
-                buf,
-                len,
-            );
+            std::ptr::copy_nonoverlapping(utf16[start..start + len].as_ptr(), buf, len);
         }
         Some(())
     });
@@ -3081,9 +3065,7 @@ fn critical_encode_element(v: Value, et: ArrayElementType, dst: &mut [u8]) {
 /// back into a `Value` for store via the region-safe accessor.
 fn critical_decode_element(et: ArrayElementType, src: &[u8]) -> Value {
     match et {
-        ArrayElementType::Byte | ArrayElementType::Boolean => {
-            Value::Int(src[0] as i8 as i32)
-        }
+        ArrayElementType::Byte | ArrayElementType::Boolean => Value::Int(src[0] as i8 as i32),
         ArrayElementType::Short => {
             let x = i16::from_ne_bytes([src[0], src[1]]);
             Value::Int(x as i32)
@@ -3092,9 +3074,7 @@ fn critical_decode_element(et: ArrayElementType, src: &[u8]) -> Value {
             let x = u16::from_ne_bytes([src[0], src[1]]);
             Value::Int(x as i32)
         }
-        ArrayElementType::Int => {
-            Value::Int(i32::from_ne_bytes([src[0], src[1], src[2], src[3]]))
-        }
+        ArrayElementType::Int => Value::Int(i32::from_ne_bytes([src[0], src[1], src[2], src[3]])),
         ArrayElementType::Float => {
             Value::Float(f32::from_ne_bytes([src[0], src[1], src[2], src[3]]))
         }
@@ -3125,7 +3105,9 @@ extern "C" fn jni_get_primitive_array_critical(
             // payload pointer — no copy, release is a no-op.
             Some(ptr) => {
                 if !is_copy.is_null() {
-                    unsafe { *is_copy = JNI_FALSE; } // Direct pointer, no copy
+                    unsafe {
+                        *is_copy = JNI_FALSE;
+                    } // Direct pointer, no copy
                 }
                 Some(ptr as *mut std::ffi::c_void)
             }
@@ -3157,11 +3139,18 @@ extern "C" fn jni_get_primitive_array_critical(
                 JNI_CRITICAL_COPIES.with(|c| {
                     c.borrow_mut().insert(
                         ptr as usize,
-                        CriticalCopy { array, element_type, len, stride },
+                        CriticalCopy {
+                            array,
+                            element_type,
+                            len,
+                            stride,
+                        },
                     );
                 });
                 if !is_copy.is_null() {
-                    unsafe { *is_copy = JNI_TRUE; } // Copy, not a direct pointer
+                    unsafe {
+                        *is_copy = JNI_TRUE;
+                    } // Copy, not a direct pointer
                 }
                 Some(ptr as *mut std::ffi::c_void)
             }
@@ -3197,10 +3186,7 @@ extern "C" fn jni_release_primitive_array_critical(
                 // SAFETY: the buffer is `copy.len * copy.stride` bytes and we
                 // only read within it.
                 let src = unsafe {
-                    std::slice::from_raw_parts(
-                        (carray as *const u8).add(off),
-                        copy.stride,
-                    )
+                    std::slice::from_raw_parts((carray as *const u8).add(off), copy.stride)
                 };
                 let v = critical_decode_element(copy.element_type, src);
                 let _ = shared.heap.set_array_element(oref, i, v);
@@ -3238,11 +3224,7 @@ extern "C" fn jni_get_string_critical(
 }
 
 // ---- Index 225: ReleaseStringCritical ----
-extern "C" fn jni_release_string_critical(
-    _env: JNIEnv,
-    str_obj: JString,
-    chars: *const JChar,
-) {
+extern "C" fn jni_release_string_critical(_env: JNIEnv, str_obj: JString, chars: *const JChar) {
     jni_release_string_chars(_env, str_obj, chars);
 }
 
@@ -3321,9 +3303,7 @@ fn set_int_field_raw(obj: JObject, field_id: JFieldID, val: i32) {
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared
-            .heap
-            .set_field(oref, field_index, Value::Int(val));
+        shared.heap.set_field(oref, field_index, Value::Int(val));
         Some(())
     });
 }
@@ -3407,12 +3387,7 @@ fn jni_native_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 
 }
 
 /// Store a JNI function pointer registered via `RegisterNatives` or symbol lookup.
-pub fn register_jni_native(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-    fn_ptr: usize,
-) {
+pub fn register_jni_native(class_name: &str, method_name: &str, descriptor: &str, fn_ptr: usize) {
     let key = jni_native_key(class_name, method_name, descriptor);
     let mut table = JNI_NATIVE_METHODS.write();
     if let Some(&existing) = table.get(&key) {
@@ -3466,7 +3441,11 @@ fn jni_encode(s: &str) -> String {
 ///
 /// Example: `("java/lang/System", "arraycopy")` → `"Java_java_lang_System_arraycopy"`.
 pub fn jni_short_name(class_name: &str, method_name: &str) -> String {
-    format!("Java_{}_{}", jni_encode(class_name), jni_encode(method_name))
+    format!(
+        "Java_{}_{}",
+        jni_encode(class_name),
+        jni_encode(method_name)
+    )
 }
 
 /// Build the JNI long name: `Java_<class>_<method>__<encoded_params>`.
@@ -3646,12 +3625,18 @@ fn jni_fn_ptr_ok(fn_ptr: usize) -> bool {
     // on all modern architectures (4-byte on ARM).
     #[cfg(target_arch = "aarch64")]
     if fn_ptr % 4 != 0 {
-        tracing::error!("JNI call with misaligned function pointer {:#x} — returning 0", fn_ptr);
+        tracing::error!(
+            "JNI call with misaligned function pointer {:#x} — returning 0",
+            fn_ptr
+        );
         return false;
     }
     #[cfg(not(target_arch = "aarch64"))]
     if fn_ptr % 2 != 0 {
-        tracing::error!("JNI call with misaligned function pointer {:#x} — returning 0", fn_ptr);
+        tracing::error!(
+            "JNI call with misaligned function pointer {:#x} — returning 0",
+            fn_ptr
+        );
         return false;
     }
     true
@@ -3768,7 +3753,9 @@ unsafe fn call_jni_marshalled(fn_ptr: usize, args: &[JniArg], fp_return: bool) -
                  unsupported on this architecture (no FP-aware trampoline) — \
                  refusing to call to avoid an ABI mismatch"
             );
-            jni_throw_unsatisfied_link("float/double JNI signatures require an FP-aware trampoline on this architecture");
+            jni_throw_unsatisfied_link(
+                "float/double JNI signatures require an FP-aware trampoline on this architecture",
+            );
             return 0;
         }
         call_jni_fn_ptr_int(fn_ptr, args)
@@ -3798,20 +3785,24 @@ unsafe fn jni_trampoline_call(
     // the offsets there.
     #[repr(C)]
     struct CallBlock {
-        fn_ptr: u64,       // +0
-        gp: [u64; 6],      // +8
-        xmm: [u64; 8],     // +56
-        stack_ptr: u64,    // +120  (pointer to first stack word, or null)
-        n_stack: u64,      // +128  (count of stack words)
-        n_xmm: u64,        // +136  (used for AL: # of vector regs, SysV varargs)
-        xmm0_ret: u64,     // +144  (out: XMM0 result)
+        fn_ptr: u64,    // +0
+        gp: [u64; 6],   // +8
+        xmm: [u64; 8],  // +56
+        stack_ptr: u64, // +120  (pointer to first stack word, or null)
+        n_stack: u64,   // +128  (count of stack words)
+        n_xmm: u64,     // +136  (used for AL: # of vector regs, SysV varargs)
+        xmm0_ret: u64,  // +144  (out: XMM0 result)
     }
 
     let mut block = CallBlock {
         fn_ptr: fn_ptr as u64,
         gp: *gp,
         xmm: *xmm,
-        stack_ptr: if stack.is_empty() { 0 } else { stack.as_ptr() as u64 },
+        stack_ptr: if stack.is_empty() {
+            0
+        } else {
+            stack.as_ptr() as u64
+        },
         n_stack: stack.len() as u64,
         n_xmm: n_xmm as u64,
         xmm0_ret: 0,
@@ -3855,20 +3846,20 @@ core::arch::global_asm!(
     "mov rbp, rsp",
     "push rbx",
     "push r12",
-    "mov rbx, rcx",          // block ptr (Win64 arg0 = RCX)
-    "mov r12, [rbx + 128]",  // r12 = n_stack
+    "mov rbx, rcx",         // block ptr (Win64 arg0 = RCX)
+    "mov r12, [rbx + 128]", // r12 = n_stack
     "mov rax, r12",
-    "shl rax, 3",            // bytes for stack args
-    "add rax, 32",           // + 32-byte shadow space (Win64)
+    "shl rax, 3",  // bytes for stack args
+    "add rax, 32", // + 32-byte shadow space (Win64)
     "sub rsp, rax",
-    "and rsp, -16",          // 16-byte align at the call
-    "mov r8, [rbx + 120]",   // r8 = stack_ptr (source, may be 0)
+    "and rsp, -16",        // 16-byte align at the call
+    "mov r8, [rbx + 120]", // r8 = stack_ptr (source, may be 0)
     "test r12, r12",
     "jz 2f",
     "test r8, r8",
     "jz 2f",
     "mov r9, rsp",
-    "add r9, 32",            // dest = above the shadow space
+    "add r9, 32", // dest = above the shadow space
     "xor r10, r10",
     "1:",
     "mov rax, [r8 + r10*8]",
@@ -3886,12 +3877,12 @@ core::arch::global_asm!(
     "movq xmm5, [rbx + 96]",
     "movq xmm6, [rbx + 104]",
     "movq xmm7, [rbx + 112]",
-    "mov rax, [rbx + 136]",  // AL = n_xmm (ignored by Win64; set for uniformity)
-    "mov r11, [rbx + 0]",    // target fn ptr
-    "mov rcx, [rbx + 8]",    // gp[0]
-    "mov rdx, [rbx + 16]",   // gp[1]
-    "mov r8,  [rbx + 24]",   // gp[2]
-    "mov r9,  [rbx + 32]",   // gp[3]
+    "mov rax, [rbx + 136]", // AL = n_xmm (ignored by Win64; set for uniformity)
+    "mov r11, [rbx + 0]",   // target fn ptr
+    "mov rcx, [rbx + 8]",   // gp[0]
+    "mov rdx, [rbx + 16]",  // gp[1]
+    "mov r8,  [rbx + 24]",  // gp[2]
+    "mov r9,  [rbx + 32]",  // gp[3]
     "call r11",
     "movq [rbx + 144], xmm0", // capture FP return
     "lea rsp, [rbp - 16]",
@@ -3910,18 +3901,18 @@ core::arch::global_asm!(
     "mov rbp, rsp",
     "push rbx",
     "push r12",
-    "mov rbx, rdi",          // block ptr (SysV arg0 = RDI)
-    "mov r12, [rbx + 128]",  // r12 = n_stack
+    "mov rbx, rdi",         // block ptr (SysV arg0 = RDI)
+    "mov r12, [rbx + 128]", // r12 = n_stack
     "mov rax, r12",
-    "shl rax, 3",            // bytes for stack args (no shadow space on SysV)
+    "shl rax, 3", // bytes for stack args (no shadow space on SysV)
     "sub rsp, rax",
-    "and rsp, -16",          // 16-byte align at the call
-    "mov r8, [rbx + 120]",   // r8 = stack_ptr (source, may be 0)
+    "and rsp, -16",        // 16-byte align at the call
+    "mov r8, [rbx + 120]", // r8 = stack_ptr (source, may be 0)
     "test r12, r12",
     "jz 2f",
     "test r8, r8",
     "jz 2f",
-    "mov r9, rsp",           // dest = [rsp] (no shadow space)
+    "mov r9, rsp", // dest = [rsp] (no shadow space)
     "xor r10, r10",
     "1:",
     "mov rax, [r8 + r10*8]",
@@ -3938,14 +3929,14 @@ core::arch::global_asm!(
     "movq xmm5, [rbx + 96]",
     "movq xmm6, [rbx + 104]",
     "movq xmm7, [rbx + 112]",
-    "mov rax, [rbx + 136]",  // AL = n_xmm (SysV variadic FP-reg count)
-    "mov r11, [rbx + 0]",    // target fn ptr
-    "mov rdi, [rbx + 8]",    // gp[0]
-    "mov rsi, [rbx + 16]",   // gp[1]
-    "mov rdx, [rbx + 24]",   // gp[2]
-    "mov rcx, [rbx + 32]",   // gp[3]
-    "mov r8,  [rbx + 40]",   // gp[4]
-    "mov r9,  [rbx + 48]",   // gp[5]
+    "mov rax, [rbx + 136]", // AL = n_xmm (SysV variadic FP-reg count)
+    "mov r11, [rbx + 0]",   // target fn ptr
+    "mov rdi, [rbx + 8]",   // gp[0]
+    "mov rsi, [rbx + 16]",  // gp[1]
+    "mov rdx, [rbx + 24]",  // gp[2]
+    "mov rcx, [rbx + 32]",  // gp[3]
+    "mov r8,  [rbx + 40]",  // gp[4]
+    "mov r9,  [rbx + 48]",  // gp[5]
     "call r11",
     "movq [rbx + 144], xmm0", // capture FP return
     "lea rsp, [rbp - 16]",
@@ -4047,22 +4038,23 @@ unsafe fn call_jni_fn_ptr_int(fn_ptr: usize, args: &[JniArg]) -> u64 {
 /// to the `ThrowNew` sentinel so the error is flagged rather than swallowed.
 fn jni_throw_unsatisfied_link(msg: &str) {
     let full = format!("Unsupported native method ABI: {msg}");
-    let raised = with_jni_context(|shared, thread| {
-        match crate::runtime::exceptions::create_exception_object(
-            shared,
-            thread,
-            "java/lang/UnsatisfiedLinkError",
-            Some(&full),
-        ) {
-            Ok(exc) => {
-                let handle = obj_to_jobject(exc);
-                JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
-                true
-            }
-            Err(_) => false,
-        }
-    })
-    .unwrap_or(false);
+    let raised =
+        with_jni_context(
+            |shared, thread| match crate::runtime::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/UnsatisfiedLinkError",
+                Some(&full),
+            ) {
+                Ok(exc) => {
+                    let handle = obj_to_jobject(exc);
+                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .unwrap_or(false);
     if !raised {
         JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
     }
@@ -4259,40 +4251,21 @@ extern "C" fn jni_set_static_boolean_field(
     set_static_int_raw(fid, val as JInt);
 }
 
-extern "C" fn jni_set_static_byte_field(
-    _env: JNIEnv,
-    _clazz: JClass,
-    fid: JFieldID,
-    val: JByte,
-) {
+extern "C" fn jni_set_static_byte_field(_env: JNIEnv, _clazz: JClass, fid: JFieldID, val: JByte) {
     set_static_int_raw(fid, val as JInt);
 }
 
-extern "C" fn jni_set_static_char_field(
-    _env: JNIEnv,
-    _clazz: JClass,
-    fid: JFieldID,
-    val: JChar,
-) {
+extern "C" fn jni_set_static_char_field(_env: JNIEnv, _clazz: JClass, fid: JFieldID, val: JChar) {
     set_static_int_raw(fid, val as JInt);
 }
 
-extern "C" fn jni_set_static_short_field(
-    _env: JNIEnv,
-    _clazz: JClass,
-    fid: JFieldID,
-    val: JShort,
-) {
+extern "C" fn jni_set_static_short_field(_env: JNIEnv, _clazz: JClass, fid: JFieldID, val: JShort) {
     set_static_int_raw(fid, val as JInt);
 }
 
 // ---- Index 163: NewString (UTF-16) ----
 // Creates a java.lang.String from a UTF-16 char array.
-extern "C" fn jni_new_string(
-    _env: JNIEnv,
-    unicode: *const JChar,
-    len: JSize,
-) -> JString {
+extern "C" fn jni_new_string(_env: JNIEnv, unicode: *const JChar, len: JSize) -> JString {
     if unicode.is_null() || len < 0 {
         return 0;
     }
@@ -4338,8 +4311,8 @@ extern "C" fn jni_get_string_chars(
         let boxed = utf16.into_boxed_slice();
         let ptr = boxed.as_ptr();
         std::mem::forget(boxed); // OWNERSHIP: buffer transferred to native caller, freed by jni_release_string_chars via Vec::from_raw_parts
-        // Track the allocation so ReleaseStringChars can reconstruct the
-        // correct Vec layout (pointer + length) for deallocation.
+                                 // Track the allocation so ReleaseStringChars can reconstruct the
+                                 // correct Vec layout (pointer + length) for deallocation.
         JNI_STRING_BUFFERS.with(|b| b.borrow_mut().insert(ptr as usize, len));
         Some(ptr)
     })
@@ -4347,7 +4320,9 @@ extern "C" fn jni_get_string_chars(
     match result {
         Some(ptr) => {
             if !is_copy.is_null() {
-                unsafe { *is_copy = JNI_TRUE; }
+                unsafe {
+                    *is_copy = JNI_TRUE;
+                }
             }
             ptr
         }
@@ -4355,18 +4330,14 @@ extern "C" fn jni_get_string_chars(
     }
 }
 
-extern "C" fn jni_release_string_chars(
-    _env: JNIEnv,
-    _str: JString,
-    chars: *const JChar,
-) {
+extern "C" fn jni_release_string_chars(_env: JNIEnv, _str: JString, chars: *const JChar) {
     if !chars.is_null() {
         // Look up the original element count so we can reconstruct the Vec
         // with the correct layout.  Without the length the global allocator
         // would receive a mismatched dealloc (single-element vs slice).
-        let len = JNI_STRING_BUFFERS.with(|b| {
-            b.borrow_mut().remove(&(chars as usize))
-        }).unwrap_or(0);
+        let len = JNI_STRING_BUFFERS
+            .with(|b| b.borrow_mut().remove(&(chars as usize)))
+            .unwrap_or(0);
         if len > 0 {
             unsafe {
                 drop(Vec::from_raw_parts(chars as *mut JChar, len, len));
@@ -4463,286 +4434,433 @@ unsafe fn free_jvalues(ptr: *const JValue, len: usize) {
 // ---------------------------------------------------------------------------
 
 // --- NewObjectV (slot 29) ---
-extern "C" fn jni_new_object_v(
+extern "C" fn jni_new_object_v(env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList) -> JObject {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let result = jni_new_object_a(env, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    result
+}
+
+// --- Instance CallXxxMethodV (slots 35, 38, 41, 44, 47, 50, 53, 56, 59, 62) ---
+extern "C" fn jni_call_object_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JObject {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_object_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_boolean_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JBoolean {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_boolean_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_byte_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JByte {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_byte_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_char_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JChar {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_char_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_short_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JShort {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_short_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_int_method_v(env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList) -> JInt {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_int_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_long_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JLong {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_long_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_float_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JFloat {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_float_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_double_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    mid: JMethodID,
+    va: VaList,
+) -> JDouble {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_double_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_void_method_v(env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList) {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    jni_call_void_method_a(env, obj, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+}
+
+// --- Nonvirtual CallNonvirtualXxxMethodV (slots 65, 68, 71, 74, 77, 80, 83, 86, 89, 92) ---
+extern "C" fn jni_call_nonvirtual_object_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JObject {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_object_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_boolean_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JBoolean {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_boolean_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_byte_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JByte {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_byte_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_char_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JChar {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_char_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_short_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JShort {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_short_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_int_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JInt {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_int_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_long_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JLong {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_long_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_float_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JFloat {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_float_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_double_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) -> JDouble {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    let r = jni_call_nonvirtual_double_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+    r
+}
+
+extern "C" fn jni_call_nonvirtual_void_method_v(
+    env: JNIEnv,
+    obj: JObject,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
+) {
+    let (args, len) = va_list_to_jvalues(mid, va);
+    jni_call_nonvirtual_void_method_a(env, obj, clazz, mid, args);
+    unsafe {
+        free_jvalues(args, len);
+    }
+}
+
+// --- Static CallStaticXxxMethodV (slots 115, 118, 121, 124, 127, 130, 133, 136, 139, 142) ---
+extern "C" fn jni_call_static_object_method_v(
     env: JNIEnv,
     clazz: JClass,
     mid: JMethodID,
     va: VaList,
 ) -> JObject {
     let (args, len) = va_list_to_jvalues(mid, va);
-    let result = jni_new_object_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    result
-}
-
-// --- Instance CallXxxMethodV (slots 35, 38, 41, 44, 47, 50, 53, 56, 59, 62) ---
-extern "C" fn jni_call_object_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JObject {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_object_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_boolean_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JBoolean {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_boolean_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_byte_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JByte {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_byte_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_char_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JChar {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_char_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_short_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JShort {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_short_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_int_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JInt {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_int_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_long_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JLong {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_long_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_float_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JFloat {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_float_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_double_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) -> JDouble {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_double_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_void_method_v(
-    env: JNIEnv, obj: JObject, mid: JMethodID, va: VaList,
-) {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    jni_call_void_method_a(env, obj, mid, args);
-    unsafe { free_jvalues(args, len); }
-}
-
-// --- Nonvirtual CallNonvirtualXxxMethodV (slots 65, 68, 71, 74, 77, 80, 83, 86, 89, 92) ---
-extern "C" fn jni_call_nonvirtual_object_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JObject {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_object_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_boolean_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JBoolean {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_boolean_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_byte_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JByte {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_byte_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_char_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JChar {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_char_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_short_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JShort {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_short_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_int_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JInt {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_int_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_long_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JLong {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_long_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_float_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JFloat {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_float_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_double_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JDouble {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    let r = jni_call_nonvirtual_double_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-    r
-}
-
-extern "C" fn jni_call_nonvirtual_void_method_v(
-    env: JNIEnv, obj: JObject, clazz: JClass, mid: JMethodID, va: VaList,
-) {
-    let (args, len) = va_list_to_jvalues(mid, va);
-    jni_call_nonvirtual_void_method_a(env, obj, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
-}
-
-// --- Static CallStaticXxxMethodV (slots 115, 118, 121, 124, 127, 130, 133, 136, 139, 142) ---
-extern "C" fn jni_call_static_object_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
-) -> JObject {
-    let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_object_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_boolean_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JBoolean {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_boolean_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_byte_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JByte {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_byte_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_char_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JChar {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_char_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_short_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JShort {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_short_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_int_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JInt {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_int_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_long_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JLong {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_long_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_float_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JFloat {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_float_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_double_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) -> JDouble {
     let (args, len) = va_list_to_jvalues(mid, va);
     let r = jni_call_static_double_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
     r
 }
 
 extern "C" fn jni_call_static_void_method_v(
-    env: JNIEnv, clazz: JClass, mid: JMethodID, va: VaList,
+    env: JNIEnv,
+    clazz: JClass,
+    mid: JMethodID,
+    va: VaList,
 ) {
     let (args, len) = va_list_to_jvalues(mid, va);
     jni_call_static_void_method_a(env, clazz, mid, args);
-    unsafe { free_jvalues(args, len); }
+    unsafe {
+        free_jvalues(args, len);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4760,9 +4878,8 @@ unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 /// Global registry of direct buffer metadata: maps JObject handle → (address, capacity).
-static DIRECT_BUFFERS: std::sync::LazyLock<
-    parking_lot::Mutex<HashMap<u64, (SendPtr, i64)>>
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static DIRECT_BUFFERS: std::sync::LazyLock<parking_lot::Mutex<HashMap<u64, (SendPtr, i64)>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 // Index 229: NewDirectByteBuffer
 extern "C" fn jni_new_direct_byte_buffer(
@@ -4799,17 +4916,16 @@ extern "C" fn jni_new_direct_byte_buffer(
         // Store the capacity in field 1.
         shared.heap.set_field(obj, 1, Value::Long(capacity));
         // Also register in our side-table for GetDirectBufferAddress.
-        DIRECT_BUFFERS.lock().insert(handle, (SendPtr(address), capacity));
+        DIRECT_BUFFERS
+            .lock()
+            .insert(handle, (SendPtr(address), capacity));
         handle
     })
     .unwrap_or(0)
 }
 
 // Index 230: GetDirectBufferAddress
-extern "C" fn jni_get_direct_buffer_address(
-    _env: JNIEnv,
-    buf: JObject,
-) -> *mut u8 {
+extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut u8 {
     if buf == 0 {
         return std::ptr::null_mut();
     }
@@ -4830,10 +4946,7 @@ extern "C" fn jni_get_direct_buffer_address(
 }
 
 // Index 231: GetDirectBufferCapacity
-extern "C" fn jni_get_direct_buffer_capacity(
-    _env: JNIEnv,
-    buf: JObject,
-) -> JLong {
+extern "C" fn jni_get_direct_buffer_capacity(_env: JNIEnv, buf: JObject) -> JLong {
     if buf == 0 {
         return -1;
     }
@@ -4859,10 +4972,7 @@ extern "C" fn jni_get_direct_buffer_capacity(
 // Index 233: GetModule (JNI 9+)
 // Returns the java.lang.Module that the class belongs to.
 // For now, we return null (unnamed module) since our module system is basic.
-extern "C" fn jni_get_module(
-    _env: JNIEnv,
-    _clazz: JClass,
-) -> JObject {
+extern "C" fn jni_get_module(_env: JNIEnv, _clazz: JClass) -> JObject {
     // All classes are in the unnamed module for now.
     0
 }
@@ -5333,8 +5443,12 @@ mod tests {
         use crate::vm::SharedVm;
         use std::sync::Arc;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj1 = shared.heap.alloc_object(crate::classloading::ClassId::new(0), 1);
-        let obj2 = shared.heap.alloc_object(crate::classloading::ClassId::new(0), 1);
+        let obj1 = shared
+            .heap
+            .alloc_object(crate::classloading::ClassId::new(0), 1);
+        let obj2 = shared
+            .heap
+            .alloc_object(crate::classloading::ClassId::new(0), 1);
         let local1 = obj_to_jobject(obj1);
         let local2 = obj_to_jobject(obj2);
         set_jni_context_arc(shared.clone());
@@ -5590,8 +5704,7 @@ mod tests {
         }
         let fn_ptr = always_99 as *const () as usize;
         let env = get_jni_env();
-        let result =
-            unsafe { dispatch_jni_native(fn_ptr, env, 0, &[], "(I)I") };
+        let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &[], "(I)I") };
         // return type is 'I', raw_result = 99 → Value::Int(99)
         assert_eq!(result, crate::types::Value::Int(99));
     }
@@ -5601,8 +5714,7 @@ mod tests {
         extern "C" fn do_nothing(_env: JNIEnv, _this: JObject) {}
         let fn_ptr = do_nothing as *const () as usize;
         let env = get_jni_env();
-        let result =
-            unsafe { dispatch_jni_native(fn_ptr, env, 0, &[], "()V") };
+        let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &[], "()V") };
         assert_eq!(result, crate::types::Value::Object(None));
     }
 
@@ -5612,7 +5724,10 @@ mod tests {
         let env = get_jni_env();
         let func_ptr = unsafe { *(*env).add(215) };
         let stub_ptr = jni_stub as *const () as usize;
-        assert_ne!(func_ptr, stub_ptr, "index 215 should be RegisterNatives, not stub");
+        assert_ne!(
+            func_ptr, stub_ptr,
+            "index 215 should be RegisterNatives, not stub"
+        );
     }
 
     #[test]
@@ -5620,7 +5735,10 @@ mod tests {
         let env = get_jni_env();
         let func_ptr = unsafe { *(*env).add(216) };
         let stub_ptr = jni_stub as *const () as usize;
-        assert_ne!(func_ptr, stub_ptr, "index 216 should be UnregisterNatives, not stub");
+        assert_ne!(
+            func_ptr, stub_ptr,
+            "index 216 should be UnregisterNatives, not stub"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5660,7 +5778,10 @@ mod tests {
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let handle = shared.jni_global_refs.lock().add(obj);
         let resolved = jobject_to_obj(handle).expect("global ref must resolve to Some");
-        assert_eq!(resolved, obj, "resolved global ref must match the original object");
+        assert_eq!(
+            resolved, obj,
+            "resolved global ref must match the original object"
+        );
         clear_jni_context();
     }
 
@@ -5717,7 +5838,10 @@ mod tests {
         push_local_frame(8);
         track_local_ref(0x100); // fake local ref
         let result = pop_local_frame(0x200); // promote a different JObject
-        assert_eq!(result, 0x200, "PopLocalFrame must return the provided result");
+        assert_eq!(
+            result, 0x200,
+            "PopLocalFrame must return the provided result"
+        );
     }
 
     #[test]
@@ -5797,8 +5921,8 @@ mod tests {
         check(156); // SetStaticByteField
         check(157); // SetStaticCharField
         check(158); // SetStaticShortField
-        check(28);  // AllocObject
-        check(30);  // NewObjectA
+        check(28); // AllocObject
+        check(30); // NewObjectA
         check(163); // NewString
         check(164); // GetStringLength
         check(165); // GetStringChars
@@ -5997,9 +6121,7 @@ mod tests {
             drop(Vec::from_raw_parts(ptr, len, cap));
         }
         // Entry is consumed; a second release would find nothing and no-op.
-        assert!(
-            JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(ptr as usize)).is_none())
-        );
+        assert!(JNI_ARRAY_ELEM_BUFFERS.with(|c| c.borrow().get(&(ptr as usize)).is_none()));
     }
 
     // -----------------------------------------------------------------------
@@ -6174,7 +6296,10 @@ mod tests {
         drop(shared);
         assert!(weak.upgrade().is_some(), "TLS Arc must keep SharedVm alive");
         clear_jni_context();
-        assert!(weak.upgrade().is_none(), "SharedVm must be dropped after clear");
+        assert!(
+            weak.upgrade().is_none(),
+            "SharedVm must be dropped after clear"
+        );
     }
 
     #[test]
@@ -6200,7 +6325,10 @@ mod tests {
         // We check that slot 233 (GetModule) is not a null pointer.
         let func_ptr = unsafe { *(*env).add(233) };
         let stub_ptr = jni_stub as *const () as usize;
-        assert_ne!(func_ptr, stub_ptr, "slot 233 (GetModule) should not be stub");
+        assert_ne!(
+            func_ptr, stub_ptr,
+            "slot 233 (GetModule) should not be stub"
+        );
     }
 
     #[test]
@@ -6222,7 +6350,10 @@ mod tests {
         assert_eq!(retrieved_addr, addr, "GetDirectBufferAddress must match");
         // Get the capacity back
         let retrieved_cap = jni_get_direct_buffer_capacity(env, buf);
-        assert_eq!(retrieved_cap, capacity, "GetDirectBufferCapacity must match");
+        assert_eq!(
+            retrieved_cap, capacity,
+            "GetDirectBufferCapacity must match"
+        );
         clear_jni_context();
     }
 
@@ -6230,9 +6361,15 @@ mod tests {
     fn jni_direct_buffer_null_returns_null() {
         let env = get_jni_env();
         let buf = jni_new_direct_byte_buffer(env, std::ptr::null_mut(), 100);
-        assert_eq!(buf, 0, "NewDirectByteBuffer with null address must return 0");
+        assert_eq!(
+            buf, 0,
+            "NewDirectByteBuffer with null address must return 0"
+        );
         let addr = jni_get_direct_buffer_address(env, 0);
-        assert!(addr.is_null(), "GetDirectBufferAddress(null) must return null");
+        assert!(
+            addr.is_null(),
+            "GetDirectBufferAddress(null) must return null"
+        );
         let cap = jni_get_direct_buffer_capacity(env, 0);
         assert_eq!(cap, -1, "GetDirectBufferCapacity(null) must return -1");
     }
@@ -6242,7 +6379,10 @@ mod tests {
         let env = get_jni_env();
         let mut buf = [0u8; 16];
         let result = jni_new_direct_byte_buffer(env, buf.as_mut_ptr(), -1);
-        assert_eq!(result, 0, "NewDirectByteBuffer with negative capacity must return 0");
+        assert_eq!(
+            result, 0,
+            "NewDirectByteBuffer with negative capacity must return 0"
+        );
     }
 
     #[test]
@@ -6259,32 +6399,84 @@ mod tests {
         // NewObjectV (29)
         assert_ne!(unsafe { *(*env).add(29) }, stub_ptr, "slot 29 (NewObjectV)");
         // CallObjectMethodV (35)
-        assert_ne!(unsafe { *(*env).add(35) }, stub_ptr, "slot 35 (CallObjectMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(35) },
+            stub_ptr,
+            "slot 35 (CallObjectMethodV)"
+        );
         // CallIntMethodV (50)
-        assert_ne!(unsafe { *(*env).add(50) }, stub_ptr, "slot 50 (CallIntMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(50) },
+            stub_ptr,
+            "slot 50 (CallIntMethodV)"
+        );
         // CallVoidMethodV (62)
-        assert_ne!(unsafe { *(*env).add(62) }, stub_ptr, "slot 62 (CallVoidMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(62) },
+            stub_ptr,
+            "slot 62 (CallVoidMethodV)"
+        );
         // CallNonvirtualObjectMethodV (65)
-        assert_ne!(unsafe { *(*env).add(65) }, stub_ptr, "slot 65 (CallNonvirtualObjectMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(65) },
+            stub_ptr,
+            "slot 65 (CallNonvirtualObjectMethodV)"
+        );
         // CallNonvirtualVoidMethodV (92)
-        assert_ne!(unsafe { *(*env).add(92) }, stub_ptr, "slot 92 (CallNonvirtualVoidMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(92) },
+            stub_ptr,
+            "slot 92 (CallNonvirtualVoidMethodV)"
+        );
         // CallStaticObjectMethodV (115)
-        assert_ne!(unsafe { *(*env).add(115) }, stub_ptr, "slot 115 (CallStaticObjectMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(115) },
+            stub_ptr,
+            "slot 115 (CallStaticObjectMethodV)"
+        );
         // CallStaticIntMethodV (130)
-        assert_ne!(unsafe { *(*env).add(130) }, stub_ptr, "slot 130 (CallStaticIntMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(130) },
+            stub_ptr,
+            "slot 130 (CallStaticIntMethodV)"
+        );
         // CallStaticVoidMethodV (142)
-        assert_ne!(unsafe { *(*env).add(142) }, stub_ptr, "slot 142 (CallStaticVoidMethodV)");
+        assert_ne!(
+            unsafe { *(*env).add(142) },
+            stub_ptr,
+            "slot 142 (CallStaticVoidMethodV)"
+        );
     }
 
     #[test]
     fn jni_nio_slots_not_stub() {
         let env = get_jni_env();
         let stub_ptr = jni_stub as *const () as usize;
-        assert_ne!(unsafe { *(*env).add(229) }, stub_ptr, "slot 229 (NewDirectByteBuffer)");
-        assert_ne!(unsafe { *(*env).add(230) }, stub_ptr, "slot 230 (GetDirectBufferAddress)");
-        assert_ne!(unsafe { *(*env).add(231) }, stub_ptr, "slot 231 (GetDirectBufferCapacity)");
-        assert_ne!(unsafe { *(*env).add(232) }, stub_ptr, "slot 232 (GetObjectRefType)");
-        assert_ne!(unsafe { *(*env).add(233) }, stub_ptr, "slot 233 (GetModule)");
+        assert_ne!(
+            unsafe { *(*env).add(229) },
+            stub_ptr,
+            "slot 229 (NewDirectByteBuffer)"
+        );
+        assert_ne!(
+            unsafe { *(*env).add(230) },
+            stub_ptr,
+            "slot 230 (GetDirectBufferAddress)"
+        );
+        assert_ne!(
+            unsafe { *(*env).add(231) },
+            stub_ptr,
+            "slot 231 (GetDirectBufferCapacity)"
+        );
+        assert_ne!(
+            unsafe { *(*env).add(232) },
+            stub_ptr,
+            "slot 232 (GetObjectRefType)"
+        );
+        assert_ne!(
+            unsafe { *(*env).add(233) },
+            stub_ptr,
+            "slot 233 (GetModule)"
+        );
     }
 
     #[test]
@@ -6334,7 +6526,10 @@ mod tests {
         assert_ne!(func_ptr, 0, "DetachCurrentThread must be registered");
         // AttachCurrentThreadAsDaemon (slot 7)
         let func_ptr = unsafe { *(*vm).add(7) };
-        assert_ne!(func_ptr, 0, "AttachCurrentThreadAsDaemon must be registered");
+        assert_ne!(
+            func_ptr, 0,
+            "AttachCurrentThreadAsDaemon must be registered"
+        );
     }
 
     // ---- Modified UTF-8 encoding (GetStringUTFChars contract) ----
@@ -6380,7 +6575,15 @@ mod tests {
     fn modified_utf8_len_agrees_with_encoder() {
         // GetStringUTFLength must report exactly the byte count GetStringUTFChars
         // produces (excluding the trailing NUL) for every code-point class.
-        for s in ["", "ascii", "a\u{0}b", "\u{00e9}", "\u{20ac}", "\u{1f600}", "mix\u{0}é€😀"] {
+        for s in [
+            "",
+            "ascii",
+            "a\u{0}b",
+            "\u{00e9}",
+            "\u{20ac}",
+            "\u{1f600}",
+            "mix\u{0}é€😀",
+        ] {
             assert_eq!(
                 modified_utf8_len(s),
                 to_modified_utf8(s).len(),
@@ -6413,7 +6616,10 @@ mod tests {
         }
         let fn_ptr = mul_add as *const () as usize;
         let env = get_jni_env();
-        let args = [crate::types::Value::Double(3.5), crate::types::Value::Double(0.25)];
+        let args = [
+            crate::types::Value::Double(3.5),
+            crate::types::Value::Double(0.25),
+        ];
         let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(DD)D") };
         assert_eq!(result, crate::types::Value::Double(35.25));
     }
@@ -6460,8 +6666,9 @@ mod tests {
         }
         let fn_ptr = sum10 as *const () as usize;
         let env = get_jni_env();
-        let args: Vec<crate::types::Value> =
-            (1..=10).map(|n| crate::types::Value::Long(n as i64)).collect();
+        let args: Vec<crate::types::Value> = (1..=10)
+            .map(|n| crate::types::Value::Long(n as i64))
+            .collect();
         let result = unsafe { dispatch_jni_native(fn_ptr, env, 0, &args, "(JJJJJJJJJJ)J") };
         assert_eq!(result, crate::types::Value::Long(55));
     }

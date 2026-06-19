@@ -410,7 +410,10 @@ impl ValueStack {
     /// sign-extending a NaN-tag-colliding `0xFFFC_…` value.
     #[inline(always)]
     pub fn push_compact_long(&mut self, cv: CompactValue) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_compact_long");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_compact_long"
+        );
         self.kinds[self.len] = KIND_LONG;
         self.slots[self.len] = cv;
         self.len += 1;
@@ -420,7 +423,10 @@ impl ValueStack {
     /// Double sibling of [`Self::push_compact_long`] (used by `dload`).
     #[inline(always)]
     pub fn push_compact_double(&mut self, cv: CompactValue) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_compact_double");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_compact_double"
+        );
         self.kinds[self.len] = KIND_DOUBLE;
         self.slots[self.len] = cv;
         self.len += 1;
@@ -712,10 +718,7 @@ impl ValueStack {
     /// other slots fall through to the descriptor-aware decode (which keeps
     /// the legacy widening for synthetic int-where-long).
     #[inline]
-    pub fn pop_arg_for_descriptor_checked(
-        &mut self,
-        desc_byte: u8,
-    ) -> Result<Value, RuntimeError> {
+    pub fn pop_arg_for_descriptor_checked(&mut self, desc_byte: u8) -> Result<Value, RuntimeError> {
         let (cv, is_long) = self.pop_compact_with_long_mark()?;
         Ok(if is_long {
             match desc_byte {
@@ -733,7 +736,10 @@ impl ValueStack {
     /// [`Self::pop_compact`].
     #[inline(always)]
     pub fn pop_compact_with_long_mark_unchecked(&mut self) -> (CompactValue, bool) {
-        debug_assert!(self.len > 0, "stack underflow in pop_compact_with_long_mark_unchecked");
+        debug_assert!(
+            self.len > 0,
+            "stack underflow in pop_compact_with_long_mark_unchecked"
+        );
         self.len -= 1;
         (self.slots[self.len], self.kinds[self.len] == KIND_LONG)
     }
@@ -750,9 +756,7 @@ impl ValueStack {
     /// variables) is otherwise indistinguishable from a tagged int and gets
     /// truncated by `decode_by_descriptor(b'J')`'s i2l-widening fallback.
     #[inline(always)]
-    pub fn pop_compact_with_long_mark(
-        &mut self,
-    ) -> Result<(CompactValue, bool), RuntimeError> {
+    pub fn pop_compact_with_long_mark(&mut self) -> Result<(CompactValue, bool), RuntimeError> {
         if self.len == 0 {
             return Err(RuntimeError::IllegalStateException {
                 message: "operand stack underflow".to_string(),
@@ -792,7 +796,10 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_int_unchecked(&mut self, v: i32) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_int_unchecked");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_int_unchecked"
+        );
         self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::int(v);
         self.len += 1;
@@ -826,7 +833,10 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_float_unchecked(&mut self, v: f32) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_float_unchecked");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_float_unchecked"
+        );
         self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::float(v);
         self.len += 1;
@@ -852,7 +862,10 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_double_unchecked(&mut self, v: f64) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_double_unchecked");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_double_unchecked"
+        );
         self.kinds[self.len] = KIND_DOUBLE;
         self.slots[self.len] = CompactValue::double(v);
         self.len += 1;
@@ -887,7 +900,10 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_long_unchecked(&mut self, v: i64) {
-        debug_assert!(self.len < self.max_size, "stack overflow in push_long_unchecked");
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_long_unchecked"
+        );
         self.kinds[self.len] = KIND_LONG;
         self.slots[self.len] = CompactValue::long(v);
         self.len += 1;
@@ -1100,7 +1116,9 @@ impl ValueStack {
                 // was always taking the `Some` branch and the fallback was
                 // pure dead code hiding the type-safety invariant.
                 // For the same reason this `expect` cannot fire at runtime.
-                Ok(cv.as_double().expect("CompactTag::Double slot always decodes via as_double"))
+                Ok(cv
+                    .as_double()
+                    .expect("CompactTag::Double slot always decodes via as_double"))
             }
             CompactTag::Long => {
                 // A raw i64 value landed here (e.g. via `CompactValue::long`
@@ -1334,7 +1352,10 @@ impl ValueStack {
     /// Tags are reconstructed from CompactValue tags so the FrozenFrame
     /// wire format (Vec<u64> + Vec<u8>) is preserved for continuation thaw.
     pub fn snapshot_raw(&self) -> (Vec<u64>, Vec<u8>) {
-        let vals: Vec<u64> = self.slots[..self.len].iter().map(|cv| cv.to_bits()).collect();
+        let vals: Vec<u64> = self.slots[..self.len]
+            .iter()
+            .map(|cv| cv.to_bits())
+            .collect();
         // Honor the kind mark when emitting SoA tags: a genuine long/double
         // whose raw bits collide with the NaN-tag space would otherwise be
         // tagged Int/Double by `compact_tag_to_vtag` and mis-restored.
@@ -1521,25 +1542,43 @@ mod tests {
         let mut stack = ValueStack::new(1);
         stack.push(Value::Int(1)).unwrap();
         assert!(
-            matches!(stack.push(Value::Int(2)), Err(RuntimeError::StackOverflowError)),
+            matches!(
+                stack.push(Value::Int(2)),
+                Err(RuntimeError::StackOverflowError)
+            ),
             "push overflow must be StackOverflowError, not NotImplemented"
         );
 
         // Type-specialised hot-path pushes share the same overflow contract.
         let mut s_int = ValueStack::new(0);
-        assert!(matches!(s_int.push_int(1), Err(RuntimeError::StackOverflowError)));
+        assert!(matches!(
+            s_int.push_int(1),
+            Err(RuntimeError::StackOverflowError)
+        ));
 
         let mut s_long = ValueStack::new(0);
-        assert!(matches!(s_long.push_long(1), Err(RuntimeError::StackOverflowError)));
+        assert!(matches!(
+            s_long.push_long(1),
+            Err(RuntimeError::StackOverflowError)
+        ));
 
         let mut s_float = ValueStack::new(0);
-        assert!(matches!(s_float.push_float(1.0), Err(RuntimeError::StackOverflowError)));
+        assert!(matches!(
+            s_float.push_float(1.0),
+            Err(RuntimeError::StackOverflowError)
+        ));
 
         let mut s_double = ValueStack::new(0);
-        assert!(matches!(s_double.push_double(1.0), Err(RuntimeError::StackOverflowError)));
+        assert!(matches!(
+            s_double.push_double(1.0),
+            Err(RuntimeError::StackOverflowError)
+        ));
 
         let mut s_null = ValueStack::new(0);
-        assert!(matches!(s_null.push_null(), Err(RuntimeError::StackOverflowError)));
+        assert!(matches!(
+            s_null.push_null(),
+            Err(RuntimeError::StackOverflowError)
+        ));
     }
 
     #[test]
@@ -1586,13 +1625,13 @@ mod tests {
         // collision long and must reinterpret bit-exact.
         const NANBOX: u64 = 0xFFFC_0000_0000_0000;
         let resolvable: &[i64] = &[
-            (NANBOX | (1u64 << 32)) as i64,         // SUB_INT, payload bit 32 set
-            (NANBOX | 0x7FFF_FFFF_FFFF) as i64,     // SUB_INT, all 47 payload bits set
-            (NANBOX | (1u64 << 47)) as i64,         // SUB_FLOAT pattern (any tag → reinterpret)
-            (NANBOX | (2u64 << 47) | 0x55) as i64,  // SUB_OBJECT pattern, nonzero payload
-            (NANBOX | (5u64 << 47) | 0x1234) as i64,// SUB_RETADDR pattern, payload bits set
-            -1,                                     // natural SUB_LONG_HI
-            i64::MIN,                               // untagged fast path
+            (NANBOX | (1u64 << 32)) as i64,          // SUB_INT, payload bit 32 set
+            (NANBOX | 0x7FFF_FFFF_FFFF) as i64,      // SUB_INT, all 47 payload bits set
+            (NANBOX | (1u64 << 47)) as i64,          // SUB_FLOAT pattern (any tag → reinterpret)
+            (NANBOX | (2u64 << 47) | 0x55) as i64,   // SUB_OBJECT pattern, nonzero payload
+            (NANBOX | (5u64 << 47) | 0x1234) as i64, // SUB_RETADDR pattern, payload bits set
+            -1,                                      // natural SUB_LONG_HI
+            i64::MIN,                                // untagged fast path
             i64::MAX,
             123_456_789_012_345,
         ];
@@ -1647,7 +1686,7 @@ mod tests {
     fn lload_then_pop_long_is_bit_exact_for_collisions() {
         const NANBOX: u64 = 0xFFFC_0000_0000_0000;
         for &v in &[
-            (NANBOX | 0x7FFF_FFFF_FFFF) as i64,    // SUB_INT, payload bits 32-46 set
+            (NANBOX | 0x7FFF_FFFF_FFFF) as i64, // SUB_INT, payload bits 32-46 set
             (NANBOX | (2u64 << 47) | 0x55) as i64, // SUB_OBJECT pattern
         ] {
             // Simulate `lstore` writing the slot, then `lload` reading it: a
@@ -2063,7 +2102,7 @@ mod tests {
         let mut stack = ValueStack::new(8);
         stack.push(Value::Long(0x0BAD_BEEF_DEAD_CAFE)).unwrap();
         stack.push(Value::Uninitialized).unwrap(); // high half of long
-        // Simulate dup2: copy the two top slots.
+                                                   // Simulate dup2: copy the two top slots.
         let high = stack.pop_compact();
         let low = stack.pop_compact();
         stack.push_compact(low);
@@ -2215,13 +2254,18 @@ mod tests {
 
         let mut stack = ValueStack::new(4);
         stack.push_compact(CompactValue::from_bits(long_bits));
-        assert_eq!(stack.get_compact(0).unwrap().tag(), CompactTag::Long,
-                   "test setup must produce a CompactTag::Long slot");
+        assert_eq!(
+            stack.get_compact(0).unwrap().tag(),
+            CompactTag::Long,
+            "test setup must produce a CompactTag::Long slot"
+        );
 
         let mut roots = Vec::new();
         stack.scan_object_refs(&mut roots, &heap);
-        assert!(roots.is_empty(),
-                "primitive Long slots must not be treated as GC roots");
+        assert!(
+            roots.is_empty(),
+            "primitive Long slots must not be treated as GC roots"
+        );
     }
 
     /// Untagged raw bits (CompactTag::Double — the ambiguous JVM long/double
@@ -2352,8 +2396,11 @@ mod tests {
         let long_bits: u64 = 0xFFFC_0000_0000_0000 | (7u64 << 47) | 0x1000;
         let new_ptr: usize = 0x2000;
         stack.push_compact(CompactValue::from_bits(long_bits));
-        assert_eq!(stack.get_compact(0).unwrap().tag(), CompactTag::Long,
-                   "test setup must produce a CompactTag::Long slot");
+        assert_eq!(
+            stack.get_compact(0).unwrap().tag(),
+            CompactTag::Long,
+            "test setup must produce a CompactTag::Long slot"
+        );
 
         let mut map = HashMap::new();
         // A malicious pointer_map entry keyed off the Long's low pointer-shaped
@@ -2414,6 +2461,10 @@ mod tests {
         stack.update_object_refs(&map, &heap);
 
         let cv = stack.get_compact(0).expect("slot present");
-        assert_eq!(cv.to_bits(), old_bits, "non-heap Double bits must be preserved");
+        assert_eq!(
+            cv.to_bits(),
+            old_bits,
+            "non-heap Double bits must be preserved"
+        );
     }
 }

@@ -15,9 +15,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, ClassType};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventType, NSFont,
-    NSFontAttributeName, NSPasteboard, NSPasteboardTypeString, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventType, NSFont, NSFontAttributeName,
+    NSPasteboard, NSPasteboardTypeString, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     CGPoint, CGRect, CGSize, MainThreadMarker, NSPoint, NSRect, NSSize, NSString,
@@ -59,10 +58,9 @@ pub struct CocoaBackend {
 impl CocoaBackend {
     /// Create a new Cocoa backend. Must be called from the main thread.
     pub fn new() -> Result<Self, PlatformError> {
-        let mtm = MainThreadMarker::new()
-            .ok_or_else(|| PlatformError::EventLoopError(
-                "CocoaBackend must be created on the main thread".into(),
-            ))?;
+        let mtm = MainThreadMarker::new().ok_or_else(|| {
+            PlatformError::EventLoopError("CocoaBackend must be created on the main thread".into())
+        })?;
 
         // Ensure NSApplication is initialized.
         let _app = NSApplication::sharedApplication(mtm);
@@ -341,7 +339,9 @@ impl PlatformBackend for CocoaBackend {
             .map(|n| n > pixels.len())
             .unwrap_or(true)
         {
-            return Err(PlatformError::CreationFailed("pixel buffer too small".into()));
+            return Err(PlatformError::CreationFailed(
+                "pixel buffer too small".into(),
+            ));
         }
 
         // Core Graphics blit using the **C ABI** entry points (the previous
@@ -542,10 +542,7 @@ impl PlatformBackend for CocoaBackend {
             let key: Retained<NSString> = NSFontAttributeName.copy();
             let font_obj: &AnyObject = std::mem::transmute(&*font);
             let dict: Retained<objc2_foundation::NSDictionary<NSString, AnyObject>> =
-                objc2_foundation::NSDictionary::from_id_slice(
-                    &[key],
-                    &[font_obj.retain()],
-                );
+                objc2_foundation::NSDictionary::from_id_slice(&[key], &[font_obj.retain()]);
 
             let size: NSSize = msg_send![&text_ns, sizeWithAttributes: &*dict];
             (size.width as f32, size.height as f32)
@@ -656,8 +653,7 @@ impl PlatformBackend for CocoaBackend {
                     if px >= 0 && (px as u32) < w && py >= 0 && (py as u32) < h {
                         let alpha = glyph.alpha[gy * gw + gx] as u32;
                         if alpha > 0 {
-                            pixels[(py as u32 * w + px as u32) as usize] =
-                                (alpha << 24) | rgb;
+                            pixels[(py as u32 * w + px as u32) as usize] = (alpha << 24) | rgb;
                         }
                     }
                 }
@@ -685,9 +681,8 @@ impl PlatformBackend for CocoaBackend {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
             let ns_text = NSString::from_str(text);
-            let types = objc2_foundation::NSArray::from_retained_slice(&[
-                NSPasteboardTypeString.copy(),
-            ]);
+            let types =
+                objc2_foundation::NSArray::from_retained_slice(&[NSPasteboardTypeString.copy()]);
             pb.declareTypes_owner(&types, None);
             let ok: bool = msg_send![&pb, setString: &*ns_text, forType: NSPasteboardTypeString];
             if ok {
@@ -712,12 +707,7 @@ impl PlatformBackend for CocoaBackend {
         None
     }
 
-    fn show_message_dialog(
-        &mut self,
-        title: &str,
-        message: &str,
-        msg_type: MessageDialogType,
-    ) {
+    fn show_message_dialog(&mut self, title: &str, message: &str, msg_type: MessageDialogType) {
         unsafe {
             let alert: Retained<AnyObject> = msg_send![objc2::class!(NSAlert), new];
             let title_ns = NSString::from_str(title);
@@ -728,7 +718,7 @@ impl PlatformBackend for CocoaBackend {
             let style: isize = match msg_type {
                 MessageDialogType::Warning => 0, // NSAlertStyleWarning
                 MessageDialogType::Error => 2,   // NSAlertStyleCritical
-                _ => 1,                           // NSAlertStyleInformational
+                _ => 1,                          // NSAlertStyleInformational
             };
             let _: () = msg_send![&alert, setAlertStyle: style];
             let _: isize = msg_send![&alert, runModal];
@@ -807,10 +797,9 @@ fn load_fontdue_font(_settings: &FontdueSettings) -> Option<fontdue::Font> {
 
             for path in &search_paths {
                 if let Ok(data) = std::fs::read(path) {
-                    if let Ok(font) = fontdue::Font::from_bytes(
-                        data,
-                        fontdue::FontSettings::default(),
-                    ) {
+                    if let Ok(font) =
+                        fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+                    {
                         debug!("cocoa: loaded font for fontdue from {path}");
                         return Some(font);
                     }

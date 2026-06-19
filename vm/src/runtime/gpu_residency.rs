@@ -6,20 +6,25 @@
 //! `craton.gpu.internal.Native.arrayWrap*`.
 
 #[cfg(feature = "gpu-offload")]
-use std::sync::Arc;
-#[cfg(feature = "gpu-offload")]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "gpu-offload")]
 use parking_lot::RwLock;
 #[cfg(feature = "gpu-offload")]
 use rustc_hash::FxHashMap;
+#[cfg(feature = "gpu-offload")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "gpu-offload")]
+use std::sync::Arc;
 
 /// Primitive element type carried by a `GpuArray<T>`. The variants
 /// match the JVM primitive-array shapes the Phase 3 native shims
 /// admit.
 #[cfg(feature = "gpu-offload")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrimitiveType { I32, I64, F32, F64 }
+pub enum PrimitiveType {
+    I32,
+    I64,
+    F32,
+    F64,
+}
 
 #[cfg(feature = "gpu-offload")]
 impl PrimitiveType {
@@ -63,18 +68,24 @@ impl ResidencyTracker {
     /// the opaque handle the Java side stores in `GpuArray.handle`.
     pub fn wrap(&self, element_type: PrimitiveType, host_bytes: Vec<u8>) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.arrays.write().insert(handle, ResidentArray {
-            element_type,
-            host_bytes,
-            device_bytes: None,
-            last_stream: None,
-        });
+        self.arrays.write().insert(
+            handle,
+            ResidentArray {
+                element_type,
+                host_bytes,
+                device_bytes: None,
+                last_stream: None,
+            },
+        );
         handle
     }
 
     /// Sync host-side copy of an array. None if the handle is unknown.
     pub fn to_host(&self, handle: u64) -> Option<Vec<u8>> {
-        self.arrays.read().get(&handle).map(|a| a.host_bytes.clone())
+        self.arrays
+            .read()
+            .get(&handle)
+            .map(|a| a.host_bytes.clone())
     }
 
     pub fn element_type(&self, handle: u64) -> Option<PrimitiveType> {
@@ -83,7 +94,10 @@ impl ResidencyTracker {
 
     /// Whether the array currently has a live device buffer.
     pub fn is_resident(&self, handle: u64) -> bool {
-        self.arrays.read().get(&handle).map_or(false, |a| a.device_bytes.is_some())
+        self.arrays
+            .read()
+            .get(&handle)
+            .map_or(false, |a| a.device_bytes.is_some())
     }
 
     /// Release the entry. The device buffer drops; the host bytes
@@ -93,12 +107,16 @@ impl ResidencyTracker {
     }
 
     /// Iteration helpers for diagnostics / tests.
-    pub fn len(&self) -> usize { self.arrays.read().len() }
+    pub fn len(&self) -> usize {
+        self.arrays.read().len()
+    }
 }
 
 #[cfg(feature = "gpu-offload")]
 impl Default for ResidencyTracker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(all(test, feature = "gpu-offload"))]

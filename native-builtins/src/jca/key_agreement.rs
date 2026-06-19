@@ -29,7 +29,9 @@ const ECDH_SPI: &str = "sun/security/ec/ECDHKeyAgreement";
 
 /// First synthetic slot index (= real `KeyAgreement` instance-field count).
 fn base_offset(ctx: &mut dyn NativeContext) -> usize {
-    let cid = ctx.ensure_class_initialized(KA_CLASS).unwrap_or(ClassId::new(0));
+    let cid = ctx
+        .ensure_class_initialized(KA_CLASS)
+        .unwrap_or(ClassId::new(0));
     ctx.class_num_total_fields(cid)
 }
 

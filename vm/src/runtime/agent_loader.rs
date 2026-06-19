@@ -111,15 +111,9 @@ pub enum AgentLoadError {
     /// The agent's `premain` threw a fatal `Error` (e.g. `OutOfMemoryError`
     /// or any `java.lang.Error` subclass) — the VM should NOT continue.
     /// Plain `Exception`s are caught and turned into warnings instead.
-    PremainFatalError {
-        class: String,
-        message: String,
-    },
+    PremainFatalError { class: String, message: String },
     /// The Premain-Class itself failed to load (e.g. ClassNotFoundException).
-    PremainClassNotFound {
-        class: String,
-        cause: String,
-    },
+    PremainClassNotFound { class: String, cause: String },
     /// Internal VM error (linkage failure, out-of-memory during mirror
     /// construction, etc.) that escaped the normal premain-exception
     /// catch path.
@@ -142,7 +136,10 @@ impl fmt::Display for AgentLoadError {
                     jar.display()
                 )
             }
-            AgentLoadError::NoPremainMethod { class, descriptors_tried } => {
+            AgentLoadError::NoPremainMethod {
+                class,
+                descriptors_tried,
+            } => {
                 write!(
                     f,
                     "Premain-Class `{class}` has no `premain` method matching any of: {}",
@@ -198,10 +195,12 @@ pub fn parse_javaagent_spec(spec: &str) -> Result<LoadedAgent, AgentLoadError> {
     // Parse the manifest. We use cratonvm-classloading's `read_jar_manifest`
     // which already opens the JAR via the `zip` crate and runs
     // `ManifestInfo::parse` over `META-INF/MANIFEST.MF`.
-    let manifest = cratonvm_classloading::ClassPath::read_jar_manifest(&jar_path)
-        .ok_or_else(|| AgentLoadError::JarNotFound {
-            path: jar_path.clone(),
-            source: "open or parse failed".to_string(),
+    let manifest =
+        cratonvm_classloading::ClassPath::read_jar_manifest(&jar_path).ok_or_else(|| {
+            AgentLoadError::JarNotFound {
+                path: jar_path.clone(),
+                source: "open or parse failed".to_string(),
+            }
         })?;
 
     parse_manifest_attributes(&jar_path, &manifest, agent_args)
@@ -235,8 +234,7 @@ pub(crate) fn parse_manifest_attributes(
         .filter(|s| !s.is_empty());
 
     let can_redefine = boolean_attribute(&manifest.attributes, "Can-Redefine-Classes");
-    let can_retransform =
-        boolean_attribute(&manifest.attributes, "Can-Retransform-Classes");
+    let can_retransform = boolean_attribute(&manifest.attributes, "Can-Retransform-Classes");
     let can_set_native_method_prefix =
         boolean_attribute(&manifest.attributes, "Can-Set-Native-Method-Prefix");
 
@@ -271,10 +269,7 @@ pub(crate) fn parse_manifest_attributes(
 /// Read a manifest attribute as a boolean per the spec rules:
 /// only the literal `true` (case-insensitive) is `true`; anything else
 /// (missing, empty, `false`, garbage) is `false`.
-fn boolean_attribute(
-    attrs: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> bool {
+fn boolean_attribute(attrs: &std::collections::HashMap<String, String>, key: &str) -> bool {
     attrs
         .get(key)
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -305,10 +300,7 @@ pub fn invoke_premains(
     for agent in agents {
         match invoke_one_premain(shared, thread, agent) {
             Ok(()) => {
-                tracing::info!(
-                    "javaagent: {} premain completed",
-                    agent.premain_class
-                );
+                tracing::info!("javaagent: {} premain completed", agent.premain_class);
             }
             Err(e @ AgentLoadError::PremainFatalError { .. }) => {
                 // Per spec a fatal Error from the agent should abort
@@ -419,10 +411,7 @@ fn invoke_one_premain(
     } else {
         return Err(AgentLoadError::NoPremainMethod {
             class: agent.premain_class.clone(),
-            descriptors_tried: vec![
-                two_arg_desc.to_string(),
-                one_arg_desc.to_string(),
-            ],
+            descriptors_tried: vec![two_arg_desc.to_string(), one_arg_desc.to_string()],
         });
     };
 
@@ -512,12 +501,7 @@ fn build_instrumentation_mirror(
 /// Returns `true` iff a class declares (or inherits) a method with the
 /// given name and descriptor. Used to pick the two-arg-vs-one-arg
 /// `premain` overload.
-fn method_present(
-    shared: &SharedVm,
-    class_internal: &str,
-    name: &str,
-    descriptor: &str,
-) -> bool {
+fn method_present(shared: &SharedVm, class_internal: &str, name: &str, descriptor: &str) -> bool {
     let cm = shared.class_manager.read();
     let cid = match cm.get_loaded_class_id(class_internal) {
         Some(id) => id,
@@ -573,12 +557,9 @@ mod tests {
     fn parse_manifest_premain_only() {
         let manifest_text = "Manifest-Version: 1.0\r\nPremain-Class: foo.Bar\r\n";
         let info = ManifestInfo::parse(manifest_text.as_bytes());
-        let agent = parse_manifest_attributes(
-            Path::new("/tmp/x.jar"),
-            &info,
-            Some("opt1=foo".into()),
-        )
-        .expect("parse_manifest_attributes");
+        let agent =
+            parse_manifest_attributes(Path::new("/tmp/x.jar"), &info, Some("opt1=foo".into()))
+                .expect("parse_manifest_attributes");
         assert_eq!(agent.premain_class, "foo.Bar");
         assert_eq!(agent.agent_args.as_deref(), Some("opt1=foo"));
         assert!(!agent.can_redefine);
@@ -597,12 +578,8 @@ mod tests {
              Can-Retransform-Classes: TRUE\r\n\
              Can-Set-Native-Method-Prefix: false\r\n";
         let info = ManifestInfo::parse(manifest_text.as_bytes());
-        let agent = parse_manifest_attributes(
-            Path::new("/opt/agents/agent.jar"),
-            &info,
-            None,
-        )
-        .expect("parse_manifest_attributes");
+        let agent = parse_manifest_attributes(Path::new("/opt/agents/agent.jar"), &info, None)
+            .expect("parse_manifest_attributes");
 
         assert_eq!(agent.premain_class, "com.example.Agent");
         assert_eq!(agent.agent_class.as_deref(), Some("com.example.Agent"));
@@ -611,10 +588,14 @@ mod tests {
         assert!(!agent.can_set_native_method_prefix);
         // Boot-Class-Path entries are resolved relative to the JAR's parent.
         assert_eq!(agent.boot_class_path.len(), 2);
-        assert!(agent.boot_class_path[0].ends_with("lib/x.jar")
-            || agent.boot_class_path[0].ends_with("lib\\x.jar"));
-        assert!(agent.boot_class_path[1].ends_with("lib/y.jar")
-            || agent.boot_class_path[1].ends_with("lib\\y.jar"));
+        assert!(
+            agent.boot_class_path[0].ends_with("lib/x.jar")
+                || agent.boot_class_path[0].ends_with("lib\\x.jar")
+        );
+        assert!(
+            agent.boot_class_path[1].ends_with("lib/y.jar")
+                || agent.boot_class_path[1].ends_with("lib\\y.jar")
+        );
     }
 
     #[test]
@@ -637,18 +618,16 @@ mod tests {
 
     #[test]
     fn parse_javaagent_spec_bad_prefix() {
-        let err = parse_javaagent_spec("-Xfoo:bar.jar")
-            .expect_err("non -javaagent: arg should fail");
+        let err =
+            parse_javaagent_spec("-Xfoo:bar.jar").expect_err("non -javaagent: arg should fail");
         assert!(matches!(err, AgentLoadError::BadPrefix(_)));
     }
 
     #[test]
     fn parse_javaagent_spec_missing_jar_file() {
         // Using a non-existent jar should produce JarNotFound.
-        let err = parse_javaagent_spec(
-            "-javaagent:/nonexistent/path/definitely-not-here.jar",
-        )
-        .expect_err("missing jar should fail");
+        let err = parse_javaagent_spec("-javaagent:/nonexistent/path/definitely-not-here.jar")
+            .expect_err("missing jar should fail");
         assert!(matches!(err, AgentLoadError::JarNotFound { .. }));
     }
 
@@ -689,8 +668,8 @@ mod tests {
         {
             let file = std::fs::File::create(&jar_path).expect("create jar");
             let mut zip = ZipWriter::new(file);
-            let opts: SimpleFileOptions = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zip.start_file("META-INF/MANIFEST.MF", opts)
                 .expect("start file");
             zip.write_all(manifest_text.as_bytes())
@@ -698,18 +677,17 @@ mod tests {
             zip.finish().expect("finish zip");
         }
 
-        let spec = format!(
-            "-javaagent:{}=key=value,opt2",
-            jar_path.to_string_lossy()
-        );
+        let spec = format!("-javaagent:{}=key=value,opt2", jar_path.to_string_lossy());
         let agent = parse_javaagent_spec(&spec).expect("round-trip ok");
         assert_eq!(agent.premain_class, "com.example.MyAgent");
         assert_eq!(agent.agent_args.as_deref(), Some("key=value,opt2"));
         assert!(agent.can_redefine);
         assert!(!agent.can_retransform);
         assert_eq!(agent.boot_class_path.len(), 1);
-        assert!(agent.boot_class_path[0].ends_with("lib/extra.jar")
-            || agent.boot_class_path[0].ends_with("lib\\extra.jar"));
+        assert!(
+            agent.boot_class_path[0].ends_with("lib/extra.jar")
+                || agent.boot_class_path[0].ends_with("lib\\extra.jar")
+        );
         assert_eq!(agent.jar_path, jar_path);
     }
 
@@ -725,13 +703,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let jar_path = tmp.path().join("noopts.jar");
 
-        let manifest_text =
-            "Manifest-Version: 1.0\r\nPremain-Class: x.Y\r\n";
+        let manifest_text = "Manifest-Version: 1.0\r\nPremain-Class: x.Y\r\n";
         {
             let file = std::fs::File::create(&jar_path).expect("create jar");
             let mut zip = ZipWriter::new(file);
-            let opts: SimpleFileOptions = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zip.start_file("META-INF/MANIFEST.MF", opts)
                 .expect("start file");
             zip.write_all(manifest_text.as_bytes())
@@ -755,13 +732,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let jar_path = tmp.path().join("args-with-equals.jar");
 
-        let manifest_text =
-            "Manifest-Version: 1.0\r\nPremain-Class: a.B\r\n";
+        let manifest_text = "Manifest-Version: 1.0\r\nPremain-Class: a.B\r\n";
         {
             let file = std::fs::File::create(&jar_path).expect("create jar");
             let mut zip = ZipWriter::new(file);
-            let opts: SimpleFileOptions = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zip.start_file("META-INF/MANIFEST.MF", opts)
                 .expect("start file");
             zip.write_all(manifest_text.as_bytes())
@@ -770,10 +746,7 @@ mod tests {
         }
 
         // First `=` separates path from args; subsequent `=` are agent-side.
-        let spec = format!(
-            "-javaagent:{}=k1=v1,k2=v2",
-            jar_path.to_string_lossy()
-        );
+        let spec = format!("-javaagent:{}=k1=v1,k2=v2", jar_path.to_string_lossy());
         let agent = parse_javaagent_spec(&spec).expect("ok");
         assert_eq!(agent.agent_args.as_deref(), Some("k1=v1,k2=v2"));
     }

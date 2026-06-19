@@ -95,7 +95,10 @@ fn class_get_declared_method_natives_registered() {
 #[test]
 fn invocation_target_exception_class_resolvable() {
     let target = "java/lang/reflect/InvocationTargetException";
-    assert_eq!(target.replace('/', "."), "java.lang.reflect.InvocationTargetException");
+    assert_eq!(
+        target.replace('/', "."),
+        "java.lang.reflect.InvocationTargetException"
+    );
 }
 
 #[test]
@@ -116,10 +119,7 @@ fn method_invoke_probe_class_files_exist_when_staged() {
         "MethodInvokeProbe$IFace.class",
         "MethodInvokeProbe$WithIface.class",
     ] {
-        assert!(
-            probe.join(inner).exists(),
-            "{inner} must be staged"
-        );
+        assert!(probe.join(inner).exists(), "{inner} must be staged");
     }
 }
 
@@ -169,16 +169,25 @@ fn descriptor_parsing_round_trip() {
         ("(I)I", 1, "I"),
         ("(BSC)Z", 3, "Z"),
         ("([I)I", 1, "I"),
-        ("([Ljava/lang/String;)Ljava/lang/String;", 1, "Ljava/lang/String;"),
+        (
+            "([Ljava/lang/String;)Ljava/lang/String;",
+            1,
+            "Ljava/lang/String;",
+        ),
         ("()V", 0, "V"),
-        ("(Ljava/lang/Object;)Ljava/lang/Object;", 1, "Ljava/lang/Object;"),
+        (
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            1,
+            "Ljava/lang/Object;",
+        ),
         ("(JJ)D", 2, "D"),
     ];
     for (desc, expected_arity, expected_ret) in descriptors {
         let close = desc.find(')').expect("descriptor must have ')'");
         let _params_part = &desc[1..close];
         let ret_part = &desc[close + 1..];
-        assert_eq!(ret_part, *expected_ret,
+        assert_eq!(
+            ret_part, *expected_ret,
             "ret mismatch for {desc}: expected {expected_ret}, got {ret_part}"
         );
         let mut count = 0;
@@ -202,7 +211,8 @@ fn descriptor_parsing_round_trip() {
                 _ => count += 1,
             }
         }
-        assert_eq!(count, *expected_arity,
+        assert_eq!(
+            count, *expected_arity,
             "arity mismatch for {desc}: expected {expected_arity}, got {count}"
         );
     }
@@ -246,7 +256,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -333,7 +347,10 @@ fn case_passed(output: &str, n: u32) -> bool {
 /// Returns the FAIL message for the case if it failed, else None.
 fn fail_message(output: &str, n: u32) -> Option<String> {
     let needle = format!("FAIL-{n}:");
-    output.lines().find(|l| l.contains(&needle)).map(|l| l.to_string())
+    output
+        .lines()
+        .find(|l| l.contains(&needle))
+        .map(|l| l.to_string())
 }
 
 /// Assert that every case in `range` PASSes; if any fails, the panic
@@ -342,9 +359,8 @@ fn assert_cases_pass(category: &str, output: &str, cases: &[u32]) {
     let mut failures = Vec::new();
     for &n in cases {
         if !case_passed(output, n) {
-            let msg = fail_message(output, n).unwrap_or_else(|| {
-                format!("(no PASS-{n} or FAIL-{n} line found in probe output)")
-            });
+            let msg = fail_message(output, n)
+                .unwrap_or_else(|| format!("(no PASS-{n} or FAIL-{n} line found in probe output)"));
             failures.push(msg);
         }
     }
@@ -379,14 +395,10 @@ fn method_invoke_probe_composite_50_of_50() {
         // Pull out the summary line for a clean panic message.
         let summary: String = output
             .lines()
-            .filter(|l| {
-                l.starts_with("PASSED:") || l.starts_with("FAILED:") || *l == "FAIL"
-            })
+            .filter(|l| l.starts_with("PASSED:") || l.starts_with("FAILED:") || *l == "FAIL")
             .collect::<Vec<_>>()
             .join(" | ");
-        panic!(
-            "WP2.2 composite probe did not reach 50/50. Summary: {summary}"
-        );
+        panic!("WP2.2 composite probe did not reach 50/50. Summary: {summary}");
     }
 }
 
@@ -473,11 +485,7 @@ fn method_invoke_cat_exception_and_varargs() {
         Some(o) => o,
         None => return,
     };
-    assert_cases_pass(
-        "exception/varargs 28-30",
-        &output,
-        &[28, 29, 30],
-    );
+    assert_cases_pass("exception/varargs 28-30", &output, &[28, 29, 30]);
 }
 
 /// Cases 31-34: void return (31), virtual dispatch on subclass receiver (32),
@@ -489,11 +497,7 @@ fn method_invoke_cat_void_virtual_npe() {
         Some(o) => o,
         None => return,
     };
-    assert_cases_pass(
-        "void/virtual/npe 31-34",
-        &output,
-        &[31, 32, 33, 34],
-    );
+    assert_cases_pass("void/virtual/npe 31-34", &output, &[31, 32, 33, 34]);
 }
 
 /// Cases 35-37: argument-validation errors — NoSuchMethodException on wrong

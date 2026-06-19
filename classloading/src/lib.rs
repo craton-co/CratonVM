@@ -40,16 +40,32 @@ pub use class::{
 };
 pub use class_manager::{
     any_class_redefined,
-    install_class_file_load_hook, install_class_load_hook, install_class_prepare_hook,
-    install_jit_invalidate_hook, install_resolution_invalidate_hook,
-    install_vtable_install_hook, install_vtable_override_hook,
-    is_builtin_classloader_name, jdk_superclass_lookup, register_builtin_classloaders,
-    ClassFileLoadHook, ClassManager, DefineClassOptions, JitInvalidateHook, JvmtiClassHook,
-    RedefineOptions, ResolutionInvalidateHook, VtableInstallHook, VtableMethodSnapshot,
-    VtableOverrideHook, VtableSlotDescriptor,
+    install_class_file_load_hook,
+    install_class_load_hook,
+    install_class_prepare_hook,
+    install_jit_invalidate_hook,
+    install_resolution_invalidate_hook,
+    install_vtable_install_hook,
+    install_vtable_override_hook,
+    is_builtin_classloader_name,
+    jdk_superclass_lookup,
+    register_builtin_classloaders,
+    ClassFileLoadHook,
+    ClassManager,
+    DefineClassOptions,
+    JitInvalidateHook,
+    JvmtiClassHook,
+    RedefineOptions,
+    ResolutionInvalidateHook,
+    VtableInstallHook,
+    VtableMethodSnapshot,
+    VtableOverrideHook,
+    VtableSlotDescriptor,
+    CLASS_INIT_INITIALIZED,
     // Round 5 audit fix (HIGH): AtomicU8 class-init fast-path constants
     // consumed by `vm_util::ensure_class_initialized_shared`.
-    CLASS_INIT_IN_PROGRESS, CLASS_INIT_INITIALIZED, CLASS_INIT_UNINITIALIZED,
+    CLASS_INIT_IN_PROGRESS,
+    CLASS_INIT_UNINITIALIZED,
 };
 pub use class_path::{ClassPath, ManifestInfo};
 // Round 5 audit fix (MED #10) / Round 7 audit fix (MED #11): expose the
@@ -67,6 +83,6 @@ pub use resolution::{LinkResolver, ResolvedMember};
 // 3 vtable dispatches per probe).
 pub use loaders::{BUILTIN_LOADER_DELEGATION_CHAIN, MAX_BUILTIN_LOADER_DEPTH};
 pub use module::{
-    descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry,
-    JAVA_BASE, UNNAMED_MODULE,
+    descriptor_from_module_attribute, package_of, ModuleDescriptor, ModuleRegistry, JAVA_BASE,
+    UNNAMED_MODULE,
 };

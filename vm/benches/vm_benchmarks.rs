@@ -12,15 +12,15 @@
 //! - Interpreter: recursive fibonacci
 //! - String creation
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 
+use cratonvm_vm::classloading::{ClassId, ClassLoaderId, ClassState};
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::vm::{SharedVm, Vm, invoke_on_class_shared};
-use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
-use cratonvm_vm::classloading::{ClassId, ClassState, ClassLoaderId};
-use cratonvm_vm::types::Value;
 use cratonvm_vm::native::builtins::register_builtins;
+use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{invoke_on_class_shared, SharedVm, Vm};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,10 +32,10 @@ fn register_bench_class(
     name: &str,
     methods: Vec<cratonvm_reader::method::ClassFileMethod>,
 ) -> ClassId {
-    use cratonvm_vm::classloading::Class;
     use cratonvm_reader::class_access_flags::ClassAccessFlags;
     use cratonvm_reader::class_file_version::ClassFileVersion;
     use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_vm::classloading::Class;
 
     let mut cm = shared.class_manager.write();
     let id = cm.class_store.next_id();
@@ -46,7 +46,8 @@ fn register_bench_class(
         name: Arc::clone(&class_name),
         source_file: None,
         version: ClassFileVersion::JAVA_8,
-        state: ClassState::Initialized, initializing_thread: None,
+        state: ClassState::Initialized,
+        initializing_thread: None,
         constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
         access_flags: ClassAccessFlags::from_bits_truncate(0x0021),
         superclass: None,
@@ -82,33 +83,49 @@ fn make_fib_bytecode() -> Vec<u8> {
     let mut code = Vec::new();
     // a = 0
     code.push(0x03); // iconst_0
-    code.push(0x36); code.push(0x01); // istore 1
-    // b = 1
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // b = 1
     code.push(0x04); // iconst_1
-    code.push(0x36); code.push(0x02); // istore 2
-    // i = 0
+    code.push(0x36);
+    code.push(0x02); // istore 2
+                     // i = 0
     code.push(0x03); // iconst_0
-    code.push(0x36); code.push(0x03); // istore 3
+    code.push(0x36);
+    code.push(0x03); // istore 3
     let loop_start = code.len(); // 9
-    // if (i >= n) goto end
-    code.push(0x15); code.push(0x03); // iload 3
-    code.push(0x15); code.push(0x00); // iload 0
+                                 // if (i >= n) goto end
+    code.push(0x15);
+    code.push(0x03); // iload 3
+    code.push(0x15);
+    code.push(0x00); // iload 0
     let if_pc = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge (placeholder)
-    // t = a + b
-    code.push(0x15); code.push(0x01); // iload 1
-    code.push(0x15); code.push(0x02); // iload 2
-    code.push(0x60);                  // iadd
-    code.push(0x36); code.push(0x04); // istore 4
-    // a = b
-    code.push(0x15); code.push(0x02); // iload 2
-    code.push(0x36); code.push(0x01); // istore 1
-    // b = t
-    code.push(0x15); code.push(0x04); // iload 4
-    code.push(0x36); code.push(0x02); // istore 2
-    // i++
-    code.push(0x84); code.push(0x03); code.push(0x01); // iinc 3, 1
-    // goto loop_start
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge (placeholder)
+                     // t = a + b
+    code.push(0x15);
+    code.push(0x01); // iload 1
+    code.push(0x15);
+    code.push(0x02); // iload 2
+    code.push(0x60); // iadd
+    code.push(0x36);
+    code.push(0x04); // istore 4
+                     // a = b
+    code.push(0x15);
+    code.push(0x02); // iload 2
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // b = t
+    code.push(0x15);
+    code.push(0x04); // iload 4
+    code.push(0x36);
+    code.push(0x02); // istore 2
+                     // i++
+    code.push(0x84);
+    code.push(0x03);
+    code.push(0x01); // iinc 3, 1
+                     // goto loop_start
     let goto_pc = code.len();
     let goto_offset = (loop_start as i16) - (goto_pc as i16);
     code.push(0xA7);
@@ -121,8 +138,9 @@ fn make_fib_bytecode() -> Vec<u8> {
     code[if_pc + 1] = ((if_offset >> 8) & 0xFF) as u8;
     code[if_pc + 2] = (if_offset & 0xFF) as u8;
     // return a
-    code.push(0x15); code.push(0x01); // iload 1
-    code.push(0xAC);                  // ireturn
+    code.push(0x15);
+    code.push(0x01); // iload 1
+    code.push(0xAC); // ireturn
     code
 }
 
@@ -152,33 +170,49 @@ fn make_nbody_bytecode() -> Vec<u8> {
     let mut code = Vec::new();
     // total = 0
     code.push(0x03); // iconst_0
-    code.push(0x36); code.push(0x01); // istore 1
-    // i = 0
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // i = 0
     code.push(0x03);
-    code.push(0x36); code.push(0x02); // istore 2
+    code.push(0x36);
+    code.push(0x02); // istore 2
     let outer_start = code.len();
     // if (i >= n) goto outer_end
-    code.push(0x15); code.push(0x02); // iload 2 (i)
-    code.push(0x15); code.push(0x00); // iload 0 (n)
+    code.push(0x15);
+    code.push(0x02); // iload 2 (i)
+    code.push(0x15);
+    code.push(0x00); // iload 0 (n)
     let outer_if = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // j = 0
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // j = 0
     code.push(0x03);
-    code.push(0x36); code.push(0x03); // istore 3
+    code.push(0x36);
+    code.push(0x03); // istore 3
     let inner_start = code.len();
     // if (j >= i) goto inner_end
-    code.push(0x15); code.push(0x03); // iload 3 (j)
-    code.push(0x15); code.push(0x02); // iload 2 (i)
+    code.push(0x15);
+    code.push(0x03); // iload 3 (j)
+    code.push(0x15);
+    code.push(0x02); // iload 2 (i)
     let inner_if = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // total = total + j
-    code.push(0x15); code.push(0x01); // iload 1 (total)
-    code.push(0x15); code.push(0x03); // iload 3 (j)
-    code.push(0x60);                  // iadd
-    code.push(0x36); code.push(0x01); // istore 1
-    // j++
-    code.push(0x84); code.push(0x03); code.push(0x01); // iinc 3,1
-    // goto inner_start
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // total = total + j
+    code.push(0x15);
+    code.push(0x01); // iload 1 (total)
+    code.push(0x15);
+    code.push(0x03); // iload 3 (j)
+    code.push(0x60); // iadd
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // j++
+    code.push(0x84);
+    code.push(0x03);
+    code.push(0x01); // iinc 3,1
+                     // goto inner_start
     let inner_goto = code.len();
     let inner_off = (inner_start as i16) - (inner_goto as i16);
     code.push(0xA7);
@@ -189,8 +223,10 @@ fn make_nbody_bytecode() -> Vec<u8> {
     code[inner_if + 1] = ((inner_off >> 8) & 0xFF) as u8;
     code[inner_if + 2] = (inner_off & 0xFF) as u8;
     // i++
-    code.push(0x84); code.push(0x02); code.push(0x01); // iinc 2,1
-    // goto outer_start
+    code.push(0x84);
+    code.push(0x02);
+    code.push(0x01); // iinc 2,1
+                     // goto outer_start
     let outer_goto = code.len();
     let outer_off = (outer_start as i16) - (outer_goto as i16);
     code.push(0xA7);
@@ -201,8 +237,9 @@ fn make_nbody_bytecode() -> Vec<u8> {
     code[outer_if + 1] = ((outer_off >> 8) & 0xFF) as u8;
     code[outer_if + 2] = (outer_off & 0xFF) as u8;
     // return total
-    code.push(0x15); code.push(0x01); // iload 1
-    code.push(0xAC);                  // ireturn
+    code.push(0x15);
+    code.push(0x01); // iload 1
+    code.push(0xAC); // ireturn
     code
 }
 
@@ -219,25 +256,35 @@ fn make_binary_trees_bytecode() -> Vec<u8> {
     let mut code = Vec::new();
     // result = 0
     code.push(0x03);
-    code.push(0x36); code.push(0x01); // istore 1
-    // i = 0
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // i = 0
     code.push(0x03);
-    code.push(0x36); code.push(0x02); // istore 2
+    code.push(0x36);
+    code.push(0x02); // istore 2
     let loop_start = code.len();
     // if (i >= d) goto end
-    code.push(0x15); code.push(0x02); // iload 2 (i)
-    code.push(0x15); code.push(0x00); // iload 0 (d)
+    code.push(0x15);
+    code.push(0x02); // iload 2 (i)
+    code.push(0x15);
+    code.push(0x00); // iload 0 (d)
     let if_pc = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // result = result*2 + 1
-    code.push(0x15); code.push(0x01); // iload 1
-    code.push(0x05);                  // iconst_2
-    code.push(0x68);                  // imul
-    code.push(0x04);                  // iconst_1
-    code.push(0x60);                  // iadd
-    code.push(0x36); code.push(0x01); // istore 1
-    // i++
-    code.push(0x84); code.push(0x02); code.push(0x01);
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // result = result*2 + 1
+    code.push(0x15);
+    code.push(0x01); // iload 1
+    code.push(0x05); // iconst_2
+    code.push(0x68); // imul
+    code.push(0x04); // iconst_1
+    code.push(0x60); // iadd
+    code.push(0x36);
+    code.push(0x01); // istore 1
+                     // i++
+    code.push(0x84);
+    code.push(0x02);
+    code.push(0x01);
     // goto loop_start
     let goto_pc = code.len();
     let goto_off = (loop_start as i16) - (goto_pc as i16);
@@ -249,7 +296,8 @@ fn make_binary_trees_bytecode() -> Vec<u8> {
     code[if_pc + 1] = ((if_off >> 8) & 0xFF) as u8;
     code[if_pc + 2] = (if_off & 0xFF) as u8;
     // return result
-    code.push(0x15); code.push(0x01);
+    code.push(0x15);
+    code.push(0x01);
     code.push(0xAC);
     code
 }
@@ -259,17 +307,23 @@ fn make_counting_loop_bytecode(n: i32) -> Vec<u8> {
     let mut code = Vec::new();
     // local[0] = 0  (counter)
     code.push(0x03); // iconst_0
-    code.push(0x36); code.push(0x00); // istore 0
+    code.push(0x36);
+    code.push(0x00); // istore 0
     let loop_start = code.len(); // 3
-    code.push(0x15); code.push(0x00); // iload 0
-    // sipush N
+    code.push(0x15);
+    code.push(0x00); // iload 0
+                     // sipush N
     code.push(0x11);
     code.push(((n >> 8) & 0xFF) as u8);
     code.push((n & 0xFF) as u8);
     let if_pc = code.len(); // 8
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge (placeholder)
-    // iinc 0, 1
-    code.push(0x84); code.push(0x00); code.push(0x01);
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge (placeholder)
+                     // iinc 0, 1
+    code.push(0x84);
+    code.push(0x00);
+    code.push(0x01);
     // goto loop_start
     let goto_pc = code.len();
     let goto_offset = (loop_start as i16) - (goto_pc as i16);
@@ -282,8 +336,9 @@ fn make_counting_loop_bytecode(n: i32) -> Vec<u8> {
     code[if_pc + 1] = ((if_offset >> 8) & 0xFF) as u8;
     code[if_pc + 2] = (if_offset & 0xFF) as u8;
     // return counter
-    code.push(0x15); code.push(0x00); // iload 0
-    code.push(0xAC);                  // ireturn
+    code.push(0x15);
+    code.push(0x00); // iload 0
+    code.push(0xAC); // ireturn
     code
 }
 
@@ -317,19 +372,25 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
                     name: "main".into(),
                     descriptor: "()I".into(),
                     access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                    attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                        max_stack: 1,
-                        max_locals: 0,
-                        code: cratonvm_reader::ByteView::from_vec(code.clone()),
-                        exception_table: vec![],
-                        attributes: vec![],
-                    }))],
+                    attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                        Attribute::Code(CodeAttribute {
+                            max_stack: 1,
+                            max_locals: 0,
+                            code: cratonvm_reader::ByteView::from_vec(code.clone()),
+                            exception_table: vec![],
+                            attributes: vec![],
+                        }),
+                    )],
                 }],
             );
             let mut thread = JvmThread::new(ThreadId(0), "main");
             let _ = black_box(invoke_on_class_shared(
-                &shared, &mut thread, class_id,
-                "main", "()I", &[],
+                &shared,
+                &mut thread,
+                class_id,
+                "main",
+                "()I",
+                &[],
             ));
         });
     });
@@ -374,7 +435,9 @@ fn bench_gc_cycle(c: &mut Criterion) {
             if shared.heap.needs_gc() {
                 // Single-threaded benchmark — no other mutator exists.
                 let stw = cratonvm_gc::collector::StopTheWorldToken::new();
-                let _ = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
+                let _ = shared
+                    .heap
+                    .collect_garbage(&stw, &mut roots, &shared.monitors);
             }
             black_box(&roots);
         });
@@ -389,9 +452,10 @@ fn bench_native_method_dispatch(c: &mut Criterion) {
     c.bench_function("native_dispatch_noop", |b| {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
-            if let Some(cb) = shared.native_methods.find(
-                "java/lang/Object", "<init>", "()V",
-            ) {
+            if let Some(cb) = shared
+                .native_methods
+                .find("java/lang/Object", "<init>", "()V")
+            {
                 let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                     shared: &shared,
                     thread: &mut thread,
@@ -419,21 +483,27 @@ fn bench_interpreter_counting_loop(c: &mut Criterion) {
                 name: "count".into(),
                 descriptor: "()I".into(),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                    max_stack: 2,
-                    max_locals: 1,
-                    code: cratonvm_reader::ByteView::from_vec(code),
-                    exception_table: vec![],
-                    attributes: vec![],
-                }))],
+                attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                    Attribute::Code(CodeAttribute {
+                        max_stack: 2,
+                        max_locals: 1,
+                        code: cratonvm_reader::ByteView::from_vec(code),
+                        exception_table: vec![],
+                        attributes: vec![],
+                    }),
+                )],
             }],
         );
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let mut thread = JvmThread::new(ThreadId(0), "bench");
                 let _ = black_box(invoke_on_class_shared(
-                    &shared, &mut thread, class_id,
-                    "count", "()I", &[],
+                    &shared,
+                    &mut thread,
+                    class_id,
+                    "count",
+                    "()I",
+                    &[],
                 ));
             });
         });
@@ -454,13 +524,15 @@ fn bench_interpreter_fibonacci(c: &mut Criterion) {
             name: "fib".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 3,
-                max_locals: 5,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 3,
+                    max_locals: 5,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -470,8 +542,12 @@ fn bench_interpreter_fibonacci(c: &mut Criterion) {
             b.iter(|| {
                 let mut thread = JvmThread::new(ThreadId(0), "bench");
                 let _ = black_box(invoke_on_class_shared(
-                    &shared, &mut thread, class_id,
-                    "fib", "(I)I", &[Value::Int(n)],
+                    &shared,
+                    &mut thread,
+                    class_id,
+                    "fib",
+                    "(I)I",
+                    &[Value::Int(n)],
                 ));
             });
         });
@@ -492,13 +568,15 @@ fn bench_shootout_nbody(c: &mut Criterion) {
             name: "nbodyLoop".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 3,
-                max_locals: 4,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 3,
+                    max_locals: 4,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -508,8 +586,12 @@ fn bench_shootout_nbody(c: &mut Criterion) {
             b.iter(|| {
                 let mut thread = JvmThread::new(ThreadId(0), "bench");
                 let _ = black_box(invoke_on_class_shared(
-                    &shared, &mut thread, class_id,
-                    "nbodyLoop", "(I)I", &[Value::Int(n)],
+                    &shared,
+                    &mut thread,
+                    class_id,
+                    "nbodyLoop",
+                    "(I)I",
+                    &[Value::Int(n)],
                 ));
             });
         });
@@ -530,13 +612,15 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
             name: "treeSum".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 3,
-                max_locals: 3,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 3,
+                    max_locals: 3,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -546,8 +630,12 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
             b.iter(|| {
                 let mut thread = JvmThread::new(ThreadId(0), "bench");
                 let _ = black_box(invoke_on_class_shared(
-                    &shared, &mut thread, class_id,
-                    "treeSum", "(I)I", &[Value::Int(d)],
+                    &shared,
+                    &mut thread,
+                    class_id,
+                    "treeSum",
+                    "(I)I",
+                    &[Value::Int(d)],
                 ));
             });
         });
@@ -598,9 +686,10 @@ fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
             for _ in 0..10_000 {
-                if let Some(cb) = shared.native_methods.find(
-                    "java/lang/Object", "<init>", "()V",
-                ) {
+                if let Some(cb) = shared
+                    .native_methods
+                    .find("java/lang/Object", "<init>", "()V")
+                {
                     let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                         shared: &shared,
                         thread: &mut thread,
@@ -639,71 +728,110 @@ fn make_sor_bytecode() -> Vec<u8> {
 
     // Locals: 0=n, 1=iters, 2=sum, 3=iter, 4=i, 5=j, 6=limit(n-1)
     // sum = 0
-    code.push(0x03); code.push(0x36); code.push(0x02); // iconst_0; istore 2
-    // limit = n - 1
-    code.push(0x15); code.push(0x00); // iload 0 (n)
-    code.push(0x04);                  // iconst_1
-    code.push(0x64);                  // isub
-    code.push(0x36); code.push(0x06); // istore 6
-    // iter = 0
-    code.push(0x03); code.push(0x36); code.push(0x03); // iconst_0; istore 3
+    code.push(0x03);
+    code.push(0x36);
+    code.push(0x02); // iconst_0; istore 2
+                     // limit = n - 1
+    code.push(0x15);
+    code.push(0x00); // iload 0 (n)
+    code.push(0x04); // iconst_1
+    code.push(0x64); // isub
+    code.push(0x36);
+    code.push(0x06); // istore 6
+                     // iter = 0
+    code.push(0x03);
+    code.push(0x36);
+    code.push(0x03); // iconst_0; istore 3
     let iter_start = code.len(); // 12
-    // if (iter >= iters) goto end
-    code.push(0x15); code.push(0x03); // iload 3
-    code.push(0x15); code.push(0x01); // iload 1
+                                 // if (iter >= iters) goto end
+    code.push(0x15);
+    code.push(0x03); // iload 3
+    code.push(0x15);
+    code.push(0x01); // iload 1
     let iter_if = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // i = 1
-    code.push(0x04); code.push(0x36); code.push(0x04); // iconst_1; istore 4
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // i = 1
+    code.push(0x04);
+    code.push(0x36);
+    code.push(0x04); // iconst_1; istore 4
     let i_start = code.len(); // ~22
-    code.push(0x15); code.push(0x04); // iload 4
-    code.push(0x15); code.push(0x06); // iload 6 (limit)
+    code.push(0x15);
+    code.push(0x04); // iload 4
+    code.push(0x15);
+    code.push(0x06); // iload 6 (limit)
     let i_if = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // j = 1
-    code.push(0x04); code.push(0x36); code.push(0x05); // iconst_1; istore 5
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // j = 1
+    code.push(0x04);
+    code.push(0x36);
+    code.push(0x05); // iconst_1; istore 5
     let j_start = code.len();
-    code.push(0x15); code.push(0x05); // iload 5
-    code.push(0x15); code.push(0x06); // iload 6 (limit)
+    code.push(0x15);
+    code.push(0x05); // iload 5
+    code.push(0x15);
+    code.push(0x06); // iload 6 (limit)
     let j_if = code.len();
-    code.push(0xA2); code.push(0x00); code.push(0x00); // if_icmpge placeholder
-    // sum += i * j
-    code.push(0x15); code.push(0x02); // iload 2 (sum)
-    code.push(0x15); code.push(0x04); // iload 4 (i)
-    code.push(0x15); code.push(0x05); // iload 5 (j)
-    code.push(0x68);                  // imul
-    code.push(0x60);                  // iadd
-    code.push(0x36); code.push(0x02); // istore 2
-    // j++
-    code.push(0x84); code.push(0x05); code.push(0x01);
+    code.push(0xA2);
+    code.push(0x00);
+    code.push(0x00); // if_icmpge placeholder
+                     // sum += i * j
+    code.push(0x15);
+    code.push(0x02); // iload 2 (sum)
+    code.push(0x15);
+    code.push(0x04); // iload 4 (i)
+    code.push(0x15);
+    code.push(0x05); // iload 5 (j)
+    code.push(0x68); // imul
+    code.push(0x60); // iadd
+    code.push(0x36);
+    code.push(0x02); // istore 2
+                     // j++
+    code.push(0x84);
+    code.push(0x05);
+    code.push(0x01);
     let j_goto = code.len();
     let j_off = (j_start as i16) - (j_goto as i16);
-    code.push(0xA7); code.push(((j_off >> 8) & 0xFF) as u8); code.push((j_off & 0xFF) as u8);
+    code.push(0xA7);
+    code.push(((j_off >> 8) & 0xFF) as u8);
+    code.push((j_off & 0xFF) as u8);
     let j_end = code.len();
     let j_patch = (j_end as i16) - (j_if as i16);
     code[j_if + 1] = ((j_patch >> 8) & 0xFF) as u8;
     code[j_if + 2] = (j_patch & 0xFF) as u8;
     // i++
-    code.push(0x84); code.push(0x04); code.push(0x01);
+    code.push(0x84);
+    code.push(0x04);
+    code.push(0x01);
     let i_goto = code.len();
     let i_off = (i_start as i16) - (i_goto as i16);
-    code.push(0xA7); code.push(((i_off >> 8) & 0xFF) as u8); code.push((i_off & 0xFF) as u8);
+    code.push(0xA7);
+    code.push(((i_off >> 8) & 0xFF) as u8);
+    code.push((i_off & 0xFF) as u8);
     let i_end = code.len();
     let i_patch = (i_end as i16) - (i_if as i16);
     code[i_if + 1] = ((i_patch >> 8) & 0xFF) as u8;
     code[i_if + 2] = (i_patch & 0xFF) as u8;
     // iter++
-    code.push(0x84); code.push(0x03); code.push(0x01);
+    code.push(0x84);
+    code.push(0x03);
+    code.push(0x01);
     let iter_goto = code.len();
     let iter_off = (iter_start as i16) - (iter_goto as i16);
-    code.push(0xA7); code.push(((iter_off >> 8) & 0xFF) as u8); code.push((iter_off & 0xFF) as u8);
+    code.push(0xA7);
+    code.push(((iter_off >> 8) & 0xFF) as u8);
+    code.push((iter_off & 0xFF) as u8);
     let iter_end = code.len();
     let iter_patch = (iter_end as i16) - (iter_if as i16);
     code[iter_if + 1] = ((iter_patch >> 8) & 0xFF) as u8;
     code[iter_if + 2] = (iter_patch & 0xFF) as u8;
     // return sum
-    code.push(0x15); code.push(0x02); // iload 2
-    code.push(0xAC);                  // ireturn
+    code.push(0x15);
+    code.push(0x02); // iload 2
+    code.push(0xAC); // ireturn
     code
 }
 
@@ -720,13 +848,15 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
             name: "sor".into(),
             descriptor: "(II)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 4,
-                max_locals: 7,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 4,
+                    max_locals: 7,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -736,8 +866,12 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
             let _ = black_box(invoke_on_class_shared(
-                &shared, &mut thread, class_id,
-                "sor", "(II)I", &[Value::Int(10), Value::Int(5)],
+                &shared,
+                &mut thread,
+                class_id,
+                "sor",
+                "(II)I",
+                &[Value::Int(10), Value::Int(5)],
             ));
         });
     });
@@ -746,8 +880,12 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
             let _ = black_box(invoke_on_class_shared(
-                &shared, &mut thread, class_id,
-                "sor", "(II)I", &[Value::Int(20), Value::Int(10)],
+                &shared,
+                &mut thread,
+                class_id,
+                "sor",
+                "(II)I",
+                &[Value::Int(20), Value::Int(10)],
             ));
         });
     });
@@ -776,13 +914,15 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
             name: "simulate".into(),
             descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 2,
-                max_locals: 1,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 2,
+                    max_locals: 1,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -790,8 +930,12 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
             let _ = black_box(invoke_on_class_shared(
-                &shared, &mut thread, class_id,
-                "simulate", "()I", &[],
+                &shared,
+                &mut thread,
+                class_id,
+                "simulate",
+                "()I",
+                &[],
             ));
         });
     });
@@ -843,13 +987,15 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
             name: "hot".into(),
             descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
-                max_stack: 2,
-                max_locals: 1,
-                code: cratonvm_reader::ByteView::from_vec(code),
-                exception_table: vec![],
-                attributes: vec![],
-            }))],
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::Code(CodeAttribute {
+                    max_stack: 2,
+                    max_locals: 1,
+                    code: cratonvm_reader::ByteView::from_vec(code),
+                    exception_table: vec![],
+                    attributes: vec![],
+                }),
+            )],
         }],
     );
 
@@ -862,8 +1008,12 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
             let _ = black_box(invoke_on_class_shared(
-                &shared, &mut thread, class_id,
-                "hot", "()I", &[],
+                &shared,
+                &mut thread,
+                class_id,
+                "hot",
+                "()I",
+                &[],
             ));
         });
     });

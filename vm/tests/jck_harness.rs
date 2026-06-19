@@ -26,7 +26,10 @@ use cratonvm_vm::vm::Vm;
 
 /// Resolve the JCK home directory from the environment.
 fn jck_home() -> Option<PathBuf> {
-    std::env::var("JCK_HOME").ok().map(PathBuf::from).filter(|p| p.is_dir())
+    std::env::var("JCK_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
 }
 
 /// Recursively discover `.class` files under the given directory.
@@ -42,10 +45,7 @@ fn discover_classes(root: &Path, base: &Path, out: &mut Vec<String>) {
         } else if path.extension().map_or(false, |e| e == "class") {
             // Convert file path to JVM class name (forward slashes, no .class).
             if let Ok(rel) = path.strip_prefix(base) {
-                let class_name = rel
-                    .with_extension("")
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let class_name = rel.with_extension("").to_string_lossy().replace('\\', "/");
                 // Skip inner classes (contain '$') — only top-level test classes.
                 if !class_name.contains('$') {
                     out.push(class_name);
@@ -90,7 +90,12 @@ fn run_jck_test(classpath: &str, class_name: &str) -> TestResult {
     let mut vm = Vm::new(config);
 
     // JCK tests use main(String[]) as entry point.
-    match vm.invoke(class_name, "main", "([Ljava/lang/String;)V", &[Value::Object(None)]) {
+    match vm.invoke(
+        class_name,
+        "main",
+        "([Ljava/lang/String;)V",
+        &[Value::Object(None)],
+    ) {
         Ok(_) => TestResult {
             class_name: class_name.to_string(),
             module,
@@ -219,7 +224,10 @@ fn jck_harness_full_run() {
 
     let tests_dir = jck_root.join("tests");
     if !tests_dir.is_dir() {
-        eprintln!("[jck-harness] {}/tests not found; skipping.", jck_root.display());
+        eprintln!(
+            "[jck-harness] {}/tests not found; skipping.",
+            jck_root.display()
+        );
         return;
     }
 
@@ -243,7 +251,10 @@ fn jck_harness_full_run() {
     }
     class_names.sort();
 
-    eprintln!("[jck-harness] discovered {} test classes", class_names.len());
+    eprintln!(
+        "[jck-harness] discovered {} test classes",
+        class_names.len()
+    );
     if class_names.is_empty() {
         eprintln!("[jck-harness] no test classes found; check JCK_HOME/tests layout.");
         return;
@@ -300,6 +311,10 @@ fn jck_harness_full_run() {
     // Regression gates are enforced by jck_conformance.rs and CI thresholds.
     eprintln!(
         "[jck-harness] complete: {passed}/{total} passed ({:.1}%)",
-        if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 }
+        if total > 0 {
+            passed as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
     );
 }

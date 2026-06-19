@@ -465,11 +465,7 @@ impl JmmManager {
     }
 
     /// Clean up after GC: remap relocated pointers and remove dead objects.
-    pub fn gc_cleanup(
-        &self,
-        pointer_map: &HashMap<u64, u64>,
-        is_live: &dyn Fn(u64) -> bool,
-    ) {
+    pub fn gc_cleanup(&self, pointer_map: &HashMap<u64, u64>, is_live: &dyn Fn(u64) -> bool) {
         self.final_fields.remove_dead(is_live);
         self.final_fields.update_after_gc(pointer_map);
     }

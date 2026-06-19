@@ -38,19 +38,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
+use cratonvm_native_api::fd_table::FdId;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
-use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
-pub mod random_access_file;
 pub mod nio_native;
+pub mod random_access_file;
 // T16.5: MulticastSocket overrides + shared helpers for async channels.
 pub mod net;
 // T19.7.a: Selector / SelectionKey / SelectableChannel NIO primitives.
@@ -460,14 +460,11 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
                             if p.components()
                                 .any(|c| matches!(c, std::path::Component::ParentDir))
                             {
-                                return Err(MethodCallFailed::InternalError(
-                                    VmError::Runtime(RuntimeError::SecurityException {
-                                        message: format!(
-                                            "Path traversal detected: {}",
-                                            path
-                                        ),
-                                    }),
-                                ));
+                                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                                    RuntimeError::SecurityException {
+                                        message: format!("Path traversal detected: {}", path),
+                                    },
+                                )));
                             }
                             // Best-effort resolution against the sandbox
                             // root so the containment check below is still
@@ -808,7 +805,11 @@ fn native_file_exists(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
     let path = validated_path(&path)?;
-    Ok(Some(Value::Int(if Path::new(&path).exists() { 1 } else { 0 })))
+    Ok(Some(Value::Int(if Path::new(&path).exists() {
+        1
+    } else {
+        0
+    })))
 }
 
 fn native_file_is_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1234,7 +1235,11 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.saturating_add(len) },
+                index: if off < 0 {
+                    off
+                } else {
+                    off.saturating_add(len)
+                },
             },
         )));
     }
@@ -1586,7 +1591,11 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.saturating_add(len) },
+                index: if off < 0 {
+                    off
+                } else {
+                    off.saturating_add(len)
+                },
             },
         )));
     }
@@ -1629,7 +1638,10 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// JDK 25 write(I,Z) — extra boolean for `append` flag (ignored, already opened).
-fn native_fos_write_byte_ignore_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_fos_write_byte_ignore_append(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0]=this, args[1]=byte, args[2]=append(ignored)
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1648,7 +1660,10 @@ fn native_fos_write_byte_ignore_append(ctx: &mut dyn NativeContext, args: &[Valu
 }
 
 /// JDK 25 writeBytes([B,I,I,Z) — extra boolean for `append` flag (ignored).
-fn native_fos_write_bytes_ignore_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_fos_write_bytes_ignore_append(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0]=this, args[1]=byte[], args[2]=offset, args[3]=len, args[4]=append(ignored)
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1918,9 +1933,17 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let off = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let len = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    if len == 0 { return Ok(Some(Value::Int(0))); }
+    let off = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
 
     // Bounds-check the output array so we don't write past its end.
     let out_len = ctx.array_length(out_arr);
@@ -1965,10 +1988,19 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if !eof_seen {
         let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, want);
         let read_result = ctx.invoke_virtual(
-            in_stream, "read", "([BII)I",
-            &[Value::Object(Some(bytes_arr)), Value::Int(0), Value::Int(want as i32)],
+            in_stream,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(bytes_arr)),
+                Value::Int(0),
+                Value::Int(want as i32),
+            ],
         )?;
-        let n = match read_result { Some(Value::Int(n)) => n, _ => -1 };
+        let n = match read_result {
+            Some(Value::Int(n)) => n,
+            _ => -1,
+        };
         if n < 0 {
             eof_seen = true;
         } else if n > 0 {
@@ -2017,7 +2049,9 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if written == 0 {
         // Decoded zero chars AND EOF → -1. Otherwise 0 would mislead
         // the caller; we made forward progress on bytes though.
-        if eof_seen { return Ok(Some(Value::Int(-1))); }
+        if eof_seen {
+            return Ok(Some(Value::Int(-1)));
+        }
         // No forward progress possible, return 0 so caller retries.
         return Ok(Some(Value::Int(0)));
     }
@@ -2167,8 +2201,7 @@ struct BrBuf {
 // identity-hash (stored in the header, stable across relocation) — the same
 // GC-stable identity used by the channel/selector side-tables in this crate.
 fn br_buf_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, BrBuf>> {
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, BrBuf>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, BrBuf>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -2846,7 +2879,11 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let data = baos_ensure_capacity(ctx, this, count + 1);
     ctx.set_array_element(data, count, Value::Int(byte_val & 0xFF));
-    ctx.set_field(this, BAOS_FIELD_COUNT, Value::Int(count.checked_add(1).unwrap_or(count) as i32));
+    ctx.set_field(
+        this,
+        BAOS_FIELD_COUNT,
+        Value::Int(count.checked_add(1).unwrap_or(count) as i32),
+    );
     Ok(None)
 }
 
@@ -2904,7 +2941,11 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let v = ctx.get_array_element(buf, off + i);
         ctx.set_array_element(data, count + i, v);
     }
-    ctx.set_field(this, BAOS_FIELD_COUNT, Value::Int(count.checked_add(len).unwrap_or(count) as i32));
+    ctx.set_field(
+        this,
+        BAOS_FIELD_COUNT,
+        Value::Int(count.checked_add(len).unwrap_or(count) as i32),
+    );
     Ok(None)
 }
 
@@ -3754,7 +3795,13 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(current_line) {
             let matched = m.as_str();
-            ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(pos.checked_add(m.end()).unwrap_or(usize::MAX))?));
+            ctx.set_field(
+                this,
+                SCAN_FIELD_POS,
+                Value::Int(safe_pos_to_i32(
+                    pos.checked_add(m.end()).unwrap_or(usize::MAX),
+                )?),
+            );
             let s = ctx.create_string(matched);
             return Ok(Some(Value::Object(Some(s))));
         }
@@ -3781,7 +3828,13 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Ok(re) = regex::Regex::new(&pattern_str) {
         if let Some(m) = re.find(remaining) {
             if m.start() == 0 {
-                ctx.set_field(this, SCAN_FIELD_POS, Value::Int(safe_pos_to_i32(pos.checked_add(m.end()).unwrap_or(usize::MAX))?));
+                ctx.set_field(
+                    this,
+                    SCAN_FIELD_POS,
+                    Value::Int(safe_pos_to_i32(
+                        pos.checked_add(m.end()).unwrap_or(usize::MAX),
+                    )?),
+                );
             }
         }
     }
@@ -3811,10 +3864,7 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// `getResourceBuffer`) then operates on the genuine jimage bytes. This is
 /// the real image content, not a stub. Returning `null` on any read error
 /// preserves the JDK's documented fall-back contract.
-fn native_jimage_get_native_map(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path = match args.first() {
         Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
             Some(p) => p,
@@ -4055,24 +4105,69 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // --- JDK 25 real bytecode uses different method names for I/O natives ---
     // FileInputStream: open0, read0, readBytes, skip0, available0 etc.
     registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
-    registry.register("java/io/FileInputStream", "open0", "(Ljava/lang/String;)V", native_fis_open0);
+    registry.register(
+        "java/io/FileInputStream",
+        "open0",
+        "(Ljava/lang/String;)V",
+        native_fis_open0,
+    );
     registry.register("java/io/FileInputStream", "read0", "()I", native_fis_read);
-    registry.register("java/io/FileInputStream", "readBytes", "([BII)I", native_fis_read_bytes);
+    registry.register(
+        "java/io/FileInputStream",
+        "readBytes",
+        "([BII)I",
+        native_fis_read_bytes,
+    );
     registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
-    registry.register("java/io/FileInputStream", "available0", "()I", native_fis_available);
-    registry.register("java/io/FileInputStream", "length0", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
-    registry.register("java/io/FileInputStream", "position0", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
+    registry.register(
+        "java/io/FileInputStream",
+        "available0",
+        "()I",
+        native_fis_available,
+    );
+    registry.register(
+        "java/io/FileInputStream",
+        "length0",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(0))),
+    );
+    registry.register(
+        "java/io/FileInputStream",
+        "position0",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(0))),
+    );
     // Report "not a regular file" so the JDK `readAllBytes()` takes the
     // generic streaming `InputStream.readAllBytes` loop (which calls our
     // `readBytes` native) instead of the `length0()`-sized fast path —
     // `length0` is a stub returning 0, which would otherwise read nothing.
-    registry.register("java/io/FileInputStream", "isRegularFile0", "(Ljava/io/FileDescriptor;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    registry.register(
+        "java/io/FileInputStream",
+        "isRegularFile0",
+        "(Ljava/io/FileDescriptor;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
 
     // FileOutputStream: open0, write(I,Z), writeBytes
     registry.register("java/io/FileOutputStream", "initIDs", "()V", native_noop);
-    registry.register("java/io/FileOutputStream", "open0", "(Ljava/lang/String;Z)V", native_fos_init_string_append);
-    registry.register("java/io/FileOutputStream", "write", "(IZ)V", native_fos_write_byte_ignore_append);
-    registry.register("java/io/FileOutputStream", "writeBytes", "([BIIZ)V", native_fos_write_bytes_ignore_append);
+    registry.register(
+        "java/io/FileOutputStream",
+        "open0",
+        "(Ljava/lang/String;Z)V",
+        native_fos_init_string_append,
+    );
+    registry.register(
+        "java/io/FileOutputStream",
+        "write",
+        "(IZ)V",
+        native_fos_write_byte_ignore_append,
+    );
+    registry.register(
+        "java/io/FileOutputStream",
+        "writeBytes",
+        "([BIIZ)V",
+        native_fos_write_bytes_ignore_append,
+    );
 
     // FileDescriptor.close0() — the real-JDK `FileInputStream.close()` /
     // `FileOutputStream.close()` bytecode routes through
@@ -4095,104 +4190,99 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `real_filewriter_enabled` and
     // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
     if !real_filewriter_enabled() {
-    // FileWriter wraps FileOutputStream; we use the same fd-in-field-0 layout.
-    registry.register(
-        "java/io/FileWriter",
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_fos_init_string,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "<init>",
-        "(Ljava/lang/String;Z)V",
-        native_fos_init_string_append,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "<init>",
-        "(Ljava/io/File;)V",
-        native_fos_init_file,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "<init>",
-        "(Ljava/io/File;Z)V",
-        native_fos_init_file_append,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "write",
-        "(I)V",
-        native_fos_write_byte,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "write",
-        "([BII)V",
-        native_fos_write_bytes,
-    );
-    registry.register(
-        "java/io/FileWriter",
-        "write",
-        "([B)V",
-        native_fos_write_byte_array,
-    );
-    // write(String) for FileWriter — write UTF-8 bytes
-    registry.register(
-        "java/io/FileWriter",
-        "write",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let text = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let fd = match ctx.get_field(this, 0) {
-                Value::Int(fd) => fd as u32,
-                _ => return Ok(None),
-            };
-            let _ = ctx.fd_table().write_string(fd, &text);
-            Ok(None)
-        },
-    );
-    // write(String, int, int) — substring write
-    registry.register(
-        "java/io/FileWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let text = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let off = match args.get(2) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let len = match args.get(3) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => text.len(),
-            };
-            let fd = match ctx.get_field(this, 0) {
-                Value::Int(fd) => fd as u32,
-                _ => return Ok(None),
-            };
-            let sub = &text[off.min(text.len())..(off + len).min(text.len())];
-            let _ = ctx.fd_table().write_string(fd, sub);
-            Ok(None)
-        },
-    );
-    registry.register("java/io/FileWriter", "flush", "()V", native_fos_flush);
-    registry.register("java/io/FileWriter", "close", "()V", native_fos_close);
+        // FileWriter wraps FileOutputStream; we use the same fd-in-field-0 layout.
+        registry.register(
+            "java/io/FileWriter",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_fos_init_string,
+        );
+        registry.register(
+            "java/io/FileWriter",
+            "<init>",
+            "(Ljava/lang/String;Z)V",
+            native_fos_init_string_append,
+        );
+        registry.register(
+            "java/io/FileWriter",
+            "<init>",
+            "(Ljava/io/File;)V",
+            native_fos_init_file,
+        );
+        registry.register(
+            "java/io/FileWriter",
+            "<init>",
+            "(Ljava/io/File;Z)V",
+            native_fos_init_file_append,
+        );
+        registry.register("java/io/FileWriter", "write", "(I)V", native_fos_write_byte);
+        registry.register(
+            "java/io/FileWriter",
+            "write",
+            "([BII)V",
+            native_fos_write_bytes,
+        );
+        registry.register(
+            "java/io/FileWriter",
+            "write",
+            "([B)V",
+            native_fos_write_byte_array,
+        );
+        // write(String) for FileWriter — write UTF-8 bytes
+        registry.register(
+            "java/io/FileWriter",
+            "write",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(None),
+                };
+                let text = match args.get(1) {
+                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let fd = match ctx.get_field(this, 0) {
+                    Value::Int(fd) => fd as u32,
+                    _ => return Ok(None),
+                };
+                let _ = ctx.fd_table().write_string(fd, &text);
+                Ok(None)
+            },
+        );
+        // write(String, int, int) — substring write
+        registry.register(
+            "java/io/FileWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(None),
+                };
+                let text = match args.get(1) {
+                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let off = match args.get(2) {
+                    Some(Value::Int(v)) => *v as usize,
+                    _ => 0,
+                };
+                let len = match args.get(3) {
+                    Some(Value::Int(v)) => *v as usize,
+                    _ => text.len(),
+                };
+                let fd = match ctx.get_field(this, 0) {
+                    Value::Int(fd) => fd as u32,
+                    _ => return Ok(None),
+                };
+                let sub = &text[off.min(text.len())..(off + len).min(text.len())];
+                let _ = ctx.fd_table().write_string(fd, sub);
+                Ok(None)
+            },
+        );
+        registry.register("java/io/FileWriter", "flush", "()V", native_fos_flush);
+        registry.register("java/io/FileWriter", "close", "()V", native_fos_close);
     } // end if !real_filewriter_enabled() — synthetic byte-fd FileWriter shim
 
     // RDR-MIGRATION 2026-06-01: the InputStreamReader natives below used to be
@@ -4217,62 +4307,62 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `synthetic-jdk`.
     #[cfg(feature = "synthetic-jdk")]
     {
-    registry.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;)V",
-        native_isr_init,
-    );
-    registry.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;Ljava/lang/String;)V",
-        native_isr_init_charset,
-    );
-    registry.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
-        native_isr_init_charset,
-    );
-    registry.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;Ljava/nio/charset/CharsetDecoder;)V",
-        native_isr_init_charset,
-    );
-    registry.register("java/io/InputStreamReader", "read", "()I", native_isr_read);
-    registry.register(
-        "java/io/InputStreamReader",
-        "read",
-        "([CII)I",
-        native_isr_read_chars,
-    );
-    registry.register(
-        "java/io/InputStreamReader",
-        "close",
-        "()V",
-        native_isr_close,
-    );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            native_isr_init,
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/lang/String;)V",
+            native_isr_init_charset,
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+            native_isr_init_charset,
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/nio/charset/CharsetDecoder;)V",
+            native_isr_init_charset,
+        );
+        registry.register("java/io/InputStreamReader", "read", "()I", native_isr_read);
+        registry.register(
+            "java/io/InputStreamReader",
+            "read",
+            "([CII)I",
+            native_isr_read_chars,
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "close",
+            "()V",
+            native_isr_close,
+        );
 
-    // RA.3: Reader.read(CharBuffer) — real-JDK path.  Registered on
-    // the base `java/io/Reader` so every subclass inherits, and
-    // additionally on `InputStreamReader` so our own
-    // `read([CII)I` override is driven directly (invoke_virtual
-    // re-dispatches to the registered native on the receiver's
-    // concrete class).
-    registry.register(
-        "java/io/Reader",
-        "read",
-        "(Ljava/nio/CharBuffer;)I",
-        native_reader_read_charbuffer,
-    );
-    registry.register(
-        "java/io/InputStreamReader",
-        "read",
-        "(Ljava/nio/CharBuffer;)I",
-        native_reader_read_charbuffer,
-    );
+        // RA.3: Reader.read(CharBuffer) — real-JDK path.  Registered on
+        // the base `java/io/Reader` so every subclass inherits, and
+        // additionally on `InputStreamReader` so our own
+        // `read([CII)I` override is driven directly (invoke_virtual
+        // re-dispatches to the registered native on the receiver's
+        // concrete class).
+        registry.register(
+            "java/io/Reader",
+            "read",
+            "(Ljava/nio/CharBuffer;)I",
+            native_reader_read_charbuffer,
+        );
+        registry.register(
+            "java/io/InputStreamReader",
+            "read",
+            "(Ljava/nio/CharBuffer;)I",
+            native_reader_read_charbuffer,
+        );
     } // end #[cfg(feature = "synthetic-jdk")] synthetic InputStreamReader natives
 
     // Subsequent synthetic-only Reader/Writer overrides assume our
@@ -4281,83 +4371,82 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // nChars + nextChar + ...).  Keep them gated.
     #[cfg(feature = "synthetic-jdk")]
     {
+        // --- java.io.BufferedReader ---
+        registry.register(
+            "java/io/BufferedReader",
+            "<init>",
+            "(Ljava/io/Reader;)V",
+            native_br_init,
+        );
+        registry.register(
+            "java/io/BufferedReader",
+            "readLine",
+            "()Ljava/lang/String;",
+            native_br_read_line,
+        );
+        registry.register("java/io/BufferedReader", "read", "()I", native_br_read);
+        registry.register("java/io/BufferedReader", "ready", "()Z", native_br_ready);
+        registry.register("java/io/BufferedReader", "close", "()V", native_br_close);
 
-    // --- java.io.BufferedReader ---
-    registry.register(
-        "java/io/BufferedReader",
-        "<init>",
-        "(Ljava/io/Reader;)V",
-        native_br_init,
-    );
-    registry.register(
-        "java/io/BufferedReader",
-        "readLine",
-        "()Ljava/lang/String;",
-        native_br_read_line,
-    );
-    registry.register("java/io/BufferedReader", "read", "()I", native_br_read);
-    registry.register("java/io/BufferedReader", "ready", "()Z", native_br_ready);
-    registry.register("java/io/BufferedReader", "close", "()V", native_br_close);
+        // --- java.io.OutputStreamWriter ---
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "<init>",
+            "(Ljava/io/OutputStream;)V",
+            native_osw_init,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "<init>",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+            native_osw_init_charset,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_osw_write,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "flush",
+            "()V",
+            native_osw_flush,
+        );
+        registry.register(
+            "java/io/OutputStreamWriter",
+            "close",
+            "()V",
+            native_osw_close,
+        );
 
-    // --- java.io.OutputStreamWriter ---
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "<init>",
-        "(Ljava/io/OutputStream;)V",
-        native_osw_init,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "<init>",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-        native_osw_init_charset,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_osw_write,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "flush",
-        "()V",
-        native_osw_flush,
-    );
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "close",
-        "()V",
-        native_osw_close,
-    );
-
-    // --- java.io.BufferedWriter ---
-    registry.register(
-        "java/io/BufferedWriter",
-        "<init>",
-        "(Ljava/io/Writer;)V",
-        native_bw_init,
-    );
-    registry.register(
-        "java/io/BufferedWriter",
-        "write",
-        "(Ljava/lang/String;II)V",
-        native_bw_write_string,
-    );
-    registry.register(
-        "java/io/BufferedWriter",
-        "write",
-        "(I)V",
-        native_bw_write_int,
-    );
-    registry.register(
-        "java/io/BufferedWriter",
-        "newLine",
-        "()V",
-        native_bw_new_line,
-    );
-    registry.register("java/io/BufferedWriter", "flush", "()V", native_bw_flush);
-    registry.register("java/io/BufferedWriter", "close", "()V", native_bw_close);
+        // --- java.io.BufferedWriter ---
+        registry.register(
+            "java/io/BufferedWriter",
+            "<init>",
+            "(Ljava/io/Writer;)V",
+            native_bw_init,
+        );
+        registry.register(
+            "java/io/BufferedWriter",
+            "write",
+            "(Ljava/lang/String;II)V",
+            native_bw_write_string,
+        );
+        registry.register(
+            "java/io/BufferedWriter",
+            "write",
+            "(I)V",
+            native_bw_write_int,
+        );
+        registry.register(
+            "java/io/BufferedWriter",
+            "newLine",
+            "()V",
+            native_bw_new_line,
+        );
+        registry.register("java/io/BufferedWriter", "flush", "()V", native_bw_flush);
+        registry.register("java/io/BufferedWriter", "close", "()V", native_bw_close);
     } // end synthetic-jdk InputStreamReader/BufferedReader/OutputStreamWriter/BufferedWriter block
 
     // --- java.io.ByteArrayInputStream ---
@@ -4419,9 +4508,24 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/io/InputStream", "close", "()V", native_bais_close);
     registry.register("java/io/InputStream", "skip", "(J)J", native_is_skip);
-    registry.register("java/io/InputStream", "readAllBytes", "()[B", native_is_read_all_bytes);
-    registry.register("java/io/InputStream", "readNBytes", "(I)[B", native_is_read_n_bytes);
-    registry.register("java/io/InputStream", "readNBytes", "([BII)I", native_is_read_n_bytes_buf);
+    registry.register(
+        "java/io/InputStream",
+        "readAllBytes",
+        "()[B",
+        native_is_read_all_bytes,
+    );
+    registry.register(
+        "java/io/InputStream",
+        "readNBytes",
+        "(I)[B",
+        native_is_read_n_bytes,
+    );
+    registry.register(
+        "java/io/InputStream",
+        "readNBytes",
+        "([BII)I",
+        native_is_read_n_bytes_buf,
+    );
     registry.register(
         "java/io/InputStream",
         "transferTo",
@@ -4448,7 +4552,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // kafka compressed record batch built through `MemoryRecordsBuilder`'s
     // `DataOutputStream(compressionStream)` → "Unexpected end of ZLIB input stream"
     // on read-back (bug-15). `closed` is at slot 1 (idempotency).
-    registry.register("java/io/FilterOutputStream", "close", "()V", native_filteros_close);
+    registry.register(
+        "java/io/FilterOutputStream",
+        "close",
+        "()V",
+        native_filteros_close,
+    );
 
     // --- java.util.Scanner ---
     register_scanner_natives(registry);
@@ -4863,18 +4972,23 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     obj
 }
 
-fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
+fn bb_state(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
     // Prefer the real-JDK `hb` field; fall back to synthetic slot 0.
     let arr = match ctx.get_field_by_name(this, "hb") {
         Value::Object(Some(a)) => a,
         _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
-            other => return Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: format!(
-                    "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                    BB_FIELD_ARRAY, other, this
-                ),
-            })),
+            other => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
+                }))
+            }
         },
     };
     let pos = buf_read_position(ctx, this);
@@ -4896,10 +5010,7 @@ fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(ObjectRef, i32,
 /// `index + width > bound` test (and panic in a debug build). Rejecting a
 /// negative `index` is the lower-bound check the abs accessors were missing.
 fn abs_access_in_bounds(index: i32, width: i32, bound: i32) -> bool {
-    index >= 0
-        && index
-            .checked_add(width)
-            .map_or(false, |end| end <= bound)
+    index >= 0 && index.checked_add(width).map_or(false, |end| end <= bound)
 }
 
 /// JDK-faithful bounds test for an element-indexed typed-buffer absolute
@@ -6288,17 +6399,17 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // synthetic StringReader natives only under `synthetic-jdk`.
     #[cfg(feature = "synthetic-jdk")]
     {
-    let sr = "java/io/StringReader";
-    registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
-    registry.register(sr, "read", "()I", native_sr_read);
-    registry.register(sr, "read", "([CII)I", native_sr_read_chars);
-    registry.register(sr, "ready", "()Z", native_sr_ready);
-    registry.register(sr, "close", "()V", native_noop_void);
-    registry.register(sr, "skip", "(J)J", native_sr_skip);
-    registry.register(sr, "reset", "()V", native_sr_reset);
-    registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    });
+        let sr = "java/io/StringReader";
+        registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
+        registry.register(sr, "read", "()I", native_sr_read);
+        registry.register(sr, "read", "([CII)I", native_sr_read_chars);
+        registry.register(sr, "ready", "()Z", native_sr_ready);
+        registry.register(sr, "close", "()V", native_noop_void);
+        registry.register(sr, "skip", "(J)J", native_sr_skip);
+        registry.register(sr, "reset", "()V", native_sr_reset);
+        registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
     }
 
     let sw = "java/io/StringWriter";
@@ -6347,15 +6458,15 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/Reader", "close", "()V", native_noop_void);
     #[cfg(feature = "synthetic-jdk")]
     {
-    registry.register("java/io/Reader", "read", "()I", native_sr_read);
-    // RA.3: Reader.read(java.nio.CharBuffer) default fills the buffer via
-    // char[] + read([CII)I, then advances the buffer's position.
-    registry.register(
-        "java/io/Reader",
-        "read",
-        "(Ljava/nio/CharBuffer;)I",
-        native_reader_read_charbuffer,
-    );
+        registry.register("java/io/Reader", "read", "()I", native_sr_read);
+        // RA.3: Reader.read(java.nio.CharBuffer) default fills the buffer via
+        // char[] + read([CII)I, then advances the buffer's position.
+        registry.register(
+            "java/io/Reader",
+            "read",
+            "(Ljava/nio/CharBuffer;)I",
+            native_reader_read_charbuffer,
+        );
     }
     registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
     registry.register("java/io/Writer", "flush", "()V", native_noop_void);
@@ -6380,10 +6491,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
 ///   3. `int n = this.read(chars, 0, chars.length)`.
 ///   4. If `n > 0`, `target.put(chars, 0, n)` via `invoke_virtual`.
 ///   5. Return `n` (or `-1` at EOF).
-fn native_reader_read_charbuffer(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_reader_read_charbuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
@@ -6438,11 +6546,7 @@ fn native_reader_read_charbuffer(
             target,
             "put",
             "([CII)Ljava/nio/CharBuffer;",
-            &[
-                Value::Object(Some(chars)),
-                Value::Int(0),
-                Value::Int(n),
-            ],
+            &[Value::Object(Some(chars)), Value::Int(0), Value::Int(n)],
         )?;
     }
 
@@ -6888,7 +6992,6 @@ fn dis_read_one(
     }
 }
 
-
 fn native_dis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -7084,10 +7187,11 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 let b = dis_read_one(ctx, this)?;
                 bytes.push(b as u8);
             }
-            let s = decode_modified_utf8(&bytes)
-                .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
+            let s = decode_modified_utf8(&bytes).map_err(|e| {
+                cratonvm_types::error::RuntimeError::IOException {
                     message: format!("readUTF: {e}"),
-                })?;
+                }
+            })?;
             let result = ctx.create_string(&s);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -7124,10 +7228,11 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let b = ctx.get_array_element(tmp_arr, i).as_int().unwrap_or(0);
         bytes.push(b as u8);
     }
-    let s = decode_modified_utf8(&bytes)
-        .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
+    let s = decode_modified_utf8(&bytes).map_err(|e| {
+        cratonvm_types::error::RuntimeError::IOException {
             message: format!("readUTF: {e}"),
-        })?;
+        }
+    })?;
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -7167,9 +7272,8 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
             if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
                 return Err(format!("bad continuation byte at offset {}", i + 1));
             }
-            let v = (((b0 as u32) & 0x0F) << 12)
-                | (((b1 as u32) & 0x3F) << 6)
-                | ((b2 as u32) & 0x3F);
+            let v =
+                (((b0 as u32) & 0x0F) << 12) | (((b1 as u32) & 0x3F) << 6) | ((b2 as u32) & 0x3F);
             i += 3;
             v
         } else {
@@ -7195,9 +7299,8 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
             if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
                 return Err(format!("bad surrogate continuation at offset {}", i + 1));
             }
-            let low = (((b0 as u32) & 0x0F) << 12)
-                | (((b1 as u32) & 0x3F) << 6)
-                | ((b2 as u32) & 0x3F);
+            let low =
+                (((b0 as u32) & 0x0F) << 12) | (((b1 as u32) & 0x3F) << 6) | ((b2 as u32) & 0x3F);
             i += 3;
             if !(0xDC00..=0xDFFF).contains(&low) {
                 return Err(format!(
@@ -7995,7 +8098,9 @@ fn parse_windows_path_root(s: &str) -> (Option<String>, Vec<String>) {
     // Verbatim UNC: \\?\UNC\server\share\...
     if verbatim
         && wb.len() >= 4
-        && work.get(..3).map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
+        && work
+            .get(..3)
+            .map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
         && is_sep(wb[3])
     {
         let after = &work[4..];
@@ -8003,7 +8108,10 @@ fn parse_windows_path_root(s: &str) -> (Option<String>, Vec<String>) {
         let server = it.next().unwrap_or("");
         let share = it.next().unwrap_or("");
         let remainder = it.next().unwrap_or("");
-        return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+        return (
+            Some(format!("\\\\{}\\{}\\", server, share)),
+            split_names(remainder),
+        );
     }
     // UNC: \\server\share\...
     if wb.len() >= 2 && is_sep(wb[0]) && is_sep(wb[1]) {
@@ -8013,7 +8121,10 @@ fn parse_windows_path_root(s: &str) -> (Option<String>, Vec<String>) {
         let share = it.next().unwrap_or("");
         if !server.is_empty() && !share.is_empty() {
             let remainder = it.next().unwrap_or("");
-            return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+            return (
+                Some(format!("\\\\{}\\{}\\", server, share)),
+                split_names(remainder),
+            );
         }
     }
     // Drive: `C:\...` / `C:/...` (absolute) or `C:foo` (drive-relative).
@@ -8160,11 +8271,9 @@ fn native_path_to_real_path(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             let result = alloc_path(ctx, &cleaned);
             Ok(Some(Value::Object(Some(result))))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::NoSuchFileException { path: s },
-            )))
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(MethodCallFailed::InternalError(
+            VmError::Runtime(RuntimeError::NoSuchFileException { path: s }),
+        )),
         Err(e) => Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::IOException {
                 message: format!("{s}: {e}"),
@@ -8198,11 +8307,7 @@ fn normalize_real_path_input(raw: &str) -> String {
     }
     // `/C:/foo` → `C:/foo` (URI-style absolute path on Windows). Only when
     // the third byte is `:` so genuine Unix-rooted paths are untouched.
-    if cfg!(windows)
-        && s.len() >= 3
-        && s.starts_with('/')
-        && s.as_bytes().get(2) == Some(&b':')
-    {
+    if cfg!(windows) && s.len() >= 3 && s.starts_with('/') && s.as_bytes().get(2) == Some(&b':') {
         s = &s[1..];
     }
     if cfg!(windows) {
@@ -8626,9 +8731,7 @@ fn native_files_is_writable(_ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 pub(crate) fn real_raf_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() != Ok("1")
-    })
+    *FLAG.get_or_init(|| std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() != Ok("1"))
 }
 
 fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
@@ -8646,39 +8749,40 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     // PhantomReference path still has a separate crash under sustained load that
     // is being diagnosed (see crash_handler VEH). Default (unset) = synthetic.
     if !real_raf_enabled() {
-    let raf = "java/io/RandomAccessFile";
-    registry.register(
-        raf,
-        "<init>",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_raf_init,
-    );
-    registry.register(
-        raf,
-        "<init>",
-        "(Ljava/io/File;Ljava/lang/String;)V",
-        native_raf_init_file,
-    );
-    registry.register(raf, "read", "()I", native_raf_read);
-    registry.register(raf, "read", "([BII)I", native_raf_read_bulk);
-    registry.register(raf, "write", "(I)V", native_raf_write);
-    registry.register(raf, "write", "([BII)V", native_raf_write_bulk);
-    registry.register(raf, "seek", "(J)V", native_raf_seek);
-    registry.register(raf, "getFilePointer", "()J", native_raf_get_file_pointer);
-    registry.register(raf, "length", "()J", native_raf_length);
-    registry.register(raf, "close", "()V", native_raf_close);
-    registry.register(raf, "readInt", "()I", native_raf_read_int);
-    registry.register(raf, "readLong", "()J", native_raf_read_long);
-    registry.register(raf, "writeInt", "(I)V", native_raf_write_int);
-    registry.register(raf, "writeLong", "(J)V", native_raf_write_long);
-    registry.register(raf, "readFully", "([B)V", native_raf_read_fully);
-    registry.register(
-        raf,
-        "readLine",
-        "()Ljava/lang/String;",
-        native_raf_read_line,
-    );
-    registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line); // simplified
+        let raf = "java/io/RandomAccessFile";
+        registry.register(
+            raf,
+            "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            native_raf_init,
+        );
+        registry.register(
+            raf,
+            "<init>",
+            "(Ljava/io/File;Ljava/lang/String;)V",
+            native_raf_init_file,
+        );
+        registry.register(raf, "read", "()I", native_raf_read);
+        registry.register(raf, "read", "([BII)I", native_raf_read_bulk);
+        registry.register(raf, "write", "(I)V", native_raf_write);
+        registry.register(raf, "write", "([BII)V", native_raf_write_bulk);
+        registry.register(raf, "seek", "(J)V", native_raf_seek);
+        registry.register(raf, "getFilePointer", "()J", native_raf_get_file_pointer);
+        registry.register(raf, "length", "()J", native_raf_length);
+        registry.register(raf, "close", "()V", native_raf_close);
+        registry.register(raf, "readInt", "()I", native_raf_read_int);
+        registry.register(raf, "readLong", "()J", native_raf_read_long);
+        registry.register(raf, "writeInt", "(I)V", native_raf_write_int);
+        registry.register(raf, "writeLong", "(J)V", native_raf_write_long);
+        registry.register(raf, "readFully", "([B)V", native_raf_read_fully);
+        registry.register(
+            raf,
+            "readLine",
+            "()Ljava/lang/String;",
+            native_raf_read_line,
+        );
+        registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line);
+        // simplified
     } // end !real_raf_enabled()
 
     // RDR-MIGRATION 2026-06-01: CharArrayReader synthetic natives (3-field
@@ -8690,13 +8794,13 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     // under `synthetic-jdk`.
     #[cfg(feature = "synthetic-jdk")]
     {
-    // CharArrayReader = 3-field synthetic (buf=0, pos=1, count=2)
-    let car = "java/io/CharArrayReader";
-    registry.register(car, "<init>", "([C)V", native_car_init);
-    registry.register(car, "<init>", "([CII)V", native_car_init_off);
-    registry.register(car, "read", "()I", native_car_read);
-    registry.register(car, "ready", "()Z", native_car_ready);
-    registry.register(car, "close", "()V", native_noop_void);
+        // CharArrayReader = 3-field synthetic (buf=0, pos=1, count=2)
+        let car = "java/io/CharArrayReader";
+        registry.register(car, "<init>", "([C)V", native_car_init);
+        registry.register(car, "<init>", "([CII)V", native_car_init_off);
+        registry.register(car, "read", "()I", native_car_read);
+        registry.register(car, "ready", "()Z", native_car_ready);
+        registry.register(car, "close", "()V", native_noop_void);
     }
 
     // CharArrayWriter: the synthetic 2-field carrier (buf=0, count=1) shadowed
@@ -8715,22 +8819,22 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     // `synthetic-jdk` (mirrors the LineNumberReader migration below).
     #[cfg(feature = "synthetic-jdk")]
     {
-    // CharArrayWriter = 2-field synthetic (buf=0, count=1)
-    let caw = "java/io/CharArrayWriter";
-    registry.register(caw, "<init>", "()V", native_caw_init);
-    registry.register(caw, "write", "(I)V", native_caw_write);
-    registry.register(caw, "write", "([CII)V", native_caw_write_bulk);
-    registry.register(
-        caw,
-        "toString",
-        "()Ljava/lang/String;",
-        native_caw_to_string,
-    );
-    registry.register(caw, "toCharArray", "()[C", native_caw_to_char_array);
-    registry.register(caw, "size", "()I", native_caw_size);
-    registry.register(caw, "reset", "()V", native_caw_reset);
-    registry.register(caw, "flush", "()V", native_noop_void);
-    registry.register(caw, "close", "()V", native_noop_void);
+        // CharArrayWriter = 2-field synthetic (buf=0, count=1)
+        let caw = "java/io/CharArrayWriter";
+        registry.register(caw, "<init>", "()V", native_caw_init);
+        registry.register(caw, "write", "(I)V", native_caw_write);
+        registry.register(caw, "write", "([CII)V", native_caw_write_bulk);
+        registry.register(
+            caw,
+            "toString",
+            "()Ljava/lang/String;",
+            native_caw_to_string,
+        );
+        registry.register(caw, "toCharArray", "()[C", native_caw_to_char_array);
+        registry.register(caw, "size", "()I", native_caw_size);
+        registry.register(caw, "reset", "()V", native_caw_reset);
+        registry.register(caw, "flush", "()V", native_noop_void);
+        registry.register(caw, "close", "()V", native_noop_void);
     } // end #[cfg(feature = "synthetic-jdk")] synthetic CharArrayWriter natives
 
     // RDR-MIGRATION 2026-06-01: LineNumberReader extends BufferedReader; its
@@ -8741,18 +8845,18 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     // natives under `synthetic-jdk`.
     #[cfg(feature = "synthetic-jdk")]
     {
-    // LineNumberReader = 4-field synthetic (in=0, lineNumber=1, pos=2, content=3)
-    let lnr = "java/io/LineNumberReader";
-    registry.register(lnr, "<init>", "(Ljava/io/Reader;)V", native_lnr_init);
-    registry.register(
-        lnr,
-        "readLine",
-        "()Ljava/lang/String;",
-        native_lnr_read_line,
-    );
-    registry.register(lnr, "getLineNumber", "()I", native_lnr_get_line_number);
-    registry.register(lnr, "setLineNumber", "(I)V", native_lnr_set_line_number);
-    registry.register(lnr, "close", "()V", native_noop_void);
+        // LineNumberReader = 4-field synthetic (in=0, lineNumber=1, pos=2, content=3)
+        let lnr = "java/io/LineNumberReader";
+        registry.register(lnr, "<init>", "(Ljava/io/Reader;)V", native_lnr_init);
+        registry.register(
+            lnr,
+            "readLine",
+            "()Ljava/lang/String;",
+            native_lnr_read_line,
+        );
+        registry.register(lnr, "getLineNumber", "()I", native_lnr_get_line_number);
+        registry.register(lnr, "setLineNumber", "(I)V", native_lnr_set_line_number);
+        registry.register(lnr, "close", "()V", native_noop_void);
     }
     registry.set_category(__prev_cat);
 }
@@ -8780,7 +8884,10 @@ fn native_raf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => "r".to_string(),
     };
     let writable = mode.contains('w');
-    let fd = ctx.fd_table().open_read_write(&path, writable).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_read_write(&path, writable)
+        .map_err(io_err)?;
     ctx.set_field(this, RAF_FIELD_FD, Value::Int(fd as i32));
     let path_str = ctx.create_string(&path);
     ctx.set_field(this, RAF_FIELD_PATH, Value::Object(Some(path_str)));
@@ -8805,7 +8912,10 @@ fn native_raf_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => "r".to_string(),
     };
     let writable = mode.contains('w');
-    let fd = ctx.fd_table().open_read_write(&path, writable).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_read_write(&path, writable)
+        .map_err(io_err)?;
     ctx.set_field(this, RAF_FIELD_FD, Value::Int(fd as i32));
     let path_str = ctx.create_string(&path);
     ctx.set_field(this, RAF_FIELD_PATH, Value::Object(Some(path_str)));
@@ -9730,12 +9840,10 @@ fn native_bis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let buffered = (count - pos).max(0);
     // Also query inner stream
     let inner_avail = match ctx.get_field(this, BIS_FIELD_IN) {
-        Value::Object(Some(o)) => {
-            match ctx.invoke_virtual(o, "available", "()I", &[]) {
-                Ok(Some(Value::Int(a))) => a,
-                _ => 0,
-            }
-        }
+        Value::Object(Some(o)) => match ctx.invoke_virtual(o, "available", "()I", &[]) {
+            Ok(Some(Value::Int(a))) => a,
+            _ => 0,
+        },
         _ => 0,
     };
     Ok(Some(Value::Int(buffered + inner_avail)))
@@ -10699,14 +10807,14 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // ===========================================================================
 
 // --- FileLock layout: 6-field synthetic ---
-const FL_FIELD_CHANNEL: usize = 0;  // Object: owning FileChannel
+const FL_FIELD_CHANNEL: usize = 0; // Object: owning FileChannel
 const FL_FIELD_POSITION: usize = 1; // Long: lock start position
-const FL_FIELD_SIZE: usize = 2;     // Long: lock region size
-const FL_FIELD_SHARED: usize = 3;   // Int: 1=shared, 0=exclusive
-const FL_FIELD_VALID: usize = 4;    // Int: 1=valid, 0=released
-// Slot 5: Long — non-zero in-process registry id (from `next_lock_token`).
-// Used by `release` to find the matching entry in `file_locks()` and drop
-// it. 0 means the FileLock is not registered (e.g. construction failed).
+const FL_FIELD_SIZE: usize = 2; // Long: lock region size
+const FL_FIELD_SHARED: usize = 3; // Int: 1=shared, 0=exclusive
+const FL_FIELD_VALID: usize = 4; // Int: 1=valid, 0=released
+                                 // Slot 5: Long — non-zero in-process registry id (from `next_lock_token`).
+                                 // Used by `release` to find the matching entry in `file_locks()` and drop
+                                 // it. 0 means the FileLock is not registered (e.g. construction failed).
 const FL_FIELD_TOKEN: usize = 5;
 const FL_NUM_FIELDS: usize = 6;
 
@@ -10828,7 +10936,11 @@ fn os_acquire_lock(
         #[cfg(target_os = "freebsd")]
         l_sysid: 0,
     };
-    let cmd = if blocking { libc::F_SETLKW } else { libc::F_SETLK };
+    let cmd = if blocking {
+        libc::F_SETLKW
+    } else {
+        libc::F_SETLK
+    };
     let r = unsafe { libc::fcntl(raw_fd, cmd, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -10928,7 +11040,11 @@ fn os_acquire_lock(
     // so LockFileEx waits until the OS grants the region — matching the
     // JDK `FileChannel.lock()` contract. When false, retain the fast-fail
     // bit so callers get `tryLock` semantics.
-    let mut flags: Dword = if blocking { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
+    let mut flags: Dword = if blocking {
+        0
+    } else {
+        LOCKFILE_FAIL_IMMEDIATELY
+    };
     if !shared {
         flags |= LOCKFILE_EXCLUSIVE_LOCK;
     }
@@ -11061,9 +11177,7 @@ fn try_acquire_file_lock_inner(
     let regions = map.entry(fd_id).or_default();
     for existing in regions.iter() {
         let want_exclusive = !shared || !existing.shared;
-        if want_exclusive
-            && regions_overlap(position, size, existing.position, existing.size)
-        {
+        if want_exclusive && regions_overlap(position, size, existing.position, existing.size) {
             return None;
         }
     }
@@ -11455,7 +11569,11 @@ fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(Value::Int(1)));
     }
     let registry = mmap_registry().lock();
-    Ok(Some(Value::Int(if registry.contains_key(&id) { 1 } else { 0 })))
+    Ok(Some(Value::Int(if registry.contains_key(&id) {
+        1
+    } else {
+        0
+    })))
 }
 
 /// MappedByteBuffer.load() -> MappedByteBuffer
@@ -11802,7 +11920,11 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let writable = matches!(mode, FcMapMode::ReadWrite | FcMapMode::Private);
     let mbb = alloc_mapped_byte_buffer(ctx, size);
     ctx.set_field(mbb, MBB_FIELD_MAPPED_ADDR, Value::Long(id));
-    ctx.set_field(mbb, MBB_FIELD_WRITABLE, Value::Int(if writable { 1 } else { 0 }));
+    ctx.set_field(
+        mbb,
+        MBB_FIELD_WRITABLE,
+        Value::Int(if writable { 1 } else { 0 }),
+    );
     let arr = match ctx.get_field(mbb, BB_FIELD_ARRAY) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(mbb)))),
@@ -11900,11 +12022,7 @@ fn native_fc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // ---------------------------------------------------------------------------
 
 /// Helper: collect directory entries as Path objects into a Vec<Value>.
-fn collect_dir_entries(
-    ctx: &mut dyn NativeContext,
-    dir: &str,
-    recursive: bool,
-) -> Vec<Value> {
+fn collect_dir_entries(ctx: &mut dyn NativeContext, dir: &str, recursive: bool) -> Vec<Value> {
     let mut results = Vec::new();
     collect_dir_entries_inner(ctx, dir, recursive, &mut results);
     results
@@ -11921,9 +12039,7 @@ fn collect_dir_entries_inner(
         Ok(rd) => rd,
         Err(e) => {
             if dbg_jetty {
-                eprintln!(
-                    "[cratonvm-jetty] Files.list/walk read_dir({dir}) failed: {e}"
-                );
+                eprintln!("[cratonvm-jetty] Files.list/walk read_dir({dir}) failed: {e}");
             }
             return;
         }
@@ -12046,12 +12162,7 @@ fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
     // FileChannelImpl path and a genuine FileLockImpl.
     #[cfg(feature = "synthetic-jdk")]
     {
-        registry.register(
-            fc,
-            "lock",
-            "()Ljava/nio/channels/FileLock;",
-            native_fc_lock,
-        );
+        registry.register(fc, "lock", "()Ljava/nio/channels/FileLock;", native_fc_lock);
         registry.register(
             fc,
             "tryLock",
@@ -12295,7 +12406,11 @@ fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             message: format!("AsynchronousFileChannel.open: {e}"),
         })?;
 
-    let afc = alloc_synthetic(ctx, "java/nio/channels/AsynchronousFileChannel", AFC_NUM_FIELDS);
+    let afc = alloc_synthetic(
+        ctx,
+        "java/nio/channels/AsynchronousFileChannel",
+        AFC_NUM_FIELDS,
+    );
     ctx.set_field(afc, AFC_FIELD_FD, Value::Int(fd_id as i32));
     let path_s = ctx.create_string(&path_str);
     ctx.set_field(afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
@@ -12680,20 +12795,10 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
     );
 
     // WatchKey.reset() → boolean
-    r.register(
-        "java/nio/file/WatchKey",
-        "reset",
-        "()Z",
-        native_wk_reset,
-    );
+    r.register("java/nio/file/WatchKey", "reset", "()Z", native_wk_reset);
 
     // WatchKey.cancel() → void
-    r.register(
-        "java/nio/file/WatchKey",
-        "cancel",
-        "()V",
-        native_wk_cancel,
-    );
+    r.register("java/nio/file/WatchKey", "cancel", "()V", native_wk_cancel);
 
     // WatchKey.isValid() → boolean
     r.register(
@@ -12721,21 +12826,36 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
 
     // StandardWatchEventKinds constants
     let kinds = "java/nio/file/StandardWatchEventKinds";
-    r.register(kinds, "ENTRY_CREATE", "()Ljava/nio/file/WatchEvent$Kind;", |ctx, _| {
-        let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-        ctx.set_field(k, 0, Value::Int(EVENT_CREATE));
-        Ok(Some(Value::Object(Some(k))))
-    });
-    r.register(kinds, "ENTRY_DELETE", "()Ljava/nio/file/WatchEvent$Kind;", |ctx, _| {
-        let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-        ctx.set_field(k, 0, Value::Int(EVENT_DELETE));
-        Ok(Some(Value::Object(Some(k))))
-    });
-    r.register(kinds, "ENTRY_MODIFY", "()Ljava/nio/file/WatchEvent$Kind;", |ctx, _| {
-        let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
-        ctx.set_field(k, 0, Value::Int(EVENT_MODIFY));
-        Ok(Some(Value::Object(Some(k))))
-    });
+    r.register(
+        kinds,
+        "ENTRY_CREATE",
+        "()Ljava/nio/file/WatchEvent$Kind;",
+        |ctx, _| {
+            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
+            ctx.set_field(k, 0, Value::Int(EVENT_CREATE));
+            Ok(Some(Value::Object(Some(k))))
+        },
+    );
+    r.register(
+        kinds,
+        "ENTRY_DELETE",
+        "()Ljava/nio/file/WatchEvent$Kind;",
+        |ctx, _| {
+            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
+            ctx.set_field(k, 0, Value::Int(EVENT_DELETE));
+            Ok(Some(Value::Object(Some(k))))
+        },
+    );
+    r.register(
+        kinds,
+        "ENTRY_MODIFY",
+        "()Ljava/nio/file/WatchEvent$Kind;",
+        |ctx, _| {
+            let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
+            ctx.set_field(k, 0, Value::Int(EVENT_MODIFY));
+            Ok(Some(Value::Object(Some(k))))
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -12752,14 +12872,16 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
     ctx.set_field(ws, WS_FIELD_OPEN, Value::Int(1));
 
     let (tx, rx) = mpsc::channel::<NotifyResult>();
-    let watcher =
-        notify::RecommendedWatcher::new(move |res: NotifyResult| {
+    let watcher = notify::RecommendedWatcher::new(
+        move |res: NotifyResult| {
             // Silently drop on disconnect — the watch service is closing.
             let _ = tx.send(res);
-        }, notify::Config::default())
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("WatchService: platform watcher init: {e}"),
-        })?;
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| RuntimeError::IOException {
+        message: format!("WatchService: platform watcher init: {e}"),
+    })?;
 
     watch_services().lock().insert(
         // GC-stable-key-fix: identity-hash, not the raw heap address.
@@ -12827,11 +12949,11 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let mut services = watch_services().lock();
         // GC-stable-key-fix: identity-hash, not the raw heap address.
         let watcher_key = ctx.identity_hash_code(watcher);
-        let state = services.get_mut(&watcher_key).ok_or_else(|| {
-            RuntimeError::IOException {
+        let state = services
+            .get_mut(&watcher_key)
+            .ok_or_else(|| RuntimeError::IOException {
                 message: "WatchService.register: service is closed or unknown".into(),
-            }
-        })?;
+            })?;
         state
             .watcher
             .watch(&canonical, RecursiveMode::NonRecursive)
@@ -12874,7 +12996,11 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// consume every queued event that targets `wk`'s registered path. Only
 /// events whose kind matches the mask the caller registered for are
 /// returned; the rest are dropped.
-fn detect_events(ctx: &mut dyn NativeContext, service: ObjectRef, wk: ObjectRef) -> Vec<(i32, String)> {
+fn detect_events(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+    wk: ObjectRef,
+) -> Vec<(i32, String)> {
     let path_str = match ctx.get_field(wk, WK_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Vec::new(),
@@ -12894,7 +13020,9 @@ fn detect_events(ctx: &mut dyn NativeContext, service: ObjectRef, wk: ObjectRef)
     };
     drain_into_queues(state);
     let raw = state.queued.remove(&canonical).unwrap_or_default();
-    raw.into_iter().filter(|(k, _)| k & event_mask != 0).collect()
+    raw.into_iter()
+        .filter(|(k, _)| k & event_mask != 0)
+        .collect()
 }
 
 fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13054,7 +13182,12 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let dc = "java/nio/channels/DatagramChannel";
 
     // open() → DatagramChannel
-    r.register(dc, "open", "()Ljava/nio/channels/DatagramChannel;", native_dc_open);
+    r.register(
+        dc,
+        "open",
+        "()Ljava/nio/channels/DatagramChannel;",
+        native_dc_open,
+    );
 
     // bind(SocketAddress) → DatagramChannel
     r.register(
@@ -13103,16 +13236,11 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     );
 
     // socket() → DatagramSocket (stub for compat)
-    r.register(
-        dc,
-        "socket",
-        "()Ljava/net/DatagramSocket;",
-        |_ctx, args| {
-            // Return self as the socket (simplified)
-            let this = obj_arg92(args, 0)?;
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
+    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", |_ctx, args| {
+        // Return self as the socket (simplified)
+        let this = obj_arg92(args, 0)?;
+        Ok(Some(Value::Object(Some(this))))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -13126,10 +13254,7 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
 
     let dc = alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS);
     ctx.set_field(dc, DC_FIELD_FD, Value::Int(fd_id as i32));
-    let addr = ctx
-        .fd_table()
-        .udp_local_addr(fd_id)
-        .unwrap_or_default();
+    let addr = ctx.fd_table().udp_local_addr(fd_id).unwrap_or_default();
     let addr_s = ctx.create_string(&addr);
     ctx.set_field(dc, DC_FIELD_ADDR, Value::Object(Some(addr_s)));
     ctx.set_field(dc, DC_FIELD_OPEN, Value::Int(1));
@@ -13156,12 +13281,12 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let _ = ctx.fd_table().close(old_fd);
 
-    let fd_id = ctx
-        .fd_table()
-        .open_udp(Some(&addr_str))
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("DatagramChannel.bind: {e}"),
-        })?;
+    let fd_id =
+        ctx.fd_table()
+            .open_udp(Some(&addr_str))
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("DatagramChannel.bind: {e}"),
+            })?;
 
     ctx.set_field(this, DC_FIELD_FD, Value::Int(fd_id as i32));
     let actual_addr = ctx.fd_table().udp_local_addr(fd_id).unwrap_or_default();
@@ -13243,12 +13368,12 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
 
     let mut buf = vec![0u8; remaining];
-    let (n, source_addr) = ctx
-        .fd_table()
-        .udp_recv(fd_id, &mut buf)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("receive: {e}"),
-        })?;
+    let (n, source_addr) =
+        ctx.fd_table()
+            .udp_recv(fd_id, &mut buf)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("receive: {e}"),
+            })?;
 
     for (i, &b) in buf.iter().enumerate().take(n) {
         ctx.set_array_element(arr, pos as usize + i, Value::Int(b as i8 as i32));
@@ -13323,7 +13448,12 @@ fn register_selector(r: &mut NativeMethodRegistry) {
     let sel = "java/nio/channels/Selector";
 
     // Selector.open() → Selector
-    r.register(sel, "open", "()Ljava/nio/channels/Selector;", native_sel_open);
+    r.register(
+        sel,
+        "open",
+        "()Ljava/nio/channels/Selector;",
+        native_sel_open,
+    );
 
     // select() → int (number of ready channels)
     r.register(sel, "select", "()I", native_sel_select);
@@ -13393,10 +13523,15 @@ fn register_selector(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if ready & OP_WRITE != 0 { 1 } else { 0 })))
     });
-    r.register(sk, "channel", "()Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(ctx.get_field(this, SK_FIELD_CHANNEL)))
-    });
+    r.register(
+        sk,
+        "channel",
+        "()Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg92(args, 0)?;
+            Ok(Some(ctx.get_field(this, SK_FIELD_CHANNEL)))
+        },
+    );
     r.register(sk, "cancel", "()V", |ctx, args| {
         let this = obj_arg92(args, 0)?;
         ctx.set_field(this, SK_FIELD_VALID, Value::Int(0));
@@ -13411,8 +13546,12 @@ fn register_selector(r: &mut NativeMethodRegistry) {
     // OP constants
     r.register(sk, "OP_READ", "()I", |_, _| Ok(Some(Value::Int(OP_READ))));
     r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
-    r.register(sk, "OP_CONNECT", "()I", |_, _| Ok(Some(Value::Int(OP_CONNECT))));
-    r.register(sk, "OP_ACCEPT", "()I", |_, _| Ok(Some(Value::Int(OP_ACCEPT))));
+    r.register(sk, "OP_CONNECT", "()I", |_, _| {
+        Ok(Some(Value::Int(OP_CONNECT)))
+    });
+    r.register(sk, "OP_ACCEPT", "()I", |_, _| {
+        Ok(Some(Value::Int(OP_ACCEPT)))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -14219,8 +14358,12 @@ mod io_tests {
         let r = io_registry();
         let f = "java/io/File";
         assert!(r.find(f, "<init>", "(Ljava/lang/String;)V").is_some());
-        assert!(r.find(f, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V").is_some());
-        assert!(r.find(f, "<init>", "(Ljava/io/File;Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(f, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(f, "<init>", "(Ljava/io/File;Ljava/lang/String;)V")
+            .is_some());
         assert!(r.find(f, "exists", "()Z").is_some());
         assert!(r.find(f, "isFile", "()Z").is_some());
         assert!(r.find(f, "isDirectory", "()Z").is_some());
@@ -14230,7 +14373,9 @@ mod io_tests {
         assert!(r.find(f, "mkdirs", "()Z").is_some());
         assert!(r.find(f, "getName", "()Ljava/lang/String;").is_some());
         assert!(r.find(f, "getPath", "()Ljava/lang/String;").is_some());
-        assert!(r.find(f, "getAbsolutePath", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(f, "getAbsolutePath", "()Ljava/lang/String;")
+            .is_some());
         assert!(r.find(f, "getParent", "()Ljava/lang/String;").is_some());
         assert!(r.find(f, "canRead", "()Z").is_some());
         assert!(r.find(f, "canWrite", "()Z").is_some());
@@ -14316,17 +14461,45 @@ mod io_tests {
         let path = "java/nio/file/Path";
         let paths = "java/nio/file/Paths";
         let files = "java/nio/file/Files";
-        assert!(r.find(paths, "get", "(Ljava/lang/String;)Ljava/nio/file/Path;").is_some());
+        assert!(r
+            .find(paths, "get", "(Ljava/lang/String;)Ljava/nio/file/Path;")
+            .is_some());
         assert!(r.find(path, "toString", "()Ljava/lang/String;").is_some());
-        assert!(r.find(path, "getFileName", "()Ljava/nio/file/Path;").is_some());
-        assert!(r.find(path, "getParent", "()Ljava/nio/file/Path;").is_some());
+        assert!(r
+            .find(path, "getFileName", "()Ljava/nio/file/Path;")
+            .is_some());
+        assert!(r
+            .find(path, "getParent", "()Ljava/nio/file/Path;")
+            .is_some());
         assert!(r.find(path, "isAbsolute", "()Z").is_some());
-        assert!(r.find(path, "normalize", "()Ljava/nio/file/Path;").is_some());
-        assert!(r.find(files, "exists", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z").is_some());
-        assert!(r.find(files, "isDirectory", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z").is_some());
+        assert!(r
+            .find(path, "normalize", "()Ljava/nio/file/Path;")
+            .is_some());
+        assert!(r
+            .find(
+                files,
+                "exists",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                files,
+                "isDirectory",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z"
+            )
+            .is_some());
         assert!(r.find(files, "delete", "(Ljava/nio/file/Path;)V").is_some());
-        assert!(r.find(files, "readAllBytes", "(Ljava/nio/file/Path;)[B").is_some());
-        assert!(r.find(files, "readString", "(Ljava/nio/file/Path;)Ljava/lang/String;").is_some());
+        assert!(r
+            .find(files, "readAllBytes", "(Ljava/nio/file/Path;)[B")
+            .is_some());
+        assert!(r
+            .find(
+                files,
+                "readString",
+                "(Ljava/nio/file/Path;)Ljava/lang/String;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -14464,7 +14637,10 @@ mod io_tests {
         set_path_validation_enabled(true);
         // `a/../../b` → one name, two parents → escapes one level above start.
         let result = validate_path("a/../../b.txt");
-        assert!(result.is_err(), "net-escaping `..` path accepted: {result:?}");
+        assert!(
+            result.is_err(),
+            "net-escaping `..` path accepted: {result:?}"
+        );
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
     }
@@ -14482,7 +14658,10 @@ mod io_tests {
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(false);
         let result = validate_path("/etc/passwd");
-        assert!(result.is_ok(), "absolute path rejected by default: {result:?}");
+        assert!(
+            result.is_ok(),
+            "absolute path rejected by default: {result:?}"
+        );
         set_path_confine_to_cwd(prev);
     }
 
@@ -14589,7 +14768,10 @@ mod io_tests {
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(false);
         let result = validated_path("../../etc/passwd");
-        assert!(result.is_err(), "Files path with `..` segment accepted: {result:?}");
+        assert!(
+            result.is_err(),
+            "Files path with `..` segment accepted: {result:?}"
+        );
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
         set_path_confine_to_cwd(prev);
@@ -14602,7 +14784,10 @@ mod io_tests {
     fn files_validated_path_rejects_null_byte_even_when_disabled() {
         set_path_validation_enabled(false);
         let result = validated_path("/tmp/evil\0.txt");
-        assert!(result.is_err(), "Files path with null byte accepted: {result:?}");
+        assert!(
+            result.is_err(),
+            "Files path with null byte accepted: {result:?}"
+        );
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("null byte"), "err = {err}");
         set_path_validation_enabled(true);
@@ -14621,7 +14806,10 @@ mod io_tests {
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(true);
         let result = validated_path("files_create_regression_target.txt");
-        assert!(result.is_ok(), "in-sandbox not-yet-existing path rejected: {result:?}");
+        assert!(
+            result.is_ok(),
+            "in-sandbox not-yet-existing path rejected: {result:?}"
+        );
         set_path_confine_to_cwd(prev);
     }
 
@@ -15097,8 +15285,7 @@ mod t2_mutf8_tests {
 
     #[test]
     fn t2_decode_surrogate_pair_to_supplementary() {
-        let decoded =
-            decode_modified_utf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap();
+        let decoded = decode_modified_utf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap();
         assert_eq!(decoded, "😀");
     }
 
@@ -15246,8 +15433,7 @@ mod ra2_utf8_decoder_tests {
     #[test]
     fn ra2_four_byte_party_popper_expected_pair() {
         // U+1F389 🎉 = 0xF0 0x9F 0x8E 0x89 → D83C, DF89 (per RA.2 spec).
-        let (chars, _, _, low) =
-            decode_utf8_into_chars(&[0xF0, 0x9F, 0x8E, 0x89], true, 100);
+        let (chars, _, _, low) = decode_utf8_into_chars(&[0xF0, 0x9F, 0x8E, 0x89], true, 100);
         assert_eq!(chars, vec![0xD83Cu16, 0xDF89u16]);
         assert!(low.is_none());
     }
@@ -15255,8 +15441,7 @@ mod ra2_utf8_decoder_tests {
     #[test]
     fn ra2_split_across_two_reads_rejoins_correctly() {
         // First call: only 2 of 3 bytes of U+2603 ☃ (0xE2 0x98 0x83) arrive.
-        let (chars1, consumed1, tail1, _) =
-            decode_utf8_into_chars(&[0x48, 0xE2, 0x98], false, 100);
+        let (chars1, consumed1, tail1, _) = decode_utf8_into_chars(&[0x48, 0xE2, 0x98], false, 100);
         assert_eq!(chars1, vec![b'H' as u16]);
         assert_eq!(consumed1, 1);
         assert_eq!(tail1, vec![0xE2, 0x98]);
@@ -15275,7 +15460,9 @@ mod ra2_utf8_decoder_tests {
     fn ra2_mixed_ascii_and_bmp_200_byte_fixture() {
         // 200-byte fixture containing ASCII, Latin-1, and BMP chars.
         let mut src = String::new();
-        for _ in 0..40 { src.push_str("a©中b"); } // 1 + 2 + 3 + 1 = 7 bytes/iter → 280 bytes
+        for _ in 0..40 {
+            src.push_str("a©中b");
+        } // 1 + 2 + 3 + 1 = 7 bytes/iter → 280 bytes
         let bytes: Vec<u8> = src.bytes().collect();
         let (chars, consumed, tail, _) = decode_utf8_into_chars(&bytes, true, 10_000);
         assert_eq!(consumed, bytes.len());
@@ -15516,8 +15703,7 @@ mod bais_layout_tests {
     fn skip_advances_within_count() {
         let mut ctx = MockNativeContext::new();
         let (this, _) = make_bais(&mut ctx, b"abcdefgh");
-        let s =
-            native_bais_skip(&mut ctx, &[Value::Object(Some(this)), Value::Long(3)]).unwrap();
+        let s = native_bais_skip(&mut ctx, &[Value::Object(Some(this)), Value::Long(3)]).unwrap();
         assert_eq!(s, Some(Value::Long(3)));
         let a = native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
         assert_eq!(a, Some(Value::Int(b'd' as i32)));
@@ -15760,10 +15946,7 @@ mod buffer_bounds_tests {
     fn bb_get_int_abs_rejects_negative_index() {
         let mut ctx = MockNativeContext::new();
         let bb = make_bb(&mut ctx, 8);
-        let r = native_bb_get_int_abs(
-            &mut ctx,
-            &[Value::Object(Some(bb)), Value::Int(-1)],
-        );
+        let r = native_bb_get_int_abs(&mut ctx, &[Value::Object(Some(bb)), Value::Int(-1)]);
         assert!(r.is_err(), "negative index must throw, got {r:?}");
     }
 
@@ -15794,10 +15977,7 @@ mod buffer_bounds_tests {
     fn bb_get_int_abs_valid_index_ok() {
         let mut ctx = MockNativeContext::new();
         let bb = make_bb(&mut ctx, 8);
-        let r = native_bb_get_int_abs(
-            &mut ctx,
-            &[Value::Object(Some(bb)), Value::Int(4)],
-        );
+        let r = native_bb_get_int_abs(&mut ctx, &[Value::Object(Some(bb)), Value::Int(4)]);
         assert!(r.is_ok(), "in-range index must succeed, got {r:?}");
     }
 
@@ -15807,10 +15987,7 @@ mod buffer_bounds_tests {
         // IntBuffer-style typed buffer: cap=4 elements.
         let buf = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 4);
         buf_set_limit(&mut ctx, buf, 4);
-        let r = native_tb_get_int_abs(
-            &mut ctx,
-            &[Value::Object(Some(buf)), Value::Int(-1)],
-        );
+        let r = native_tb_get_int_abs(&mut ctx, &[Value::Object(Some(buf)), Value::Int(-1)]);
         assert!(r.is_err(), "negative element index must throw, got {r:?}");
     }
 
@@ -15820,10 +15997,7 @@ mod buffer_bounds_tests {
         let buf = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 4);
         buf_set_limit(&mut ctx, buf, 4);
         // idx == cap is out of range (valid indices are 0..cap).
-        let r = native_tb_get_int_abs(
-            &mut ctx,
-            &[Value::Object(Some(buf)), Value::Int(4)],
-        );
+        let r = native_tb_get_int_abs(&mut ctx, &[Value::Object(Some(buf)), Value::Int(4)]);
         assert!(r.is_err(), "index==cap must throw, got {r:?}");
     }
 }
@@ -15893,8 +16067,7 @@ mod files_bulk_transfer_tests {
         assert_eq!(std::fs::read(&path).unwrap(), data, "file bytes on disk");
 
         // Read it back through the native and compare the byte[].
-        let r = native_files_read_all_bytes(&mut ctx, &[Value::Object(Some(p))])
-            .expect("read ok");
+        let r = native_files_read_all_bytes(&mut ctx, &[Value::Object(Some(p))]).expect("read ok");
         let read_arr = match r {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected byte[] object, got {other:?}"),
@@ -15924,8 +16097,7 @@ mod files_bulk_transfer_tests {
 
         let mut ctx = MockNativeContext::new();
         let p = make_path(&mut ctx, &path_str);
-        let r = native_files_read_all_bytes(&mut ctx, &[Value::Object(Some(p))])
-            .expect("read ok");
+        let r = native_files_read_all_bytes(&mut ctx, &[Value::Object(Some(p))]).expect("read ok");
         match r {
             Some(Value::Object(Some(o))) => assert_eq!(ctx.array_length(o), 0),
             other => panic!("expected empty byte[], got {other:?}"),
@@ -15990,7 +16162,10 @@ mod abs_path_tests {
             Value::Object(Some(o)) => ctx.read_string(o).expect("string value"),
             other => panic!("expected String, got {other:?}"),
         };
-        assert_eq!(out, input, "already-absolute path must be returned verbatim");
+        assert_eq!(
+            out, input,
+            "already-absolute path must be returned verbatim"
+        );
         assert!(
             !out.starts_with(r"\\?\"),
             "getAbsolutePath must not add the canonicalize-only \\\\?\\ prefix"

@@ -940,11 +940,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
 /// compiled method's map; the conservative path is the NEW-1 blind
 /// scan, still required for entries that were pushed without precise
 /// metadata.
-pub fn scan_active_jit_frames_with_sp(
-    scanner_sp: usize,
-    heap: &VmHeap,
-    out: &mut Vec<ObjectRef>,
-) {
+pub fn scan_active_jit_frames_with_sp(scanner_sp: usize, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     JIT_ENTRY_CHAIN.with(|c| {
         let chain = c.borrow();
         for entry in chain.iter() {
@@ -1094,8 +1090,7 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                         // the registry is evicted before a cm is dropped.
                         let cm: &cratonvm_jit::CompiledMethod =
                             unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
-                        let (found, examined, n) =
-                            remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                        let (found, examined, n) = remap_one_jit_frame(parent_rbp, cm, pointer_map);
                         dbg_frames += 1;
                         dbg_slots.set(dbg_slots.get() + n);
                         if found {
@@ -1188,11 +1183,7 @@ fn remap_one_jit_frame(
 /// keeps the walker functional even when the compiler has only
 /// populated oop maps at a subset of safepoints — a realistic state
 /// during the staged rollout described in `docs/roadmap.md` NEW-12.
-fn scan_one_frame_precise(
-    info: PreciseFrameInfo,
-    heap: &VmHeap,
-    out: &mut Vec<ObjectRef>,
-) {
+fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // SAFETY: `info.compiled_method` was populated from a live
     // `&CompiledMethod` at push time, and the chain is popped before
     // the borrow ends. The JIT cache also keeps the CompiledMethod
@@ -1656,8 +1647,8 @@ mod tests {
     ///      real-oop slot, and the poison slot is filtered out.
     #[test]
     fn new12_scan_oop_slots_filters_via_heap_validation() {
-        use crate::memory::vm_heap::VmHeap;
         use crate::classloading::ClassId;
+        use crate::memory::vm_heap::VmHeap;
         // Build a real heap and allocate one object so we have a
         // known-valid address.
         let heap = VmHeap::new(

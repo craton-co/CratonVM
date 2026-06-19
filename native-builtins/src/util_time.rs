@@ -31,12 +31,12 @@
 //! path directly; in real-JDK mode the JDK's own JCK-equivalent
 //! test suite exercises the same contract through the bytecode path.
 
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
+use crate::{alloc_concurrent_synthetic, obj_arg};
 use std::fmt::Write;
-use crate::{obj_arg, alloc_concurrent_synthetic};
 
 // java.time — LocalDate, LocalTime, Instant, Duration (Phase 17)
 // ===========================================================================
@@ -64,7 +64,12 @@ const DUR_FIELD_SECONDS: usize = 0;
 const DUR_FIELD_NANOS: usize = 1;
 const DUR_NUM_FIELDS: usize = 2;
 
-pub(crate) fn alloc_local_date(ctx: &mut dyn NativeContext, year: i32, month: i32, day: i32) -> ObjectRef {
+pub(crate) fn alloc_local_date(
+    ctx: &mut dyn NativeContext,
+    year: i32,
+    month: i32,
+    day: i32,
+) -> ObjectRef {
     let obj = alloc_time_synthetic(ctx, "java/time/LocalDate", LD_NUM_FIELDS);
     ctx.set_field(obj, LD_FIELD_YEAR, Value::Int(year));
     ctx.set_field(obj, LD_FIELD_MONTH, Value::Int(month));
@@ -105,7 +110,11 @@ pub(crate) fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i
     obj
 }
 
-pub(crate) fn alloc_time_synthetic(ctx: &mut dyn NativeContext, class: &str, n: usize) -> ObjectRef {
+pub(crate) fn alloc_time_synthetic(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    n: usize,
+) -> ObjectRef {
     match ctx.ensure_class_initialized(class) {
         Ok(cid) => ctx.alloc_object(cid, n),
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), n),
@@ -565,10 +574,12 @@ fn native_ld_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let obj = alloc_local_date(ctx, y, m, d);
         Ok(Some(Value::Object(Some(obj))))
     } else {
-        Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("Invalid date: {s}"),
-        }
-        .into())
+        Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Invalid date: {s}"),
+            }
+            .into(),
+        )
     }
 }
 
@@ -1041,10 +1052,12 @@ fn native_lt_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let obj = alloc_local_time(ctx, h, m, sec, nano);
         Ok(Some(Value::Object(Some(obj))))
     } else {
-        Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("Invalid time: {s}"),
-        }
-        .into())
+        Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Invalid time: {s}"),
+            }
+            .into(),
+        )
     }
 }
 
@@ -4302,16 +4315,37 @@ fn native_dtf_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         read_ldt_fields(ctx, temporal)
     } else if nf == 3 {
         // LocalDate
-        let y = match ctx.get_field(temporal, 0) { Value::Int(v) => v, _ => 2000 };
-        let mo = match ctx.get_field(temporal, 1) { Value::Int(v) => v, _ => 1 };
-        let d = match ctx.get_field(temporal, 2) { Value::Int(v) => v, _ => 1 };
+        let y = match ctx.get_field(temporal, 0) {
+            Value::Int(v) => v,
+            _ => 2000,
+        };
+        let mo = match ctx.get_field(temporal, 1) {
+            Value::Int(v) => v,
+            _ => 1,
+        };
+        let d = match ctx.get_field(temporal, 2) {
+            Value::Int(v) => v,
+            _ => 1,
+        };
         (y, mo, d, 0, 0, 0, 0)
     } else if nf == 4 {
         // LocalTime
-        let h = match ctx.get_field(temporal, 0) { Value::Int(v) => v, _ => 0 };
-        let mi = match ctx.get_field(temporal, 1) { Value::Int(v) => v, _ => 0 };
-        let s = match ctx.get_field(temporal, 2) { Value::Int(v) => v, _ => 0 };
-        let n = match ctx.get_field(temporal, 3) { Value::Int(v) => v, _ => 0 };
+        let h = match ctx.get_field(temporal, 0) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let mi = match ctx.get_field(temporal, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let s = match ctx.get_field(temporal, 2) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let n = match ctx.get_field(temporal, 3) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         (2000, 1, 1, h, mi, s, n)
     } else {
         (2000, 1, 1, 0, 0, 0, 0)
@@ -4387,8 +4421,8 @@ pub(crate) fn dtf_apply_pattern(
                 if count >= 3 {
                     // Month name (abbreviated)
                     let names = [
-                        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                        "Nov", "Dec",
                     ];
                     let idx = (month.max(1).min(12) - 1) as usize;
                     out.push_str(names[idx]);
@@ -4413,7 +4447,11 @@ pub(crate) fn dtf_apply_pattern(
                 }
             }
             'h' => {
-                let h12 = if hour == 0 || hour == 12 { 12 } else { hour % 12 };
+                let h12 = if hour == 0 || hour == 12 {
+                    12
+                } else {
+                    hour % 12
+                };
                 if count >= 2 {
                     write!(&mut out, "{:02}", h12).unwrap();
                 } else {
@@ -4459,11 +4497,21 @@ pub(crate) fn dtf_apply_pattern(
                 let dow = {
                     let (mut y, m, d) = (year, month, day);
                     let t = [0i32, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-                    if m < 3 { y -= 1; }
+                    if m < 3 {
+                        y -= 1;
+                    }
                     ((y + y / 4 - y / 100 + y / 400 + t[(m - 1).max(0) as usize] + d) % 7) as usize
                 };
                 let names_abbr = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-                let names_full = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+                let names_full = [
+                    "Sunday",
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                ];
                 if count >= 4 {
                     out.push_str(names_full[dow % 7]);
                 } else {
@@ -4543,10 +4591,7 @@ fn native_dtf_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 /// Parse a date/time string using pattern letters.
 /// Supports: yyyy, yy, MM, dd, HH, mm, ss, SSS and literal chars.
-pub(crate) fn dtf_parse_pattern(
-    pattern: &str,
-    text: &str,
-) -> (i32, i32, i32, i32, i32, i32, i32) {
+pub(crate) fn dtf_parse_pattern(pattern: &str, text: &str) -> (i32, i32, i32, i32, i32, i32, i32) {
     let pchars: Vec<char> = pattern.chars().collect();
     let tchars: Vec<char> = text.chars().collect();
     let plen = pchars.len();
@@ -4576,7 +4621,9 @@ pub(crate) fn dtf_parse_pattern(
                     ti += 1; // skip literal char
                     pi += 1;
                 }
-                if pi < plen { pi += 1; } // skip closing quote
+                if pi < plen {
+                    pi += 1;
+                } // skip closing quote
             }
             continue;
         }
@@ -4591,7 +4638,11 @@ pub(crate) fn dtf_parse_pattern(
         if ch.is_ascii_alphabetic() && ch != 'T' && ch != 'X' && ch != 'V' && ch != 'Z' {
             // Extract digits from text
             let digit_start = ti;
-            let max_digits = if ch == 'S' || ch == 'n' { count.max(3) } else { count.max(4) };
+            let max_digits = if ch == 'S' || ch == 'n' {
+                count.max(3)
+            } else {
+                count.max(4)
+            };
             while ti < tlen && ti - digit_start < max_digits && tchars[ti].is_ascii_digit() {
                 ti += 1;
             }
@@ -4599,7 +4650,11 @@ pub(crate) fn dtf_parse_pattern(
             let val: i32 = s.parse().unwrap_or(0);
             match ch {
                 'y' | 'u' => {
-                    year = if count <= 2 && val < 100 { 2000 + val } else { val };
+                    year = if count <= 2 && val < 100 {
+                        2000 + val
+                    } else {
+                        val
+                    };
                 }
                 'M' | 'L' => month = val,
                 'd' => day = val,
@@ -4637,15 +4692,16 @@ fn native_ld_with_adjuster(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     let tag = ctx.get_field(adjuster, 0).as_int().unwrap_or(0);
     let (ny, nm, nd) = match tag {
-        1 => (y, m, 1), // firstDayOfMonth
+        1 => (y, m, 1),                   // firstDayOfMonth
         2 => (y, m, days_in_month(y, m)), // lastDayOfMonth
-        3 => { // firstDayOfNextMonth
+        3 => {
+            // firstDayOfNextMonth
             let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
             (ny, nm, 1)
         }
-        4 => (y, 1, 1), // firstDayOfYear
+        4 => (y, 1, 1),   // firstDayOfYear
         5 => (y, 12, 31), // lastDayOfYear
-        _ => (y, m, d), // unknown — no change
+        _ => (y, m, d),   // unknown — no change
     };
     Ok(Some(Value::Object(Some(alloc_local_date(ctx, ny, nm, nd)))))
 }
@@ -4709,7 +4765,9 @@ fn ymd_to_epoch_day(y: i32, m: i32, d: i32) -> i64 {
     let m = m as i64;
     let d = d as i64;
     let mut yr = y;
-    if m <= 2 { yr -= 1; }
+    if m <= 2 {
+        yr -= 1;
+    }
     let era = if yr >= 0 { yr } else { yr - 399 } / 400;
     let yoe = yr - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
@@ -4811,16 +4869,28 @@ fn native_zone_id_of_with_validation(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-fn native_zone_id_get_available(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_zone_id_get_available(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let zones = [
-        "UTC", "GMT", "US/Eastern", "US/Central", "US/Mountain", "US/Pacific",
-        "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
-        "Europe/London", "Europe/Paris", "Europe/Berlin", "Europe/Moscow",
-        "Asia/Tokyo", "Asia/Shanghai", "Asia/Kolkata", "Asia/Singapore",
-        "Australia/Sydney", "Pacific/Auckland",
+        "UTC",
+        "GMT",
+        "US/Eastern",
+        "US/Central",
+        "US/Mountain",
+        "US/Pacific",
+        "America/New_York",
+        "America/Chicago",
+        "America/Denver",
+        "America/Los_Angeles",
+        "Europe/London",
+        "Europe/Paris",
+        "Europe/Berlin",
+        "Europe/Moscow",
+        "Asia/Tokyo",
+        "Asia/Shanghai",
+        "Asia/Kolkata",
+        "Asia/Singapore",
+        "Australia/Sydney",
+        "Pacific/Auckland",
     ];
     // Return as a HashSet — use a simple ArrayList for now (consumers iterate)
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
@@ -4887,7 +4957,11 @@ fn alloc_fixed_clock(
 ) -> ObjectRef {
     let c = alloc_time_synthetic(ctx, "java/time/Clock", CLOCK_NUM_FIELDS);
     ctx.set_field(c, CLOCK_FIELD_ZONE, Value::Object(Some(zone)));
-    ctx.set_field(c, CLOCK_FIELD_FIXED_INSTANT, Value::Object(Some(fixed_instant)));
+    ctx.set_field(
+        c,
+        CLOCK_FIELD_FIXED_INSTANT,
+        Value::Object(Some(fixed_instant)),
+    );
     c
 }
 
@@ -4943,7 +5017,9 @@ fn native_clock_millis(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 Value::Int(v) => v,
                 _ => 0,
             };
-            let millis = sec.saturating_mul(1_000).saturating_add((nano / 1_000_000) as i64);
+            let millis = sec
+                .saturating_mul(1_000)
+                .saturating_add((nano / 1_000_000) as i64);
             return Ok(Some(Value::Long(millis)));
         }
     }
@@ -4977,7 +5053,11 @@ fn native_clock_fixed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // tests that pass null.
         _ => return Ok(Some(Value::Object(Some(alloc_clock(ctx, zone))))),
     };
-    Ok(Some(Value::Object(Some(alloc_fixed_clock(ctx, zone, fixed_instant)))))
+    Ok(Some(Value::Object(Some(alloc_fixed_clock(
+        ctx,
+        zone,
+        fixed_instant,
+    )))))
 }
 
 // ---------------------------------------------------------------------------
@@ -5101,10 +5181,7 @@ fn native_zone_id_get_rules(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// (DST is not modeled in synthetic mode per the file-level T2.5.15
 /// note). The signature is still honored so callers pass the argument
 /// without error.
-fn native_zone_rules_get_offset(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_zone_rules_get_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Argument[1] is the Instant — read but unused; presence validated
     // for callers who pass null defensively.
@@ -5200,10 +5277,7 @@ fn temporal_to_epoch_nanos(ctx: &mut dyn NativeContext, t: ObjectRef) -> i128 {
             _ => 0,
         };
         let epoch_day = to_epoch_day(y, m, d);
-        let epoch_sec = epoch_day * 86_400
-            + hour as i64 * 3_600
-            + min as i64 * 60
-            + sec as i64;
+        let epoch_sec = epoch_day * 86_400 + hour as i64 * 3_600 + min as i64 * 60 + sec as i64;
         epoch_sec as i128 * 1_000_000_000 + nano as i128
     } else {
         // Generic field-0 epoch-second fallback.
@@ -5250,10 +5324,7 @@ fn native_dur_between(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // Our DateTimeFormatter stores the pattern string in field 0 and
 // ignores locale for formatting arithmetic (ASCII-only output). The
 // two-argument overload therefore delegates to the one-argument native.
-fn native_dtf_of_pattern_locale(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_dtf_of_pattern_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Re-use the single-arg native by passing only args[0].
     let trimmed_args: Vec<Value> = if args.is_empty() {
         Vec::new()
@@ -5300,10 +5371,7 @@ fn native_year_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(ctx.get_field(this, YEAR_FIELD_VALUE)))
 }
 
-fn native_year_is_leap_instance(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_year_is_leap_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let y = match ctx.get_field(this, YEAR_FIELD_VALUE) {
         Value::Int(v) => v,
@@ -5319,10 +5387,7 @@ fn native_year_is_leap_instance(
 /// that range never occur in any sane Java application; HotSpot's
 /// Year value range is `Year.MIN_VALUE..Year.MAX_VALUE` which fits
 /// in an i32.
-fn native_year_is_leap_static(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_year_is_leap_static(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let y = match args.first() {
         Some(Value::Long(v)) => *v as i32,
         Some(Value::Int(v)) => *v,
@@ -5361,10 +5426,12 @@ fn native_month_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => 0,
     };
     if !(1..=12).contains(&m) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("Invalid value for MonthOfYear (valid values 1 - 12): {m}"),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Invalid value for MonthOfYear (valid values 1 - 12): {m}"),
+            }
+            .into(),
+        );
     }
     Ok(Some(Value::Object(Some(alloc_month(ctx, m)))))
 }
@@ -5446,10 +5513,12 @@ fn native_dow_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => 0,
     };
     if !(1..=7).contains(&d) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("Invalid value for DayOfWeek (valid values 1 - 7): {d}"),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Invalid value for DayOfWeek (valid values 1 - 7): {d}"),
+            }
+            .into(),
+        );
     }
     Ok(Some(Value::Object(Some(alloc_day_of_week(ctx, d)))))
 }
@@ -5483,12 +5552,7 @@ fn dow_from_ymd(year: i32, month: i32, day: i32) -> i32 {
     let k = y64.rem_euclid(100);
     let j = y64.div_euclid(100);
     // Zeller output h: 0=Saturday, 1=Sunday, 2=Monday, ..., 6=Friday.
-    let h = (q
-        + (13 * (m64 + 1)).div_euclid(5)
-        + k
-        + k.div_euclid(4)
-        + j.div_euclid(4)
-        + 5 * j)
+    let h = (q + (13 * (m64 + 1)).div_euclid(5) + k + k.div_euclid(4) + j.div_euclid(4) + 5 * j)
         .rem_euclid(7);
     // Java's DayOfWeek: 1=Monday .. 7=Sunday.
     (((h + 5).rem_euclid(7)) + 1) as i32
@@ -5555,12 +5619,12 @@ fn native_dow_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let epoch_days = sec.div_euclid(86_400);
         (((epoch_days + 3).rem_euclid(7)) + 1) as i32
     } else {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!(
-                "DayOfWeek.from: unsupported TemporalAccessor class: {class_str}"
-            ),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("DayOfWeek.from: unsupported TemporalAccessor class: {class_str}"),
+            }
+            .into(),
+        );
     };
     Ok(Some(Value::Object(Some(alloc_day_of_week(ctx, dow)))))
 }
@@ -5604,9 +5668,19 @@ pub(crate) fn register_t25_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/time/Instant;Ljava/time/ZoneId;)Ljava/time/Clock;",
         native_clock_fixed,
     );
-    registry.register(clock, "instant", "()Ljava/time/Instant;", native_clock_instant);
+    registry.register(
+        clock,
+        "instant",
+        "()Ljava/time/Instant;",
+        native_clock_instant,
+    );
     registry.register(clock, "millis", "()J", native_clock_millis);
-    registry.register(clock, "getZone", "()Ljava/time/ZoneId;", native_clock_get_zone);
+    registry.register(
+        clock,
+        "getZone",
+        "()Ljava/time/ZoneId;",
+        native_clock_get_zone,
+    );
 
     // T2.5.3 / T2.5.4 — LocalDate.now(Clock), LocalDateTime.now(Clock)
     registry.register(
@@ -5773,11 +5847,8 @@ mod t25_tests {
     fn t25_duration_between_same_instant_is_zero() {
         let mut ctx = mock_ctx();
         let i = alloc_instant(&mut ctx, 1_000, 500);
-        let v = native_dur_between(
-            &mut ctx,
-            &[Value::Object(Some(i)), Value::Object(Some(i))],
-        )
-        .unwrap();
+        let v = native_dur_between(&mut ctx, &[Value::Object(Some(i)), Value::Object(Some(i))])
+            .unwrap();
         match v {
             Some(Value::Object(Some(d))) => {
                 let s = match ctx.get_field(d, DUR_FIELD_SECONDS) {
@@ -5865,32 +5936,28 @@ mod t25_tests {
     #[test]
     fn t25_year_is_leap_static_2000() {
         let mut ctx = mock_ctx();
-        let v =
-            native_year_is_leap_static(&mut ctx, &[Value::Long(2000)]).unwrap();
+        let v = native_year_is_leap_static(&mut ctx, &[Value::Long(2000)]).unwrap();
         assert_eq!(v, Some(Value::Int(1)));
     }
 
     #[test]
     fn t25_year_is_leap_static_1900() {
         let mut ctx = mock_ctx();
-        let v =
-            native_year_is_leap_static(&mut ctx, &[Value::Long(1900)]).unwrap();
+        let v = native_year_is_leap_static(&mut ctx, &[Value::Long(1900)]).unwrap();
         assert_eq!(v, Some(Value::Int(0)));
     }
 
     #[test]
     fn t25_year_is_leap_static_2024() {
         let mut ctx = mock_ctx();
-        let v =
-            native_year_is_leap_static(&mut ctx, &[Value::Long(2024)]).unwrap();
+        let v = native_year_is_leap_static(&mut ctx, &[Value::Long(2024)]).unwrap();
         assert_eq!(v, Some(Value::Int(1)));
     }
 
     #[test]
     fn t25_year_is_leap_static_2023() {
         let mut ctx = mock_ctx();
-        let v =
-            native_year_is_leap_static(&mut ctx, &[Value::Long(2023)]).unwrap();
+        let v = native_year_is_leap_static(&mut ctx, &[Value::Long(2023)]).unwrap();
         assert_eq!(v, Some(Value::Int(0)));
     }
 
@@ -5944,8 +6011,7 @@ mod t25_tests {
     fn t25_month_length_february_leap_is_29() {
         let mut ctx = mock_ctx();
         let feb = alloc_month(&mut ctx, 2);
-        let v =
-            native_month_length(&mut ctx, &[Value::Object(Some(feb)), Value::Int(1)]).unwrap();
+        let v = native_month_length(&mut ctx, &[Value::Object(Some(feb)), Value::Int(1)]).unwrap();
         assert_eq!(v, Some(Value::Int(29)));
     }
 
@@ -5953,8 +6019,7 @@ mod t25_tests {
     fn t25_month_length_february_non_leap_is_28() {
         let mut ctx = mock_ctx();
         let feb = alloc_month(&mut ctx, 2);
-        let v =
-            native_month_length(&mut ctx, &[Value::Object(Some(feb)), Value::Int(0)]).unwrap();
+        let v = native_month_length(&mut ctx, &[Value::Object(Some(feb)), Value::Int(0)]).unwrap();
         assert_eq!(v, Some(Value::Int(28)));
     }
 
@@ -5962,10 +6027,8 @@ mod t25_tests {
     fn t25_month_length_january_is_31_regardless_of_leap() {
         let mut ctx = mock_ctx();
         let jan = alloc_month(&mut ctx, 1);
-        let v1 =
-            native_month_length(&mut ctx, &[Value::Object(Some(jan)), Value::Int(0)]).unwrap();
-        let v2 =
-            native_month_length(&mut ctx, &[Value::Object(Some(jan)), Value::Int(1)]).unwrap();
+        let v1 = native_month_length(&mut ctx, &[Value::Object(Some(jan)), Value::Int(0)]).unwrap();
+        let v2 = native_month_length(&mut ctx, &[Value::Object(Some(jan)), Value::Int(1)]).unwrap();
         assert_eq!(v1, Some(Value::Int(31)));
         assert_eq!(v2, Some(Value::Int(31)));
     }
@@ -5974,8 +6037,7 @@ mod t25_tests {
     fn t25_month_length_june_is_30() {
         let mut ctx = mock_ctx();
         let jun = alloc_month(&mut ctx, 6);
-        let v =
-            native_month_length(&mut ctx, &[Value::Object(Some(jun)), Value::Int(0)]).unwrap();
+        let v = native_month_length(&mut ctx, &[Value::Object(Some(jun)), Value::Int(0)]).unwrap();
         assert_eq!(v, Some(Value::Int(30)));
     }
 
@@ -6141,4 +6203,3 @@ mod t25_tests {
         assert!(matches!(v, Some(Value::Object(Some(_)))));
     }
 }
-

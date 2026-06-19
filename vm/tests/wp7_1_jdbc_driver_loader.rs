@@ -83,10 +83,7 @@ fn make_spi_classpath_dir() -> std::path::PathBuf {
 /// the multi-entry walk in `find_all_resource_urls` rather than a
 /// single-entry shortcut path.
 fn test_vm_with_spi(spi_dir: &std::path::Path) -> Vm {
-    let cp = vec![
-        test_resources_dir(),
-        spi_dir.to_string_lossy().into_owned(),
-    ];
+    let cp = vec![test_resources_dir(), spi_dir.to_string_lossy().into_owned()];
     let config = VmConfig::new().with_classpath(cp);
     Vm::new(config)
 }
@@ -105,9 +102,9 @@ fn fake_driver_class_loads() {
     let result = vm.invoke("cratonvm/Wp71JdbcSpi", "instantiateDirectly", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!(
-            "Wp71JdbcSpi::instantiateDirectly expected Ok(Some(Int(1))), got: {other:?}"
-        ),
+        other => {
+            panic!("Wp71JdbcSpi::instantiateDirectly expected Ok(Some(Int(1))), got: {other:?}")
+        }
     }
 }
 
@@ -173,9 +170,9 @@ fn first_discovered_provider_matches_descriptor() {
                  META-INF/services/java.sql.Driver content."
             );
         }
-        other => panic!(
-            "Wp71JdbcSpi::firstDiscoveredProvider expected non-null String, got: {other:?}"
-        ),
+        other => {
+            panic!("Wp71JdbcSpi::firstDiscoveredProvider expected non-null String, got: {other:?}")
+        }
     }
 }
 

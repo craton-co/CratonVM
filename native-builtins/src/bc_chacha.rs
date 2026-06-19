@@ -56,39 +56,71 @@ fn chacha_rounds(s: &mut [u32; 16], rounds: i32) {
     let mut i = rounds;
     while i > 0 {
         // Column rounds: QR(0,4,8,12) QR(1,5,9,13) QR(2,6,10,14) QR(3,7,11,15)
-        s[0] = s[0].wrapping_add(s[4]);   s[12] = (s[12] ^ s[0]).rotate_left(16);
-        s[8] = s[8].wrapping_add(s[12]);  s[4]  = (s[4]  ^ s[8]).rotate_left(12);
-        s[0] = s[0].wrapping_add(s[4]);   s[12] = (s[12] ^ s[0]).rotate_left(8);
-        s[8] = s[8].wrapping_add(s[12]);  s[4]  = (s[4]  ^ s[8]).rotate_left(7);
-        s[1] = s[1].wrapping_add(s[5]);   s[13] = (s[13] ^ s[1]).rotate_left(16);
-        s[9] = s[9].wrapping_add(s[13]);  s[5]  = (s[5]  ^ s[9]).rotate_left(12);
-        s[1] = s[1].wrapping_add(s[5]);   s[13] = (s[13] ^ s[1]).rotate_left(8);
-        s[9] = s[9].wrapping_add(s[13]);  s[5]  = (s[5]  ^ s[9]).rotate_left(7);
-        s[2] = s[2].wrapping_add(s[6]);   s[14] = (s[14] ^ s[2]).rotate_left(16);
-        s[10] = s[10].wrapping_add(s[14]); s[6] = (s[6]  ^ s[10]).rotate_left(12);
-        s[2] = s[2].wrapping_add(s[6]);   s[14] = (s[14] ^ s[2]).rotate_left(8);
-        s[10] = s[10].wrapping_add(s[14]); s[6] = (s[6]  ^ s[10]).rotate_left(7);
-        s[3] = s[3].wrapping_add(s[7]);   s[15] = (s[15] ^ s[3]).rotate_left(16);
-        s[11] = s[11].wrapping_add(s[15]); s[7] = (s[7]  ^ s[11]).rotate_left(12);
-        s[3] = s[3].wrapping_add(s[7]);   s[15] = (s[15] ^ s[3]).rotate_left(8);
-        s[11] = s[11].wrapping_add(s[15]); s[7] = (s[7]  ^ s[11]).rotate_left(7);
+        s[0] = s[0].wrapping_add(s[4]);
+        s[12] = (s[12] ^ s[0]).rotate_left(16);
+        s[8] = s[8].wrapping_add(s[12]);
+        s[4] = (s[4] ^ s[8]).rotate_left(12);
+        s[0] = s[0].wrapping_add(s[4]);
+        s[12] = (s[12] ^ s[0]).rotate_left(8);
+        s[8] = s[8].wrapping_add(s[12]);
+        s[4] = (s[4] ^ s[8]).rotate_left(7);
+        s[1] = s[1].wrapping_add(s[5]);
+        s[13] = (s[13] ^ s[1]).rotate_left(16);
+        s[9] = s[9].wrapping_add(s[13]);
+        s[5] = (s[5] ^ s[9]).rotate_left(12);
+        s[1] = s[1].wrapping_add(s[5]);
+        s[13] = (s[13] ^ s[1]).rotate_left(8);
+        s[9] = s[9].wrapping_add(s[13]);
+        s[5] = (s[5] ^ s[9]).rotate_left(7);
+        s[2] = s[2].wrapping_add(s[6]);
+        s[14] = (s[14] ^ s[2]).rotate_left(16);
+        s[10] = s[10].wrapping_add(s[14]);
+        s[6] = (s[6] ^ s[10]).rotate_left(12);
+        s[2] = s[2].wrapping_add(s[6]);
+        s[14] = (s[14] ^ s[2]).rotate_left(8);
+        s[10] = s[10].wrapping_add(s[14]);
+        s[6] = (s[6] ^ s[10]).rotate_left(7);
+        s[3] = s[3].wrapping_add(s[7]);
+        s[15] = (s[15] ^ s[3]).rotate_left(16);
+        s[11] = s[11].wrapping_add(s[15]);
+        s[7] = (s[7] ^ s[11]).rotate_left(12);
+        s[3] = s[3].wrapping_add(s[7]);
+        s[15] = (s[15] ^ s[3]).rotate_left(8);
+        s[11] = s[11].wrapping_add(s[15]);
+        s[7] = (s[7] ^ s[11]).rotate_left(7);
         // Diagonal rounds: QR(0,5,10,15) QR(1,6,11,12) QR(2,7,8,13) QR(3,4,9,14)
-        s[0] = s[0].wrapping_add(s[5]);   s[15] = (s[15] ^ s[0]).rotate_left(16);
-        s[10] = s[10].wrapping_add(s[15]); s[5] = (s[5]  ^ s[10]).rotate_left(12);
-        s[0] = s[0].wrapping_add(s[5]);   s[15] = (s[15] ^ s[0]).rotate_left(8);
-        s[10] = s[10].wrapping_add(s[15]); s[5] = (s[5]  ^ s[10]).rotate_left(7);
-        s[1] = s[1].wrapping_add(s[6]);   s[12] = (s[12] ^ s[1]).rotate_left(16);
-        s[11] = s[11].wrapping_add(s[12]); s[6] = (s[6]  ^ s[11]).rotate_left(12);
-        s[1] = s[1].wrapping_add(s[6]);   s[12] = (s[12] ^ s[1]).rotate_left(8);
-        s[11] = s[11].wrapping_add(s[12]); s[6] = (s[6]  ^ s[11]).rotate_left(7);
-        s[2] = s[2].wrapping_add(s[7]);   s[13] = (s[13] ^ s[2]).rotate_left(16);
-        s[8] = s[8].wrapping_add(s[13]);  s[7]  = (s[7]  ^ s[8]).rotate_left(12);
-        s[2] = s[2].wrapping_add(s[7]);   s[13] = (s[13] ^ s[2]).rotate_left(8);
-        s[8] = s[8].wrapping_add(s[13]);  s[7]  = (s[7]  ^ s[8]).rotate_left(7);
-        s[3] = s[3].wrapping_add(s[4]);   s[14] = (s[14] ^ s[3]).rotate_left(16);
-        s[9] = s[9].wrapping_add(s[14]);  s[4]  = (s[4]  ^ s[9]).rotate_left(12);
-        s[3] = s[3].wrapping_add(s[4]);   s[14] = (s[14] ^ s[3]).rotate_left(8);
-        s[9] = s[9].wrapping_add(s[14]);  s[4]  = (s[4]  ^ s[9]).rotate_left(7);
+        s[0] = s[0].wrapping_add(s[5]);
+        s[15] = (s[15] ^ s[0]).rotate_left(16);
+        s[10] = s[10].wrapping_add(s[15]);
+        s[5] = (s[5] ^ s[10]).rotate_left(12);
+        s[0] = s[0].wrapping_add(s[5]);
+        s[15] = (s[15] ^ s[0]).rotate_left(8);
+        s[10] = s[10].wrapping_add(s[15]);
+        s[5] = (s[5] ^ s[10]).rotate_left(7);
+        s[1] = s[1].wrapping_add(s[6]);
+        s[12] = (s[12] ^ s[1]).rotate_left(16);
+        s[11] = s[11].wrapping_add(s[12]);
+        s[6] = (s[6] ^ s[11]).rotate_left(12);
+        s[1] = s[1].wrapping_add(s[6]);
+        s[12] = (s[12] ^ s[1]).rotate_left(8);
+        s[11] = s[11].wrapping_add(s[12]);
+        s[6] = (s[6] ^ s[11]).rotate_left(7);
+        s[2] = s[2].wrapping_add(s[7]);
+        s[13] = (s[13] ^ s[2]).rotate_left(16);
+        s[8] = s[8].wrapping_add(s[13]);
+        s[7] = (s[7] ^ s[8]).rotate_left(12);
+        s[2] = s[2].wrapping_add(s[7]);
+        s[13] = (s[13] ^ s[2]).rotate_left(8);
+        s[8] = s[8].wrapping_add(s[13]);
+        s[7] = (s[7] ^ s[8]).rotate_left(7);
+        s[3] = s[3].wrapping_add(s[4]);
+        s[14] = (s[14] ^ s[3]).rotate_left(16);
+        s[9] = s[9].wrapping_add(s[14]);
+        s[4] = (s[4] ^ s[9]).rotate_left(12);
+        s[3] = s[3].wrapping_add(s[4]);
+        s[14] = (s[14] ^ s[3]).rotate_left(8);
+        s[9] = s[9].wrapping_add(s[14]);
+        s[4] = (s[4] ^ s[9]).rotate_left(7);
         i -= 2;
     }
 }
@@ -202,10 +234,9 @@ mod tests {
         0x00000001, 0x09000000, 0x4a000000, 0x00000000, // counter=1, nonce
     ];
     const RFC8439_OUTPUT: [u32; 16] = [
-        0xe4e7f110, 0x15593bd1, 0x1fdd0f50, 0xc47120a3,
-        0xc7f4d1c7, 0x0368c033, 0x9aaa2204, 0x4e6cd4c3,
-        0x466482d2, 0x09aa9f07, 0x05d7c214, 0xa2028bd9,
-        0xd19c12b5, 0xb94e16de, 0xe883d0cb, 0x4e3c50a2,
+        0xe4e7f110, 0x15593bd1, 0x1fdd0f50, 0xc47120a3, 0xc7f4d1c7, 0x0368c033, 0x9aaa2204,
+        0x4e6cd4c3, 0x466482d2, 0x09aa9f07, 0x05d7c214, 0xa2028bd9, 0xd19c12b5, 0xb94e16de,
+        0xe883d0cb, 0x4e3c50a2,
     ];
 
     #[test]

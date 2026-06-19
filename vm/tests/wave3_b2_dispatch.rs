@@ -74,7 +74,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -87,13 +91,20 @@ fn cratonvm_binary() -> Option<PathBuf> {
 fn java_home() -> Option<PathBuf> {
     if let Ok(h) = std::env::var("CRATONVM_TEST_JAVA_HOME") {
         let p = PathBuf::from(h);
-        if p.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" }).exists() {
+        if p.join("bin")
+            .join(if cfg!(windows) { "javac.exe" } else { "javac" })
+            .exists()
+        {
             return Some(p);
         }
     }
     // Default real-JDK 25 install location used by the rest of the repo.
     let default = PathBuf::from("C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot");
-    if default.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" }).exists() {
+    if default
+        .join("bin")
+        .join(if cfg!(windows) { "javac.exe" } else { "javac" })
+        .exists()
+    {
         return Some(default);
     }
     None
@@ -110,7 +121,9 @@ fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
     } else {
         return false;
     }
-    let javac = jh.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" });
+    let javac = jh
+        .join("bin")
+        .join(if cfg!(windows) { "javac.exe" } else { "javac" });
     let status = Command::new(&javac)
         .arg("--release")
         .arg("21")
@@ -225,7 +238,12 @@ fn w3b2_http_server_get_address_get_port() {
         }
     };
     let classes = temp_classes_dir("httpsrv");
-    if !compile_probe(&jh, &classes, "HttpServerDispatchProbe", HTTP_SERVER_PROBE_SRC) {
+    if !compile_probe(
+        &jh,
+        &classes,
+        "HttpServerDispatchProbe",
+        HTTP_SERVER_PROBE_SRC,
+    ) {
         eprintln!("[w3b2] failed to compile HttpServerDispatchProbe; skipping");
         return;
     }

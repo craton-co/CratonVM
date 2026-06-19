@@ -318,7 +318,9 @@ mod tests {
             is_native: false,
         };
         cache.put_method("java/lang/Object", "hashCode", "()I", m.clone());
-        let got = cache.get_method("java/lang/Object", "hashCode", "()I").unwrap();
+        let got = cache
+            .get_method("java/lang/Object", "hashCode", "()I")
+            .unwrap();
         assert_eq!(*got, m);
     }
 
@@ -352,15 +354,35 @@ mod tests {
     #[test]
     fn resolution_cache_clear() {
         let mut cache = ResolutionCache::new();
-        cache.put_method("A", "b", "()V", ResolvedMethod {
-            class_id: 1, method_index: 0, is_static: false, is_native: false,
-        });
-        cache.put_field("A", "x", "I", ResolvedField {
-            class_id: 1, field_index: 0, is_static: true,
-        });
-        cache.put_call_site(1, ResolvedCallSite {
-            bootstrap_index: 0, target_class_id: 1, target_method_index: 0,
-        });
+        cache.put_method(
+            "A",
+            "b",
+            "()V",
+            ResolvedMethod {
+                class_id: 1,
+                method_index: 0,
+                is_static: false,
+                is_native: false,
+            },
+        );
+        cache.put_field(
+            "A",
+            "x",
+            "I",
+            ResolvedField {
+                class_id: 1,
+                field_index: 0,
+                is_static: true,
+            },
+        );
+        cache.put_call_site(
+            1,
+            ResolvedCallSite {
+                bootstrap_index: 0,
+                target_class_id: 1,
+                target_method_index: 0,
+            },
+        );
         assert_eq!(cache.len(), 3);
         cache.clear();
         assert_eq!(cache.len(), 0);
@@ -371,17 +393,37 @@ mod tests {
     fn resolution_cache_len() {
         let mut cache = ResolutionCache::new();
         assert_eq!(cache.len(), 0);
-        cache.put_method("A", "m", "()V", ResolvedMethod {
-            class_id: 0, method_index: 0, is_static: false, is_native: false,
-        });
+        cache.put_method(
+            "A",
+            "m",
+            "()V",
+            ResolvedMethod {
+                class_id: 0,
+                method_index: 0,
+                is_static: false,
+                is_native: false,
+            },
+        );
         assert_eq!(cache.len(), 1);
-        cache.put_field("A", "f", "I", ResolvedField {
-            class_id: 0, field_index: 0, is_static: false,
-        });
+        cache.put_field(
+            "A",
+            "f",
+            "I",
+            ResolvedField {
+                class_id: 0,
+                field_index: 0,
+                is_static: false,
+            },
+        );
         assert_eq!(cache.len(), 2);
-        cache.put_call_site(7, ResolvedCallSite {
-            bootstrap_index: 0, target_class_id: 0, target_method_index: 0,
-        });
+        cache.put_call_site(
+            7,
+            ResolvedCallSite {
+                bootstrap_index: 0,
+                target_class_id: 0,
+                target_method_index: 0,
+            },
+        );
         assert_eq!(cache.len(), 3);
     }
 

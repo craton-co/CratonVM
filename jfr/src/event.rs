@@ -94,8 +94,8 @@ pub enum EventPeriod {
 #[derive(Debug, Clone)]
 pub struct EventInstance {
     pub type_id: EventTypeId,
-    pub start_time: u64,  // nanos since epoch
-    pub end_time: u64,    // nanos since epoch (== start_time for instant events)
+    pub start_time: u64, // nanos since epoch
+    pub end_time: u64,   // nanos since epoch (== start_time for instant events)
     pub thread_id: u64,
     pub fields: EventFields,
 }
@@ -200,7 +200,9 @@ impl FieldKind {
     /// hazard.
     #[inline]
     pub fn matches_declared(self, declared: FieldKind) -> bool {
-        if self == FieldKind::Null { return true; }
+        if self == FieldKind::Null {
+            return true;
+        }
         self == declared
     }
 }
@@ -259,7 +261,10 @@ impl EventTypeRegistry {
     /// never be assigned to a real event type.
     pub fn register(&mut self, mut event_type: EventType) -> EventTypeId {
         // Guard against ever assigning the INVALID sentinel value.
-        assert!(self.next_id < u32::MAX, "event type ID overflow (reached INVALID sentinel)");
+        assert!(
+            self.next_id < u32::MAX,
+            "event type ID overflow (reached INVALID sentinel)"
+        );
         let id = EventTypeId(self.next_id);
         self.next_id = self.next_id.checked_add(1).expect("event type ID overflow");
         event_type.id = id;
@@ -370,9 +375,7 @@ mod tests {
             name: name.to_string(),
             category: vec!["Test".into()],
             description: "Test event".into(),
-            fields: vec![
-                EventField::new("field1", "int", "First field"),
-            ],
+            fields: vec![EventField::new("field1", "int", "First field")],
             has_thread: true,
             has_stacktrace: false,
             period: EventPeriod::None,
@@ -506,8 +509,14 @@ mod tests {
 
     #[test]
     fn test_event_value_boolean() {
-        assert!(matches!(EventValue::Boolean(true), EventValue::Boolean(true)));
-        assert!(matches!(EventValue::Boolean(false), EventValue::Boolean(false)));
+        assert!(matches!(
+            EventValue::Boolean(true),
+            EventValue::Boolean(true)
+        ));
+        assert!(matches!(
+            EventValue::Boolean(false),
+            EventValue::Boolean(false)
+        ));
     }
 
     #[test]

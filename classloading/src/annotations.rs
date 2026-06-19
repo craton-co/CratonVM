@@ -57,7 +57,9 @@
 //! Every tag is exercised by the integration probe at
 //! `apps/annotation_probe/AnnotationProbe.java`.
 
-use cratonvm_reader::attribute::{Annotation, Attribute, ElementValue, LazyAttribute, TypeAnnotation};
+use cratonvm_reader::attribute::{
+    Annotation, Attribute, ElementValue, LazyAttribute, TypeAnnotation,
+};
 use cratonvm_reader::field::ClassFileField;
 use cratonvm_reader::method::ClassFileMethod;
 
@@ -309,9 +311,9 @@ mod tests {
 
     #[test]
     fn parameter_annotations_falls_back_to_invisible() {
-        let attrs = decoded(vec![Attribute::RuntimeInvisibleParameterAnnotations(
-            vec![vec![make_ann(5, vec![])]],
-        )]);
+        let attrs = decoded(vec![Attribute::RuntimeInvisibleParameterAnnotations(vec![
+            vec![make_ann(5, vec![])],
+        ])]);
         let v = AnnotationsView::new(&attrs);
         let got = v.parameter_annotations().unwrap();
         assert_eq!(got.len(), 1);

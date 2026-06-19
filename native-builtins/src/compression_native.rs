@@ -32,9 +32,9 @@
 //! the `flate2`-backed Inflater/Deflater approach in [`crate::zip_real`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -476,7 +476,9 @@ fn zstd_is_error(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn zstd_get_error_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let code = arg_long(args, 0) as usize;
-    Ok(Some(Value::Object(Some(ctx.create_string(&zstd_err_name(code))))))
+    Ok(Some(Value::Object(Some(
+        ctx.create_string(&zstd_err_name(code)),
+    ))))
 }
 
 fn zstd_get_error_code(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -517,7 +519,9 @@ fn zstd_set_compression_level(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn lz4_compress_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let n = arg_int(args, 0).max(0) as usize;
-    Ok(Some(Value::Int(lz4_flex::block::get_maximum_output_size(n) as i32)))
+    Ok(Some(Value::Int(
+        lz4_flex::block::get_maximum_output_size(n) as i32,
+    )))
 }
 
 /// Shared body for `LZ4_compress_limitedOutput` / `LZ4_compressHC`. lz4_flex
@@ -774,13 +778,48 @@ fn xxh64_free(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     // --- snappy-java: org.xerial.snappy.SnappyNative (instance methods) ---
     let sn = "org/xerial/snappy/SnappyNative";
-    r.register(sn, "nativeLibraryVersion", "()Ljava/lang/String;", snappy_native_library_version);
-    r.register(sn, "maxCompressedLength", "(I)I", snappy_max_compressed_length);
-    r.register(sn, "uncompressedLength", "(Ljava/lang/Object;II)I", snappy_uncompressed_length);
-    r.register(sn, "rawCompress", "(Ljava/lang/Object;IILjava/lang/Object;I)I", snappy_raw_compress);
-    r.register(sn, "rawUncompress", "(Ljava/lang/Object;IILjava/lang/Object;I)I", snappy_raw_uncompress);
-    r.register(sn, "isValidCompressedBuffer", "(Ljava/lang/Object;II)Z", snappy_is_valid_compressed_buffer);
-    r.register(sn, "arrayCopy", "(Ljava/lang/Object;IILjava/lang/Object;I)V", snappy_array_copy);
+    r.register(
+        sn,
+        "nativeLibraryVersion",
+        "()Ljava/lang/String;",
+        snappy_native_library_version,
+    );
+    r.register(
+        sn,
+        "maxCompressedLength",
+        "(I)I",
+        snappy_max_compressed_length,
+    );
+    r.register(
+        sn,
+        "uncompressedLength",
+        "(Ljava/lang/Object;II)I",
+        snappy_uncompressed_length,
+    );
+    r.register(
+        sn,
+        "rawCompress",
+        "(Ljava/lang/Object;IILjava/lang/Object;I)I",
+        snappy_raw_compress,
+    );
+    r.register(
+        sn,
+        "rawUncompress",
+        "(Ljava/lang/Object;IILjava/lang/Object;I)I",
+        snappy_raw_uncompress,
+    );
+    r.register(
+        sn,
+        "isValidCompressedBuffer",
+        "(Ljava/lang/Object;II)Z",
+        snappy_is_valid_compressed_buffer,
+    );
+    r.register(
+        sn,
+        "arrayCopy",
+        "(Ljava/lang/Object;IILjava/lang/Object;I)V",
+        snappy_array_copy,
+    );
 
     // --- lz4-java: net.jpountz.lz4.LZ4JNI (static methods, block format) ---
     let lz = "net/jpountz/lz4/LZ4JNI";
@@ -828,7 +867,9 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     // --- zstd-jni: streaming compress (ZstdOutputStreamNoFinalizer) ---
     let zo = "com/github/luben/zstd/ZstdOutputStreamNoFinalizer";
     r.register(zo, "recommendedCOutSize", "()J", |_c, _a| {
-        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_CStreamOutSize() } as i64)))
+        Ok(Some(Value::Long(
+            unsafe { zstd_safe::zstd_sys::ZSTD_CStreamOutSize() } as i64,
+        )))
     });
     r.register(zo, "createCStream", "()J", zstd_create_cstream);
     r.register(zo, "freeCStream", "(J)I", zstd_free_cstream);
@@ -840,10 +881,14 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     // --- zstd-jni: streaming decompress (ZstdInputStreamNoFinalizer) ---
     let zi = "com/github/luben/zstd/ZstdInputStreamNoFinalizer";
     r.register(zi, "recommendedDInSize", "()J", |_c, _a| {
-        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_DStreamInSize() } as i64)))
+        Ok(Some(Value::Long(
+            unsafe { zstd_safe::zstd_sys::ZSTD_DStreamInSize() } as i64,
+        )))
     });
     r.register(zi, "recommendedDOutSize", "()J", |_c, _a| {
-        Ok(Some(Value::Long(unsafe { zstd_safe::zstd_sys::ZSTD_DStreamOutSize() } as i64)))
+        Ok(Some(Value::Long(
+            unsafe { zstd_safe::zstd_sys::ZSTD_DStreamOutSize() } as i64,
+        )))
     });
     r.register(zi, "createDStream", "()J", zstd_create_dstream);
     r.register(zi, "freeDStream", "(J)I", zstd_free_dstream);
@@ -853,21 +898,37 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     // --- zstd-jni: com.github.luben.zstd.Zstd static helpers ---
     let z = "com/github/luben/zstd/Zstd";
     r.register(z, "isError", "(J)Z", zstd_is_error);
-    r.register(z, "getErrorName", "(J)Ljava/lang/String;", zstd_get_error_name);
+    r.register(
+        z,
+        "getErrorName",
+        "(J)Ljava/lang/String;",
+        zstd_get_error_name,
+    );
     r.register(z, "getErrorCode", "(J)J", zstd_get_error_code);
     r.register(z, "compressBound", "(J)J", zstd_compress_bound);
-    r.register(z, "defaultCompressionLevel", "()I", |_c, _a| Ok(Some(Value::Int(3))));
+    r.register(z, "defaultCompressionLevel", "()I", |_c, _a| {
+        Ok(Some(Value::Int(3)))
+    });
     r.register(z, "minCompressionLevel", "()I", |_c, _a| {
-        Ok(Some(Value::Int(unsafe { zstd_safe::zstd_sys::ZSTD_minCLevel() })))
+        Ok(Some(Value::Int(unsafe {
+            zstd_safe::zstd_sys::ZSTD_minCLevel()
+        })))
     });
     r.register(z, "maxCompressionLevel", "()I", |_c, _a| {
-        Ok(Some(Value::Int(unsafe { zstd_safe::zstd_sys::ZSTD_maxCLevel() })))
+        Ok(Some(Value::Int(unsafe {
+            zstd_safe::zstd_sys::ZSTD_maxCLevel()
+        })))
     });
 
     // Parameter setters: apply the level (frame-affecting and cheap), no-op the
     // rest (Kafka's default codec path leaves them at their defaults, and a
     // 0/"success" return keeps the stream init from throwing). Each returns int.
-    r.register(z, "setCompressionLevel", "(JI)I", zstd_set_compression_level);
+    r.register(
+        z,
+        "setCompressionLevel",
+        "(JI)I",
+        zstd_set_compression_level,
+    );
     for name in [
         "setCompressionChecksums",
         "setCompressionMagicless",
@@ -896,14 +957,24 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         r.register(z, name, "(JZ)I", |_c, _a| Ok(Some(Value::Int(0))));
     }
     // Dictionary loaders (Kafka uses no dictionary): report 0 (success/no dict).
-    r.register(z, "loadDictCompress", "(J[BI)I", |_c, _a| Ok(Some(Value::Int(0))));
-    r.register(z, "loadDictDecompress", "(J[BI)I", |_c, _a| Ok(Some(Value::Int(0))));
-    r.register(z, "loadFastDictCompress", "(JLcom/github/luben/zstd/ZstdDictCompress;)I", |_c, _a| {
+    r.register(z, "loadDictCompress", "(J[BI)I", |_c, _a| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(z, "loadFastDictDecompress", "(JLcom/github/luben/zstd/ZstdDictDecompress;)I", |_c, _a| {
+    r.register(z, "loadDictDecompress", "(J[BI)I", |_c, _a| {
         Ok(Some(Value::Int(0)))
     });
+    r.register(
+        z,
+        "loadFastDictCompress",
+        "(JLcom/github/luben/zstd/ZstdDictCompress;)I",
+        |_c, _a| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        z,
+        "loadFastDictDecompress",
+        "(JLcom/github/luben/zstd/ZstdDictDecompress;)I",
+        |_c, _a| Ok(Some(Value::Int(0))),
+    );
 
     // Canonical libzstd error-code accessors. These are only consulted on the
     // error path (which Kafka's round-trip never reaches), but registering them
@@ -982,11 +1053,15 @@ mod tests {
     fn snappy_block_round_trip() {
         let original = b"the quick brown fox jumps over the lazy dog, repeatedly.....";
         let mut comp = vec![0u8; snap::raw::max_compress_len(original.len())];
-        let clen = snap::raw::Encoder::new().compress(original, &mut comp).unwrap();
+        let clen = snap::raw::Encoder::new()
+            .compress(original, &mut comp)
+            .unwrap();
         let dlen = snap::raw::decompress_len(&comp[..clen]).unwrap();
         assert_eq!(dlen, original.len());
         let mut out = vec![0u8; dlen];
-        let n = snap::raw::Decoder::new().decompress(&comp[..clen], &mut out).unwrap();
+        let n = snap::raw::Decoder::new()
+            .decompress(&comp[..clen], &mut out)
+            .unwrap();
         assert_eq!(&out[..n], original);
     }
 

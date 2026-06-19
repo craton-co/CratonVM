@@ -12,9 +12,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use cratonvm_types::intern_arc;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use cratonvm_types::intern_arc;
 
 // `metrics_cache` uses `FxHashMap`: smaller per-entry overhead than std
 // `HashMap` (no SipHash random state), which matters for the bounded cache
@@ -309,8 +309,8 @@ impl FontEngine {
             "dialog" | "sansserif" | "sans-serif" | "default" | "arial" | "helvetica" => {
                 "SansSerif"
             }
-            "dialoginput" | "monospaced" | "monospace" | "courier" | "courier new"
-            | "consolas" | "lucida console" => "Monospaced",
+            "dialoginput" | "monospaced" | "monospace" | "courier" | "courier new" | "consolas"
+            | "lucida console" => "Monospaced",
             "serif" | "times" | "times new roman" | "georgia" => "Serif",
             _ => "SansSerif", // fallback
         }

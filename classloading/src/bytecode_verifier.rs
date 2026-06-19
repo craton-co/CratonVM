@@ -192,13 +192,7 @@ fn verify_method(
         let has_branches = bytecode_has_branches(bytecode);
         let has_handlers = !code_attr.exception_table.is_empty();
         if has_branches || has_handlers {
-            return verify_by_inference(
-                class_name,
-                method,
-                code_attr,
-                cp,
-                hierarchy,
-            );
+            return verify_by_inference(class_name, method, code_attr, cp, hierarchy);
         }
         // No branches and no handlers — fall through to linear walk
     }
@@ -546,11 +540,13 @@ fn build_declared_frames(
     let mut frames = FxHashMap::with_capacity_and_hasher(32, Default::default());
     // Round 7 audit fix (MED #8): u32-internal accumulation with
     // `absolute > u16::MAX` rejection surfaces here as a verify error.
-    let offsets = table.absolute_offsets().map_err(|e| LinkageError::VerifyError {
-        class_name: class_name.to_string(),
-        method_name: method_name.to_string(),
-        message: format!("StackMapTable absolute_offsets: {e}"),
-    })?;
+    let offsets = table
+        .absolute_offsets()
+        .map_err(|e| LinkageError::VerifyError {
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            message: format!("StackMapTable absolute_offsets: {e}"),
+        })?;
 
     let mut prev_frame = initial_frame.clone();
 
@@ -624,7 +620,9 @@ fn verify_by_inference(
             return Err(LinkageError::VerifyError {
                 class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
-                message: "type inference exceeded iteration limit (possible infinite loop in bytecode)".to_string(),
+                message:
+                    "type inference exceeded iteration limit (possible infinite loop in bytecode)"
+                        .to_string(),
             });
         }
 
@@ -651,22 +649,46 @@ fn verify_by_inference(
 
         // Verify the instruction's type effects
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
+            &insn,
+            pc,
+            &mut current,
+            cp,
+            class_name,
+            &method.name,
+            &method.descriptor,
+            hierarchy,
         )
         .map_err(|e| match e {
-            LinkageError::VerifyError { class_name: cn, method_name: mn, message } => {
-                LinkageError::VerifyError {
-                    class_name: if cn.is_empty() { class_name.to_string() } else { cn },
-                    method_name: if mn.is_empty() { method.name.to_string() } else { mn },
-                    message: format!("at bytecode offset {pc}: {message}"),
-                }
-            }
+            LinkageError::VerifyError {
+                class_name: cn,
+                method_name: mn,
+                message,
+            } => LinkageError::VerifyError {
+                class_name: if cn.is_empty() {
+                    class_name.to_string()
+                } else {
+                    cn
+                },
+                method_name: if mn.is_empty() {
+                    method.name.to_string()
+                } else {
+                    mn
+                },
+                message: format!("at bytecode offset {pc}: {message}"),
+            },
             other => other,
         })?;
 
         // Propagate to fall-through successor
         if result.falls_through && next_pc < bytecode.len() {
-            if merge_inference_frame(&mut frame_at, next_pc, &current, hierarchy, class_name, &method.name)? {
+            if merge_inference_frame(
+                &mut frame_at,
+                next_pc,
+                &current,
+                hierarchy,
+                class_name,
+                &method.name,
+            )? {
                 if enqueued.insert(next_pc) {
                     worklist.push(next_pc);
                 }
@@ -723,10 +745,20 @@ fn verify_by_inference(
                     .map_err(|_| LinkageError::VerifyError {
                         class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
-                        message: format!("exception handler stack overflow at handler pc {}", entry.handler_pc),
+                        message: format!(
+                            "exception handler stack overflow at handler pc {}",
+                            entry.handler_pc
+                        ),
                     })?;
                 let handler_pc = entry.handler_pc as usize;
-                if merge_inference_frame(&mut frame_at, handler_pc, &handler_frame, hierarchy, class_name, &method.name)? {
+                if merge_inference_frame(
+                    &mut frame_at,
+                    handler_pc,
+                    &handler_frame,
+                    hierarchy,
+                    class_name,
+                    &method.name,
+                )? {
                     if enqueued.insert(handler_pc) {
                         worklist.push(handler_pc);
                     }
@@ -818,7 +850,8 @@ mod tests {
             name: Arc::from("Test"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Loaded, initializing_thread: None,
+            state: ClassState::Loaded,
+            initializing_thread: None,
             constant_pool: simple_cp(),
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
             superclass: None,
@@ -1325,12 +1358,12 @@ mod tests {
                 max_stack: 1,
                 max_locals: 0,
                 code: cratonvm_reader::ByteView::from_vec(vec![
-                    0x03,             // 0: iconst_0
+                    0x03, // 0: iconst_0
                     0x99, 0x00, 0x05, // 1: ifeq +5 (jump to offset 6)
-                    0x04,             // 4: iconst_1
-                    0xAC,             // 5: ireturn
-                    0x05,             // 6: iconst_2
-                    0xAC,             // 7: ireturn
+                    0x04, // 4: iconst_1
+                    0xAC, // 5: ireturn
+                    0x05, // 6: iconst_2
+                    0xAC, // 7: ireturn
                 ]),
                 exception_table: vec![],
                 attributes: vec![],
@@ -1415,13 +1448,7 @@ mod tests {
         // aconst_null (0x01), aconst_null (0x01), iadd (0x60), ireturn (0xAC)
         // iadd requires two ints on the stack; feeding it two null
         // references must fail with a type-mismatch.
-        let class = make_pre_java7_method_class(
-            "bad",
-            "()I",
-            2,
-            0,
-            vec![0x01, 0x01, 0x60, 0xAC],
-        );
+        let class = make_pre_java7_method_class("bad", "()I", 2, 0, vec![0x01, 0x01, 0x60, 0xAC]);
         let res = verify_pre_java7(&class);
         match res {
             Err(LinkageError::VerifyError { message, .. }) => {
@@ -1441,22 +1468,13 @@ mod tests {
         //   0: goto +100  (0xa7, 0x00, 0x64)
         // followed by nothing; the target is bytecode offset 100 which
         // is well past the end of the method.
-        let class = make_pre_java7_method_class(
-            "bad",
-            "()V",
-            0,
-            0,
-            vec![0xa7, 0x00, 0x64],
-        );
+        let class = make_pre_java7_method_class("bad", "()V", 0, 0, vec![0xa7, 0x00, 0x64]);
         let res = verify_pre_java7(&class);
         // The worklist verifier silently ignores out-of-range targets
         // and the function's fall-through runs off the end of code —
         // which triggers a decode error for the unused offset. Either
         // way, the method must not be accepted.
-        assert!(
-            res.is_err(),
-            "goto to out-of-range target must be rejected"
-        );
+        assert!(res.is_err(), "goto to out-of-range target must be rejected");
     }
 
     #[test]
@@ -1514,10 +1532,10 @@ mod tests {
                 max_stack: 1,
                 max_locals: 0,
                 code: cratonvm_reader::ByteView::from_vec(vec![
-                    0x03,             // iconst_0
+                    0x03, // iconst_0
                     0x99, 0x00, 0x05, // ifeq +5
-                    0x04, 0xAC,       // iconst_1, ireturn
-                    0x05, 0xAC,       // iconst_2, ireturn
+                    0x04, 0xAC, // iconst_1, ireturn
+                    0x05, 0xAC, // iconst_2, ireturn
                 ]),
                 exception_table: vec![],
                 attributes: vec![], // no StackMapTable!
@@ -1535,13 +1553,7 @@ mod tests {
         // NEW-9's fix rejects this with a clear "must hold a returnAddress"
         // message.
         //   iconst_0 (0x03), istore_0 (0x3B), ret 0 (0xA9, 0x00)
-        let class = make_pre_java7_method_class(
-            "bad",
-            "()V",
-            1,
-            1,
-            vec![0x03, 0x3B, 0xA9, 0x00],
-        );
+        let class = make_pre_java7_method_class("bad", "()V", 1, 1, vec![0x03, 0x3B, 0xA9, 0x00]);
         let res = verify_pre_java7(&class);
         assert_verify_err_contains(&res, "returnAddress");
     }
@@ -1549,13 +1561,7 @@ mod tests {
     #[test]
     fn new9_differential_ret_on_empty_local() {
         // `ret 5` with max_locals=1 — the local index is out of range.
-        let class = make_pre_java7_method_class(
-            "bad",
-            "()V",
-            0,
-            1,
-            vec![0xA9, 0x05],
-        );
+        let class = make_pre_java7_method_class("bad", "()V", 0, 1, vec![0xA9, 0x05]);
         let res = verify_pre_java7(&class);
         assert_verify_err_contains(&res, "local");
     }
@@ -1585,10 +1591,10 @@ mod tests {
             1,
             vec![
                 0xa8, 0x00, 0x05, // 0: jsr +5
-                0xb1,             // 3: return
-                0x00,             // 4: nop (padding, unreachable)
-                0x4b,             // 5: astore_0
-                0xa9, 0x00,       // 6: ret 0
+                0xb1, // 3: return
+                0x00, // 4: nop (padding, unreachable)
+                0x4b, // 5: astore_0
+                0xa9, 0x00, // 6: ret 0
             ],
         );
         let res = verify_pre_java7(&class);
@@ -1767,8 +1773,8 @@ mod tests {
             0,
             vec![
                 0x03, 0x03, // iconst_0, iconst_0 (two ints)
-                0x79,       // lshl — expects long, int
-                0xAD,       // lreturn
+                0x79, // lshl — expects long, int
+                0xAD, // lreturn
             ],
         );
         assert!(
@@ -2171,14 +2177,8 @@ mod tests {
             0x00, 0x01, // number_of_stack_items = 1
             0x01, // ITEM_INTEGER
         ];
-        let class = make_class_with_stackmap(
-            ClassFileVersion::JAVA_8,
-            "()V",
-            1,
-            1,
-            code,
-            stack_map_bytes,
-        );
+        let class =
+            make_class_with_stackmap(ClassFileVersion::JAVA_8, "()V", 1, 1, code, stack_map_bytes);
         let res = verify_bytecode(&class, &MockHierarchy);
         assert!(
             res.is_err(),
@@ -2290,14 +2290,8 @@ mod tests {
         // NOT at the real branch target offset 4.
         let code = vec![0x03, 0xa7, 0x00, 0x03, 0x57, 0xb1];
         let stack_map = vec![0x00, 0x01, 0x05]; // one same_frame at offset 5
-        let class = make_class_with_stackmap(
-            ClassFileVersion::JAVA_8,
-            "()V",
-            1,
-            1,
-            code,
-            stack_map,
-        );
+        let class =
+            make_class_with_stackmap(ClassFileVersion::JAVA_8, "()V", 1, 1, code, stack_map);
         // Default (Application loader) is untrusted → strict → rejected.
         assert!(
             verify_bytecode(&class, &MockHierarchy).is_err(),
@@ -2318,4 +2312,3 @@ mod tests {
         );
     }
 }
-

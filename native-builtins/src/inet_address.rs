@@ -42,7 +42,6 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -55,7 +54,10 @@ fn unknown_host<S: Into<String>>(msg: S) -> MethodCallFailed {
 }
 
 fn npe<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::NullPointerException { message: Some(msg.into()) }.into()
+    RuntimeError::NullPointerException {
+        message: Some(msg.into()),
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -105,11 +107,7 @@ fn resolve_addrs(host: &str) -> Result<Vec<IpAddr>, MethodCallFailed> {
     Ok(out)
 }
 
-fn alloc_inet_address_mirror(
-    ctx: &mut dyn NativeContext,
-    host: &str,
-    ip: &IpAddr,
-) -> ObjectRef {
+fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAddr) -> ObjectRef {
     // `java.net.Inet4Address` / `Inet6Address` are real bootstrap classes:
     // their instance slots 0/1 are the inherited `holder` reference fields,
     // NOT `hostName` / `address` Strings. `alloc_inet_address_external`
@@ -283,7 +281,9 @@ fn ptr_lookup(_addr: &IpAddr) -> Result<String, String> {
 
 fn ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
     match bytes.len() {
-        4 => Some(IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))),
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
         16 => {
             let mut o = [0u8; 16];
             o.copy_from_slice(bytes);
@@ -293,10 +293,7 @@ fn ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
     }
 }
 
-fn get_host_by_addr_impl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn get_host_by_addr_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [this, byte[] addr]
     let addr_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
@@ -318,10 +315,7 @@ fn get_host_by_addr_impl(
 // `getLocalHostName` — `gethostname()` shim used by both impls.
 // ---------------------------------------------------------------------------
 
-fn get_local_host_name_impl(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn get_local_host_name_impl(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let name = local_host_name();
     Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
 }
@@ -336,7 +330,11 @@ fn local_host_name() -> String {
         }
         let cstr = std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char);
         let s = cstr.to_string_lossy().into_owned();
-        if s.is_empty() { "localhost".to_string() } else { s }
+        if s.is_empty() {
+            "localhost".to_string()
+        } else {
+            s
+        }
     }
 }
 
@@ -350,7 +348,10 @@ fn local_host_name() -> String {
         extern "system" {
             fn gethostname(name: *mut std::os::raw::c_char, len: i32) -> i32;
         }
-        let rc = gethostname(buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len() as i32);
+        let rc = gethostname(
+            buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            buf.len() as i32,
+        );
         if rc != 0 {
             // Winsock not initialised — fall back to env-driven discovery.
             return std::env::var("COMPUTERNAME")
@@ -385,10 +386,7 @@ fn local_host_name() -> String {
 // which is what the JDK does in its non-privileged path anyway.
 // ---------------------------------------------------------------------------
 
-fn is_reachable0_impl(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn is_reachable0_impl(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Inet4AddressImpl: (this, byte[] addr, int scope, int timeout)
     // Inet6AddressImpl: (this, byte[] addr, int scope, byte[] ifAddr, int ttl, int timeout)
     let addr_obj = match args.get(1) {
@@ -406,10 +404,10 @@ fn is_reachable0_impl(
     let mut bytes_buf = Vec::new();
     {
         let _ = &args; // silence
-        // Re-borrow ctx-style: since we don't need ctx for read here, we have
-        // to peek the byte[] through an immutable handle. Build the IpAddr
-        // by reading the array directly.
-        // Note: we can't shadow ctx mutably here without recursion; just peek.
+                       // Re-borrow ctx-style: since we don't need ctx for read here, we have
+                       // to peek the byte[] through an immutable handle. Build the IpAddr
+                       // by reading the array directly.
+                       // Note: we can't shadow ctx mutably here without recursion; just peek.
     }
     // Read addr bytes via an immutable handle.
     bytes_buf.clear();
@@ -497,14 +495,22 @@ fn native_inet_address_is_ipv6_supported(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(if ipv6_supported_cached() { 1 } else { 0 })))
+    Ok(Some(Value::Int(if ipv6_supported_cached() {
+        1
+    } else {
+        0
+    })))
 }
 
 fn native_inet_address_is_ipv4_available(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(if ipv4_available_cached() { 1 } else { 0 })))
+    Ok(Some(Value::Int(if ipv4_available_cached() {
+        1
+    } else {
+        0
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +579,12 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         get_local_host_name_impl,
     );
-    r.register(INET6_IMPL, "isReachable0", "([BII[BII)Z", is_reachable0_impl);
+    r.register(
+        INET6_IMPL,
+        "isReachable0",
+        "([BII[BII)Z",
+        is_reachable0_impl,
+    );
     r.register(INET6_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
     // ---- InetAddress static init ----
@@ -621,8 +632,12 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // native `init()V` invoked from their own `<clinit>` (Inet4Address.java
     // line 144, Inet6Address.java line 394). The `*Impl` versions are
     // already registered above; these are the top-level (non-Impl) ones.
-    r.register("java/net/Inet4Address", "init", "()V", |_ctx, _args| Ok(None));
-    r.register("java/net/Inet6Address", "init", "()V", |_ctx, _args| Ok(None));
+    r.register("java/net/Inet4Address", "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register("java/net/Inet6Address", "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // Touch CString so the `use std::ffi::CString;` import isn't dead in the
     // (rare) builds that cull both `unix` and `windows`.

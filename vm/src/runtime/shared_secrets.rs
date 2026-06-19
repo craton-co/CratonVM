@@ -124,9 +124,7 @@ impl SharedSecretsInterface {
             Self::JavaLangRef => "jdk/internal/access/JavaLangRefAccess",
             Self::JavaLangReflect => "jdk/internal/access/JavaLangReflectAccess",
             Self::JavaIO => "jdk/internal/access/JavaIOAccess",
-            Self::JavaIORandomAccessFile => {
-                "jdk/internal/access/JavaIORandomAccessFileAccess"
-            }
+            Self::JavaIORandomAccessFile => "jdk/internal/access/JavaIORandomAccessFileAccess",
             Self::JavaNetInetAddress => "jdk/internal/access/JavaNetInetAddressAccess",
             Self::JavaNetUri => "jdk/internal/access/JavaNetUriAccess",
             Self::JavaNio => "jdk/internal/access/JavaNioAccess",
@@ -134,12 +132,8 @@ impl SharedSecretsInterface {
             Self::JavaUtilJar => "jdk/internal/access/JavaUtilJarAccess",
             Self::JavaUtilZipFile => "jdk/internal/access/JavaUtilZipFileAccess",
             Self::JavaNetHttpCookie => "jdk/internal/access/JavaNetHttpCookieAccess",
-            Self::JavaObjectInputStream => {
-                "jdk/internal/access/JavaObjectInputStreamAccess"
-            }
-            Self::JavaUtilResourceBundle => {
-                "jdk/internal/access/JavaUtilResourceBundleAccess"
-            }
+            Self::JavaObjectInputStream => "jdk/internal/access/JavaObjectInputStreamAccess",
+            Self::JavaUtilResourceBundle => "jdk/internal/access/JavaUtilResourceBundleAccess",
         }
     }
 
@@ -159,9 +153,7 @@ impl SharedSecretsInterface {
             Self::JavaLangRef => "java/lang/ref/Reference$1",
             Self::JavaLangReflect => "java/lang/reflect/ReflectAccess",
             Self::JavaIO => "java/io/Console$1",
-            Self::JavaIORandomAccessFile => {
-                "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1"
-            }
+            Self::JavaIORandomAccessFile => "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
             Self::JavaNetInetAddress => "java/net/InetAddress$1",
             Self::JavaNetUri => "cratonvm/internal/ss/JavaNetUriAccess$1",
             Self::JavaNio => "java/nio/Buffer$1",

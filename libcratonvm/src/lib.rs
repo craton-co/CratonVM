@@ -69,7 +69,7 @@ use cratonvm_vm::vm::Vm;
 // identical to the function-table side).
 // ---------------------------------------------------------------------------
 
-pub use cratonvm_vm::native::jni::{JInt, JSize, JavaVM, JNIEnv};
+pub use cratonvm_vm::native::jni::{JInt, JNIEnv, JSize, JavaVM};
 
 /// `jni.h`: success.
 pub const JNI_OK: JInt = 0;
@@ -180,10 +180,7 @@ static CREATED_VM: Mutex<Option<ParkedVm>> = Mutex::new(None);
 /// `true` once a VM has been created (drives `JNI_GetCreatedJavaVMs` and the
 /// one-VM-per-process guard).
 fn vm_exists() -> bool {
-    CREATED_VM
-        .lock()
-        .map(|g| g.is_some())
-        .unwrap_or(false)
+    CREATED_VM.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -545,10 +542,16 @@ pub struct CratonValue {
 
 impl CratonValue {
     const fn void() -> Self {
-        CratonValue { tag: craton_tag::VOID, payload: 0 }
+        CratonValue {
+            tag: craton_tag::VOID,
+            payload: 0,
+        }
     }
     const fn error() -> Self {
-        CratonValue { tag: craton_tag::ERROR, payload: 0 }
+        CratonValue {
+            tag: craton_tag::ERROR,
+            payload: 0,
+        }
     }
 
     /// Convert an inbound `CratonValue` (from C) into a VM [`Value`].
@@ -567,11 +570,26 @@ impl CratonValue {
     /// Convert an outbound VM [`Value`] into a `CratonValue` for C.
     fn from_value(v: Value) -> Self {
         match v {
-            Value::Int(i) => CratonValue { tag: craton_tag::INT, payload: i as u32 as u64 },
-            Value::Long(l) => CratonValue { tag: craton_tag::LONG, payload: l as u64 },
-            Value::Float(f) => CratonValue { tag: craton_tag::FLOAT, payload: f.to_bits() as u64 },
-            Value::Double(d) => CratonValue { tag: craton_tag::DOUBLE, payload: d.to_bits() },
-            Value::Object(o) => CratonValue { tag: craton_tag::OBJECT, payload: handle_from_ref(o) },
+            Value::Int(i) => CratonValue {
+                tag: craton_tag::INT,
+                payload: i as u32 as u64,
+            },
+            Value::Long(l) => CratonValue {
+                tag: craton_tag::LONG,
+                payload: l as u64,
+            },
+            Value::Float(f) => CratonValue {
+                tag: craton_tag::FLOAT,
+                payload: f.to_bits() as u64,
+            },
+            Value::Double(d) => CratonValue {
+                tag: craton_tag::DOUBLE,
+                payload: d.to_bits(),
+            },
+            Value::Object(o) => CratonValue {
+                tag: craton_tag::OBJECT,
+                payload: handle_from_ref(o),
+            },
             // ReturnAddress / Uninitialized never escape a normal return; treat
             // as void so the C side sees a defined (if empty) result.
             Value::ReturnAddress(_) | Value::Uninitialized => CratonValue::void(),
@@ -692,11 +710,7 @@ pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
 ///
 /// # Safety
 /// `vm` must be a valid `*mut CratonVm` or null.
-unsafe fn with_vm<R>(
-    vm: *mut CratonVm,
-    err_val: R,
-    f: impl FnOnce(&mut CratonVm) -> R,
-) -> R {
+unsafe fn with_vm<R>(vm: *mut CratonVm, err_val: R, f: impl FnOnce(&mut CratonVm) -> R) -> R {
     if vm.is_null() {
         set_last_error("null CratonVm handle");
         return err_val;
@@ -869,7 +883,10 @@ fn describe_failure(e: &MethodCallFailed) -> String {
     match e {
         MethodCallFailed::InternalError(err) => err.to_string(),
         MethodCallFailed::ExceptionThrown(obj) => {
-            format!("java exception thrown (throwable handle=0x{:x})", obj.as_ptr() as u64)
+            format!(
+                "java exception thrown (throwable handle=0x{:x})",
+                obj.as_ptr() as u64
+            )
         }
     }
 }
@@ -954,9 +971,7 @@ pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mu
                         }
                     }
                     None => {
-                        set_last_error(
-                            "cratonvm_string_utf8: handle is not a java.lang.String",
-                        );
+                        set_last_error("cratonvm_string_utf8: handle is not a java.lang.String");
                         std::ptr::null_mut()
                     }
                 }
@@ -1107,9 +1122,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 let class_name = match h.vm.class_name(class_id) {
                     Some(n) => n,
                     None => {
-                        set_last_error(
-                            "cratonvm_invoke_virtual: receiver has no resolvable class",
-                        );
+                        set_last_error("cratonvm_invoke_virtual: receiver has no resolvable class");
                         return CratonValue::error();
                     }
                 };
@@ -1246,14 +1259,13 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
                     }
                 };
                 let class_id = h.vm.shared.heap.class_id_of(oref);
-                let n = h
-                    .vm
-                    .shared
-                    .class_manager
-                    .read()
-                    .get_class(class_id)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
+                let n =
+                    h.vm.shared
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields)
+                        .unwrap_or(0);
                 n as JInt
             })
         }
@@ -1299,14 +1311,13 @@ pub extern "C" fn cratonvm_get_field(
                     }
                 };
                 let class_id = h.vm.shared.heap.class_id_of(oref);
-                let nfields = h
-                    .vm
-                    .shared
-                    .class_manager
-                    .read()
-                    .get_class(class_id)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
+                let nfields =
+                    h.vm.shared
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields)
+                        .unwrap_or(0);
                 if index < 0 || (index as usize) >= nfields {
                     set_last_error(format!(
                         "cratonvm_get_field: index {index} out of range for {nfields} field(s)"
@@ -1633,11 +1644,26 @@ mod tests {
         // int / long / float / double / object survive a to_value→from_value
         // round trip with identical bit content.
         let cases = [
-            CratonValue { tag: craton_tag::INT, payload: (-42i32) as u32 as u64 },
-            CratonValue { tag: craton_tag::LONG, payload: 0x0123_4567_89ab_cdef },
-            CratonValue { tag: craton_tag::FLOAT, payload: 1.5f32.to_bits() as u64 },
-            CratonValue { tag: craton_tag::DOUBLE, payload: (-2.25f64).to_bits() },
-            CratonValue { tag: craton_tag::OBJECT, payload: 0 }, // null ref
+            CratonValue {
+                tag: craton_tag::INT,
+                payload: (-42i32) as u32 as u64,
+            },
+            CratonValue {
+                tag: craton_tag::LONG,
+                payload: 0x0123_4567_89ab_cdef,
+            },
+            CratonValue {
+                tag: craton_tag::FLOAT,
+                payload: 1.5f32.to_bits() as u64,
+            },
+            CratonValue {
+                tag: craton_tag::DOUBLE,
+                payload: (-2.25f64).to_bits(),
+            },
+            CratonValue {
+                tag: craton_tag::OBJECT,
+                payload: 0,
+            }, // null ref
         ];
         for c in cases {
             let v = c.to_value();
@@ -1797,7 +1823,10 @@ mod tests {
             std::ptr::null_mut(),
             0,
             0,
-            CratonValue { tag: craton_tag::INT, payload: 1 },
+            CratonValue {
+                tag: craton_tag::INT,
+                payload: 1,
+            },
         );
         assert_eq!(rc, JNI_ERR);
         assert!(last_error_string().is_some());
@@ -1811,7 +1840,10 @@ mod tests {
             std::ptr::null_mut(),
             0,
             name.as_ptr(),
-            CratonValue { tag: craton_tag::INT, payload: 1 },
+            CratonValue {
+                tag: craton_tag::INT,
+                payload: 1,
+            },
         );
         assert_eq!(rc, JNI_ERR);
         assert!(last_error_string().is_some());
@@ -1847,8 +1879,12 @@ mod tests {
         // load a bootstrap class.
         let name = CString::new("java/lang/System").unwrap();
         let mut cls: CratonClass = u64::MAX;
-        assert_eq!(cratonvm_load_class(vm, name.as_ptr(), &mut cls), JNI_OK,
-            "load_class failed: {:?}", last_error_string());
+        assert_eq!(
+            cratonvm_load_class(vm, name.as_ptr(), &mut cls),
+            JNI_OK,
+            "load_class failed: {:?}",
+            last_error_string()
+        );
 
         // create a string handle.
         let text = CString::new("embed").unwrap();
@@ -1857,29 +1893,50 @@ mod tests {
 
         // read the string handle back to UTF-8 and confirm the round trip.
         let back = cratonvm_string_utf8(vm, s);
-        assert!(!back.is_null(), "string_utf8 failed: {:?}", last_error_string());
+        assert!(
+            !back.is_null(),
+            "string_utf8 failed: {:?}",
+            last_error_string()
+        );
         // SAFETY: `back` is a live caller-owned C string from cratonvm_string_utf8.
-        let back_str = unsafe { CStr::from_ptr(back) }.to_string_lossy().into_owned();
+        let back_str = unsafe { CStr::from_ptr(back) }
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(back_str, "embed");
         cratonvm_free_string(back);
 
         // virtual dispatch: "embed".length() == 5 (descriptor excludes receiver).
         let len_m = CString::new("length").unwrap();
         let len_sig = CString::new("()I").unwrap();
-        let len = cratonvm_invoke_virtual(vm, s, len_m.as_ptr(), len_sig.as_ptr(),
-            std::ptr::null(), 0);
-        assert_eq!(len.tag, craton_tag::INT, "length() failed: {:?}", last_error_string());
+        let len =
+            cratonvm_invoke_virtual(vm, s, len_m.as_ptr(), len_sig.as_ptr(), std::ptr::null(), 0);
+        assert_eq!(
+            len.tag,
+            craton_tag::INT,
+            "length() failed: {:?}",
+            last_error_string()
+        );
         assert_eq!(len.payload as u32 as i32, 5);
 
         // object inspection: the string's runtime class is java/lang/String.
         let mut scls: CratonClass = u64::MAX;
-        assert_eq!(cratonvm_object_class(vm, s, &mut scls), JNI_OK,
-            "object_class failed: {:?}", last_error_string());
+        assert_eq!(
+            cratonvm_object_class(vm, s, &mut scls),
+            JNI_OK,
+            "object_class failed: {:?}",
+            last_error_string()
+        );
         assert_ne!(scls, u64::MAX);
         let cname = cratonvm_class_name(vm, scls);
-        assert!(!cname.is_null(), "class_name failed: {:?}", last_error_string());
+        assert!(
+            !cname.is_null(),
+            "class_name failed: {:?}",
+            last_error_string()
+        );
         // SAFETY: caller-owned C string from cratonvm_class_name.
-        let cname_str = unsafe { CStr::from_ptr(cname) }.to_string_lossy().into_owned();
+        let cname_str = unsafe { CStr::from_ptr(cname) }
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(cname_str, "java/lang/String");
         cratonvm_free_string(cname);
 
@@ -1890,8 +1947,12 @@ mod tests {
         assert!(fc >= 0, "field_count failed: {:?}", last_error_string());
         if fc > 0 {
             let f0 = cratonvm_get_field(vm, s, 0);
-            assert_ne!(f0.tag, craton_tag::ERROR, "get_field(0) failed: {:?}",
-                last_error_string());
+            assert_ne!(
+                f0.tag,
+                craton_tag::ERROR,
+                "get_field(0) failed: {:?}",
+                last_error_string()
+            );
         }
         // out-of-range field index is a clean error, not a crash.
         let oob = cratonvm_get_field(vm, s, fc);
@@ -1902,8 +1963,12 @@ mod tests {
         // JDK String layout).
         let hash_name = CString::new("hash").unwrap();
         let mut hash_idx: JInt = -1;
-        assert_eq!(cratonvm_field_index(vm, scls, hash_name.as_ptr(), &mut hash_idx), JNI_OK,
-            "field_index(String.hash) failed: {:?}", last_error_string());
+        assert_eq!(
+            cratonvm_field_index(vm, scls, hash_name.as_ptr(), &mut hash_idx),
+            JNI_OK,
+            "field_index(String.hash) failed: {:?}",
+            last_error_string()
+        );
         assert!(hash_idx >= 0);
         // name-based read agrees with index-based read at the resolved slot.
         let by_name = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
@@ -1912,23 +1977,47 @@ mod tests {
         assert_eq!(by_name.payload, by_index.payload);
         // write-back by name, then read it back (round trip).
         assert_eq!(
-            cratonvm_set_field_by_name(vm, s, hash_name.as_ptr(),
-                CratonValue { tag: craton_tag::INT, payload: 0x4d2 }),
-            JNI_OK, "set_field_by_name failed: {:?}", last_error_string());
+            cratonvm_set_field_by_name(
+                vm,
+                s,
+                hash_name.as_ptr(),
+                CratonValue {
+                    tag: craton_tag::INT,
+                    payload: 0x4d2
+                }
+            ),
+            JNI_OK,
+            "set_field_by_name failed: {:?}",
+            last_error_string()
+        );
         let after = cratonvm_get_field_by_name(vm, s, hash_name.as_ptr());
         assert_eq!(after.payload as u32 as i32, 0x4d2);
         // an unknown field name is a clean error, not a crash.
         let bogus = CString::new("no_such_field_xyz").unwrap();
         let mut bogus_idx: JInt = -1;
-        assert_eq!(cratonvm_field_index(vm, scls, bogus.as_ptr(), &mut bogus_idx), JNI_ERR);
+        assert_eq!(
+            cratonvm_field_index(vm, scls, bogus.as_ptr(), &mut bogus_idx),
+            JNI_ERR
+        );
         assert!(last_error_string().is_some());
 
         // invoke a void static (System.gc) with no args.
         let m = CString::new("gc").unwrap();
         let sig = CString::new("()V").unwrap();
-        let r = cratonvm_invoke_static(vm, name.as_ptr(), m.as_ptr(), sig.as_ptr(),
-            std::ptr::null(), 0);
-        assert_ne!(r.tag, craton_tag::ERROR, "invoke failed: {:?}", last_error_string());
+        let r = cratonvm_invoke_static(
+            vm,
+            name.as_ptr(),
+            m.as_ptr(),
+            sig.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert_ne!(
+            r.tag,
+            craton_tag::ERROR,
+            "invoke failed: {:?}",
+            last_error_string()
+        );
 
         // a bogus class name sets the last error.
         let bad = CString::new("no/such/Class").unwrap();

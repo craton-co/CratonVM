@@ -161,10 +161,7 @@ fn read_strict_utf8(ctx: &dyn NativeContext, charset: ObjectRef) -> Option<bool>
 }
 
 /// `forInputStreamReader(InputStream, Object, Charset) -> StreamDecoder`.
-fn native_sd_for_isr_charset(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_sd_for_isr_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let is = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
@@ -667,26 +664,21 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
         let open = matches!(ctx.get_field(this, SD_INPUT), Value::Object(Some(_)));
         Ok(Some(Value::Int(if open { 1 } else { 0 })))
     });
-    registry.register(
-        sd,
-        "getEncoding",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match obj_arg(args, 0) {
-                Some(o) => o,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            let id = sd_id(ctx, this);
-            let name = sd_table()
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "UTF-8".to_string());
-            let s = ctx.create_string(&name);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    registry.register(sd, "getEncoding", "()Ljava/lang/String;", |ctx, args| {
+        let this = match obj_arg(args, 0) {
+            Some(o) => o,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        let id = sd_id(ctx, this);
+        let name = sd_table()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "UTF-8".to_string());
+        let s = ctx.create_string(&name);
+        Ok(Some(Value::Object(Some(s))))
+    });
     registry.set_category(__prev_cat);
 }
 
@@ -727,10 +719,7 @@ mod tests {
 
     #[test]
     fn utf32_split_quad() {
-        assert_eq!(
-            split_complete_prefix("UTF-32BE", &[0, 0, 0, 0x41, 0, 0]),
-            4
-        );
+        assert_eq!(split_complete_prefix("UTF-32BE", &[0, 0, 0, 0x41, 0, 0]), 4);
     }
 
     #[test]

@@ -44,11 +44,17 @@ const JDK25_CLASS_NATIVES: &[(&str, &str)] = &[
     // T13.2 — Reflection
     ("getDeclaredFields0", "(Z)[Ljava/lang/reflect/Field;"),
     ("getDeclaredMethods0", "(Z)[Ljava/lang/reflect/Method;"),
-    ("getDeclaredConstructors0", "(Z)[Ljava/lang/reflect/Constructor;"),
+    (
+        "getDeclaredConstructors0",
+        "(Z)[Ljava/lang/reflect/Constructor;",
+    ),
     ("getDeclaredClasses0", "()[Ljava/lang/Class;"),
     ("getDeclaringClass0", "()Ljava/lang/Class;"),
     ("getEnclosingMethod0", "()[Ljava/lang/Object;"),
-    ("getRecordComponents0", "()[Ljava/lang/reflect/RecordComponent;"),
+    (
+        "getRecordComponents0",
+        "()[Ljava/lang/reflect/RecordComponent;",
+    ),
     ("getPermittedSubclasses0", "()[Ljava/lang/Class;"),
     ("getNestHost0", "()Ljava/lang/Class;"),
     ("getNestMembers0", "()[Ljava/lang/Class;"),
@@ -60,7 +66,10 @@ const JDK25_CLASS_NATIVES: &[(&str, &str)] = &[
     ("getSimpleBinaryName0", "()Ljava/lang/String;"),
     ("getClassFileVersion0", "()I"),
     ("getClassAccessFlagsRaw0", "()I"),
-    ("forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;"),
+    (
+        "forName0",
+        "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;",
+    ),
     // T13.4 — Miscellaneous
     ("desiredAssertionStatus0", "(Ljava/lang/Class;)Z"),
     ("isHidden", "()Z"),
@@ -72,7 +81,10 @@ const JDK25_CLASS_NATIVES: &[(&str, &str)] = &[
 /// canonical list has a corresponding `registry.register(...)` call.
 #[test]
 fn t13_all_class_natives_registered() {
-    let lib_path = workspace_root().join("native-builtins").join("src").join("lib.rs");
+    let lib_path = workspace_root()
+        .join("native-builtins")
+        .join("src")
+        .join("lib.rs");
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
@@ -119,7 +131,10 @@ fn t13_all_class_natives_registered() {
 /// returning void, or desiredAssertionStatus returning false) are OK.
 #[test]
 fn t13_no_stub_closures() {
-    let lib_path = workspace_root().join("native-builtins").join("src").join("lib.rs");
+    let lib_path = workspace_root()
+        .join("native-builtins")
+        .join("src")
+        .join("lib.rs");
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
@@ -343,7 +358,10 @@ fn t13_class_struct_has_required_fields() {
 
 #[test]
 fn t13_no_duplicate_registrations() {
-    let lib_path = workspace_root().join("native-builtins").join("src").join("lib.rs");
+    let lib_path = workspace_root()
+        .join("native-builtins")
+        .join("src")
+        .join("lib.rs");
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
@@ -448,15 +466,16 @@ fn t13_unit_tests_exist() {
 
 #[test]
 fn t13_method_count() {
-    let lib_path = workspace_root().join("native-builtins").join("src").join("lib.rs");
+    let lib_path = workspace_root()
+        .join("native-builtins")
+        .join("src")
+        .join("lib.rs");
     let contents = std::fs::read_to_string(&lib_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", lib_path.display()));
 
     let class_reg_count = contents
         .lines()
-        .filter(|line| {
-            line.contains("\"java/lang/Class\"") && line.contains("register")
-        })
+        .filter(|line| line.contains("\"java/lang/Class\"") && line.contains("register"))
         .count();
 
     // We expect at least 28 registrations across all registration functions

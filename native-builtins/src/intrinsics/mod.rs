@@ -53,18 +53,14 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
         ("java/lang/String", "isEmpty", "()Z") => StringIsEmpty,
 
         // java/lang/System — static
-        (
-            "java/lang/System",
-            "arraycopy",
-            "(Ljava/lang/Object;ILjava/lang/Object;II)V",
-        ) => SystemArraycopy,
+        ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V") => {
+            SystemArraycopy
+        }
 
         // java/lang/StringBuilder — virtual
-        (
-            "java/lang/StringBuilder",
-            "append",
-            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
-        ) => StringBuilderAppendString,
+        ("java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendString
+        }
         ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;") => {
             StringBuilderAppendInt
         }
@@ -77,14 +73,10 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
         ("java/lang/StringBuilder", "append", "(Z)Ljava/lang/StringBuilder;") => {
             StringBuilderAppendBool
         }
-        (
-            "java/lang/StringBuilder",
-            "append",
-            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
-        ) => StringBuilderAppendObject,
-        ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;") => {
-            StringBuilderToString
+        ("java/lang/StringBuilder", "append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendObject
         }
+        ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;") => StringBuilderToString,
         ("java/lang/StringBuilder", "length", "()I") => StringBuilderLength,
 
         // java/lang/Integer
@@ -287,7 +279,14 @@ mod tests {
 
     #[test]
     fn lookup_misses_unknown() {
-        assert_eq!(lookup("java/lang/String", "concat", "(Ljava/lang/String;)Ljava/lang/String;"), None);
+        assert_eq!(
+            lookup(
+                "java/lang/String",
+                "concat",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            ),
+            None
+        );
         assert_eq!(lookup("com/example/Foo", "bar", "()V"), None);
     }
 }

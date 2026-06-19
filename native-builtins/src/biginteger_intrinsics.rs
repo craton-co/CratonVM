@@ -64,10 +64,7 @@ fn read_int(
     len: usize,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: idx as i32,
-        }
-        .into());
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }.into());
     }
     match ctx.get_array_element(arr, idx) {
         Value::Int(v) => Ok(v),
@@ -89,10 +86,7 @@ fn write_int(
     val: i32,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: idx as i32,
-        }
-        .into());
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }.into());
     }
     ctx.set_array_element(arr, idx, Value::Int(val));
     Ok(())
@@ -102,7 +96,10 @@ fn write_int(
 /// (Java spec: the JDK's intrinsic never receives null because the wrapper
 /// always allocates first; defensive check anyway so a malformed bytecode
 /// caller cannot crash us).
-fn require_int_array(v: Option<&Value>, name: &str) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+fn require_int_array(
+    v: Option<&Value>,
+    name: &str,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => Err(RuntimeError::NullPointerException {
@@ -112,7 +109,10 @@ fn require_int_array(v: Option<&Value>, name: &str) -> Result<ObjectRef, cratonv
     }
 }
 
-fn require_int(v: Option<&Value>, name: &str) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+fn require_int(
+    v: Option<&Value>,
+    name: &str,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
         _ => Err(RuntimeError::IllegalArgumentException {
@@ -122,7 +122,10 @@ fn require_int(v: Option<&Value>, name: &str) -> Result<i32, cratonvm_types::err
     }
 }
 
-fn require_long(v: Option<&Value>, name: &str) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
+fn require_long(
+    v: Option<&Value>,
+    name: &str,
+) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Long(i)) => Ok(*i),
         _ => Err(RuntimeError::IllegalArgumentException {
@@ -160,8 +163,8 @@ pub fn impl_square_to_len(x: &[i32], len: usize, z: &mut [i32], zlen: usize) {
         let piece: u64 = (x[j] as u32) as u64;
         let product: u64 = piece.wrapping_mul(piece);
         // z[i++] = (lastProductLowWord << 31) | (int)(product >>> 33);
-        let high_part: u32 = ((last_product_low_word as u64) << 31) as u32
-            | ((product >> 33) as u32);
+        let high_part: u32 =
+            ((last_product_low_word as u64) << 31) as u32 | ((product >> 33) as u32);
         z[i] = high_part as i32;
         i += 1;
         // z[i++] = (int)(product >>> 1);
@@ -227,9 +230,8 @@ pub fn mul_add(out: &mut [i32], in_: &[i32], offset: usize, len: usize, k: i32) 
             break;
         }
         let off_u = off as usize;
-        let product: u64 = ((in_[j] as u32) as u64).wrapping_mul(k_long)
-            + ((out[off_u] as u32) as u64)
-            + carry;
+        let product: u64 =
+            ((in_[j] as u32) as u64).wrapping_mul(k_long) + ((out[off_u] as u32) as u64) + carry;
         out[off_u] = product as u32 as i32;
         carry = product >> 32;
         off -= 1;
@@ -402,9 +404,7 @@ fn read_int_array(
             // exception rather than an opaque value-type panic.
             _ => {
                 return Err(RuntimeError::ArrayStoreException {
-                    message: format!(
-                        "expected int[] element at index {i}, got non-int value"
-                    ),
+                    message: format!("expected int[] element at index {i}, got non-int value"),
                 }
                 .into())
             }
@@ -433,10 +433,7 @@ fn write_int_array(
 }
 
 /// `private static int[] implSquareToLen(int[] x, int len, int[] z, int zlen)`
-fn native_impl_square_to_len(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_impl_square_to_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Static method: args = [x, len, z, zlen].
     let x_ref = require_int_array(args.first(), "x")?;
     let len_i = require_int(args.get(1), "len")?;
@@ -487,10 +484,7 @@ fn native_impl_square_to_len(
 }
 
 /// `static void shiftLeftImplWorker(int[] newArr, int[] oldArr, int newIdx, int shiftCount, int numIter)`
-fn native_shift_left_impl_worker(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_shift_left_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let new_arr = require_int_array(args.first(), "newArr")?;
     let old_arr = require_int_array(args.get(1), "oldArr")?;
     let new_idx = require_int(args.get(2), "newIdx")? as i64;
@@ -539,10 +533,7 @@ fn native_shift_left_impl_worker(
 }
 
 /// `static void shiftRightImplWorker(int[] newArr, int[] oldArr, int newIdx, int shiftCount, int numIter)`
-fn native_shift_right_impl_worker(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_shift_right_impl_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let new_arr = require_int_array(args.first(), "newArr")?;
     let old_arr = require_int_array(args.get(1), "oldArr")?;
     let new_idx = require_int(args.get(2), "newIdx")? as i64;
@@ -581,10 +572,7 @@ fn native_shift_right_impl_worker(
 }
 
 /// `private static int implMulAdd(int[] out, int[] in_, int offset, int len, int k)`
-fn native_impl_mul_add(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_impl_mul_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let out_ref = require_int_array(args.first(), "out")?;
     let in_ref = require_int_array(args.get(1), "in_")?;
     let offset_i = require_int(args.get(2), "offset")?;
@@ -603,10 +591,7 @@ fn native_impl_mul_add(
     let out_len = ctx.array_length(out_ref);
     let in_len = ctx.array_length(in_ref);
     if len > in_len {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-            index: len as i32,
-        }
-        .into());
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: len as i32 }.into());
     }
     // Per JDK: writes go to out[out.len() - offset - 1] downward through
     // out[out.len() - offset - len]. Both must be in-range.
@@ -627,10 +612,7 @@ fn native_impl_mul_add(
 /// `private static int mulAdd(int[] out, int[] in_, int offset, int len, int k)`
 /// — same semantics as `implMulAdd`, just the public wrapper. Some JDK
 /// snapshots dispatch through both names, so we register both.
-fn native_mul_add(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_mul_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_impl_mul_add(ctx, args)
 }
 
@@ -807,7 +789,12 @@ mod tests {
     #[test]
     fn shift_left_impl_worker_n1() {
         let mut new_buf = vec![0i32; 4];
-        let old = vec![0x1111_1111i32, 0x2222_2222i32, 0x3333_3333i32, 0x4444_4444i32];
+        let old = vec![
+            0x1111_1111i32,
+            0x2222_2222i32,
+            0x3333_3333i32,
+            0x4444_4444i32,
+        ];
         shift_left_impl_worker(&mut new_buf, &old, 0, 1, 4);
         // For n=1, last word is patched by the wrapper, not the worker. The
         // worker writes idx 0..2.
@@ -894,7 +881,12 @@ mod tests {
     #[test]
     fn native_impl_square_to_len_dispatch() {
         let mut ctx = mock_ctx();
-        let x_vals = vec![0x1234_5678i32, 0x9ABC_DEF0u32 as i32, 0x1111_2222i32, 0x3333_4444i32];
+        let x_vals = vec![
+            0x1234_5678i32,
+            0x9ABC_DEF0u32 as i32,
+            0x1111_2222i32,
+            0x3333_4444i32,
+        ];
         let x = alloc_int_arr(&mut ctx, &x_vals);
         let z = alloc_int_arr(&mut ctx, &vec![0i32; 8]);
         let r = native_impl_square_to_len(

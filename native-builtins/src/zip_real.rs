@@ -24,14 +24,14 @@
 //! `register_builtins`), so last-writer-wins makes synthetic take over.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 
 // ---------------------------------------------------------------------------
 // Handle tables
@@ -99,12 +99,7 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
     }
 }
 
-fn read_byte_array(
-    ctx: &dyn NativeContext,
-    arr: ObjectRef,
-    off: usize,
-    len: usize,
-) -> Vec<u8> {
+fn read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, len: usize) -> Vec<u8> {
     let arr_len = ctx.array_length(arr);
     let end = (off + len).min(arr_len);
     let start = off.min(arr_len);
@@ -118,12 +113,7 @@ fn read_byte_array(
     out
 }
 
-fn write_byte_array(
-    ctx: &mut dyn NativeContext,
-    arr: ObjectRef,
-    off: usize,
-    data: &[u8],
-) -> usize {
+fn write_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, data: &[u8]) -> usize {
     let arr_len = ctx.array_length(arr);
     let mut written = 0usize;
     for (i, b) in data.iter().enumerate() {
@@ -235,7 +225,9 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
     let total_in_before = st.decomp.total_in();
     let total_out_before = st.decomp.total_out();
-    let status = st.decomp.decompress(&input_data, &mut output_buf, FlushDecompress::None);
+    let status = st
+        .decomp
+        .decompress(&input_data, &mut output_buf, FlushDecompress::None);
     let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
     let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
 
@@ -571,16 +563,36 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     r.register(il, "initIDs", "()V", infl_init_ids);
     r.register(il, "init", "(Z)J", infl_init);
     r.register(il, "setDictionary", "(J[BII)V", infl_set_dictionary);
-    r.register(il, "setDictionaryBuffer", "(JJI)V", infl_set_dictionary_buffer);
+    r.register(
+        il,
+        "setDictionaryBuffer",
+        "(JJI)V",
+        infl_set_dictionary_buffer,
+    );
     r.register(
         il,
         "inflateBytesBytes",
         "(J[BII[BII)J",
         infl_inflate_bytes_bytes,
     );
-    r.register(il, "inflateBytesBuffer", "(J[BIIJI)J", infl_inflate_bytes_buffer);
-    r.register(il, "inflateBufferBytes", "(JJI[BII)J", infl_inflate_buffer_bytes);
-    r.register(il, "inflateBufferBuffer", "(JJIJI)J", infl_inflate_buffer_buffer);
+    r.register(
+        il,
+        "inflateBytesBuffer",
+        "(J[BIIJI)J",
+        infl_inflate_bytes_buffer,
+    );
+    r.register(
+        il,
+        "inflateBufferBytes",
+        "(JJI[BII)J",
+        infl_inflate_buffer_bytes,
+    );
+    r.register(
+        il,
+        "inflateBufferBuffer",
+        "(JJIJI)J",
+        infl_inflate_buffer_buffer,
+    );
     r.register(il, "getAdler", "(J)I", infl_get_adler);
     r.register(il, "reset", "(J)V", infl_reset);
     r.register(il, "end", "(J)V", infl_end);
@@ -590,7 +602,12 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     r.register(dl, "initIDs", "()V", defl_init_ids);
     r.register(dl, "init", "(IIZ)J", defl_init);
     r.register(dl, "setDictionary", "(J[BII)V", defl_set_dictionary);
-    r.register(dl, "setDictionaryBuffer", "(JJI)V", defl_set_dictionary_buffer);
+    r.register(
+        dl,
+        "setDictionaryBuffer",
+        "(JJI)V",
+        defl_set_dictionary_buffer,
+    );
     r.register(
         dl,
         "deflateBytesBytes",
@@ -616,7 +633,12 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     let crc = "java/util/zip/CRC32";
     r.register(crc, "update", "(II)I", crc32_update);
     r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
-    r.register(crc, "updateByteBuffer0", "(IJII)I", crc32_update_byte_buffer_0);
+    r.register(
+        crc,
+        "updateByteBuffer0",
+        "(IJII)I",
+        crc32_update_byte_buffer_0,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +648,7 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{Compression, write::DeflateEncoder};
+    use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
     #[test]

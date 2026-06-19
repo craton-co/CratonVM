@@ -73,14 +73,44 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     // `NativeContext::gpu_device_info` escape hatch. Truthful on a
     // driverless host: `deviceCount` returns 0 and the per-device
     // queries return null / 0 for every ordinal.
-    registry.register(KLASS, "deviceCount",              "()I", builtin_device_count);
-    registry.register(KLASS, "deviceName",               "(I)Ljava/lang/String;", builtin_device_name);
-    registry.register(KLASS, "deviceTotalMemory",        "(I)J", builtin_device_total_memory);
-    registry.register(KLASS, "deviceComputeCapability",  "(I)I", builtin_device_compute_capability);
+    registry.register(KLASS, "deviceCount", "()I", builtin_device_count);
+    registry.register(
+        KLASS,
+        "deviceName",
+        "(I)Ljava/lang/String;",
+        builtin_device_name,
+    );
+    registry.register(
+        KLASS,
+        "deviceTotalMemory",
+        "(I)J",
+        builtin_device_total_memory,
+    );
+    registry.register(
+        KLASS,
+        "deviceComputeCapability",
+        "(I)I",
+        builtin_device_compute_capability,
+    );
 
-    registry.register(KLASS, "openExecutor", "(I)Lcraton/gpu/GpuExecutor;", builtin_open_executor);
-    registry.register(KLASS, "submit",       "(JLcraton/gpu/GpuCallable;)Lcraton/gpu/GpuFuture;", builtin_submit);
-    registry.register(KLASS, "launch",       "(JLcraton/gpu/GpuRunnable;)Lcraton/gpu/GpuFuture;", builtin_launch);
+    registry.register(
+        KLASS,
+        "openExecutor",
+        "(I)Lcraton/gpu/GpuExecutor;",
+        builtin_open_executor,
+    );
+    registry.register(
+        KLASS,
+        "submit",
+        "(JLcraton/gpu/GpuCallable;)Lcraton/gpu/GpuFuture;",
+        builtin_submit,
+    );
+    registry.register(
+        KLASS,
+        "launch",
+        "(JLcraton/gpu/GpuRunnable;)Lcraton/gpu/GpuFuture;",
+        builtin_launch,
+    );
     registry.register(
         KLASS,
         "submitMethod",
@@ -99,23 +129,48 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(JLjava/lang/Object;[Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
         builtin_submit_with_args,
     );
-    registry.register(KLASS, "newStream",    "(J)Lcraton/gpu/GpuStream;", builtin_new_stream);
-    registry.register(KLASS, "closeStream",  "(J)V", builtin_close_stream);
+    registry.register(
+        KLASS,
+        "newStream",
+        "(J)Lcraton/gpu/GpuStream;",
+        builtin_new_stream,
+    );
+    registry.register(KLASS, "closeStream", "(J)V", builtin_close_stream);
 
-    registry.register(KLASS, "futureStatus",            "(J)I", builtin_future_status);
-    registry.register(KLASS, "futureSynchronize",       "(J)V", builtin_future_synchronize);
-    registry.register(KLASS, "futureGetResult",         "(J)Ljava/lang/Object;", builtin_future_get_result);
-    registry.register(KLASS, "futureGetErrorMessage",   "(J)Ljava/lang/String;", builtin_future_get_error_message);
+    registry.register(KLASS, "futureStatus", "(J)I", builtin_future_status);
+    registry.register(
+        KLASS,
+        "futureSynchronize",
+        "(J)V",
+        builtin_future_synchronize,
+    );
+    registry.register(
+        KLASS,
+        "futureGetResult",
+        "(J)Ljava/lang/Object;",
+        builtin_future_get_result,
+    );
+    registry.register(
+        KLASS,
+        "futureGetErrorMessage",
+        "(J)Ljava/lang/String;",
+        builtin_future_get_error_message,
+    );
 
-    registry.register(KLASS, "arrayWrapInt",    "([I)J", builtin_array_wrap_int);
-    registry.register(KLASS, "arrayWrapLong",   "([J)J", builtin_array_wrap_long);
-    registry.register(KLASS, "arrayWrapFloat",  "([F)J", builtin_array_wrap_float);
+    registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
+    registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
+    registry.register(KLASS, "arrayWrapFloat", "([F)J", builtin_array_wrap_float);
     registry.register(KLASS, "arrayWrapDouble", "([D)J", builtin_array_wrap_double);
-    registry.register(KLASS, "arrayToHost",     "(J)Ljava/lang/Object;", builtin_array_to_host);
+    registry.register(
+        KLASS,
+        "arrayToHost",
+        "(J)Ljava/lang/Object;",
+        builtin_array_to_host,
+    );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
 
-    registry.register(KLASS, "releaseFuture",   "(J)V", builtin_release_future);
-    registry.register(KLASS, "releaseArray",    "(J)V", builtin_release_array);
+    registry.register(KLASS, "releaseFuture", "(J)V", builtin_release_future);
+    registry.register(KLASS, "releaseArray", "(J)V", builtin_release_array);
     registry.register(KLASS, "releaseExecutor", "(J)V", builtin_release_executor);
     registry.set_category(__prev_cat);
 }
@@ -151,8 +206,12 @@ mod state {
     #[derive(Debug)]
     pub(super) enum FutureState {
         Pending,
-        Done { result_obj: Option<cratonvm_types::ObjectRef> },
-        Failed { message: String },
+        Done {
+            result_obj: Option<cratonvm_types::ObjectRef>,
+        },
+        Failed {
+            message: String,
+        },
     }
 
     #[derive(Debug, Default)]
@@ -201,9 +260,7 @@ mod state {
 /// `Vec<u8>` is a fresh allocation; the caller may modify it
 /// without affecting the store.
 #[cfg(feature = "gpu-offload")]
-pub fn array_snapshot(
-    handle: u64,
-) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>)> {
+pub fn array_snapshot(handle: u64) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>)> {
     state::with(|s| {
         s.arrays
             .get(&handle)
@@ -275,7 +332,9 @@ fn rebuild_java_array(
         ArrayElementType::Int => {
             for i in 0..element_count {
                 let off = i * 4;
-                if off + 4 > bytes.len() { break; }
+                if off + 4 > bytes.len() {
+                    break;
+                }
                 let v = i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
                 ctx.set_array_element(obj, i, Value::Int(v));
             }
@@ -283,7 +342,9 @@ fn rebuild_java_array(
         ArrayElementType::Long => {
             for i in 0..element_count {
                 let off = i * 8;
-                if off + 8 > bytes.len() { break; }
+                if off + 8 > bytes.len() {
+                    break;
+                }
                 let v = i64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap());
                 ctx.set_array_element(obj, i, Value::Long(v));
             }
@@ -291,7 +352,9 @@ fn rebuild_java_array(
         ArrayElementType::Float => {
             for i in 0..element_count {
                 let off = i * 4;
-                if off + 4 > bytes.len() { break; }
+                if off + 4 > bytes.len() {
+                    break;
+                }
                 let v = f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
                 ctx.set_array_element(obj, i, Value::Float(v));
             }
@@ -299,7 +362,9 @@ fn rebuild_java_array(
         ArrayElementType::Double => {
             for i in 0..element_count {
                 let off = i * 8;
-                if off + 8 > bytes.len() { break; }
+                if off + 8 > bytes.len() {
+                    break;
+                }
                 let v = f64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap());
                 ctx.set_array_element(obj, i, Value::Double(v));
             }
@@ -556,7 +621,9 @@ fn record_failed_future() -> u64 {
         let h = s.fresh_handle();
         s.futures.insert(
             h,
-            state::FutureState::Failed { message: STUB_FAILURE_MESSAGE.to_string() },
+            state::FutureState::Failed {
+                message: STUB_FAILURE_MESSAGE.to_string(),
+            },
         );
         h
     })
@@ -588,17 +655,10 @@ fn builtin_submit(
     if let Some((class_name, method_name, descriptor, captures)) =
         ctx.gpu_resolve_lambda_target(callable)
     {
-        if let Some(handle) = ctx.gpu_dispatch_method(
-            &class_name,
-            &method_name,
-            &descriptor,
-            &captures,
-        ) {
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                handle,
-            );
+        if let Some(handle) =
+            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
+        {
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
     // Fallback — the callable is not a recognized GPU-dispatchable
@@ -644,17 +704,10 @@ fn builtin_submit_with_arg(
         ctx.gpu_resolve_lambda_target(lambda)
     {
         captures.push(sam_arg);
-        if let Some(handle) = ctx.gpu_dispatch_method(
-            &class_name,
-            &method_name,
-            &descriptor,
-            &captures,
-        ) {
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                handle,
-            );
+        if let Some(handle) =
+            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
+        {
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
     let h = record_failed_future_with_message(
@@ -698,17 +751,10 @@ fn builtin_submit_with_args(
                 captures.push(ctx.get_array_element(arr_obj, i));
             }
         }
-        if let Some(handle) = ctx.gpu_dispatch_method(
-            &class_name,
-            &method_name,
-            &descriptor,
-            &captures,
-        ) {
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                handle,
-            );
+        if let Some(handle) =
+            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
+        {
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
     let h = record_failed_future_with_message(
@@ -738,17 +784,10 @@ fn builtin_launch(
     if let Some((class_name, method_name, descriptor, captures)) =
         ctx.gpu_resolve_lambda_target(runnable)
     {
-        if let Some(handle) = ctx.gpu_dispatch_method(
-            &class_name,
-            &method_name,
-            &descriptor,
-            &captures,
-        ) {
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                handle,
-            );
+        if let Some(handle) =
+            ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &captures)
+        {
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
         }
     }
     let h = record_failed_future_with_message(
@@ -785,33 +824,21 @@ fn builtin_submit_method(
         Some(s) => s,
         None => {
             let h = record_failed_future_with_message("submitMethod: className was null");
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                h,
-            );
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
         }
     };
     let method_name = match arg_object(args, 2).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
             let h = record_failed_future_with_message("submitMethod: methodName was null");
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                h,
-            );
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
         }
     };
     let descriptor = match arg_object(args, 3).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
             let h = record_failed_future_with_message("submitMethod: descriptor was null");
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                h,
-            );
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
         }
     };
 
@@ -823,11 +850,7 @@ fn builtin_submit_method(
         Some(o) => o,
         None => {
             let h = record_failed_future_with_message("submitMethod: args array was null");
-            return instantiate_handle_wrapper(
-                ctx,
-                "craton/gpu/internal/GpuFutureImpl",
-                h,
-            );
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
         }
     };
     let n = ctx.array_length(java_args_obj);
@@ -838,28 +861,20 @@ fn builtin_submit_method(
 
     // Dispatch via the NativeContext escape hatch. The VM's impl
     // calls into `runtime::offload::dispatch_method_from_native`.
-    let submission_handle = match ctx.gpu_dispatch_method(
-        &class_name,
-        &method_name,
-        &descriptor,
-        &java_args,
-    ) {
-        Some(h) => h,
-        None => {
-            // gpu-offload feature off on the VM side. Fall back to
-            // the synthetic Failed-future path so the Java side gets
-            // a coherent error.
-            record_failed_future_with_message(
-                "submitMethod: gpu-offload feature is disabled in this build",
-            )
-        }
-    };
+    let submission_handle =
+        match ctx.gpu_dispatch_method(&class_name, &method_name, &descriptor, &java_args) {
+            Some(h) => h,
+            None => {
+                // gpu-offload feature off on the VM side. Fall back to
+                // the synthetic Failed-future path so the Java side gets
+                // a coherent error.
+                record_failed_future_with_message(
+                    "submitMethod: gpu-offload feature is disabled in this build",
+                )
+            }
+        };
 
-    instantiate_handle_wrapper(
-        ctx,
-        "craton/gpu/internal/GpuFutureImpl",
-        submission_handle,
-    )
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", submission_handle)
 }
 
 /// gpu-offload-off shim — submitMethod is unreachable in default
@@ -879,7 +894,9 @@ fn record_failed_future_with_message(message: &str) -> u64 {
         let h = s.fresh_handle();
         s.futures.insert(
             h,
-            state::FutureState::Failed { message: message.to_string() },
+            state::FutureState::Failed {
+                message: message.to_string(),
+            },
         );
         h
     })
@@ -1111,9 +1128,9 @@ fn builtin_array_to_host(
         array_replace_bytes(handle, fresh_bytes);
     }
     let snapshot = state::with(|s| {
-        s.arrays.get(&handle).map(|entry| {
-            (entry.element_type, entry.element_count, entry.bytes.clone())
-        })
+        s.arrays
+            .get(&handle)
+            .map(|entry| (entry.element_type, entry.element_count, entry.bytes.clone()))
     });
     match snapshot {
         Some((etype, count, bytes)) => {
@@ -1131,9 +1148,7 @@ fn builtin_array_is_resident(
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
-    let resident = state::with(|s| {
-        s.arrays.get(&handle).map(|e| e.resident).unwrap_or(false)
-    });
+    let resident = state::with(|s| s.arrays.get(&handle).map(|e| e.resident).unwrap_or(false));
     Ok(Some(Value::Int(if resident { 1 } else { 0 })))
 }
 
@@ -1167,7 +1182,12 @@ mod tests {
 
     fn synthetic_devices() -> Vec<DeviceInfo> {
         vec![
-            ("NVIDIA GeForce RTX 2060".to_string(), 7, 5, 6 * 1024 * 1024 * 1024),
+            (
+                "NVIDIA GeForce RTX 2060".to_string(),
+                7,
+                5,
+                6 * 1024 * 1024 * 1024,
+            ),
             ("NVIDIA A100".to_string(), 8, 0, 40 * 1024 * 1024 * 1024),
         ]
     }

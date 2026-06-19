@@ -20,8 +20,7 @@ fn workspace_root() -> PathBuf {
 
 fn read_ws(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 // ===========================================================================
@@ -83,7 +82,10 @@ fn t15_classloader_natives_registered() {
     let lib = read_ws("native-builtins/src/lib.rs");
 
     let required = [
-        ("findBootstrapClass", "native_classloader_find_bootstrap_class"),
+        (
+            "findBootstrapClass",
+            "native_classloader_find_bootstrap_class",
+        ),
         ("defineClass0", "native_classloader_define_class0"),
         ("defineClass1", "native_classloader_define_class1"),
     ];
@@ -94,12 +96,11 @@ fn t15_classloader_natives_registered() {
                 && line.contains(&format!("\"{}\"", method))
                 && line.contains(func)
         });
-        assert!(
-            found,
-            "T15: ClassLoader.{method} not wired to {func}",
-        );
+        assert!(found, "T15: ClassLoader.{method} not wired to {func}",);
     }
-    eprintln!("[T15.2] ✓ ClassLoader.defineClass0/1 and findBootstrapClass use real implementations");
+    eprintln!(
+        "[T15.2] ✓ ClassLoader.defineClass0/1 and findBootstrapClass use real implementations"
+    );
 }
 
 // ===========================================================================
@@ -146,8 +147,7 @@ fn t15_vm_uid_gid_registered() {
 
     for method in &required {
         let found = lib.lines().any(|line| {
-            line.contains("\"jdk/internal/misc/VM\"")
-                && line.contains(&format!("\"{}\"", method))
+            line.contains("\"jdk/internal/misc/VM\"") && line.contains(&format!("\"{}\"", method))
         });
         if !found {
             missing.push(method);
@@ -219,7 +219,9 @@ fn t15_no_stubs_in_mhn_registrations() {
     let mut stubs: Vec<String> = Vec::new();
 
     for line in lib.lines() {
-        if !(line.contains("MethodHandleNatives") || line.contains("mhn,")) || !line.contains("register") {
+        if !(line.contains("MethodHandleNatives") || line.contains("mhn,"))
+            || !line.contains("register")
+        {
             continue;
         }
         let lower = line.to_lowercase();
@@ -288,8 +290,7 @@ fn t15_define_class_not_stub() {
         let line = lib
             .lines()
             .find(|l| {
-                l.contains("\"java/lang/ClassLoader\"")
-                    && l.contains(&format!("\"{}\"", method))
+                l.contains("\"java/lang/ClassLoader\"") && l.contains(&format!("\"{}\"", method))
             })
             .unwrap_or_else(|| panic!("defineClass registration not found for {method}"));
 

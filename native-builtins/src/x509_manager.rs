@@ -78,10 +78,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use parking_lot::RwLock;
 
 use crate::alloc_concurrent_synthetic;
 use crate::keystore;
@@ -599,7 +599,11 @@ pub fn is_server_cert(p: &ParsedCert) -> bool {
     // ExtendedKeyUsage check: if present, must include id-kp-serverAuth.
     // If absent, we permit (many older certs omit EKU).
     if !p.ext_key_usage.is_empty() {
-        if !p.ext_key_usage.iter().any(|o| o.as_slice() == OID_KP_SERVER_AUTH) {
+        if !p
+            .ext_key_usage
+            .iter()
+            .any(|o| o.as_slice() == OID_KP_SERVER_AUTH)
+        {
             return false;
         }
     }
@@ -614,7 +618,11 @@ pub fn is_client_cert(p: &ParsedCert) -> bool {
         }
     }
     if !p.ext_key_usage.is_empty() {
-        if !p.ext_key_usage.iter().any(|o| o.as_slice() == OID_KP_CLIENT_AUTH) {
+        if !p
+            .ext_key_usage
+            .iter()
+            .any(|o| o.as_slice() == OID_KP_CLIENT_AUTH)
+        {
             return false;
         }
     }
@@ -740,28 +748,45 @@ fn insert_anchor(state: &mut TrustManagerState, der: Vec<u8>) {
 #[derive(Debug, Clone)]
 pub enum TrustError {
     EmptyChain,
-    Expired { subject_dn: Vec<u8>, when: i64 },
-    NotYetValid { subject_dn: Vec<u8>, when: i64 },
-    BrokenChain { at: usize },
-    NotCa { at: usize },
+    Expired {
+        subject_dn: Vec<u8>,
+        when: i64,
+    },
+    NotYetValid {
+        subject_dn: Vec<u8>,
+        when: i64,
+    },
+    BrokenChain {
+        at: usize,
+    },
+    NotCa {
+        at: usize,
+    },
     NoTrustAnchor,
     /// Signature *value* was missing or otherwise structurally unusable
     /// (issuer SPKI couldn't be decoded, signature length mismatch with
     /// modulus, etc.). Kept for backwards compatibility with code that
     /// matched on `SignatureFailed { at }` before we split out the
     /// cryptographic-failure paths.
-    SignatureFailed { at: usize },
+    SignatureFailed {
+        at: usize,
+    },
     /// The cryptographic signature verification step itself rejected the
     /// pair `(issuer SPKI, signature)` for cert `at`. RSA-PKCS1v15 padding
     /// mismatch / decoded digest mismatch, ECDSA `u1*G + u2*Q.x ≠ r mod n`,
     /// or any other algorithm-level failure.
-    BadSignature { at: usize },
+    BadSignature {
+        at: usize,
+    },
     /// The signature-algorithm OID is recognised but this verifier doesn't
     /// implement it. Lets callers distinguish "DSA chain — please fall back
     /// to JCE" from "we have no idea what 1.2.3.4 is". Currently fires
     /// for DSA (id-dsa-with-sha1), RSA-PSS (id-RSASSA-PSS), and Ed25519
     /// (id-Ed25519). See the OID const block for the upgrade plan.
-    NotImplemented { at: usize, oid: Vec<u8> },
+    NotImplemented {
+        at: usize,
+        oid: Vec<u8>,
+    },
     Parse(CertParseError),
 }
 
@@ -777,10 +802,18 @@ impl std::fmt::Display for TrustError {
             TrustError::NotCa { at } => write!(f, "cert at index {} is not a CA", at),
             TrustError::NoTrustAnchor => f.write_str("no trust anchor found for chain"),
             TrustError::SignatureFailed { at } => {
-                write!(f, "signature verification failed at index {} (structural)", at)
+                write!(
+                    f,
+                    "signature verification failed at index {} (structural)",
+                    at
+                )
             }
             TrustError::BadSignature { at } => {
-                write!(f, "signature verification failed at index {} (cryptographic)", at)
+                write!(
+                    f,
+                    "signature verification failed at index {} (cryptographic)",
+                    at
+                )
             }
             TrustError::NotImplemented { at, oid } => {
                 write!(
@@ -821,10 +854,7 @@ impl std::fmt::Display for TrustError {
 /// Everything else returns `TrustError::NotImplemented` so the caller can
 /// choose to delegate to a JCE provider. See the OID block above for the
 /// inventory of recognised-but-unimplemented OIDs.
-pub fn validate_chain(
-    chain: &[Vec<u8>],
-    trust: &TrustManagerState,
-) -> Result<(), TrustError> {
+pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<(), TrustError> {
     if chain.is_empty() {
         return Err(TrustError::EmptyChain);
     }
@@ -946,9 +976,7 @@ fn verify_one_signature(
     cert: &ParsedCert,
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
-    use crate::crypto_impl::{
-        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256,
-    };
+    use crate::crypto_impl::{parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256};
 
     let oid = cert.signature_algorithm_oid.as_slice();
     let sig = cert.signature_value.as_slice();
@@ -1347,9 +1375,20 @@ fn make_private_key_mirror(
 fn classify_key_type_from_pkcs8(key_der: &[u8]) -> &'static str {
     // PKCS#8 PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier, OCTET STRING }
     let needles: &[(&[u8], &'static str)] = &[
-        (&[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01], "RSA"),
-        (&[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01], "EC"),
-        (&[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01], "DSA"),
+        (
+            &[
+                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+            ],
+            "RSA",
+        ),
+        (
+            &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01],
+            "EC",
+        ),
+        (
+            &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01],
+            "DSA",
+        ),
         (&[0x06, 0x03, 0x2b, 0x65, 0x70], "Ed25519"),
         (&[0x06, 0x03, 0x2b, 0x65, 0x71], "Ed448"),
     ];
@@ -1442,7 +1481,10 @@ fn get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let chain = {
         let registry = km_registry().read();
-        match registry.get(&id).and_then(|s| s.aliases_to_chain.get(&alias)) {
+        match registry
+            .get(&id)
+            .and_then(|s| s.aliases_to_chain.get(&alias))
+        {
             Some(c) => c.clone(),
             None => return Ok(Some(Value::Object(None))),
         }
@@ -1486,7 +1528,9 @@ fn get_server_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .and_then(|s| s.server_aliases_by_key_type.get(&key_type).cloned())
             .unwrap_or_default()
     };
-    Ok(Some(Value::Object(Some(materialize_string_array(ctx, &aliases)))))
+    Ok(Some(Value::Object(Some(materialize_string_array(
+        ctx, &aliases,
+    )))))
 }
 
 fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1500,7 +1544,9 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .and_then(|s| s.client_aliases_by_key_type.get(&key_type).cloned())
             .unwrap_or_default()
     };
-    Ok(Some(Value::Object(Some(materialize_string_array(ctx, &aliases)))))
+    Ok(Some(Value::Object(Some(materialize_string_array(
+        ctx, &aliases,
+    )))))
 }
 
 fn materialize_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
@@ -1858,7 +1904,11 @@ mod tests {
         tbs.extend_from_slice(&name_with_cn(spec.issuer_cn));
         // validity
         tbs.extend_from_slice(&der_seq(
-            [der_utctime(spec.not_before_utc), der_utctime(spec.not_after_utc)].concat(),
+            [
+                der_utctime(spec.not_before_utc),
+                der_utctime(spec.not_after_utc),
+            ]
+            .concat(),
         ));
         // subject
         tbs.extend_from_slice(&name_with_cn(spec.subject_cn));
@@ -2250,9 +2300,7 @@ mod tests {
         tbs.extend_from_slice(&der_int(1));
         // signature alg (this MUST match the outer sigAlg byte-for-byte;
         // RFC 5280 §4.1.1.2 requires it)
-        let sig_alg_seq = der_seq(
-            [der_oid(spec.sig_alg_oid), der_tlv(TAG_NULL, &[])].concat(),
-        );
+        let sig_alg_seq = der_seq([der_oid(spec.sig_alg_oid), der_tlv(TAG_NULL, &[])].concat());
         tbs.extend_from_slice(&sig_alg_seq);
         // issuer
         tbs.extend_from_slice(&name_with_cn(spec.issuer_cn));
@@ -2271,11 +2319,7 @@ mod tests {
         // extensions
         let mut exts: Vec<u8> = Vec::new();
         if let Some(bits) = spec.key_usage_bits {
-            exts.extend_from_slice(&extension(
-                OID_EXT_KEY_USAGE,
-                true,
-                ku_bitstring(bits),
-            ));
+            exts.extend_from_slice(&extension(OID_EXT_KEY_USAGE, true, ku_bitstring(bits)));
         }
         if !spec.ext_key_usages.is_empty() {
             exts.extend_from_slice(&extension(
@@ -2285,11 +2329,7 @@ mod tests {
             ));
         }
         if let Some(ca) = spec.basic_constraints_ca {
-            exts.extend_from_slice(&extension(
-                OID_EXT_BASIC_CONSTRAINTS,
-                true,
-                bc_seq(ca),
-            ));
+            exts.extend_from_slice(&extension(OID_EXT_BASIC_CONSTRAINTS, true, bc_seq(ca)));
         }
         if !exts.is_empty() {
             tbs.extend_from_slice(&der_context_explicit(3, &der_seq(exts)));

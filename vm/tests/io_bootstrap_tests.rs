@@ -37,17 +37,11 @@ macro_rules! require_class_files {
 
 fn invoke_expect_int(method: &str, expected: i32) {
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/IoBootstrapTest",
-        method,
-        "()I",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/IoBootstrapTest", method, "()I", &[]);
     match result {
-        Ok(Some(Value::Int(v))) => assert_eq!(
-            v, expected,
-            "{method} returned {v}, expected {expected}"
-        ),
+        Ok(Some(Value::Int(v))) => {
+            assert_eq!(v, expected, "{method} returned {v}, expected {expected}")
+        }
         other => panic!("{method} failed: {other:?}"),
     }
 }
@@ -174,7 +168,9 @@ fn io_superclass_chain_file_input_stream() {
 
     // Load FileInputStream
     drop(cm);
-    let fis_id = shared.class_manager.write()
+    let fis_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/FileInputStream")
         .expect("should load FileInputStream");
 
@@ -185,7 +181,10 @@ fn io_superclass_chain_file_input_stream() {
     // Check superclass is InputStream
     let super_id = fis.superclass.expect("FIS should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
-    assert_eq!(&*super_cls.name, "java/io/InputStream", "FIS should extend InputStream");
+    assert_eq!(
+        &*super_cls.name, "java/io/InputStream",
+        "FIS should extend InputStream"
+    );
 }
 
 #[test]
@@ -193,7 +192,9 @@ fn io_superclass_chain_print_stream() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let ps_id = shared.class_manager.write()
+    let ps_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/PrintStream")
         .expect("should load PrintStream");
 
@@ -201,8 +202,10 @@ fn io_superclass_chain_print_stream() {
     let ps = cm.get_class(ps_id).expect("PS class");
     let super_id = ps.superclass.expect("PS should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
-    assert_eq!(&*super_cls.name, "java/io/FilterOutputStream",
-        "PrintStream should extend FilterOutputStream");
+    assert_eq!(
+        &*super_cls.name, "java/io/FilterOutputStream",
+        "PrintStream should extend FilterOutputStream"
+    );
 }
 
 #[test]
@@ -210,7 +213,9 @@ fn io_superclass_chain_byte_buffer() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let bb_id = shared.class_manager.write()
+    let bb_id = shared
+        .class_manager
+        .write()
         .load_class("java/nio/ByteBuffer")
         .expect("should load ByteBuffer");
 
@@ -218,8 +223,10 @@ fn io_superclass_chain_byte_buffer() {
     let bb = cm.get_class(bb_id).expect("BB class");
     let super_id = bb.superclass.expect("BB should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
-    assert_eq!(&*super_cls.name, "java/nio/Buffer",
-        "ByteBuffer should extend Buffer");
+    assert_eq!(
+        &*super_cls.name, "java/nio/Buffer",
+        "ByteBuffer should extend Buffer"
+    );
 }
 
 #[test]
@@ -227,7 +234,9 @@ fn io_superclass_chain_buffered_reader() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let br_id = shared.class_manager.write()
+    let br_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/BufferedReader")
         .expect("should load BufferedReader");
 
@@ -235,8 +244,10 @@ fn io_superclass_chain_buffered_reader() {
     let br = cm.get_class(br_id).expect("BR class");
     let super_id = br.superclass.expect("BR should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
-    assert_eq!(&*super_cls.name, "java/io/Reader",
-        "BufferedReader should extend Reader");
+    assert_eq!(
+        &*super_cls.name, "java/io/Reader",
+        "BufferedReader should extend Reader"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +259,14 @@ fn io_field_count_file_streams() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let fis_id = shared.class_manager.write()
+    let fis_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/FileInputStream")
         .expect("load FIS");
-    let fos_id = shared.class_manager.write()
+    let fos_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/FileOutputStream")
         .expect("load FOS");
 
@@ -260,10 +275,16 @@ fn io_field_count_file_streams() {
     let fos = cm.get_class(fos_id).expect("FOS");
 
     // FileInputStream should have at least 1 field (for fd)
-    assert!(fis.num_total_fields >= 1,
-        "FileInputStream should have >= 1 field, got {}", fis.num_total_fields);
-    assert!(fos.num_total_fields >= 1,
-        "FileOutputStream should have >= 1 field, got {}", fos.num_total_fields);
+    assert!(
+        fis.num_total_fields >= 1,
+        "FileInputStream should have >= 1 field, got {}",
+        fis.num_total_fields
+    );
+    assert!(
+        fos.num_total_fields >= 1,
+        "FileOutputStream should have >= 1 field, got {}",
+        fos.num_total_fields
+    );
 }
 
 #[test]
@@ -271,7 +292,9 @@ fn io_field_count_byte_buffer() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let bb_id = shared.class_manager.write()
+    let bb_id = shared
+        .class_manager
+        .write()
         .load_class("java/nio/ByteBuffer")
         .expect("load ByteBuffer");
 
@@ -279,8 +302,11 @@ fn io_field_count_byte_buffer() {
     let bb = cm.get_class(bb_id).expect("BB");
 
     // ByteBuffer should have 5 own fields + 4 from Buffer parent = 9 total
-    assert!(bb.num_total_fields >= 5,
-        "ByteBuffer should have >= 5 total fields, got {}", bb.num_total_fields);
+    assert!(
+        bb.num_total_fields >= 5,
+        "ByteBuffer should have >= 5 total fields, got {}",
+        bb.num_total_fields
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +318,9 @@ fn io_input_stream_implements_closeable() {
     let vm = test_vm();
     let shared = vm.shared.clone();
 
-    let is_id = shared.class_manager.write()
+    let is_id = shared
+        .class_manager
+        .write()
         .load_class("java/io/InputStream")
         .expect("load InputStream");
 
@@ -301,10 +329,15 @@ fn io_input_stream_implements_closeable() {
 
     // Class.name is Arc<str> post T10.9.C; convert to String at the test
     // boundary so the `contains(&String)` check below stays readable.
-    let iface_names: Vec<String> = is_cls.interfaces.iter()
+    let iface_names: Vec<String> = is_cls
+        .interfaces
+        .iter()
         .filter_map(|&iid| cm.class_store.get(iid).map(|c| c.name.to_string()))
         .collect();
 
-    assert!(iface_names.contains(&"java/io/Closeable".to_string()),
-        "InputStream should implement Closeable, got {:?}", iface_names);
+    assert!(
+        iface_names.contains(&"java/io/Closeable".to_string()),
+        "InputStream should implement Closeable, got {:?}",
+        iface_names
+    );
 }

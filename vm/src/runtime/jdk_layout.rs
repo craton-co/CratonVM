@@ -100,8 +100,7 @@ const MODULES: &[&str] = &[
 
 /// Executables to place in `bin/`.
 const BIN_TOOLS: &[&str] = &[
-    "java", "javac", "javap", "jar", "jcmd", "jstack", "jmap", "jps", "jfr",
-    "jshell",
+    "java", "javac", "javap", "jar", "jcmd", "jstack", "jmap", "jps", "jfr", "jshell",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,10 +230,7 @@ SOURCE=\"{SOURCE}\"\n"
         std::fs::write(lib.join("jvm.cfg"), jvm_cfg)?;
 
         // lib/modules — marker file (real JDKs have a jimage here)
-        std::fs::write(
-            lib.join("modules"),
-            b"CRATONVM_MODULES_MARKER\n",
-        )?;
+        std::fs::write(lib.join("modules"), b"CRATONVM_MODULES_MARKER\n")?;
 
         // lib/security/default.policy
         let default_policy = "\
@@ -473,10 +469,7 @@ mod tests {
                 "line not properly quoted: {line}"
             );
             let inner = &value[1..value.len() - 1];
-            assert!(
-                !inner.is_empty(),
-                "key {key} has empty quoted value"
-            );
+            assert!(!inner.is_empty(), "key {key} has empty quoted value");
         }
     }
 
@@ -495,7 +488,10 @@ mod tests {
         let quoted = line.trim_start_matches("MODULES=");
         let inner = quoted.trim_matches('"');
         // Must contain at least one comma (it is a list).
-        assert!(inner.contains(','), "MODULES must be comma-separated: {line}");
+        assert!(
+            inner.contains(','),
+            "MODULES must be comma-separated: {line}"
+        );
         // Commas must NOT have surrounding spaces (real JDK format).
         assert!(
             !inner.contains(", ") && !inner.contains(" ,"),
@@ -580,8 +576,14 @@ mod tests {
 
         assert!(layout.jdk_home().join("lib/jvm.cfg").exists());
         assert!(layout.jdk_home().join("lib/modules").exists());
-        assert!(layout.jdk_home().join("lib/security/default.policy").exists());
-        assert!(layout.jdk_home().join("conf/security/java.security").exists());
+        assert!(layout
+            .jdk_home()
+            .join("lib/security/default.policy")
+            .exists());
+        assert!(layout
+            .jdk_home()
+            .join("conf/security/java.security")
+            .exists());
     }
 
     #[test]

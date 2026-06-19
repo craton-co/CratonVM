@@ -288,11 +288,13 @@ fn verify_method_typestate(
             // returns `Result` so a malformed StackMapTable whose
             // accumulated offset overflows u16 surfaces as a verify
             // error here instead of silently wrapping.
-            let offsets = table.absolute_offsets().map_err(|e| LinkageError::VerifyError {
-                class_name: class_name.to_string(),
-                method_name: method.name.to_string(),
-                message: format!("StackMapTable absolute_offsets: {e}"),
-            })?;
+            let offsets = table
+                .absolute_offsets()
+                .map_err(|e| LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!("StackMapTable absolute_offsets: {e}"),
+                })?;
             let mut frames = std::collections::HashMap::with_capacity(table.entries.len());
             let mut prev = compact.clone();
             for (i, entry) in table.entries.iter().enumerate() {
@@ -301,9 +303,7 @@ fn verify_method_typestate(
                     LinkageError::VerifyError { message, .. } => LinkageError::VerifyError {
                         class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
-                        message: format!(
-                            "StackMapTable frame {i} at offset {off}: {message}"
-                        ),
+                        message: format!("StackMapTable frame {i} at offset {off}: {message}"),
                     },
                     other => other,
                 })?;
@@ -353,13 +353,13 @@ fn verify_method_typestate(
             if !verified {
                 let mut handler_frame = current.clone();
                 handler_frame.clear_stack();
-                handler_frame.push(catch_type.clone()).map_err(|_| {
-                    LinkageError::VerifyError {
+                handler_frame
+                    .push(catch_type.clone())
+                    .map_err(|_| LinkageError::VerifyError {
                         class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
                         message: format!("exception handler stack overflow at offset {pc}"),
-                    }
-                })?;
+                    })?;
                 current = handler_frame;
             }
         }
@@ -392,16 +392,22 @@ fn verify_method_typestate(
             continue;
         }
 
-        let (insn, next_pc) = Instruction::decode(bytecode, pc).map_err(|e| {
-            LinkageError::VerifyError {
+        let (insn, next_pc) =
+            Instruction::decode(bytecode, pc).map_err(|e| LinkageError::VerifyError {
                 class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
-            }
-        })?;
+            })?;
 
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
+            &insn,
+            pc,
+            &mut current,
+            cp,
+            class_name,
+            &method.name,
+            &method.descriptor,
+            hierarchy,
         )
         .map_err(|e| match e {
             LinkageError::VerifyError {
@@ -512,16 +518,22 @@ fn verify_pre_java7_inference(
             None => continue,
         };
 
-        let (insn, next_pc) = Instruction::decode(bytecode, pc).map_err(|e| {
-            LinkageError::VerifyError {
+        let (insn, next_pc) =
+            Instruction::decode(bytecode, pc).map_err(|e| LinkageError::VerifyError {
                 class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
-            }
-        })?;
+            })?;
 
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
+            &insn,
+            pc,
+            &mut current,
+            cp,
+            class_name,
+            &method.name,
+            &method.descriptor,
+            hierarchy,
         )
         .map_err(|e| match e {
             LinkageError::VerifyError {
@@ -545,7 +557,14 @@ fn verify_pre_java7_inference(
         })?;
 
         if result.falls_through && next_pc < bytecode.len() {
-            if merge_frame_into(&mut frame_at, next_pc, &current, hierarchy, class_name, &method.name)? {
+            if merge_frame_into(
+                &mut frame_at,
+                next_pc,
+                &current,
+                hierarchy,
+                class_name,
+                &method.name,
+            )? {
                 if enqueued.insert(next_pc) {
                     worklist.push(next_pc);
                 }
@@ -565,7 +584,14 @@ fn verify_pre_java7_inference(
                     ),
                 });
             }
-            if merge_frame_into(&mut frame_at, target_pc, &current, hierarchy, class_name, &method.name)? {
+            if merge_frame_into(
+                &mut frame_at,
+                target_pc,
+                &current,
+                hierarchy,
+                class_name,
+                &method.name,
+            )? {
                 if enqueued.insert(target_pc) {
                     worklist.push(target_pc);
                 }
@@ -584,16 +610,16 @@ fn verify_pre_java7_inference(
                 };
                 let mut handler_frame = current.clone();
                 handler_frame.clear_stack();
-                handler_frame.push(catch).map_err(|_| {
-                    LinkageError::VerifyError {
+                handler_frame
+                    .push(catch)
+                    .map_err(|_| LinkageError::VerifyError {
                         class_name: class_name.to_string(),
                         method_name: method.name.to_string(),
                         message: format!(
                             "exception handler stack overflow at handler pc {}",
                             entry.handler_pc
                         ),
-                    }
-                })?;
+                    })?;
                 let handler_pc = entry.handler_pc as usize;
                 if merge_frame_into(
                     &mut frame_at,
@@ -756,13 +782,12 @@ fn verify_method_structural_only(
     // Decode every instruction and collect branch targets.
     let mut pc = 0usize;
     while pc < code_len {
-        let (insn, next_pc) = Instruction::decode(bytecode, pc).map_err(|e| {
-            LinkageError::VerifyError {
+        let (insn, next_pc) =
+            Instruction::decode(bytecode, pc).map_err(|e| LinkageError::VerifyError {
                 class_name: class.name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
-            }
-        })?;
+            })?;
 
         // Enumerate branch targets that this instruction can reach and
         // confirm each one lies inside the code array. We do NOT do
@@ -801,18 +826,14 @@ fn verify_method_structural_only(
             return Err(LinkageError::VerifyError {
                 class_name: class.name.to_string(),
                 method_name: method.name.to_string(),
-                message: format!(
-                    "exception handler range invalid: start_pc={start}, end_pc={end}"
-                ),
+                message: format!("exception handler range invalid: start_pc={start}, end_pc={end}"),
             });
         }
         if end > code_len {
             return Err(LinkageError::VerifyError {
                 class_name: class.name.to_string(),
                 method_name: method.name.to_string(),
-                message: format!(
-                    "exception handler end_pc={end} is past code length {code_len}"
-                ),
+                message: format!("exception handler end_pc={end} is past code length {code_len}"),
             });
         }
         if handler >= code_len {
@@ -1021,9 +1042,7 @@ fn verify_inherited_abstract_methods_implemented(
                         None => break,
                     }
                 };
-                if let Some(found) =
-                    scan_class.find_method(&method.name, &method.descriptor)
-                {
+                if let Some(found) = scan_class.find_method(&method.name, &method.descriptor) {
                     if !found.is_abstract() {
                         implemented = true;
                         break;
@@ -1177,7 +1196,9 @@ fn verify_final_method_constraint(class: &Class, store: &ClassStore) -> Result<(
         if let Some((super_method, _)) =
             find_method_recursive(super_id, &method.name, &method.descriptor, store)
         {
-            if super_method.access_flags.contains(MethodAccessFlags::PRIVATE)
+            if super_method
+                .access_flags
+                .contains(MethodAccessFlags::PRIVATE)
                 || super_method.is_static()
             {
                 continue;
@@ -1278,11 +1299,7 @@ fn verify_interface_methods(class: &Class, store: &ClassStore) -> Result<(), Lin
                 continue;
             }
             // Static and private interface methods don't need implementation
-            if method.is_static()
-                || method
-                    .access_flags
-                    .contains(MethodAccessFlags::PRIVATE)
-            {
+            if method.is_static() || method.access_flags.contains(MethodAccessFlags::PRIVATE) {
                 continue;
             }
             // Skip <init> and <clinit>
@@ -1290,10 +1307,9 @@ fn verify_interface_methods(class: &Class, store: &ClassStore) -> Result<(), Lin
                 continue;
             }
 
-            let has_impl =
-                find_method_recursive(class.id, &method.name, &method.descriptor, store)
-                    .map(|(m, _)| !m.is_abstract())
-                    .unwrap_or(false);
+            let has_impl = find_method_recursive(class.id, &method.name, &method.descriptor, store)
+                .map(|(m, _)| !m.is_abstract())
+                .unwrap_or(false);
 
             if !has_impl {
                 return Err(LinkageError::VerifyError {
@@ -1375,7 +1391,8 @@ mod tests {
             name: Arc::from(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Loaded, initializing_thread: None,
+            state: ClassState::Loaded,
+            initializing_thread: None,
             constant_pool: empty_cp(),
             access_flags: flags,
             superclass,
@@ -1882,10 +1899,10 @@ mod tests {
             vec![
                 0xa8, 0x00, 0x09, // 0: jsr +9
                 0xa8, 0x00, 0x06, // 3: jsr +6
-                0xb1,             // 6: return
-                0x00, 0x00,       // 7..8: nop padding (unreachable)
-                0x4b,             // 9: astore_0
-                0xa9, 0x00,       // 10: ret 0
+                0xb1, // 6: return
+                0x00, 0x00, // 7..8: nop padding (unreachable)
+                0x4b, // 9: astore_0
+                0xa9, 0x00, // 10: ret 0
             ],
             vec![],
         );
@@ -1937,23 +1954,23 @@ mod tests {
         // Build the bytecode array first so we can reference precise
         // offsets in the exception table without juggling magic numbers.
         let code: Vec<u8> = vec![
-            0x01,             // 0: aconst_null
-            0x57,             // 1: pop
+            0x01, // 0: aconst_null
+            0x57, // 1: pop
             0xa8, 0x00, 0x13, // 2: jsr +19  → 21
             0xa7, 0x00, 0x17, // 5: goto +23 → 28
             0x00, 0x00, 0x00, // 8..10: nop
             0x00, 0x00, 0x00, // 11..13: nop
-            0x00,             // 14: nop
-            0x4c,             // 15: astore_1
+            0x00, // 14: nop
+            0x4c, // 15: astore_1
             0xa8, 0x00, 0x05, // 16: jsr +5 → 21
-            0x2b,             // 19: aload_1
-            0xbf,             // 20: athrow
-            0x4d,             // 21: astore_2
-            0x2a,             // 22: aload_0
-            0x57,             // 23: pop
-            0x00, 0x00,       // 24..25: nop
-            0xa9, 0x02,       // 26: ret 2
-            0xb1,             // 28: return
+            0x2b, // 19: aload_1
+            0xbf, // 20: athrow
+            0x4d, // 21: astore_2
+            0x2a, // 22: aload_0
+            0x57, // 23: pop
+            0x00, 0x00, // 24..25: nop
+            0xa9, 0x02, // 26: ret 2
+            0xb1, // 28: return
         ];
         let exc = vec![
             cratonvm_reader::attribute::ExceptionTableEntry {
@@ -1992,7 +2009,7 @@ mod tests {
             1,
             vec![
                 0xa8, 0x7f, 0xff, // jsr +32767 (way past end of method)
-                0xb1,             // return
+                0xb1, // return
             ],
             vec![],
         );
@@ -2050,10 +2067,10 @@ mod tests {
             vec![
                 0xa8, 0x00, 0x09, // 0: jsr +9
                 0xa8, 0x00, 0x06, // 3: jsr +6
-                0xb1,             // 6: return
-                0x00, 0x00,       // 7..8: pad
-                0x4b,             // 9: astore_0
-                0xa9, 0x00,       // 10: ret 0
+                0xb1, // 6: return
+                0x00, 0x00, // 7..8: pad
+                0x4b, // 9: astore_0
+                0xa9, 0x00, // 10: ret 0
             ],
             vec![],
         );
@@ -2092,10 +2109,10 @@ mod tests {
             1,
             vec![
                 0xa8, 0x00, 0x06, // 0: jsr +6 → 6
-                0xb1,             // 3: return
-                0x00, 0x00,       // 4..5: pad
-                0x4b,             // 6: astore_0
-                0xa9, 0x00,       // 7: ret 0
+                0xb1, // 3: return
+                0x00, 0x00, // 4..5: pad
+                0x4b, // 6: astore_0
+                0xa9, 0x00, // 7: ret 0
             ],
             vec![],
         );
@@ -2135,10 +2152,10 @@ mod tests {
             1,
             vec![
                 0xa8, 0x00, 0x06, // 0: jsr +6 → 6
-                0xb1,             // 3: return
-                0x00, 0x00,       // 4..5: pad
-                0x4b,             // 6: astore_0
-                0xa9, 0x00,       // 7: ret 0
+                0xb1, // 3: return
+                0x00, 0x00, // 4..5: pad
+                0x4b, // 6: astore_0
+                0xa9, 0x00, // 7: ret 0
             ],
             vec![],
         );
@@ -2188,8 +2205,8 @@ mod tests {
         let mut code: Vec<u8> = Vec::new();
         code.push(0x03); // 0: iconst_0
         code.push(0xaa); // 1: tableswitch
-        // Pad so default starts at offset (1+1+pad) ≡ 0 mod 4 → next offset must be 4
-        // so we need 2 pad bytes after offset 1
+                         // Pad so default starts at offset (1+1+pad) ≡ 0 mod 4 → next offset must be 4
+                         // so we need 2 pad bytes after offset 1
         code.push(0x00);
         code.push(0x00);
         // 4..7: default

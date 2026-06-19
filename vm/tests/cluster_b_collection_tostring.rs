@@ -45,7 +45,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -143,9 +147,7 @@ fn collection_tostring_matches_hotspot_format() {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!(
-                        "[cluster_b_collection_tostring] CollProbe timed out after {timeout:?}"
-                    );
+                    panic!("[cluster_b_collection_tostring] CollProbe timed out after {timeout:?}");
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -189,10 +191,7 @@ fn collection_tostring_matches_hotspot_format() {
     // bracketed form with both elements.
     assert!(
         stdout.lines().any(|l| {
-            l.starts_with("HashSet=[")
-                && l.ends_with(']')
-                && l.contains('a')
-                && l.contains('b')
+            l.starts_with("HashSet=[") && l.ends_with(']') && l.contains('a') && l.contains('b')
         }),
         "HashSet toString missing or wrong shape.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );

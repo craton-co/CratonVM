@@ -141,198 +141,468 @@ impl UIDefaults {
         let monospaced_plain_12 = ("Monospaced".to_string(), 0, 12);
 
         // ── Button ──────────────────────────────────────────────────────
-        defaults.fonts.insert("Button.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Button.background".into(), theme.control);
-        defaults.colors.insert("Button.foreground".into(), theme.text);
-        defaults.colors.insert("Button.select".into(), theme.control_shadow);
-        defaults.colors.insert("Button.disabledText".into(), theme.secondary1);
-        defaults.colors.insert("Button.focus".into(), theme.primary2);
-        defaults.insets.insert("Button.margin".into(), (2, 14, 2, 14));
+        defaults
+            .fonts
+            .insert("Button.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Button.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("Button.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("Button.select".into(), theme.control_shadow);
+        defaults
+            .colors
+            .insert("Button.disabledText".into(), theme.secondary1);
+        defaults
+            .colors
+            .insert("Button.focus".into(), theme.primary2);
+        defaults
+            .insets
+            .insert("Button.margin".into(), (2, 14, 2, 14));
 
         // ── Label ───────────────────────────────────────────────────────
-        defaults.fonts.insert("Label.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Label.foreground".into(), theme.text);
-        defaults.colors.insert("Label.background".into(), theme.control);
-        defaults.colors.insert("Label.disabledForeground".into(), theme.secondary1);
+        defaults
+            .fonts
+            .insert("Label.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Label.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("Label.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("Label.disabledForeground".into(), theme.secondary1);
 
         // ── TextField ───────────────────────────────────────────────────
-        defaults.fonts.insert("TextField.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("TextField.background".into(), theme.white);
-        defaults.colors.insert("TextField.foreground".into(), theme.text);
-        defaults.colors.insert("TextField.caretForeground".into(), theme.text);
-        defaults.colors.insert("TextField.inactiveBackground".into(), theme.secondary3);
-        defaults.colors.insert("TextField.inactiveForeground".into(), theme.secondary1);
-        defaults.colors.insert("TextField.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("TextField.selectionForeground".into(), theme.text);
-        defaults.insets.insert("TextField.margin".into(), (0, 0, 0, 0));
+        defaults
+            .fonts
+            .insert("TextField.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("TextField.background".into(), theme.white);
+        defaults
+            .colors
+            .insert("TextField.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("TextField.caretForeground".into(), theme.text);
+        defaults
+            .colors
+            .insert("TextField.inactiveBackground".into(), theme.secondary3);
+        defaults
+            .colors
+            .insert("TextField.inactiveForeground".into(), theme.secondary1);
+        defaults
+            .colors
+            .insert("TextField.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("TextField.selectionForeground".into(), theme.text);
+        defaults
+            .insets
+            .insert("TextField.margin".into(), (0, 0, 0, 0));
 
         // ── TextArea ────────────────────────────────────────────────────
-        defaults.fonts.insert("TextArea.font".into(), monospaced_plain_12.clone());
-        defaults.colors.insert("TextArea.background".into(), theme.white);
-        defaults.colors.insert("TextArea.foreground".into(), theme.text);
-        defaults.colors.insert("TextArea.caretForeground".into(), theme.text);
-        defaults.colors.insert("TextArea.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("TextArea.selectionForeground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("TextArea.font".into(), monospaced_plain_12.clone());
+        defaults
+            .colors
+            .insert("TextArea.background".into(), theme.white);
+        defaults
+            .colors
+            .insert("TextArea.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("TextArea.caretForeground".into(), theme.text);
+        defaults
+            .colors
+            .insert("TextArea.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("TextArea.selectionForeground".into(), theme.text);
 
         // ── Table ───────────────────────────────────────────────────────
-        defaults.fonts.insert("Table.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Table.background".into(), theme.white);
-        defaults.colors.insert("Table.foreground".into(), theme.text);
-        defaults.colors.insert("Table.gridColor".into(), theme.secondary2);
-        defaults.colors.insert("Table.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("Table.selectionForeground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("Table.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Table.background".into(), theme.white);
+        defaults
+            .colors
+            .insert("Table.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("Table.gridColor".into(), theme.secondary2);
+        defaults
+            .colors
+            .insert("Table.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("Table.selectionForeground".into(), theme.text);
         defaults.integers.insert("Table.rowHeight".into(), 16);
 
         // ── Tree ────────────────────────────────────────────────────────
-        defaults.fonts.insert("Tree.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Tree.background".into(), theme.white);
+        defaults
+            .fonts
+            .insert("Tree.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Tree.background".into(), theme.white);
         defaults.colors.insert("Tree.foreground".into(), theme.text);
-        defaults.colors.insert("Tree.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("Tree.selectionForeground".into(), theme.text);
+        defaults
+            .colors
+            .insert("Tree.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("Tree.selectionForeground".into(), theme.text);
         defaults.colors.insert("Tree.hash".into(), theme.secondary2);
         defaults.colors.insert("Tree.line".into(), theme.secondary2);
         defaults.integers.insert("Tree.rowHeight".into(), 16);
 
         // ── Panel ───────────────────────────────────────────────────────
-        defaults.fonts.insert("Panel.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Panel.background".into(), theme.control);
-        defaults.colors.insert("Panel.foreground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("Panel.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Panel.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("Panel.foreground".into(), theme.text);
 
         // ── OptionPane ──────────────────────────────────────────────────
-        defaults.fonts.insert("OptionPane.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("OptionPane.background".into(), theme.control);
-        defaults.colors.insert("OptionPane.messageForeground".into(), theme.text);
-        defaults.fonts.insert("OptionPane.messageFont".into(), dialog_plain_12.clone());
-        defaults.fonts.insert("OptionPane.buttonFont".into(), dialog_plain_12.clone());
+        defaults
+            .fonts
+            .insert("OptionPane.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("OptionPane.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("OptionPane.messageForeground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("OptionPane.messageFont".into(), dialog_plain_12.clone());
+        defaults
+            .fonts
+            .insert("OptionPane.buttonFont".into(), dialog_plain_12.clone());
 
         // ── ScrollPane / ScrollBar ──────────────────────────────────────
-        defaults.colors.insert("ScrollPane.background".into(), theme.control);
-        defaults.colors.insert("ScrollBar.background".into(), theme.secondary3);
-        defaults.colors.insert("ScrollBar.thumb".into(), theme.primary2);
-        defaults.colors.insert("ScrollBar.thumbShadow".into(), theme.primary1);
-        defaults.colors.insert("ScrollBar.thumbHighlight".into(), theme.primary3);
-        defaults.colors.insert("ScrollBar.track".into(), theme.secondary3);
+        defaults
+            .colors
+            .insert("ScrollPane.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("ScrollBar.background".into(), theme.secondary3);
+        defaults
+            .colors
+            .insert("ScrollBar.thumb".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("ScrollBar.thumbShadow".into(), theme.primary1);
+        defaults
+            .colors
+            .insert("ScrollBar.thumbHighlight".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("ScrollBar.track".into(), theme.secondary3);
         defaults.integers.insert("ScrollBar.width".into(), 17);
 
         // ── Menu / MenuBar / MenuItem ───────────────────────────────────
-        defaults.fonts.insert("Menu.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Menu.background".into(), theme.menu_background);
-        defaults.colors.insert("Menu.foreground".into(), theme.menu_foreground);
-        defaults.colors.insert("Menu.selectionBackground".into(), theme.menu_selected_background);
-        defaults.colors.insert("Menu.selectionForeground".into(), theme.menu_selected_foreground);
-        defaults.colors.insert("Menu.acceleratorForeground".into(), theme.accelerator_foreground);
-        defaults.colors.insert("MenuBar.background".into(), theme.menu_background);
-        defaults.colors.insert("MenuBar.foreground".into(), theme.menu_foreground);
-        defaults.fonts.insert("MenuBar.font".into(), dialog_plain_12.clone());
-        defaults.fonts.insert("MenuItem.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("MenuItem.background".into(), theme.menu_background);
-        defaults.colors.insert("MenuItem.foreground".into(), theme.menu_foreground);
-        defaults.colors.insert("MenuItem.selectionBackground".into(), theme.menu_selected_background);
-        defaults.colors.insert("MenuItem.selectionForeground".into(), theme.menu_selected_foreground);
-        defaults.colors.insert("MenuItem.acceleratorForeground".into(), theme.accelerator_foreground);
+        defaults
+            .fonts
+            .insert("Menu.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Menu.background".into(), theme.menu_background);
+        defaults
+            .colors
+            .insert("Menu.foreground".into(), theme.menu_foreground);
+        defaults.colors.insert(
+            "Menu.selectionBackground".into(),
+            theme.menu_selected_background,
+        );
+        defaults.colors.insert(
+            "Menu.selectionForeground".into(),
+            theme.menu_selected_foreground,
+        );
+        defaults.colors.insert(
+            "Menu.acceleratorForeground".into(),
+            theme.accelerator_foreground,
+        );
+        defaults
+            .colors
+            .insert("MenuBar.background".into(), theme.menu_background);
+        defaults
+            .colors
+            .insert("MenuBar.foreground".into(), theme.menu_foreground);
+        defaults
+            .fonts
+            .insert("MenuBar.font".into(), dialog_plain_12.clone());
+        defaults
+            .fonts
+            .insert("MenuItem.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("MenuItem.background".into(), theme.menu_background);
+        defaults
+            .colors
+            .insert("MenuItem.foreground".into(), theme.menu_foreground);
+        defaults.colors.insert(
+            "MenuItem.selectionBackground".into(),
+            theme.menu_selected_background,
+        );
+        defaults.colors.insert(
+            "MenuItem.selectionForeground".into(),
+            theme.menu_selected_foreground,
+        );
+        defaults.colors.insert(
+            "MenuItem.acceleratorForeground".into(),
+            theme.accelerator_foreground,
+        );
 
         // ── FileChooser ─────────────────────────────────────────────────
-        defaults.colors.insert("FileChooser.detailsViewIcon".into(), theme.primary2);
-        defaults.colors.insert("FileChooser.homeFolderIcon".into(), theme.primary2);
-        defaults.colors.insert("FileChooser.listViewIcon".into(), theme.primary2);
-        defaults.colors.insert("FileChooser.newFolderIcon".into(), theme.primary2);
-        defaults.colors.insert("FileChooser.upFolderIcon".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("FileChooser.detailsViewIcon".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("FileChooser.homeFolderIcon".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("FileChooser.listViewIcon".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("FileChooser.newFolderIcon".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("FileChooser.upFolderIcon".into(), theme.primary2);
 
         // ── TabbedPane ──────────────────────────────────────────────────
-        defaults.fonts.insert("TabbedPane.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("TabbedPane.background".into(), theme.control);
-        defaults.colors.insert("TabbedPane.foreground".into(), theme.text);
-        defaults.colors.insert("TabbedPane.selected".into(), theme.primary3);
-        defaults.colors.insert("TabbedPane.highlight".into(), theme.control_highlight);
-        defaults.colors.insert("TabbedPane.shadow".into(), theme.control_shadow);
-        defaults.insets.insert("TabbedPane.tabInsets".into(), (0, 4, 1, 4));
-        defaults.insets.insert("TabbedPane.contentBorderInsets".into(), (2, 2, 3, 3));
+        defaults
+            .fonts
+            .insert("TabbedPane.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("TabbedPane.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("TabbedPane.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("TabbedPane.selected".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("TabbedPane.highlight".into(), theme.control_highlight);
+        defaults
+            .colors
+            .insert("TabbedPane.shadow".into(), theme.control_shadow);
+        defaults
+            .insets
+            .insert("TabbedPane.tabInsets".into(), (0, 4, 1, 4));
+        defaults
+            .insets
+            .insert("TabbedPane.contentBorderInsets".into(), (2, 2, 3, 3));
 
         // ── CheckBox ────────────────────────────────────────────────────
-        defaults.fonts.insert("CheckBox.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("CheckBox.background".into(), theme.control);
-        defaults.colors.insert("CheckBox.foreground".into(), theme.text);
-        defaults.colors.insert("CheckBox.focus".into(), theme.primary2);
+        defaults
+            .fonts
+            .insert("CheckBox.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("CheckBox.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("CheckBox.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("CheckBox.focus".into(), theme.primary2);
 
         // ── ComboBox ────────────────────────────────────────────────────
-        defaults.fonts.insert("ComboBox.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("ComboBox.background".into(), theme.white);
-        defaults.colors.insert("ComboBox.foreground".into(), theme.text);
-        defaults.colors.insert("ComboBox.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("ComboBox.selectionForeground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("ComboBox.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("ComboBox.background".into(), theme.white);
+        defaults
+            .colors
+            .insert("ComboBox.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("ComboBox.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("ComboBox.selectionForeground".into(), theme.text);
 
         // ── Spinner ─────────────────────────────────────────────────────
-        defaults.fonts.insert("Spinner.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("Spinner.background".into(), theme.secondary3);
-        defaults.colors.insert("Spinner.foreground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("Spinner.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("Spinner.background".into(), theme.secondary3);
+        defaults
+            .colors
+            .insert("Spinner.foreground".into(), theme.text);
 
         // ── Slider ──────────────────────────────────────────────────────
-        defaults.fonts.insert("Slider.font".into(), dialog_plain_10.clone());
-        defaults.colors.insert("Slider.background".into(), theme.control);
-        defaults.colors.insert("Slider.foreground".into(), theme.primary2);
-        defaults.colors.insert("Slider.focus".into(), theme.primary2);
+        defaults
+            .fonts
+            .insert("Slider.font".into(), dialog_plain_10.clone());
+        defaults
+            .colors
+            .insert("Slider.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("Slider.foreground".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("Slider.focus".into(), theme.primary2);
 
         // ── ProgressBar ─────────────────────────────────────────────────
-        defaults.fonts.insert("ProgressBar.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("ProgressBar.background".into(), theme.secondary3);
-        defaults.colors.insert("ProgressBar.foreground".into(), theme.primary2);
-        defaults.colors.insert("ProgressBar.selectionBackground".into(), theme.primary1);
-        defaults.colors.insert("ProgressBar.selectionForeground".into(), theme.secondary3);
+        defaults
+            .fonts
+            .insert("ProgressBar.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("ProgressBar.background".into(), theme.secondary3);
+        defaults
+            .colors
+            .insert("ProgressBar.foreground".into(), theme.primary2);
+        defaults
+            .colors
+            .insert("ProgressBar.selectionBackground".into(), theme.primary1);
+        defaults
+            .colors
+            .insert("ProgressBar.selectionForeground".into(), theme.secondary3);
 
         // ── TitledBorder ────────────────────────────────────────────────
-        defaults.fonts.insert("TitledBorder.font".into(), dialog_bold_12.clone());
-        defaults.colors.insert("TitledBorder.titleColor".into(), theme.primary1);
+        defaults
+            .fonts
+            .insert("TitledBorder.font".into(), dialog_bold_12.clone());
+        defaults
+            .colors
+            .insert("TitledBorder.titleColor".into(), theme.primary1);
 
         // ── ToolTip ─────────────────────────────────────────────────────
-        defaults.fonts.insert("ToolTip.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("ToolTip.background".into(), 0xFFFFFFE1); // light yellow
-        defaults.colors.insert("ToolTip.foreground".into(), theme.text);
+        defaults
+            .fonts
+            .insert("ToolTip.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("ToolTip.background".into(), 0xFFFFFFE1); // light yellow
+        defaults
+            .colors
+            .insert("ToolTip.foreground".into(), theme.text);
 
         // ── List ────────────────────────────────────────────────────────
-        defaults.fonts.insert("List.font".into(), dialog_plain_12.clone());
-        defaults.colors.insert("List.background".into(), theme.white);
+        defaults
+            .fonts
+            .insert("List.font".into(), dialog_plain_12.clone());
+        defaults
+            .colors
+            .insert("List.background".into(), theme.white);
         defaults.colors.insert("List.foreground".into(), theme.text);
-        defaults.colors.insert("List.selectionBackground".into(), theme.primary3);
-        defaults.colors.insert("List.selectionForeground".into(), theme.text);
+        defaults
+            .colors
+            .insert("List.selectionBackground".into(), theme.primary3);
+        defaults
+            .colors
+            .insert("List.selectionForeground".into(), theme.text);
 
         // ── EditorPane / TextPane ───────────────────────────────────────
-        defaults.fonts.insert("EditorPane.font".into(), dialog_plain_12.clone());
-        defaults.fonts.insert("TextPane.font".into(), dialog_plain_12.clone());
+        defaults
+            .fonts
+            .insert("EditorPane.font".into(), dialog_plain_12.clone());
+        defaults
+            .fonts
+            .insert("TextPane.font".into(), dialog_plain_12.clone());
 
         // ── ToolBar ─────────────────────────────────────────────────────
-        defaults.colors.insert("ToolBar.background".into(), theme.control);
-        defaults.colors.insert("ToolBar.foreground".into(), theme.text);
+        defaults
+            .colors
+            .insert("ToolBar.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("ToolBar.foreground".into(), theme.text);
 
         // ── SplitPane ───────────────────────────────────────────────────
-        defaults.colors.insert("SplitPane.background".into(), theme.control);
+        defaults
+            .colors
+            .insert("SplitPane.background".into(), theme.control);
         defaults.integers.insert("SplitPane.dividerSize".into(), 7);
 
         // ── InternalFrame ───────────────────────────────────────────────
-        defaults.colors.insert("InternalFrame.activeTitleBackground".into(), theme.window_title_background);
-        defaults.colors.insert("InternalFrame.activeTitleForeground".into(), theme.window_title_foreground);
-        defaults.colors.insert("InternalFrame.inactiveTitleBackground".into(), theme.secondary3);
-        defaults.colors.insert("InternalFrame.inactiveTitleForeground".into(), theme.secondary1);
+        defaults.colors.insert(
+            "InternalFrame.activeTitleBackground".into(),
+            theme.window_title_background,
+        );
+        defaults.colors.insert(
+            "InternalFrame.activeTitleForeground".into(),
+            theme.window_title_foreground,
+        );
+        defaults.colors.insert(
+            "InternalFrame.inactiveTitleBackground".into(),
+            theme.secondary3,
+        );
+        defaults.colors.insert(
+            "InternalFrame.inactiveTitleForeground".into(),
+            theme.secondary1,
+        );
 
         // ── Global defaults ─────────────────────────────────────────────
         defaults.colors.insert("control".into(), theme.control);
-        defaults.colors.insert("controlShadow".into(), theme.control_shadow);
-        defaults.colors.insert("controlDkShadow".into(), theme.control_dark_shadow);
-        defaults.colors.insert("controlHighlight".into(), theme.control_highlight);
+        defaults
+            .colors
+            .insert("controlShadow".into(), theme.control_shadow);
+        defaults
+            .colors
+            .insert("controlDkShadow".into(), theme.control_dark_shadow);
+        defaults
+            .colors
+            .insert("controlHighlight".into(), theme.control_highlight);
         defaults.colors.insert("text".into(), theme.text);
-        defaults.colors.insert("textHighlight".into(), theme.text_highlight);
-        defaults.colors.insert("window".into(), theme.window_background);
-        defaults.colors.insert("activeCaption".into(), theme.window_title_background);
-        defaults.colors.insert("activeCaptionText".into(), theme.window_title_foreground);
+        defaults
+            .colors
+            .insert("textHighlight".into(), theme.text_highlight);
+        defaults
+            .colors
+            .insert("window".into(), theme.window_background);
+        defaults
+            .colors
+            .insert("activeCaption".into(), theme.window_title_background);
+        defaults
+            .colors
+            .insert("activeCaptionText".into(), theme.window_title_foreground);
 
         // ── Booleans ────────────────────────────────────────────────────
-        defaults.booleans.insert("Button.defaultButtonFollowsFocus".into(), true);
-        defaults.booleans.insert("Table.scrollPaneBorder.allowAutoBorder".into(), true);
+        defaults
+            .booleans
+            .insert("Button.defaultButtonFollowsFocus".into(), true);
+        defaults
+            .booleans
+            .insert("Table.scrollPaneBorder.allowAutoBorder".into(), true);
 
         // ── Dimensions ──────────────────────────────────────────────────
-        defaults.dimensions.insert("Slider.minimumHorizontalSize".into(), (36, 21));
-        defaults.dimensions.insert("Slider.minimumVerticalSize".into(), (21, 36));
-        defaults.dimensions.insert("ProgressBar.horizontalSize".into(), (146, 12));
-        defaults.dimensions.insert("ProgressBar.verticalSize".into(), (12, 146));
+        defaults
+            .dimensions
+            .insert("Slider.minimumHorizontalSize".into(), (36, 21));
+        defaults
+            .dimensions
+            .insert("Slider.minimumVerticalSize".into(), (21, 36));
+        defaults
+            .dimensions
+            .insert("ProgressBar.horizontalSize".into(), (146, 12));
+        defaults
+            .dimensions
+            .insert("ProgressBar.verticalSize".into(), (12, 146));
 
         defaults
     }
@@ -370,11 +640,13 @@ impl UIDefaults {
     }
 
     pub fn put_font(&mut self, key: &str, family: &str, style: i32, size: i32) {
-        self.fonts.insert(key.to_string(), (family.to_string(), style, size));
+        self.fonts
+            .insert(key.to_string(), (family.to_string(), style, size));
     }
 
     pub fn put_insets(&mut self, key: &str, top: i32, left: i32, bottom: i32, right: i32) {
-        self.insets.insert(key.to_string(), (top, left, bottom, right));
+        self.insets
+            .insert(key.to_string(), (top, left, bottom, right));
     }
 
     pub fn put_dimension(&mut self, key: &str, width: i32, height: i32) {
@@ -570,7 +842,10 @@ mod tests {
     #[test]
     fn metal_defaults_has_booleans() {
         let d = UIDefaults::new_metal();
-        assert_eq!(d.get_boolean("Button.defaultButtonFollowsFocus"), Some(true));
+        assert_eq!(
+            d.get_boolean("Button.defaultButtonFollowsFocus"),
+            Some(true)
+        );
     }
 
     #[test]

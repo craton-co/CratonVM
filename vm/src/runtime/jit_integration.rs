@@ -194,7 +194,11 @@ impl CodeCache {
     /// Install a compiled method into the cache. Returns the entry index.
     pub fn install(&mut self, method: CompiledMethodState) -> Result<usize, CodeCacheError> {
         // Check for duplicate
-        if self.entries.iter().any(|e| e.method.method_id == method.method_id) {
+        if self
+            .entries
+            .iter()
+            .any(|e| e.method.method_id == method.method_id)
+        {
             return Err(CodeCacheError::DuplicateMethod(method.method_id));
         }
         let needed = method.code_size;
@@ -238,9 +242,7 @@ impl CodeCache {
         self.entries
             .iter()
             .find(|e| {
-                e.method.is_valid
-                    && e.method.class_name == class
-                    && e.method.method_name == method
+                e.method.is_valid && e.method.class_name == class && e.method.method_name == method
             })
             .map(|e| &e.method)
     }
@@ -518,7 +520,9 @@ impl DeoptimizationManager {
         if self.blacklisted_methods.contains(&method_id) {
             return false;
         }
-        self.recompilation_queue.iter().any(|r| r.method_id == method_id)
+        self.recompilation_queue
+            .iter()
+            .any(|r| r.method_id == method_id)
     }
 
     pub fn is_blacklisted(&self, method_id: u64) -> bool {
@@ -804,7 +808,13 @@ mod tests {
         let mut cache = CodeCache::with_max_size(200);
         cache.install(make_method(1, 150)).unwrap();
         let err = cache.install(make_method(2, 100)).unwrap_err();
-        assert_eq!(err, CodeCacheError::Full { available: 50, needed: 100 });
+        assert_eq!(
+            err,
+            CodeCacheError::Full {
+                available: 50,
+                needed: 100
+            }
+        );
     }
 
     #[test]
@@ -932,7 +942,14 @@ mod tests {
             tier: CompilationTier::C1,
         };
         mgr.register_osr(1, 10, entry.clone());
-        mgr.register_osr(1, 20, OsrEntry { bci: 20, ..entry.clone() });
+        mgr.register_osr(
+            1,
+            20,
+            OsrEntry {
+                bci: 20,
+                ..entry.clone()
+            },
+        );
         mgr.register_osr(2, 10, OsrEntry { bci: 10, ..entry });
         let removed = mgr.remove_osr(1);
         assert_eq!(removed, 2);
@@ -957,9 +974,18 @@ mod tests {
     #[test]
     fn osr_local_mapping_variants() {
         let mappings = vec![
-            OsrLocalMapping { local_index: 0, register_or_stack: OsrLocation::Register(3) },
-            OsrLocalMapping { local_index: 1, register_or_stack: OsrLocation::StackSlot(-8) },
-            OsrLocalMapping { local_index: 2, register_or_stack: OsrLocation::Constant(42) },
+            OsrLocalMapping {
+                local_index: 0,
+                register_or_stack: OsrLocation::Register(3),
+            },
+            OsrLocalMapping {
+                local_index: 1,
+                register_or_stack: OsrLocation::StackSlot(-8),
+            },
+            OsrLocalMapping {
+                local_index: 2,
+                register_or_stack: OsrLocation::Constant(42),
+            },
         ];
         assert_eq!(mappings[0].register_or_stack, OsrLocation::Register(3));
         assert_eq!(mappings[1].register_or_stack, OsrLocation::StackSlot(-8));
@@ -1115,7 +1141,10 @@ mod tests {
         let t = mgr.update(1, 100);
         assert_eq!(
             t,
-            CacheTransition::Transition(InlineCacheState::Uninitialized, InlineCacheState::Monomorphic)
+            CacheTransition::Transition(
+                InlineCacheState::Uninitialized,
+                InlineCacheState::Monomorphic
+            )
         );
     }
 

@@ -298,7 +298,8 @@ impl ModuleRegistry {
         // Step 1 — seed each module's readable set with direct requires
         // and dynamic addReads edges.
         let module_names: Vec<String> = self.modules.keys().cloned().collect();
-        let mut readable: FxHashMap<String, FxHashSet<String>> = FxHashMap::with_capacity_and_hasher(16, Default::default());
+        let mut readable: FxHashMap<String, FxHashSet<String>> =
+            FxHashMap::with_capacity_and_hasher(16, Default::default());
 
         for name in &module_names {
             let set = readable.entry(name.clone()).or_default();
@@ -407,11 +408,8 @@ impl ModuleRegistry {
     /// detecting them is useful for diagnostics and spec conformance testing.
     pub fn detect_cycles(&self) -> Vec<Vec<String>> {
         let names: Vec<&str> = self.modules.keys().map(|s| s.as_str()).collect();
-        let name_to_idx: FxHashMap<&str, usize> = names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (*n, i))
-            .collect();
+        let name_to_idx: FxHashMap<&str, usize> =
+            names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
         let n = names.len();
 
         // Build adjacency list (only real requires, not self/java.base).
@@ -467,7 +465,15 @@ impl ModuleRegistry {
 
         for i in 0..n {
             if !visited[i] {
-                dfs(i, &adj, &mut visited, &mut on_stack, &mut stack, &mut cycles, &names);
+                dfs(
+                    i,
+                    &adj,
+                    &mut visited,
+                    &mut on_stack,
+                    &mut stack,
+                    &mut cycles,
+                    &names,
+                );
             }
         }
 
@@ -678,8 +684,7 @@ impl ModuleRegistry {
         if let Some(extras) = self.extra_opens.get(target_module) {
             for de in extras {
                 if de.package == target_pkg
-                    && (de.to_module.is_none()
-                        || de.to_module.as_deref() == Some(accessor_module))
+                    && (de.to_module.is_none() || de.to_module.as_deref() == Some(accessor_module))
                 {
                     return Ok(());
                 }
@@ -714,13 +719,20 @@ impl ModuleRegistry {
             if desc.is_open {
                 return true;
             }
-            if desc.exports.iter().any(|e| e.package_name == pkg && e.to_modules.is_empty()) {
+            if desc
+                .exports
+                .iter()
+                .any(|e| e.package_name == pkg && e.to_modules.is_empty())
+            {
                 return true;
             }
         }
         // Check dynamic exports (unqualified).
         if let Some(extras) = self.extra_exports.get(module_name) {
-            if extras.iter().any(|de| de.package == pkg && de.to_module.is_none()) {
+            if extras
+                .iter()
+                .any(|de| de.package == pkg && de.to_module.is_none())
+            {
                 return true;
             }
         }
@@ -762,13 +774,20 @@ impl ModuleRegistry {
             if desc.is_open {
                 return true;
             }
-            if desc.opens.iter().any(|o| o.package_name == pkg && o.to_modules.is_empty()) {
+            if desc
+                .opens
+                .iter()
+                .any(|o| o.package_name == pkg && o.to_modules.is_empty())
+            {
                 return true;
             }
         }
         // Check dynamic opens (unqualified).
         if let Some(extras) = self.extra_opens.get(module_name) {
-            if extras.iter().any(|de| de.package == pkg && de.to_module.is_none()) {
+            if extras
+                .iter()
+                .any(|de| de.package == pkg && de.to_module.is_none())
+            {
                 return true;
             }
         }
@@ -868,8 +887,7 @@ impl ModuleRegistry {
 
         // 2. Exports check.
         // If neither module is registered, use open-world assumption → allow.
-        if self.modules.get(accessor_module).is_none()
-            && self.modules.get(target_module).is_none()
+        if self.modules.get(accessor_module).is_none() && self.modules.get(target_module).is_none()
         {
             return Ok(());
         }
@@ -910,20 +928,37 @@ pub fn descriptor_from_module_attribute(
     use cratonvm_reader::attribute::Attribute;
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
-    let (name_index, flags, version_index, requires_raw, exports_raw, opens_raw, uses_raw, provides_raw) =
-        match attr {
-            Attribute::Module {
-                name_index,
-                flags,
-                version_index,
-                requires,
-                exports,
-                opens,
-                uses,
-                provides,
-            } => (name_index, flags, version_index, requires, exports, opens, uses, provides),
-            _ => return None,
-        };
+    let (
+        name_index,
+        flags,
+        version_index,
+        requires_raw,
+        exports_raw,
+        opens_raw,
+        uses_raw,
+        provides_raw,
+    ) = match attr {
+        Attribute::Module {
+            name_index,
+            flags,
+            version_index,
+            requires,
+            exports,
+            opens,
+            uses,
+            provides,
+        } => (
+            name_index,
+            flags,
+            version_index,
+            requires,
+            exports,
+            opens,
+            uses,
+            provides,
+        ),
+        _ => return None,
+    };
 
     let name = cp.get_utf8(*name_index)?.to_string();
 
@@ -1201,8 +1236,12 @@ mod tests {
     #[test]
     fn check_access_unnamed_always_ok() {
         let reg = ModuleRegistry::new();
-        assert!(reg.check_module_access(UNNAMED_MODULE, "java.base", "java/lang").is_ok());
-        assert!(reg.check_module_access("java.base", UNNAMED_MODULE, "java/lang").is_ok());
+        assert!(reg
+            .check_module_access(UNNAMED_MODULE, "java.base", "java/lang")
+            .is_ok());
+        assert!(reg
+            .check_module_access("java.base", UNNAMED_MODULE, "java/lang")
+            .is_ok());
     }
 
     #[test]
@@ -1437,7 +1476,11 @@ mod tests {
         let mut reg = ModuleRegistry::new();
         reg.register(
             sample_desc("java.base"),
-            vec!["java/lang".to_string(), "java/util".to_string(), "java/io".to_string()],
+            vec![
+                "java/lang".to_string(),
+                "java/util".to_string(),
+                "java/io".to_string(),
+            ],
         );
         reg.register(sample_desc("modB"), vec!["com/b".to_string()]);
 
@@ -1537,7 +1580,9 @@ mod tests {
     #[test]
     fn deep_reflection_same_module_ok() {
         let reg = ModuleRegistry::new();
-        assert!(reg.check_deep_reflection_access("modA", "modA", "com/foo").is_ok());
+        assert!(reg
+            .check_deep_reflection_access("modA", "modA", "com/foo")
+            .is_ok());
     }
 
     #[test]
@@ -1546,8 +1591,12 @@ mod tests {
         // reflection into it always succeeds regardless of accessor.
         let mut reg = ModuleRegistry::new();
         reg.register(sample_desc("modA"), vec![]);
-        assert!(reg.check_deep_reflection_access("modA", UNNAMED_MODULE, "com/foo").is_ok());
-        assert!(reg.check_deep_reflection_access(UNNAMED_MODULE, UNNAMED_MODULE, "anything").is_ok());
+        assert!(reg
+            .check_deep_reflection_access("modA", UNNAMED_MODULE, "com/foo")
+            .is_ok());
+        assert!(reg
+            .check_deep_reflection_access(UNNAMED_MODULE, UNNAMED_MODULE, "anything")
+            .is_ok());
     }
 
     #[test]
@@ -1560,7 +1609,8 @@ mod tests {
         reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
         reg.build_readability_graph();
         assert!(
-            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret").is_err(),
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
+                .is_err(),
             "unnamed accessor must not bypass strong encapsulation"
         );
     }
@@ -1576,7 +1626,8 @@ mod tests {
         // add_opens with empty target = unqualified = open to all (incl. unnamed)
         reg.add_opens("modA", "com/secret", "");
         assert!(
-            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret").is_ok(),
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
+                .is_ok(),
             "--add-opens should grant unnamed accessor deep access"
         );
     }
@@ -1596,7 +1647,9 @@ mod tests {
         reg.build_readability_graph();
 
         // modA reads modB, but modB does not open com/secret → denied.
-        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_err());
+        assert!(reg
+            .check_deep_reflection_access("modA", "modB", "com/secret")
+            .is_err());
     }
 
     #[test]
@@ -1617,7 +1670,9 @@ mod tests {
         reg.register(desc_b, vec!["com/secret".to_string()]);
         reg.build_readability_graph();
 
-        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_ok());
+        assert!(reg
+            .check_deep_reflection_access("modA", "modB", "com/secret")
+            .is_ok());
     }
 
     #[test]
@@ -1635,11 +1690,15 @@ mod tests {
         reg.build_readability_graph();
 
         // Initially denied.
-        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_err());
+        assert!(reg
+            .check_deep_reflection_access("modA", "modB", "com/secret")
+            .is_err());
 
         // Dynamic addOpens.
         reg.add_opens("modB", "com/secret", "modA");
-        assert!(reg.check_deep_reflection_access("modA", "modB", "com/secret").is_ok());
+        assert!(reg
+            .check_deep_reflection_access("modA", "modB", "com/secret")
+            .is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1661,10 +1720,14 @@ mod tests {
         reg.build_readability_graph();
 
         // modA reads modB, but modB doesn't export com/internal → denied.
-        assert!(reg.check_module_access("modA", "modB", "com/internal").is_err());
+        assert!(reg
+            .check_module_access("modA", "modB", "com/internal")
+            .is_err());
 
         // Dynamic addExports.
         reg.add_exports("modB", "com/internal", "modA");
-        assert!(reg.check_module_access("modA", "modB", "com/internal").is_ok());
+        assert!(reg
+            .check_module_access("modA", "modB", "com/internal")
+            .is_ok());
     }
 }

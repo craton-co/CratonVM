@@ -93,8 +93,7 @@ fn annotation_proxy_class_constant_is_stable() {
 #[test]
 fn annotation_proxy_field_indices_constant() {
     use cratonvm_native_builtins::lang_class::{
-        ANN_PROXY_ELEM_NAMES, ANN_PROXY_ELEM_VALUES, ANN_PROXY_TYPE_DESC,
-        ANN_PROXY_TYPE_MIRROR,
+        ANN_PROXY_ELEM_NAMES, ANN_PROXY_ELEM_VALUES, ANN_PROXY_TYPE_DESC, ANN_PROXY_TYPE_MIRROR,
     };
     assert_eq!(ANN_PROXY_TYPE_DESC, 0);
     assert_eq!(ANN_PROXY_TYPE_MIRROR, 1);

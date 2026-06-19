@@ -163,8 +163,8 @@ impl InductionVar {
                     return None;
                 }
                 let mag = -stride; // positive magnitude of the (negative) stride
-                //   Le: runs while iv >  bound → span = init - bound
-                //   Lt: runs while iv >= bound → span = init - bound + 1
+                                   //   Le: runs while iv >  bound → span = init - bound
+                                   //   Lt: runs while iv >= bound → span = init - bound + 1
                 if init < bound {
                     return Some(0); // already past the (lower) bound at entry
                 }
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(ivs.len(), 1);
         assert_eq!(ivs[0].stride, -1);
         assert_eq!(ivs[0].cmp, Some(ExitCmp::Le)); // if_icmple decoded
-        // init is None (set before the loop) → trip_count unknown.
+                                                   // init is None (set before the loop) → trip_count unknown.
         assert_eq!(ivs[0].trip_count(), None);
         // With a known init, the decreasing-loop count is now computed
         // correctly (the old code could not handle negative strides at all).

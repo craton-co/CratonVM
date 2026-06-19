@@ -294,7 +294,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         if std::env::var_os("CRATONVM_DBG_SHADOW_DEPTH").is_some() {
             let d = thread.shadow_stack.depth();
             if d > 0 {
-                eprintln!("[SHADOW_DEPTH] tid={:?} depth={} pin={}", thread.thread_id, d, pin);
+                eprintln!(
+                    "[SHADOW_DEPTH] tid={:?} depth={} pin={}",
+                    thread.thread_id, d, pin
+                );
             }
         }
         thread.shadow_stack.for_each_value(|v| {
@@ -526,10 +529,9 @@ mod tests {
     #[test]
     fn conservative_jit_root_scan_finds_spilled_object() {
         let shared = test_shared_vm();
-        let obj = shared.heap.alloc_object(
-            crate::classloading::ClassId::new(0),
-            0,
-        );
+        let obj = shared
+            .heap
+            .alloc_object(crate::classloading::ClassId::new(0), 0);
         let thread = JvmThread::new(ThreadId(0), "test");
 
         // Place the object's address into a stack-allocated slot. The
@@ -557,7 +559,10 @@ mod tests {
             "conservative JIT root scan must report the spilled object as a root \
              (heap addr = {:#x}, roots = {:?})",
             obj.as_ptr() as usize,
-            roots.iter().map(|r| r.as_ptr() as usize).collect::<Vec<_>>()
+            roots
+                .iter()
+                .map(|r| r.as_ptr() as usize)
+                .collect::<Vec<_>>()
         );
         // Hint to the compiler that spill_slot is still live at this point
         // — otherwise it might be reused by an earlier register before the
@@ -571,10 +576,9 @@ mod tests {
     #[test]
     fn conservative_jit_root_scan_skips_inactive_threads() {
         let shared = test_shared_vm();
-        let obj = shared.heap.alloc_object(
-            crate::classloading::ClassId::new(0),
-            0,
-        );
+        let obj = shared
+            .heap
+            .alloc_object(crate::classloading::ClassId::new(0), 0);
         let thread = JvmThread::new(ThreadId(0), "test");
 
         let mut spill_slot: usize = obj.as_ptr() as usize;
@@ -596,10 +600,7 @@ mod tests {
         let depth_before = cratonvm_gc::gc_quiescence::depth();
         {
             let _g = crate::jit::conservative_roots::JitEntryGuard::enter();
-            assert_eq!(
-                cratonvm_gc::gc_quiescence::depth(),
-                depth_before + 1
-            );
+            assert_eq!(cratonvm_gc::gc_quiescence::depth(), depth_before + 1);
             assert!(cratonvm_gc::gc_quiescence::is_active());
         }
         assert_eq!(cratonvm_gc::gc_quiescence::depth(), depth_before);

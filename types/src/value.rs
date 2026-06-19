@@ -526,9 +526,7 @@ mod tests {
         let (val, tag) = encode_value(Value::Object(Some(obj)));
         assert!(is_object_tag(tag));
         let decoded = decode_value(val, tag);
-        assert!(
-            matches!(decoded, Value::Object(Some(r)) if r.as_ptr() as u64 == 0x1234_5678_ABC0)
-        );
+        assert!(matches!(decoded, Value::Object(Some(r)) if r.as_ptr() as u64 == 0x1234_5678_ABC0));
     }
 
     #[test]
@@ -542,10 +540,7 @@ mod tests {
         // T14 graceful degradation: a VTAG_OBJECT tag paired with a null
         // pointer is treated as Value::Object(None) rather than panicking,
         // so corrupted or zero-initialized slots don't crash the VM.
-        assert!(matches!(
-            decode_value(0, VTAG_OBJECT),
-            Value::Object(None)
-        ));
+        assert!(matches!(decode_value(0, VTAG_OBJECT), Value::Object(None)));
     }
 
     #[test]
@@ -572,7 +567,10 @@ mod tests {
         // Null pointer with VTAG_OBJECT → degrade.
         assert!(matches!(decode_value(0, VTAG_OBJECT), Value::Object(None)));
         // Unaligned non-null pointer with VTAG_OBJECT → degrade.
-        assert!(matches!(decode_value(0x1001, VTAG_OBJECT), Value::Object(None)));
+        assert!(matches!(
+            decode_value(0x1001, VTAG_OBJECT),
+            Value::Object(None)
+        ));
         assert!(
             object_degradation_count() >= 2,
             "expected at least 2 degradations recorded, got {}",

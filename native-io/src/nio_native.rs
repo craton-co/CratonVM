@@ -124,7 +124,9 @@ fn native_fd_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // so a handle lands in the off-heap store instead of being memcpy'd raw
     // (which SIGSEGVs, same as the socket path did). `n <= len` bounds it.
     if !ctx.copy_to_native_memory(addr, &buf[..n]) {
-        return Err(io_error(format!("read0: invalid destination address {addr:#x}")));
+        return Err(io_error(format!(
+            "read0: invalid destination address {addr:#x}"
+        )));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -154,7 +156,9 @@ fn native_fd_pread0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
     // Route through the context — `addr` may be an arena handle (see read0).
     if !ctx.copy_to_native_memory(addr, &buf[..n]) {
-        return Err(io_error(format!("pread0: invalid destination address {addr:#x}")));
+        return Err(io_error(format!(
+            "pread0: invalid destination address {addr:#x}"
+        )));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -179,7 +183,9 @@ fn native_fd_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // so a handle is read from the off-heap store instead of dereferenced raw
     // (a raw memcpy from the synthetic handle SIGSEGVs).
     if !ctx.copy_from_native_memory(addr, &mut buf) {
-        return Err(io_error(format!("write0: invalid source address {addr:#x}")));
+        return Err(io_error(format!(
+            "write0: invalid source address {addr:#x}"
+        )));
     }
     ctx.fd_table()
         .write_bytes(fd, &buf)
@@ -204,7 +210,9 @@ fn native_fd_pwrite0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let mut buf = vec![0u8; len];
     // Route through the context — `addr` may be an arena handle (see write0).
     if !ctx.copy_from_native_memory(addr, &mut buf) {
-        return Err(io_error(format!("pwrite0: invalid source address {addr:#x}")));
+        return Err(io_error(format!(
+            "pwrite0: invalid source address {addr:#x}"
+        )));
     }
     let n = ctx
         .fd_table()
@@ -806,28 +814,112 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/WindowsFileDispatcherImpl",
         "sun/nio/ch/UnixFileDispatcherImpl",
     ] {
-        r.register(cls, "read0", "(Ljava/io/FileDescriptor;JI)I", native_fd_read0);
-        r.register(cls, "pread0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pread0);
-        r.register(cls, "readv0", "(Ljava/io/FileDescriptor;JI)J", native_fd_readv0);
-        r.register(cls, "write0", "(Ljava/io/FileDescriptor;JIZ)I", native_fd_write0);
-        r.register(cls, "write0", "(Ljava/io/FileDescriptor;JI)I", native_fd_write0);
-        r.register(cls, "pwrite0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pwrite0);
-        r.register(cls, "writev0", "(Ljava/io/FileDescriptor;JIZ)J", native_fd_writev0);
-        r.register(cls, "writev0", "(Ljava/io/FileDescriptor;JI)J", native_fd_writev0);
+        r.register(
+            cls,
+            "read0",
+            "(Ljava/io/FileDescriptor;JI)I",
+            native_fd_read0,
+        );
+        r.register(
+            cls,
+            "pread0",
+            "(Ljava/io/FileDescriptor;JIJ)I",
+            native_fd_pread0,
+        );
+        r.register(
+            cls,
+            "readv0",
+            "(Ljava/io/FileDescriptor;JI)J",
+            native_fd_readv0,
+        );
+        r.register(
+            cls,
+            "write0",
+            "(Ljava/io/FileDescriptor;JIZ)I",
+            native_fd_write0,
+        );
+        r.register(
+            cls,
+            "write0",
+            "(Ljava/io/FileDescriptor;JI)I",
+            native_fd_write0,
+        );
+        r.register(
+            cls,
+            "pwrite0",
+            "(Ljava/io/FileDescriptor;JIJ)I",
+            native_fd_pwrite0,
+        );
+        r.register(
+            cls,
+            "writev0",
+            "(Ljava/io/FileDescriptor;JIZ)J",
+            native_fd_writev0,
+        );
+        r.register(
+            cls,
+            "writev0",
+            "(Ljava/io/FileDescriptor;JI)J",
+            native_fd_writev0,
+        );
         r.register(cls, "size0", "(Ljava/io/FileDescriptor;)J", native_fd_size0);
-        r.register(cls, "seek0", "(Ljava/io/FileDescriptor;J)J", native_fd_seek0);
+        r.register(
+            cls,
+            "seek0",
+            "(Ljava/io/FileDescriptor;J)J",
+            native_fd_seek0,
+        );
         // `force0` is registered by `file_channel.rs::register_file_channel_real`
         // (real fsync via `std::fs::File::sync_all` / `sync_data`).
-        r.register(cls, "truncate0", "(Ljava/io/FileDescriptor;J)I", native_fd_truncate0);
-        r.register(cls, "available0", "(Ljava/io/FileDescriptor;)I", native_fd_available0);
-        r.register(cls, "isOther0", "(Ljava/io/FileDescriptor;)Z", native_fd_isother0);
-        r.register(cls, "close0", "(Ljava/io/FileDescriptor;)V", native_fd_close0);
-        r.register(cls, "preClose0", "(Ljava/io/FileDescriptor;)V", native_fd_preclose0);
-        r.register(cls, "lock0", "(Ljava/io/FileDescriptor;ZJJZ)I", native_fd_lock0);
-        r.register(cls, "release0", "(Ljava/io/FileDescriptor;JJ)V", native_fd_release0);
+        r.register(
+            cls,
+            "truncate0",
+            "(Ljava/io/FileDescriptor;J)I",
+            native_fd_truncate0,
+        );
+        r.register(
+            cls,
+            "available0",
+            "(Ljava/io/FileDescriptor;)I",
+            native_fd_available0,
+        );
+        r.register(
+            cls,
+            "isOther0",
+            "(Ljava/io/FileDescriptor;)Z",
+            native_fd_isother0,
+        );
+        r.register(
+            cls,
+            "close0",
+            "(Ljava/io/FileDescriptor;)V",
+            native_fd_close0,
+        );
+        r.register(
+            cls,
+            "preClose0",
+            "(Ljava/io/FileDescriptor;)V",
+            native_fd_preclose0,
+        );
+        r.register(
+            cls,
+            "lock0",
+            "(Ljava/io/FileDescriptor;ZJJZ)I",
+            native_fd_lock0,
+        );
+        r.register(
+            cls,
+            "release0",
+            "(Ljava/io/FileDescriptor;JJ)V",
+            native_fd_release0,
+        );
         r.register(cls, "duplicateHandle", "(J)J", native_fd_duplicate_handle);
-        r.register(cls, "setDirect0", "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
-                   native_fd_setdirect0);
+        r.register(
+            cls,
+            "setDirect0",
+            "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
+            native_fd_setdirect0,
+        );
         r.register(cls, "init", "()V", native_nt_init);
         // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0
         // are registered by `file_channel.rs::register_file_channel_real`
@@ -835,7 +927,12 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         // previously stubbed here and the duplicate registration was
         // fragile — order-of-registration decided which won. Only
         // `allocationGranularity0` (a pure constant) is owned here.
-        r.register(cls, "allocationGranularity0", "()J", native_fc_allocation_granularity0);
+        r.register(
+            cls,
+            "allocationGranularity0",
+            "()J",
+            native_fc_allocation_granularity0,
+        );
     }
 
     // --- FileChannelImpl (legacy names for older JDKs that carried the
@@ -845,8 +942,18 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // `allocationGranularity0` and `initIDs` remain — none of those
     // have a "real" counterpart and they are otherwise harmless.
     let fci = "sun/nio/ch/FileChannelImpl";
-    r.register(fci, "position0", "(Ljava/io/FileDescriptor;J)J", native_fc_position0);
-    r.register(fci, "allocationGranularity0", "()J", native_fc_allocation_granularity0);
+    r.register(
+        fci,
+        "position0",
+        "(Ljava/io/FileDescriptor;J)J",
+        native_fc_position0,
+    );
+    r.register(
+        fci,
+        "allocationGranularity0",
+        "()J",
+        native_fc_allocation_granularity0,
+    );
     r.register(fci, "initIDs", "()J", |_c, _a| Ok(Some(Value::Long(65536))));
 
     // --- NativeThread ---
@@ -940,7 +1047,11 @@ fn udp_remove(id: i32) {
 /// the synthetic field layout. Tolerates classes that don't appear in the
 /// bootstrap classloader — falls back to `ClassId::new(0)` with the
 /// explicit field count.
-fn alloc_t16(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> cratonvm_types::ObjectRef {
+fn alloc_t16(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    nfields: usize,
+) -> cratonvm_types::ObjectRef {
     match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => ctx.alloc_object(cid, nfields),
         Err(_) => ctx.alloc_object(ClassId::new(0), nfields),
@@ -1010,7 +1121,9 @@ fn t16_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             // toggle on a long-lived AFC — incorrectly reject a path
             // that was legitimate at open time. We deliberately do not
             // call `validate_path` here.
-            let sz = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+            let sz = std::fs::metadata(&path)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
             Ok(Some(Value::Long(sz)))
         }
         _ => Ok(Some(Value::Long(0))),
@@ -1121,11 +1234,11 @@ fn t16_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
         }
         Err(_) => (0, -1),
     };
-    ctx.set_field(ch, 0, Value::Int(port));     // port
-    ctx.set_field(ch, 1, Value::Int(1));        // open
-    ctx.set_field(ch, 2, Value::Int(0));        // not connected
-    ctx.set_field(ch, 3, Value::Int(1));        // blocking = true (JDK default)
-    ctx.set_field(ch, 4, Value::Int(sock_id));  // sock_id into udp_registry
+    ctx.set_field(ch, 0, Value::Int(port)); // port
+    ctx.set_field(ch, 1, Value::Int(1)); // open
+    ctx.set_field(ch, 2, Value::Int(0)); // not connected
+    ctx.set_field(ch, 3, Value::Int(1)); // blocking = true (JDK default)
+    ctx.set_field(ch, 4, Value::Int(sock_id)); // sock_id into udp_registry
     Ok(Some(Value::Object(Some(ch))))
 }
 
@@ -1282,7 +1395,12 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
 
     // AsynchronousSocketChannel
     let asc = "java/nio/channels/AsynchronousSocketChannel";
-    r.register(asc, "open", "()Ljava/nio/channels/AsynchronousSocketChannel;", t16_asc_open);
+    r.register(
+        asc,
+        "open",
+        "()Ljava/nio/channels/AsynchronousSocketChannel;",
+        t16_asc_open,
+    );
     r.register(
         asc,
         "open",
@@ -1329,7 +1447,12 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     {
         let dc = "java/nio/channels/DatagramChannel";
         r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-        r.register(dc, "open", "()Ljava/nio/channels/DatagramChannel;", t16_dc_open);
+        r.register(
+            dc,
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;",
+            t16_dc_open,
+        );
         r.register(dc, "isOpen", "()Z", t16_dc_is_open);
         r.register(dc, "isConnected", "()Z", t16_dc_is_connected);
         r.register(dc, "isBlocking", "()Z", t16_dc_is_blocking);
@@ -1389,4 +1512,3 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     crate::net::register_sun_nio_ch_net(r);
     r.set_category(__prev_cat);
 }
-

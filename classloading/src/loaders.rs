@@ -13,11 +13,7 @@
 
 #![cfg_attr(
     not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-    )
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic,)
 )]
 
 use crate::class::ClassLoaderId;
@@ -240,6 +236,9 @@ mod tests {
                 ClassLoaderId::Application,
             ]
         );
-        assert_eq!(BUILTIN_LOADER_DELEGATION_CHAIN.len(), MAX_BUILTIN_LOADER_DEPTH);
+        assert_eq!(
+            BUILTIN_LOADER_DELEGATION_CHAIN.len(),
+            MAX_BUILTIN_LOADER_DEPTH
+        );
     }
 }

@@ -695,7 +695,14 @@ mod tests {
         assert_eq!(events.len(), 2);
 
         // Emit one more
-        crate::builtin::emit_class_load_event(&mut fr, "java/lang/Object", "boot", "boot", 3000, 100);
+        crate::builtin::emit_class_load_event(
+            &mut fr,
+            "java/lang/Object",
+            "boot",
+            "boot",
+            3000,
+            100,
+        );
 
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
@@ -719,7 +726,10 @@ mod tests {
         // can't perturb our exact event-count assertions.
         let _g = crate::repository::jfr_test_guard();
         let mut fr = crate::create_flight_recorder();
-        let gc_type_id = fr.type_registry.find_by_name("jdk.GarbageCollection").unwrap();
+        let gc_type_id = fr
+            .type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .unwrap();
 
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("filter-test"));
         fr.start_recording(rid);

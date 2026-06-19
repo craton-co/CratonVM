@@ -74,18 +74,64 @@ bitflags::bitflags! {
 /// Events produced by the native event loop.
 #[derive(Debug, Clone)]
 pub enum PlatformEvent {
-    WindowClose { id: WindowId },
-    WindowResize { id: WindowId, w: u32, h: u32 },
-    WindowExposed { id: WindowId },
-    MousePressed { id: WindowId, x: i32, y: i32, button: u8 },
-    MouseReleased { id: WindowId, x: i32, y: i32, button: u8 },
-    MouseMoved { id: WindowId, x: i32, y: i32 },
-    MouseDragged { id: WindowId, x: i32, y: i32, button: u8 },
-    MouseWheel { id: WindowId, x: i32, y: i32, amount: i32 },
-    KeyPressed { id: WindowId, key_code: u32, char_val: Option<char>, modifiers: KeyModifiers },
-    KeyReleased { id: WindowId, key_code: u32, char_val: Option<char>, modifiers: KeyModifiers },
-    FocusGained { id: WindowId },
-    FocusLost { id: WindowId },
+    WindowClose {
+        id: WindowId,
+    },
+    WindowResize {
+        id: WindowId,
+        w: u32,
+        h: u32,
+    },
+    WindowExposed {
+        id: WindowId,
+    },
+    MousePressed {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        button: u8,
+    },
+    MouseReleased {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        button: u8,
+    },
+    MouseMoved {
+        id: WindowId,
+        x: i32,
+        y: i32,
+    },
+    MouseDragged {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        button: u8,
+    },
+    MouseWheel {
+        id: WindowId,
+        x: i32,
+        y: i32,
+        amount: i32,
+    },
+    KeyPressed {
+        id: WindowId,
+        key_code: u32,
+        char_val: Option<char>,
+        modifiers: KeyModifiers,
+    },
+    KeyReleased {
+        id: WindowId,
+        key_code: u32,
+        char_val: Option<char>,
+        modifiers: KeyModifiers,
+    },
+    FocusGained {
+        id: WindowId,
+    },
+    FocusLost {
+        id: WindowId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +283,5 @@ pub trait PlatformBackend: Send {
     ) -> Option<String>;
 
     /// Show a modal message dialog (info / warning / error / question).
-    fn show_message_dialog(
-        &mut self,
-        title: &str,
-        message: &str,
-        msg_type: MessageDialogType,
-    );
+    fn show_message_dialog(&mut self, title: &str, message: &str, msg_type: MessageDialogType);
 }

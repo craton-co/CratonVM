@@ -62,19 +62,17 @@ pub fn build_jar(dest_jar: &Path, main_class: &str, class_file: &Path) {
     let f = std::fs::File::create(dest_jar)
         .unwrap_or_else(|e| panic!("create {}: {e}", dest_jar.display()));
     let mut zip = zip::ZipWriter::new(f);
-    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
-    let manifest = format!(
-        "Manifest-Version: 1.0\r\nMain-Class: {main_class}\r\n\r\n"
-    );
+    let manifest = format!("Manifest-Version: 1.0\r\nMain-Class: {main_class}\r\n\r\n");
     zip.write_all(manifest.as_bytes()).unwrap();
 
     let entry_name = format!("{main_class}.class");
     zip.start_file(&entry_name, opts).unwrap();
-    let bytes = std::fs::read(class_file)
-        .unwrap_or_else(|e| panic!("read {}: {e}", class_file.display()));
+    let bytes =
+        std::fs::read(class_file).unwrap_or_else(|e| panic!("read {}: {e}", class_file.display()));
     zip.write_all(&bytes).unwrap();
 
     zip.finish().unwrap();

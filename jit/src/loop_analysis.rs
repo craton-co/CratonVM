@@ -471,7 +471,7 @@ mod tests {
         let mut code: Vec<u8> = Vec::new();
         code.push(0x00); // PC 0: nop
         code.push(0xaa); // PC 1: tableswitch opcode
-        // operand begins at (1+1+3)&!3 = 4, so padding = PC 2,3 (2 bytes)
+                         // operand begins at (1+1+3)&!3 = 4, so padding = PC 2,3 (2 bytes)
         code.push(0x00); // PC 2 padding
         code.push(0x00); // PC 3 padding
         code.extend_from_slice(&0i32.to_be_bytes()); // PC 4..8 default

@@ -10,11 +10,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ClassId, ObjectKind, ObjectRef, Value};
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ClassId, ObjectKind, ObjectRef, Value};
 
-use crate::{obj_arg, alloc_concurrent_synthetic};
-use crate::lang_class::{mirror_class_name, mirror_class_id, box_value};
+use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Hoisted descriptor / class-name string constants
@@ -25,27 +25,27 @@ use crate::lang_class::{mirror_class_name, mirror_class_id, box_value};
 // `&'static str` lets callers borrow without allocating on the per-call
 // fast path, and gives the rest of the file a single source of truth for
 // the descriptor character / wrapper-class name mapping.
-const DESC_VOID:    &str = "V";
-const DESC_INT:     &str = "I";
-const DESC_LONG:    &str = "J";
-const DESC_FLOAT:   &str = "F";
-const DESC_DOUBLE:  &str = "D";
+const DESC_VOID: &str = "V";
+const DESC_INT: &str = "I";
+const DESC_LONG: &str = "J";
+const DESC_FLOAT: &str = "F";
+const DESC_DOUBLE: &str = "D";
 const DESC_BOOLEAN: &str = "Z";
-const DESC_BYTE:    &str = "B";
-const DESC_CHAR:    &str = "C";
-const DESC_SHORT:   &str = "S";
-const DESC_REF:     &str = "L";
-const DESC_OBJECT:  &str = "Ljava/lang/Object;";
+const DESC_BYTE: &str = "B";
+const DESC_CHAR: &str = "C";
+const DESC_SHORT: &str = "S";
+const DESC_REF: &str = "L";
+const DESC_OBJECT: &str = "Ljava/lang/Object;";
 
-const NAME_VOID:    &str = "void";
-const NAME_INT:     &str = "int";
-const NAME_LONG:    &str = "long";
-const NAME_FLOAT:   &str = "float";
-const NAME_DOUBLE:  &str = "double";
+const NAME_VOID: &str = "void";
+const NAME_INT: &str = "int";
+const NAME_LONG: &str = "long";
+const NAME_FLOAT: &str = "float";
+const NAME_DOUBLE: &str = "double";
 const NAME_BOOLEAN: &str = "boolean";
-const NAME_BYTE:    &str = "byte";
-const NAME_CHAR:    &str = "char";
-const NAME_SHORT:   &str = "short";
+const NAME_BYTE: &str = "byte";
+const NAME_CHAR: &str = "char";
+const NAME_SHORT: &str = "short";
 
 const DESC_DEFAULT_METHOD: &str = "()V";
 const DESC_DEFAULT_OBJECT_RETURN: &str = "()Ljava/lang/Object;";
@@ -92,7 +92,11 @@ fn vh_field_desc(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Cow<'static, str
 /// that `box_value` expects (e.g. "I", "J", "Ljava/lang/Object;").
 fn vh_type_desc(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Cow<'static, str> {
     let desc = vh_field_desc(ctx, vh);
-    if desc.len() == 1 { desc } else { Cow::Borrowed(DESC_REF) }
+    if desc.len() == 1 {
+        desc
+    } else {
+        Cow::Borrowed(DESC_REF)
+    }
 }
 
 /// Round-7 HIGH-2 fix: caller-side variant of `vh_type_desc` that consumes
@@ -108,22 +112,21 @@ fn vh_type_desc_from_meta(meta: &VarHandleMeta) -> Cow<'static, str> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // VarHandle synthetic field layout (6 fields)
 // ---------------------------------------------------------------------------
 /// VarHandle kind
-const VH_KIND: usize = 0;      // i32: 0=instanceField, 1=staticField, 2=array
+const VH_KIND: usize = 0; // i32: 0=instanceField, 1=staticField, 2=array
 /// Target class name (JVM internal, e.g. "java/lang/Foo")
-const VH_CLASS: usize = 1;     // Object(String)
+const VH_CLASS: usize = 1; // Object(String)
 /// Field name
-const VH_FIELD: usize = 2;     // Object(String)
+const VH_FIELD: usize = 2; // Object(String)
 /// Field descriptor (e.g. "I", "J", "Ljava/lang/String;")
 const VH_FIELD_DESC: usize = 3; // Object(String)
 /// Resolved field index (slot in the object's field array)
 const VH_FIELD_INDEX: usize = 4; // Int
 /// Cached ClassId of the declaring class
-const VH_CLASS_ID: usize = 5;   // Int (ClassId raw)
+const VH_CLASS_ID: usize = 5; // Int (ClassId raw)
 const VH_FIELD_COUNT: usize = 6;
 
 const VH_KIND_INSTANCE: i32 = 0;
@@ -194,8 +197,7 @@ static VH_META_TABLE: std::sync::OnceLock<
     parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>>,
 > = std::sync::OnceLock::new();
 
-fn vh_meta_table()
--> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>> {
+fn vh_meta_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>> {
     VH_META_TABLE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -212,7 +214,10 @@ pub(crate) fn vh_meta_put(ctx: &mut dyn NativeContext, vh: ObjectRef, meta: VarH
     t.insert(key, Arc::new(meta));
 }
 
-pub(crate) fn vh_meta_get(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Option<Arc<VarHandleMeta>> {
+pub(crate) fn vh_meta_get(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<Arc<VarHandleMeta>> {
     let key = ctx.identity_hash_code(vh);
     let t = vh_meta_table().lock();
     // Refcount bump only — no per-field String clone.
@@ -245,15 +250,15 @@ pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: Object
 /// `L<class>;` builder produces an owned `String`.
 fn class_name_to_descriptor(name: &str) -> Cow<'static, str> {
     match name {
-        NAME_VOID    => Cow::Borrowed(DESC_VOID),
-        NAME_INT     => Cow::Borrowed(DESC_INT),
-        NAME_LONG    => Cow::Borrowed(DESC_LONG),
-        NAME_FLOAT   => Cow::Borrowed(DESC_FLOAT),
-        NAME_DOUBLE  => Cow::Borrowed(DESC_DOUBLE),
+        NAME_VOID => Cow::Borrowed(DESC_VOID),
+        NAME_INT => Cow::Borrowed(DESC_INT),
+        NAME_LONG => Cow::Borrowed(DESC_LONG),
+        NAME_FLOAT => Cow::Borrowed(DESC_FLOAT),
+        NAME_DOUBLE => Cow::Borrowed(DESC_DOUBLE),
         NAME_BOOLEAN => Cow::Borrowed(DESC_BOOLEAN),
-        NAME_BYTE    => Cow::Borrowed(DESC_BYTE),
-        NAME_CHAR    => Cow::Borrowed(DESC_CHAR),
-        NAME_SHORT   => Cow::Borrowed(DESC_SHORT),
+        NAME_BYTE => Cow::Borrowed(DESC_BYTE),
+        NAME_CHAR => Cow::Borrowed(DESC_CHAR),
+        NAME_SHORT => Cow::Borrowed(DESC_SHORT),
         _ if name.starts_with('[') => Cow::Owned(name.to_string()), // already descriptor form
         _ => Cow::Owned(format!("L{name};")),
     }
@@ -263,17 +268,17 @@ fn class_name_to_descriptor(name: &str) -> Cow<'static, str> {
 /// "I" → "int", "Ljava/lang/String;" → "java/lang/String", etc.
 fn descriptor_to_class_name(desc: &str) -> Cow<'static, str> {
     match desc {
-        DESC_VOID    => Cow::Borrowed(NAME_VOID),
-        DESC_INT     => Cow::Borrowed(NAME_INT),
-        DESC_LONG    => Cow::Borrowed(NAME_LONG),
-        DESC_FLOAT   => Cow::Borrowed(NAME_FLOAT),
-        DESC_DOUBLE  => Cow::Borrowed(NAME_DOUBLE),
+        DESC_VOID => Cow::Borrowed(NAME_VOID),
+        DESC_INT => Cow::Borrowed(NAME_INT),
+        DESC_LONG => Cow::Borrowed(NAME_LONG),
+        DESC_FLOAT => Cow::Borrowed(NAME_FLOAT),
+        DESC_DOUBLE => Cow::Borrowed(NAME_DOUBLE),
         DESC_BOOLEAN => Cow::Borrowed(NAME_BOOLEAN),
-        DESC_BYTE    => Cow::Borrowed(NAME_BYTE),
-        DESC_CHAR    => Cow::Borrowed(NAME_CHAR),
-        DESC_SHORT   => Cow::Borrowed(NAME_SHORT),
+        DESC_BYTE => Cow::Borrowed(NAME_BYTE),
+        DESC_CHAR => Cow::Borrowed(NAME_CHAR),
+        DESC_SHORT => Cow::Borrowed(NAME_SHORT),
         _ if desc.starts_with('L') && desc.ends_with(';') => {
-            Cow::Owned(desc[1..desc.len()-1].to_string())
+            Cow::Owned(desc[1..desc.len() - 1].to_string())
         }
         _ => Cow::Owned(desc.to_string()),
     }
@@ -375,7 +380,9 @@ pub(crate) fn recover_class_mirror_from_slot(
                 } else {
                     None
                 }
-            } else { None }
+            } else {
+                None
+            }
         }
         Value::Int(i) if i != 0 => {
             // Lower 32 bits of a heap pointer.  Bit-aligned and within 48-bit
@@ -392,7 +399,9 @@ pub(crate) fn recover_class_mirror_from_slot(
                 } else {
                     None
                 }
-            } else { None }
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -407,10 +416,9 @@ fn descriptor_from_method_type(ctx: &dyn NativeContext, mt: ObjectRef) -> String
     if let Value::Object(Some(params_arr)) = ctx.get_field(mt, 1) {
         let len = ctx.array_length(params_arr);
         for i in 0..len {
-            if let Some(param_mirror) = recover_class_mirror_from_slot(
-                ctx,
-                ctx.get_array_element(params_arr, i),
-            ) {
+            if let Some(param_mirror) =
+                recover_class_mirror_from_slot(ctx, ctx.get_array_element(params_arr, i))
+            {
                 desc.push_str(&mirror_to_descriptor(ctx, param_mirror));
             }
         }
@@ -428,7 +436,10 @@ fn descriptor_from_method_type(ctx: &dyn NativeContext, mt: ObjectRef) -> String
 }
 
 /// Build a field descriptor for a single Class mirror (used by findGetter/findSetter).
-fn field_descriptor_from_mirror(ctx: &dyn NativeContext, type_mirror: ObjectRef) -> Cow<'static, str> {
+fn field_descriptor_from_mirror(
+    ctx: &dyn NativeContext,
+    type_mirror: ObjectRef,
+) -> Cow<'static, str> {
     mirror_to_descriptor(ctx, type_mirror)
 }
 
@@ -616,28 +627,24 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 2)))
         },
     );
-    r.register(
-        mn_cls,
-        "getModifiers",
-        "()I",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Modifiers = low 16 bits of flags.
-            let flags = match ctx.get_field(this, 3) { Value::Int(f) => f, _ => 0 };
-            Ok(Some(Value::Int(flags & 0xFFFF)))
-        },
-    );
-    r.register(
-        mn_cls,
-        "getReferenceKind",
-        "()B",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // flags is at declared-slot 3; refKind is the top byte
-            let flags = match ctx.get_field(this, 3) { Value::Int(f) => f, _ => 0 };
-            Ok(Some(Value::Int((flags >> 24) & 0x0F)))
-        },
-    );
+    r.register(mn_cls, "getModifiers", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Modifiers = low 16 bits of flags.
+        let flags = match ctx.get_field(this, 3) {
+            Value::Int(f) => f,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(flags & 0xFFFF)))
+    });
+    r.register(mn_cls, "getReferenceKind", "()B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // flags is at declared-slot 3; refKind is the top byte
+        let flags = match ctx.get_field(this, 3) {
+            Value::Int(f) => f,
+            _ => 0,
+        };
+        Ok(Some(Value::Int((flags >> 24) & 0x0F)))
+    });
     r.register(
         mn_cls,
         "getDeclaringClass",
@@ -647,15 +654,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
-    r.register(
-        mn_cls,
-        "getName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
-    );
+    r.register(mn_cls, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
 
     // --- MethodHandles (static utility) ---
     let mhs = "java/lang/invoke/MethodHandles";
@@ -693,7 +695,8 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     let cid = ctx.class_id_from_mirror(*mirror);
                     let name = cid.and_then(|c| ctx.class_name_of_id(c));
                     // array class name is "[J" / "[I" / … → element descriptor is byte 1
-                    name.and_then(|n| n.as_bytes().get(1).copied()).unwrap_or(b'J')
+                    name.and_then(|n| n.as_bytes().get(1).copied())
+                        .unwrap_or(b'J')
                 }
                 _ => b'J',
             };
@@ -712,7 +715,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 ctx,
                 vh,
                 VarHandleMeta {
-                    kind: if le { VH_KIND_BYTE_VIEW_LE } else { VH_KIND_BYTE_VIEW_BE },
+                    kind: if le {
+                        VH_KIND_BYTE_VIEW_LE
+                    } else {
+                        VH_KIND_BYTE_VIEW_BE
+                    },
                     class_name: String::new(),
                     field_name: String::new(),
                     field_desc: (elem as char).to_string(),
@@ -759,12 +766,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // its side-table meta. `sun.security.provider.SHA3.<clinit>` chains
     // `byteArrayViewVarHandle(...).withInvokeExactBehavior()`, which would
     // otherwise hit AbstractMethodError on our synthetic VarHandle.
-    r.register(vh, "withInvokeExactBehavior", "()Ljava/lang/invoke/VarHandle;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
-    r.register(vh, "withInvokeBehavior", "()Ljava/lang/invoke/VarHandle;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
+    r.register(
+        vh,
+        "withInvokeExactBehavior",
+        "()Ljava/lang/invoke/VarHandle;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        vh,
+        "withInvokeBehavior",
+        "()Ljava/lang/invoke/VarHandle;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
 
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
@@ -806,8 +819,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     r.register(vh, "setVolatile", "([Ljava/lang/Object;)V", varhandle_set);
 
     // VarHandle.getOpaque / getAcquire — read semantics
-    r.register(vh, "getOpaque", "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get);
-    r.register(vh, "getAcquire", "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get);
+    r.register(
+        vh,
+        "getOpaque",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        varhandle_get,
+    );
+    r.register(
+        vh,
+        "getAcquire",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        varhandle_get,
+    );
 
     // VarHandle.setOpaque / setRelease — write semantics
     r.register(vh, "setOpaque", "([Ljava/lang/Object;)V", varhandle_set);
@@ -826,34 +849,85 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // the generic Object descriptor first and unbox_poly_return coerces the
     // result back to the call-site numeric type (H2 uses [III)I).
     for name in &["getAndAdd", "getAndAddAcquire", "getAndAddRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_add);
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_get_and_add,
+        );
     }
 
     // VarHandle.getAndBitwise{Or,And,Xor} (+ ordering variants). java.net.Socket
     // updates its `state` int field via `STATE.getAndBitwiseOr(this, flag)`.
-    for name in &["getAndBitwiseOr", "getAndBitwiseOrAcquire", "getAndBitwiseOrRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_or);
+    for name in &[
+        "getAndBitwiseOr",
+        "getAndBitwiseOrAcquire",
+        "getAndBitwiseOrRelease",
+    ] {
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_get_and_bitwise_or,
+        );
     }
-    for name in &["getAndBitwiseAnd", "getAndBitwiseAndAcquire", "getAndBitwiseAndRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_and);
+    for name in &[
+        "getAndBitwiseAnd",
+        "getAndBitwiseAndAcquire",
+        "getAndBitwiseAndRelease",
+    ] {
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_get_and_bitwise_and,
+        );
     }
-    for name in &["getAndBitwiseXor", "getAndBitwiseXorAcquire", "getAndBitwiseXorRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_xor);
+    for name in &[
+        "getAndBitwiseXor",
+        "getAndBitwiseXorAcquire",
+        "getAndBitwiseXorRelease",
+    ] {
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_get_and_bitwise_xor,
+        );
     }
 
     // C38: Ordering variants of compareAndSet / compareAndExchange / getAndSet.
     // The real JDK maps each to a distinct native; we use the same underlying
     // CAS / CAX / xchg implementation (we don't emit hardware fences). Needed
     // by Jackson's ConcurrentLinkedQueue which calls weakCompareAndSet.
-    for name in &["weakCompareAndSet", "weakCompareAndSetPlain",
-                  "weakCompareAndSetAcquire", "weakCompareAndSetRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Z", varhandle_compare_and_set);
+    for name in &[
+        "weakCompareAndSet",
+        "weakCompareAndSetPlain",
+        "weakCompareAndSetAcquire",
+        "weakCompareAndSetRelease",
+    ] {
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Z",
+            varhandle_compare_and_set,
+        );
     }
     for name in &["compareAndExchangeAcquire", "compareAndExchangeRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_compare_and_exchange);
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_compare_and_exchange,
+        );
     }
     for name in &["getAndSetAcquire", "getAndSetRelease"] {
-        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_set);
+        r.register(
+            vh,
+            name,
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            varhandle_get_and_set,
+        );
     }
     r.set_category(__prev_cat);
 }
@@ -883,14 +957,18 @@ pub(crate) fn alloc_instance_var_handle(
     ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
     // WP4.2: also stash in the side table so the descriptor-aware setter
     // on real-JDK VarHandle layout doesn't drop our metadata.
-    vh_meta_put(ctx, vh, VarHandleMeta {
-        kind: VH_KIND_INSTANCE,
-        class_name: class_name.to_string(),
-        field_name: field_name.to_string(),
-        field_desc: field_desc.to_string(),
-        field_index: field_index as i32,
-        class_id: class_id.as_u32(),
-    });
+    vh_meta_put(
+        ctx,
+        vh,
+        VarHandleMeta {
+            kind: VH_KIND_INSTANCE,
+            class_name: class_name.to_string(),
+            field_name: field_name.to_string(),
+            field_desc: field_desc.to_string(),
+            field_index: field_index as i32,
+            class_id: class_id.as_u32(),
+        },
+    );
     vh
 }
 
@@ -912,14 +990,18 @@ pub(crate) fn alloc_static_var_handle(
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(-1)); // resolved lazily
     ctx.set_field(vh, VH_CLASS_ID, Value::Int(0));
     // WP4.2: side table for descriptor-aware-coercion-safe metadata access.
-    vh_meta_put(ctx, vh, VarHandleMeta {
-        kind: VH_KIND_STATIC,
-        class_name: class_name.to_string(),
-        field_name: field_name.to_string(),
-        field_desc: field_desc.to_string(),
-        field_index: -1,
-        class_id: 0,
-    });
+    vh_meta_put(
+        ctx,
+        vh,
+        VarHandleMeta {
+            kind: VH_KIND_STATIC,
+            class_name: class_name.to_string(),
+            field_name: field_name.to_string(),
+            field_desc: field_desc.to_string(),
+            field_index: -1,
+            class_id: 0,
+        },
+    );
     vh
 }
 
@@ -1029,7 +1111,11 @@ fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, 
     let mut raw: u64 = 0;
     for i in 0..w {
         let b = ctx.get_array_element(arr, idx + i).as_int().unwrap_or(0) as u8 as u64;
-        if le { raw |= b << (8 * i); } else { raw = (raw << 8) | b; }
+        if le {
+            raw |= b << (8 * i);
+        } else {
+            raw = (raw << 8) | b;
+        }
     }
     match elem {
         b'J' => Value::Long(raw as i64),
@@ -1044,7 +1130,14 @@ fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, 
 
 /// Decompose `value` into `width` bytes per endianness and write them into the
 /// `byte[]` at BYTE index `idx`. The correct `byteArrayViewVarHandle` set.
-fn byte_view_set(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool, value: &Value) {
+fn byte_view_set(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    idx: usize,
+    elem: u8,
+    le: bool,
+    value: &Value,
+) {
     let w = byte_view_width(elem);
     let raw: u64 = match value {
         Value::Long(v) => *v as u64,
@@ -1090,7 +1183,10 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let idx = match args.get(2) { Some(Value::Int(i)) => *i as usize, _ => 0 };
+        let idx = match args.get(2) {
+            Some(Value::Int(i)) => *i as usize,
+            _ => 0,
+        };
         return Ok(Some(byte_view_get(ctx, arr, idx, elem, le)));
     }
     // C38: Array-element VarHandle call — detected by args[1] being an array
@@ -1106,8 +1202,14 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
-            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
-            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
             (k, i)
         }
     };
@@ -1196,7 +1298,10 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // SHA3/SHAKE-zeros bug.)
     if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let idx = match args.get(2) { Some(Value::Int(i)) => *i as usize, _ => 0 };
+            let idx = match args.get(2) {
+                Some(Value::Int(i)) => *i as usize,
+                _ => 0,
+            };
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_view_set(ctx, *arr, idx, elem, le, &value);
         }
@@ -1212,8 +1317,14 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
-            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(None) };
-            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(None),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
             (k, i)
         }
     };
@@ -1286,8 +1397,14 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
-            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Int(0))) };
-            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
             (k, i)
         }
     };
@@ -1383,8 +1500,14 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
-            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
-            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
             (k, i)
         }
     };
@@ -1480,8 +1603,14 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
-            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
-            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
             (k, i)
         }
     };
@@ -2176,10 +2305,11 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let _this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            let lookup =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
-            // Access reduced to PUBLIC + UNCONDITIONAL when crossing packages
+                                                    // Access reduced to PUBLIC + UNCONDITIONAL when crossing packages
             lk_write_allowed_modes(ctx, lookup, 0x01 | 0x20);
             Ok(Some(Value::Object(Some(lookup))))
         },
@@ -2196,9 +2326,12 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         lookup_find_static);
 
     // findConstructor — resolve to real 5-field MH
-    r.register(lk, "findConstructor",
+    r.register(
+        lk,
+        "findConstructor",
         "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
-        lookup_find_constructor);
+        lookup_find_constructor,
+    );
 
     // findSpecial — same as findVirtual but MH_KIND_SPECIAL
     r.register(lk, "findSpecial",
@@ -2206,32 +2339,50 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         lookup_find_special);
 
     // findGetter — creates a MH with kind=GETTER that reads an instance field
-    r.register(lk, "findGetter",
+    r.register(
+        lk,
+        "findGetter",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        lookup_find_getter);
+        lookup_find_getter,
+    );
 
     // findSetter — creates a MH with kind=SETTER that writes an instance field
-    r.register(lk, "findSetter",
+    r.register(
+        lk,
+        "findSetter",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        lookup_find_setter);
+        lookup_find_setter,
+    );
 
     // findStaticGetter/findStaticSetter
-    r.register(lk, "findStaticGetter",
+    r.register(
+        lk,
+        "findStaticGetter",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        lookup_find_static_getter);
-    r.register(lk, "findStaticSetter",
+        lookup_find_static_getter,
+    );
+    r.register(
+        lk,
+        "findStaticSetter",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        lookup_find_static_setter);
+        lookup_find_static_setter,
+    );
 
     // findVarHandle — create a real VarHandle for an instance field
-    r.register(lk, "findVarHandle",
+    r.register(
+        lk,
+        "findVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
-        lookup_find_var_handle);
+        lookup_find_var_handle,
+    );
 
     // findStaticVarHandle
-    r.register(lk, "findStaticVarHandle",
+    r.register(
+        lk,
+        "findStaticVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
-        lookup_find_static_var_handle);
+        lookup_find_static_var_handle,
+    );
 
     // revealDirect — crack a (direct) MethodHandle into a MethodHandleInfo.
     //
@@ -2267,17 +2418,26 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_method_error("", "", ""));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_method_error("", "", ""));
-    }};
-    let mt_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-        let name = ctx.read_string(name_obj).unwrap_or_default();
-        return Err(no_such_method_error(&class, &name, ""));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_method_error("", "", ""));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_method_error("", "", ""));
+        }
+    };
+    let mt_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            return Err(no_such_method_error(&class, &name, ""));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
@@ -2323,13 +2483,19 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_method_error("", "<init>", ""));
-    }};
-    let mt_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-        return Err(no_such_method_error(&class, "<init>", ""));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_method_error("", "<init>", ""));
+        }
+    };
+    let mt_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
+            return Err(no_such_method_error(&class, "<init>", ""));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let mut desc = descriptor_from_method_type(ctx, mt_obj);
     if let Some(pos) = desc.rfind(')') {
@@ -2349,17 +2515,26 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     //   args[2] = name (method name)
     //   args[3] = type (MethodType)
     //   args[4] = specialCaller (Class authorized to do invokespecial)
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_method_error("", "", ""));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_method_error("", "", ""));
-    }};
-    let mt_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        let class = resolve_class_name_robust(ctx, class_obj).unwrap_or_default();
-        let name = ctx.read_string(name_obj).unwrap_or_default();
-        return Err(no_such_method_error(&class, &name, ""));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_method_error("", "", ""));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_method_error("", "", ""));
+        }
+    };
+    let mt_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let class = resolve_class_name_robust(ctx, class_obj).unwrap_or_default();
+            let name = ctx.read_string(name_obj).unwrap_or_default();
+            return Err(no_such_method_error(&class, &name, ""));
+        }
+    };
     // specialCaller (args[4]) — for spec correctness, we ensure it's loaded
     // so subsequent access checks work. The actual access check (specialCaller
     // must be the lookup class or have PRIVATE-mode access) is permissive
@@ -2381,7 +2556,11 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 /// Create a NoSuchMethodException error.
-fn no_such_method_error(class: &str, method: &str, desc: &str) -> cratonvm_types::error::MethodCallFailed {
+fn no_such_method_error(
+    class: &str,
+    method: &str,
+    desc: &str,
+) -> cratonvm_types::error::MethodCallFailed {
     cratonvm_types::error::MethodCallFailed::InternalError(
         cratonvm_types::error::VmError::Internal {
             message: format!("NoSuchMethodException: {class}.{method}{desc}"),
@@ -2399,15 +2578,24 @@ fn no_such_field_error(class: &str, field: &str) -> cratonvm_types::error::Metho
 }
 
 fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2422,15 +2610,24 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Err(no_such_field_error("", ""));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(no_such_field_error("", ""));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2444,15 +2641,42 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_GETTER)))));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_GETTER)))));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_GETTER)))));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_GETTER,
+            )))));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_GETTER,
+            )))));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_GETTER,
+            )))));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2462,15 +2686,42 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_SETTER)))));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_SETTER)))));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(Some(alloc_method_handle(ctx, "", "", "", MH_KIND_SETTER)))));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_SETTER,
+            )))));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_SETTER,
+            )))));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_method_handle(
+                ctx,
+                "",
+                "",
+                "",
+                MH_KIND_SETTER,
+            )))));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2480,15 +2731,24 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2506,23 +2766,33 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                     Err(_) => return Ok(Some(Value::Object(None))),
                 }
             }
-        }
+        },
     };
 
-    let vh = alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id);
+    let vh =
+        alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id);
     Ok(Some(Value::Object(Some(vh))))
 }
 
 fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_obj = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
-    let name_obj = match args.get(2) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
-    let type_obj = match args.get(3) { Some(Value::Object(Some(o))) => *o, _ => {
-        return Ok(Some(Value::Object(None)));
-    }};
+    let class_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let name_obj = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let type_obj = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(None)));
+        }
+    };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
@@ -2541,17 +2811,17 @@ fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// `IllegalArgumentException: not a direct method handle`.
 fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // MemberName flag bits (mirroring native_mhn_init).
-    const IS_METHOD: i32      = 0x1_0000;
+    const IS_METHOD: i32 = 0x1_0000;
     const IS_CONSTRUCTOR: i32 = 0x2_0000;
-    const IS_FIELD: i32       = 0x4_0000;
+    const IS_FIELD: i32 = 0x4_0000;
     // JVM spec table 5.4.3.5 reference kinds.
-    const REF_GET_FIELD: i32        = 1;
-    const REF_GET_STATIC: i32       = 2;
-    const REF_PUT_FIELD: i32        = 3;
-    const REF_PUT_STATIC: i32       = 4;
-    const REF_INVOKE_VIRTUAL: i32   = 5;
-    const REF_INVOKE_STATIC: i32    = 6;
-    const REF_INVOKE_SPECIAL: i32   = 7;
+    const REF_GET_FIELD: i32 = 1;
+    const REF_GET_STATIC: i32 = 2;
+    const REF_PUT_FIELD: i32 = 3;
+    const REF_PUT_STATIC: i32 = 4;
+    const REF_INVOKE_VIRTUAL: i32 = 5;
+    const REF_INVOKE_STATIC: i32 = 6;
+    const REF_INVOKE_SPECIAL: i32 = 7;
     const REF_NEW_INVOKE_SPECIAL: i32 = 8;
     const ACC_STATIC: i32 = 0x0008;
     const ACC_PUBLIC: i32 = 0x0001;
@@ -2571,28 +2841,36 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // empty, in which case we fall back to a default `()V`/static descriptor
     // so revealDirect at least returns a non-throwing InfoFromMemberName.
     let class = mh_read_class(ctx, mh).unwrap_or_default();
-    let name  = mh_read_name(ctx, mh).unwrap_or_default();
-    let desc  = mh_read_desc(ctx, mh).unwrap_or_else(|| DESC_DEFAULT_METHOD.to_string());
-    let kind  = match ctx.get_field(mh, MH_KIND) {
+    let name = mh_read_name(ctx, mh).unwrap_or_default();
+    let desc = mh_read_desc(ctx, mh).unwrap_or_else(|| DESC_DEFAULT_METHOD.to_string());
+    let kind = match ctx.get_field(mh, MH_KIND) {
         Value::Int(k) => k,
         _ => MH_KIND_STATIC,
     };
 
     // Map our MH_KIND_* to (refKind, kindFlag, accStaticBits).
     let (ref_kind, kind_flag, acc_static) = match kind {
-        MH_KIND_STATIC      => (REF_INVOKE_STATIC, IS_METHOD,      ACC_STATIC),
-        MH_KIND_VIRTUAL     => (REF_INVOKE_VIRTUAL, IS_METHOD,     0),
-        MH_KIND_SPECIAL     => (REF_INVOKE_SPECIAL, IS_METHOD,     0),
+        MH_KIND_STATIC => (REF_INVOKE_STATIC, IS_METHOD, ACC_STATIC),
+        MH_KIND_VIRTUAL => (REF_INVOKE_VIRTUAL, IS_METHOD, 0),
+        MH_KIND_SPECIAL => (REF_INVOKE_SPECIAL, IS_METHOD, 0),
         MH_KIND_CONSTRUCTOR => (REF_NEW_INVOKE_SPECIAL, IS_CONSTRUCTOR, 0),
-        MH_KIND_GETTER      => {
+        MH_KIND_GETTER => {
             // Distinguish static vs instance by descriptor arity.
             let is_static = desc.starts_with("()");
-            let rk = if is_static { REF_GET_STATIC } else { REF_GET_FIELD };
+            let rk = if is_static {
+                REF_GET_STATIC
+            } else {
+                REF_GET_FIELD
+            };
             (rk, IS_FIELD, if is_static { ACC_STATIC } else { 0 })
         }
-        MH_KIND_SETTER      => {
+        MH_KIND_SETTER => {
             let is_static = !desc_has_two_params(&desc);
-            let rk = if is_static { REF_PUT_STATIC } else { REF_PUT_FIELD };
+            let rk = if is_static {
+                REF_PUT_STATIC
+            } else {
+                REF_PUT_FIELD
+            };
             (rk, IS_FIELD, if is_static { ACC_STATIC } else { 0 })
         }
         _ => (REF_INVOKE_STATIC, IS_METHOD, ACC_STATIC),
@@ -2687,7 +2965,9 @@ fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
     const REF_GET_STATIC: i32 = 2;
     // For getters the field type is the return-type slice.
     if ref_kind == REF_GET_FIELD || ref_kind == REF_GET_STATIC {
-        if let Some(idx) = desc.find(')') { return desc[idx + 1..].to_string(); }
+        if let Some(idx) = desc.find(')') {
+            return desc[idx + 1..].to_string();
+        }
         return DESC_VOID.to_string();
     }
     // For setters the field type is the LAST parameter.
@@ -2700,19 +2980,33 @@ fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
     while i < bytes.len() {
         last_start = i;
         match bytes[i] as char {
-            'B'|'C'|'D'|'F'|'I'|'J'|'S'|'Z' => { i += 1; }
+            'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
+                i += 1;
+            }
             '[' => {
-                while i < bytes.len() && bytes[i] as char == '[' { i += 1; }
-                if i < bytes.len() && bytes[i] as char == 'L' {
-                    while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
+                while i < bytes.len() && bytes[i] as char == '[' {
+                    i += 1;
                 }
-                if i < bytes.len() { i += 1; }
+                if i < bytes.len() && bytes[i] as char == 'L' {
+                    while i < bytes.len() && bytes[i] as char != ';' {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
             }
             'L' => {
-                while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
-                if i < bytes.len() { i += 1; }
+                while i < bytes.len() && bytes[i] as char != ';' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     params[last_start..].to_string()
@@ -3126,11 +3420,11 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
 // either overwrites JDK code's view of the handle or gets overwritten when
 // the JDK class field is populated.  By anchoring our synthetic fields at
 // slot 16 we reserve plenty of headroom past any future JDK field additions.
-const MH_BASE:  usize = 16;
+const MH_BASE: usize = 16;
 const MH_CLASS: usize = MH_BASE + 0;
-const MH_NAME:  usize = MH_BASE + 1;
-const MH_DESC:  usize = MH_BASE + 2;
-const MH_KIND:  usize = MH_BASE + 3;
+const MH_NAME: usize = MH_BASE + 1;
+const MH_DESC: usize = MH_BASE + 2;
+const MH_KIND: usize = MH_BASE + 3;
 const MH_BOUND: usize = MH_BASE + 4;
 
 /// Returns true if a method descriptor has exactly two parameters.
@@ -3154,12 +3448,18 @@ fn desc_has_two_params(desc: &str) -> bool {
             }
             '[' => {
                 // skip array prefix
-                while i < bytes.len() && bytes[i] as char == '[' { i += 1; }
+                while i < bytes.len() && bytes[i] as char == '[' {
+                    i += 1;
+                }
                 // then one type
                 if i < bytes.len() {
                     if bytes[i] as char == 'L' {
-                        while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
-                        if i < bytes.len() { i += 1; }
+                        while i < bytes.len() && bytes[i] as char != ';' {
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
                     } else {
                         i += 1;
                     }
@@ -3167,8 +3467,12 @@ fn desc_has_two_params(desc: &str) -> bool {
                 count += 1;
             }
             'L' => {
-                while i < bytes.len() && bytes[i] as char != ';' { i += 1; }
-                if i < bytes.len() { i += 1; }
+                while i < bytes.len() && bytes[i] as char != ';' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
                 count += 1;
             }
             _ => return false,
@@ -3177,22 +3481,22 @@ fn desc_has_two_params(desc: &str) -> bool {
     count == 2
 }
 
-const MH_KIND_STATIC:      i32 = 0;
-const MH_KIND_VIRTUAL:     i32 = 1;
-const MH_KIND_SPECIAL:     i32 = 2;
+const MH_KIND_STATIC: i32 = 0;
+const MH_KIND_VIRTUAL: i32 = 1;
+const MH_KIND_SPECIAL: i32 = 2;
 const MH_KIND_CONSTRUCTOR: i32 = 3;
 #[allow(dead_code)]
-const MH_KIND_GETTER:      i32 = 4;
+const MH_KIND_GETTER: i32 = 4;
 #[allow(dead_code)]
-const MH_KIND_SETTER:      i32 = 5;
-const MH_KIND_PERMUTE:     i32 = 6;
-const MH_KIND_GUARD:       i32 = 7;
+const MH_KIND_SETTER: i32 = 5;
+const MH_KIND_PERMUTE: i32 = 6;
+const MH_KIND_GUARD: i32 = 7;
 /// C26: dropArgumentsTrusted adapter. MH_BOUND holds the wrapped inner MH.
 /// MH_DESC is the widened descriptor (used for invokeExact arity check).
 /// Dispatch reads the inner MH's MH_DESC and forwards a trimmed argument
 /// slice (outer-arity minus inner-arity extras are discarded from the
 /// position encoded in MH_CLASS as a decimal pos string).
-const MH_KIND_DROP:        i32 = 8;
+const MH_KIND_DROP: i32 = 8;
 /// Round-9 perf: StringConcatFactory CallSite target. MH_CLASS holds the
 /// concatenation recipe string (`\u{0001}` argument placeholder,
 /// `\u{0002}` constant placeholder), MH_BOUND is a synthetic 1-field
@@ -3286,16 +3590,16 @@ pub fn gc_scan_lambda_callsite_cache_roots(out: &mut Vec<ObjectRef>) {
 /// remapped so a post-GC lookup with the same logical bootstrap args
 /// still hits the cache. The remap rebuilds the table entry-by-entry
 /// because cache key membership is hash-sensitive to the remapped value.
-pub fn gc_update_lambda_callsite_cache_refs(
-    pointer_map: &std::collections::HashMap<usize, usize>,
-) {
+pub fn gc_update_lambda_callsite_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
     if pointer_map.is_empty() {
         return;
     }
     let mut cache = lambda_callsite_cache().lock();
     let old: Vec<(LambdaKey, ObjectRef)> = cache.drain().collect();
     let remap = |addr: usize| -> usize {
-        if addr == 0 { return 0; }
+        if addr == 0 {
+            return 0;
+        }
         match pointer_map.get(&addr) {
             Some(&new_addr) => new_addr,
             None => addr,
@@ -3342,12 +3646,12 @@ pub(crate) fn alloc_method_handle(
     // overwriting our class/name/desc/kind/bound data.
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
     let cls = ctx.create_string(class);
-    let nm  = ctx.create_string(name);
-    let dc  = ctx.create_string(desc);
+    let nm = ctx.create_string(name);
+    let dc = ctx.create_string(desc);
     ctx.set_field(mh, MH_CLASS, Value::Object(Some(cls)));
-    ctx.set_field(mh, MH_NAME,  Value::Object(Some(nm)));
-    ctx.set_field(mh, MH_DESC,  Value::Object(Some(dc)));
-    ctx.set_field(mh, MH_KIND,  Value::Int(kind));
+    ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
+    ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
+    ctx.set_field(mh, MH_KIND, Value::Int(kind));
     ctx.set_field(mh, MH_BOUND, Value::Object(None));
     // Populate the real-JDK MethodHandle.type:MethodType field at its
     // resolved slot (0) so `mh.type()` and JDK-internal reads (LambdaForm,
@@ -3370,10 +3674,7 @@ pub(crate) fn alloc_method_handle(
 /// common 80% of cases — primitives and String/CharSequence/Object via
 /// `Object.toString` (best-effort).  Non-string Objects fall back to a
 /// label of the form `Class@hash` to keep concatenation lossless.
-pub(crate) fn string_concat_render_value(
-    ctx: &mut dyn NativeContext,
-    v: Value,
-) -> String {
+pub(crate) fn string_concat_render_value(ctx: &mut dyn NativeContext, v: Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),
         Value::Long(l) => l.to_string(),
@@ -3427,19 +3728,23 @@ pub(crate) fn alloc_string_concat_method_handle(
     // instead of a class name.
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
     let cls = ctx.create_string(recipe);
-    let nm  = ctx.create_string("concat");
-    let dc  = ctx.create_string("()Ljava/lang/String;");
+    let nm = ctx.create_string("concat");
+    let dc = ctx.create_string("()Ljava/lang/String;");
     ctx.set_field(mh, MH_CLASS, Value::Object(Some(cls)));
-    ctx.set_field(mh, MH_NAME,  Value::Object(Some(nm)));
-    ctx.set_field(mh, MH_DESC,  Value::Object(Some(dc)));
-    ctx.set_field(mh, MH_KIND,  Value::Int(MH_KIND_STRING_CONCAT));
+    ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
+    ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
+    ctx.set_field(mh, MH_KIND, Value::Int(MH_KIND_STRING_CONCAT));
     // Wrap the constants array in a 1-field holder so MH_BOUND is a single
     // ObjectRef (the rest of mh_dispatch assumes that shape).
     let holder = alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1);
-    ctx.set_field(holder, 0, match constants {
-        Some(arr) => Value::Object(Some(arr)),
-        None => Value::Object(None),
-    });
+    ctx.set_field(
+        holder,
+        0,
+        match constants {
+            Some(arr) => Value::Object(Some(arr)),
+            None => Value::Object(None),
+        },
+    );
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(holder)));
     // Populate the real-JDK `type:MethodType` field at slot 0 so JDK-internal
     // `mh.type()` walks see a non-null MethodType.
@@ -3450,7 +3755,10 @@ pub(crate) fn alloc_string_concat_method_handle(
 }
 
 /// Read the class name string from a MethodHandle (field MH_CLASS).
-pub(crate) fn mh_read_class(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_class(
+    ctx: &dyn NativeContext,
+    mh: cratonvm_types::ObjectRef,
+) -> Option<String> {
     match ctx.get_field(mh, MH_CLASS) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -3458,7 +3766,10 @@ pub(crate) fn mh_read_class(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectR
 }
 
 /// Read the method name string from a MethodHandle (field MH_NAME).
-pub(crate) fn mh_read_name(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_name(
+    ctx: &dyn NativeContext,
+    mh: cratonvm_types::ObjectRef,
+) -> Option<String> {
     match ctx.get_field(mh, MH_NAME) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -3466,7 +3777,10 @@ pub(crate) fn mh_read_name(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRe
 }
 
 /// Read the descriptor string from a MethodHandle (field MH_DESC).
-pub(crate) fn mh_read_desc(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_desc(
+    ctx: &dyn NativeContext,
+    mh: cratonvm_types::ObjectRef,
+) -> Option<String> {
     match ctx.get_field(mh, MH_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -3674,10 +3988,10 @@ pub(crate) fn mh_dispatch(
                 Err(_) => return Ok(Some(Value::Object(None))),
             };
             let new_obj = ctx.alloc_object(cid, 16); // generous field count
-            // Coerce/unbox args against the <init> descriptor. The constructor
-            // params align 1:1 with extra_args (no receiver), so this is exact.
-            // invokeExact does NOT pre-adapt, so unboxing here covers both the
-            // invoke and invokeExact paths (Jackson 3 uses invokeExact).
+                                                     // Coerce/unbox args against the <init> descriptor. The constructor
+                                                     // params align 1:1 with extra_args (no receiver), so this is exact.
+                                                     // invokeExact does NOT pre-adapt, so unboxing here covers both the
+                                                     // invoke and invokeExact paths (Jackson 3 uses invokeExact).
             let adapted = adapt_invoke_args(ctx, extra_args, &desc);
             let mut init_args = Vec::with_capacity(1 + adapted.len());
             init_args.push(Value::Object(Some(new_obj)));
@@ -3819,7 +4133,12 @@ pub(crate) fn mh_dispatch(
             };
             let inner_needs_recv = inner_kind == MH_KIND_VIRTUAL || inner_kind == MH_KIND_SPECIAL;
             let inner_bound = matches!(ctx.get_field(inner, MH_BOUND), Value::Object(Some(_)));
-            let inner_expected = inner_params + if inner_needs_recv && !inner_bound { 1 } else { 0 };
+            let inner_expected = inner_params
+                + if inner_needs_recv && !inner_bound {
+                    1
+                } else {
+                    0
+                };
             let pos: usize = mh_read_class(ctx, mh)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
@@ -3884,7 +4203,10 @@ pub(crate) fn mh_dispatch(
             for ch in recipe.chars() {
                 match ch {
                     '\u{0001}' => {
-                        let v = extra_args.get(arg_idx).copied().unwrap_or(Value::Object(None));
+                        let v = extra_args
+                            .get(arg_idx)
+                            .copied()
+                            .unwrap_or(Value::Object(None));
                         out.push_str(&string_concat_render_value(ctx, v));
                         arg_idx += 1;
                     }
@@ -4073,10 +4395,11 @@ fn record_deser_dispatch(
     // Index the stream fields by name. `objValues` holds the non-primitive
     // fields in stream order (k-th object field → objValues[k]); `primValues`
     // holds primitive bytes at each field's reported offset.
-    let fields = match ctx.invoke_virtual(desc, "getFields", "()[Ljava/io/ObjectStreamField;", &[])? {
-        Some(Value::Object(Some(a))) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    let fields =
+        match ctx.invoke_virtual(desc, "getFields", "()[Ljava/io/ObjectStreamField;", &[])? {
+            Some(Value::Object(Some(a))) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
     let nfields = ctx.array_length(fields);
     // name -> (is_primitive, slot, type_code) where slot = objValues index
     // (reference) or primValues byte offset (primitive).
@@ -4092,7 +4415,10 @@ fn record_deser_dispatch(
             Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
             _ => continue,
         };
-        let is_prim = matches!(ctx.invoke_virtual(f, "isPrimitive", "()Z", &[])?, Some(Value::Int(1)));
+        let is_prim = matches!(
+            ctx.invoke_virtual(f, "isPrimitive", "()Z", &[])?,
+            Some(Value::Int(1))
+        );
         let tc = match ctx.invoke_virtual(f, "getTypeCode", "()C", &[])? {
             Some(Value::Int(c)) => char::from_u32(c as u32).unwrap_or('L'),
             _ => 'L',
@@ -4114,7 +4440,12 @@ fn record_deser_dispatch(
         Some(cid) => ctx.get_class_mirror(cid),
         None => return Ok(Some(Value::Object(None))),
     };
-    let comps = match ctx.invoke_virtual(cls_mirror, "getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", &[])? {
+    let comps = match ctx.invoke_virtual(
+        cls_mirror,
+        "getRecordComponents",
+        "()[Ljava/lang/reflect/RecordComponent;",
+        &[],
+    )? {
         Some(Value::Object(Some(a))) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -4165,7 +4496,12 @@ fn record_deser_dispatch(
 /// Decode a single primitive value, big-endian, out of the record stream's
 /// `primValues` byte[] at `offset` per JVM type code (matches
 /// `jdk.internal.util.ByteArray` big-endian layout used by record serialization).
-fn record_decode_primitive(ctx: &dyn NativeContext, arr: ObjectRef, offset: usize, tc: char) -> Value {
+fn record_decode_primitive(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    offset: usize,
+    tc: char,
+) -> Value {
     let len = ctx.array_length(arr);
     let b = |i: usize| -> u64 {
         if offset + i < len {
@@ -4183,11 +4519,29 @@ fn record_decode_primitive(ctx: &dyn NativeContext, arr: ObjectRef, offset: usiz
         'C' => Value::Int((((b(0) << 8) | b(1)) as u16) as i32),
         'S' => Value::Int(((((b(0) << 8) | b(1)) as u16) as i16) as i32),
         'I' => Value::Int((((b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)) as u32) as i32),
-        'F' => Value::Float(f32::from_bits(((b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)) as u32)),
-        'J' => Value::Long((((b(0) << 56) | (b(1) << 48) | (b(2) << 40) | (b(3) << 32)
-            | (b(4) << 24) | (b(5) << 16) | (b(6) << 8) | b(7)) as u64) as i64),
-        'D' => Value::Double(f64::from_bits((b(0) << 56) | (b(1) << 48) | (b(2) << 40) | (b(3) << 32)
-            | (b(4) << 24) | (b(5) << 16) | (b(6) << 8) | b(7))),
+        'F' => Value::Float(f32::from_bits(
+            ((b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)) as u32,
+        )),
+        'J' => Value::Long(
+            (((b(0) << 56)
+                | (b(1) << 48)
+                | (b(2) << 40)
+                | (b(3) << 32)
+                | (b(4) << 24)
+                | (b(5) << 16)
+                | (b(6) << 8)
+                | b(7)) as u64) as i64,
+        ),
+        'D' => Value::Double(f64::from_bits(
+            (b(0) << 56)
+                | (b(1) << 48)
+                | (b(2) << 40)
+                | (b(3) << 32)
+                | (b(4) << 24)
+                | (b(5) << 16)
+                | (b(6) << 8)
+                | b(7),
+        )),
         _ => Value::Int(0),
     }
 }
@@ -4249,23 +4603,27 @@ fn widen_descriptor(
 
 /// Count the number of parameters in a JVM method descriptor.
 fn count_descriptor_params(desc: &str) -> usize {
-    if !desc.starts_with('(') { return 0; }
-    let close = match desc.find(')') { Some(i) => i, None => return 0 };
+    if !desc.starts_with('(') {
+        return 0;
+    }
+    let close = match desc.find(')') {
+        Some(i) => i,
+        None => return 0,
+    };
     let params_str = &desc[1..close];
     parse_descriptor_types(params_str).len()
 }
 
 /// Type adaptation for invoke(): coerce args to match the expected descriptor.
 /// Handles boxing (int→Integer), unboxing (Integer→int), and widening (int→long).
-fn adapt_invoke_args(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    desc: &str,
-) -> Vec<Value> {
+fn adapt_invoke_args(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> Vec<Value> {
     if desc.is_empty() || !desc.starts_with('(') {
         return args.to_vec();
     }
-    let close = match desc.find(')') { Some(i) => i, None => return args.to_vec() };
+    let close = match desc.find(')') {
+        Some(i) => i,
+        None => return args.to_vec(),
+    };
     let params_str = &desc[1..close];
     let param_types = parse_descriptor_types(params_str);
 
@@ -4289,11 +4647,7 @@ fn adapt_invoke_args(
 /// `Integer` reached the `<init>` frame as an object reference and the int
 /// field was stored as the wrapper's pointer. `unbox_value` returns non-wrapper
 /// objects unchanged, so a misaligned receiver/object arg is left intact.
-fn adapt_single_arg(
-    ctx: &mut dyn NativeContext,
-    arg: Value,
-    expected_type: &str,
-) -> Value {
+fn adapt_single_arg(ctx: &mut dyn NativeContext, arg: Value, expected_type: &str) -> Value {
     match expected_type {
         // Unbox-only primitives (no widening from another primitive tag).
         "int" | "short" | "byte" | "char" | "boolean" => match arg {
@@ -4338,15 +4692,17 @@ fn return_type_desc(desc: &str) -> &str {
 /// Auto-box a primitive return value if the method descriptor returns a primitive.
 /// This is needed because signature-polymorphic invoke() returns Object, but the
 /// underlying method may return a primitive (int, long, etc.).
-fn auto_box_return(ctx: &mut dyn NativeContext, result: MethodCallResult, desc: &str) -> MethodCallResult {
+fn auto_box_return(
+    ctx: &mut dyn NativeContext,
+    result: MethodCallResult,
+    desc: &str,
+) -> MethodCallResult {
     let ret_desc = return_type_desc(desc);
     match ret_desc {
-        "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => {
-            match result {
-                Ok(Some(val)) => Ok(Some(box_value(ctx, val, ret_desc))),
-                other => other,
-            }
-        }
+        "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => match result {
+            Ok(Some(val)) => Ok(Some(box_value(ctx, val, ret_desc))),
+            other => other,
+        },
         "V" => match result {
             // void → null for Object return, but preserve thrown exceptions.
             // Previously this arm unconditionally returned Ok(Some(Object(None))),
@@ -4368,190 +4724,278 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // invoke(...) — polymorphic signature with automatic type adaptation.
     // Boxing/unboxing and widening conversions are applied implicitly.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(mh, "invoke", "([Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let extra = &args[1..];
-        let desc = mh_read_desc(ctx, this).unwrap_or_default();
-        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        // For virtual/special handles the first extra arg is the RECEIVER, not
-        // a descriptor param — adapting it against param_types[0] would misalign
-        // every param by one and (now that adapt unboxes) could wrongly unbox a
-        // wrapper receiver. Skip the receiver, then adapt the params 1:1.
-        let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
-        let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
-        let adapted = if needs_receiver && !has_bound && !extra.is_empty() {
-            let mut v = Vec::with_capacity(extra.len());
-            v.push(extra[0]);
-            v.extend(adapt_invoke_args(ctx, &extra[1..], &desc));
-            v
-        } else {
-            adapt_invoke_args(ctx, extra, &desc)
-        };
-        let result = mh_dispatch(ctx, this, &adapted);
-        // Constructor MH already returns the new object; skip auto_box_return
-        // which would incorrectly convert the result to null (desc ends in V).
-        if kind == MH_KIND_CONSTRUCTOR {
-            result
-        } else {
-            auto_box_return(ctx, result, &desc)
-        }
-    });
+    r.register(
+        mh,
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let extra = &args[1..];
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            let kind = match ctx.get_field(this, MH_KIND) {
+                Value::Int(k) => k,
+                _ => MH_KIND_VIRTUAL,
+            };
+            // For virtual/special handles the first extra arg is the RECEIVER, not
+            // a descriptor param — adapting it against param_types[0] would misalign
+            // every param by one and (now that adapt unboxes) could wrongly unbox a
+            // wrapper receiver. Skip the receiver, then adapt the params 1:1.
+            let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
+            let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
+            let adapted = if needs_receiver && !has_bound && !extra.is_empty() {
+                let mut v = Vec::with_capacity(extra.len());
+                v.push(extra[0]);
+                v.extend(adapt_invoke_args(ctx, &extra[1..], &desc));
+                v
+            } else {
+                adapt_invoke_args(ctx, extra, &desc)
+            };
+            let result = mh_dispatch(ctx, this, &adapted);
+            // Constructor MH already returns the new object; skip auto_box_return
+            // which would incorrectly convert the result to null (desc ends in V).
+            if kind == MH_KIND_CONSTRUCTOR {
+                result
+            } else {
+                auto_box_return(ctx, result, &desc)
+            }
+        },
+    );
 
     // invokeExact(...) — strict type checking: argument count must match.
     // Throws WrongMethodTypeException if arity mismatches.
     // Return value is auto-boxed since call-site expects Object.
-    r.register(mh, "invokeExact", "([Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let extra = &args[1..];
-        let desc = mh_read_desc(ctx, this).unwrap_or_default();
-        // Verify argument count matches descriptor
-        if !desc.is_empty() {
-            let expected_params = count_descriptor_params(&desc);
-            let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-            // Virtual/special methods need a receiver arg in addition to params
-            let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
-            let expected_count = if needs_receiver { expected_params + 1 } else { expected_params };
-            // Check for bound receiver (reduces expected by 1)
-            let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
-            let final_expected = if has_bound && needs_receiver { expected_count - 1 } else { expected_count };
-            if extra.len() != final_expected {
-                // WrongMethodTypeException — arity mismatch
-                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Internal {
-                        message: format!("WrongMethodTypeException: expected {} args, got {}", final_expected, extra.len()),
-                    },
-                ));
-            }
-        }
-        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        let result = mh_dispatch(ctx, this, extra);
-        if kind == MH_KIND_CONSTRUCTOR {
-            result
-        } else {
-            auto_box_return(ctx, result, &desc)
-        }
-    });
-    r.register(mh, "invokeWithArguments", "([Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // args[1] is an Object[] — unpack it
-        let arr_ref = match args.get(1) {
-            Some(Value::Object(Some(a))) => *a,
-            _ => {
-                let desc = mh_read_desc(ctx, this).unwrap_or_default();
-                let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-                let result = mh_dispatch(ctx, this, &[]);
-                return if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) };
-            }
-        };
-        let len = ctx.array_length(arr_ref);
-        let unpacked: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr_ref, i)).collect();
-        // invokeWithArguments ALWAYS returns Object: a void target must yield
-        // null (returning Ok(None) pushes NOTHING — the caller's areturn then
-        // underflows the operand stack and killed the VM; Gradle's
-        // MethodHandleBasedServiceMethod.invoke was the canonical victim) and
-        // primitive returns must be boxed.
-        let desc = mh_read_desc(ctx, this).unwrap_or_default();
-        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        let result = mh_dispatch(ctx, this, &unpacked);
-        if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) }
-    });
-    r.register(mh, "invokeWithArguments", "(Ljava/util/List;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Unpack the List via its own toArray() — layout-agnostic (the old
-        // direct slot reads assumed the ArrayList layout and silently saw 0
-        // args for any other List implementation).
-        let unpacked: Vec<Value> = match args.get(1) {
-            Some(Value::Object(Some(l))) => {
-                match ctx.invoke_virtual(*l, "toArray", "()[Ljava/lang/Object;", &[])? {
-                    Some(Value::Object(Some(arr))) => {
-                        let len = ctx.array_length(arr);
-                        (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
-                    }
-                    _ => Vec::new(),
+    r.register(
+        mh,
+        "invokeExact",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let extra = &args[1..];
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            // Verify argument count matches descriptor
+            if !desc.is_empty() {
+                let expected_params = count_descriptor_params(&desc);
+                let kind = match ctx.get_field(this, MH_KIND) {
+                    Value::Int(k) => k,
+                    _ => MH_KIND_VIRTUAL,
+                };
+                // Virtual/special methods need a receiver arg in addition to params
+                let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
+                let expected_count = if needs_receiver {
+                    expected_params + 1
+                } else {
+                    expected_params
+                };
+                // Check for bound receiver (reduces expected by 1)
+                let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
+                let final_expected = if has_bound && needs_receiver {
+                    expected_count - 1
+                } else {
+                    expected_count
+                };
+                if extra.len() != final_expected {
+                    // WrongMethodTypeException — arity mismatch
+                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Internal {
+                            message: format!(
+                                "WrongMethodTypeException: expected {} args, got {}",
+                                final_expected,
+                                extra.len()
+                            ),
+                        },
+                    ));
                 }
             }
-            _ => Vec::new(),
-        };
-        // Same Object-return contract as the Object[] overload above: box
-        // primitives, void → null.
-        let desc = mh_read_desc(ctx, this).unwrap_or_default();
-        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        let result = mh_dispatch(ctx, this, &unpacked);
-        if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) }
-    });
-    r.register(mh, "bindTo", "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let recv = args.get(1).copied().unwrap_or(Value::Object(None));
-        // Clone the MH and set BOUND field
-        let class = mh_read_class(ctx, this).unwrap_or_default();
-        let name  = mh_read_name(ctx, this).unwrap_or_default();
-        let desc  = mh_read_desc(ctx, this).unwrap_or_default();
-        let kind  = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
-        if kind == MH_KIND_LAMBDA_FACTORY {
-            // A lambda factory may capture more than one value (e.g. log4j's
-            // `factory.bindTo(serviceType).bindTo(classLoader)`). The single-slot
-            // MH_BOUND used by the other kinds would drop all but the last bind,
-            // so accumulate captures, in bind order, into an Object[].
-            let prev = ctx.get_field(this, MH_BOUND);
-            let new_arr = match prev {
-                Value::Object(Some(old)) => {
-                    let oldlen = ctx.array_length(old);
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, oldlen + 1);
-                    for i in 0..oldlen {
-                        let v = ctx.get_array_element(old, i);
-                        ctx.set_array_element(arr, i, v);
-                    }
-                    ctx.set_array_element(arr, oldlen, recv);
-                    arr
-                }
+            let kind = match ctx.get_field(this, MH_KIND) {
+                Value::Int(k) => k,
+                _ => MH_KIND_VIRTUAL,
+            };
+            let result = mh_dispatch(ctx, this, extra);
+            if kind == MH_KIND_CONSTRUCTOR {
+                result
+            } else {
+                auto_box_return(ctx, result, &desc)
+            }
+        },
+    );
+    r.register(
+        mh,
+        "invokeWithArguments",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // args[1] is an Object[] — unpack it
+            let arr_ref = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
                 _ => {
-                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-                    ctx.set_array_element(arr, 0, recv);
-                    arr
+                    let desc = mh_read_desc(ctx, this).unwrap_or_default();
+                    let kind = match ctx.get_field(this, MH_KIND) {
+                        Value::Int(k) => k,
+                        _ => MH_KIND_VIRTUAL,
+                    };
+                    let result = mh_dispatch(ctx, this, &[]);
+                    return if kind == MH_KIND_CONSTRUCTOR {
+                        result
+                    } else {
+                        auto_box_return(ctx, result, &desc)
+                    };
                 }
             };
-            ctx.set_field(new_mh, MH_BOUND, Value::Object(Some(new_arr)));
-        } else {
-            ctx.set_field(new_mh, MH_BOUND, recv);
-        }
-        Ok(Some(Value::Object(Some(new_mh))))
-    });
+            let len = ctx.array_length(arr_ref);
+            let unpacked: Vec<Value> = (0..len)
+                .map(|i| ctx.get_array_element(arr_ref, i))
+                .collect();
+            // invokeWithArguments ALWAYS returns Object: a void target must yield
+            // null (returning Ok(None) pushes NOTHING — the caller's areturn then
+            // underflows the operand stack and killed the VM; Gradle's
+            // MethodHandleBasedServiceMethod.invoke was the canonical victim) and
+            // primitive returns must be boxed.
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            let kind = match ctx.get_field(this, MH_KIND) {
+                Value::Int(k) => k,
+                _ => MH_KIND_VIRTUAL,
+            };
+            let result = mh_dispatch(ctx, this, &unpacked);
+            if kind == MH_KIND_CONSTRUCTOR {
+                result
+            } else {
+                auto_box_return(ctx, result, &desc)
+            }
+        },
+    );
+    r.register(
+        mh,
+        "invokeWithArguments",
+        "(Ljava/util/List;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Unpack the List via its own toArray() — layout-agnostic (the old
+            // direct slot reads assumed the ArrayList layout and silently saw 0
+            // args for any other List implementation).
+            let unpacked: Vec<Value> = match args.get(1) {
+                Some(Value::Object(Some(l))) => {
+                    match ctx.invoke_virtual(*l, "toArray", "()[Ljava/lang/Object;", &[])? {
+                        Some(Value::Object(Some(arr))) => {
+                            let len = ctx.array_length(arr);
+                            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            // Same Object-return contract as the Object[] overload above: box
+            // primitives, void → null.
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            let kind = match ctx.get_field(this, MH_KIND) {
+                Value::Int(k) => k,
+                _ => MH_KIND_VIRTUAL,
+            };
+            let result = mh_dispatch(ctx, this, &unpacked);
+            if kind == MH_KIND_CONSTRUCTOR {
+                result
+            } else {
+                auto_box_return(ctx, result, &desc)
+            }
+        },
+    );
+    r.register(
+        mh,
+        "bindTo",
+        "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let recv = args.get(1).copied().unwrap_or(Value::Object(None));
+            // Clone the MH and set BOUND field
+            let class = mh_read_class(ctx, this).unwrap_or_default();
+            let name = mh_read_name(ctx, this).unwrap_or_default();
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            let kind = match ctx.get_field(this, MH_KIND) {
+                Value::Int(k) => k,
+                _ => MH_KIND_VIRTUAL,
+            };
+            let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
+            if kind == MH_KIND_LAMBDA_FACTORY {
+                // A lambda factory may capture more than one value (e.g. log4j's
+                // `factory.bindTo(serviceType).bindTo(classLoader)`). The single-slot
+                // MH_BOUND used by the other kinds would drop all but the last bind,
+                // so accumulate captures, in bind order, into an Object[].
+                let prev = ctx.get_field(this, MH_BOUND);
+                let new_arr = match prev {
+                    Value::Object(Some(old)) => {
+                        let oldlen = ctx.array_length(old);
+                        let arr =
+                            ctx.new_array(cratonvm_types::ArrayElementType::Reference, oldlen + 1);
+                        for i in 0..oldlen {
+                            let v = ctx.get_array_element(old, i);
+                            ctx.set_array_element(arr, i, v);
+                        }
+                        ctx.set_array_element(arr, oldlen, recv);
+                        arr
+                    }
+                    _ => {
+                        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+                        ctx.set_array_element(arr, 0, recv);
+                        arr
+                    }
+                };
+                ctx.set_field(new_mh, MH_BOUND, Value::Object(Some(new_arr)));
+            } else {
+                ctx.set_field(new_mh, MH_BOUND, recv);
+            }
+            Ok(Some(Value::Object(Some(new_mh))))
+        },
+    );
     // asType — type adaptation: return self, but propagate the supplied
     // MethodType into the `type` field so subsequent JDK-internal reads of
     // `mh.type()` / `parameterSlotCount` reflect the adapted signature.
     // invoke()/invokeExact handle the actual argument coercions.
-    r.register(mh, "asType", "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
-        if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) = (args.first(), args.get(1)) {
-            ctx.set_field_by_name(*this, "type", Value::Object(Some(*mt)));
-        }
-        Ok(Some(args[0]))
-    });
+    r.register(
+        mh,
+        "asType",
+        "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) =
+                (args.first(), args.get(1))
+            {
+                ctx.set_field_by_name(*this, "type", Value::Object(Some(*mt)));
+            }
+            Ok(Some(args[0]))
+        },
+    );
 
     // C21: rebind() is JDK-abstract (no Code attribute) — synthetic MHs that
     // do not subclass BoundMethodHandle still get rebind() called by JDK
     // internals (e.g. Invokers, LambdaForm specialization). Return self so the
     // chain continues without "no Code attribute" internal errors.
-    r.register(mh, "rebind", "()Ljava/lang/invoke/BoundMethodHandle;", |_ctx, args| {
-        Ok(Some(args[0]))
-    });
+    r.register(
+        mh,
+        "rebind",
+        "()Ljava/lang/invoke/BoundMethodHandle;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
 
     // type() — return a MethodType representing this MH's signature.
     // C19: prefer the real-JDK `type` field (populated by C15/C19 at
     // slot 0). Fall back to our synthetic descriptor, then finally
     // synthesize `()V` so callers never observe null.
-    r.register(mh, "type", "()Ljava/lang/invoke/MethodType;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
-            return Ok(Some(Value::Object(Some(mt))));
-        }
-        let desc = mh_read_desc(ctx, this).unwrap_or_default();
-        if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
-            return Ok(Some(Value::Object(Some(mt))));
-        }
-        let mt = build_method_type_from_descriptor(ctx, "()V");
-        Ok(Some(Value::Object(mt)))
-    });
+    r.register(
+        mh,
+        "type",
+        "()Ljava/lang/invoke/MethodType;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
+                return Ok(Some(Value::Object(Some(mt))));
+            }
+            let desc = mh_read_desc(ctx, this).unwrap_or_default();
+            if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+                return Ok(Some(Value::Object(Some(mt))));
+            }
+            let mt = build_method_type_from_descriptor(ctx, "()V");
+            Ok(Some(Value::Object(mt)))
+        },
+    );
 
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
@@ -4569,7 +5013,7 @@ pub fn build_method_type_from_descriptor(
 
     let close = desc.find(')')?;
     let params_str = &desc[1..close];
-    let ret_str = &desc[close+1..];
+    let ret_str = &desc[close + 1..];
 
     let param_names = parse_descriptor_types(params_str);
     let ret_name = descriptor_to_class_name(ret_str);
@@ -4582,7 +5026,10 @@ pub fn build_method_type_from_descriptor(
     };
 
     // Create params array
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, param_names.len());
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        param_names.len(),
+    );
     for (i, pname) in param_names.iter().enumerate() {
         let mirror = if let Some(cid) = ctx.class_id_by_name(pname) {
             ctx.get_class_mirror(cid)
@@ -4661,37 +5108,72 @@ fn parse_descriptor_types(desc: &str) -> Vec<Cow<'static, str>> {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'I' => { result.push(Cow::Borrowed(NAME_INT));     i += 1; }
-            b'J' => { result.push(Cow::Borrowed(NAME_LONG));    i += 1; }
-            b'F' => { result.push(Cow::Borrowed(NAME_FLOAT));   i += 1; }
-            b'D' => { result.push(Cow::Borrowed(NAME_DOUBLE));  i += 1; }
-            b'Z' => { result.push(Cow::Borrowed(NAME_BOOLEAN)); i += 1; }
-            b'B' => { result.push(Cow::Borrowed(NAME_BYTE));    i += 1; }
-            b'C' => { result.push(Cow::Borrowed(NAME_CHAR));    i += 1; }
-            b'S' => { result.push(Cow::Borrowed(NAME_SHORT));   i += 1; }
-            b'V' => { result.push(Cow::Borrowed(NAME_VOID));    i += 1; }
+            b'I' => {
+                result.push(Cow::Borrowed(NAME_INT));
+                i += 1;
+            }
+            b'J' => {
+                result.push(Cow::Borrowed(NAME_LONG));
+                i += 1;
+            }
+            b'F' => {
+                result.push(Cow::Borrowed(NAME_FLOAT));
+                i += 1;
+            }
+            b'D' => {
+                result.push(Cow::Borrowed(NAME_DOUBLE));
+                i += 1;
+            }
+            b'Z' => {
+                result.push(Cow::Borrowed(NAME_BOOLEAN));
+                i += 1;
+            }
+            b'B' => {
+                result.push(Cow::Borrowed(NAME_BYTE));
+                i += 1;
+            }
+            b'C' => {
+                result.push(Cow::Borrowed(NAME_CHAR));
+                i += 1;
+            }
+            b'S' => {
+                result.push(Cow::Borrowed(NAME_SHORT));
+                i += 1;
+            }
+            b'V' => {
+                result.push(Cow::Borrowed(NAME_VOID));
+                i += 1;
+            }
             b'L' => {
                 if let Some(semi) = desc[i..].find(';') {
-                    result.push(Cow::Owned(desc[i+1..i+semi].to_string()));
+                    result.push(Cow::Owned(desc[i + 1..i + semi].to_string()));
                     i += semi + 1;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             b'[' => {
                 let start = i;
-                while i < bytes.len() && bytes[i] == b'[' { i += 1; }
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
                 if i < bytes.len() {
                     if bytes[i] == b'L' {
                         if let Some(semi) = desc[i..].find(';') {
-                            result.push(Cow::Owned(desc[start..i+semi+1].to_string()));
+                            result.push(Cow::Owned(desc[start..i + semi + 1].to_string()));
                             i += semi + 1;
-                        } else { break; }
+                        } else {
+                            break;
+                        }
                     } else {
                         result.push(Cow::Owned(desc[start..=i].to_string()));
                         i += 1;
                     }
                 }
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     result
@@ -4816,7 +5298,8 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(orig_ptypes)) = ctx.get_field(mt, 1) {
                     let orig_n = ctx.array_length(orig_ptypes);
                     let new_n = orig_n + extra_n;
-                    let new_ptypes = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
+                    let new_ptypes =
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
                     let pos_c = pos.min(orig_n);
                     for i in 0..pos_c {
                         let v = ctx.get_array_element(orig_ptypes, i);
@@ -4971,7 +5454,11 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => 0,
     };
     let is_static = (modifiers & 0x0008) != 0;
-    let kind = if is_static { MH_KIND_STATIC } else { MH_KIND_VIRTUAL };
+    let kind = if is_static {
+        MH_KIND_STATIC
+    } else {
+        MH_KIND_VIRTUAL
+    };
 
     let _ = ctx.ensure_class_initialized(&class_name);
     let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, kind);
@@ -5012,7 +5499,10 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// CratonVM extra-slot descriptor (matches `create_field_object` in
 /// `lang_class.rs`), and falls back to deriving it from the `type` Class
 /// mirror if needed.
-fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: cratonvm_types::ObjectRef) -> Cow<'static, str> {
+fn read_field_descriptor_string(
+    ctx: &dyn NativeContext,
+    field_obj: cratonvm_types::ObjectRef,
+) -> Cow<'static, str> {
     // The `type` field is a Class mirror — derive the descriptor from it
     // as a safe fallback (e.g. "J" for primitive long, "Ljava/lang/String;"
     // for references). This is the authoritative source in real JDK mode.
@@ -5021,14 +5511,14 @@ fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: cratonvm_typ
         if !name.is_empty() {
             return match name.as_str() {
                 NAME_BOOLEAN => Cow::Borrowed(DESC_BOOLEAN),
-                NAME_BYTE    => Cow::Borrowed(DESC_BYTE),
-                NAME_CHAR    => Cow::Borrowed(DESC_CHAR),
-                NAME_SHORT   => Cow::Borrowed(DESC_SHORT),
-                NAME_INT     => Cow::Borrowed(DESC_INT),
-                NAME_LONG    => Cow::Borrowed(DESC_LONG),
-                NAME_FLOAT   => Cow::Borrowed(DESC_FLOAT),
-                NAME_DOUBLE  => Cow::Borrowed(DESC_DOUBLE),
-                NAME_VOID    => Cow::Borrowed(DESC_VOID),
+                NAME_BYTE => Cow::Borrowed(DESC_BYTE),
+                NAME_CHAR => Cow::Borrowed(DESC_CHAR),
+                NAME_SHORT => Cow::Borrowed(DESC_SHORT),
+                NAME_INT => Cow::Borrowed(DESC_INT),
+                NAME_LONG => Cow::Borrowed(DESC_LONG),
+                NAME_FLOAT => Cow::Borrowed(DESC_FLOAT),
+                NAME_DOUBLE => Cow::Borrowed(DESC_DOUBLE),
+                NAME_VOID => Cow::Borrowed(DESC_VOID),
                 s if s.starts_with('[') => Cow::Owned(s.to_string()),
                 s => Cow::Owned(format!("L{};", s.replace('.', "/"))),
             };
@@ -5223,10 +5713,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 ///   field 2: Object type - MethodType or Class (field type)
 ///   field 3: int flags - access flags + ref kind
 ///   field 4: Object resolution (vmtarget/vmindex as int)
-pub(crate) fn native_mhn_resolve(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = MemberName self, args[1] = caller Class, args[2] = lookupMode, args[3] = speculativeResolve
     let member_name = crate::obj_arg(args, 0)?;
 
@@ -5289,10 +5776,7 @@ pub(crate) fn native_mhn_resolve(
 /// Initializes a MemberName from a reflected member (Method, Field, Constructor).
 /// Copies the declaring class, name, type, and flags from the reflected object
 /// into the MemberName fields.
-pub(crate) fn native_mhn_init(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // MemberName layout (JDK):
     //   clazz  (Class<?>)
     //   name   (String)
@@ -5336,7 +5820,11 @@ pub(crate) fn native_mhn_init(
                 Value::Int(v) => v,
                 _ => 0,
             };
-            let ref_kind = if (modifiers & ACC_STATIC) != 0 { REF_GET_STATIC } else { REF_GET_FIELD };
+            let ref_kind = if (modifiers & ACC_STATIC) != 0 {
+                REF_GET_STATIC
+            } else {
+                REF_GET_FIELD
+            };
             let flags = IS_FIELD | (modifiers & 0xFFFF) | (ref_kind << 24);
 
             ctx.set_field_by_name(member_name, "clazz", clazz);
@@ -5352,7 +5840,11 @@ pub(crate) fn native_mhn_init(
                 _ => 0,
             };
             let is_static = (modifiers & ACC_STATIC) != 0;
-            let ref_kind = if is_static { REF_INVOKE_STATIC } else { REF_INVOKE_VIRTUAL };
+            let ref_kind = if is_static {
+                REF_INVOKE_STATIC
+            } else {
+                REF_INVOKE_VIRTUAL
+            };
             let flags = IS_METHOD | (modifiers & 0xFFFF) | (ref_kind << 24);
 
             ctx.set_field_by_name(member_name, "clazz", clazz);
@@ -5394,8 +5886,7 @@ pub(crate) fn native_mhn_init(
             let ptypes = match ctx.get_field_by_name(ref_obj, "parameterTypes") {
                 Value::Object(Some(a)) => Value::Object(Some(a)),
                 _ => {
-                    let empty =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     Value::Object(Some(empty))
                 }
             };
@@ -5449,14 +5940,16 @@ pub(crate) fn native_mhn_link_method(
 ) -> MethodCallResult {
     // args: callerClass(0), refKind(1), defc(2), name(3), type(4), appendixResult(5)
     let _caller = args.get(0);
-    let ref_kind = match args.get(1) { Some(Value::Int(k)) => *k, _ => 0 };
+    let ref_kind = match args.get(1) {
+        Some(Value::Int(k)) => *k,
+        _ => 0,
+    };
 
     let defc_mirror = match args.get(2) {
         Some(Value::Object(Some(m))) => *m,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let class_name = crate::lang_class::mirror_class_name(ctx, defc_mirror)
-        .unwrap_or_default();
+    let class_name = crate::lang_class::mirror_class_name(ctx, defc_mirror).unwrap_or_default();
 
     let name = match args.get(3) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -5471,14 +5964,14 @@ pub(crate) fn native_mhn_link_method(
 
     // Determine MH kind from refKind
     let mh_kind = match ref_kind {
-        1 | 2 | 3 => MH_KIND_GETTER,   // getField/getStatic/putField
-        4         => MH_KIND_SETTER,    // putStatic
-        5         => MH_KIND_VIRTUAL,   // invokeVirtual
-        6         => MH_KIND_STATIC,    // invokeStatic
-        7         => MH_KIND_SPECIAL,   // invokeSpecial
-        8         => MH_KIND_CONSTRUCTOR, // newInvokeSpecial
-        9         => MH_KIND_VIRTUAL,   // invokeInterface
-        _         => MH_KIND_VIRTUAL,
+        1 | 2 | 3 => MH_KIND_GETTER, // getField/getStatic/putField
+        4 => MH_KIND_SETTER,         // putStatic
+        5 => MH_KIND_VIRTUAL,        // invokeVirtual
+        6 => MH_KIND_STATIC,         // invokeStatic
+        7 => MH_KIND_SPECIAL,        // invokeSpecial
+        8 => MH_KIND_CONSTRUCTOR,    // newInvokeSpecial
+        9 => MH_KIND_VIRTUAL,        // invokeInterface
+        _ => MH_KIND_VIRTUAL,
     };
 
     let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind);
@@ -5674,14 +6167,12 @@ pub(crate) fn native_ibg_generate_interpreter_entry_point(
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
         _ => DESC_DEFAULT_METHOD.to_string(),
     };
-    let ret_char = desc.rsplit_once(')').map(|(_, r)| r.chars().next().unwrap_or('V')).unwrap_or('V');
+    let ret_char = desc
+        .rsplit_once(')')
+        .map(|(_, r)| r.chars().next().unwrap_or('V'))
+        .unwrap_or('V');
     let name = format!("interpret_{}", ret_char);
-    let mn = alloc_resolved_member_name(
-        ctx,
-        "java/lang/invoke/LambdaForm",
-        &name,
-        &desc,
-    );
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", &name, &desc);
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -5701,12 +6192,7 @@ pub(crate) fn native_ibg_generate_customized_code(
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
         _ => DESC_DEFAULT_METHOD.to_string(),
     };
-    let mn = alloc_resolved_member_name(
-        ctx,
-        "java/lang/invoke/LambdaForm",
-        "MH",
-        &desc,
-    );
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "MH", &desc);
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -5722,12 +6208,7 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
     // args: LambdaForm.NamedFunction$Kind typeForm (0) OR MethodTypeForm (0)
     // We don't read it — just return a resolved MemberName with ()V type.
     let _ = args;
-    let mn = alloc_resolved_member_name(
-        ctx,
-        "java/lang/invoke/LambdaForm",
-        "NFI",
-        "()V",
-    );
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V");
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -5757,7 +6238,10 @@ mod tests {
         let t = ctx.get_field_by_name(mh, "type");
         match t {
             Value::Object(Some(_)) => {}
-            other => panic!("expected non-null MethodType at 'type' field, got {:?}", other),
+            other => panic!(
+                "expected non-null MethodType at 'type' field, got {:?}",
+                other
+            ),
         }
     }
 
@@ -5767,7 +6251,10 @@ mod tests {
     fn build_method_type_from_descriptor_non_null() {
         let mut ctx = MockNativeContext::new();
         let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I");
-        assert!(mt.is_some(), "MethodType should be non-null for a valid descriptor");
+        assert!(
+            mt.is_some(),
+            "MethodType should be non-null for a valid descriptor"
+        );
     }
 
     // Invalid descriptors should return None rather than panicking.
@@ -5810,7 +6297,10 @@ mod tests {
             Value::Int(f) => {
                 assert!(f != 0, "flags must be non-zero");
                 assert!((f & 0x1_0000) != 0, "IS_METHOD bit must be set");
-                assert!((f >> 24) & 0x0F == 6, "refKind must be REF_invokeStatic (6)");
+                assert!(
+                    (f >> 24) & 0x0F == 6,
+                    "refKind must be REF_invokeStatic (6)"
+                );
             }
             other => panic!("expected flags to be Int, got {:?}", other),
         }
@@ -5832,10 +6322,8 @@ mod tests {
     fn c33_ibg_interpreter_entry_point_returns_non_null() {
         let mut ctx = MockNativeContext::new();
         let mt = build_method_type_from_descriptor(&mut ctx, "(I)J").expect("MethodType");
-        let result = native_ibg_generate_interpreter_entry_point(
-            &mut ctx,
-            &[Value::Object(Some(mt))],
-        );
+        let result =
+            native_ibg_generate_interpreter_entry_point(&mut ctx, &[Value::Object(Some(mt))]);
         match result {
             Ok(Some(Value::Object(Some(_)))) => {}
             other => panic!("expected non-null MemberName, got {:?}", other),
@@ -5863,10 +6351,8 @@ mod tests {
     fn c33_ibg_named_function_invoker_returns_non_null() {
         let mut ctx = MockNativeContext::new();
         let form = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6);
-        let result = native_ibg_generate_named_function_invoker(
-            &mut ctx,
-            &[Value::Object(Some(form))],
-        );
+        let result =
+            native_ibg_generate_named_function_invoker(&mut ctx, &[Value::Object(Some(form))]);
         match result {
             Ok(Some(Value::Object(Some(_)))) => {}
             other => panic!("expected non-null MemberName, got {:?}", other),
@@ -5912,11 +6398,23 @@ mod tests {
         );
         let old = varhandle_get_and_add(
             &mut ctx,
-            &[Value::Object(Some(vh)), Value::Object(Some(recv)), Value::Int(5)],
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(5),
+            ],
         )
         .unwrap();
-        assert_eq!(old, Some(Value::Int(10)), "must return old value via meta, not 0");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(15), "field must be old + delta");
+        assert_eq!(
+            old,
+            Some(Value::Int(10)),
+            "must return old value via meta, not 0"
+        );
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(15),
+            "field must be old + delta"
+        );
     }
 
     #[test]
@@ -5943,11 +6441,23 @@ mod tests {
         );
         let old = varhandle_get_and_set(
             &mut ctx,
-            &[Value::Object(Some(vh)), Value::Object(Some(recv)), Value::Int(99)],
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(99),
+            ],
         )
         .unwrap();
-        assert_eq!(old, Some(Value::Int(20)), "must return old value via meta, not null");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(99), "field must be the new value");
+        assert_eq!(
+            old,
+            Some(Value::Int(20)),
+            "must return old value via meta, not null"
+        );
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(99),
+            "field must be the new value"
+        );
     }
 
     #[test]
@@ -5983,8 +6493,16 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(witness, Some(Value::Int(30)), "witness must be old value via meta");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(77), "field must be updated on match");
+        assert_eq!(
+            witness,
+            Some(Value::Int(30)),
+            "witness must be old value via meta"
+        );
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(77),
+            "field must be updated on match"
+        );
     }
 
     // LOW-finding fix regression: on a compareAndExchange whose `expected`
@@ -6026,8 +6544,16 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(witness, Some(Value::Int(30)), "witness must be the current value on mismatch");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(30), "field must be unchanged on mismatch");
+        assert_eq!(
+            witness,
+            Some(Value::Int(30)),
+            "witness must be the current value on mismatch"
+        );
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(30),
+            "field must be unchanged on mismatch"
+        );
     }
 
     // LOW-finding fix regression: `varhandle_compare_and_set` now routes the
@@ -6067,8 +6593,16 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(miss, Some(Value::Int(0)), "mismatch must report CAS failure");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(5), "field must be unchanged on mismatch");
+        assert_eq!(
+            miss,
+            Some(Value::Int(0)),
+            "mismatch must report CAS failure"
+        );
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(5),
+            "field must be unchanged on mismatch"
+        );
         // Correct expected → swap, returns 1 (true).
         let hit = varhandle_compare_and_set(
             &mut ctx,
@@ -6081,7 +6615,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hit, Some(Value::Int(1)), "match must report CAS success");
-        assert_eq!(ctx.get_field(recv, 0), Value::Int(42), "field must hold new value on success");
+        assert_eq!(
+            ctx.get_field(recv, 0),
+            Value::Int(42),
+            "field must hold new value on success"
+        );
     }
 }
-

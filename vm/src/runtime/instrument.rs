@@ -66,8 +66,8 @@ use std::sync::{OnceLock, RwLock};
 
 use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::{
-    ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
     error::{MethodCallFailed, MethodCallResult, VmError},
+    ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -199,9 +199,7 @@ pub fn approximate_object_size(
     length: usize,
     num_slots: usize,
 ) -> i64 {
-    use cratonvm_types::{
-        HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE, element_byte_size,
-    };
+    use cratonvm_types::{element_byte_size, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE};
     let header = HEADER_SIZE as i64;
     let body = match kind {
         ObjectKind::Object => (num_slots * SLOT_SIZE) as i64,
@@ -273,7 +271,10 @@ fn native_is_modifiable_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// `Class<?>[] getAllLoadedClasses0()`. Args: [this].
-fn native_get_all_loaded_classes0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_get_all_loaded_classes0(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let class_ids = ctx.list_loaded_class_ids();
     let class_class_id = ctx
         .class_id_by_name("java/lang/Class")
@@ -288,10 +289,7 @@ fn native_get_all_loaded_classes0(ctx: &mut dyn NativeContext, _args: &[Value]) 
 
 /// `Class<?>[] getInitiatedClasses0(ClassLoader loader)`.
 /// Args: [this, loaderObject].
-fn native_get_initiated_classes0(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_get_initiated_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // We don't dereference the loader object — we use the bootstrap /
     // app-loader-id 0 path for null and a synthetic mapping for
     // non-null. The `list_initiated_class_ids(0)` call returns the
@@ -531,12 +529,18 @@ fn native_set_native_method_prefix0(
 }
 
 /// `boolean isRetransformClassesSupported0()`. Args: [this].
-fn native_is_retransform_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_is_retransform_supported0(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
 
 /// `boolean isRedefineClassesSupported0()`. Args: [this].
-fn native_is_redefine_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_is_redefine_supported0(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
 
@@ -565,7 +569,10 @@ fn native_bridge_add_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(None)
 }
 
-fn native_bridge_remove_transformer(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_bridge_remove_transformer(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let transformer = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -600,7 +607,10 @@ fn native_bridge_get_all_loaded_classes(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-fn native_bridge_is_modifiable_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_bridge_is_modifiable_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let mirror = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -1694,11 +1704,7 @@ mod tests {
             )
             .is_some());
         assert!(r
-            .find(
-                impl_class,
-                "retransformClasses0",
-                "([Ljava/lang/Class;)V",
-            )
+            .find(impl_class, "retransformClasses0", "([Ljava/lang/Class;)V",)
             .is_some());
         assert!(r
             .find(impl_class, "getAllLoadedClasses0", "()[Ljava/lang/Class;")

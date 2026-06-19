@@ -40,8 +40,8 @@
 
 use crate::{DeviceCaps, DeviceError, KernelArg, KernelArgs, LaunchConfig, Result};
 use cudarc::driver::{
-    CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig as CudarcLaunchConfig,
-    DeviceSlice, DevicePtr, LaunchAsync,
+    CudaDevice, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, DeviceSlice,
+    LaunchAsync, LaunchConfig as CudarcLaunchConfig,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -55,8 +55,12 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     let dev = CudaDevice::new(0).map_err(map_err("CudaDevice::new(0)"))?;
     let name = dev.name().map_err(map_err("device name"))?;
     let attr = |a| dev.attribute(a).map_err(map_err("device attribute"));
-    let major = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-    let minor = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+    let major = attr(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+    )?;
+    let minor = attr(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+    )?;
     // cudarc 0.13 / the CUDA driver API has no
     // `CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY` device attribute — total
     // global memory is queried with `cuDeviceTotalMem` instead. The
@@ -143,14 +147,22 @@ pub(crate) struct DeviceContextInner {
 impl DeviceContextInner {
     pub(crate) fn new(device_ordinal: u32) -> Result<Self> {
         let dev = CudaDevice::new(device_ordinal as usize).map_err(map_err("CudaDevice::new"))?;
-        let default = dev.fork_default_stream().map_err(map_err("fork_default_stream"))?;
+        let default = dev
+            .fork_default_stream()
+            .map_err(map_err("fork_default_stream"))?;
         // AUDIT 2026-05-17 (PERF Fix 1): create three auxiliary streams
         // for the H2D → compute → D2H pipeline. `fork_default_stream` produces
         // an independent cudarc stream (the cudarc equivalent of
         // `cudaStreamCreate(&s, cudaStreamNonBlocking)`).
-        let copy_h2d = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_h2d"))?;
-        let compute = dev.fork_default_stream().map_err(map_err("fork_default_stream compute"))?;
-        let copy_d2h = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_d2h"))?;
+        let copy_h2d = dev
+            .fork_default_stream()
+            .map_err(map_err("fork_default_stream copy_h2d"))?;
+        let compute = dev
+            .fork_default_stream()
+            .map_err(map_err("fork_default_stream compute"))?;
+        let copy_d2h = dev
+            .fork_default_stream()
+            .map_err(map_err("fork_default_stream copy_d2h"))?;
         // AUDIT 2026-05-24 (C32 stream-port fix): create the two barrier
         // events with `CU_EVENT_DISABLE_TIMING` since we never measure
         // elapsed GPU time on them — only use them for `cuEventRecord`
@@ -192,7 +204,9 @@ impl DeviceContextInner {
         // (`CudaDevice::wait_for` only makes the default stream wait on
         // another stream and does NOT block the host, so it cannot be
         // used here.)
-        self.dev.synchronize().map_err(map_err("synchronize device"))?;
+        self.dev
+            .synchronize()
+            .map_err(map_err("synchronize device"))?;
         Ok(())
     }
 
@@ -299,7 +313,8 @@ impl DeviceModuleInner {
             .map_err(map_err("load_ptx"))?;
         let mut functions = HashMap::with_capacity(kernel_names.len());
         for &name in kernel_names {
-            let func = ctx.dev
+            let func = ctx
+                .dev
                 .get_func(module_name, name)
                 .ok_or_else(|| DeviceError::KernelNotFound(format!("{module_name}::{name}")))?;
             functions.insert(name.to_string(), func);
@@ -465,8 +480,7 @@ impl DeviceModuleInner {
                 // record it on the compute stream the kernel ran on.
                 let kernel_done = std::sync::Arc::new(self.make_compute_event(ctx)?);
                 for slot in &last_write_slots {
-                    *slot.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(kernel_done.clone());
+                    *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
                 }
             }
         }
@@ -560,7 +574,11 @@ impl DeviceModuleInner {
         let mut ptr_h = PTR_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         ptr_h.clear();
         // Pre-size in one shot so we don't realloc mid-loop
-        let n_ptrs = args.raw.iter().filter(|a| matches!(a, KernelArg::DevicePtr { .. })).count();
+        let n_ptrs = args
+            .raw
+            .iter()
+            .filter(|a| matches!(a, KernelArg::DevicePtr { .. }))
+            .count();
         ptr_h.reserve(n_ptrs);
         for a in &args.raw {
             if let KernelArg::DevicePtr { addr, .. } = a {
@@ -835,24 +853,30 @@ pub(crate) struct DeviceBufferInner<T> {
 /// overflow check at all.
 #[inline]
 fn check_alloc_size<T>(stage: &str, len: usize) -> Result<()> {
-    len.checked_mul(std::mem::size_of::<T>())
-        .ok_or_else(|| DeviceError::Driver(format!(
+    len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        DeviceError::Driver(format!(
             "{stage}: size overflow ({len} elements of {} bytes)",
             std::mem::size_of::<T>()
-        )))?;
+        ))
+    })?;
     Ok(())
 }
 
-impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBufferInner<T> {
+impl<
+        T: bytemuck::Pod
+            + DeviceRepr
+            + Send
+            + Sync
+            + 'static
+            + cudarc::driver::ValidAsZeroBits
+            + std::marker::Unpin,
+    > DeviceBufferInner<T>
+{
     pub(crate) fn uninit(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
         check_alloc_size::<T>("alloc uninit", len)?;
         // Output buffers are bound to the compute stream — the kernel
         // launch that fills them already runs there.
-        let slice = unsafe {
-            ctx.dev
-                .alloc::<T>(len)
-                .map_err(map_err("alloc uninit"))?
-        };
+        let slice = unsafe { ctx.dev.alloc::<T>(len).map_err(map_err("alloc uninit"))? };
         Ok(Self {
             slice: Arc::new(slice),
             stream: ctx.compute.clone(),
@@ -867,7 +891,8 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // AUDIT 2026-05-20 (PERF Fix #4): same overflow guard as `uninit`
         // — `alloc_zeros` would otherwise wrap inside cudarc on a huge `len`.
         check_alloc_size::<T>("alloc_zeros", len)?;
-        let slice = ctx.dev
+        let slice = ctx
+            .dev
             .alloc_zeros::<T>(len)
             .map_err(map_err("alloc_zeros"))?;
         Ok(Self {
@@ -960,8 +985,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // responsible for the host-buffer lifetime; see this method's
         // doc comment. `last_write_event` is owned by the caller's
         // `Arc<Event>` and only borrowed for the FFI call.
-        let slice =
-            unsafe { upload_on_stream(ctx, host, upload_stream, last_write_event) }?;
+        let slice = unsafe { upload_on_stream(ctx, host, upload_stream, last_write_event) }?;
         Ok(Self {
             slice: Arc::new(slice),
             // The buffer's contents were produced on `upload_stream`;
@@ -975,7 +999,11 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         })
     }
 
-    pub(crate) fn to_host(&self, dst: &mut [T], wait_event: Option<cudarc::driver::sys::CUevent>) -> Result<()> {
+    pub(crate) fn to_host(
+        &self,
+        dst: &mut [T],
+        wait_event: Option<cudarc::driver::sys::CUevent>,
+    ) -> Result<()> {
         if dst.len() != self.len() {
             return Err(DeviceError::Memcpy(format!(
                 "to_host length mismatch: dst.len()={}, slice.len()={}",

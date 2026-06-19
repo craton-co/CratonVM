@@ -63,7 +63,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -106,8 +110,8 @@ fn build_svctest_jar(workdir: &Path) -> Option<PathBuf> {
     let jar_path = workdir.join("svctest.jar");
     let file = File::create(&jar_path).ok()?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file("META-INF/MANIFEST.MF", opts).ok()?;
     zip.write_all(SVCTEST_MANIFEST_MF.as_bytes()).ok()?;
@@ -169,9 +173,7 @@ fn parse_total(stdout: &str) -> i64 {
             }
         }
     }
-    panic!(
-        "[wave1_b2_bootloader_resources] no `total=` line in stdout:\n{stdout}"
-    );
+    panic!("[wave1_b2_bootloader_resources] no `total=` line in stdout:\n{stdout}");
 }
 
 /// W1-B regression: `META-INF/MANIFEST.MF` in a classpath JAR is enumerated.
@@ -239,9 +241,7 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
     let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
-            eprintln!(
-                "[wave1_b2_bootloader_resources] skip: cratonvm binary not found"
-            );
+            eprintln!("[wave1_b2_bootloader_resources] skip: cratonvm binary not found");
             return;
         }
     };
@@ -260,8 +260,8 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
     let cp = format!("{}", classes.display());
     let res = "META-INF/services/java.nio.file.spi.FileSystemProvider";
 
-    let (stdout, stderr) = run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60))
-        .expect("spawn cratonvm");
+    let (stdout, stderr) =
+        run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60)).expect("spawn cratonvm");
 
     assert!(
         stdout.contains("OK"),
@@ -282,7 +282,9 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
     if total >= 1 {
         // URL line present and well-formed.
         assert!(
-            stdout.contains("url: jrt:") || stdout.contains("url: jar:") || stdout.contains("url: file:"),
+            stdout.contains("url: jrt:")
+                || stdout.contains("url: jar:")
+                || stdout.contains("url: file:"),
             "[wave1_b2] expected at least one well-formed URL line; got:\n{stdout}"
         );
     }
@@ -297,9 +299,7 @@ fn wave1_b2_missing_jimage_resource_returns_zero() {
     let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
-            eprintln!(
-                "[wave1_b2_bootloader_resources] skip: cratonvm binary not found"
-            );
+            eprintln!("[wave1_b2_bootloader_resources] skip: cratonvm binary not found");
             return;
         }
     };
@@ -320,10 +320,13 @@ fn wave1_b2_missing_jimage_resource_returns_zero() {
     // sane JDK image and any classpath entry we build.
     let res = "META-INF/this/does/not/exist/anywhere.txt";
 
-    let (stdout, _stderr) = run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60))
-        .expect("spawn cratonvm");
+    let (stdout, _stderr) =
+        run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60)).expect("spawn cratonvm");
 
-    assert!(stdout.contains("OK"), "[wave1_b2] expected OK in stdout: {stdout}");
+    assert!(
+        stdout.contains("OK"),
+        "[wave1_b2] expected OK in stdout: {stdout}"
+    );
     let total = parse_total(&stdout);
     assert_eq!(
         total, 0,

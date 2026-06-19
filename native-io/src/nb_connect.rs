@@ -52,10 +52,10 @@ pub enum ConnectPoll {
     Failed(std::io::Error),
 }
 
-#[cfg(windows)]
-pub use imp_windows::{poll, start};
 #[cfg(unix)]
 pub use imp_unix::{poll, start};
+#[cfg(windows)]
+pub use imp_windows::{poll, start};
 
 // ---------------------------------------------------------------------------
 // Windows — raw Ws2_32 FFI (mirrors net.rs / nio_selector.rs patterns)
@@ -104,8 +104,13 @@ mod imp_windows {
         fn socket(af: i32, ty: i32, protocol: i32) -> Socket;
         fn connect(s: Socket, name: *const u8, namelen: i32) -> i32;
         fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
-        fn getsockopt(s: Socket, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32)
-            -> i32;
+        fn getsockopt(
+            s: Socket,
+            level: i32,
+            optname: i32,
+            optval: *mut u8,
+            optlen: *mut i32,
+        ) -> i32;
         fn closesocket(s: Socket) -> i32;
         fn WSAGetLastError() -> i32;
         fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
@@ -188,8 +193,15 @@ mod imp_windows {
         let mut err: i32 = 0;
         let mut len: i32 = std::mem::size_of::<i32>() as i32;
         // SAFETY: `err`/`len` are valid out-pointers sized for an int option.
-        let rc =
-            unsafe { getsockopt(s, SOL_SOCKET, SO_ERROR, &mut err as *mut i32 as *mut u8, &mut len) };
+        let rc = unsafe {
+            getsockopt(
+                s,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut err as *mut i32 as *mut u8,
+                &mut len,
+            )
+        };
         if rc != 0 {
             return ConnectPoll::Failed(std::io::Error::last_os_error());
         }
@@ -261,7 +273,11 @@ mod imp_unix {
                 return Err(e);
             }
             let sa = build_sockaddr(addr);
-            let rc = libc::connect(fd, sa.as_ptr() as *const libc::sockaddr, sa.len() as libc::socklen_t);
+            let rc = libc::connect(
+                fd,
+                sa.as_ptr() as *const libc::sockaddr,
+                sa.len() as libc::socklen_t,
+            );
             if rc == 0 {
                 return Ok(StartConnect::Connected(TcpStream::from_raw_fd(fd)));
             }

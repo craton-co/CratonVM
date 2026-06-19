@@ -156,15 +156,10 @@ pub enum EventModifier {
         depth: StepDepth,
     },
     /// FieldOnly modifier (JDWP modKind 8): restrict to a specific field.
-    FieldOnly {
-        class_id: u64,
-        field_id: u64,
-    },
+    FieldOnly { class_id: u64, field_id: u64 },
     /// ConditionalFilter modifier (JDWP modKind 7): expression ID for
     /// conditional breakpoints.
-    ConditionalFilter {
-        expr_id: u32,
-    },
+    ConditionalFilter { expr_id: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -229,13 +224,16 @@ impl EventManager {
         self.next_request_id += 1;
 
         // Extract step depth/size from the Step modifier if present.
-        let (step_depth, step_size) = modifiers.iter().find_map(|m| {
-            if let EventModifier::Step { depth, size, .. } = m {
-                Some((Some(*depth), Some(*size)))
-            } else {
-                None
-            }
-        }).unwrap_or((None, None));
+        let (step_depth, step_size) = modifiers
+            .iter()
+            .find_map(|m| {
+                if let EventModifier::Step { depth, size, .. } = m {
+                    Some((Some(*depth), Some(*size)))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((None, None));
 
         self.requests.insert(
             id,
@@ -304,12 +302,16 @@ impl EventManager {
 
     /// Whether any breakpoint requests are currently active.
     pub fn has_breakpoints(&self) -> bool {
-        self.requests.values().any(|r| r.kind == EventKind::Breakpoint)
+        self.requests
+            .values()
+            .any(|r| r.kind == EventKind::Breakpoint)
     }
 
     /// Whether any single-step requests are currently active.
     pub fn has_single_steps(&self) -> bool {
-        self.requests.values().any(|r| r.kind == EventKind::SingleStep)
+        self.requests
+            .values()
+            .any(|r| r.kind == EventKind::SingleStep)
     }
 
     /// Clear all event requests.
@@ -327,10 +329,7 @@ impl EventManager {
     ///
     /// If you don't have frame depth info, pass `None` for `current_frame_depth`
     /// and depth filtering will be skipped (backwards compatible).
-    pub fn check_single_step(
-        &self,
-        thread_id: u64,
-    ) -> Option<&EventRequest> {
+    pub fn check_single_step(&self, thread_id: u64) -> Option<&EventRequest> {
         self.check_single_step_with_depth(thread_id, None)
     }
 
@@ -415,20 +414,20 @@ impl EventManager {
 
     /// Whether any field-access watchpoints are currently active.
     pub fn has_field_access_watchpoints(&self) -> bool {
-        self.requests.values().any(|r| r.kind == EventKind::FieldAccess)
+        self.requests
+            .values()
+            .any(|r| r.kind == EventKind::FieldAccess)
     }
 
     /// Whether any field-modification watchpoints are currently active.
     pub fn has_field_modification_watchpoints(&self) -> bool {
-        self.requests.values().any(|r| r.kind == EventKind::FieldModification)
+        self.requests
+            .values()
+            .any(|r| r.kind == EventKind::FieldModification)
     }
 
     /// Check whether any request matches a thread event of the given kind.
-    pub fn check_thread_event(
-        &self,
-        kind: EventKind,
-        thread_id: u64,
-    ) -> Option<&EventRequest> {
+    pub fn check_thread_event(&self, kind: EventKind, thread_id: u64) -> Option<&EventRequest> {
         for req in self.requests.values() {
             if req.kind != kind {
                 continue;
@@ -789,14 +788,25 @@ mod tests {
         mgr.set_event_request(
             EventKind::FieldAccess,
             SuspendPolicy::All,
-            vec![EventModifier::FieldOnly { class_id: 10, field_id: 3 }],
+            vec![EventModifier::FieldOnly {
+                class_id: 10,
+                field_id: 3,
+            }],
         );
 
-        assert!(mgr.check_field_watchpoint(EventKind::FieldAccess, 10, 3).is_some());
-        assert!(mgr.check_field_watchpoint(EventKind::FieldAccess, 10, 4).is_none());
-        assert!(mgr.check_field_watchpoint(EventKind::FieldAccess, 11, 3).is_none());
+        assert!(mgr
+            .check_field_watchpoint(EventKind::FieldAccess, 10, 3)
+            .is_some());
+        assert!(mgr
+            .check_field_watchpoint(EventKind::FieldAccess, 10, 4)
+            .is_none());
+        assert!(mgr
+            .check_field_watchpoint(EventKind::FieldAccess, 11, 3)
+            .is_none());
         // Wrong kind
-        assert!(mgr.check_field_watchpoint(EventKind::FieldModification, 10, 3).is_none());
+        assert!(mgr
+            .check_field_watchpoint(EventKind::FieldModification, 10, 3)
+            .is_none());
     }
 
     #[test]
@@ -808,7 +818,10 @@ mod tests {
         mgr.set_event_request(
             EventKind::FieldAccess,
             SuspendPolicy::All,
-            vec![EventModifier::FieldOnly { class_id: 1, field_id: 1 }],
+            vec![EventModifier::FieldOnly {
+                class_id: 1,
+                field_id: 1,
+            }],
         );
         assert!(mgr.has_field_access_watchpoints());
         assert!(!mgr.has_field_modification_watchpoints());
@@ -816,7 +829,10 @@ mod tests {
         mgr.set_event_request(
             EventKind::FieldModification,
             SuspendPolicy::EventThread,
-            vec![EventModifier::FieldOnly { class_id: 2, field_id: 2 }],
+            vec![EventModifier::FieldOnly {
+                class_id: 2,
+                field_id: 2,
+            }],
         );
         assert!(mgr.has_field_modification_watchpoints());
     }

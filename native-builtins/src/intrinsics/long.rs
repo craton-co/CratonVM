@@ -16,8 +16,8 @@
 //! behavior.
 
 use cratonvm_native_api::NativeContext;
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 /// `java/lang/Long.valueOf (J)Ljava/lang/Long;`
 ///
@@ -31,10 +31,7 @@ use cratonvm_types::error::MethodCallResult;
 /// Because dispatch lands in identical Rust code, the wrapper-allocation /
 /// Long-cache identity behavior is exactly whatever the registry path produces
 /// — there is no second code path to drift from.
-pub fn intrinsic_long_value_of(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_long_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_math::native_long_value_of(ctx, args)
 }
 
@@ -48,10 +45,7 @@ pub fn intrinsic_long_value_of(
 /// `lang_math.rs`. (The registered callback is `native_wrapper_long_value`, not
 /// a `native_long_long_value`; the contract handler name `intrinsic_long_long_value`
 /// maps onto that exact registered native.)
-pub fn intrinsic_long_long_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_long_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_math::native_wrapper_long_value(ctx, args)
 }
 
@@ -65,10 +59,7 @@ pub fn intrinsic_long_long_value(
 /// Because dispatch lands in identical Rust code, `NumberFormatException`
 /// parity (roadmap §7) is automatic: a null string or an unparseable input
 /// throws the identical exception with intrinsics on or off.
-pub fn intrinsic_long_parse_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_long_parse_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::lang_math::native_long_parse_long(ctx, args)
 }
 

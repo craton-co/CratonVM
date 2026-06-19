@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use smallvec::smallvec;
 
-use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventTypeRegistry, EventValue, FieldKind};
+use crate::event::{
+    EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventTypeRegistry, EventValue,
+    FieldKind,
+};
 use crate::recording::FlightRecorder;
 
 // ---------------------------------------------------------------------------
@@ -101,7 +104,12 @@ fn validate_builtin_field_shape(
             actual: field_values.len(),
         });
     }
-    for (idx, (decl, value)) in event_type.fields.iter().zip(field_values.iter()).enumerate() {
+    for (idx, (decl, value)) in event_type
+        .fields
+        .iter()
+        .zip(field_values.iter())
+        .enumerate()
+    {
         let declared = FieldKind::from_declared(&decl.type_name).ok_or_else(|| {
             EmitError::UnknownDeclaredType {
                 field_index: idx,
@@ -129,7 +137,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     registry.register(EventType {
         id: stub_id,
         name: "jdk.GarbageCollection".into(),
-        category: vec!["Java Virtual Machine".into(), "GC".into(), "Collector".into()],
+        category: vec![
+            "Java Virtual Machine".into(),
+            "GC".into(),
+            "Collector".into(),
+        ],
         description: "Garbage collection".into(),
         fields: vec![
             EventField::new("gcId", "int", "GC Identifier"),
@@ -164,7 +176,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     registry.register(EventType {
         id: stub_id,
         name: "jdk.YoungGarbageCollection".into(),
-        category: vec!["Java Virtual Machine".into(), "GC".into(), "Collector".into()],
+        category: vec![
+            "Java Virtual Machine".into(),
+            "GC".into(),
+            "Collector".into(),
+        ],
         description: "Young generation garbage collection".into(),
         fields: vec![
             EventField::new("gcId", "int", "GC Identifier"),
@@ -180,11 +196,13 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     registry.register(EventType {
         id: stub_id,
         name: "jdk.OldGarbageCollection".into(),
-        category: vec!["Java Virtual Machine".into(), "GC".into(), "Collector".into()],
-        description: "Old generation garbage collection".into(),
-        fields: vec![
-            EventField::new("gcId", "int", "GC Identifier"),
+        category: vec![
+            "Java Virtual Machine".into(),
+            "GC".into(),
+            "Collector".into(),
         ],
+        description: "Old generation garbage collection".into(),
+        fields: vec![EventField::new("gcId", "int", "GC Identifier")],
         has_thread: true,
         has_stacktrace: false,
         period: EventPeriod::BeginEnd,
@@ -213,9 +231,7 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         name: "jdk.ThreadEnd".into(),
         category: vec!["Java Application".into(), "Threading".into()],
         description: "Thread end".into(),
-        fields: vec![
-            EventField::new("thread", "string", "Java Thread"),
-        ],
+        fields: vec![EventField::new("thread", "string", "Java Thread")],
         has_thread: true,
         has_stacktrace: false,
         period: EventPeriod::None,
@@ -228,9 +244,7 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         name: "jdk.ThreadSleep".into(),
         category: vec!["Java Application".into(), "Threading".into()],
         description: "Thread sleep".into(),
-        fields: vec![
-            EventField::new("time", "long", "Sleep Time (ns)"),
-        ],
+        fields: vec![EventField::new("time", "long", "Sleep Time (ns)")],
         has_thread: true,
         has_stacktrace: true,
         period: EventPeriod::BeginEnd,
@@ -470,7 +484,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     registry.register(EventType {
         id: stub_id,
         name: "jdk.MetaspaceSummary".into(),
-        category: vec!["Java Virtual Machine".into(), "GC".into(), "Metaspace".into()],
+        category: vec![
+            "Java Virtual Machine".into(),
+            "GC".into(),
+            "Metaspace".into(),
+        ],
         description: "Metaspace summary".into(),
         fields: vec![
             EventField::new("gcId", "int", "GC Identifier"),
@@ -631,9 +649,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         name: "jdk.SafepointEnd".into(),
         category: vec!["Java Virtual Machine".into(), "Runtime".into()],
         description: "Safepoint end".into(),
-        fields: vec![
-            EventField::new("safepointId", "long", "Safepoint Identifier"),
-        ],
+        fields: vec![EventField::new(
+            "safepointId",
+            "long",
+            "Safepoint Identifier",
+        )],
         has_thread: true,
         has_stacktrace: false,
         period: EventPeriod::BeginEnd,
@@ -727,9 +747,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         name: "jdk.SystemGC".into(),
         category: vec!["Java Virtual Machine".into(), "GC".into()],
         description: "System.gc() invocation".into(),
-        fields: vec![
-            EventField::new("invokedConcurrent", "boolean", "Invoked Concurrent"),
-        ],
+        fields: vec![EventField::new(
+            "invokedConcurrent",
+            "boolean",
+            "Invoked Concurrent",
+        )],
         has_thread: true,
         has_stacktrace: true,
         period: EventPeriod::None,
@@ -740,7 +762,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     registry.register(EventType {
         id: stub_id,
         name: "jdk.GCReferenceStatistics".into(),
-        category: vec!["Java Virtual Machine".into(), "GC".into(), "Reference".into()],
+        category: vec![
+            "Java Virtual Machine".into(),
+            "GC".into(),
+            "Reference".into(),
+        ],
         description: "GC reference processing statistics".into(),
         fields: vec![
             EventField::new("gcId", "int", "GC Identifier"),
@@ -842,9 +868,11 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         name: "jdk.ExceptionStatistics".into(),
         category: vec!["Java Application".into()],
         description: "Exception statistics".into(),
-        fields: vec![
-            EventField::new("throwables", "long", "Total Throwables Created"),
-        ],
+        fields: vec![EventField::new(
+            "throwables",
+            "long",
+            "Total Throwables Created",
+        )],
         has_thread: false,
         has_stacktrace: false,
         period: EventPeriod::EveryChunk,
@@ -982,7 +1010,9 @@ pub fn emit_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GarbageCollection") {
         // Round-4: name/cause are now `&'static str` (every caller passes
@@ -1025,7 +1055,9 @@ pub fn emit_class_load_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1054,7 +1086,9 @@ pub fn emit_class_load_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassLoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1086,7 +1120,9 @@ pub fn emit_thread_start_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         // `thread_name` is the user-supplied Java thread name — still Arc.
@@ -1117,7 +1153,9 @@ pub fn emit_thread_start_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -1149,7 +1187,9 @@ pub fn emit_compilation_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
         // `method` is a fully-qualified Java method descriptor, dynamic — Arc.
@@ -1188,7 +1228,9 @@ pub fn emit_compilation_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Compilation") {
         let mut fields = crate::event::EventFields::with_capacity(7);
@@ -1219,7 +1261,9 @@ pub fn emit_thread_end_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
         // Round-9 HIGH-5: prefer `emit_thread_end_event_arc` below when the
@@ -1245,7 +1289,9 @@ pub fn emit_thread_end_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
         let mut fields = crate::event::EventFields::with_capacity(1);
@@ -1271,7 +1317,9 @@ pub fn emit_thread_sleep_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadSleep") {
         let event = EventInstance {
@@ -1279,9 +1327,7 @@ pub fn emit_thread_sleep_event(
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
             thread_id,
-            fields: smallvec![
-                EventValue::Long(sleep_time_ns),
-            ],
+            fields: smallvec![EventValue::Long(sleep_time_ns),],
         };
         push_builtin_event(recorder, event);
     }
@@ -1301,7 +1347,9 @@ pub fn emit_monitor_wait_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
         // Round-5: `notifier_thread` callers pass literals ("unknown" today;
@@ -1339,7 +1387,9 @@ pub fn emit_monitor_wait_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorWait") {
         let mut fields = crate::event::EventFields::with_capacity(5);
@@ -1376,7 +1426,9 @@ pub fn emit_monitor_enter_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1406,7 +1458,9 @@ pub fn emit_monitor_enter_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaMonitorEnter") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1436,7 +1490,9 @@ pub fn emit_class_unload_event(
     defining_loader: &'static str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
         // class_name is dynamic; defining_loader is taxonomy literal.
@@ -1467,7 +1523,9 @@ pub fn emit_class_unload_event_arc(
     defining_loader: &'static str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ClassUnload") {
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -1496,7 +1554,9 @@ pub fn emit_thread_park_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadPark") {
         // Round-4: `parked_class` is always a literal class name (`LockSupport`).
@@ -1527,7 +1587,9 @@ pub fn emit_virtual_thread_pinned_event(
     virtual_thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
         // Round-4: `pin_reason` is a JEP-491 enum literal (e.g. "Synchronized",
@@ -1561,7 +1623,9 @@ pub fn emit_virtual_thread_pinned_event_arc(
     virtual_thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.VirtualThreadPinned") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1590,7 +1654,9 @@ pub fn emit_gc_heap_summary_event(
     heap_max: i64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCHeapSummary") {
         // Round-4: `when` is "Before GC" / "After GC", `heap_space` is "Eden",
@@ -1624,7 +1690,9 @@ pub fn emit_allocation_in_new_tlab_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
         // `object_class` is a Java class name — fully dynamic.
@@ -1654,7 +1722,9 @@ pub fn emit_allocation_outside_tlab_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
         // Prefer `emit_allocation_outside_tlab_event_arc` from callers that
@@ -1684,7 +1754,9 @@ pub fn emit_allocation_in_new_tlab_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationInNewTLAB") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1711,7 +1783,9 @@ pub fn emit_allocation_outside_tlab_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationOutsideTLAB") {
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -1736,7 +1810,9 @@ pub fn emit_gc_phase_pause_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.GCPhasePause") {
         // Round-4: `phase_name` is from the fixed GC-phase taxonomy
@@ -1763,7 +1839,9 @@ pub fn emit_young_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.YoungGarbageCollection") {
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -1787,7 +1865,9 @@ pub fn emit_old_gc_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.OldGarbageCollection") {
         let mut fields = crate::event::EventFields::with_capacity(1);
@@ -1813,7 +1893,9 @@ pub fn emit_metaspace_summary_event(
     metaspace_reserved: i64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.MetaspaceSummary") {
         // Round-4: `when` is "Before GC" / "After GC" — literal.
@@ -1843,7 +1925,9 @@ pub fn emit_execution_sample_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
         // Round-4: `state` is a fixed JVM thread-state enum
@@ -1876,7 +1960,9 @@ pub fn emit_execution_sample_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExecutionSample") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1902,7 +1988,9 @@ pub fn emit_cpu_load_event(
     machine_total: f32,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.CPULoad") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -1929,7 +2017,9 @@ pub fn emit_thread_statistics_event(
     peak_count: i64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaThreadStatistics") {
         let mut fields = crate::event::EventFields::with_capacity(4);
@@ -1958,7 +2048,9 @@ pub fn emit_active_recording_event(
     max_size: i64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveRecording") {
         // Recording metadata: `name` and `destination` are user-supplied —
@@ -1991,7 +2083,9 @@ pub fn emit_active_setting_event(
     value: &str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -2019,7 +2113,9 @@ pub fn emit_active_setting_event_arc(
     value: Arc<str>,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ActiveSetting") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -2053,7 +2149,9 @@ pub fn emit_deoptimization_event(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
         // Round-4: `reason` and `action` are fixed JIT taxonomies
@@ -2089,7 +2187,9 @@ pub fn emit_deoptimization_event_arc(
     thread_id: u64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.Deoptimization") {
         let mut fields = crate::event::EventFields::with_capacity(5);
@@ -2122,7 +2222,9 @@ pub fn emit_file_read_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileRead") {
         let event = EventInstance {
@@ -2153,7 +2255,9 @@ pub fn emit_file_read_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileRead") {
         let event = EventInstance {
@@ -2182,7 +2286,9 @@ pub fn emit_file_write_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileWrite") {
         let event = EventInstance {
@@ -2209,7 +2315,9 @@ pub fn emit_file_write_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.FileWrite") {
         let event = EventInstance {
@@ -2217,10 +2325,7 @@ pub fn emit_file_write_event_arc(
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
             thread_id,
-            fields: smallvec![
-                EventValue::String(path),
-                EventValue::Long(bytes_written),
-            ],
+            fields: smallvec![EventValue::String(path), EventValue::Long(bytes_written),],
         };
         push_builtin_event(recorder, event);
     }
@@ -2240,7 +2345,9 @@ pub fn emit_socket_read_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketRead") {
         let event = EventInstance {
@@ -2272,7 +2379,9 @@ pub fn emit_socket_read_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketRead") {
         let event = EventInstance {
@@ -2303,7 +2412,9 @@ pub fn emit_socket_write_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketWrite") {
         let event = EventInstance {
@@ -2332,7 +2443,9 @@ pub fn emit_socket_write_event_arc(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SocketWrite") {
         let event = EventInstance {
@@ -2358,7 +2471,9 @@ pub fn emit_safepoint_begin_event(
     jni_critical_threads: i32,
     start_time_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointBegin") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -2384,7 +2499,9 @@ pub fn emit_safepoint_end_event(
     start_time_ns: u64,
     duration_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SafepointEnd") {
         let mut fields = crate::event::EventFields::with_capacity(1);
@@ -2407,7 +2524,9 @@ pub fn emit_system_gc_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.SystemGC") {
         let event = EventInstance {
@@ -2429,7 +2548,9 @@ pub fn emit_allocation_requiring_gc_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.AllocationRequiringGC") {
         let event = EventInstance {
@@ -2451,7 +2572,9 @@ pub fn emit_java_exception_throw_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
         // message and thrown_class are dynamic; Arc. Prefer
@@ -2484,7 +2607,9 @@ pub fn emit_java_exception_throw_event_arc(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaExceptionThrow") {
         let mut fields = crate::event::EventFields::with_capacity(2);
@@ -2512,7 +2637,9 @@ pub fn emit_network_utilization_event(
     write_rate: i64,
     time_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -2541,7 +2668,9 @@ pub fn emit_network_utilization_event_arc(
     write_rate: i64,
     time_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.NetworkUtilization") {
         let mut fields = crate::event::EventFields::with_capacity(3);
@@ -2567,7 +2696,9 @@ pub fn emit_thread_cpu_load_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadCPULoad") {
         let event = EventInstance {
@@ -2575,10 +2706,7 @@ pub fn emit_thread_cpu_load_event(
             start_time: time_ns,
             end_time: time_ns,
             thread_id,
-            fields: smallvec![
-                EventValue::Float(user),
-                EventValue::Float(system),
-            ],
+            fields: smallvec![EventValue::Float(user), EventValue::Float(system),],
         };
         push_builtin_event(recorder, event);
     }
@@ -2595,7 +2723,9 @@ pub fn emit_allocation_sample_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationSample") {
         let event = EventInstance {
@@ -2621,7 +2751,9 @@ pub fn emit_allocation_sample_event_arc(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ObjectAllocationSample") {
         let event = EventInstance {
@@ -2629,10 +2761,7 @@ pub fn emit_allocation_sample_event_arc(
             start_time: time_ns,
             end_time: time_ns,
             thread_id,
-            fields: smallvec![
-                EventValue::String(object_class),
-                EventValue::Long(weight),
-            ],
+            fields: smallvec![EventValue::String(object_class), EventValue::Long(weight),],
         };
         push_builtin_event(recorder, event);
     }
@@ -2660,7 +2789,9 @@ pub fn emit_java_error_throw_event(
     time_ns: u64,
     thread_id: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.JavaErrorThrow") {
         // Field order matches registration at builtin.rs line 790:
@@ -2853,7 +2984,9 @@ pub fn emit_initial_environment_variable_event(
     value: &str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.InitialEnvironmentVariable") {
         // Field order matches the registration above: key, value.
@@ -2887,7 +3020,9 @@ pub fn emit_exception_statistics_event(
     total_throwables: i64,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ExceptionStatistics") {
         // Field order matches the registration above: throwables.
@@ -2918,7 +3053,9 @@ pub fn emit_module_require_event(
     required_module: &str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ModuleRequire") {
         // Field order: source, requiredModule.
@@ -2948,7 +3085,9 @@ pub fn emit_module_export_event(
     target_module: &str,
     timestamp_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    if !crate::is_enabled() {
+        return;
+    }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ModuleExport") {
         // Field order: exportedPackage, targetModule.
@@ -2987,7 +3126,10 @@ pub fn register_custom_event(
         name: name.to_string(),
         category: category.iter().map(|s| s.to_string()).collect(),
         description: description.to_string(),
-        fields: fields.iter().map(|(n, t, d)| EventField::new(n, t, d)).collect(),
+        fields: fields
+            .iter()
+            .map(|(n, t, d)| EventField::new(n, t, d))
+            .collect(),
         has_thread,
         has_stacktrace,
         period: EventPeriod::None,
@@ -3012,14 +3154,25 @@ pub enum EmitError {
     FieldCountMismatch { expected: usize, actual: usize },
     /// A registry-declared field has a `type_name` that does not map to a
     /// known [`FieldKind`] (e.g. typo in `register_custom_event`).
-    UnknownDeclaredType { field_index: usize, declared: String },
+    UnknownDeclaredType {
+        field_index: usize,
+        declared: String,
+    },
     /// The runtime [`EventValue`] variant does not match the declared field
     /// type for this position.
-    DeclaredTypeMismatch { field_index: usize, declared: FieldKind, actual: FieldKind },
+    DeclaredTypeMismatch {
+        field_index: usize,
+        declared: FieldKind,
+        actual: FieldKind,
+    },
     /// The runtime variant sequence for a subsequent emit does not match
     /// the shape locked in on this event type's first emit. See
     /// [`FlightRecorder::field_shape_lock`].
-    ShapeLockMismatch { field_index: usize, locked: FieldKind, actual: FieldKind },
+    ShapeLockMismatch {
+        field_index: usize,
+        locked: FieldKind,
+        actual: FieldKind,
+    },
 }
 
 impl std::fmt::Display for EmitError {
@@ -3027,19 +3180,38 @@ impl std::fmt::Display for EmitError {
         match self {
             EmitError::UnknownEventType => write!(f, "unknown event type"),
             EmitError::FieldCountMismatch { expected, actual } => {
-                write!(f, "field count mismatch: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "field count mismatch: expected {}, got {}",
+                    expected, actual
+                )
             }
-            EmitError::UnknownDeclaredType { field_index, declared } => {
-                write!(f, "field {}: unknown declared type '{}'", field_index, declared)
+            EmitError::UnknownDeclaredType {
+                field_index,
+                declared,
+            } => {
+                write!(
+                    f,
+                    "field {}: unknown declared type '{}'",
+                    field_index, declared
+                )
             }
-            EmitError::DeclaredTypeMismatch { field_index, declared, actual } => {
+            EmitError::DeclaredTypeMismatch {
+                field_index,
+                declared,
+                actual,
+            } => {
                 write!(
                     f,
                     "field {}: declared {:?} but supplied {:?} — would desync the chunk",
                     field_index, declared, actual
                 )
             }
-            EmitError::ShapeLockMismatch { field_index, locked, actual } => {
+            EmitError::ShapeLockMismatch {
+                field_index,
+                locked,
+                actual,
+            } => {
                 write!(
                     f,
                     "field {}: first emit locked variant {:?}, this emit supplies {:?}",
@@ -3069,7 +3241,9 @@ fn validate_and_lock_shape(
     //    a small stack vector so we drop the immutable borrow before we
     //    mutate the shape-lock map.
     let declared_kinds: smallvec::SmallVec<[FieldKind; crate::event::EVENT_FIELD_INLINE]> = {
-        let event_type = recorder.type_registry.get(type_id)
+        let event_type = recorder
+            .type_registry
+            .get(type_id)
             .ok_or(EmitError::UnknownEventType)?;
         if event_type.fields.len() != field_values.len() {
             return Err(EmitError::FieldCountMismatch {
@@ -3121,8 +3295,12 @@ fn validate_and_lock_shape(
             });
         }
         for (idx, (&l, &a)) in locked.iter().zip(actual_kinds.iter()).enumerate() {
-            if a == FieldKind::Null { continue; }
-            if l == FieldKind::Null { continue; }
+            if a == FieldKind::Null {
+                continue;
+            }
+            if l == FieldKind::Null {
+                continue;
+            }
             if l != a {
                 return Err(EmitError::ShapeLockMismatch {
                     field_index: idx,
@@ -3135,7 +3313,9 @@ fn validate_and_lock_shape(
         // First emit for this event type: lock the shape in. We store the
         // runtime variants (not the declared kinds) because the WRITER
         // dispatches on those — that is the wire-format truth.
-        recorder.field_shape_lock.insert(type_id, actual_kinds.into_vec());
+        recorder
+            .field_shape_lock
+            .insert(type_id, actual_kinds.into_vec());
     }
 
     Ok(())
@@ -3161,7 +3341,9 @@ pub fn emit_custom_event(
     time_ns: u64,
     thread_id: u64,
 ) -> Result<(), EmitError> {
-    if !crate::is_enabled() { return Ok(()); }
+    if !crate::is_enabled() {
+        return Ok(());
+    }
     let type_id = match recorder.type_registry.find_by_name(event_name) {
         Some(id) => id,
         None => {
@@ -3246,31 +3428,139 @@ impl JfrProfile {
             description: "Low overhead configuration for continuous use".to_string(),
             settings: vec![
                 // GC events: enabled with 0ms threshold
-                JfrEventSetting { event_name: "jdk.GarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.GCPhasePause".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.YoungGarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.OldGarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.GCHeapSummary".into(), enabled: true, threshold: None, stacktrace: None, period: None },
+                JfrEventSetting {
+                    event_name: "jdk.GarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.GCPhasePause".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.YoungGarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.OldGarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.GCHeapSummary".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
                 // Thread events
-                JfrEventSetting { event_name: "jdk.ThreadStart".into(), enabled: true, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.ThreadEnd".into(), enabled: true, threshold: None, stacktrace: None, period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadStart".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadEnd".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
                 // Class loading
-                JfrEventSetting { event_name: "jdk.ClassLoad".into(), enabled: true, threshold: Some(Duration::from_millis(0)), stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ClassLoad".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(0)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // JIT
-                JfrEventSetting { event_name: "jdk.Compilation".into(), enabled: true, threshold: Some(Duration::from_millis(100)), stacktrace: None, period: None },
+                JfrEventSetting {
+                    event_name: "jdk.Compilation".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(100)),
+                    stacktrace: None,
+                    period: None,
+                },
                 // CPU/memory periodic
-                JfrEventSetting { event_name: "jdk.CPULoad".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everyChunk".into()) },
-                JfrEventSetting { event_name: "jdk.JavaThreadStatistics".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everyChunk".into()) },
+                JfrEventSetting {
+                    event_name: "jdk.CPULoad".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everyChunk".into()),
+                },
+                JfrEventSetting {
+                    event_name: "jdk.JavaThreadStatistics".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everyChunk".into()),
+                },
                 // File/socket I/O: higher threshold for low overhead
-                JfrEventSetting { event_name: "jdk.FileRead".into(), enabled: true, threshold: Some(Duration::from_millis(20)), stacktrace: Some(false), period: None },
-                JfrEventSetting { event_name: "jdk.FileWrite".into(), enabled: true, threshold: Some(Duration::from_millis(20)), stacktrace: Some(false), period: None },
-                JfrEventSetting { event_name: "jdk.SocketRead".into(), enabled: true, threshold: Some(Duration::from_millis(20)), stacktrace: Some(false), period: None },
-                JfrEventSetting { event_name: "jdk.SocketWrite".into(), enabled: true, threshold: Some(Duration::from_millis(20)), stacktrace: Some(false), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.FileRead".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(20)),
+                    stacktrace: Some(false),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.FileWrite".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(20)),
+                    stacktrace: Some(false),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SocketRead".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(20)),
+                    stacktrace: Some(false),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SocketWrite".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(20)),
+                    stacktrace: Some(false),
+                    period: None,
+                },
                 // Exceptions: disabled by default in production
-                JfrEventSetting { event_name: "jdk.JavaExceptionThrow".into(), enabled: false, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.JavaErrorThrow".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.JavaExceptionThrow".into(),
+                    enabled: false,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.JavaErrorThrow".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Allocation: sampled
-                JfrEventSetting { event_name: "jdk.ObjectAllocationSample".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ObjectAllocationSample".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
             ],
         }
     }
@@ -3282,53 +3572,269 @@ impl JfrProfile {
             description: "Detailed profiling configuration".to_string(),
             settings: vec![
                 // GC events: all enabled
-                JfrEventSetting { event_name: "jdk.GarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.GCPhasePause".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.YoungGarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.OldGarbageCollection".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.GCHeapSummary".into(), enabled: true, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.GCReferenceStatistics".into(), enabled: true, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.AllocationRequiringGC".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.SystemGC".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.GarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.GCPhasePause".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.YoungGarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.OldGarbageCollection".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.GCHeapSummary".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.GCReferenceStatistics".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.AllocationRequiringGC".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SystemGC".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Thread events
-                JfrEventSetting { event_name: "jdk.ThreadStart".into(), enabled: true, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.ThreadEnd".into(), enabled: true, threshold: None, stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.ThreadSleep".into(), enabled: true, threshold: Some(Duration::from_millis(10)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.ThreadPark".into(), enabled: true, threshold: Some(Duration::from_millis(10)), stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadStart".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadEnd".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadSleep".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(10)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadPark".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(10)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Monitor events
-                JfrEventSetting { event_name: "jdk.JavaMonitorEnter".into(), enabled: true, threshold: Some(Duration::from_millis(10)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.JavaMonitorWait".into(), enabled: true, threshold: Some(Duration::from_millis(10)), stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.JavaMonitorEnter".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(10)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.JavaMonitorWait".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(10)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Class loading
-                JfrEventSetting { event_name: "jdk.ClassLoad".into(), enabled: true, threshold: Some(Duration::from_millis(0)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.ClassUnload".into(), enabled: true, threshold: None, stacktrace: None, period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ClassLoad".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(0)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ClassUnload".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: None,
+                },
                 // JIT
-                JfrEventSetting { event_name: "jdk.Compilation".into(), enabled: true, threshold: Some(Duration::from_millis(0)), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.Deoptimization".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.Compilation".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(0)),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.Deoptimization".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // CPU/memory periodic
-                JfrEventSetting { event_name: "jdk.CPULoad".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everySecond".into()) },
-                JfrEventSetting { event_name: "jdk.ThreadCPULoad".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everySecond".into()) },
-                JfrEventSetting { event_name: "jdk.JavaThreadStatistics".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everySecond".into()) },
-                JfrEventSetting { event_name: "jdk.MetaspaceSummary".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everyChunk".into()) },
+                JfrEventSetting {
+                    event_name: "jdk.CPULoad".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everySecond".into()),
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ThreadCPULoad".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everySecond".into()),
+                },
+                JfrEventSetting {
+                    event_name: "jdk.JavaThreadStatistics".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everySecond".into()),
+                },
+                JfrEventSetting {
+                    event_name: "jdk.MetaspaceSummary".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everyChunk".into()),
+                },
                 // File/socket I/O: lower threshold for more detail
-                JfrEventSetting { event_name: "jdk.FileRead".into(), enabled: true, threshold: Some(Duration::from_millis(1)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.FileWrite".into(), enabled: true, threshold: Some(Duration::from_millis(1)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.SocketRead".into(), enabled: true, threshold: Some(Duration::from_millis(1)), stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.SocketWrite".into(), enabled: true, threshold: Some(Duration::from_millis(1)), stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.FileRead".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(1)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.FileWrite".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(1)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SocketRead".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(1)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SocketWrite".into(),
+                    enabled: true,
+                    threshold: Some(Duration::from_millis(1)),
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Exceptions: enabled for profiling
-                JfrEventSetting { event_name: "jdk.JavaExceptionThrow".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.JavaErrorThrow".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.JavaExceptionThrow".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.JavaErrorThrow".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Allocation: full tracking
-                JfrEventSetting { event_name: "jdk.ObjectAllocationSample".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.ObjectAllocationInNewTLAB".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
-                JfrEventSetting { event_name: "jdk.ObjectAllocationOutsideTLAB".into(), enabled: true, threshold: None, stacktrace: Some(true), period: None },
+                JfrEventSetting {
+                    event_name: "jdk.ObjectAllocationSample".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ObjectAllocationInNewTLAB".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.ObjectAllocationOutsideTLAB".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: None,
+                },
                 // Safepoints
-                JfrEventSetting { event_name: "jdk.SafepointBegin".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
-                JfrEventSetting { event_name: "jdk.SafepointEnd".into(), enabled: true, threshold: Some(Duration::ZERO), stacktrace: None, period: None },
+                JfrEventSetting {
+                    event_name: "jdk.SafepointBegin".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
+                JfrEventSetting {
+                    event_name: "jdk.SafepointEnd".into(),
+                    enabled: true,
+                    threshold: Some(Duration::ZERO),
+                    stacktrace: None,
+                    period: None,
+                },
                 // Execution sample for profiling
-                JfrEventSetting { event_name: "jdk.ExecutionSample".into(), enabled: true, threshold: None, stacktrace: Some(true), period: Some("everySecond".into()) },
-                JfrEventSetting { event_name: "jdk.NativeMethodSample".into(), enabled: true, threshold: None, stacktrace: Some(true), period: Some("everySecond".into()) },
+                JfrEventSetting {
+                    event_name: "jdk.ExecutionSample".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: Some("everySecond".into()),
+                },
+                JfrEventSetting {
+                    event_name: "jdk.NativeMethodSample".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: Some(true),
+                    period: Some("everySecond".into()),
+                },
                 // Network
-                JfrEventSetting { event_name: "jdk.NetworkUtilization".into(), enabled: true, threshold: None, stacktrace: None, period: Some("everySecond".into()) },
+                JfrEventSetting {
+                    event_name: "jdk.NetworkUtilization".into(),
+                    enabled: true,
+                    threshold: None,
+                    stacktrace: None,
+                    period: Some("everySecond".into()),
+                },
             ],
         }
     }
@@ -3341,7 +3847,11 @@ impl JfrProfile {
     /// it maps only `enabled` (→ `enabled_events`) and `threshold` (→
     /// `event_thresholds`); the `stacktrace` and `period` fields are NOT applied
     /// (those features are unimplemented — see [`JfrProfile`]).
-    pub fn apply_to(&self, settings: &mut crate::recording::RecordingSettings, registry: &EventTypeRegistry) {
+    pub fn apply_to(
+        &self,
+        settings: &mut crate::recording::RecordingSettings,
+        registry: &EventTypeRegistry,
+    ) {
         for es in &self.settings {
             if !es.enabled {
                 // If there's an event ID, it stays excluded from enabled_events
@@ -3616,8 +4126,10 @@ mod tests {
         let mut reg = EventTypeRegistry::new();
         register_builtin_events(&mut reg);
         let gc_names = [
-            "jdk.GarbageCollection", "jdk.GCPhasePause",
-            "jdk.YoungGarbageCollection", "jdk.OldGarbageCollection",
+            "jdk.GarbageCollection",
+            "jdk.GCPhasePause",
+            "jdk.YoungGarbageCollection",
+            "jdk.OldGarbageCollection",
         ];
         for name in &gc_names {
             let id = reg.find_by_name(name).unwrap();
@@ -3635,8 +4147,10 @@ mod tests {
         let mut reg = EventTypeRegistry::new();
         register_builtin_events(&mut reg);
         let thread_names = [
-            "jdk.ThreadStart", "jdk.ThreadEnd",
-            "jdk.ThreadSleep", "jdk.ThreadPark",
+            "jdk.ThreadStart",
+            "jdk.ThreadEnd",
+            "jdk.ThreadSleep",
+            "jdk.ThreadPark",
         ];
         for name in &thread_names {
             let id = reg.find_by_name(name).unwrap();
@@ -3655,7 +4169,11 @@ mod tests {
         register_builtin_events(&mut reg);
         let ids: Vec<EventTypeId> = reg.iter().map(|(id, _)| *id).collect();
         let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(ids.len(), unique.len(), "All builtin event IDs should be unique");
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "All builtin event IDs should be unique"
+        );
     }
 
     #[test]
@@ -3664,7 +4182,11 @@ mod tests {
         register_builtin_events(&mut reg);
         let names: Vec<&str> = reg.iter().map(|(_, et)| et.name.as_str()).collect();
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(names.len(), unique.len(), "All builtin event names should be unique");
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "All builtin event names should be unique"
+        );
     }
 
     // --- Emission function tests ---
@@ -3722,7 +4244,14 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_class_load_event(&mut fr, "java/lang/Object", "bootstrap", "bootstrap", 2000, 100);
+        emit_class_load_event(
+            &mut fr,
+            "java/lang/Object",
+            "bootstrap",
+            "bootstrap",
+            2000,
+            100,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -3746,7 +4275,18 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_compilation_event(&mut fr, "java/lang/String.hashCode:()I", 1, 3, true, false, 256, 128, 4000, 200);
+        emit_compilation_event(
+            &mut fr,
+            "java/lang/String.hashCode:()I",
+            1,
+            3,
+            true,
+            false,
+            256,
+            128,
+            4000,
+            200,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -3811,7 +4351,17 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_monitor_wait_event(&mut fr, "java/lang/Object", "main", 0, false, 0xDEAD, 1, 8000, 500);
+        emit_monitor_wait_event(
+            &mut fr,
+            "java/lang/Object",
+            "main",
+            0,
+            false,
+            0xDEAD,
+            1,
+            8000,
+            500,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -3847,7 +4397,15 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_thread_park_event(&mut fr, "java/util/concurrent/locks/AQS", 0, 0xCAFE, 1, 11000, 300);
+        emit_thread_park_event(
+            &mut fr,
+            "java/util/concurrent/locks/AQS",
+            0,
+            0xCAFE,
+            1,
+            11000,
+            300,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -3859,7 +4417,16 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_gc_heap_summary_event(&mut fr, 1, "Before GC", "G1 Eden", 1024 * 1024, 512 * 1024, 2048 * 1024, 12000);
+        emit_gc_heap_summary_event(
+            &mut fr,
+            1,
+            "Before GC",
+            "G1 Eden",
+            1024 * 1024,
+            512 * 1024,
+            2048 * 1024,
+            12000,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -3905,7 +4472,14 @@ mod tests {
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
         emit_deoptimization_event(
-            &mut fr, "com/example/Foo.bar:()V", 1, "NullCheck", "Reinterpret", 42, 1, 10000,
+            &mut fr,
+            "com/example/Foo.bar:()V",
+            1,
+            "NullCheck",
+            "Reinterpret",
+            42,
+            1,
+            10000,
         );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4063,7 +4637,10 @@ mod tests {
             Some(EventValue::Float(v)) => (v - 0.25).abs() < 0.001,
             _ => false,
         });
-        assert!(found, "expected cpu_load event with 0.25 in field[0] to be drained");
+        assert!(
+            found,
+            "expected cpu_load event with 0.25 in field[0] to be drained"
+        );
     }
 
     #[test]
@@ -4143,14 +4720,20 @@ mod tests {
     #[test]
     fn t6_safepoint_events_exist() {
         let fr = crate::create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.SafepointBegin").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.SafepointBegin")
+            .is_some());
         assert!(fr.type_registry.find_by_name("jdk.SafepointEnd").is_some());
     }
 
     #[test]
     fn t6_allocation_sample_exists() {
         let fr = crate::create_flight_recorder();
-        let id = fr.type_registry.find_by_name("jdk.ObjectAllocationSample").unwrap();
+        let id = fr
+            .type_registry
+            .find_by_name("jdk.ObjectAllocationSample")
+            .unwrap();
         let et = fr.type_registry.get(id).unwrap();
         assert_eq!(et.fields.len(), 2);
         assert!(et.has_stacktrace);
@@ -4159,27 +4742,45 @@ mod tests {
     #[test]
     fn t6_native_method_sample_exists() {
         let fr = crate::create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.NativeMethodSample").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.NativeMethodSample")
+            .is_some());
     }
 
     #[test]
     fn t6_allocation_requiring_gc_exists() {
         let fr = crate::create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.AllocationRequiringGC").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.AllocationRequiringGC")
+            .is_some());
     }
 
     #[test]
     fn t6_exception_events_exist() {
         let fr = crate::create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.JavaExceptionThrow").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.JavaErrorThrow").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.ExceptionStatistics").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.JavaExceptionThrow")
+            .is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.JavaErrorThrow")
+            .is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.ExceptionStatistics")
+            .is_some());
     }
 
     #[test]
     fn t6_network_utilization_exists() {
         let fr = crate::create_flight_recorder();
-        let id = fr.type_registry.find_by_name("jdk.NetworkUtilization").unwrap();
+        let id = fr
+            .type_registry
+            .find_by_name("jdk.NetworkUtilization")
+            .unwrap();
         let et = fr.type_registry.get(id).unwrap();
         assert_eq!(et.fields.len(), 3);
         assert_eq!(et.fields[0].name, "networkInterface");
@@ -4188,8 +4789,14 @@ mod tests {
     #[test]
     fn t6_container_events_exist() {
         let fr = crate::create_flight_recorder();
-        assert!(fr.type_registry.find_by_name("jdk.ContainerCPUUsage").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.ContainerMemoryUsage").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.ContainerCPUUsage")
+            .is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.ContainerMemoryUsage")
+            .is_some());
     }
 
     #[test]
@@ -4257,7 +4864,8 @@ mod tests {
             vec![EventValue::from_str("hello")],
             1000,
             1,
-        ).expect("emit should succeed");
+        )
+        .expect("emit should succeed");
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
@@ -4278,7 +4886,12 @@ mod tests {
 
     fn t30_setup_recorder(
         field_type: &str,
-    ) -> (FlightRecorder, EventTypeId, u64, parking_lot::MutexGuard<'static, ()>) {
+    ) -> (
+        FlightRecorder,
+        EventTypeId,
+        u64,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
         // Hold the global test lock for the test's duration: these tests depend
         // on `is_enabled()` staying true (set by our own `start_recording`); a
         // concurrent test's `stop_recording` would otherwise flip the global
@@ -4325,14 +4938,18 @@ mod tests {
         // Release path: the call above returned an Err; assert its shape.
         // (Debug path: the `debug_assert!` inside the emit panicked, so
         // execution never reaches this point — `#[should_panic]` covers it.)
-        assert!(matches!(
-            err,
-            Err(EmitError::DeclaredTypeMismatch {
-                field_index: 0,
-                declared: FieldKind::Double,
-                actual: FieldKind::Float,
-            })
-        ), "expected DeclaredTypeMismatch(Double, Float), got {:?}", err);
+        assert!(
+            matches!(
+                err,
+                Err(EmitError::DeclaredTypeMismatch {
+                    field_index: 0,
+                    declared: FieldKind::Double,
+                    actual: FieldKind::Float,
+                })
+            ),
+            "expected DeclaredTypeMismatch(Double, Float), got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -4348,14 +4965,18 @@ mod tests {
             1000,
             1,
         );
-        assert!(matches!(
-            err,
-            Err(EmitError::DeclaredTypeMismatch {
-                field_index: 0,
-                declared: FieldKind::Float,
-                actual: FieldKind::Double,
-            })
-        ), "expected DeclaredTypeMismatch(Float, Double), got {:?}", err);
+        assert!(
+            matches!(
+                err,
+                Err(EmitError::DeclaredTypeMismatch {
+                    field_index: 0,
+                    declared: FieldKind::Float,
+                    actual: FieldKind::Double,
+                })
+            ),
+            "expected DeclaredTypeMismatch(Float, Double), got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -4372,14 +4993,18 @@ mod tests {
             1000,
             1,
         );
-        assert!(matches!(
-            err,
-            Err(EmitError::DeclaredTypeMismatch {
-                field_index: 0,
-                declared: FieldKind::Int,
-                actual: FieldKind::String,
-            })
-        ), "expected DeclaredTypeMismatch(Int, String), got {:?}", err);
+        assert!(
+            matches!(
+                err,
+                Err(EmitError::DeclaredTypeMismatch {
+                    field_index: 0,
+                    declared: FieldKind::Int,
+                    actual: FieldKind::String,
+                })
+            ),
+            "expected DeclaredTypeMismatch(Int, String), got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -4394,14 +5019,18 @@ mod tests {
             1000,
             1,
         );
-        assert!(matches!(
-            err,
-            Err(EmitError::DeclaredTypeMismatch {
-                field_index: 0,
-                declared: FieldKind::String,
-                actual: FieldKind::Int,
-            })
-        ), "expected DeclaredTypeMismatch(String, Int), got {:?}", err);
+        assert!(
+            matches!(
+                err,
+                Err(EmitError::DeclaredTypeMismatch {
+                    field_index: 0,
+                    declared: FieldKind::String,
+                    actual: FieldKind::Int,
+                })
+            ),
+            "expected DeclaredTypeMismatch(String, Int), got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -4432,8 +5061,12 @@ mod tests {
             vec![EventValue::from_str("v1")],
             1000,
             1,
-        ).expect("first emit succeeds");
-        assert_eq!(fr.field_shape_lock.get(&type_id).cloned(), Some(vec![FieldKind::String]));
+        )
+        .expect("first emit succeeds");
+        assert_eq!(
+            fr.field_shape_lock.get(&type_id).cloned(),
+            Some(vec![FieldKind::String])
+        );
         for i in 0..8 {
             emit_custom_event(
                 &mut fr,
@@ -4441,7 +5074,8 @@ mod tests {
                 vec![EventValue::from_str(&format!("v{}", i + 2))],
                 1000 + i as u64,
                 1,
-            ).expect("same-shape emit succeeds");
+            )
+            .expect("same-shape emit succeeds");
         }
     }
 
@@ -4474,10 +5108,17 @@ mod tests {
             1000,
             1,
         );
-        assert!(matches!(
-            err,
-            Err(EmitError::FieldCountMismatch { expected: 2, actual: 1 })
-        ), "expected FieldCountMismatch(2,1), got {:?}", err);
+        assert!(
+            matches!(
+                err,
+                Err(EmitError::FieldCountMismatch {
+                    expected: 2,
+                    actual: 1
+                })
+            ),
+            "expected FieldCountMismatch(2,1), got {:?}",
+            err
+        );
     }
 
     // --- JFR profiles ---
@@ -4488,9 +5129,15 @@ mod tests {
         assert_eq!(profile.name, "default");
         assert!(!profile.settings.is_empty());
         // GC events should be enabled
-        assert!(profile.settings.iter().any(|s| s.event_name == "jdk.GarbageCollection" && s.enabled));
+        assert!(profile
+            .settings
+            .iter()
+            .any(|s| s.event_name == "jdk.GarbageCollection" && s.enabled));
         // Exception throw should be disabled in default profile
-        assert!(profile.settings.iter().any(|s| s.event_name == "jdk.JavaExceptionThrow" && !s.enabled));
+        assert!(profile
+            .settings
+            .iter()
+            .any(|s| s.event_name == "jdk.JavaExceptionThrow" && !s.enabled));
     }
 
     #[test]
@@ -4499,9 +5146,15 @@ mod tests {
         assert_eq!(profile.name, "profile");
         assert!(!profile.settings.is_empty());
         // Exception throw should be enabled in detailed profile
-        assert!(profile.settings.iter().any(|s| s.event_name == "jdk.JavaExceptionThrow" && s.enabled));
+        assert!(profile
+            .settings
+            .iter()
+            .any(|s| s.event_name == "jdk.JavaExceptionThrow" && s.enabled));
         // Safepoints should be enabled
-        assert!(profile.settings.iter().any(|s| s.event_name == "jdk.SafepointBegin" && s.enabled));
+        assert!(profile
+            .settings
+            .iter()
+            .any(|s| s.event_name == "jdk.SafepointBegin" && s.enabled));
     }
 
     #[test]
@@ -4535,7 +5188,13 @@ mod tests {
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
         let _g = drain_ring_baseline();
-        emit_java_exception_throw_event(&mut fr, "test error", "java.lang.RuntimeException", 1000, 1);
+        emit_java_exception_throw_event(
+            &mut fr,
+            "test error",
+            "java.lang.RuntimeException",
+            1000,
+            1,
+        );
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 1);

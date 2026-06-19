@@ -18,11 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
+use cratonvm_types::ObjectRef;
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
-use cratonvm_types::ObjectRef;
 
-use crate::event::{AwtEvent, AwtEventData, PeerId, event_id};
+use crate::event::{event_id, AwtEvent, AwtEventData, PeerId};
 
 // ---------------------------------------------------------------------------
 // Runnable registry — used by invokeLater / invokeAndWait
@@ -249,7 +249,10 @@ impl EventDispatchThread {
                 break;
             }
         }
-        if map.insert(callback_id, RunnableEntry { runnable, gc_gen }).is_none() {
+        if map
+            .insert(callback_id, RunnableEntry { runnable, gc_gen })
+            .is_none()
+        {
             order.push_back(callback_id);
         }
     }
@@ -442,8 +445,7 @@ impl EventDispatchThread {
         // Register a completion handle BEFORE posting the event, otherwise
         // an extremely fast EDT could dispatch and try to signal an entry
         // that does not yet exist.
-        let handle: CompletionHandle =
-            Arc::new((Mutex::new(false), Condvar::new()));
+        let handle: CompletionHandle = Arc::new((Mutex::new(false), Condvar::new()));
         {
             let mut map = self.pending_invocations.lock();
             map.insert(callback_id, Arc::clone(&handle));
@@ -1033,7 +1035,8 @@ mod tests {
 
         // This should complete once the consumer dequeues the event and
         // poll_event signals the completion handle.
-        edt.invoke_and_wait(99, PeerId(1)).expect("non-EDT caller must succeed");
+        edt.invoke_and_wait(99, PeerId(1))
+            .expect("non-EDT caller must succeed");
         consumer.join().unwrap();
         edt.stop();
     }
@@ -1051,7 +1054,8 @@ mod tests {
             edt2.stop();
         });
 
-        edt.invoke_and_wait(7777, PeerId(2)).expect("must release once EDT stops");
+        edt.invoke_and_wait(7777, PeerId(2))
+            .expect("must release once EDT stops");
         stopper.join().unwrap();
     }
 
@@ -1154,14 +1158,19 @@ mod tests {
 
         // Register a completion handle to detect spurious signalling.
         let handle: CompletionHandle = Arc::new((Mutex::new(false), Condvar::new()));
-        edt.pending_invocations.lock().insert(id, Arc::clone(&handle));
+        edt.pending_invocations
+            .lock()
+            .insert(id, Arc::clone(&handle));
 
         edt.post_event(AwtEvent::invocation(PeerId(0), 0, id));
         let _ = edt.poll_event();
 
         // The Runnable is still registered, so dequeue must have been
         // silent: the completion handle stays un-flipped.
-        assert!(!*handle.0.lock(), "dequeue must not signal while runnable is pending");
+        assert!(
+            !*handle.0.lock(),
+            "dequeue must not signal while runnable is pending"
+        );
     }
 
     #[test]
@@ -1190,7 +1199,8 @@ mod tests {
             }
         });
 
-        edt.invoke_and_wait(id, PeerId(0)).expect("non-EDT caller must succeed");
+        edt.invoke_and_wait(id, PeerId(0))
+            .expect("non-EDT caller must succeed");
         dispatcher.join().unwrap();
         edt.stop();
     }
@@ -1207,7 +1217,13 @@ mod tests {
         assert_eq!(edt.queue_length(), 1);
 
         let evt = edt.poll_event().unwrap();
-        if let AwtEventData::Paint { x, y, width, height } = &evt.data {
+        if let AwtEventData::Paint {
+            x,
+            y,
+            width,
+            height,
+        } = &evt.data
+        {
             assert_eq!((*x, *y, *width, *height), (0, 0, 30, 30));
         } else {
             panic!("expected Paint");
@@ -1225,7 +1241,14 @@ mod tests {
         edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 0, 0, 0, 10, 10));
         edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 1, 5, 5, 10, 10));
         edt.post_event(AwtEvent::mouse(
-            event_id::MOUSE_CLICKED, peer, 2, 1, 1, 1, 1, 0,
+            event_id::MOUSE_CLICKED,
+            peer,
+            2,
+            1,
+            1,
+            1,
+            1,
+            0,
         ));
         edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 3, 50, 50, 10, 10));
 
@@ -1233,7 +1256,13 @@ mod tests {
         // Two paints merged + one mouse + one trailing paint = 3 events.
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].id, event_id::PAINT);
-        if let AwtEventData::Paint { x, y, width, height } = &drained[0].data {
+        if let AwtEventData::Paint {
+            x,
+            y,
+            width,
+            height,
+        } = &drained[0].data
+        {
             // Bounding union of (0,0,10,10) and (5,5,10,10) = (0,0,15,15)
             assert_eq!((*x, *y, *width, *height), (0, 0, 15, 15));
         } else {

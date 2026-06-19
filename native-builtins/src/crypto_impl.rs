@@ -12,8 +12,8 @@
 //! SHA-2 / HMAC / HKDF / RSA / ECDSA / Ed25519 / X.509 / PKCS#12
 //! parsers remain in-tree as before.
 
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ============================================================================
@@ -57,8 +57,8 @@ impl std::fmt::Display for CryptoError {
 // `AesEcb`/`AesCbc`/`AesGcm` wrappers and `jca/cipher.rs` keep compiling
 // without changes.
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
 /// AES expanded-key state, parameterised over the three NIST key sizes.
 /// Each variant owns a fully-initialised RustCrypto cipher; cloning is
@@ -252,8 +252,8 @@ impl AesGcm {
     /// shape; callers that want the JDK wire format concatenate
     /// `ciphertext || tag` themselves (`jca/cipher.rs` does so).
     pub fn encrypt(key: &AesKey, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> AesGcmOutput {
-        use aes_gcm::{aead::AeadInPlace, AesGcm as AesGcmAead, Aes128Gcm, Aes256Gcm};
         use aes::cipher::consts::U12;
+        use aes_gcm::{aead::AeadInPlace, Aes128Gcm, Aes256Gcm, AesGcm as AesGcmAead};
         // aes-gcm 0.10 ships type aliases for AES-128/256 only; spell
         // out the AES-192 variant explicitly.
         type Aes192Gcm = AesGcmAead<aes::Aes192, U12>;
@@ -281,7 +281,10 @@ impl AesGcm {
 
         let mut tag = [0u8; 16];
         tag.copy_from_slice(tag_arr.as_slice());
-        AesGcmOutput { ciphertext: buf, tag }
+        AesGcmOutput {
+            ciphertext: buf,
+            tag,
+        }
     }
 
     /// Verify-then-decrypt with AES-GCM. Returns
@@ -295,8 +298,8 @@ impl AesGcm {
         aad: &[u8],
         tag: &[u8; 16],
     ) -> Result<Vec<u8>, CryptoError> {
-        use aes_gcm::{aead::AeadInPlace, AesGcm as AesGcmAead, Aes128Gcm, Aes256Gcm};
         use aes::cipher::consts::U12;
+        use aes_gcm::{aead::AeadInPlace, Aes128Gcm, Aes256Gcm, AesGcm as AesGcmAead};
         type Aes192Gcm = AesGcmAead<aes::Aes192, U12>;
 
         let nonce_arr = aes_gcm::Nonce::<U12>::from_slice(nonce);
@@ -323,27 +326,18 @@ impl AesGcm {
 // ============================================================================
 
 const SHA256_H: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 #[derive(Clone)]
@@ -460,40 +454,108 @@ impl Sha256 {
 // ============================================================================
 
 const SHA512_H: [u64; 8] = [
-    0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
-    0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
-    0x510e527fade682d1, 0x9b05688c2b3e6c1f,
-    0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
 ];
 
 const SHA384_H: [u64; 8] = [
-    0xcbbb9d5dc1059ed8, 0x629a292a367cd507,
-    0x9159015a3070dd17, 0x152fecd8f70e5939,
-    0x67332667ffc00b31, 0x8eb44a8768581511,
-    0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4,
+    0xcbbb9d5dc1059ed8,
+    0x629a292a367cd507,
+    0x9159015a3070dd17,
+    0x152fecd8f70e5939,
+    0x67332667ffc00b31,
+    0x8eb44a8768581511,
+    0xdb0c2e0d64f98fa7,
+    0x47b5481dbefa4fa4,
 ];
 
 const SHA512_K: [u64; 80] = [
-    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
-    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
-    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
-    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
-    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
-    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
-    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
-    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
-    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
-    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
-    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
-    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
-    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
-    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
-    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
-    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
-    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
-    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
-    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
-    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+    0x428a2f98d728ae22,
+    0x7137449123ef65cd,
+    0xb5c0fbcfec4d3b2f,
+    0xe9b5dba58189dbbc,
+    0x3956c25bf348b538,
+    0x59f111f1b605d019,
+    0x923f82a4af194f9b,
+    0xab1c5ed5da6d8118,
+    0xd807aa98a3030242,
+    0x12835b0145706fbe,
+    0x243185be4ee4b28c,
+    0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f,
+    0x80deb1fe3b1696b1,
+    0x9bdc06a725c71235,
+    0xc19bf174cf692694,
+    0xe49b69c19ef14ad2,
+    0xefbe4786384f25e3,
+    0x0fc19dc68b8cd5b5,
+    0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275,
+    0x4a7484aa6ea6e483,
+    0x5cb0a9dcbd41fbd4,
+    0x76f988da831153b5,
+    0x983e5152ee66dfab,
+    0xa831c66d2db43210,
+    0xb00327c898fb213f,
+    0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2,
+    0xd5a79147930aa725,
+    0x06ca6351e003826f,
+    0x142929670a0e6e70,
+    0x27b70a8546d22ffc,
+    0x2e1b21385c26c926,
+    0x4d2c6dfc5ac42aed,
+    0x53380d139d95b3df,
+    0x650a73548baf63de,
+    0x766a0abb3c77b2a8,
+    0x81c2c92e47edaee6,
+    0x92722c851482353b,
+    0xa2bfe8a14cf10364,
+    0xa81a664bbc423001,
+    0xc24b8b70d0f89791,
+    0xc76c51a30654be30,
+    0xd192e819d6ef5218,
+    0xd69906245565a910,
+    0xf40e35855771202a,
+    0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8,
+    0x1e376c085141ab53,
+    0x2748774cdf8eeb99,
+    0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63,
+    0x4ed8aa4ae3418acb,
+    0x5b9cca4f7763e373,
+    0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc,
+    0x78a5636f43172f60,
+    0x84c87814a1f0ab72,
+    0x8cc702081a6439ec,
+    0x90befffa23631e28,
+    0xa4506cebde82bde9,
+    0xbef9a3f7b2c67915,
+    0xc67178f2e372532b,
+    0xca273eceea26619c,
+    0xd186b8c721c0c207,
+    0xeada7dd6cde0eb1e,
+    0xf57d4f7fee6ed178,
+    0x06f067aa72176fba,
+    0x0a637dc5a2c898a6,
+    0x113f9804bef90dae,
+    0x1b710b35131c471b,
+    0x28db77f523047d84,
+    0x32caab7b40c72493,
+    0x3c9ebe0a15c9bebc,
+    0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6,
+    0x597f299cfc657e2a,
+    0x5fcb6fab3ad6faec,
+    0x6c44198c4a475817,
 ];
 
 /// Internal SHA-512 engine used by both SHA-512 and SHA-384.
@@ -529,7 +591,8 @@ impl Sha512Engine {
         while self.buffer.len() % 128 != 112 {
             self.buffer.push(0x00);
         }
-        self.buffer.extend_from_slice(&(bit_len as u128).to_be_bytes());
+        self.buffer
+            .extend_from_slice(&(bit_len as u128).to_be_bytes());
 
         let buf = std::mem::take(&mut self.buffer);
         for chunk in buf.chunks(128) {
@@ -542,14 +605,23 @@ impl Sha512Engine {
         let mut w = [0u64; 80];
         for i in 0..16 {
             w[i] = u64::from_be_bytes([
-                block[8 * i], block[8 * i + 1], block[8 * i + 2], block[8 * i + 3],
-                block[8 * i + 4], block[8 * i + 5], block[8 * i + 6], block[8 * i + 7],
+                block[8 * i],
+                block[8 * i + 1],
+                block[8 * i + 2],
+                block[8 * i + 3],
+                block[8 * i + 4],
+                block[8 * i + 5],
+                block[8 * i + 6],
+                block[8 * i + 7],
             ]);
         }
         for i in 16..80 {
             let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
             let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.h;
@@ -566,9 +638,13 @@ impl Sha512Engine {
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
 
-            h = g; g = f; f = e;
+            h = g;
+            g = f;
+            f = e;
             e = d.wrapping_add(temp1);
-            d = c; c = b; b = a;
+            d = c;
+            c = b;
+            b = a;
             a = temp1.wrapping_add(temp2);
         }
 
@@ -858,11 +934,19 @@ impl SecureRandom {
                 .unwrap_or_default()
                 .as_nanos() as u64
         };
-        SecureRandom { seed, counter: 0, use_os_entropy: true }
+        SecureRandom {
+            seed,
+            counter: 0,
+            use_os_entropy: true,
+        }
     }
 
     pub fn new_with_seed(seed: u64) -> Self {
-        SecureRandom { seed, counter: 0, use_os_entropy: false }
+        SecureRandom {
+            seed,
+            counter: 0,
+            use_os_entropy: false,
+        }
     }
 
     pub fn next_bytes(&mut self, buf: &mut [u8]) {
@@ -1060,7 +1144,10 @@ fn read_seed_bytes(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
     out
 }
 
-fn native_secure_random_next_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_secure_random_next_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // java/security/SecureRandom.nextBytes([B)V
     // args: [this, byte[]]
     let this = match args.first() {
@@ -1084,7 +1171,10 @@ fn native_secure_random_next_bytes(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(None)
 }
 
-fn native_secure_random_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_secure_random_generate_seed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // java/security/SecureRandom.generateSeed(I)[B
     // args: [this, numBytes]
     let this = match args.first() {
@@ -1204,11 +1294,36 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     // (together with this file's seed-ignoring nextBytes) let the instance seed
     // be silently dropped.  Keeping the full SecureRandom output+seed surface in
     // one place ensures setSeed actually supplements the stream end-to-end.
-    r.register("java/security/SecureRandom", "nextBytes", "([B)V", native_secure_random_next_bytes);
-    r.register("java/security/SecureRandom", "generateSeed", "(I)[B", native_secure_random_generate_seed);
-    r.register("java/security/SecureRandom", "setSeed", "(J)V", native_secure_random_set_seed_long);
-    r.register("java/security/SecureRandom", "setSeed", "([B)V", native_secure_random_set_seed_bytes);
-    r.register("java/security/SecureRandom", "<init>", "([B)V", native_secure_random_init_seed_bytes);
+    r.register(
+        "java/security/SecureRandom",
+        "nextBytes",
+        "([B)V",
+        native_secure_random_next_bytes,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "generateSeed",
+        "(I)[B",
+        native_secure_random_generate_seed,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "setSeed",
+        "(J)V",
+        native_secure_random_set_seed_long,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "setSeed",
+        "([B)V",
+        native_secure_random_set_seed_bytes,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "<init>",
+        "([B)V",
+        native_secure_random_init_seed_bytes,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -1229,21 +1344,31 @@ pub struct BigUint {
 impl BigUint {
     pub const ZERO: BigUint = BigUint { limbs: Vec::new() };
 
-    pub fn zero() -> Self { BigUint { limbs: Vec::new() } }
+    pub fn zero() -> Self {
+        BigUint { limbs: Vec::new() }
+    }
 
-    pub fn one() -> Self { BigUint { limbs: vec![1] } }
+    pub fn one() -> Self {
+        BigUint { limbs: vec![1] }
+    }
 
     pub fn from_u64(v: u64) -> Self {
-        if v == 0 { return Self::zero(); }
+        if v == 0 {
+            return Self::zero();
+        }
         let lo = v as u32;
         let hi = (v >> 32) as u32;
         let mut limbs = vec![lo];
-        if hi != 0 { limbs.push(hi); }
+        if hi != 0 {
+            limbs.push(hi);
+        }
         BigUint { limbs }
     }
 
     pub fn from_bytes_be(bytes: &[u8]) -> Self {
-        if bytes.is_empty() { return Self::zero(); }
+        if bytes.is_empty() {
+            return Self::zero();
+        }
         let mut limbs = Vec::with_capacity((bytes.len() + 3) / 4);
         let mut i = bytes.len();
         while i > 0 {
@@ -1261,45 +1386,63 @@ impl BigUint {
     }
 
     pub fn to_bytes_be(&self) -> Vec<u8> {
-        if self.is_zero() { return vec![0]; }
+        if self.is_zero() {
+            return vec![0];
+        }
         let mut bytes = Vec::new();
         for &limb in self.limbs.iter().rev() {
             bytes.extend_from_slice(&limb.to_be_bytes());
         }
         // strip leading zeros
-        while bytes.len() > 1 && bytes[0] == 0 { bytes.remove(0); }
+        while bytes.len() > 1 && bytes[0] == 0 {
+            bytes.remove(0);
+        }
         bytes
     }
 
     /// Return bytes zero-padded to exactly `len` bytes (big-endian).
     pub fn to_bytes_be_padded(&self, len: usize) -> Vec<u8> {
         let raw = self.to_bytes_be();
-        if raw.len() >= len { return raw[raw.len()-len..].to_vec(); }
+        if raw.len() >= len {
+            return raw[raw.len() - len..].to_vec();
+        }
         let mut out = vec![0u8; len - raw.len()];
         out.extend_from_slice(&raw);
         out
     }
 
-    pub fn is_zero(&self) -> bool { self.limbs.is_empty() || self.limbs.iter().all(|&l| l == 0) }
+    pub fn is_zero(&self) -> bool {
+        self.limbs.is_empty() || self.limbs.iter().all(|&l| l == 0)
+    }
 
-    pub fn is_one(&self) -> bool { self.limbs.len() == 1 && self.limbs[0] == 1 }
+    pub fn is_one(&self) -> bool {
+        self.limbs.len() == 1 && self.limbs[0] == 1
+    }
 
-    pub fn is_even(&self) -> bool { self.limbs.is_empty() || (self.limbs[0] & 1) == 0 }
+    pub fn is_even(&self) -> bool {
+        self.limbs.is_empty() || (self.limbs[0] & 1) == 0
+    }
 
     pub fn bit_length(&self) -> usize {
-        if self.is_zero() { return 0; }
+        if self.is_zero() {
+            return 0;
+        }
         let top = self.limbs.len() - 1;
         (top * 32) + (32 - self.limbs[top].leading_zeros() as usize)
     }
 
     pub fn bit(&self, idx: usize) -> bool {
         let limb_idx = idx / 32;
-        if limb_idx >= self.limbs.len() { return false; }
+        if limb_idx >= self.limbs.len() {
+            return false;
+        }
         (self.limbs[limb_idx] >> (idx % 32)) & 1 == 1
     }
 
     fn normalize(&mut self) {
-        while self.limbs.last() == Some(&0) { self.limbs.pop(); }
+        while self.limbs.last() == Some(&0) {
+            self.limbs.pop();
+        }
     }
 
     pub fn add(&self, other: &BigUint) -> BigUint {
@@ -1313,7 +1456,9 @@ impl BigUint {
             result.push(sum as u32);
             carry = sum >> 32;
         }
-        if carry > 0 { result.push(carry as u32); }
+        if carry > 0 {
+            result.push(carry as u32);
+        }
         let mut r = BigUint { limbs: result };
         r.normalize();
         r
@@ -1341,13 +1486,15 @@ impl BigUint {
     }
 
     pub fn mul(&self, other: &BigUint) -> BigUint {
-        if self.is_zero() || other.is_zero() { return Self::zero(); }
+        if self.is_zero() || other.is_zero() {
+            return Self::zero();
+        }
         let mut result = vec![0u32; self.limbs.len() + other.limbs.len()];
         for i in 0..self.limbs.len() {
             let mut carry = 0u64;
             for j in 0..other.limbs.len() {
-                let prod = self.limbs[i] as u64 * other.limbs[j] as u64
-                    + result[i + j] as u64 + carry;
+                let prod =
+                    self.limbs[i] as u64 * other.limbs[j] as u64 + result[i + j] as u64 + carry;
                 result[i + j] = prod as u32;
                 carry = prod >> 32;
             }
@@ -1359,7 +1506,9 @@ impl BigUint {
     }
 
     pub fn mul_u32(&self, v: u32) -> BigUint {
-        if v == 0 || self.is_zero() { return Self::zero(); }
+        if v == 0 || self.is_zero() {
+            return Self::zero();
+        }
         let mut result = Vec::with_capacity(self.limbs.len() + 1);
         let mut carry = 0u64;
         for &limb in &self.limbs {
@@ -1367,7 +1516,9 @@ impl BigUint {
             result.push(prod as u32);
             carry = prod >> 32;
         }
-        if carry > 0 { result.push(carry as u32); }
+        if carry > 0 {
+            result.push(carry as u32);
+        }
         let mut r = BigUint { limbs: result };
         r.normalize();
         r
@@ -1461,9 +1612,7 @@ impl BigUint {
             // Correction: if q_hat * v_top2 > base * r_hat + u[j+n-2], reduce q_hat.
             // The two checks are sufficient for a tight estimate.
             let u_low = u.limbs[j + n - 2] as u64;
-            while q_hat >= base
-                || q_hat * v_top2 > base * r_hat + u_low
-            {
+            while q_hat >= base || q_hat * v_top2 > base * r_hat + u_low {
                 q_hat -= 1;
                 r_hat += v_top;
                 if r_hat >= base {
@@ -1514,7 +1663,9 @@ impl BigUint {
         }
 
         // D8. Unnormalize the remainder by shifting right.
-        let mut rem = BigUint { limbs: u.limbs[..n].to_vec() };
+        let mut rem = BigUint {
+            limbs: u.limbs[..n].to_vec(),
+        };
         rem.normalize();
         let rem = rem.shr_bits(shift);
 
@@ -1524,7 +1675,9 @@ impl BigUint {
     }
 
     fn shl_bits(&self, shift: u32) -> BigUint {
-        if shift == 0 || self.is_zero() { return self.clone(); }
+        if shift == 0 || self.is_zero() {
+            return self.clone();
+        }
         let word_shift = (shift / 32) as usize;
         let bit_shift = shift % 32;
         let mut result = vec![0u32; self.limbs.len() + word_shift + 1];
@@ -1535,23 +1688,31 @@ impl BigUint {
             result[i + word_shift] = shifted as u32;
             carry = (shifted >> 32) as u32;
         }
-        if carry > 0 { result[self.limbs.len() + word_shift] = carry; }
+        if carry > 0 {
+            result[self.limbs.len() + word_shift] = carry;
+        }
         let mut r = BigUint { limbs: result };
         r.normalize();
         r
     }
 
     pub fn shr_bits(&self, shift: u32) -> BigUint {
-        if shift == 0 || self.is_zero() { return self.clone(); }
+        if shift == 0 || self.is_zero() {
+            return self.clone();
+        }
         let word_shift = (shift / 32) as usize;
         let bit_shift = shift % 32;
-        if word_shift >= self.limbs.len() { return Self::zero(); }
+        if word_shift >= self.limbs.len() {
+            return Self::zero();
+        }
         let mut result = Vec::with_capacity(self.limbs.len() - word_shift);
         for i in word_shift..self.limbs.len() {
             let lo = self.limbs[i] >> bit_shift;
             let hi = if bit_shift > 0 && i + 1 < self.limbs.len() {
                 self.limbs[i + 1] << (32 - bit_shift)
-            } else { 0 };
+            } else {
+                0
+            };
             result.push(lo | hi);
         }
         let mut r = BigUint { limbs: result };
@@ -1562,7 +1723,9 @@ impl BigUint {
     fn set_bit(mut self, idx: usize) -> BigUint {
         let limb_idx = idx / 32;
         let bit_idx = idx % 32;
-        while self.limbs.len() <= limb_idx { self.limbs.push(0); }
+        while self.limbs.len() <= limb_idx {
+            self.limbs.push(0);
+        }
         self.limbs[limb_idx] |= 1 << bit_idx;
         self
     }
@@ -1573,11 +1736,15 @@ impl BigUint {
         // compare effective lengths (skip trailing zeros)
         let a_eff = if self.is_zero() { 0 } else { a_len };
         let b_eff = if other.is_zero() { 0 } else { b_len };
-        if a_eff != b_eff { return a_eff.cmp(&b_eff); }
+        if a_eff != b_eff {
+            return a_eff.cmp(&b_eff);
+        }
         for i in (0..a_eff).rev() {
             let a = self.limbs[i];
             let b = other.limbs[i];
-            if a != b { return a.cmp(&b); }
+            if a != b {
+                return a.cmp(&b);
+            }
         }
         std::cmp::Ordering::Equal
     }
@@ -1602,7 +1769,9 @@ impl BigUint {
     /// scope. Do NOT rely on this for secrets exposed to a timing adversary;
     /// prefer the audited `rsa` / `p256` crates for such paths.
     pub fn modpow(&self, exp: &BigUint, m: &BigUint) -> BigUint {
-        if m.is_one() { return Self::zero(); }
+        if m.is_one() {
+            return Self::zero();
+        }
         let mut r0 = BigUint::one();
         let mut r1 = self.modulo(m);
         let bits = exp.bit_length();
@@ -1645,7 +1814,9 @@ impl BigUint {
     /// Modular inverse: self^-1 mod m.
     pub fn modinv(&self, m: &BigUint) -> Option<BigUint> {
         let (g, x, x_neg, _, _) = BigUint::extended_gcd(self, m);
-        if !g.is_one() { return None; }
+        if !g.is_one() {
+            return None;
+        }
         if x_neg {
             Some(m.sub(&x.modulo(m)))
         } else {
@@ -1661,7 +1832,9 @@ impl BigUint {
 }
 
 impl PartialEq for BigUint {
-    fn eq(&self, other: &Self) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
 }
 impl Eq for BigUint {}
 
@@ -1683,8 +1856,12 @@ pub struct RsaPrivateKey {
 impl Drop for RsaPrivateKey {
     fn drop(&mut self) {
         // Zeroize private key material
-        for limb in &mut self.d.limbs { *limb = 0; }
-        for limb in &mut self.n.limbs { *limb = 0; }
+        for limb in &mut self.d.limbs {
+            *limb = 0;
+        }
+        for limb in &mut self.n.limbs {
+            *limb = 0;
+        }
     }
 }
 
@@ -1693,9 +1870,15 @@ pub struct Rsa;
 impl Rsa {
     /// Miller-Rabin primality test with `k` rounds.
     fn is_probably_prime(n: &BigUint, k: usize, rng: &mut SecureRandom) -> bool {
-        if n.cmp(&BigUint::from_u64(2)) == std::cmp::Ordering::Less { return false; }
-        if n.cmp(&BigUint::from_u64(2)) == std::cmp::Ordering::Equal { return true; }
-        if n.is_even() { return false; }
+        if n.cmp(&BigUint::from_u64(2)) == std::cmp::Ordering::Less {
+            return false;
+        }
+        if n.cmp(&BigUint::from_u64(2)) == std::cmp::Ordering::Equal {
+            return true;
+        }
+        if n.is_even() {
+            return false;
+        }
 
         // Write n-1 as 2^r * d
         let n_minus_1 = n.sub(&BigUint::one());
@@ -1740,9 +1923,11 @@ impl Rsa {
             let top_bit = bits - 1;
             candidate = candidate.set_bit(top_bit);
             candidate.limbs[0] |= 1; // make odd
-            // Trim to exact bit length
+                                     // Trim to exact bit length
             let target_limbs = (bits + 31) / 32;
-            while candidate.limbs.len() > target_limbs { candidate.limbs.pop(); }
+            while candidate.limbs.len() > target_limbs {
+                candidate.limbs.pop();
+            }
             if candidate.limbs.len() == target_limbs && bits % 32 != 0 {
                 let mask = (1u32 << (bits % 32)) - 1;
                 *candidate.limbs.last_mut().unwrap() &= mask;
@@ -1754,12 +1939,16 @@ impl Rsa {
             let mut skip = false;
             for &sp in small_primes {
                 let spb = BigUint::from_u64(sp);
-                if candidate.modulo(&spb).is_zero() && candidate.cmp(&spb) != std::cmp::Ordering::Equal {
+                if candidate.modulo(&spb).is_zero()
+                    && candidate.cmp(&spb) != std::cmp::Ordering::Equal
+                {
                     skip = true;
                     break;
                 }
             }
-            if skip { continue; }
+            if skip {
+                continue;
+            }
 
             if Self::is_probably_prime(&candidate, 20, rng) {
                 return candidate;
@@ -1775,17 +1964,26 @@ impl Rsa {
         loop {
             let p = Self::gen_prime(half, &mut rng);
             let q = Self::gen_prime(half, &mut rng);
-            if p.cmp(&q) == std::cmp::Ordering::Equal { continue; }
+            if p.cmp(&q) == std::cmp::Ordering::Equal {
+                continue;
+            }
             let n = p.mul(&q);
-            if n.bit_length() != bits { continue; }
+            if n.bit_length() != bits {
+                continue;
+            }
             let p1 = p.sub(&BigUint::one());
             let q1 = q.sub(&BigUint::one());
             let phi = p1.mul(&q1);
             // Verify gcd(e, phi) == 1 (coprimality requirement)
             let (gcd, _, _, _, _) = BigUint::extended_gcd(&e, &phi);
-            if !gcd.is_one() { continue; }
+            if !gcd.is_one() {
+                continue;
+            }
             if let Some(d) = e.modinv(&phi) {
-                let pub_key = RsaPublicKey { n: n.clone(), e: e.clone() };
+                let pub_key = RsaPublicKey {
+                    n: n.clone(),
+                    e: e.clone(),
+                };
                 let priv_key = RsaPrivateKey { n, d, e: e.clone() };
                 return (pub_key, priv_key);
             }
@@ -1812,7 +2010,9 @@ impl Rsa {
     /// PKCS#1 v1.5 SHA-256 verification.
     pub fn verify_sha256(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
         let k = (key.n.bit_length() + 7) / 8;
-        if signature.len() != k { return false; }
+        if signature.len() != k {
+            return false;
+        }
         let s = BigUint::from_bytes_be(signature);
         let m = s.modpow(&key.e, &key.n);
         let em = m.to_bytes_be_padded(k);
@@ -1841,8 +2041,8 @@ impl Rsa {
     fn pkcs1v15_encode(hash: &[u8], k: usize) -> Option<Vec<u8>> {
         // DigestInfo DER prefix for SHA-256
         let digest_info_prefix: &[u8] = &[
-            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
-            0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01, 0x05, 0x00, 0x04, 0x20,
         ];
         let t_len = digest_info_prefix.len() + hash.len();
         // Need: 00 01 || PS(>=8 bytes of FF) || 00 || T  => k >= t_len + 11.
@@ -1870,7 +2070,9 @@ impl Rsa {
         let rsa_key_seq = der_encode_sequence(&seq_inner);
 
         // AlgorithmIdentifier for RSA: OID 1.2.840.113549.1.1.1 + NULL
-        let alg_oid: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00];
+        let alg_oid: &[u8] = &[
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+        ];
         let alg_id = der_encode_sequence(alg_oid);
 
         // BIT STRING wrapping the RSA key sequence
@@ -2117,7 +2319,11 @@ fn rsa_pkcs1_type2_unpad(em: &[u8]) -> Result<Vec<u8>, String> {
     // that is 0xFF when sep < 10. Since sep is small, a direct comparison here
     // does not leak plaintext (it only reflects the padding length, which the
     // attacker already influences), but we still fold it into `bad`.
-    let ps_too_short = if found != 0 && sep < 10 { 0xFFu8 } else { 0x00u8 };
+    let ps_too_short = if found != 0 && sep < 10 {
+        0xFFu8
+    } else {
+        0x00u8
+    };
     bad |= ps_too_short;
 
     if bad != 0 {
@@ -2149,7 +2355,11 @@ fn rsa_oaep_pad(pad: RsaCipherPadding, msg: &[u8], k: usize) -> Result<Vec<u8>, 
     let db_mask = rsa_mgf1(pad, &seed, k - hlen - 1);
     let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
     let seed_mask = rsa_mgf1(pad, &masked_db, hlen);
-    let masked_seed: Vec<u8> = seed.iter().zip(seed_mask.iter()).map(|(a, b)| a ^ b).collect();
+    let masked_seed: Vec<u8> = seed
+        .iter()
+        .zip(seed_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
     let mut em = Vec::with_capacity(k);
     em.push(0x00);
     em.extend_from_slice(&masked_seed);
@@ -2281,10 +2491,12 @@ pub fn rsa_cipher_decrypt(
 /// Resolve a synthetic key's `crypto_impl` private components `(n, d)`.
 pub fn rsa_key_get_priv(id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
     let guard = RSA_KEY_STORE.read();
-    guard
-        .as_ref()
-        .and_then(|m| m.get(&id))
-        .map(|kp| (kp.private_key.n.to_bytes_be(), kp.private_key.d.to_bytes_be()))
+    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
+        (
+            kp.private_key.n.to_bytes_be(),
+            kp.private_key.d.to_bytes_be(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2340,13 +2552,7 @@ fn pss_mgf1(hash: PssHash, seed: &[u8], len: usize) -> Vec<u8> {
 
 /// RSASSA-PSS verify with MGF1 and salt length == hLen (the JWA convention for
 /// PS256/PS384/PS512). Returns `false` for any malformed/invalid signature.
-pub fn rsa_verify_pss(
-    n: &[u8],
-    e: &[u8],
-    hash: PssHash,
-    message: &[u8],
-    signature: &[u8],
-) -> bool {
+pub fn rsa_verify_pss(n: &[u8], e: &[u8], hash: PssHash, message: &[u8], signature: &[u8]) -> bool {
     let n_big = BigUint::from_bytes_be(n);
     let e_big = BigUint::from_bytes_be(e);
     let mod_bits = n_big.bit_length();
@@ -2446,30 +2652,59 @@ pub struct FieldElement256 {
 
 // P-256 prime: p = 2^256 - 2^224 + 2^192 + 2^96 - 1
 const P256_P: FieldElement256 = FieldElement256 {
-    limbs: [0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF, 0x0000000000000000, 0xFFFFFFFF00000001],
+    limbs: [
+        0xFFFFFFFFFFFFFFFF,
+        0x00000000FFFFFFFF,
+        0x0000000000000000,
+        0xFFFFFFFF00000001,
+    ],
 };
 
 // P-256 order n
 const P256_N: FieldElement256 = FieldElement256 {
-    limbs: [0xF3B9CAC2FC632551, 0xBCE6FAADA7179E84, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000000],
+    limbs: [
+        0xF3B9CAC2FC632551,
+        0xBCE6FAADA7179E84,
+        0xFFFFFFFFFFFFFFFF,
+        0xFFFFFFFF00000000,
+    ],
 };
 
 // P-256 parameter b
 const P256_B: FieldElement256 = FieldElement256 {
-    limbs: [0x3BCE3C3E27D2604B, 0x651D06B0CC53B0F6, 0xB3EBBD55769886BC, 0x5AC635D8AA3A93E7],
+    limbs: [
+        0x3BCE3C3E27D2604B,
+        0x651D06B0CC53B0F6,
+        0xB3EBBD55769886BC,
+        0x5AC635D8AA3A93E7,
+    ],
 };
 
 // Generator point G
 const P256_GX: FieldElement256 = FieldElement256 {
-    limbs: [0xF4A13945D898C296, 0x77037D812DEB33A0, 0xF8BCE6E563A440F2, 0x6B17D1F2E12C4247],
+    limbs: [
+        0xF4A13945D898C296,
+        0x77037D812DEB33A0,
+        0xF8BCE6E563A440F2,
+        0x6B17D1F2E12C4247,
+    ],
 };
 const P256_GY: FieldElement256 = FieldElement256 {
-    limbs: [0xCBB6406837BF51F5, 0x2BCE33576B315ECE, 0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B],
+    limbs: [
+        0xCBB6406837BF51F5,
+        0x2BCE33576B315ECE,
+        0x8EE7EB4A7C0F9E16,
+        0x4FE342E2FE1A7F9B,
+    ],
 };
 
 impl FieldElement256 {
-    pub const ZERO: FieldElement256 = FieldElement256 { limbs: [0, 0, 0, 0] };
-    pub const ONE: FieldElement256 = FieldElement256 { limbs: [1, 0, 0, 0] };
+    pub const ZERO: FieldElement256 = FieldElement256 {
+        limbs: [0, 0, 0, 0],
+    };
+    pub const ONE: FieldElement256 = FieldElement256 {
+        limbs: [1, 0, 0, 0],
+    };
 
     pub fn from_bytes_be(bytes: &[u8]) -> Self {
         let mut padded = [0u8; 32];
@@ -2492,7 +2727,9 @@ impl FieldElement256 {
         out
     }
 
-    pub fn is_zero(&self) -> bool { self.limbs == [0, 0, 0, 0] }
+    pub fn is_zero(&self) -> bool {
+        self.limbs == [0, 0, 0, 0]
+    }
 
     /// Add two 256-bit field elements mod p.
     pub fn add_mod(a: &Self, b: &Self, p: &Self) -> Self {
@@ -2594,7 +2831,9 @@ fn sub_u256(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], bool) {
 
 fn cmp_u256(a: &[u64; 4], b: &[u64; 4]) -> std::cmp::Ordering {
     for i in (0..4).rev() {
-        if a[i] != b[i] { return a[i].cmp(&b[i]); }
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
     }
     std::cmp::Ordering::Equal
 }
@@ -2643,17 +2882,29 @@ pub struct EcPoint {
 
 impl EcPoint {
     pub fn infinity() -> Self {
-        EcPoint { x: FieldElement256::ZERO, y: FieldElement256::ZERO, infinity: true }
+        EcPoint {
+            x: FieldElement256::ZERO,
+            y: FieldElement256::ZERO,
+            infinity: true,
+        }
     }
 
     pub fn new(x: FieldElement256, y: FieldElement256) -> Self {
-        EcPoint { x, y, infinity: false }
+        EcPoint {
+            x,
+            y,
+            infinity: false,
+        }
     }
 
     /// Point addition on P-256 (affine).
     pub fn add(p1: &EcPoint, p2: &EcPoint) -> EcPoint {
-        if p1.infinity { return *p2; }
-        if p2.infinity { return *p1; }
+        if p1.infinity {
+            return *p2;
+        }
+        if p2.infinity {
+            return *p1;
+        }
 
         let p = &P256_P;
 
@@ -2684,11 +2935,17 @@ impl EcPoint {
 
     /// Point doubling on P-256.
     pub fn double(p1: &EcPoint) -> EcPoint {
-        if p1.infinity || p1.y.is_zero() { return Self::infinity(); }
+        if p1.infinity || p1.y.is_zero() {
+            return Self::infinity();
+        }
 
         let p = &P256_P;
-        let three = FieldElement256 { limbs: [3, 0, 0, 0] };
-        let two = FieldElement256 { limbs: [2, 0, 0, 0] };
+        let three = FieldElement256 {
+            limbs: [3, 0, 0, 0],
+        };
+        let two = FieldElement256 {
+            limbs: [2, 0, 0, 0],
+        };
 
         // lambda = (3*x1^2 + a) / (2*y1), where a = -3 for P-256
         let x1_sq = FieldElement256::mul_mod(&p1.x, &p1.x, p);
@@ -2769,10 +3026,16 @@ impl Ecdsa {
             rng.next_bytes(&mut d_bytes);
             let d = FieldElement256::from_bytes_be(&d_bytes);
             // Ensure d is in [1, n-1]
-            if d.is_zero() { continue; }
-            if cmp_u256(&d.limbs, &P256_N.limbs) != std::cmp::Ordering::Less { continue; }
+            if d.is_zero() {
+                continue;
+            }
+            if cmp_u256(&d.limbs, &P256_N.limbs) != std::cmp::Ordering::Less {
+                continue;
+            }
             let q = EcPoint::scalar_mul(&g, &d);
-            if q.infinity { continue; }
+            if q.infinity {
+                continue;
+            }
             return (EcdsaPublicKey { point: q }, EcdsaPrivateKey { d });
         }
     }
@@ -2827,22 +3090,35 @@ impl Ecdsa {
             let mut k_bytes = [0u8; 32];
             rng.next_bytes(&mut k_bytes);
             let k = FieldElement256::from_bytes_be(&k_bytes);
-            if k.is_zero() { continue; }
-            if cmp_u256(&k.limbs, &n.limbs) != std::cmp::Ordering::Less { continue; }
+            if k.is_zero() {
+                continue;
+            }
+            if cmp_u256(&k.limbs, &n.limbs) != std::cmp::Ordering::Less {
+                continue;
+            }
 
             let r_point = EcPoint::scalar_mul(&g, &k);
-            if r_point.infinity { continue; }
+            if r_point.infinity {
+                continue;
+            }
             let r_big = r_point.x.to_biguint().modulo(&n_big);
-            if r_big.is_zero() { continue; }
+            if r_big.is_zero() {
+                continue;
+            }
 
             let k_big = k.to_biguint();
             let z_big = z.to_biguint();
             let d_big = key.d.to_biguint();
-            let k_inv = match k_big.modinv(&n_big) { Some(v) => v, None => continue };
+            let k_inv = match k_big.modinv(&n_big) {
+                Some(v) => v,
+                None => continue,
+            };
             let rd = r_big.mul(&d_big).modulo(&n_big);
             let zrd = z_big.add(&rd).modulo(&n_big);
             let s_big = k_inv.mul(&zrd).modulo(&n_big);
-            if s_big.is_zero() { continue; }
+            if s_big.is_zero() {
+                continue;
+            }
 
             let r_bytes = r_big.to_bytes_be();
             let s_bytes = s_big.to_bytes_be();
@@ -2860,15 +3136,22 @@ impl Ecdsa {
         let r_big = BigUint::from_bytes_be(&r_bytes);
         let s_big = BigUint::from_bytes_be(&s_bytes);
 
-        if r_big.is_zero() || r_big.cmp(&n_big) != std::cmp::Ordering::Less { return false; }
-        if s_big.is_zero() || s_big.cmp(&n_big) != std::cmp::Ordering::Less { return false; }
+        if r_big.is_zero() || r_big.cmp(&n_big) != std::cmp::Ordering::Less {
+            return false;
+        }
+        if s_big.is_zero() || s_big.cmp(&n_big) != std::cmp::Ordering::Less {
+            return false;
+        }
 
         let mut z_bytes = [0u8; 32];
         let dn = digest.len().min(32);
         z_bytes[..dn].copy_from_slice(&digest[..dn]);
         let z_big = BigUint::from_bytes_be(&z_bytes).modulo(&n_big);
 
-        let s_inv = match s_big.modinv(&n_big) { Some(v) => v, None => return false };
+        let s_inv = match s_big.modinv(&n_big) {
+            Some(v) => v,
+            None => return false,
+        };
         let u1 = z_big.mul(&s_inv).modulo(&n_big);
         let u2 = r_big.mul(&s_inv).modulo(&n_big);
 
@@ -2879,7 +3162,9 @@ impl Ecdsa {
         let p2 = EcPoint::scalar_mul(&key.point, &u2_fe);
         let r_point = EcPoint::add(&p1, &p2);
 
-        if r_point.infinity { return false; }
+        if r_point.infinity {
+            return false;
+        }
         let rx = r_point.x.to_biguint().modulo(&n_big);
         rx.cmp(&r_big) == std::cmp::Ordering::Equal
     }
@@ -2898,23 +3183,36 @@ impl Ecdsa {
             let mut k_bytes = [0u8; 32];
             rng.next_bytes(&mut k_bytes);
             let k = FieldElement256::from_bytes_be(&k_bytes);
-            if k.is_zero() { continue; }
-            if cmp_u256(&k.limbs, &n.limbs) != std::cmp::Ordering::Less { continue; }
+            if k.is_zero() {
+                continue;
+            }
+            if cmp_u256(&k.limbs, &n.limbs) != std::cmp::Ordering::Less {
+                continue;
+            }
 
             let r_point = EcPoint::scalar_mul(&g, &k);
-            if r_point.infinity { continue; }
+            if r_point.infinity {
+                continue;
+            }
             let r_big = r_point.x.to_biguint().modulo(&n_big);
-            if r_big.is_zero() { continue; }
+            if r_big.is_zero() {
+                continue;
+            }
 
             // s = k^-1 * (z + r * d) mod n
             let k_big = k.to_biguint();
             let z_big = z.to_biguint();
             let d_big = key.d.to_biguint();
-            let k_inv = match k_big.modinv(&n_big) { Some(v) => v, None => continue };
+            let k_inv = match k_big.modinv(&n_big) {
+                Some(v) => v,
+                None => continue,
+            };
             let rd = r_big.mul(&d_big).modulo(&n_big);
             let zrd = z_big.add(&rd).modulo(&n_big);
             let s_big = k_inv.mul(&zrd).modulo(&n_big);
-            if s_big.is_zero() { continue; }
+            if s_big.is_zero() {
+                continue;
+            }
 
             // DER encode (r, s)
             let r_bytes = r_big.to_bytes_be();
@@ -2933,13 +3231,20 @@ impl Ecdsa {
         let r_big = BigUint::from_bytes_be(&r_bytes);
         let s_big = BigUint::from_bytes_be(&s_bytes);
 
-        if r_big.is_zero() || r_big.cmp(&n_big) != std::cmp::Ordering::Less { return false; }
-        if s_big.is_zero() || s_big.cmp(&n_big) != std::cmp::Ordering::Less { return false; }
+        if r_big.is_zero() || r_big.cmp(&n_big) != std::cmp::Ordering::Less {
+            return false;
+        }
+        if s_big.is_zero() || s_big.cmp(&n_big) != std::cmp::Ordering::Less {
+            return false;
+        }
 
         let hash_full = Sha384::digest(message);
         let z_big = BigUint::from_bytes_be(&hash_full[..32]).modulo(&n_big);
 
-        let s_inv = match s_big.modinv(&n_big) { Some(v) => v, None => return false };
+        let s_inv = match s_big.modinv(&n_big) {
+            Some(v) => v,
+            None => return false,
+        };
         let u1 = z_big.mul(&s_inv).modulo(&n_big);
         let u2 = r_big.mul(&s_inv).modulo(&n_big);
 
@@ -2950,7 +3255,9 @@ impl Ecdsa {
         let p2 = EcPoint::scalar_mul(&key.point, &u2_fe);
         let r_point = EcPoint::add(&p1, &p2);
 
-        if r_point.infinity { return false; }
+        if r_point.infinity {
+            return false;
+        }
         let rx = r_point.x.to_biguint().modulo(&n_big);
         rx.cmp(&r_big) == std::cmp::Ordering::Equal
     }
@@ -2966,10 +3273,14 @@ impl Ecdsa {
 
     /// Parse uncompressed public key (0x04 || x || y).
     pub fn public_key_from_bytes(bytes: &[u8]) -> Option<EcdsaPublicKey> {
-        if bytes.len() != 65 || bytes[0] != 0x04 { return None; }
+        if bytes.len() != 65 || bytes[0] != 0x04 {
+            return None;
+        }
         let x = FieldElement256::from_bytes_be(&bytes[1..33]);
         let y = FieldElement256::from_bytes_be(&bytes[33..65]);
-        Some(EcdsaPublicKey { point: EcPoint::new(x, y) })
+        Some(EcdsaPublicKey {
+            point: EcPoint::new(x, y),
+        })
     }
 
     /// Serialize private key (raw 32-byte scalar).
@@ -3009,7 +3320,9 @@ fn der_encode_ecdsa_signature(r: &[u8], s: &[u8]) -> Vec<u8> {
 }
 
 fn der_decode_ecdsa_signature(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    if data.len() < 6 || data[0] != 0x30 { return None; }
+    if data.len() < 6 || data[0] != 0x30 {
+        return None;
+    }
     let (_, content) = der_read_tag_length(data)?;
     let (r, rest) = der_read_integer(content)?;
     let (s, _) = der_read_integer(rest)?;
@@ -3048,7 +3361,9 @@ pub fn der_encode_integer(value: &[u8]) -> Vec<u8> {
     } else {
         // Strip leading zeros (keep at least one byte)
         let mut start = 0;
-        while start + 1 < value.len() && value[start] == 0 { start += 1; }
+        while start + 1 < value.len() && value[start] == 0 {
+            start += 1;
+        }
         let trimmed = &value[start..];
         out.extend_from_slice(&der_encode_length(trimmed.len()));
         out.extend_from_slice(trimmed);
@@ -3060,7 +3375,9 @@ pub fn der_encode_integer(value: &[u8]) -> Vec<u8> {
 
 /// Read a DER tag and length, return (total header+content length consumed, content slice).
 fn der_read_tag_length(data: &[u8]) -> Option<(usize, &[u8])> {
-    if data.len() < 2 { return None; }
+    if data.len() < 2 {
+        return None;
+    }
     let _tag = data[0];
     let (len, hdr_size) = der_read_length(&data[1..])?;
     // `1 + hdr_size` cannot overflow (hdr_size <= 9), but the content end
@@ -3069,24 +3386,32 @@ fn der_read_tag_length(data: &[u8]) -> Option<(usize, &[u8])> {
     // inverted/out-of-range slice (panic / DoS on a malicious certificate).
     let total_hdr = 1 + hdr_size;
     let end = total_hdr.checked_add(len)?;
-    if data.len() < end { return None; }
+    if data.len() < end {
+        return None;
+    }
     Some((end, &data[total_hdr..end]))
 }
 
 fn der_read_length(data: &[u8]) -> Option<(usize, usize)> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     if data[0] < 0x80 {
         Some((data[0] as usize, 1))
     } else {
         let num_bytes = (data[0] & 0x7f) as usize;
-        if num_bytes == 0 || data.len() < 1 + num_bytes { return None; }
+        if num_bytes == 0 || data.len() < 1 + num_bytes {
+            return None;
+        }
         // A length encoded in more bytes than a `usize` can hold would wrap
         // the accumulator below to a small value that then slips past the
         // caller's bounds check, so reject an over-wide width outright. With
         // `num_bytes <= size_of::<usize>()` the shift/or accumulation fits
         // exactly and cannot overflow; any oversized-but-in-range `len` is
         // then caught by the caller's `checked_add` + buffer-length guard.
-        if num_bytes > core::mem::size_of::<usize>() { return None; }
+        if num_bytes > core::mem::size_of::<usize>() {
+            return None;
+        }
         let mut len = 0usize;
         for i in 0..num_bytes {
             len = (len << 8) | data[1 + i] as usize;
@@ -3096,14 +3421,20 @@ fn der_read_length(data: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn der_read_integer(data: &[u8]) -> Option<(Vec<u8>, &[u8])> {
-    if data.is_empty() || data[0] != 0x02 { return None; }
+    if data.is_empty() || data[0] != 0x02 {
+        return None;
+    }
     let (len, hdr_size) = der_read_length(&data[1..])?;
     let start = 1 + hdr_size;
     let end = start.checked_add(len)?;
-    if data.len() < end { return None; }
+    if data.len() < end {
+        return None;
+    }
     let mut bytes = data[start..end].to_vec();
     // Strip leading zero used for sign
-    while bytes.len() > 1 && bytes[0] == 0 { bytes.remove(0); }
+    while bytes.len() > 1 && bytes[0] == 0 {
+        bytes.remove(0);
+    }
     Some((bytes, &data[end..]))
 }
 
@@ -3117,7 +3448,7 @@ pub struct X509Cert {
     pub issuer_cn: String,
     pub subject_raw: Vec<u8>,
     pub subject_cn: String,
-    pub not_before: i64,  // seconds since epoch
+    pub not_before: i64, // seconds since epoch
     pub not_after: i64,
     pub public_key_bytes: Vec<u8>,
     pub public_key_algorithm: String,
@@ -3130,10 +3461,13 @@ impl X509Cert {
     /// Parse an X.509 certificate from DER-encoded bytes.
     pub fn parse_der(data: &[u8]) -> Result<Self, CryptoError> {
         if data.len() < 10 || data[0] != 0x30 {
-            return Err(CryptoError::UnsupportedAlgorithm("not a valid DER certificate".into()));
+            return Err(CryptoError::UnsupportedAlgorithm(
+                "not a valid DER certificate".into(),
+            ));
         }
-        let (_, cert_content) = der_read_tag_length(data)
-            .ok_or_else(|| CryptoError::UnsupportedAlgorithm("invalid certificate structure".into()))?;
+        let (_, cert_content) = der_read_tag_length(data).ok_or_else(|| {
+            CryptoError::UnsupportedAlgorithm("invalid certificate structure".into())
+        })?;
 
         // TBSCertificate is the first SEQUENCE in the certificate content
         let (tbs_total_len, tbs_content) = der_read_tag_length(cert_content)
@@ -3150,10 +3484,14 @@ impl X509Cert {
                 .ok_or_else(|| CryptoError::UnsupportedAlgorithm("bad version tag".into()))?;
             let ver = if v_content.len() >= 3 && v_content[0] == 0x02 {
                 v_content[2]
-            } else { 0 };
+            } else {
+                0
+            };
             pos = &pos[vlen..];
             ver + 1 // X.509 version is 0-indexed in DER
-        } else { 1 };
+        } else {
+            1
+        };
 
         // Serial number
         let (serial, rest) = der_read_integer(pos)
@@ -3202,8 +3540,14 @@ impl X509Cert {
         let signature_bytes = if !rest3.is_empty() && rest3[0] == 0x03 {
             let (_, bs_content) = der_read_tag_length(rest3)
                 .ok_or_else(|| CryptoError::UnsupportedAlgorithm("bad signature".into()))?;
-            if bs_content.is_empty() { Vec::new() } else { bs_content[1..].to_vec() } // skip unused-bits byte
-        } else { Vec::new() };
+            if bs_content.is_empty() {
+                Vec::new()
+            } else {
+                bs_content[1..].to_vec()
+            } // skip unused-bits byte
+        } else {
+            Vec::new()
+        };
 
         Ok(X509Cert {
             version,
@@ -3229,12 +3573,16 @@ impl X509Cert {
             "SHA256withRSA" => {
                 if let Some(pub_key) = parse_rsa_public_key(issuer_spki) {
                     Rsa::verify_sha256(&pub_key, &self.tbs_bytes, &self.signature_bytes)
-                } else { false }
+                } else {
+                    false
+                }
             }
             "SHA384withECDSA" => {
                 if let Some(pub_key) = parse_ecdsa_public_key(issuer_spki) {
                     Ecdsa::verify_sha384(&pub_key, &self.tbs_bytes, &self.signature_bytes)
-                } else { false }
+                } else {
+                    false
+                }
             }
             _ => false,
         }
@@ -3352,9 +3700,9 @@ pub fn verify_cert_chain(
         // issuers can share a CN). When the next chain element is used as the
         // issuer we additionally require strict Name-DER continuity, matching
         // `x509_manager::validate_chain` step 3.
-        let next_in_chain = chain.get(i + 1).filter(|next| {
-            next.subject_der_matches(&cert.issuer_raw)
-        });
+        let next_in_chain = chain
+            .get(i + 1)
+            .filter(|next| next.subject_der_matches(&cert.issuer_raw));
         let anchor = trust_anchors
             .iter()
             .find(|a| a.subject_der_matches(&cert.issuer_raw));
@@ -3386,9 +3734,13 @@ pub fn verify_cert_chain(
 
 fn oid_to_sig_name(alg_seq_content: &[u8]) -> String {
     // Extract OID bytes
-    if alg_seq_content.len() < 2 || alg_seq_content[0] != 0x06 { return "Unknown".into(); }
+    if alg_seq_content.len() < 2 || alg_seq_content[0] != 0x06 {
+        return "Unknown".into();
+    }
     let oid_len = alg_seq_content[1] as usize;
-    if alg_seq_content.len() < 2 + oid_len { return "Unknown".into(); }
+    if alg_seq_content.len() < 2 + oid_len {
+        return "Unknown".into();
+    }
     let oid = &alg_seq_content[2..2 + oid_len];
 
     // Match common OIDs
@@ -3428,8 +3780,9 @@ fn extract_cn(name_content: &[u8]) -> String {
                                     let val_start2 = val_start + 2;
                                     if atv_content.len() >= val_start2 + val_len {
                                         return String::from_utf8_lossy(
-                                            &atv_content[val_start2..val_start2 + val_len]
-                                        ).into_owned();
+                                            &atv_content[val_start2..val_start2 + val_len],
+                                        )
+                                        .into_owned();
                                     }
                                 }
                             }
@@ -3438,7 +3791,9 @@ fn extract_cn(name_content: &[u8]) -> String {
                 }
             }
             pos = &pos[set_len..];
-        } else { break; }
+        } else {
+            break;
+        }
     }
     String::new()
 }
@@ -3451,7 +3806,9 @@ fn parse_validity(content: &[u8]) -> (i64, i64) {
 }
 
 fn parse_asn1_time(pos: &mut &[u8]) -> i64 {
-    if pos.is_empty() { return 0; }
+    if pos.is_empty() {
+        return 0;
+    }
     let tag = pos[0];
     let (total_len, content) = match der_read_tag_length(pos) {
         Some(v) => v,
@@ -3461,7 +3818,7 @@ fn parse_asn1_time(pos: &mut &[u8]) -> i64 {
     let time_str = std::str::from_utf8(content).unwrap_or("");
 
     match tag {
-        0x17 => parse_utc_time(time_str),      // UTCTime
+        0x17 => parse_utc_time(time_str),         // UTCTime
         0x18 => parse_generalized_time(time_str), // GeneralizedTime
         _ => 0,
     }
@@ -3469,7 +3826,9 @@ fn parse_asn1_time(pos: &mut &[u8]) -> i64 {
 
 fn parse_utc_time(s: &str) -> i64 {
     // YYMMDDHHMMSSZ
-    if s.len() < 12 { return 0; }
+    if s.len() < 12 {
+        return 0;
+    }
     let yy: i32 = s[0..2].parse().unwrap_or(0);
     let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
     let month: u32 = s[2..4].parse().unwrap_or(1);
@@ -3482,7 +3841,9 @@ fn parse_utc_time(s: &str) -> i64 {
 
 fn parse_generalized_time(s: &str) -> i64 {
     // YYYYMMDDHHMMSSZ
-    if s.len() < 14 { return 0; }
+    if s.len() < 14 {
+        return 0;
+    }
     let year: i32 = s[0..4].parse().unwrap_or(2000);
     let month: u32 = s[4..6].parse().unwrap_or(1);
     let day: u32 = s[6..8].parse().unwrap_or(1);
@@ -3501,7 +3862,9 @@ fn datetime_to_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: 
     let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     for m in 1..month {
         days += mdays[m as usize] as i64;
-        if m == 2 && is_leap(year) { days += 1; }
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
     }
     days += (day as i64) - 1;
     days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
@@ -3517,9 +3880,13 @@ fn detect_pk_algorithm(spki: &[u8]) -> String {
     // Check for EC OID: 1.2.840.10045.2.1
     let ec_oid = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 
-    if spki.windows(rsa_oid.len()).any(|w| w == rsa_oid) { "RSA".into() }
-    else if spki.windows(ec_oid.len()).any(|w| w == ec_oid) { "EC".into() }
-    else { "Unknown".into() }
+    if spki.windows(rsa_oid.len()).any(|w| w == rsa_oid) {
+        "RSA".into()
+    } else if spki.windows(ec_oid.len()).any(|w| w == ec_oid) {
+        "EC".into()
+    } else {
+        "Unknown".into()
+    }
 }
 
 /// Parse an RSA public key from DER SubjectPublicKeyInfo.
@@ -3530,11 +3897,15 @@ pub fn parse_rsa_public_key(spki: &[u8]) -> Option<RsaPublicKey> {
     let (alg_len, _) = der_read_tag_length(outer)?;
     let rest = &outer[alg_len..];
     // BIT STRING
-    if rest.is_empty() || rest[0] != 0x03 { return None; }
+    if rest.is_empty() || rest[0] != 0x03 {
+        return None;
+    }
     let (_, bs_content) = der_read_tag_length(rest)?;
-    if bs_content.is_empty() { return None; }
+    if bs_content.is_empty() {
+        return None;
+    }
     let key_seq = &bs_content[1..]; // skip unused bits byte
-    // SEQUENCE { INTEGER n, INTEGER e }
+                                    // SEQUENCE { INTEGER n, INTEGER e }
     let (_, seq_content) = der_read_tag_length(key_seq)?;
     let (n_bytes, rest2) = der_read_integer(seq_content)?;
     let (e_bytes, _) = der_read_integer(rest2)?;
@@ -3549,9 +3920,13 @@ pub fn parse_ecdsa_public_key(spki: &[u8]) -> Option<EcdsaPublicKey> {
     let (_, outer) = der_read_tag_length(spki)?;
     let (alg_len, _) = der_read_tag_length(outer)?;
     let rest = &outer[alg_len..];
-    if rest.is_empty() || rest[0] != 0x03 { return None; }
+    if rest.is_empty() || rest[0] != 0x03 {
+        return None;
+    }
     let (_, bs_content) = der_read_tag_length(rest)?;
-    if bs_content.is_empty() { return None; }
+    if bs_content.is_empty() {
+        return None;
+    }
     let pk_bytes = &bs_content[1..]; // skip unused bits
     Ecdsa::public_key_from_bytes(pk_bytes)
 }
@@ -3650,23 +4025,26 @@ pub fn rsa_key_store(id: u64, data: RsaKeyPairData) {
 
 pub fn rsa_key_get_pub(id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
     let guard = RSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        (kp.public_key.n.to_bytes_be(), kp.public_key.e.to_bytes_be())
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| (kp.public_key.n.to_bytes_be(), kp.public_key.e.to_bytes_be()))
 }
 
 pub fn rsa_sign(id: u64, message: &[u8]) -> Option<Vec<u8>> {
     let guard = RSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Rsa::sign_sha256(&kp.private_key, message)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Rsa::sign_sha256(&kp.private_key, message))
 }
 
 pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = RSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Rsa::verify_sha256(&kp.public_key, message, signature)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Rsa::verify_sha256(&kp.public_key, message, signature))
 }
 
 /// Maps a *real* RSA key object's GC-stable `identityHashCode` to its
@@ -3681,7 +4059,9 @@ static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<i32, u64>>> =
 
 pub fn rsa_realkey_map_set(identity_hash: i32, key_id: u64) {
     let mut guard = RSA_REALKEY_MAP.write();
-    guard.get_or_insert_with(HashMap::new).insert(identity_hash, key_id);
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(identity_hash, key_id);
 }
 
 pub fn rsa_realkey_map_get(identity_hash: i32) -> Option<u64> {
@@ -3712,16 +4092,18 @@ pub fn ecdsa_key_store(id: u64, data: EcdsaKeyPairData) {
 
 pub fn ecdsa_sign(id: u64, message: &[u8]) -> Option<Vec<u8>> {
     let guard = ECDSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Ecdsa::sign_sha384(&kp.private_key, message)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Ecdsa::sign_sha384(&kp.private_key, message))
 }
 
 pub fn ecdsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = ECDSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Ecdsa::verify_sha384(&kp.public_key, message, signature)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Ecdsa::verify_sha384(&kp.public_key, message, signature))
 }
 
 /// ECDSA sign with SHA-256 (the JCA algorithm `SHA256withECDSA`).  Used by
@@ -3729,16 +4111,18 @@ pub fn ecdsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
 /// common P-256 signing variant.
 pub fn ecdsa_sign_sha256(id: u64, message: &[u8]) -> Option<Vec<u8>> {
     let guard = ECDSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Ecdsa::sign_sha256(&kp.private_key, message)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Ecdsa::sign_sha256(&kp.private_key, message))
 }
 
 pub fn ecdsa_verify_sha256(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = ECDSA_KEY_STORE.read();
-    guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        Ecdsa::verify_sha256(&kp.public_key, message, signature)
-    })
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| Ecdsa::verify_sha256(&kp.public_key, message, signature))
 }
 
 // ---------------------------------------------------------------------------
@@ -3794,7 +4178,9 @@ pub fn ed25519_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool>
     use ed25519_dalek::{Signature, Verifier};
     let guard = ED25519_KEY_STORE.read();
     guard.as_ref().and_then(|m| m.get(&id)).map(|kp| {
-        if signature.len() != 64 { return false; }
+        if signature.len() != 64 {
+            return false;
+        }
         let sig = match Signature::from_bytes(signature.try_into().unwrap_or(&[0u8; 64])) {
             sig => sig,
         };
@@ -3844,7 +4230,9 @@ static SIG_DATA_STORE: parking_lot::RwLock<Option<HashMap<i32, Vec<u8>>>> =
 pub fn sig_data_append_h(key: i32, data: &[u8]) {
     let mut guard = SIG_DATA_STORE.write();
     let map = guard.get_or_insert_with(HashMap::new);
-    map.entry(key).or_insert_with(Vec::new).extend_from_slice(data);
+    map.entry(key)
+        .or_insert_with(Vec::new)
+        .extend_from_slice(data);
 }
 
 /// Remove and return the payload accumulated against `key`.  Returns
@@ -3891,26 +4279,35 @@ static SIG_DATA_STORE_RAW_PTR: parking_lot::RwLock<Option<HashMap<u64, Vec<u8>>>
 pub fn sig_data_append(id: u64, data: &[u8]) {
     let mut guard = SIG_DATA_STORE_RAW_PTR.write();
     let map = guard.get_or_insert_with(HashMap::new);
-    map.entry(id).or_insert_with(Vec::new).extend_from_slice(data);
+    map.entry(id)
+        .or_insert_with(Vec::new)
+        .extend_from_slice(data);
 }
 
 /// Legacy raw-pointer-keyed take.  Prefer `sig_data_take_h(i32)`.
 pub fn sig_data_take(id: u64) -> Vec<u8> {
     let mut guard = SIG_DATA_STORE_RAW_PTR.write();
-    guard.as_mut().and_then(|m| m.remove(&id)).unwrap_or_default()
+    guard
+        .as_mut()
+        .and_then(|m| m.remove(&id))
+        .unwrap_or_default()
 }
 
 /// Legacy raw-pointer-keyed clear.  Prefer `sig_data_clear_h(i32)`.
 pub fn sig_data_clear(id: u64) {
     let mut guard = SIG_DATA_STORE_RAW_PTR.write();
-    if let Some(m) = guard.as_mut() { m.remove(&id); }
+    if let Some(m) = guard.as_mut() {
+        m.remove(&id);
+    }
 }
 
 impl KeyStoreData {
     /// Parse a JKS (Java KeyStore) file.
     pub fn load_jks(data: &[u8], _password: &[u8]) -> Result<Self, CryptoError> {
         if data.len() < 12 {
-            return Err(CryptoError::UnsupportedAlgorithm("JKS data too short".into()));
+            return Err(CryptoError::UnsupportedAlgorithm(
+                "JKS data too short".into(),
+            ));
         }
         // Magic: 0xFEEDFEED
         let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -3924,40 +4321,63 @@ impl KeyStoreData {
         let mut pos = 12;
 
         for _ in 0..entry_count {
-            if pos + 4 > data.len() { break; }
-            let tag = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+            if pos + 4 > data.len() {
+                break;
+            }
+            let tag = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
             // Read alias (2-byte length + UTF-16BE)
-            if pos + 2 > data.len() { break; }
-            let alias_len = u16::from_be_bytes([data[pos], data[pos+1]]) as usize;
+            if pos + 2 > data.len() {
+                break;
+            }
+            let alias_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            if pos + alias_len * 2 > data.len() { break; }
-            let alias: String = (0..alias_len).filter_map(|i| {
-                let c = u16::from_be_bytes([data[pos + i*2], data[pos + i*2 + 1]]);
-                char::from_u32(c as u32)
-            }).collect();
+            if pos + alias_len * 2 > data.len() {
+                break;
+            }
+            let alias: String = (0..alias_len)
+                .filter_map(|i| {
+                    let c = u16::from_be_bytes([data[pos + i * 2], data[pos + i * 2 + 1]]);
+                    char::from_u32(c as u32)
+                })
+                .collect();
             pos += alias_len * 2;
 
             // Timestamp (8 bytes)
-            if pos + 8 > data.len() { break; }
+            if pos + 8 > data.len() {
+                break;
+            }
             pos += 8;
 
             match tag {
                 2 => {
                     // Trusted cert entry
                     // cert type (2-byte length + string)
-                    if pos + 2 > data.len() { break; }
-                    let ct_len = u16::from_be_bytes([data[pos], data[pos+1]]) as usize;
+                    if pos + 2 > data.len() {
+                        break;
+                    }
+                    let ct_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
                     pos += 2;
-                    if pos + ct_len > data.len() { break; }
+                    if pos + ct_len > data.len() {
+                        break;
+                    }
                     pos += ct_len; // skip cert type string
 
                     // cert data (4-byte length + DER)
-                    if pos + 4 > data.len() { break; }
-                    let cert_data_len = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    let cert_data_len = u32::from_be_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
                     pos += 4;
-                    if pos + cert_data_len > data.len() { break; }
+                    if pos + cert_data_len > data.len() {
+                        break;
+                    }
                     let cert_bytes = &data[pos..pos + cert_data_len];
                     pos += cert_data_len;
 
@@ -3968,37 +4388,72 @@ impl KeyStoreData {
                 1 => {
                     // Private key entry
                     // key data (4-byte length + encrypted key)
-                    if pos + 4 > data.len() { break; }
-                    let key_data_len = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    let key_data_len = u32::from_be_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
                     pos += 4;
-                    if pos + key_data_len > data.len() { break; }
+                    if pos + key_data_len > data.len() {
+                        break;
+                    }
                     let key_bytes = data[pos..pos + key_data_len].to_vec();
                     pos += key_data_len;
 
                     // cert chain count (4 bytes)
-                    if pos + 4 > data.len() { break; }
-                    let chain_count = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    let chain_count = u32::from_be_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
                     pos += 4;
 
                     let mut chain = Vec::new();
                     for _ in 0..chain_count {
-                        if pos + 2 > data.len() { break; }
-                        let ct_len = u16::from_be_bytes([data[pos], data[pos+1]]) as usize;
+                        if pos + 2 > data.len() {
+                            break;
+                        }
+                        let ct_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
                         pos += 2;
-                        if pos + ct_len > data.len() { break; }
+                        if pos + ct_len > data.len() {
+                            break;
+                        }
                         pos += ct_len;
 
-                        if pos + 4 > data.len() { break; }
-                        let cd_len = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                        if pos + 4 > data.len() {
+                            break;
+                        }
+                        let cd_len = u32::from_be_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]) as usize;
                         pos += 4;
-                        if pos + cd_len > data.len() { break; }
+                        if pos + cd_len > data.len() {
+                            break;
+                        }
                         if let Ok(cert) = X509Cert::parse_der(&data[pos..pos + cd_len]) {
                             chain.push(cert);
                         }
                         pos += cd_len;
                     }
 
-                    entries.insert(alias, KeyStoreEntry::PrivateKeyEntry { key_bytes, cert_chain: chain });
+                    entries.insert(
+                        alias,
+                        KeyStoreEntry::PrivateKeyEntry {
+                            key_bytes,
+                            cert_chain: chain,
+                        },
+                    );
                 }
                 _ => break,
             }
@@ -4013,7 +4468,9 @@ impl KeyStoreData {
     /// Parse a PKCS#12 file (simplified — handles common structures).
     pub fn load_pkcs12(data: &[u8], _password: &[u8]) -> Result<Self, CryptoError> {
         if data.len() < 4 || data[0] != 0x30 {
-            return Err(CryptoError::UnsupportedAlgorithm("not a PKCS#12 file".into()));
+            return Err(CryptoError::UnsupportedAlgorithm(
+                "not a PKCS#12 file".into(),
+            ));
         }
 
         // PFX: SEQUENCE { INTEGER version, SEQUENCE authSafe, [0] macData }
@@ -4049,11 +4506,15 @@ impl KeyStoreData {
 
 /// Recursively walk DER structures looking for X.509 certificates.
 fn extract_certs_from_der(data: &[u8], entries: &mut HashMap<String, KeyStoreEntry>, depth: usize) {
-    if depth > 20 || data.len() < 2 { return; }
+    if depth > 20 || data.len() < 2 {
+        return;
+    }
 
     let mut pos = 0;
     while pos < data.len() {
-        if data.len() - pos < 2 { break; }
+        if data.len() - pos < 2 {
+            break;
+        }
         let tag = data[pos];
 
         match der_read_tag_length(&data[pos..]) {
@@ -4291,8 +4752,10 @@ mod tests {
     fn aes128_encrypt_decrypt_roundtrip() {
         let key = from_hex("2b7e151628aed2a6abf7158809cf4f3c");
         let aes_key = Aes::key_expansion(&key).unwrap();
-        let plaintext = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                         0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let plaintext = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
         let ct = Aes::encrypt_block(&aes_key, &plaintext);
         let pt = Aes::decrypt_block(&aes_key, &ct);
         assert_eq!(pt, plaintext);
@@ -4302,8 +4765,10 @@ mod tests {
     fn aes256_encrypt_decrypt_roundtrip() {
         let key = from_hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
         let aes_key = Aes::key_expansion(&key).unwrap();
-        let plaintext = [0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
-                         0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a];
+        let plaintext = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
         let ct = Aes::encrypt_block(&aes_key, &plaintext);
         let pt = Aes::decrypt_block(&aes_key, &ct);
         assert_eq!(pt, plaintext);
@@ -4373,7 +4838,8 @@ mod tests {
         let key = from_hex("2b7e151628aed2a6abf7158809cf4f3c");
         let aes_key = Aes::key_expansion(&key).unwrap();
         let iv = [0u8; 16];
-        let plaintext = b"This is a longer message that spans multiple AES blocks for CBC mode testing.";
+        let plaintext =
+            b"This is a longer message that spans multiple AES blocks for CBC mode testing.";
         let ct = AesCbc::encrypt(&aes_key, &iv, plaintext);
         let pt = AesCbc::decrypt(&aes_key, &iv, &ct).unwrap();
         assert_eq!(pt, plaintext);
@@ -4442,7 +4908,14 @@ mod tests {
         let aes_key = Aes::key_expansion(&key).unwrap();
         let nonce = [0u8; 12];
         let output = AesGcm::encrypt(&aes_key, &nonce, b"test", b"correct aad");
-        assert!(AesGcm::decrypt(&aes_key, &nonce, &output.ciphertext, b"wrong aad", &output.tag).is_err());
+        assert!(AesGcm::decrypt(
+            &aes_key,
+            &nonce,
+            &output.ciphertext,
+            b"wrong aad",
+            &output.tag
+        )
+        .is_err());
     }
 
     #[test]
@@ -4468,7 +4941,8 @@ mod tests {
         let plaintext = vec![0xabu8; 256];
         let aad = b"test aad";
         let output = AesGcm::encrypt(&aes_key, &nonce_arr, &plaintext, aad);
-        let pt = AesGcm::decrypt(&aes_key, &nonce_arr, &output.ciphertext, aad, &output.tag).unwrap();
+        let pt =
+            AesGcm::decrypt(&aes_key, &nonce_arr, &output.ciphertext, aad, &output.tag).unwrap();
         assert_eq!(pt, plaintext);
     }
     // -----------------------------------------------------------------------
@@ -4491,8 +4965,8 @@ mod tests {
         // C  = 42831ec2..73f5985
         // T  = 4d5c2af327cd64a62cf35abd2ba6fab4
         let key = from_hex("feffe9928665731c6d6a8f9467308308");
-        let iv  = from_hex("cafebabefacedbaddecaf888");
-        let pt  = from_hex(
+        let iv = from_hex("cafebabefacedbaddecaf888");
+        let pt = from_hex(
             "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da\
              2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525\
              b16aedf5aa0de657ba637b391aafd255",
@@ -4509,7 +4983,11 @@ mod tests {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&iv);
         let out = AesGcm::encrypt(&aes_key, &nonce, &pt, &aad);
-        assert_eq!(hex(&out.ciphertext), hex(&expected_ct), "AES-128-GCM ciphertext");
+        assert_eq!(
+            hex(&out.ciphertext),
+            hex(&expected_ct),
+            "AES-128-GCM ciphertext"
+        );
         assert_eq!(hex(&out.tag), hex(&expected_tag), "AES-128-GCM tag");
     }
 
@@ -4518,8 +4996,8 @@ mod tests {
         // Same vector — decrypt direction, plus an explicit
         // AuthenticationFailed proof on a tampered tag.
         let key = from_hex("feffe9928665731c6d6a8f9467308308");
-        let iv  = from_hex("cafebabefacedbaddecaf888");
-        let ct  = from_hex(
+        let iv = from_hex("cafebabefacedbaddecaf888");
+        let ct = from_hex(
             "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e0\
              35c17e2329aca12e21d514b25466931c7d8f6a5aac84aa05\
              1ba30b396a0aac973d58e091473f5985",
@@ -4546,10 +5024,12 @@ mod tests {
         let mut bad_tag = tag;
         bad_tag[0] ^= 0x80;
         let res = AesGcm::decrypt(&aes_key, &nonce, &ct, &aad, &bad_tag);
-        assert!(matches!(res, Err(CryptoError::AuthenticationFailed)),
-            "AES-128-GCM with tampered tag must return AuthenticationFailed, got {:?}", res);
+        assert!(
+            matches!(res, Err(CryptoError::AuthenticationFailed)),
+            "AES-128-GCM with tampered tag must return AuthenticationFailed, got {:?}",
+            res
+        );
     }
-
 
     // -----------------------------------------------------------------------
     // HMAC Tests (RFC 4231 test vectors)
@@ -4949,8 +5429,10 @@ mod tests {
     fn aes192_encrypt_decrypt_roundtrip() {
         let key = from_hex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
         let aes_key = Aes::key_expansion(&key).unwrap();
-        let pt = [0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
-                  0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a];
+        let pt = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
         let ct = Aes::encrypt_block(&aes_key, &pt);
         let decrypted = Aes::decrypt_block(&aes_key, &ct);
         assert_eq!(decrypted, pt);
@@ -4980,7 +5462,10 @@ mod tests {
         let diff = a.sub(&b);
         assert_eq!(diff.to_bytes_be(), BigUint::from_u64(5556).to_bytes_be());
         let prod = a.mul(&b);
-        assert_eq!(prod.to_bytes_be(), BigUint::from_u64(12345 * 6789).to_bytes_be());
+        assert_eq!(
+            prod.to_bytes_be(),
+            BigUint::from_u64(12345 * 6789).to_bytes_be()
+        );
     }
 
     #[test]
@@ -5059,12 +5544,11 @@ mod tests {
         let p = &P256_P;
         let x2 = FieldElement256::mul_mod(&g.x, &g.x, p);
         let x3 = FieldElement256::mul_mod(&x2, &g.x, p);
-        let three = FieldElement256 { limbs: [3, 0, 0, 0] };
+        let three = FieldElement256 {
+            limbs: [3, 0, 0, 0],
+        };
         let three_x = FieldElement256::mul_mod(&three, &g.x, p);
-        let rhs = FieldElement256::add_mod(
-            &FieldElement256::sub_mod(&x3, &three_x, p),
-            &P256_B, p
-        );
+        let rhs = FieldElement256::add_mod(&FieldElement256::sub_mod(&x3, &three_x, p), &P256_B, p);
         let y2 = FieldElement256::mul_mod(&g.y, &g.y, p);
         assert_eq!(y2.limbs, rhs.limbs);
     }
@@ -5118,7 +5602,9 @@ mod tests {
 
     #[test]
     fn jks_magic_detection() {
-        let data = vec![0xFE, 0xED, 0xFE, 0xED, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+        let data = vec![
+            0xFE, 0xED, 0xFE, 0xED, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        ];
         let ks = KeyStoreData::load_jks(&data, b"").unwrap();
         assert_eq!(ks.store_type, "JKS");
         assert_eq!(ks.entries.len(), 0);
@@ -5132,7 +5618,9 @@ mod tests {
 
     #[test]
     fn keystore_auto_detect() {
-        let jks = vec![0xFE, 0xED, 0xFE, 0xED, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+        let jks = vec![
+            0xFE, 0xED, 0xFE, 0xED, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        ];
         let ks = KeyStoreData::load(&jks, b"", "auto").unwrap();
         assert_eq!(ks.store_type, "JKS");
     }
@@ -5147,7 +5635,9 @@ mod tests {
         // This is a structurally valid DER cert (not cryptographically valid)
         let serial = der_encode_integer(&[0x01]);
         // Sig alg: sha256WithRSAEncryption
-        let sig_alg_oid: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00];
+        let sig_alg_oid: &[u8] = &[
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00,
+        ];
         let sig_alg = der_encode_sequence(sig_alg_oid);
         // Issuer: CN=Test
         let cn_oid = &[0x06, 0x03, 0x55, 0x04, 0x03];
@@ -5165,14 +5655,21 @@ mod tests {
         let issuer = der_encode_sequence(&rdn_set);
         let subject = issuer.clone();
         // Validity: notBefore=240101000000Z, notAfter=341231235959Z
-        let nb = &[0x17, 0x0d, b'2', b'4', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
-        let na = &[0x17, 0x0d, b'3', b'4', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9', b'Z'];
+        let nb = &[
+            0x17, 0x0d, b'2', b'4', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'Z',
+        ];
+        let na = &[
+            0x17, 0x0d, b'3', b'4', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9',
+            b'Z',
+        ];
         let mut validity_inner = Vec::new();
         validity_inner.extend_from_slice(nb);
         validity_inner.extend_from_slice(na);
         let validity = der_encode_sequence(&validity_inner);
         // SPKI (stub RSA)
-        let spki = der_encode_sequence(&[0x30, 0x03, 0x06, 0x01, 0x00, 0x03, 0x03, 0x00, 0x01, 0x02]);
+        let spki =
+            der_encode_sequence(&[0x30, 0x03, 0x06, 0x01, 0x00, 0x03, 0x03, 0x00, 0x01, 0x02]);
 
         // TBSCertificate
         let version = &[0xa0, 0x03, 0x02, 0x01, 0x02]; // v3
@@ -5285,8 +5782,14 @@ mod tests {
     #[test]
     fn rf1_md5_empty_and_known() {
         // RFC 1321 test suite
-        assert_eq!(hex(&crate::real_md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(hex(&crate::real_md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            hex(&crate::real_md5(b"")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(
+            hex(&crate::real_md5(b"abc")),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
         assert_eq!(
             hex(&crate::real_md5(b"message digest")),
             "f96b697d7cb7938d525a2f31aaf161d0"
@@ -5337,16 +5840,13 @@ mod tests {
     // (zero key, zero IV, zero plaintext) is the canonical smoke test.
     #[test]
     fn rf3_aes_256_gcm_nist_zero_vector() {
-        use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce, aead::Aead};
+        use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
         let key = Key::<Aes256Gcm>::from_slice(&[0u8; 32]);
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(&[0u8; 12]);
         let ct = cipher.encrypt(nonce, b"".as_ref()).unwrap();
         // Expected tag (no plaintext) from NIST vectors.
-        assert_eq!(
-            hex(&ct),
-            "530f8afbc74536b9a963b4f1c4cb738b"
-        );
+        assert_eq!(hex(&ct), "530f8afbc74536b9a963b4f1c4cb738b");
     }
 
     // RF.6: RSA key generation produces a functional sign/verify pair.
@@ -5506,7 +6006,10 @@ mod tests {
             }
         )
         .contains("trust anchor"));
-        assert_eq!(format!("{}", PkixError::ChainTooLong), "chain exceeds maximum depth");
+        assert_eq!(
+            format!("{}", PkixError::ChainTooLong),
+            "chain exceeds maximum depth"
+        );
     }
 
     #[test]

@@ -68,7 +68,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -116,7 +120,9 @@ fn ensure_console_probe_compiled() -> bool {
 
 fn run_console_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     if !ensure_console_probe_compiled() {
-        eprintln!("wave3_console_module: ConsoleProbe.class missing and javac unavailable; skipping");
+        eprintln!(
+            "wave3_console_module: ConsoleProbe.class missing and javac unavailable; skipping"
+        );
         return None;
     }
     let bin = cratonvm_binary()?;

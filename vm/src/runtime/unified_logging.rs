@@ -276,9 +276,7 @@ fn validate_log_file_path(path_str: &str) -> Result<(), String> {
     // Reject path traversal
     for component in path.components() {
         if let std::path::Component::ParentDir = component {
-            return Err(format!(
-                "log file path must not contain '..': '{path_str}'"
-            ));
+            return Err(format!("log file path must not contain '..': '{path_str}'"));
         }
     }
 
@@ -539,8 +537,7 @@ impl UnifiedLogger {
             // Rejoin as "file=C:\path" and split decorators at next ':'
             let rest = parts[2];
             if let Some(colon_pos) = rest.find(':') {
-                let full_path =
-                    format!("{}:{}", parts[1].trim(), &rest[..colon_pos]);
+                let full_path = format!("{}:{}", parts[1].trim(), &rest[..colon_pos]);
                 (full_path, rest[colon_pos + 1..].to_string())
             } else {
                 let full_path = format!("{}:{}", parts[1].trim(), rest);
@@ -555,10 +552,7 @@ impl UnifiedLogger {
 
         // Split tags from level on `=`
         let (tags_str, level_str) = if let Some(eq_pos) = tags_and_level.rfind('=') {
-            (
-                &tags_and_level[..eq_pos],
-                &tags_and_level[eq_pos + 1..],
-            )
+            (&tags_and_level[..eq_pos], &tags_and_level[eq_pos + 1..])
         } else {
             (tags_and_level, "info")
         };
@@ -580,8 +574,7 @@ impl UnifiedLogger {
     /// by any active rule.
     pub fn is_enabled(&self, tags: &[LogTag], level: LogLevel) -> bool {
         self.rules.iter().any(|rule| {
-            level.is_enabled_at(rule.level)
-                && tags.iter().any(|t| rule.tags.contains(t))
+            level.is_enabled_at(rule.level) && tags.iter().any(|t| rule.tags.contains(t))
         })
     }
 
@@ -671,11 +664,7 @@ impl UnifiedLogger {
         let file = if let Some(pos) = handles.iter().position(|(p, _)| p == path) {
             &mut handles[pos].1
         } else {
-            let f = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            let f = match OpenOptions::new().create(true).append(true).open(path) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = writeln!(
@@ -733,9 +722,7 @@ fn chrono_free_timestamp() -> String {
     // Date from days since epoch (1970-01-01)
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -744,8 +731,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let z = days as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64; // day of era [0, 146096]
-    let yoe =
-        (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
     let mp = (5 * doy + 2) / 153; // month index [0, 11]
@@ -1057,8 +1043,7 @@ mod tests {
 
     #[test]
     fn parse_full_spec_with_decorators() {
-        let logger =
-            UnifiedLogger::parse("gc*=info:stdout:time,level,tags").unwrap();
+        let logger = UnifiedLogger::parse("gc*=info:stdout:time,level,tags").unwrap();
         assert_eq!(logger.rule_count(), 1);
         let rule = &logger.rules()[0];
         assert!(rule.decorators.time);
@@ -1071,8 +1056,7 @@ mod tests {
 
     #[test]
     fn parse_multiple_rules() {
-        let logger =
-            UnifiedLogger::parse("gc=info:stdout;class*=debug:stderr").unwrap();
+        let logger = UnifiedLogger::parse("gc=info:stdout;class*=debug:stderr").unwrap();
         assert_eq!(logger.rule_count(), 2);
         assert_eq!(logger.rules()[0].tags, vec![LogTag::Gc]);
         assert_eq!(logger.rules()[0].output, LogOutput::Stdout);

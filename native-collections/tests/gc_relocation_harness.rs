@@ -28,13 +28,12 @@ mod common;
 
 use common::MockCtx;
 use cratonvm_native_api::NativeContext;
-use cratonvm_native_collections::{
-    __test_ll_get, __test_ll_set, __test_lhm_get, __test_lhm_set,
-    __test_tm_fast_get_str, __test_tm_fast_put_str,
-    __test_tm_get_slot, __test_tm_set_slot, __test_ts_get_slot, __test_ts_set_slot,
-    gc_scan_collection_overlay_roots, gc_update_collection_overlay_refs,
-};
 use cratonvm_native_collections::identity_hash::obj_key;
+use cratonvm_native_collections::{
+    __test_lhm_get, __test_lhm_set, __test_ll_get, __test_ll_set, __test_tm_fast_get_str,
+    __test_tm_fast_put_str, __test_tm_get_slot, __test_tm_set_slot, __test_ts_get_slot,
+    __test_ts_set_slot, gc_scan_collection_overlay_roots, gc_update_collection_overlay_refs,
+};
 use cratonvm_types::{ObjectRef, Value};
 use std::collections::HashMap;
 
@@ -242,7 +241,10 @@ fn fast_treemap_value_survives_relocation() {
     let old_addr = val.as_ptr() as usize;
     let val_post = ctx.relocate_object(val);
     let new_addr = val_post.as_ptr() as usize;
-    assert_ne!(old_addr, new_addr, "relocate must hand back a fresh address");
+    assert_ne!(
+        old_addr, new_addr,
+        "relocate must hand back a fresh address"
+    );
 
     let mut pm: HashMap<usize, usize> = HashMap::new();
     pm.insert(old_addr, new_addr);
@@ -331,9 +333,7 @@ fn all_four_overlays_survive_concurrent_relocation() {
 /// collection objects and their five (distinct) value objects, in funnel
 /// order: (ll, lhm, tm, tmf, ts) and (v_ll, v_lhm, v_tm, v_tmf, v_ts).
 #[allow(clippy::type_complexity)]
-fn plant_one_value_per_overlay(
-    ctx: &mut MockCtx,
-) -> ([ObjectRef; 5], [ObjectRef; 5]) {
+fn plant_one_value_per_overlay(ctx: &mut MockCtx) -> ([ObjectRef; 5], [ObjectRef; 5]) {
     let cols = [
         ctx.alloc_object_simple(0),
         ctx.alloc_object_simple(0),
@@ -407,26 +407,31 @@ fn all_overlay_object_values_survive_relocation() {
     assert_eq!(
         __test_ll_get(&ctx, cols[0], "head"),
         Value::Object(Some(moved[0])),
-        "{} not remapped", OVERLAY_LABELS[0]
+        "{} not remapped",
+        OVERLAY_LABELS[0]
     );
     assert_eq!(
         __test_lhm_get(&ctx, cols[1], "table"),
         Value::Object(Some(moved[1])),
-        "{} not remapped", OVERLAY_LABELS[1]
+        "{} not remapped",
+        OVERLAY_LABELS[1]
     );
     assert_eq!(
         __test_tm_get_slot(&ctx, cols[2], TM_FIELD_DATA),
         Value::Object(Some(moved[2])),
-        "{} not remapped", OVERLAY_LABELS[2]
+        "{} not remapped",
+        OVERLAY_LABELS[2]
     );
     assert_eq!(
         __test_tm_fast_get_str(&ctx, cols[3], "k"),
         Value::Object(Some(moved[3])),
-        "{} not remapped", OVERLAY_LABELS[3]
+        "{} not remapped",
+        OVERLAY_LABELS[3]
     );
     assert_eq!(
         __test_ts_get_slot(&ctx, cols[4], TS_FIELD_DATA),
         Value::Object(Some(moved[4])),
-        "{} not remapped", OVERLAY_LABELS[4]
+        "{} not remapped",
+        OVERLAY_LABELS[4]
     );
 }

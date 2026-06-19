@@ -74,17 +74,17 @@
 pub mod aarch64;
 pub mod aarch64_backend;
 pub mod deopt;
+pub mod escape_analysis;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
 pub mod loop_analysis;
+pub mod null_check_elim;
+pub mod pgo;
 pub mod platform;
 pub mod profile;
-pub mod escape_analysis;
-pub mod pgo;
 pub mod regalloc;
-pub mod null_check_elim;
 pub mod scev;
 pub mod tiered;
 pub mod x64;
@@ -119,7 +119,9 @@ pub struct JitCodeRegion {
 
 impl JitCodeRegion {
     fn new() -> Self {
-        Self { regions: Vec::new() }
+        Self {
+            regions: Vec::new(),
+        }
     }
 
     fn register(&mut self, ptr: *const u8, size: usize) {
@@ -181,7 +183,9 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
 
 pub use cratonvm_jit_api::{CachedBytecodeMethod, JitRuntimeHelpers};
 #[allow(unused_imports)]
-use cratonvm_types::{ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+};
 
 // Compile-time size assertions for Value on all platforms.
 // Value must be exactly 16 bytes for JIT slot layout. If this fails on a new
@@ -269,7 +273,10 @@ pub enum CompileError {
     /// branch patch. `kind` is `"rel8"` or `"rel32"`; `displacement` is
     /// the out-of-range value. Currently produced by the safe-idiv
     /// guard patches; the surrounding compile bails via `overflowed`.
-    DisplacementOverflow { kind: &'static str, displacement: i64 },
+    DisplacementOverflow {
+        kind: &'static str,
+        displacement: i64,
+    },
     /// `CompiledMethod::try_call` / `try_call_with_context` was invoked
     /// with more arguments than the JIT's hand-rolled call thunks
     /// support (currently 8 / 7 respectively, excluding the implicit
@@ -469,7 +476,10 @@ impl ExecutableBuffer {
                 len = self.len,
                 "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
             );
-            return Err(CompileError::PatchFailed { kind: "i32", offset });
+            return Err(CompileError::PatchFailed {
+                kind: "i32",
+                offset,
+            });
         }
         let bytes = value.to_le_bytes();
         // Safety: bounds checked above; ptr is owned and writable.
@@ -493,7 +503,10 @@ impl ExecutableBuffer {
                 len = self.len,
                 "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
             );
-            return Err(CompileError::PatchFailed { kind: "byte", offset });
+            return Err(CompileError::PatchFailed {
+                kind: "byte",
+                offset,
+            });
         }
         // Safety: bounds checked above.
         unsafe {
@@ -526,22 +539,20 @@ impl ExecutableBuffer {
     /// undefined behavior. Call [`make_writable`](Self::make_writable)
     /// first if you need to patch code after finalization.
     pub fn finalize(&self) {
-        platform::make_executable(self.ptr, self.capacity)
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: JIT: make_executable failed: {e}");
-                std::process::abort();
-            });
+        platform::make_executable(self.ptr, self.capacity).unwrap_or_else(|e| {
+            eprintln!("FATAL: JIT: make_executable failed: {e}");
+            std::process::abort();
+        });
     }
 
     /// Transition the buffer back from executable to writable (for patching).
     ///
     /// Calls the OS API to switch from RX to RW permissions.
     pub fn make_writable(&self) {
-        platform::make_writable(self.ptr, self.capacity)
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: JIT: make_writable failed: {e}");
-                std::process::abort();
-            });
+        platform::make_writable(self.ptr, self.capacity).unwrap_or_else(|e| {
+            eprintln!("FATAL: JIT: make_writable failed: {e}");
+            std::process::abort();
+        });
     }
 }
 
@@ -1237,12 +1248,16 @@ impl CompiledMethod {
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6]))
+                Ok(f(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                ))
             }
             8 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]))
+                Ok(f(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                ))
             }
             n => Err(CompileError::TooManyArgs(n)),
         }
@@ -1306,7 +1321,9 @@ impl CompiledMethod {
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5]))
+                Ok(f(
+                    vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5],
+                ))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
@@ -1428,12 +1445,9 @@ impl CompiledMethod {
 /// re-entry. Entries are never evicted during a VM run; they're released when the
 /// process exits (or, if the cache is ever cleared, after no thread can hold a
 /// transient `Arc` clone).
-fn osr_trampoline_cache()
-    -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>
-{
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>,
-    > = std::sync::OnceLock::new();
+fn osr_trampoline_cache() -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
@@ -1795,8 +1809,7 @@ unsafe fn osr_trampoline(
     // platform C ABI. `vm_ptr` is only read when `needs_context`, and
     // `thread_ptr` only when the shadow-stack gate is on (follow-up §1); both
     // are passed unconditionally (caller-saved registers, ignored if unused).
-    let tramp_fn: unsafe extern "C" fn(*const i64, i64, i64) -> i64 =
-        std::mem::transmute(code_ptr);
+    let tramp_fn: unsafe extern "C" fn(*const i64, i64, i64) -> i64 = std::mem::transmute(code_ptr);
 
     // SAFETY: `tramp_arc` holds an Arc clone of the cached buffer, keeping the
     // executable memory alive for the duration of the call. `locals_ptr` is
@@ -2103,8 +2116,8 @@ pub enum JitIntrinsic {
     // still used for the genuinely uncertain cases (null receiver, null
     // String argument, null backing `value` array). Variant ordering here
     // is local and not externally observed.
-    StringEquals,    // equals(Ljava/lang/Object;)Z
-    StringCompareTo, // compareTo(Ljava/lang/String;)I
+    StringEquals,      // equals(Ljava/lang/Object;)Z
+    StringCompareTo,   // compareTo(Ljava/lang/String;)I
     StringIndexOfChar, // indexOf(I)I
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
@@ -2169,7 +2182,7 @@ pub enum JitIntrinsic {
     Crc32cUpdateBytes, // CRC32C.update([BII)V
     Crc32UpdateByte,   // CRC32.update(I)V
     Crc32UpdateBytes,  // CRC32.update([BII)V
-    // ===== INTRINSIC REGION END: CRC32 =====
+                       // ===== INTRINSIC REGION END: CRC32 =====
 }
 
 impl JitIntrinsic {
@@ -2215,18 +2228,10 @@ impl JitIntrinsic {
         // Exhaustive map — keeps this in lockstep with the enum so a new
         // variant fails to compile until added here.
         Some(match offset {
-            x if x == JitIntrinsic::Crc32cUpdateByte as usize => {
-                JitIntrinsic::Crc32cUpdateByte
-            }
-            x if x == JitIntrinsic::Crc32cUpdateBytes as usize => {
-                JitIntrinsic::Crc32cUpdateBytes
-            }
-            x if x == JitIntrinsic::Crc32UpdateByte as usize => {
-                JitIntrinsic::Crc32UpdateByte
-            }
-            x if x == JitIntrinsic::Crc32UpdateBytes as usize => {
-                JitIntrinsic::Crc32UpdateBytes
-            }
+            x if x == JitIntrinsic::Crc32cUpdateByte as usize => JitIntrinsic::Crc32cUpdateByte,
+            x if x == JitIntrinsic::Crc32cUpdateBytes as usize => JitIntrinsic::Crc32cUpdateBytes,
+            x if x == JitIntrinsic::Crc32UpdateByte as usize => JitIntrinsic::Crc32UpdateByte,
+            x if x == JitIntrinsic::Crc32UpdateBytes as usize => JitIntrinsic::Crc32UpdateBytes,
             // Non-CRC32 intrinsic — the resolution loop only needs CRC32
             // classification, so any other in-range sentinel is reported as
             // "not a CRC32 intrinsic" via the `is_crc32_family` check below.
@@ -2331,9 +2336,7 @@ pub fn try_resolve_intrinsic(
     //     compare use only baseline instructions.
     if class == "java/lang/Integer" {
         let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
-            ("bitCount", "(I)I") if x64::has_popcnt() => {
-                Some((JitIntrinsic::IntBitCount, 1, b'I'))
-            }
+            ("bitCount", "(I)I") if x64::has_popcnt() => Some((JitIntrinsic::IntBitCount, 1, b'I')),
             ("numberOfLeadingZeros", "(I)I") => {
                 Some((JitIntrinsic::IntNumberOfLeadingZeros, 1, b'I'))
             }
@@ -2369,9 +2372,7 @@ pub fn try_resolve_intrinsic(
     //   * Long.reverse is intentionally NOT registered: it has no single-
     //     instruction lowering and the multi-mask SWAR sequence is omitted in
     //     favour of safe fallback to normal dispatch (roadmap §3.4).
-    if class == "java/lang/Long"
-        && std::env::var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none()
-    {
+    if class == "java/lang/Long" && std::env::var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none() {
         let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("bitCount", "(J)I") if x64::has_popcnt() => {
                 Some((JitIntrinsic::LongBitCount, 1, b'I'))
@@ -2661,9 +2662,7 @@ pub fn try_resolve_string_intrinsic(
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
             ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
-            ("indexOf", "(Ljava/lang/String;)I") => {
-                Some((JitIntrinsic::StringIndexOfStr, 1, b'I'))
-            }
+            ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };
         if let Some((intrinsic, num_params, ret)) = search_hit {
@@ -2791,13 +2790,7 @@ impl JitMICSlot {
     }
 
     /// Update all cached fields after a cache miss.
-    pub fn update(
-        &self,
-        class_id: u32,
-        class_name: &str,
-        entry_ptr: u64,
-        needs_context: bool,
-    ) {
+    pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
         // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
         // (which checks class_id first, then loads entry_ptr) can never observe
         // the new class id paired with a stale entry_ptr.
@@ -2813,8 +2806,7 @@ impl JitMICSlot {
     /// Record a cache hit.
     #[inline]
     pub fn record_hit(&self) {
-        self.hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a cache miss.
@@ -3493,12 +3485,7 @@ impl JitCache {
     /// Verifies the full string key matches before removing, so a
     /// (rare) hash collision can't cause an unrelated cached entry to
     /// be evicted.
-    pub fn remove(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-    ) {
+    pub fn remove(&mut self, class_name: &str, method_name: &str, descriptor: &str) {
         let h = compute_jit_key_hash(class_name, method_name, descriptor);
         if let Some((key, cm)) = self.methods.get(&h) {
             if &*key.class_name == class_name
@@ -3587,7 +3574,9 @@ impl std::fmt::Debug for JitCache {
 /// `Graph` types, so we translate node-by-node.  Returns both the EA graph
 /// and the id_map (`ir::NodeId` index → `escape_analysis::NodeId` value)
 /// so callers can map EA results back to IR node IDs.
-fn escape_analysis_from_ir(ir_graph: &ir::Graph) -> (escape_analysis::Graph, Vec<escape_analysis::NodeId>) {
+fn escape_analysis_from_ir(
+    ir_graph: &ir::Graph,
+) -> (escape_analysis::Graph, Vec<escape_analysis::NodeId>) {
     let mut ea = escape_analysis::Graph::new();
 
     // Map from ir::NodeId → ea::NodeId.  Start/Return are pre-created as
@@ -3663,7 +3652,10 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         ir::Op::Mul => EaOp::Mul,
         ir::Op::Load(mk) => EaOp::Load(*mk as usize),
         ir::Op::Store(mk) => EaOp::Store(*mk as usize),
-        ir::Op::New { class_id, num_fields } => EaOp::New {
+        ir::Op::New {
+            class_id,
+            num_fields,
+        } => EaOp::New {
             class_id: *class_id,
             num_fields: *num_fields,
         },
@@ -3829,8 +3821,7 @@ fn apply_ea_to_ir(
 
 static JIT_BAIL_LIST: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
     std::sync::OnceLock::new();
-static JIT_BAIL_SHORTCIRCUITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static JIT_BAIL_SHORTCIRCUITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
     JIT_BAIL_LIST.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
@@ -3908,7 +3899,11 @@ pub fn try_compile(
     // backend already permanently bailed on.  Avoids ~50µs of wasted
     // scan/IR/lowering work per re-attempt (every 2000 invocations
     // under the default interpreter warmup gate).
-    if is_jit_bail_listed(&cached.class_name, &cached.method_name, &cached.method_descriptor) {
+    if is_jit_bail_listed(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
@@ -3968,7 +3963,10 @@ pub fn try_compile(
                 let bytes = cm.code_bytes();
                 eprintln!(
                     "[JIT_DUMP] {}{} len={} entry={:p}",
-                    sig, cached.method_descriptor, bytes.len(), bytes.as_ptr(),
+                    sig,
+                    cached.method_descriptor,
+                    bytes.len(),
+                    bytes.as_ptr(),
                 );
                 let mut line = String::new();
                 for (i, b) in bytes.iter().enumerate() {
@@ -4059,8 +4057,8 @@ fn try_compile_inner(
     // boxed values / `String` fields read back as 0). The early-compile
     // path already gets this right because it derives the count from the
     // live `args.len()`; the callee-compile path used here did not.
-    let prologue_param_slots: usize = count_param_slots(&cached.method_descriptor)
-        + if cached.is_static { 0 } else { 1 };
+    let prologue_param_slots: usize =
+        count_param_slots(&cached.method_descriptor) + if cached.is_static { 0 } else { 1 };
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -4174,8 +4172,7 @@ fn try_compile_inner(
     // `boolean eq(long, long)` truncated the second long parameter — read
     // from the never-populated `locals[2]` slot — and panicked with a
     // `u32::MAX` slot index; bc-java InterleaveTest failed 2/4 under JIT.)
-    if ir::ir_compatible(&scan)
-        && !method_uses_category2(code, code_len, &cached.method_descriptor)
+    if ir::ir_compatible(&scan) && !method_uses_category2(code, code_len, &cached.method_descriptor)
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -4198,8 +4195,7 @@ fn try_compile_inner(
             // the IR builder can't fully build still return None → single-pass.
             // (Bisected originally from keycloak JsonParserTest /
             // SkeletonKeyTokenTest SIGSEGVs + a standalone `Modifier.isStatic`.)
-            let has_conditional_branch =
-                graph.nodes.iter().any(|n| matches!(n.op, ir::Op::If));
+            let has_conditional_branch = graph.nodes.iter().any(|n| matches!(n.op, ir::Op::If));
             if has_conditional_branch
                 && scan.invoke_ops.is_empty()
                 && !ir_optimize::ir_branchy_enabled()
@@ -4208,30 +4204,26 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-            ir_optimize::optimize(&mut graph);
+                ir_optimize::optimize(&mut graph);
 
-            // --- Escape analysis (Phase 41 + G46 wiring) ---
-            // Convert IR graph to escape analysis graph, run analysis,
-            // and apply scalar replacement / lock elision to the IR graph.
-            {
-                let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
-                let ea_result = escape_analysis::analyze_escapes(&ea_graph);
-                if !ea_result.scalar_replaceable.is_empty()
-                    || !ea_result.elide_locks.is_empty()
+                // --- Escape analysis (Phase 41 + G46 wiring) ---
+                // Convert IR graph to escape analysis graph, run analysis,
+                // and apply scalar replacement / lock elision to the IR graph.
                 {
-                    apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                    let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                    let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                    if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
+                    {
+                        apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                    }
                 }
-            }
 
-            let schedule = ir_schedule::schedule(&graph);
-            if let Some(compiled) = ir_lower::lower(
-                &graph,
-                &schedule,
-                num_params,
-                cached.max_locals as usize,
-            ) {
-                return Some(compiled);
-            }
+                let schedule = ir_schedule::schedule(&graph);
+                if let Some(compiled) =
+                    ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
+                {
+                    return Some(compiled);
+                }
             } // end else (IR-lowering path)
         }
     }
@@ -4443,49 +4435,49 @@ fn try_compile_inner(
                 }
 
                 if !planned_inline {
-                if let Some(compiler) = callee_compiler.as_ref() {
-                    if let Some((entry, callee_needs_ctx)) =
-                        compiler(&class_name, &method_name, &descriptor)
-                    {
-                        if callee_needs_ctx {
-                            needs_heap = true;
+                    if let Some(compiler) = callee_compiler.as_ref() {
+                        if let Some((entry, callee_needs_ctx)) =
+                            compiler(&class_name, &method_name, &descriptor)
+                        {
+                            if callee_needs_ctx {
+                                needs_heap = true;
+                            }
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: callee_needs_ctx,
+                                    num_params,
+                                    return_type: ret_type,
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
                         }
+                    }
+                    needs_heap = true;
+
+                    // Call-site intrinsics — inline machine code, no call overhead.
+                    // The matcher (`try_resolve_intrinsic`) keys on
+                    // (class, name, descriptor) and applies the same CPU-feature
+                    // gates the x64 codegen ladder relies on. This invokestatic/
+                    // invokespecial path never resolves a CRC32 intrinsic (those
+                    // are `invokevirtual` only), so `guard_class_id` is 0.
+                    if let Some((entry, num_params, ret)) =
+                        try_resolve_intrinsic(&class_name, &method_name, &descriptor)
+                    {
                         direct_calls.push((
                             pc,
                             JitDirectCall {
                                 entry,
-                                needs_context: callee_needs_ctx,
+                                needs_context: false,
                                 num_params,
-                                return_type: ret_type,
+                                return_type: ret,
                                 guard_class_id: 0,
                             },
                         ));
                         continue;
                     }
-                }
-                needs_heap = true;
-
-                // Call-site intrinsics — inline machine code, no call overhead.
-                // The matcher (`try_resolve_intrinsic`) keys on
-                // (class, name, descriptor) and applies the same CPU-feature
-                // gates the x64 codegen ladder relies on. This invokestatic/
-                // invokespecial path never resolves a CRC32 intrinsic (those
-                // are `invokevirtual` only), so `guard_class_id` is 0.
-                if let Some((entry, num_params, ret)) =
-                    try_resolve_intrinsic(&class_name, &method_name, &descriptor)
-                {
-                    direct_calls.push((
-                        pc,
-                        JitDirectCall {
-                            entry,
-                            needs_context: false,
-                            num_params,
-                            return_type: ret,
-                            guard_class_id: 0,
-                        },
-                    ));
-                    continue;
-                }
                 } // end !planned_inline (RBC.3)
             }
 
@@ -4522,8 +4514,7 @@ fn try_compile_inner(
                     // anyway would leave a `direct_calls` entry whose
                     // `entry` is an intrinsic sentinel the codegen could
                     // not safely emit.
-                    if JitIntrinsic::from_entry(entry)
-                        .is_some_and(|i| i.is_crc32_family())
+                    if JitIntrinsic::from_entry(entry).is_some_and(|i| i.is_crc32_family())
                         && guard_class_id == 0
                     {
                         // Fall through — no `continue`, no direct_calls push.
@@ -4550,14 +4541,12 @@ fn try_compile_inner(
                 // decision and the codegen's "can emit inline" decision
                 // never disagree — a String sentinel is never registered
                 // for a site whose codegen would then bail to a raw `CALL`.
-                if let Some((entry, num_params, ret, guard_class_id)) =
-                    try_resolve_string_intrinsic(
-                        &class_name,
-                        &method_name,
-                        &descriptor,
-                        resolved_string_layout,
-                    )
-                {
+                if let Some((entry, num_params, ret, guard_class_id)) = try_resolve_string_intrinsic(
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                    resolved_string_layout,
+                ) {
                     needs_heap = true;
                     direct_calls.push((
                         pc,
@@ -4608,7 +4597,8 @@ fn try_compile_inner(
                 let mic = Box::new(JitMICSlot::new());
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
-                        if let Some(dom_class_id) = profile::dominant_receiver(receiver_counts, 80) {
+                        if let Some(dom_class_id) = profile::dominant_receiver(receiver_counts, 80)
+                        {
                             mic.prepopulate(dom_class_id);
                         }
                     }
@@ -4670,7 +4660,8 @@ fn try_compile_inner(
             prof.loops
                 .iter()
                 .filter_map(|(&backedge_pc, trip)| {
-                    trip.suggests_unroll_factor(8).map(|factor| (backedge_pc, factor))
+                    trip.suggests_unroll_factor(8)
+                        .map(|factor| (backedge_pc, factor))
                 })
                 .collect()
         })
@@ -4681,8 +4672,7 @@ fn try_compile_inner(
     // loadable) is fine — String intrinsic codegen treats it as "bail to
     // normal dispatch". Resolved here (cheap, once) so neither the
     // intrinsic matcher nor `x64::compile` needs the VM class registry.
-    let string_layout: Option<StringFieldLayout> =
-        string_layout_resolver.and_then(|r| r());
+    let string_layout: Option<StringFieldLayout> = string_layout_resolver.and_then(|r| r());
 
     // round-7 fix (bug 1): from this point on, any `None` return is a
     // permanent backend bail — the resolver pre-checks all completed
@@ -4756,7 +4746,10 @@ fn try_compile_inner(
     compiled.inlined_methods = inlined_methods;
 
     if let Ok(want) = std::env::var("CRATONVM_DBG_JIT_CODE") {
-        let full = format!("{}.{}{}", cached.class_name, cached.method_name, cached.method_descriptor);
+        let full = format!(
+            "{}.{}{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        );
         if full.contains(&want) {
             let slice = compiled._buffer_slice_for_debug();
             let mut hex = String::new();
@@ -4765,7 +4758,13 @@ fn try_compile_inner(
             }
             eprintln!(
                 "[JIT_CODE] {} entry={:p} len={} param_jvm_slots={:?} span={} needs_heap={}\n{}",
-                full, compiled.entry, slice.len(), param_jvm_slots, param_slot_span, needs_heap, hex
+                full,
+                compiled.entry,
+                slice.len(),
+                param_jvm_slots,
+                param_slot_span,
+                needs_heap,
+                hex
             );
         }
     }
@@ -5198,9 +5197,15 @@ mod tests {
         // instance, one reference param → this (0) + param (1).
         assert_eq!(compute_param_oop_mask("(Ljava/lang/Object;)V", false), 0b11);
         // static, long (slots 0,1; non-oop) then reference at slot 2.
-        assert_eq!(compute_param_oop_mask("(JLjava/lang/Object;)V", true), 0b100);
+        assert_eq!(
+            compute_param_oop_mask("(JLjava/lang/Object;)V", true),
+            0b100
+        );
         // static, array ref (slot 0), long (slots 1,2), array-of-ref (slot 3).
-        assert_eq!(compute_param_oop_mask("([IJ[Ljava/lang/String;)V", true), 0b1001);
+        assert_eq!(
+            compute_param_oop_mask("([IJ[Ljava/lang/String;)V", true),
+            0b1001
+        );
         // bt18's `static Node make(int)` — the live oop is the LOCAL `n`, not a
         // param, so the param mask is empty (the dataflow seeds it as `astore`d).
         assert_eq!(compute_param_oop_mask("(I)Lpkg/Node;", true), 0b0);
@@ -5227,12 +5232,9 @@ mod tests {
     fn test_jit_mic_slot_offsets() {
         let slot = JitMICSlot::new();
         let base = &slot as *const JitMICSlot as usize;
-        let off_class_id =
-            (&slot.cached_class_id as *const _ as usize) - base;
-        let off_entry_ptr =
-            (&slot.cached_entry_ptr as *const _ as usize) - base;
-        let off_needs_context =
-            (&slot.cached_needs_context as *const _ as usize) - base;
+        let off_class_id = (&slot.cached_class_id as *const _ as usize) - base;
+        let off_entry_ptr = (&slot.cached_entry_ptr as *const _ as usize) - base;
+        let off_needs_context = (&slot.cached_needs_context as *const _ as usize) - base;
         assert_eq!(
             off_class_id,
             JitMICSlot::CACHED_CLASS_ID_OFFSET,
@@ -5418,7 +5420,10 @@ mod tests {
         let result = buf.try_patch_i32(8, 0xDEAD_BEEFu32 as i32);
         assert!(matches!(
             result,
-            Err(CompileError::PatchFailed { kind: "i32", offset: 8 })
+            Err(CompileError::PatchFailed {
+                kind: "i32",
+                offset: 8
+            })
         ));
         assert!(
             buf.overflowed(),
@@ -5431,7 +5436,10 @@ mod tests {
         let result2 = buf2.try_patch_byte(99, 0xCC);
         assert!(matches!(
             result2,
-            Err(CompileError::PatchFailed { kind: "byte", offset: 99 })
+            Err(CompileError::PatchFailed {
+                kind: "byte",
+                offset: 99
+            })
         ));
         assert!(buf2.overflowed());
     }
@@ -5604,10 +5612,7 @@ mod tests {
         let pic = JitPICSlot::new();
         assert!(pic.lookup(42).is_none());
         assert_eq!(pic.entries_used(), 0);
-        assert_eq!(
-            pic.misses.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(pic.misses.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -5634,7 +5639,7 @@ mod tests {
             pic.lookup(1);
         }
         pic.lookup(3); // give class 3 at least one hit
-        // Hit counters: [10, 0, 1] → victim = index 1 (class 2).
+                       // Hit counters: [10, 0, 1] → victim = index 1 (class 2).
         pic.install(4, "D", 0x4000, true);
         // Class 1 and 3 remain; class 2 evicted; class 4 installed.
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
@@ -6069,7 +6074,10 @@ mod tests {
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(
-            ir::Op::New { class_id: 1, num_fields: 2 },
+            ir::Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
             ir::IrType::Ref,
             vec![start],
             None,
@@ -6153,7 +6161,10 @@ mod tests {
     fn probe_object_ptr_offset_in_range() {
         // The offset must be a valid position within a 16-byte Value.
         let off = super::probe_object_ptr_offset();
-        assert!(off < 9, "offset must leave room for 8-byte pointer within 16 bytes, got {off}");
+        assert!(
+            off < 9,
+            "offset must leave room for 8-byte pointer within 16 bytes, got {off}"
+        );
     }
 
     #[test]
@@ -6179,10 +6190,20 @@ mod tests {
     #[test]
     fn s33_mic_slot_new_is_empty() {
         let mic = JitMICSlot::new();
-        assert_eq!(mic.cached_class_id.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(mic.cached_class_name.lock().is_none());
-        assert_eq!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert!(!mic.cached_needs_context.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(!mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(mic.hits.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(mic.misses.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(mic.total_observations(), 0);
@@ -6193,26 +6214,51 @@ mod tests {
     fn s33_mic_slot_prepopulate() {
         let mic = JitMICSlot::new();
         mic.prepopulate(42);
-        assert_eq!(mic.cached_class_id.load(std::sync::atomic::Ordering::Relaxed), 42);
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42
+        );
         // Entry ptr should still be 0 (prepopulate only sets class_id)
-        assert_eq!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
     fn s33_mic_slot_update_all_fields() {
         let mic = JitMICSlot::new();
         mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true);
-        assert_eq!(mic.cached_class_id.load(std::sync::atomic::Ordering::Acquire), 7);
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("com/example/MyClass"));
-        assert_eq!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Acquire), 0xDEAD_BEEF);
-        assert!(mic.cached_needs_context.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
+        assert_eq!(
+            mic.cached_class_name.lock().as_deref(),
+            Some("com/example/MyClass")
+        );
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0xDEAD_BEEF
+        );
+        assert!(mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
     fn s33_mic_slot_hit_miss_counters() {
         let mic = JitMICSlot::new();
-        for _ in 0..10 { mic.record_hit(); }
-        for _ in 0..5 { mic.record_miss(); }
+        for _ in 0..10 {
+            mic.record_hit();
+        }
+        for _ in 0..5 {
+            mic.record_miss();
+        }
         assert_eq!(mic.hits.load(std::sync::atomic::Ordering::Relaxed), 10);
         assert_eq!(mic.misses.load(std::sync::atomic::Ordering::Relaxed), 5);
         assert_eq!(mic.total_observations(), 15);
@@ -6224,10 +6270,14 @@ mod tests {
     fn s33_mic_slot_is_monomorphic() {
         let mic = JitMICSlot::new();
         // Not enough observations
-        for _ in 0..5 { mic.record_hit(); }
+        for _ in 0..5 {
+            mic.record_hit();
+        }
         assert!(!mic.is_monomorphic());
         // 10 hits, 0 misses → 100% hit rate, ≥10 obs → monomorphic
-        for _ in 0..5 { mic.record_hit(); }
+        for _ in 0..5 {
+            mic.record_hit();
+        }
         assert!(mic.is_monomorphic());
     }
 
@@ -6235,16 +6285,24 @@ mod tests {
     fn s33_mic_slot_is_megamorphic() {
         let mic = JitMICSlot::new();
         // 5 hits, 20 misses → 20% hit rate → megamorphic
-        for _ in 0..5 { mic.record_hit(); }
-        for _ in 0..20 { mic.record_miss(); }
+        for _ in 0..5 {
+            mic.record_hit();
+        }
+        for _ in 0..20 {
+            mic.record_miss();
+        }
         assert!(mic.is_megamorphic());
     }
 
     #[test]
     fn s33_mic_slot_not_megamorphic_when_mostly_hits() {
         let mic = JitMICSlot::new();
-        for _ in 0..18 { mic.record_hit(); }
-        for _ in 0..2 { mic.record_miss(); }
+        for _ in 0..18 {
+            mic.record_hit();
+        }
+        for _ in 0..2 {
+            mic.record_miss();
+        }
         assert!(!mic.is_megamorphic());
         assert!(mic.is_monomorphic());
     }
@@ -6254,10 +6312,20 @@ mod tests {
         let mic = JitMICSlot::new();
         mic.update(1, "A", 100, false);
         mic.update(2, "B", 200, true);
-        assert_eq!(mic.cached_class_id.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
         assert_eq!(mic.cached_class_name.lock().as_deref(), Some("B"));
-        assert_eq!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Acquire), 200);
-        assert!(mic.cached_needs_context.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            200
+        );
+        assert!(mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -6277,7 +6345,9 @@ mod tests {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         // 4 threads * 100 hits + 4 threads * 100 misses = 800
         assert_eq!(mic.total_observations(), 800);
         assert_eq!(mic.hits.load(std::sync::atomic::Ordering::Relaxed), 400);
@@ -6288,8 +6358,12 @@ mod tests {
     fn s33_mic_slot_hit_rate_boundary() {
         // Exactly 90% hit rate should count as monomorphic
         let mic = JitMICSlot::new();
-        for _ in 0..9 { mic.record_hit(); }
-        for _ in 0..1 { mic.record_miss(); }
+        for _ in 0..9 {
+            mic.record_hit();
+        }
+        for _ in 0..1 {
+            mic.record_miss();
+        }
         // 10 total, 90% hits → monomorphic
         assert!(mic.is_monomorphic());
     }
@@ -6299,10 +6373,18 @@ mod tests {
         let mic = JitMICSlot::new();
         mic.prepopulate(5);
         // Even with class_id populated, entry_ptr 0 means no direct dispatch
-        assert_eq!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         // After update with non-zero entry, it's resolved
         mic.update(5, "Foo", 0x1234, false);
-        assert_ne!(mic.cached_entry_ptr.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_ne!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     // =======================================================================
@@ -6366,19 +6448,31 @@ mod tests {
     fn rg2_jit_accepts_fp_compare_opcodes() {
         // Float: fconst_0 (0x0b), fconst_1 (0x0c), fcmpl (0x95), ireturn
         let fcmpl = vec![0x0b, 0x0c, 0x95, 0x03, 0xac];
-        assert!(is_jit_compatible(&fcmpl, fcmpl.len(), "()I"), "fcmpl must be JIT-compatible");
+        assert!(
+            is_jit_compatible(&fcmpl, fcmpl.len(), "()I"),
+            "fcmpl must be JIT-compatible"
+        );
 
         // fconst_0, fconst_1, fcmpg
         let fcmpg = vec![0x0b, 0x0c, 0x96, 0x03, 0xac];
-        assert!(is_jit_compatible(&fcmpg, fcmpg.len(), "()I"), "fcmpg must be JIT-compatible");
+        assert!(
+            is_jit_compatible(&fcmpg, fcmpg.len(), "()I"),
+            "fcmpg must be JIT-compatible"
+        );
 
         // dconst_0 (0x0e), dconst_1 (0x0f), dcmpl (0x97)
         let dcmpl = vec![0x0e, 0x0f, 0x97, 0x03, 0xac];
-        assert!(is_jit_compatible(&dcmpl, dcmpl.len(), "()I"), "dcmpl must be JIT-compatible");
+        assert!(
+            is_jit_compatible(&dcmpl, dcmpl.len(), "()I"),
+            "dcmpl must be JIT-compatible"
+        );
 
         // dconst_0, dconst_1, dcmpg (0x98)
         let dcmpg = vec![0x0e, 0x0f, 0x98, 0x03, 0xac];
-        assert!(is_jit_compatible(&dcmpg, dcmpg.len(), "()I"), "dcmpg must be JIT-compatible");
+        assert!(
+            is_jit_compatible(&dcmpg, dcmpg.len(), "()I"),
+            "dcmpg must be JIT-compatible"
+        );
     }
 
     /// RG.3 — JIT accepts lcmp (0x94).
@@ -6386,7 +6480,10 @@ mod tests {
     fn rg3_jit_accepts_lcmp() {
         // lconst_0 (0x09), lconst_1 (0x0a), lcmp (0x94), ireturn
         let lcmp = vec![0x09, 0x0a, 0x94, 0x03, 0xac];
-        assert!(is_jit_compatible(&lcmp, lcmp.len(), "()I"), "lcmp must be JIT-compatible");
+        assert!(
+            is_jit_compatible(&lcmp, lcmp.len(), "()I"),
+            "lcmp must be JIT-compatible"
+        );
     }
 
     /// RG.4 — JIT accepts tableswitch and lookupswitch and correctly skips
@@ -6449,8 +6546,8 @@ mod tests {
         );
         // A method without athrow must NOT set the flag.
         let plain = vec![0x03, 0xac];
-        let scan = x64::jit_scan(&plain, plain.len(), "()I")
-            .expect("trivial method must pass jit_scan");
+        let scan =
+            x64::jit_scan(&plain, plain.len(), "()I").expect("trivial method must pass jit_scan");
         assert!(!scan.has_athrow);
     }
 
@@ -6475,9 +6572,7 @@ mod tests {
         // aconst_null, iconst_0, aconst_null, iconst_0, iconst_0,
         // invokestatic #1 (placeholder CP index — scanner only checks opcode shape),
         // ireturn
-        let code = vec![
-            0x01, 0x03, 0x01, 0x03, 0x03, 0xb8, 0x00, 0x01, 0x03, 0xac,
-        ];
+        let code = vec![0x01, 0x03, 0x01, 0x03, 0x03, 0xb8, 0x00, 0x01, 0x03, 0xac];
         assert!(
             is_jit_compatible(&code, code.len(), "()I"),
             "invokestatic for System.arraycopy must scan OK"
@@ -6496,11 +6591,11 @@ mod tests {
         // iconst_0, ireturn
         // Offsets are relative to the branch opcode's pc.
         let code = vec![
-            0x03, 0x3c,                  // iconst_0, istore_1
+            0x03, 0x3c, // iconst_0, istore_1
             0x1b, 0x08, 0xa2, 0x00, 0x0a, // iload_1, iconst_5, if_icmpge +10
-            0x84, 0x01, 0x01,            // iinc 1, 1
-            0xa7, 0xff, 0xf8,            // goto -8
-            0x03, 0xac,                  // iconst_0, ireturn
+            0x84, 0x01, 0x01, // iinc 1, 1
+            0xa7, 0xff, 0xf8, // goto -8
+            0x03, 0xac, // iconst_0, ireturn
         ];
         assert!(
             is_jit_compatible(&code, code.len(), "()I"),

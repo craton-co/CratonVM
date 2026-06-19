@@ -89,10 +89,10 @@
 //! 4. `post_clinit_fixup` (in vm_util.rs) sets `ApplicationStartup.DEFAULT`
 //!    to the same singleton so GETSTATIC paths also get a non-null value.
 
-use parking_lot::Mutex;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
+use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 /// Whether the real Spring `org.springframework.core.metrics` startup-metrics
@@ -360,11 +360,16 @@ fn mps_replace_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let name = args.get(1).and_then(|v| {
-        if let Value::Object(Some(s)) = v {
-            ctx.read_string(*s)
-        } else { None }
-    }).unwrap_or_default();
+    let name = args
+        .get(1)
+        .and_then(|v| {
+            if let Value::Object(Some(s)) = v {
+                ctx.read_string(*s)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     let source = args.get(2).copied().unwrap_or(Value::Object(None));
     mps_replace_impl(ctx, this, &name, source)
 }
@@ -374,11 +379,16 @@ fn mps_add_before_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let name = args.get(1).and_then(|v| {
-        if let Value::Object(Some(s)) = v {
-            ctx.read_string(*s)
-        } else { None }
-    }).unwrap_or_default();
+    let name = args
+        .get(1)
+        .and_then(|v| {
+            if let Value::Object(Some(s)) = v {
+                ctx.read_string(*s)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     let source = args.get(2).copied().unwrap_or(Value::Object(None));
     mps_add_at_offset_impl(ctx, this, &name, source, 0)
 }
@@ -388,11 +398,16 @@ fn mps_add_after_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let name = args.get(1).and_then(|v| {
-        if let Value::Object(Some(s)) = v {
-            ctx.read_string(*s)
-        } else { None }
-    }).unwrap_or_default();
+    let name = args
+        .get(1)
+        .and_then(|v| {
+            if let Value::Object(Some(s)) = v {
+                ctx.read_string(*s)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     let source = args.get(2).copied().unwrap_or(Value::Object(None));
     mps_add_at_offset_impl(ctx, this, &name, source, 1)
 }
@@ -445,9 +460,7 @@ fn throw_iae_not_exist(ctx: &mut dyn NativeContext, name: &str) -> MethodCallRes
     }
     Err(cratonvm_types::error::MethodCallFailed::InternalError(
         cratonvm_types::error::VmError::Runtime(
-            cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(msg),
-            },
+            cratonvm_types::error::RuntimeError::NullPointerException { message: Some(msg) },
         ),
     ))
 }
@@ -467,7 +480,9 @@ fn mps_replace_impl(
     }
     // Build a new array with the replaced element; COWAL is copy-on-write.
     let len = ctx.array_length(arr);
-    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(cratonvm_types::ClassId::new(0));
+    let cid = ctx
+        .class_id_by_name("java/lang/Object")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let new_arr = ctx.new_ref_array(cid, len);
     let idx_u = idx as usize;
     for i in 0..len {
@@ -495,8 +510,12 @@ fn mps_add_at_offset_impl(
         let n = ctx.get_field_by_name(s, "name");
         if let Value::Object(Some(ns)) = n {
             ctx.read_string(ns)
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let (psl, arr, target_idx, _len) = match mps_find_index_by_name(ctx, mps, name) {
         Some(t) => t,
@@ -533,7 +552,9 @@ fn mps_add_at_offset_impl(
         items.push(source);
     }
 
-    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(cratonvm_types::ClassId::new(0));
+    let cid = ctx
+        .class_id_by_name("java/lang/Object")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let new_arr = ctx.new_ref_array(cid, items.len());
     for (i, v) in items.iter().enumerate() {
         ctx.set_array_element(new_arr, i, *v);
@@ -593,10 +614,7 @@ fn env_get_property_str(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 // Environment.getProperty(String, String) → defaultValue
-fn env_get_property_str_default(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn env_get_property_str_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.get(2).copied().unwrap_or(Value::Object(None))))
 }
 
@@ -617,10 +635,7 @@ fn env_get_active_profiles(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
 }
 
 // Environment.getDefaultProfiles() → ["default"]
-fn env_get_default_profiles(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn env_get_default_profiles(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
     let default_str = ctx.create_string("default");
     ctx.set_array_element(arr, 0, Value::Object(Some(default_str)));
@@ -633,19 +648,13 @@ fn env_accepts_profiles(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 }
 
 // Environment.acceptsProfiles(String[]) → true
-fn env_accepts_profiles_arr(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn env_accepts_profiles_arr(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
 
 // getPropertySources() → read from the cached env's propertySources field,
 // falling back to the env object itself if the field is not found.
-fn env_get_property_sources(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn env_get_property_sources(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let env = get_noop_environment(ctx);
     // Try to read the real propertySources field.
     let mps = ctx.get_field_by_name(env, "propertySources");
@@ -664,10 +673,7 @@ fn env_get_property_sources(
 }
 
 // resolveRequiredPlaceholders(String) → same string
-fn env_resolve_placeholders(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn env_resolve_placeholders(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
@@ -713,8 +719,7 @@ const BPP_LIST: &str =
 /// The old logic returned early whenever the class name matched, so those
 /// lists were never repaired and `addBeanProcessor` NPE'd on the outer ref.
 fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: ObjectRef) {
-    const INNER_INIT: &str =
-        "(Lorg/springframework/beans/factory/support/AbstractBeanFactory;)V";
+    const INNER_INIT: &str = "(Lorg/springframework/beans/factory/support/AbstractBeanFactory;)V";
 
     let cur = ctx.get_field_by_name(bean_factory, "beanPostProcessors");
     if let Value::Object(Some(obj)) = cur {
@@ -735,10 +740,7 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
     }
 
     if let Ok(Some(Value::Object(Some(list)))) = ctx.new_object(BPP_LIST) {
-        let args = &[
-            Value::Object(Some(list)),
-            Value::Object(Some(bean_factory)),
-        ];
+        let args = &[Value::Object(Some(list)), Value::Object(Some(bean_factory))];
         let inited = ctx
             .invoke_special(BPP_LIST, "<init>", INNER_INIT, args)
             .is_ok()
@@ -771,7 +773,8 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
             _ => return None,
         };
         // Invoke DefaultListableBeanFactory() no-arg constructor.
-        ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))]).ok()?;
+        ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))])
+            .ok()?;
         Some(obj)
     })()
     .unwrap_or_else(|| {
@@ -907,10 +910,7 @@ fn abstract_env_decrypt(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     empty_hashmap(ctx)
 }
 
-fn standard_config_data_resolve(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn standard_config_data_resolve(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     empty_arraylist(ctx)
 }
 
@@ -953,7 +953,8 @@ fn standard_config_data_resolve_profile_specific(
 #[allow(dead_code)]
 const SICP_CACHE: &str =
     "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache";
-const SICP_NAME: &str = "org/springframework/boot/context/properties/source/ConfigurationPropertyName";
+const SICP_NAME: &str =
+    "org/springframework/boot/context/properties/source/ConfigurationPropertyName";
 
 #[allow(dead_code)]
 fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1053,14 +1054,22 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
         // Write the 6 record components directly so accessor methods return
         // non-null containers.
         ctx.set_field_by_name(obj, "mappings", Value::Object(Some(mappings)));
-        ctx.set_field_by_name(obj, "reverseMappings", Value::Object(Some(reverse_mappings)));
+        ctx.set_field_by_name(
+            obj,
+            "reverseMappings",
+            Value::Object(Some(reverse_mappings)),
+        );
         ctx.set_field_by_name(obj, "descendants", Value::Object(Some(descendants)));
         ctx.set_field_by_name(
             obj,
             "configurationPropertyNames",
             Value::Object(Some(cpn_arr)),
         );
-        ctx.set_field_by_name(obj, "systemEnvironmentCopy", Value::Object(Some(sys_env_copy)));
+        ctx.set_field_by_name(
+            obj,
+            "systemEnvironmentCopy",
+            Value::Object(Some(sys_env_copy)),
+        );
         ctx.set_field_by_name(obj, "lastUpdated", Value::Object(Some(str_arr)));
         obj
     });
@@ -1193,12 +1202,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 step_tag_ssup,
             );
             registry.register(step_class, "end", "()V", step_end);
-            registry.register(
-                step_class,
-                "getName",
-                "()Ljava/lang/String;",
-                step_get_name,
-            );
+            registry.register(step_class, "getName", "()Ljava/lang/String;", step_get_name);
             registry.register(step_class, "getId", "()J", step_get_id);
             registry.register(
                 step_class,
@@ -1654,7 +1658,8 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // boundary is skipped.
     // ───────────────────────────────────────────────────────────────────────
     const CCPP: &str = "org/springframework/context/annotation/ConfigurationClassPostProcessor";
-    const BDRPP: &str = "org/springframework/beans/factory/support/BeanDefinitionRegistryPostProcessor";
+    const BDRPP: &str =
+        "org/springframework/beans/factory/support/BeanDefinitionRegistryPostProcessor";
     const BFPP: &str = "org/springframework/beans/factory/config/BeanFactoryPostProcessor";
 
     // GAUNTLET ROUND-5: CCPP/BDRPP/BFPP post-processor shims DISABLED.
@@ -1761,8 +1766,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // No-op the listener entirely; metadata reader caching is purely an
     // optimization and skipping cleanup is harmless. Also no-op `destroy()`
     // so the bean's lifecycle teardown path doesn't NPE the same way.
-    const SMRF_BEAN: &str =
-        "org/springframework/boot/autoconfigure/\
+    const SMRF_BEAN: &str = "org/springframework/boot/autoconfigure/\
          SharedMetadataReaderFactoryContextInitializer\
          $SharedMetadataReaderFactoryBean";
     registry.register(
@@ -2076,7 +2080,7 @@ fn spring_set_wrapped_instance_conditional(
     };
     let target = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),  // null target — no-op
+        _ => return Ok(None), // null target — no-op
     };
     // Store target in the wrappedObject field. Spring's BeanWrapperImpl uses
     // 'wrappedObject' as the canonical field name (inherited from the parent
@@ -2185,13 +2189,18 @@ fn ccpp_process_config_bean_definitions(
         };
         // Only walk @Configuration classes.
         let anns = ctx.class_annotations(cid);
-        let is_config = anns
-            .iter()
-            .any(|a| a.type_descriptor == CONFIGURATION_DESC);
+        let is_config = anns.iter().any(|a| a.type_descriptor == CONFIGURATION_DESC);
         if !is_config {
             continue;
         }
-        walk_imports_recursive(ctx, cls_name, registry, &mut seen_imports, &mut registered, 0);
+        walk_imports_recursive(
+            ctx,
+            cls_name,
+            registry,
+            &mut seen_imports,
+            &mut registered,
+            0,
+        );
     }
 
     if registered > 0 {
@@ -2239,11 +2248,7 @@ fn walk_imports_recursive(
     };
 
     // @Import.value() is a Class[] — find the "value" element.
-    let value_array = match import_ann
-        .elements
-        .iter()
-        .find(|(name, _)| name == "value")
-    {
+    let value_array = match import_ann.elements.iter().find(|(name, _)| name == "value") {
         Some((_, v)) => v.clone(),
         None => return,
     };
@@ -2271,9 +2276,7 @@ fn walk_imports_recursive(
         // simply omits the import (often guarded by @ConditionalOnClass).
         // Without this, registering a RootBeanDefinition for a missing class
         // throws CannotLoadBeanClassException later during bean preInstantiation.
-        if ctx.class_id_by_name(&imp_class).is_none()
-            && ctx.load_class(&imp_class).is_err()
-        {
+        if ctx.class_id_by_name(&imp_class).is_none() && ctx.load_class(&imp_class).is_err() {
             if std::env::var("CCPP_DBG").is_ok() {
                 eprintln!(
                     "[CCPP-DBG] walk_imports: skipping missing @Import target {}",
@@ -2434,12 +2437,7 @@ fn s_instantiation_strategy_instantiate(
 
     match ctx.new_object(&class_name) {
         Ok(Some(Value::Object(Some(obj)))) => {
-            let _ = ctx.invoke(
-                &class_name,
-                "<init>",
-                "()V",
-                &[Value::Object(Some(obj))],
-            );
+            let _ = ctx.invoke(&class_name, "<init>", "()V", &[Value::Object(Some(obj))]);
             Ok(Some(Value::Object(Some(obj))))
         }
         _ => {
@@ -2675,8 +2673,7 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
         // 3. Remove from `beanDefinitionNames` (List<String>) — this is the
         //    iteration source for preInstantiateSingletons when the
         //    configuration isn't frozen.
-        if let Value::Object(Some(list)) = ctx.get_field_by_name(factory, "beanDefinitionNames")
-        {
+        if let Value::Object(Some(list)) = ctx.get_field_by_name(factory, "beanDefinitionNames") {
             let _ = ctx.invoke(
                 "java/util/List",
                 "remove",
@@ -2695,9 +2692,7 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
         // 5. Also try removing from `manualSingletonNames` (a
         //    LinkedHashSet<String>) in case the orphan was registered as a
         //    manual singleton. Harmless no-op if the name isn't present.
-        if let Value::Object(Some(set)) =
-            ctx.get_field_by_name(factory, "manualSingletonNames")
-        {
+        if let Value::Object(Some(set)) = ctx.get_field_by_name(factory, "manualSingletonNames") {
             let _ = ctx.invoke(
                 "java/util/Set",
                 "remove",
@@ -2765,10 +2760,7 @@ fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 ///   * Otherwise re-invoke `registry.registerBeanDefinition(name, bd)`
 ///     manually to faithfully reproduce what the original bytecode would have
 ///     done.  This keeps every other app's happy path unchanged.
-fn bdru_register_bean_definition(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let holder = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),

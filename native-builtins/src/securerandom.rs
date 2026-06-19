@@ -61,16 +61,16 @@
 //! same issue with `ThreadLocalRandom` and solves it by using a per-thread
 //! field, which is an option if memory ever becomes a concern.
 
-use cratonvm_types::error::{MethodCallResult};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
 // Round-9 MED-3: migrated `SEED_TABLE` from `std::sync::RwLock` to
 // `parking_lot::RwLock` — removes poison handling (which the file already
 // drained with `unwrap_or_else(into_inner)`) and matches the doc comment that
 // already claimed parking-lot semantics.
-use rustc_hash::FxHashMap;
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // OS entropy helpers
@@ -240,20 +240,19 @@ fn set_seed(ctx: &mut dyn NativeContext, obj: ObjectRef, user_seed: i64) {
 /// fallback) so each unseeded `new Random()` produces a distinct
 /// sequence, just like the JDK.
 fn set_entropy_seed(ctx: &mut dyn NativeContext, obj: ObjectRef) {
-    let user_seed = os_random_u64()
-        .map(|u| u as i64)
-        .unwrap_or_else(|| {
-            // Last-resort fallback — should never trigger on a well-
-            // configured system.  The two-component mix keeps us out
-            // of trivially-collidable seed space.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            let counter = ENTROPY_FALLBACK_COUNTER
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            nanos.wrapping_mul(0x9E3779B97F4A7C15u64 as i64).wrapping_add(counter as i64)
-        });
+    let user_seed = os_random_u64().map(|u| u as i64).unwrap_or_else(|| {
+        // Last-resort fallback — should never trigger on a well-
+        // configured system.  The two-component mix keeps us out
+        // of trivially-collidable seed space.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let counter = ENTROPY_FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        nanos
+            .wrapping_mul(0x9E3779B97F4A7C15u64 as i64)
+            .wrapping_add(counter as i64)
+    });
     set_seed(ctx, obj, user_seed);
 }
 
@@ -281,22 +280,18 @@ fn lcg_next(ctx: &mut dyn NativeContext, obj: ObjectRef, bits: u32) -> i32 {
                 // Lazy initialization with OS entropy — defensive:
                 // shouldn't happen, but if it does we don't want to
                 // emit zeros forever.
-                let s = os_random_u64()
-                    .map(|u| u & LCG_MASK)
-                    .unwrap_or_else(|| {
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(1);
-                        nanos & LCG_MASK
-                    });
+                let s = os_random_u64().map(|u| u & LCG_MASK).unwrap_or_else(|| {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(1);
+                    nanos & LCG_MASK
+                });
                 t.insert(key, s);
                 s
             }
         };
-        let next = old.wrapping_mul(LCG_MULTIPLIER)
-            .wrapping_add(LCG_INCREMENT)
-            & LCG_MASK;
+        let next = old.wrapping_mul(LCG_MULTIPLIER).wrapping_add(LCG_INCREMENT) & LCG_MASK;
         t.insert(key, next);
         next
     });
@@ -389,10 +384,12 @@ pub(crate) fn native_random_next_int_bound(
                 );
             }
         }
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "bound must be positive".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "bound must be positive".to_string(),
+            }
+            .into(),
+        );
     }
     let m = bound - 1;
     let mut r = lcg_next(ctx, this, 31);
@@ -588,10 +585,12 @@ pub(crate) fn native_secure_random_next_int_bound(
         _ => 1,
     };
     if bound <= 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "bound must be positive".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "bound must be positive".to_string(),
+            }
+            .into(),
+        );
     }
     // Rejection sampling on full 32 bits to keep the distribution
     // unbiased for arbitrary bounds (JDK uses the same approach).
@@ -788,10 +787,12 @@ pub(crate) fn native_secure_random_generate_seed(
         _ => 0,
     };
     if n < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "numBytes must be non-negative".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "numBytes must be non-negative".to_string(),
+            }
+            .into(),
+        );
     }
     let n = n as usize;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
@@ -861,10 +862,12 @@ pub(crate) fn native_secure_random_get_instance(
         _ => String::new(),
     };
     if algo.is_empty() {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "null algorithm name".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "null algorithm name".to_string(),
+            }
+            .into(),
+        );
     }
     Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
 }
@@ -888,7 +891,10 @@ pub(crate) fn native_secure_random_get_instance_strong(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(make_secure_random(ctx, "OS-CSPRNG")))))
+    Ok(Some(Value::Object(Some(make_secure_random(
+        ctx,
+        "OS-CSPRNG",
+    )))))
 }
 
 // ---------------------------------------------------------------------------
@@ -954,8 +960,18 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     // from the CSPRNG; otherwise it inherits java.util.Random's LCG-backed
     // `native_random_next_gaussian` (registered above on java/util/Random),
     // leaking predictable Gaussian deviates from a "secure" source.
-    registry.register(sr, "nextGaussian", "()D", native_secure_random_next_gaussian);
-    registry.register(sr, "generateSeed", "(I)[B", native_secure_random_generate_seed);
+    registry.register(
+        sr,
+        "nextGaussian",
+        "()D",
+        native_secure_random_next_gaussian,
+    );
+    registry.register(
+        sr,
+        "generateSeed",
+        "(I)[B",
+        native_secure_random_generate_seed,
+    );
     // Static factories — `getInstance(...)` / `getInstanceStrong()`.  Without
     // these the real-JDK body falls through to the JCA provider chain, which has
     // no `SecureRandom` service entry and dead-ends in "no SecureRandom <algo>
@@ -1027,10 +1043,16 @@ mod tests {
     #[test]
     fn test_os_random_bytes_fills_buffer() {
         let mut buf = [0u8; 32];
-        assert!(os_random_bytes(&mut buf), "OS entropy source must be available");
+        assert!(
+            os_random_bytes(&mut buf),
+            "OS entropy source must be available"
+        );
         // It would be vanishingly unlikely to get all zeros from 32
         // bytes of OS entropy; if we do, something is seriously wrong.
-        assert!(buf.iter().any(|&b| b != 0), "all-zero buffer indicates broken entropy source");
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "all-zero buffer indicates broken entropy source"
+        );
     }
 
     #[test]
@@ -1057,8 +1079,10 @@ mod tests {
         let mut seed = scramble_seed(42);
 
         let next_bits = |seed: &mut u64, bits: u32| -> i32 {
-            *seed = (seed.wrapping_mul(LCG_MULTIPLIER)
-                .wrapping_add(LCG_INCREMENT)) & LCG_MASK;
+            *seed = (seed
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT))
+                & LCG_MASK;
             (*seed >> (48 - bits)) as i32
         };
         let hi = next_bits(&mut seed, 32) as i64;
@@ -1115,7 +1139,10 @@ mod tests {
             buckets[b] += 1;
         }
         for &b in &buckets {
-            assert!(b > 80 && b < 512, "bucket distribution wildly skewed: {buckets:?}");
+            assert!(
+                b > 80 && b < 512,
+                "bucket distribution wildly skewed: {buckets:?}"
+            );
         }
     }
 

@@ -246,10 +246,18 @@ impl NativeContext for MockNativeContext {
     }
 
     // --- everything else: default stubs (unused by the test) ---
-    fn load_class(&mut self, _n: &str) -> MethodCallResult { Ok(None) }
-    fn new_object(&mut self, _c: &str) -> MethodCallResult { Ok(None) }
-    fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult { Ok(None) }
-    fn identity_hash_code(&self, o: ObjectRef) -> i32 { o.as_ptr() as i32 }
+    fn load_class(&mut self, _n: &str) -> MethodCallResult {
+        Ok(None)
+    }
+    fn new_object(&mut self, _c: &str) -> MethodCallResult {
+        Ok(None)
+    }
+    fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
+        Ok(None)
+    }
+    fn identity_hash_code(&self, o: ObjectRef) -> i32 {
+        o.as_ptr() as i32
+    }
     fn record_printed_value(&mut self, _v: Value) {}
     fn class_name_of_id(&self, c: ClassId) -> Option<String> {
         match self.class_table.get(c.as_u32() as usize) {
@@ -263,19 +271,33 @@ impl NativeContext for MockNativeContext {
             .copied()
             .unwrap_or_else(|| ClassId::new(0))
     }
-    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
-    fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value { Value::Object(None) }
+    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+        None
+    }
+    fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
+        Value::Object(None)
+    }
     fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> { None }
-    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool { false }
+    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
+        None
+    }
+    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+        false
+    }
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
             elements: vec![Value::Object(None); length],
         })
     }
-    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind { ObjectKind::Object }
-    fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType { ArrayElementType::Reference }
+    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind {
+        ObjectKind::Object
+    }
+    fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
+        ArrayElementType::Reference
+    }
     fn create_string(&mut self, t: &str) -> ObjectRef {
         let obj = self.alloc_object(0);
         let ptr = obj.as_ptr() as usize;
@@ -286,109 +308,223 @@ impl NativeContext for MockNativeContext {
         let ptr = o.as_ptr() as usize;
         self.strings_ref().get(&ptr).cloned()
     }
-    fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef { self.alloc_object(0) }
+    fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
+        self.alloc_object(0)
+    }
     fn record_printed_line(&mut self, _t: String) {}
-    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
-    fn get_system_property(&self, _k: &str) -> Option<String> { None }
-    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> { None }
+    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+        None
+    }
+    fn get_system_property(&self, _k: &str) -> Option<String> {
+        None
+    }
+    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+        None
+    }
     fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
         MockNativeContext::alloc_object(self, num_fields)
     }
     fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
         Ok(ClassId::new(0))
     }
-    fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool { false }
-    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> { None }
-    fn is_interface_class(&self, _c: ClassId) -> bool { false }
-    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> { None }
-    fn loader_id_of_class(&self, _c: ClassId) -> i32 { 2 }
-    fn is_record_class(&self, _c: ClassId) -> bool { false }
-    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> { Vec::new() }
-    fn is_sealed_class(&self, _c: ClassId) -> bool { false }
-    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> { Vec::new() }
+    fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
+        false
+    }
+    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
+        None
+    }
+    fn is_interface_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
+        None
+    }
+    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+        2
+    }
+    fn is_record_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn is_sealed_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+        Vec::new()
+    }
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
         match &self.heap_ref()[self.entry_index(obj)] {
             HeapEntry::Object { fields } => fields.len(),
             _ => 0,
         }
     }
-    fn thread_id(&self) -> u64 { 1 }
+    fn thread_id(&self) -> u64 {
+        1
+    }
     fn monitor_enter(&mut self, _o: ObjectRef) {}
     fn monitor_exit(&mut self, _o: ObjectRef) {}
-    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult { Ok(None) }
-    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
-    fn thread_is_alive(&self, _o: ObjectRef) -> bool { false }
-    fn current_thread_object(&mut self) -> ObjectRef { self.alloc_object(0) }
+    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+    fn thread_is_alive(&self, _o: ObjectRef) -> bool {
+        false
+    }
+    fn current_thread_object(&mut self) -> ObjectRef {
+        self.alloc_object(0)
+    }
     fn thread_interrupt(&mut self, _o: ObjectRef) {}
-    fn is_interrupted(&self, _c: bool) -> bool { false }
-    fn active_thread_count(&self) -> i32 { 1 }
-    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> { Vec::new() }
-    fn heap_allocated_bytes(&self) -> usize { 0 }
-    fn loaded_class_count(&self) -> usize { 0 }
-    fn gc_collection_count(&self) -> u64 { 0 }
+    fn is_interrupted(&self, _c: bool) -> bool {
+        false
+    }
+    fn active_thread_count(&self) -> i32 {
+        1
+    }
+    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
+        Vec::new()
+    }
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+    fn loaded_class_count(&self) -> usize {
+        0
+    }
+    fn gc_collection_count(&self) -> u64 {
+        0
+    }
     fn force_gc(&mut self) {}
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> { Vec::new() }
-    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> { Vec::new() }
-    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> { Vec::new() }
-    fn class_access_flags(&self, _c: ClassId) -> u16 { 0 }
-    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
+    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+        Vec::new()
+    }
+    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+        Vec::new()
+    }
+    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
+        Vec::new()
+    }
+    fn class_access_flags(&self, _c: ClassId) -> u16 {
+        0
+    }
+    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
+        Value::Int(0)
+    }
     fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-    fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef { self.alloc_object(0) }
+    fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
+        self.alloc_object(0)
+    }
     fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
         use std::sync::OnceLock;
         static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
         FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
     }
-    fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value { self.get_field(o, i) }
-    fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) { self.set_field(o, i, v) }
-    fn compare_and_swap_field(
-        &mut self, _o: ObjectRef, _i: usize, _e: Value, _n: Value,
-    ) -> bool { false }
+    fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
+        self.get_field(o, i)
+    }
+    fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
+        self.set_field(o, i, v)
+    }
+    fn compare_and_swap_field(&mut self, _o: ObjectRef, _i: usize, _e: Value, _n: Value) -> bool {
+        false
+    }
     fn park(&mut self, _t: Option<std::time::Duration>) {}
     fn unpark(&self, _o: ObjectRef) {}
-    fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> { None }
-    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> { Vec::new() }
-    fn method_annotations(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Vec<AnnotationData> { Vec::new() }
-    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> { Vec::new() }
+    fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
+        None
+    }
+    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
     fn method_parameter_annotations(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Vec<Vec<AnnotationData>> { Vec::new() }
-    fn class_signature(&self, _c: ClassId) -> Option<String> { None }
-    fn method_signature(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Option<String> { None }
-    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+    fn class_signature(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+        None
+    }
+    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+        None
+    }
     fn method_annotation_default(
-        &self, _c: ClassId, _m: &str, _d: &str,
-    ) -> Option<AnnotationElementValue> { None }
-    fn get_scoped_value(&self, _k: u64) -> Option<Value> { None }
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Option<AnnotationElementValue> {
+        None
+    }
+    fn get_scoped_value(&self, _k: u64) -> Option<Value> {
+        None
+    }
     fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
     fn pop_scoped_value(&mut self) {}
-    fn scoped_value_depth(&self) -> usize { 0 }
-    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> { None }
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
+    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
+        None
+    }
     fn free_native_memory(&mut self, _a: i64) {}
-    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
-    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
-    fn register_upcall(&mut self, _e: cratonvm_native_api::ffi::UpcallEntry) -> usize { 0 }
-    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
-    fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
-    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }
-    fn list_application_class_names(&self) -> Vec<String> { Vec::new() }
+    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> {
+        Ok(0)
+    }
+    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> {
+        None
+    }
+    fn register_upcall(&mut self, _e: cratonvm_native_api::ffi::UpcallEntry) -> usize {
+        0
+    }
+    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
+        None
+    }
+    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn list_application_class_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> { None }
-    fn define_class_with_loader(
-        &mut self, _n: &str, _b: &[u8], _l: u32,
-    ) -> Option<ClassId> { None }
-    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> { None }
-    fn allocate_loader_id(&mut self) -> u32 { 0 }
-    fn discover_reference(
-        &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
-    ) {}
+    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+        None
+    }
+    fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn allocate_loader_id(&mut self) -> u32 {
+        0
+    }
+    fn discover_reference(&mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>) {}
 }
 
 // ---------------------------------------------------------------------------

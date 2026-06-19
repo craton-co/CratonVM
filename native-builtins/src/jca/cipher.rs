@@ -84,9 +84,9 @@ use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
 use crate::crypto_impl::{Aes, AesGcm};
 use crate::phases_early::CIPHER_IV;
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Cipher state — kept in a process-wide side-table keyed on the
@@ -201,11 +201,7 @@ fn security_clinit_spimap(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     if let Some(Value::Object(Some(m))) =
         ctx.new_object_initialized("java/util/concurrent/ConcurrentHashMap", "()V", &[])?
     {
-        ctx.set_static_field_by_name(
-            "java/security/Security",
-            "spiMap",
-            Value::Object(Some(m)),
-        );
+        ctx.set_static_field_by_name("java/security/Security", "spiMap", Value::Object(Some(m)));
     }
     Ok(None)
 }
@@ -340,7 +336,9 @@ fn cipher_init_record(
     let key_bytes = extract_key_bytes(ctx, key);
     let tkey = obj_key(ctx, this);
     let algo = with_table_read(|t| {
-        t.get(&tkey).map(|s| s.algorithm.clone()).unwrap_or_default()
+        t.get(&tkey)
+            .map(|s| s.algorithm.clone())
+            .unwrap_or_default()
     });
     let (rsa_n, rsa_exp) = if is_rsa_transformation(&algo) {
         rsa_key_components(ctx, key, mode).unwrap_or_default()
@@ -448,12 +446,9 @@ fn extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec<u8>
     // crypto.rs::alloc_key — (alg_idx Int @0, size_bits Int @1, enc_len Int @2).
     // Slot 0 is NOT a byte[] here. Fall back to invoking getEncoded() which
     // produces a fresh byte[] of length enc_len.
-    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
-        key_obj,
-        "getEncoded",
-        "()[B",
-        &[],
-    ) {
+    if let Ok(Some(Value::Object(Some(arr)))) =
+        ctx.invoke_virtual(key_obj, "getEncoded", "()[B", &[])
+    {
         return read_bytes(ctx, arr);
     }
     Vec::new()
@@ -542,7 +537,9 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         };
         if rsa_n.is_empty() || rsa_exp.is_empty() {
             return Err(RuntimeError::IllegalStateException {
-                message: "RSA cipher: key components unavailable (init did not capture modulus/exponent)".into(),
+                message:
+                    "RSA cipher: key components unavailable (init did not capture modulus/exponent)"
+                        .into(),
             }
             .into());
         }
@@ -771,7 +768,12 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // map is harmless for the synthetic RSA/AES/digest paths (which never read
     // it). Only the pure-synthetic kill-switch keeps the bare no-op.
     if crate::real_jca_mode() || crate::route_ec_to_real() {
-        r.register("java/security/Security", "<clinit>", "()V", security_clinit_spimap);
+        r.register(
+            "java/security/Security",
+            "<clinit>",
+            "()V",
+            security_clinit_spimap,
+        );
     } else {
         r.register("java/security/Security", "<clinit>", "()V", clinit_noop);
     }
@@ -802,7 +804,12 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // `<init>` of Cipher synthetic still triggers init of the
     // declared-fields graph, so cover Providers too.
     r.register("sun/security/jca/Providers", "<clinit>", "()V", clinit_noop);
-    r.register("sun/security/jca/ProviderList", "<clinit>", "()V", clinit_noop);
+    r.register(
+        "sun/security/jca/ProviderList",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
 
     // `javax/crypto/JceSecurity.<clinit>` — the real JDK-25 clinit invokes
     // `setupJurisdictionPolicies()` which reads the `crypto.policy` Security
@@ -1151,7 +1158,11 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             // RSA output is always the modulus size; not on the JWE hot path.
             total.max(256)
         } else if mode_str == "GCM" {
-            if encrypt { total + 16 } else { total.saturating_sub(16) }
+            if encrypt {
+                total + 16
+            } else {
+                total.saturating_sub(16)
+            }
         } else if encrypt {
             // Block cipher with PKCS padding: round up to the next 16-byte block.
             (total / 16 + 1) * 16
@@ -1197,7 +1208,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let tkey = obj_key(ctx, this);
             let algo = with_table_read(|t| {
-                t.get(&tkey).map(|s| s.algorithm.clone()).unwrap_or_default()
+                t.get(&tkey)
+                    .map(|s| s.algorithm.clone())
+                    .unwrap_or_default()
             });
             let s = ctx.create_string(&algo);
             Ok(Some(Value::Object(Some(s))))
@@ -1233,9 +1246,8 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
     r.register(cipher, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tkey = obj_key(ctx, this);
-        let iv_bytes = with_table_read(|t| {
-            t.get(&tkey).map(|s| s.iv_bytes.clone()).unwrap_or_default()
-        });
+        let iv_bytes =
+            with_table_read(|t| t.get(&tkey).map(|s| s.iv_bytes.clone()).unwrap_or_default());
         if iv_bytes.is_empty() {
             return Ok(Some(Value::Object(None)));
         }
@@ -1353,7 +1365,8 @@ mod tests {
         }
         // Provider clinit must NOT be shimmed.
         assert!(
-            r.find("java/security/Provider", "<clinit>", "()V").is_none(),
+            r.find("java/security/Provider", "<clinit>", "()V")
+                .is_none(),
             "Provider.<clinit> must run real bytecode to populate knownEngines"
         );
     }
@@ -1389,9 +1402,7 @@ mod tests {
                 "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V"
             )
             .is_some());
-        assert!(r
-            .find("javax/crypto/Cipher", "doFinal", "([B)[B")
-            .is_some());
+        assert!(r.find("javax/crypto/Cipher", "doFinal", "([B)[B").is_some());
 
         // Spec-type constructors
         assert!(r

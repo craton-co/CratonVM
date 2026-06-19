@@ -133,7 +133,10 @@ mod tests {
     fn class_id_display() {
         assert_eq!(format!("{}", ClassId::new(0)), "0");
         assert_eq!(format!("{}", ClassId::new(42)), "42");
-        assert_eq!(format!("{}", ClassId::new(u32::MAX)), format!("{}", u32::MAX));
+        assert_eq!(
+            format!("{}", ClassId::new(u32::MAX)),
+            format!("{}", u32::MAX)
+        );
     }
 
     #[test]

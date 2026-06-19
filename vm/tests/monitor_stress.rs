@@ -148,7 +148,8 @@ fn monitor_stress_8_threads_no_imse_no_deadlock() {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        h.join().unwrap_or_else(|_| panic!("worker #{idx} panicked"));
+        h.join()
+            .unwrap_or_else(|_| panic!("worker #{idx} panicked"));
     }
 
     let imse_count = imse_counter.load(Ordering::Relaxed);

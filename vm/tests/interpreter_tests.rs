@@ -423,7 +423,12 @@ fn test_record_canonical_ctor() {
 fn test_record_accessor_generation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testAccessorGeneration",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -469,7 +474,12 @@ fn test_record_equals_null() {
 fn test_record_hashcode_consistent() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testHashCodeConsistent",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -480,7 +490,12 @@ fn test_record_hashcode_consistent() {
 fn test_record_hashcode_different() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testHashCodeDifferent",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -504,7 +519,12 @@ fn test_record_tostring() {
 fn test_sealed_permitted_loads() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/SealedVerify",
+        "testPermittedSubclassLoads",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -576,7 +596,12 @@ fn test_reflect_method_string_return() {
 fn test_reflect_method_private_accessible() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectMethod",
+        "testPrivateSetAccessible",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(777))) => {}
         other => panic!("Expected Ok(Some(Int(777))), got: {other:?}"),
@@ -587,7 +612,12 @@ fn test_reflect_method_private_accessible() {
 fn test_reflect_method_exception_wrapping() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectMethod",
+        "testExceptionWrapping",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -646,7 +676,12 @@ fn test_reflect_field_set_int() {
 fn test_reflect_constructor_noarg() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testNoArgConstructor",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(10))) => {}
         other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
@@ -657,7 +692,12 @@ fn test_reflect_constructor_noarg() {
 fn test_reflect_constructor_param() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testParamConstructor",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -668,7 +708,12 @@ fn test_reflect_constructor_param() {
 fn test_reflect_constructor_exception() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testExceptionInConstructor",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -681,7 +726,12 @@ fn test_reflect_constructor_exception() {
 fn test_reflect_annotation_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testClassAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -692,7 +742,12 @@ fn test_reflect_annotation_class() {
 fn test_reflect_annotation_method() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testMethodAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -714,7 +769,12 @@ fn test_reflect_annotation_absent() {
 fn test_reflect_annotation_is_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testIsAnnotationPresent",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -766,7 +826,12 @@ fn test_serialize_transient_field() {
 fn test_serialize_non_serializable_throws() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/SerializeBasic",
+        "testNonSerializableThrows",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -778,7 +843,12 @@ fn test_serialize_non_serializable_throws() {
 fn test_context_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testContextClassLoader",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -790,7 +860,12 @@ fn test_context_class_loader() {
 fn test_parent_delegation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testParentDelegation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -802,7 +877,12 @@ fn test_parent_delegation() {
 fn test_set_context_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSetContextClassLoader",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -814,7 +894,12 @@ fn test_set_context_class_loader() {
 fn test_class_get_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testClassGetClassLoader",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -830,7 +915,12 @@ fn test_class_get_class_loader() {
 fn test_bootstrap_class_loader_is_null() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testBootstrapClassLoaderIsNull",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -841,7 +931,12 @@ fn test_bootstrap_class_loader_is_null() {
 fn test_string_bootstrap_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testStringBootstrapLoader",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -864,7 +959,12 @@ fn test_loader_name() {
 fn test_platform_loader_name() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testPlatformLoaderName",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -876,7 +976,12 @@ fn test_platform_loader_name() {
 fn test_system_class_loader_chain() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSystemClassLoaderChain",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -888,7 +993,12 @@ fn test_system_class_loader_chain() {
 fn test_load_class_delegation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoadClassDelegation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -900,7 +1010,12 @@ fn test_load_class_delegation() {
 fn test_load_class_for_user_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoadClassForUserClass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -912,7 +1027,12 @@ fn test_load_class_for_user_class() {
 fn test_class_loader_identity() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testClassLoaderIdentity",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -924,7 +1044,12 @@ fn test_class_loader_identity() {
 fn test_system_class_loader_identity() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSystemClassLoaderIdentity",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -936,7 +1061,12 @@ fn test_system_class_loader_identity() {
 fn test_loader_isolation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoaderIsolation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -952,7 +1082,12 @@ fn test_loader_isolation() {
 fn test_method_handle_static() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testStaticMethodHandle",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -964,7 +1099,12 @@ fn test_method_handle_static() {
 fn test_method_handle_virtual() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testVirtualMethodHandle",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -976,7 +1116,12 @@ fn test_method_handle_virtual() {
 fn test_method_handle_constructor() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testConstructorMethodHandle",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1012,7 +1157,12 @@ fn test_lookup_in() {
 fn test_var_handle_get_set() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testVarHandleGetSet",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1036,7 +1186,12 @@ fn test_var_handle_cas() {
 fn test_method_handle_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testMethodHandleType",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1092,7 +1247,7 @@ fn test_var_handle_acquire_release() {
 // 97.1: JTReg directive parsing — compile test
 #[test]
 fn test_jtreg_parse_compile() {
-    use cratonvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+    use cratonvm_vm::runtime::tck::{JtregDirective, JtregRunMode, JtregTestDescriptor};
 
     let source = r#"
 /*
@@ -1113,17 +1268,19 @@ public class TestCompile {
     assert!(desc.compile_files.contains(&"TestCompile.java".to_string()));
     assert_eq!(desc.main_class.as_deref(), Some("TestCompile"));
     // Check that Run directive was parsed
-    let has_run = desc.directives.iter().any(|d| matches!(d,
-        JtregDirective::Run { mode: JtregRunMode::Main, class_name, .. }
-        if class_name == "TestCompile"
-    ));
+    let has_run = desc.directives.iter().any(|d| {
+        matches!(d,
+            JtregDirective::Run { mode: JtregRunMode::Main, class_name, .. }
+            if class_name == "TestCompile"
+        )
+    });
     assert!(has_run, "Should have @run main TestCompile directive");
 }
 
 // 97.1: JTReg directive parsing — run test with othervm
 #[test]
 fn test_jtreg_parse_run() {
-    use cratonvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+    use cratonvm_vm::runtime::tck::{JtregDirective, JtregRunMode, JtregTestDescriptor};
 
     let source = r#"
 /* @test
@@ -1138,14 +1295,22 @@ public class TestOther {
     let desc = JtregTestDescriptor::parse("TestOther.java", source);
     assert!(desc.is_test);
     // Check for othervm mode
-    let has_othervm = desc.directives.iter().any(|d| matches!(d,
-        JtregDirective::Run { mode: JtregRunMode::OtherVm, .. }
-    ));
+    let has_othervm = desc.directives.iter().any(|d| {
+        matches!(
+            d,
+            JtregDirective::Run {
+                mode: JtregRunMode::OtherVm,
+                ..
+            }
+        )
+    });
     assert!(has_othervm, "Should detect main/othervm mode");
     // Check bug directive
-    let has_bug = desc.directives.iter().any(|d| matches!(d,
-        JtregDirective::Bug(id) if id == "1234567"
-    ));
+    let has_bug = desc.directives.iter().any(|d| {
+        matches!(d,
+            JtregDirective::Bug(id) if id == "1234567"
+        )
+    });
     assert!(has_bug, "Should parse @bug directive");
 }
 
@@ -1308,7 +1473,12 @@ fn test_tck_instructions_long_arithmetic() {
 fn test_tck_instructions_float_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/TckInstructions",
+        "testFloatArithmetic",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1396,7 +1566,12 @@ fn test_tck_instructions_invoke_static() {
 fn test_tck_instructions_exception_handling() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/TckInstructions", "testExceptionHandling", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/TckInstructions",
+        "testExceptionHandling",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1433,7 +1608,12 @@ fn test_tck_instructions_instanceof() {
 fn test_s17_method_invoke_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokePrivateViaReflection",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(49))) => {}
         other => panic!("Expected Ok(Some(Int(49))), got: {other:?}"),
@@ -1444,7 +1624,12 @@ fn test_s17_method_invoke_private() {
 fn test_s17_method_invoke_instance() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokeInstance",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1455,7 +1640,12 @@ fn test_s17_method_invoke_instance() {
 fn test_s17_method_invoke_type_coercion() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokeTypeCoercion",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(36))) => {}
         other => panic!("Expected Ok(Some(Int(36))), got: {other:?}"),
@@ -1466,7 +1656,12 @@ fn test_s17_method_invoke_type_coercion() {
 fn test_s17_field_get_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldGetPrivate",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1477,7 +1672,12 @@ fn test_s17_field_get_private() {
 fn test_s17_field_set_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldSetPrivate",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(999))) => {}
         other => panic!("Expected Ok(Some(Int(999))), got: {other:?}"),
@@ -1488,7 +1688,12 @@ fn test_s17_field_set_private() {
 fn test_s17_field_static_get_set() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldStaticGetSet",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1499,7 +1704,12 @@ fn test_s17_field_static_get_set() {
 fn test_s17_constructor_noarg() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorNoArg",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -1510,7 +1720,12 @@ fn test_s17_constructor_noarg() {
 fn test_s17_constructor_with_args() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorWithArgs",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1521,7 +1736,12 @@ fn test_s17_constructor_with_args() {
 fn test_s17_constructor_set_accessible() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorSetAccessible",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(300))) => {}
         other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
@@ -1543,7 +1763,12 @@ fn test_s17_proxy_basic() {
 fn test_s17_proxy_is_proxy_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testProxyIsProxyClass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1554,7 +1779,12 @@ fn test_s17_proxy_is_proxy_class() {
 fn test_s17_proxy_get_handler() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testProxyGetHandler",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1565,7 +1795,12 @@ fn test_s17_proxy_get_handler() {
 fn test_s17_get_declared_methods() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredMethods",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -1576,7 +1811,12 @@ fn test_s17_get_declared_methods() {
 fn test_s17_get_declared_fields() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredFields",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1587,7 +1827,12 @@ fn test_s17_get_declared_fields() {
 fn test_s17_get_declared_constructors() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredConstructors",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1598,7 +1843,12 @@ fn test_s17_get_declared_constructors() {
 fn test_s17_get_declared_method_by_name() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredMethodByName",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1609,7 +1859,12 @@ fn test_s17_get_declared_method_by_name() {
 fn test_s17_method_modifiers() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodModifiers",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1620,7 +1875,12 @@ fn test_s17_method_modifiers() {
 fn test_s17_field_modifiers() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldModifiers",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1631,7 +1891,12 @@ fn test_s17_field_modifiers() {
 fn test_s17_method_return_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodReturnType",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1642,7 +1907,12 @@ fn test_s17_method_return_type() {
 fn test_s17_method_parameter_types() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodParameterTypes",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1653,7 +1923,12 @@ fn test_s17_method_parameter_types() {
 fn test_s17_method_parameter_count() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodParameterCount",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1675,7 +1950,12 @@ fn test_s17_field_type() {
 fn test_s17_field_declaring_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldDeclaringClass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1686,7 +1966,12 @@ fn test_s17_field_declaring_class() {
 fn test_s17_method_declaring_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodDeclaringClass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1701,7 +1986,12 @@ fn test_s17_method_declaring_class() {
 fn test_s18_custom_annotation_values() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testCustomAnnotationValues",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1712,7 +2002,12 @@ fn test_s18_custom_annotation_values() {
 fn test_s18_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testInheritedAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1723,7 +2018,12 @@ fn test_s18_inherited_annotation() {
 fn test_s18_non_inherited_not_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testNonInheritedNotPresent",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1734,7 +2034,12 @@ fn test_s18_non_inherited_not_present() {
 fn test_s18_get_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testGetInheritedAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1745,7 +2050,12 @@ fn test_s18_get_inherited_annotation() {
 fn test_s18_declared_annotations_no_inherited() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testDeclaredAnnotationsNoInherited",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1756,7 +2066,12 @@ fn test_s18_declared_annotations_no_inherited() {
 fn test_s18_overriding_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testOverridingInheritedAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1767,7 +2082,12 @@ fn test_s18_overriding_inherited_annotation() {
 fn test_s18_method_annotation_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodAnnotationPresent",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1778,7 +2098,12 @@ fn test_s18_method_annotation_present() {
 fn test_s18_method_no_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodNoAnnotation",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1789,7 +2114,12 @@ fn test_s18_method_no_annotation() {
 fn test_s18_parameter_annotation_count() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testParameterAnnotationCount",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1800,7 +2130,12 @@ fn test_s18_parameter_annotation_count() {
 fn test_s18_parameter_annotation_empty() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testParameterAnnotationEmpty",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1815,7 +2150,12 @@ fn test_s18_parameter_annotation_empty() {
 fn test_s19_class_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testClassTypeParams",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1826,7 +2166,12 @@ fn test_s19_class_type_params() {
 fn test_s19_multiple_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMultipleTypeParams",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1837,7 +2182,12 @@ fn test_s19_multiple_type_params() {
 fn test_s19_bounded_type_param() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testBoundedTypeParam",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1848,7 +2198,12 @@ fn test_s19_bounded_type_param() {
 fn test_s19_generic_superclass() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testGenericSuperclass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1859,7 +2214,12 @@ fn test_s19_generic_superclass() {
 fn test_s19_non_generic_superclass() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testNonGenericSuperclass",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1870,7 +2230,12 @@ fn test_s19_non_generic_superclass() {
 fn test_s19_method_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodTypeParams",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1881,7 +2246,12 @@ fn test_s19_method_type_params() {
 fn test_s19_method_generic_return_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodGenericReturnType",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1892,7 +2262,12 @@ fn test_s19_method_generic_return_type() {
 fn test_s19_method_generic_param_types() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodGenericParamTypes",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1903,7 +2278,12 @@ fn test_s19_method_generic_param_types() {
 fn test_s19_field_generic_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testFieldGenericType",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1914,7 +2294,12 @@ fn test_s19_field_generic_type() {
 fn test_s19_no_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testNoTypeParams",
+        "()I",
+        &[],
+    );
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -2015,7 +2400,11 @@ macro_rules! s20_test {
     };
 }
 
-s20_test!(test_s20_filter_map_collect_to_list, "testFilterMapCollectToList", 3);
+s20_test!(
+    test_s20_filter_map_collect_to_list,
+    "testFilterMapCollectToList",
+    3
+);
 s20_test!(test_s20_stream_of_count, "testStreamOfCount", 5);
 s20_test!(test_s20_reduce_with_identity, "testReduceWithIdentity", 15);
 s20_test!(test_s20_for_each, "testForEach", 60);
@@ -2031,7 +2420,11 @@ s20_test!(test_s20_to_array, "testToArray", 3);
 s20_test!(test_s20_flat_map, "testFlatMap", 10);
 s20_test!(test_s20_collectors_joining, "testCollectorsJoining", 1);
 s20_test!(test_s20_collectors_to_map, "testCollectorsToMap", 5);
-s20_test!(test_s20_collectors_grouping_by, "testCollectorsGroupingBy", 32);
+s20_test!(
+    test_s20_collectors_grouping_by,
+    "testCollectorsGroupingBy",
+    32
+);
 s20_test!(test_s20_stream_empty, "testStreamEmpty", 0);
 s20_test!(test_s20_reduce_optional, "testReduceOptional", 10);
 s20_test!(test_s20_grouping_by_counting, "testGroupingByCounting", 3);
@@ -2066,7 +2459,11 @@ macro_rules! s21_test {
 }
 
 s21_test!(test_s21_string_concat, "testStringConcat", 1);
-s21_test!(test_s21_concat_with_primitives, "testConcatWithPrimitives", 1);
+s21_test!(
+    test_s21_concat_with_primitives,
+    "testConcatWithPrimitives",
+    1
+);
 s21_test!(test_s21_concat_with_null, "testConcatWithNull", 1);
 s21_test!(test_s21_format_string, "testFormatString", 1);
 s21_test!(test_s21_format_int, "testFormatInt", 1);
@@ -2087,14 +2484,30 @@ s21_test!(test_s21_format_formatted, "testStringFormatted", 1);
 s21_test!(test_s21_formatter_object, "testFormatterObject", 1);
 s21_test!(test_s21_formatter_append, "testFormatterAppend", 1);
 s21_test!(test_s21_message_format, "testMessageFormat", 1);
-s21_test!(test_s21_message_format_multiple, "testMessageFormatMultiple", 1);
+s21_test!(
+    test_s21_message_format_multiple,
+    "testMessageFormatMultiple",
+    1
+);
 s21_test!(test_s21_decimal_format_basic, "testDecimalFormatBasic", 1);
-s21_test!(test_s21_decimal_format_integer, "testDecimalFormatInteger", 1);
-s21_test!(test_s21_decimal_format_no_grouping, "testDecimalFormatNoGrouping", 1);
+s21_test!(
+    test_s21_decimal_format_integer,
+    "testDecimalFormatInteger",
+    1
+);
+s21_test!(
+    test_s21_decimal_format_no_grouping,
+    "testDecimalFormatNoGrouping",
+    1
+);
 s21_test!(test_s21_concat_with_char, "testConcatWithChar", 1);
 s21_test!(test_s21_format_plus_sign, "testFormatPlusSign", 1);
 s21_test!(test_s21_concat_in_loop, "testConcatInLoop", 1);
-s21_test!(test_s21_string_builder_with_format, "testStringBuilderWithFormat", 1);
+s21_test!(
+    test_s21_string_builder_with_format,
+    "testStringBuilderWithFormat",
+    1
+);
 
 // ===========================================================================
 // Session 22: Properties and Resource Loading
@@ -2127,14 +2540,26 @@ s22_test!(test_s22_java_vendor, "testJavaVendor", 1);
 s22_test!(test_s22_get_property_default, "testGetPropertyDefault", 1);
 s22_test!(test_s22_get_property_null, "testGetPropertyNull", 1);
 s22_test!(test_s22_set_property, "testSetProperty", 1);
-s22_test!(test_s22_set_property_returns_old, "testSetPropertyReturnsOld", 1);
+s22_test!(
+    test_s22_set_property_returns_old,
+    "testSetPropertyReturnsOld",
+    1
+);
 s22_test!(test_s22_properties_basic, "testPropertiesBasic", 1);
 s22_test!(test_s22_properties_default, "testPropertiesDefault", 1);
 s22_test!(test_s22_properties_load, "testPropertiesLoad", 1);
-s22_test!(test_s22_properties_load_comments, "testPropertiesLoadComments", 1);
+s22_test!(
+    test_s22_properties_load_comments,
+    "testPropertiesLoadComments",
+    1
+);
 s22_test!(test_s22_properties_load_colon, "testPropertiesLoadColon", 1);
 s22_test!(test_s22_properties_size, "testPropertiesSize", 3);
-s22_test!(test_s22_properties_contains_key, "testPropertiesContainsKey", 1);
+s22_test!(
+    test_s22_properties_contains_key,
+    "testPropertiesContainsKey",
+    1
+);
 s22_test!(test_s22_properties_remove, "testPropertiesRemove", 1);
 s22_test!(test_s22_properties_overwrite, "testPropertiesOverwrite", 1);
 s22_test!(test_s22_properties_empty, "testPropertiesEmpty", 1);
@@ -2142,7 +2567,11 @@ s22_test!(test_s22_properties_clear, "testPropertiesClear", 1);
 s22_test!(test_s22_system_line_separator, "testSystemLineSeparator", 1);
 s22_test!(test_s22_tmp_dir, "testTmpDir", 1);
 s22_test!(test_s22_properties_load_empty, "testPropertiesLoadEmpty", 1);
-s22_test!(test_s22_properties_load_spaces, "testPropertiesLoadSpaces", 1);
+s22_test!(
+    test_s22_properties_load_spaces,
+    "testPropertiesLoadSpaces",
+    1
+);
 s22_test!(test_s22_get_env, "testGetEnv", 1);
 s22_test!(test_s22_get_env_missing, "testGetEnvMissing", 1);
 
@@ -2179,9 +2608,15 @@ fn test_s23_thread_basic() {
 s23_test!(test_s23_volatile_visibility, "testVolatileVisibility");
 s23_test!(test_s23_join_happens_before, "testJoinHappensBefore");
 s23_test!(test_s23_start_happens_before, "testStartHappensBefore");
-s23_test!(test_s23_synchronized_happens_before, "testSynchronizedHappensBefore");
+s23_test!(
+    test_s23_synchronized_happens_before,
+    "testSynchronizedHappensBefore"
+);
 s23_test!(test_s23_double_checked_locking, "testDoubleCheckedLocking");
-s23_test!(test_s23_dekker_mutual_exclusion, "testDekkerMutualExclusion");
+s23_test!(
+    test_s23_dekker_mutual_exclusion,
+    "testDekkerMutualExclusion"
+);
 s23_test!(test_s23_volatile_counter, "testVolatileCounter");
 s23_test!(test_s23_monitor_wait_notify, "testMonitorWaitNotify");
 s23_test!(test_s23_synchronized_counter, "testSynchronizedCounter");
@@ -2207,21 +2642,41 @@ macro_rules! s23b_test {
 }
 
 s23b_test!(test_s23b_thread_start_join, "testThreadStartJoin", 42);
-s23b_test!(test_s23b_multiple_threads_join, "testMultipleThreadsJoin", 30);
+s23b_test!(
+    test_s23b_multiple_threads_join,
+    "testMultipleThreadsJoin",
+    30
+);
 s23b_test!(test_s23b_volatile_visibility, "testVolatileVisibility", 1);
 s23b_test!(test_s23b_synchronized_mutex, "testSynchronizedMutex", 500);
 s23b_test!(test_s23b_current_thread, "testCurrentThread", 1);
 s23b_test!(test_s23b_thread_sleep, "testThreadSleep", 1);
 s23b_test!(test_s23b_atomic_integer_basic, "testAtomicIntegerBasic", 10);
 s23b_test!(test_s23b_atomic_integer_cas, "testAtomicIntegerCAS", 1);
-s23b_test!(test_s23b_atomic_integer_increment, "testAtomicIntegerIncrement", 6);
-s23b_test!(test_s23b_atomic_integer_get_and_add, "testAtomicIntegerGetAndAdd", 25);
+s23b_test!(
+    test_s23b_atomic_integer_increment,
+    "testAtomicIntegerIncrement",
+    6
+);
+s23b_test!(
+    test_s23b_atomic_integer_get_and_add,
+    "testAtomicIntegerGetAndAdd",
+    25
+);
 s23b_test!(test_s23b_atomic_boolean, "testAtomicBoolean", 1);
 s23b_test!(test_s23b_atomic_long, "testAtomicLong", 1);
 s23b_test!(test_s23b_synchronized_method, "testSynchronizedMethod", 150);
 s23b_test!(test_s23b_thread_computation, "testThreadComputation", 55);
-s23b_test!(test_s23b_atomic_concurrent_increment, "testAtomicConcurrentIncrement", 100);
-s23b_test!(test_s23b_double_checked_locking, "testDoubleCheckedLocking", 1);
+s23b_test!(
+    test_s23b_atomic_concurrent_increment,
+    "testAtomicConcurrentIncrement",
+    100
+);
+s23b_test!(
+    test_s23b_double_checked_locking,
+    "testDoubleCheckedLocking",
+    1
+);
 s23b_test!(test_s23b_wait_notify, "testWaitNotify", 1);
 s23b_test!(test_s23b_thread_name, "testThreadName", 1);
 s23b_test!(test_s23b_thread_is_alive, "testThreadIsAlive", 1);
@@ -2235,7 +2690,11 @@ s23b_test!(test_s23b_volatile_array, "testVolatileArray", 99);
 s23b_test!(test_s23b_atomic_get_and_set, "testAtomicGetAndSet", 142);
 s23b_test!(test_s23b_join_timeout, "testJoinTimeout", 1);
 s23b_test!(test_s23b_sync_block_return, "testSyncBlockReturn", 42);
-s23b_test!(test_s23b_thread_start_join_multiple, "testThreadStartJoinMultiple", 55);
+s23b_test!(
+    test_s23b_thread_start_join_multiple,
+    "testThreadStartJoinMultiple",
+    55
+);
 
 // =============================================================================
 // Session 24: Thread.interrupt() and Timed Waits
@@ -2256,11 +2715,31 @@ macro_rules! s24_test {
     };
 }
 
-s24_test!(test_s24_interrupt_sleeping_thread, "interrupt_sleeping_thread", 1);
-s24_test!(test_s24_interrupt_waiting_thread, "interrupt_waiting_thread", 1);
-s24_test!(test_s24_interrupt_parked_thread, "interrupt_parked_thread", 1);
-s24_test!(test_s24_is_interrupted_no_clear, "is_interrupted_no_clear", 1);
-s24_test!(test_s24_interrupted_clears_flag, "interrupted_clears_flag", 1);
+s24_test!(
+    test_s24_interrupt_sleeping_thread,
+    "interrupt_sleeping_thread",
+    1
+);
+s24_test!(
+    test_s24_interrupt_waiting_thread,
+    "interrupt_waiting_thread",
+    1
+);
+s24_test!(
+    test_s24_interrupt_parked_thread,
+    "interrupt_parked_thread",
+    1
+);
+s24_test!(
+    test_s24_is_interrupted_no_clear,
+    "is_interrupted_no_clear",
+    1
+);
+s24_test!(
+    test_s24_interrupted_clears_flag,
+    "interrupted_clears_flag",
+    1
+);
 s24_test!(test_s24_interrupt_before_sleep, "interrupt_before_sleep", 1);
 s24_test!(test_s24_interrupt_before_wait, "interrupt_before_wait", 1);
 s24_test!(test_s24_interrupt_before_park, "interrupt_before_park", 1);
@@ -2268,24 +2747,76 @@ s24_test!(test_s24_timed_wait_normal, "timed_wait_normal", 1);
 s24_test!(test_s24_timed_wait_interrupted, "timed_wait_interrupted", 1);
 s24_test!(test_s24_thread_interrupt_self, "thread_interrupt_self", 1);
 s24_test!(test_s24_multiple_interrupts, "multiple_interrupts", 1);
-s24_test!(test_s24_wait_notify_no_interrupt, "wait_notify_no_interrupt", 1);
-s24_test!(test_s24_park_unpark_no_interrupt, "park_unpark_no_interrupt", 1);
+s24_test!(
+    test_s24_wait_notify_no_interrupt,
+    "wait_notify_no_interrupt",
+    1
+);
+s24_test!(
+    test_s24_park_unpark_no_interrupt,
+    "park_unpark_no_interrupt",
+    1
+);
 s24_test!(test_s24_unpark_before_park, "unpark_before_park", 1);
 s24_test!(test_s24_park_nanos_timeout, "park_nanos_timeout", 1);
 s24_test!(test_s24_sleep_nanos_interrupt, "sleep_nanos_interrupt", 1);
-s24_test!(test_s24_interrupt_clears_on_exception, "interrupt_clears_on_exception", 1);
-s24_test!(test_s24_wait_reacquires_monitor, "wait_reacquires_monitor", 1);
-s24_test!(test_s24_interrupt_during_timed_park, "interrupt_during_timed_park", 1);
-s24_test!(test_s24_notify_all_wakes_waiters, "notify_all_wakes_waiters", 2);
-s24_test!(test_s24_park_after_interrupt_repeated, "park_after_interrupt_repeated", 1);
-s24_test!(test_s24_sleep_zero_no_interrupt_check, "sleep_zero_no_interrupt_check", 1);
+s24_test!(
+    test_s24_interrupt_clears_on_exception,
+    "interrupt_clears_on_exception",
+    1
+);
+s24_test!(
+    test_s24_wait_reacquires_monitor,
+    "wait_reacquires_monitor",
+    1
+);
+s24_test!(
+    test_s24_interrupt_during_timed_park,
+    "interrupt_during_timed_park",
+    1
+);
+s24_test!(
+    test_s24_notify_all_wakes_waiters,
+    "notify_all_wakes_waiters",
+    2
+);
+s24_test!(
+    test_s24_park_after_interrupt_repeated,
+    "park_after_interrupt_repeated",
+    1
+);
+s24_test!(
+    test_s24_sleep_zero_no_interrupt_check,
+    "sleep_zero_no_interrupt_check",
+    1
+);
 s24_test!(test_s24_timed_join, "timed_join", 1);
 s24_test!(test_s24_interrupt_not_alive, "interrupt_not_alive", 1);
-s24_test!(test_s24_wait_with_notify_all_and_interrupt, "wait_with_notify_all_and_interrupt", 1);
-s24_test!(test_s24_concurrent_interrupt_and_join, "concurrent_interrupt_and_join", 1);
-s24_test!(test_s24_park_unpark_multiple_threads, "park_unpark_multiple_threads", 5);
-s24_test!(test_s24_wait_interrupt_reacquires_monitor, "wait_interrupt_reacquires_monitor", 1);
-s24_test!(test_s24_interrupt_flag_survives_park, "interrupt_flag_survives_park", 1);
+s24_test!(
+    test_s24_wait_with_notify_all_and_interrupt,
+    "wait_with_notify_all_and_interrupt",
+    1
+);
+s24_test!(
+    test_s24_concurrent_interrupt_and_join,
+    "concurrent_interrupt_and_join",
+    1
+);
+s24_test!(
+    test_s24_park_unpark_multiple_threads,
+    "park_unpark_multiple_threads",
+    5
+);
+s24_test!(
+    test_s24_wait_interrupt_reacquires_monitor,
+    "wait_interrupt_reacquires_monitor",
+    1
+);
+s24_test!(
+    test_s24_interrupt_flag_survives_park,
+    "interrupt_flag_survives_park",
+    1
+);
 
 // =============================================================================
 // Session 25: Virtual Threads Integration
@@ -2308,14 +2839,42 @@ macro_rules! s25_test {
 
 s25_test!(test_s25_single_virtual_thread, "testSingleVirtualThread", 1);
 s25_test!(test_s25_is_virtual, "testIsVirtual", 1);
-s25_test!(test_s25_is_not_virtual_platform, "testIsNotVirtualPlatform", 1);
-s25_test!(test_s25_hundred_virtual_threads, "testHundredVirtualThreads", 100);
-s25_test!(test_s25_thousand_virtual_threads, "testThousandVirtualThreads", 1000);
+s25_test!(
+    test_s25_is_not_virtual_platform,
+    "testIsNotVirtualPlatform",
+    1
+);
+s25_test!(
+    test_s25_hundred_virtual_threads,
+    "testHundredVirtualThreads",
+    100
+);
+s25_test!(
+    test_s25_thousand_virtual_threads,
+    "testThousandVirtualThreads",
+    1000
+);
 s25_test!(test_s25_builder_virtual_start, "testBuilderVirtualStart", 1);
-s25_test!(test_s25_builder_platform_start, "testBuilderPlatformStart", 1);
-s25_test!(test_s25_virtual_join_happens_before, "testVirtualJoinHappensBefore", 42);
-s25_test!(test_s25_mixed_virtual_platform, "testMixedVirtualPlatform", 4);
-s25_test!(test_s25_virtual_start_happens_before, "testVirtualStartHappensBefore", 100);
+s25_test!(
+    test_s25_builder_platform_start,
+    "testBuilderPlatformStart",
+    1
+);
+s25_test!(
+    test_s25_virtual_join_happens_before,
+    "testVirtualJoinHappensBefore",
+    42
+);
+s25_test!(
+    test_s25_mixed_virtual_platform,
+    "testMixedVirtualPlatform",
+    4
+);
+s25_test!(
+    test_s25_virtual_start_happens_before,
+    "testVirtualStartHappensBefore",
+    100
+);
 
 // =============================================================================
 // Session 27: GC Finalizer Support
@@ -2364,7 +2923,11 @@ macro_rules! s32_test {
 }
 
 s32_test!(test_s32_point_sum, "testPointSum", 30);
-s32_test!(test_s32_point_distance_squared, "testPointDistanceSquared", 500);
+s32_test!(
+    test_s32_point_distance_squared,
+    "testPointDistanceSquared",
+    500
+);
 s32_test!(test_s32_multiple_objects, "testMultipleObjects", 60);
 s32_test!(test_s32_point_3d, "testPoint3D", 600);
 s32_test!(test_s32_field_overwrite, "testFieldOverwrite", 99);
@@ -2418,7 +2981,11 @@ s31_test!(test_s31_inline_getter_setter, "inline_getter_setter", 42);
 s31_test!(test_s31_inline_multi_field, "inline_multi_field", 42);
 s31_test!(test_s31_inline_static_field, "inline_static_field", 42);
 s31_test!(test_s31_inline_long_add, "inline_long_add", 42);
-s31_test!(test_s31_inline_loop_body, "inline_loop_with_inlined_body", 42);
+s31_test!(
+    test_s31_inline_loop_body,
+    "inline_loop_with_inlined_body",
+    42
+);
 s31_test!(test_s31_inline_complex_expr, "inline_complex_expr", 42);
 
 // ---------------------------------------------------------------------------
@@ -2442,7 +3009,11 @@ macro_rules! s33_test {
 s33_test!(test_s33_monomorphic_call_site, "testMonomorphicCallSite", 1);
 s33_test!(test_s33_polymorphic_call_site, "testPolymorphicCallSite", 1);
 s33_test!(test_s33_megamorphic_call_site, "testMegamorphicCallSite", 1);
-s33_test!(test_s33_virtual_dispatch_correctness, "testVirtualDispatchCorrectness", 1);
+s33_test!(
+    test_s33_virtual_dispatch_correctness,
+    "testVirtualDispatchCorrectness",
+    1
+);
 s33_test!(test_s33_interface_dispatch, "testInterfaceDispatch", 1);
 s33_test!(test_s33_cache_miss_recovery, "testCacheMissRecovery", 1);
 s33_test!(test_s33_hot_loop_monomorphic, "testHotLoopMonomorphic", 1);
@@ -2472,26 +3043,54 @@ s35_test!(test_s35_osr_simple_sum, "osr_simple_sum", 5000);
 s35_test!(test_s35_osr_accumulator, "osr_accumulator", 1);
 s35_test!(test_s35_osr_while_loop, "osr_while_loop", 1);
 s35_test!(test_s35_osr_countdown, "osr_countdown", 5000);
-s35_test!(test_s35_osr_multiply_accumulate, "osr_multiply_accumulate", 1);
+s35_test!(
+    test_s35_osr_multiply_accumulate,
+    "osr_multiply_accumulate",
+    1
+);
 s35_test!(test_s35_osr_nested_loop, "osr_nested_loop", 5000);
 s35_test!(test_s35_osr_branch_in_loop, "osr_branch_in_loop", 1);
 s35_test!(test_s35_osr_local_variables, "osr_local_variables", 1);
 s35_test!(test_s35_osr_long_arithmetic, "osr_long_arithmetic", 1);
 s35_test!(test_s35_osr_bitwise_ops, "osr_bitwise_ops", 1);
 s35_test!(test_s35_osr_array_sum, "osr_array_sum", 1);
-s35_test!(test_s35_osr_post_loop_correctness, "osr_post_loop_correctness", 1);
-s35_test!(test_s35_osr_method_call_after, "osr_method_call_after", 5000);
+s35_test!(
+    test_s35_osr_post_loop_correctness,
+    "osr_post_loop_correctness",
+    1
+);
+s35_test!(
+    test_s35_osr_method_call_after,
+    "osr_method_call_after",
+    5000
+);
 s35_test!(test_s35_osr_shift_operations, "osr_shift_operations", 1);
 s35_test!(test_s35_osr_comparison_loop, "osr_comparison_loop", 1);
 s35_test!(test_s35_osr_do_while, "osr_do_while", 1);
-s35_test!(test_s35_osr_fibonacci_iterative, "osr_fibonacci_iterative", 1);
-s35_test!(test_s35_osr_static_field_in_loop, "osr_static_field_in_loop", 1);
+s35_test!(
+    test_s35_osr_fibonacci_iterative,
+    "osr_fibonacci_iterative",
+    1
+);
+s35_test!(
+    test_s35_osr_static_field_in_loop,
+    "osr_static_field_in_loop",
+    1
+);
 s35_test!(test_s35_osr_negative_step, "osr_negative_step", 1);
 s35_test!(test_s35_osr_multiple_exits, "osr_multiple_exits", 5000);
 s35_test!(test_s35_osr_return_from_loop, "osr_return_from_loop", 1);
 s35_test!(test_s35_osr_two_counters, "osr_two_counters", 1);
-s35_test!(test_s35_osr_conditional_increment, "osr_conditional_increment", 1);
-s35_test!(test_s35_osr_early_exit_not_taken, "osr_early_exit_not_taken", 5000);
+s35_test!(
+    test_s35_osr_conditional_increment,
+    "osr_conditional_increment",
+    1
+);
+s35_test!(
+    test_s35_osr_early_exit_not_taken,
+    "osr_early_exit_not_taken",
+    5000
+);
 s35_test!(test_s35_osr_gauss_sum, "osr_gauss_sum", 1);
 s35_test!(test_s35_osr_min_max_tracking, "osr_min_max_tracking", 1);
 s35_test!(test_s35_osr_char_loop, "osr_char_loop", 1);
@@ -2538,8 +3137,16 @@ s37_test_int!(test_s37_d2i_nan, "testD2iNaN", 0);
 s37_test_int!(test_s37_d2i_pos_overflow, "testD2iPosOverflow", 2147483647);
 s37_test_int!(test_s37_d2i_neg_overflow, "testD2iNegOverflow", -2147483648);
 s37_test_long!(test_s37_d2l_nan, "testD2lNaN", 0);
-s37_test_long!(test_s37_d2l_pos_overflow, "testD2lPosOverflow", 9223372036854775807i64);
-s37_test_long!(test_s37_d2l_neg_overflow, "testD2lNegOverflow", -9223372036854775808i64);
+s37_test_long!(
+    test_s37_d2l_pos_overflow,
+    "testD2lPosOverflow",
+    9223372036854775807i64
+);
+s37_test_long!(
+    test_s37_d2l_neg_overflow,
+    "testD2lNegOverflow",
+    -9223372036854775808i64
+);
 s37_test_int!(test_s37_f2i_nan, "testF2iNaN", 0);
 s37_test_int!(test_s37_f2i_pos_overflow, "testF2iPosOverflow", 2147483647);
 s37_test_long!(test_s37_f2l_nan, "testF2lNaN", 0);
@@ -2652,7 +3259,11 @@ macro_rules! s44_test {
 // Static field access
 s44_test!(test_s44_static_int_field, "static_int_field", 100);
 s44_test!(test_s44_static_long_field, "static_long_field", 200);
-s44_test!(test_s44_static_string_field_len, "static_string_field_len", 5);
+s44_test!(
+    test_s44_static_string_field_len,
+    "static_string_field_len",
+    5
+);
 
 // Instance field/method access
 s44_test!(test_s44_instance_create_get, "instance_create_get", 42);
@@ -2720,7 +3331,11 @@ macro_rules! s46_test {
 }
 
 // Object
-s46_test!(test_s46_obj_hashCode_consistent, "obj_hashCode_consistent", 1);
+s46_test!(
+    test_s46_obj_hashCode_consistent,
+    "obj_hashCode_consistent",
+    1
+);
 s46_test!(test_s46_obj_equals_identity, "obj_equals_identity", 1);
 s46_test!(test_s46_obj_equals_different, "obj_equals_different", 1);
 s46_test!(test_s46_obj_getClass, "obj_getClass", 1);
@@ -2876,7 +3491,11 @@ s50_test!(test_s50_cls_forName, "cls_forName", 1);
 s50_test!(test_s50_cls_getName, "cls_getName", 1);
 s50_test!(test_s50_cls_getSimpleName, "cls_getSimpleName", 1);
 s50_test!(test_s50_cls_getSuperclass, "cls_getSuperclass", 1);
-s50_test!(test_s50_cls_objectSuperclassNull, "cls_objectSuperclassNull", 1);
+s50_test!(
+    test_s50_cls_objectSuperclassNull,
+    "cls_objectSuperclassNull",
+    1
+);
 s50_test!(test_s50_cls_isInterface, "cls_isInterface", 1);
 s50_test!(test_s50_cls_isPrimitive, "cls_isPrimitive", 1);
 s50_test!(test_s50_cls_isArray, "cls_isArray", 1);
@@ -2900,7 +3519,11 @@ s50_test!(test_s50_meth_getParameterTypes, "meth_getParameterTypes", 1);
 s50_test!(test_s50_meth_getParameterCount, "meth_getParameterCount", 1);
 s50_test!(test_s50_meth_getModifiers, "meth_getModifiers", 1);
 s50_test!(test_s50_meth_getDeclaringClass, "meth_getDeclaringClass", 1);
-s50_test!(test_s50_meth_getDeclaredMethods, "meth_getDeclaredMethods", 1);
+s50_test!(
+    test_s50_meth_getDeclaredMethods,
+    "meth_getDeclaredMethods",
+    1
+);
 
 // Field reflection
 s50_test!(test_s50_fld_getDeclaredField, "fld_getDeclaredField", 1);
@@ -2915,14 +3538,30 @@ s50_test!(test_s50_fld_getDeclaringClass, "fld_getDeclaringClass", 1);
 s50_test!(test_s50_fld_getDeclaredFields, "fld_getDeclaredFields", 1);
 
 // Constructor reflection
-s50_test!(test_s50_ctor_getDeclaredConstructor, "ctor_getDeclaredConstructor", 1);
+s50_test!(
+    test_s50_ctor_getDeclaredConstructor,
+    "ctor_getDeclaredConstructor",
+    1
+);
 s50_test!(test_s50_ctor_newInstanceNoArgs, "ctor_newInstanceNoArgs", 1);
-s50_test!(test_s50_ctor_newInstanceWithArgs, "ctor_newInstanceWithArgs", 1);
-s50_test!(test_s50_ctor_newInstancePrivate, "ctor_newInstancePrivate", 1);
+s50_test!(
+    test_s50_ctor_newInstanceWithArgs,
+    "ctor_newInstanceWithArgs",
+    1
+);
+s50_test!(
+    test_s50_ctor_newInstancePrivate,
+    "ctor_newInstancePrivate",
+    1
+);
 s50_test!(test_s50_ctor_getParameterTypes, "ctor_getParameterTypes", 1);
 s50_test!(test_s50_ctor_getModifiers, "ctor_getModifiers", 1);
 s50_test!(test_s50_ctor_getDeclaringClass, "ctor_getDeclaringClass", 1);
-s50_test!(test_s50_ctor_getDeclaredConstructors, "ctor_getDeclaredConstructors", 1);
+s50_test!(
+    test_s50_ctor_getDeclaredConstructors,
+    "ctor_getDeclaredConstructors",
+    1
+);
 
 // Annotations — class level
 s50_test!(test_s50_ann_classPresent, "ann_classPresent", 1);
@@ -2930,8 +3569,16 @@ s50_test!(test_s50_ann_classAbsent, "ann_classAbsent", 1);
 s50_test!(test_s50_ann_classValue, "ann_classValue", 1);
 s50_test!(test_s50_ann_inherited, "ann_inherited", 1);
 s50_test!(test_s50_ann_inheritedValue, "ann_inheritedValue", 1);
-s50_test!(test_s50_ann_declaredExcludesInherited, "ann_declaredExcludesInherited", 1);
-s50_test!(test_s50_ann_getAnnotationsIncludesInherited, "ann_getAnnotationsIncludesInherited", 1);
+s50_test!(
+    test_s50_ann_declaredExcludesInherited,
+    "ann_declaredExcludesInherited",
+    1
+);
+s50_test!(
+    test_s50_ann_getAnnotationsIncludesInherited,
+    "ann_getAnnotationsIncludesInherited",
+    1
+);
 
 // Annotations — method level
 s50_test!(test_s50_ann_methodPresent, "ann_methodPresent", 1);
@@ -2968,20 +3615,36 @@ s50_test!(test_s50_mod_toString, "mod_toString", 1);
 
 // Hierarchy
 s50_test!(test_s50_hier_isInstance, "hier_isInstance", 1);
-s50_test!(test_s50_hier_isAssignableFromInterface, "hier_isAssignableFromInterface", 1);
+s50_test!(
+    test_s50_hier_isAssignableFromInterface,
+    "hier_isAssignableFromInterface",
+    1
+);
 s50_test!(test_s50_hier_superclassChain, "hier_superclassChain", 1);
 
 // Miscellaneous
 s50_test!(test_s50_misc_invokeReturnBoxed, "misc_invokeReturnBoxed", 1);
 s50_test!(test_s50_misc_multiFieldRead, "misc_multiFieldRead", 1);
 s50_test!(test_s50_misc_ctorThenInvoke, "misc_ctorThenInvoke", 1);
-s50_test!(test_s50_misc_getMethodInherited, "misc_getMethodInherited", 1);
+s50_test!(
+    test_s50_misc_getMethodInherited,
+    "misc_getMethodInherited",
+    1
+);
 s50_test!(test_s50_misc_noSuchField, "misc_noSuchField", 1);
 s50_test!(test_s50_misc_noSuchMethod, "misc_noSuchMethod", 1);
-s50_test!(test_s50_misc_invocationTargetException, "misc_invocationTargetException", 1);
+s50_test!(
+    test_s50_misc_invocationTargetException,
+    "misc_invocationTargetException",
+    1
+);
 s50_test!(test_s50_misc_getPublicFields, "misc_getPublicFields", 1);
 s50_test!(test_s50_misc_getPublicMethods, "misc_getPublicMethods", 1);
-s50_test!(test_s50_misc_getPublicConstructors, "misc_getPublicConstructors", 1);
+s50_test!(
+    test_s50_misc_getPublicConstructors,
+    "misc_getPublicConstructors",
+    1
+);
 s50_test!(test_s50_misc_primitiveClass, "misc_primitiveClass", 1);
 s50_test!(test_s50_misc_voidClass, "misc_voidClass", 1);
 
@@ -3011,10 +3674,18 @@ s38_test!(test_s38_biased_branch, "testBiasedBranch", 9135);
 
 // Loop trip count profiling
 s38_test!(test_s38_short_loop_repeated, "testShortLoopRepeated", 5600);
-s38_test!(test_s38_medium_loop_repeated, "testMediumLoopRepeated", 19000);
+s38_test!(
+    test_s38_medium_loop_repeated,
+    "testMediumLoopRepeated",
+    19000
+);
 
 // Receiver type profiling
-s38_test!(test_s38_monomorphic_dispatch, "testMonomorphicDispatch", 2500);
+s38_test!(
+    test_s38_monomorphic_dispatch,
+    "testMonomorphicDispatch",
+    2500
+);
 s38_test!(test_s38_bimorphic_dispatch, "testBimorphicDispatch", 1450);
 
 // Combined PGO scenario
@@ -3056,7 +3727,8 @@ fn test_s45_manifest_class_path_parsing() {
 fn test_s45_resolve_class_path() {
     use cratonvm_vm::ManifestInfo;
 
-    let manifest = b"Manifest-Version: 1.0\r\nMain-Class: Main\r\nClass-Path: lib/dep.jar other.jar\r\n";
+    let manifest =
+        b"Manifest-Version: 1.0\r\nMain-Class: Main\r\nClass-Path: lib/dep.jar other.jar\r\n";
     let info = ManifestInfo::parse(manifest);
     let jar_path = std::path::Path::new("/app/myapp.jar");
     let resolved = info.resolve_class_path(jar_path);
@@ -3092,11 +3764,13 @@ fn test_s45_read_jar_manifest() {
     // Create a JAR with a manifest
     let file = std::fs::File::create(&jar_path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
-    zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\nClass-Path: lib/util.jar\r\n")
-        .unwrap();
+    zip.write_all(
+        b"Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\nClass-Path: lib/util.jar\r\n",
+    )
+    .unwrap();
     zip.start_file("com/example/App.class", opts).unwrap();
     zip.write_all(b"\xCA\xFE\xBA\xBE_fake").unwrap();
     zip.finish().unwrap();
@@ -3173,8 +3847,8 @@ fn test_s45_read_jar_no_manifest() {
 
     let file = std::fs::File::create(&jar_path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip.start_file("com/Foo.class", opts).unwrap();
     zip.write_all(b"\xCA\xFE\xBA\xBE_fake").unwrap();
     zip.finish().unwrap();
@@ -3246,7 +3920,10 @@ s47_test!(test_s47_arrays_as_list, "testArraysAsList");
 
 // Collections utility
 s47_test!(test_s47_collections_empty_list, "testCollectionsEmptyList");
-s47_test!(test_s47_collections_singleton_list, "testCollectionsSingletonList");
+s47_test!(
+    test_s47_collections_singleton_list,
+    "testCollectionsSingletonList"
+);
 s47_test!(test_s47_collections_reverse, "testCollectionsReverse");
 
 // Optional
@@ -3291,56 +3968,123 @@ macro_rules! s49_test {
 // --- Atomics ---
 s49_test!(test_s49_atomic_int_cas, "testAtomicIntCas");
 s49_test!(test_s49_atomic_int_incr_decr, "testAtomicIntIncrDecr");
-s49_test!(test_s49_atomic_int_pre_incr_decr, "testAtomicIntPreIncrDecr");
+s49_test!(
+    test_s49_atomic_int_pre_incr_decr,
+    "testAtomicIntPreIncrDecr"
+);
 s49_test!(test_s49_atomic_int_add_ops, "testAtomicIntAddOps");
 s49_test!(test_s49_atomic_int_get_and_set, "testAtomicIntGetAndSet");
 s49_test!(test_s49_atomic_long_basic, "testAtomicLongBasic");
 s49_test!(test_s49_atomic_boolean_cas, "testAtomicBooleanCas");
-s49_test!(test_s49_atomic_boolean_get_and_set, "testAtomicBooleanGetAndSet");
+s49_test!(
+    test_s49_atomic_boolean_get_and_set,
+    "testAtomicBooleanGetAndSet"
+);
 s49_test!(test_s49_atomic_ref_cas, "testAtomicRefCas");
 s49_test!(test_s49_atomic_ref_get_and_set, "testAtomicRefGetAndSet");
-s49_test!(test_s49_atomic_int_concurrent_incr, "testAtomicIntConcurrentIncr", 100);
+s49_test!(
+    test_s49_atomic_int_concurrent_incr,
+    "testAtomicIntConcurrentIncr",
+    100
+);
 s49_test!(test_s49_atomic_int_lazy_set, "testAtomicIntLazySet", 99);
 s49_test!(test_s49_atomic_long_lazy_set, "testAtomicLongLazySet");
 
 // --- ReentrantLock ---
 s49_test!(test_s49_reentrant_lock_basic, "testReentrantLockBasic");
 s49_test!(test_s49_reentrant_lock_try_lock, "testReentrantLockTryLock");
-s49_test!(test_s49_reentrant_lock_reentrant, "testReentrantLockReentrant");
-s49_test!(test_s49_reentrant_lock_condition, "testReentrantLockCondition");
+s49_test!(
+    test_s49_reentrant_lock_reentrant,
+    "testReentrantLockReentrant"
+);
+s49_test!(
+    test_s49_reentrant_lock_condition,
+    "testReentrantLockCondition"
+);
 s49_test!(test_s49_read_write_lock_basic, "testReadWriteLockBasic");
 
 // --- CountDownLatch ---
 s49_test!(test_s49_count_down_latch_basic, "testCountDownLatchBasic");
-s49_test!(test_s49_count_down_latch_get_count, "testCountDownLatchGetCount");
-s49_test!(test_s49_count_down_latch_extra_countdown, "testCountDownLatchExtraCountDown");
-s49_test!(test_s49_count_down_latch_to_string, "testCountDownLatchToString");
-s49_test!(test_s49_count_down_latch_await_timeout, "testCountDownLatchAwaitTimeout");
+s49_test!(
+    test_s49_count_down_latch_get_count,
+    "testCountDownLatchGetCount"
+);
+s49_test!(
+    test_s49_count_down_latch_extra_countdown,
+    "testCountDownLatchExtraCountDown"
+);
+s49_test!(
+    test_s49_count_down_latch_to_string,
+    "testCountDownLatchToString"
+);
+s49_test!(
+    test_s49_count_down_latch_await_timeout,
+    "testCountDownLatchAwaitTimeout"
+);
 
 // --- Semaphore ---
 s49_test!(test_s49_semaphore_basic, "testSemaphoreBasic");
 s49_test!(test_s49_semaphore_try_acquire, "testSemaphoreTryAcquire");
 s49_test!(test_s49_semaphore_drain, "testSemaphoreDrain");
-s49_test!(test_s49_semaphore_release_above_init, "testSemaphoreReleaseAboveInit");
+s49_test!(
+    test_s49_semaphore_release_above_init,
+    "testSemaphoreReleaseAboveInit"
+);
 s49_test!(test_s49_semaphore_acquire_n, "testSemaphoreAcquireN");
 s49_test!(test_s49_semaphore_is_fair, "testSemaphoreIsFair");
 
 // --- CyclicBarrier ---
-s49_test!(test_s49_cyclic_barrier_get_parties, "testCyclicBarrierGetParties");
-s49_test!(test_s49_cyclic_barrier_is_broken, "testCyclicBarrierIsBroken");
-s49_test!(test_s49_cyclic_barrier_get_number_waiting, "testCyclicBarrierGetNumberWaiting");
+s49_test!(
+    test_s49_cyclic_barrier_get_parties,
+    "testCyclicBarrierGetParties"
+);
+s49_test!(
+    test_s49_cyclic_barrier_is_broken,
+    "testCyclicBarrierIsBroken"
+);
+s49_test!(
+    test_s49_cyclic_barrier_get_number_waiting,
+    "testCyclicBarrierGetNumberWaiting"
+);
 s49_test!(test_s49_cyclic_barrier_reset, "testCyclicBarrierReset");
 
 // --- ConcurrentHashMap ---
-s49_test!(test_s49_concurrent_hashmap_put_get, "testConcurrentHashMapPutGet");
-s49_test!(test_s49_concurrent_hashmap_contains_key, "testConcurrentHashMapContainsKey");
-s49_test!(test_s49_concurrent_hashmap_remove, "testConcurrentHashMapRemove");
-s49_test!(test_s49_concurrent_hashmap_put_if_absent, "testConcurrentHashMapPutIfAbsent");
-s49_test!(test_s49_concurrent_hashmap_is_empty, "testConcurrentHashMapIsEmpty");
-s49_test!(test_s49_concurrent_hashmap_get_or_default, "testConcurrentHashMapGetOrDefault");
-s49_test!(test_s49_concurrent_hashmap_replace, "testConcurrentHashMapReplace");
-s49_test!(test_s49_concurrent_hashmap_contains_value, "testConcurrentHashMapContainsValue");
-s49_test!(test_s49_concurrent_hashmap_clear, "testConcurrentHashMapClear");
+s49_test!(
+    test_s49_concurrent_hashmap_put_get,
+    "testConcurrentHashMapPutGet"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_contains_key,
+    "testConcurrentHashMapContainsKey"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_remove,
+    "testConcurrentHashMapRemove"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_put_if_absent,
+    "testConcurrentHashMapPutIfAbsent"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_is_empty,
+    "testConcurrentHashMapIsEmpty"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_get_or_default,
+    "testConcurrentHashMapGetOrDefault"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_replace,
+    "testConcurrentHashMapReplace"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_contains_value,
+    "testConcurrentHashMapContainsValue"
+);
+s49_test!(
+    test_s49_concurrent_hashmap_clear,
+    "testConcurrentHashMapClear"
+);
 
 // --- CopyOnWriteArrayList ---
 s49_test!(test_s49_cowal_add_get, "testCOWALAddGet");
@@ -3352,33 +4096,68 @@ s49_test!(test_s49_cowal_is_empty, "testCOWALIsEmpty");
 s49_test!(test_s49_lbq_offer_poll, "testLinkedBlockingQueueOfferPoll");
 s49_test!(test_s49_lbq_put_take, "testLinkedBlockingQueuePutTake");
 s49_test!(test_s49_lbq_peek, "testLinkedBlockingQueuePeek");
-s49_test!(test_s49_lbq_is_empty_size, "testLinkedBlockingQueueIsEmptySize");
+s49_test!(
+    test_s49_lbq_is_empty_size,
+    "testLinkedBlockingQueueIsEmptySize"
+);
 s49_test!(test_s49_lbq_capacity, "testLinkedBlockingQueueCapacity");
 s49_test!(test_s49_lbq_clear, "testLinkedBlockingQueueClear");
 
 // --- ArrayBlockingQueue ---
 s49_test!(test_s49_abq_offer_poll, "testArrayBlockingQueueOfferPoll");
 s49_test!(test_s49_abq_capacity, "testArrayBlockingQueueCapacity");
-s49_test!(test_s49_abq_remaining_capacity, "testArrayBlockingQueueRemainingCapacity");
+s49_test!(
+    test_s49_abq_remaining_capacity,
+    "testArrayBlockingQueueRemainingCapacity"
+);
 
 // --- CompletableFuture ---
 s49_test!(test_s49_cf_complete, "testCompletableFutureComplete");
-s49_test!(test_s49_cf_completed_future, "testCompletableFutureCompletedFuture");
+s49_test!(
+    test_s49_cf_completed_future,
+    "testCompletableFutureCompletedFuture"
+);
 s49_test!(test_s49_cf_then_apply, "testCompletableFutureThenApply");
 s49_test!(test_s49_cf_then_accept, "testCompletableFutureThenAccept");
 s49_test!(test_s49_cf_state, "testCompletableFutureState");
 s49_test!(test_s49_cf_cancel, "testCompletableFutureCancel");
-s49_test!(test_s49_cf_exceptionally, "testCompletableFutureExceptionally");
-s49_test!(test_s49_cf_is_completed_exceptionally, "testCompletableFutureIsCompletedExceptionally");
+s49_test!(
+    test_s49_cf_exceptionally,
+    "testCompletableFutureExceptionally"
+);
+s49_test!(
+    test_s49_cf_is_completed_exceptionally,
+    "testCompletableFutureIsCompletedExceptionally"
+);
 
 // --- Multi-threaded synchronizer tests ---
-s49_test!(test_s49_count_down_latch_threaded, "testCountDownLatchThreaded", 6);
+s49_test!(
+    test_s49_count_down_latch_threaded,
+    "testCountDownLatchThreaded",
+    6
+);
 s49_test!(test_s49_semaphore_threaded, "testSemaphoreThreaded", 3);
-s49_test!(test_s49_reentrant_lock_threaded, "testReentrantLockThreaded", 100);
-s49_test!(test_s49_concurrent_hashmap_threaded, "testConcurrentHashMapThreaded", 50);
-s49_test!(test_s49_blocking_queue_producer_consumer, "testBlockingQueueProducerConsumer", 15);
+s49_test!(
+    test_s49_reentrant_lock_threaded,
+    "testReentrantLockThreaded",
+    100
+);
+s49_test!(
+    test_s49_concurrent_hashmap_threaded,
+    "testConcurrentHashMapThreaded",
+    50
+);
+s49_test!(
+    test_s49_blocking_queue_producer_consumer,
+    "testBlockingQueueProducerConsumer",
+    15
+);
 s49_test!(test_s49_cowal_threaded, "testCOWALThreaded", 4);
-s49_test!(test_s49_synchronizer_composition, "testSynchronizerComposition", 10);
+s49_test!(
+    test_s49_synchronizer_composition,
+    "testSynchronizerComposition",
+    10
+);
 
 // ============================================================================
 // Session 51 – JDK 25: Scoped Values (JEP 487)
@@ -3405,7 +4184,10 @@ s51_test!(test_s51_where_run, "testWhereRun");
 s51_test!(test_s51_unbound_after_run, "testUnboundAfterRun");
 s51_test!(test_s51_where_call, "testWhereCall");
 s51_test!(test_s51_get_unbound_throws, "testGetUnboundThrows");
-s51_test!(test_s51_is_bound_initially_false, "testIsBoundInitiallyFalse");
+s51_test!(
+    test_s51_is_bound_initially_false,
+    "testIsBoundInitiallyFalse"
+);
 s51_test!(test_s51_is_bound_inside, "testIsBoundInside");
 
 // orElse / orElseThrow
@@ -3417,7 +4199,10 @@ s51_test!(test_s51_or_else_throw_unbound, "testOrElseThrowUnbound");
 
 // Nested / rebinding
 s51_test!(test_s51_nested_rebinding, "testNestedRebinding");
-s51_test!(test_s51_outer_restored_after_nested, "testOuterRestoredAfterNested");
+s51_test!(
+    test_s51_outer_restored_after_nested,
+    "testOuterRestoredAfterNested"
+);
 s51_test!(test_s51_triple_nesting, "testTripleNesting");
 
 // Multiple ScopedValues
@@ -3430,8 +4215,14 @@ s51_test!(test_s51_call_return, "testCallReturn");
 s51_test!(test_s51_call_string_concat, "testCallStringConcat");
 
 // Exception handling
-s51_test!(test_s51_exception_in_run_unbinds, "testExceptionInRunUnbinds");
-s51_test!(test_s51_exception_in_call_unbinds, "testExceptionInCallUnbinds");
+s51_test!(
+    test_s51_exception_in_run_unbinds,
+    "testExceptionInRunUnbinds"
+);
+s51_test!(
+    test_s51_exception_in_call_unbinds,
+    "testExceptionInCallUnbinds"
+);
 
 // hashCode
 s51_test!(test_s51_hash_code_stable, "testHashCodeStable");
@@ -3442,12 +4233,18 @@ s51_test!(test_s51_bind_null, "testBindNull");
 
 // Thread inheritance
 s51_test!(test_s51_thread_visibility, "testThreadVisibility");
-s51_test!(test_s51_child_rebind_no_affect_parent, "testChildRebindNoAffectParent");
+s51_test!(
+    test_s51_child_rebind_no_affect_parent,
+    "testChildRebindNoAffectParent"
+);
 
 // Carrier operations
 s51_test!(test_s51_carrier_get, "testCarrierGet");
 s51_test!(test_s51_multiple_runs, "testMultipleRuns");
-s51_test!(test_s51_carrier_reuse_after_exception, "testCarrierReuseAfterException");
+s51_test!(
+    test_s51_carrier_reuse_after_exception,
+    "testCarrierReuseAfterException"
+);
 
 // ==========================================================================
 // ---------------------------------------------------------------------------
@@ -3557,18 +4354,36 @@ macro_rules! new14_jdbc_test {
 }
 
 new14_jdbc_test!(test_new14_jdbc_open_inmemory, "open_inmemory_connection");
-new14_jdbc_test!(test_new14_jdbc_statement_ddl_dml_query, "statement_ddl_dml_query");
+new14_jdbc_test!(
+    test_new14_jdbc_statement_ddl_dml_query,
+    "statement_ddl_dml_query"
+);
 new14_jdbc_test!(
     test_new14_jdbc_prepared_statement_binds,
     "prepared_statement_binds_and_executes"
 );
-new14_jdbc_test!(test_new14_jdbc_rollback_discards, "rollback_discards_changes");
-new14_jdbc_test!(test_new14_jdbc_savepoint_roundtrip, "savepoint_rollback_and_release");
+new14_jdbc_test!(
+    test_new14_jdbc_rollback_discards,
+    "rollback_discards_changes"
+);
+new14_jdbc_test!(
+    test_new14_jdbc_savepoint_roundtrip,
+    "savepoint_rollback_and_release"
+);
 new14_jdbc_test!(test_new14_jdbc_blob_round_trip, "blob_round_trip");
 new14_jdbc_test!(test_new14_jdbc_clob_round_trip, "clob_round_trip");
-new14_jdbc_test!(test_new14_jdbc_callable_inherits_prepared, "callable_inherits_prepared");
-new14_jdbc_test!(test_new14_jdbc_metadata_identifies_sqlite, "metadata_identifies_sqlite");
-new14_jdbc_test!(test_new14_jdbc_driver_register_list_deregister, "driver_register_list_deregister");
+new14_jdbc_test!(
+    test_new14_jdbc_callable_inherits_prepared,
+    "callable_inherits_prepared"
+);
+new14_jdbc_test!(
+    test_new14_jdbc_metadata_identifies_sqlite,
+    "metadata_identifies_sqlite"
+);
+new14_jdbc_test!(
+    test_new14_jdbc_driver_register_list_deregister,
+    "driver_register_list_deregister"
+);
 new14_jdbc_test!(test_new14_jdbc_e2e_mini_app, "e2e_mini_app");
 
 // Session 53 — Pattern Matching Completeness (JEP 441, 395, 409, 507)
@@ -3604,7 +4419,10 @@ s53_test!(test_s53_multiple_guards, "testMultipleGuards");
 // Record patterns
 s53_test!(test_s53_record_decon, "testRecordDecon");
 s53_test!(test_s53_record_guard, "testRecordGuard");
-s53_test!(test_s53_record_object_component, "testRecordObjectComponent");
+s53_test!(
+    test_s53_record_object_component,
+    "testRecordObjectComponent"
+);
 s53_test!(test_s53_nested_records, "testNestedRecords");
 s53_test!(test_s53_record_null, "testRecordNull");
 
@@ -3622,4 +4440,3 @@ s53_test!(test_s53_instanceof_chain, "testInstanceofChain");
 // Mixed / integration
 s53_test!(test_s53_mixed_dispatch, "testMixedDispatch");
 s53_test!(test_s53_area_calc, "testAreaCalc");
-

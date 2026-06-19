@@ -82,7 +82,10 @@ struct ConnRegistry {
 
 impl ConnRegistry {
     fn new() -> Self {
-        Self { next_id: 1, conns: HashMap::new() }
+        Self {
+            next_id: 1,
+            conns: HashMap::new(),
+        }
     }
     fn allocate(&mut self, state: ConnState) -> i32 {
         let id = self.next_id;
@@ -159,7 +162,11 @@ fn huc_real_object_url(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<S
 /// field is not at a known synthetic slot.
 fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) -> i32 {
     let key = ctx.identity_hash_code(this);
-    if let Some(st) = real_results().lock().ok().and_then(|t| t.get(&key).map(|r| r.status)) {
+    if let Some(st) = real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.status))
+    {
         return st;
     }
     let parsed = match parse_url(url_str) {
@@ -223,11 +230,17 @@ fn shared_legacy_config() -> Arc<ClientConfig> {
 // ---------------------------------------------------------------------------
 
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IOException { message: message.into() }.into()
+    RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
 }
 
 fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: message.into() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
 }
 
 fn read_str_field(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Option<String> {
@@ -303,7 +316,12 @@ fn parse_url(url: &str) -> Result<Url1, String> {
     if host.is_empty() {
         return Err(format!("empty host in {url}"));
     }
-    Ok(Url1 { scheme, host, port, path: path.to_string() })
+    Ok(Url1 {
+        scheme,
+        host,
+        port,
+        path: path.to_string(),
+    })
 }
 
 fn build_request(
@@ -524,8 +542,7 @@ fn perform(
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
             .map_err(|e| format!("rustls ClientConnection::new: {e}"))?;
-        let mut stream: StreamOwned<ClientConnection, TcpStream> =
-            StreamOwned::new(conn, tcp);
+        let mut stream: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
         let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
         while stream.conn.is_handshaking() {
             if std::time::Instant::now() > deadline {
@@ -760,12 +777,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             && !url_str.starts_with("http://")
             && !url_str.starts_with("https://")
         {
-            return ctx.invoke_virtual(
-                maybe_url,
-                "openStream",
-                "()Ljava/io/InputStream;",
-                &[],
-            );
+            return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
     }
 
@@ -795,8 +807,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(Value::Object(None)));
     }
     let (status, body_bytes) =
-        with_state(ctx, this, |s| (s.status, s.response_body.clone()))
-            .unwrap_or((-1, Vec::new()));
+        with_state(ctx, this, |s| (s.status, s.response_body.clone())).unwrap_or((-1, Vec::new()));
     if status < 400 {
         return Ok(Some(Value::Object(None)));
     }
@@ -874,7 +885,10 @@ fn huc_get_header_field_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
 }
 
-fn huc_get_header_field_key_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn huc_get_header_field_key_indexed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(-1);
     if idx < 0 {
@@ -1055,14 +1069,20 @@ fn huc_set_read_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-fn huc_set_instance_follow_redirects(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn huc_set_instance_follow_redirects(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
     ctx.set_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS, Value::Int(v));
     Ok(None)
 }
 
-fn huc_get_instance_follow_redirects(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn huc_get_instance_follow_redirects(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field(this, HUC_INSTANCE_FOLLOW_REDIRECTS)))
 }
@@ -1248,7 +1268,11 @@ mod http_url_connection_tests {
         register_http_url_connection_real(&mut r);
         let cls = "sun/net/www/protocol/http/HttpURLConnection";
         assert!(r
-            .find(cls, "getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;")
+            .find(
+                cls,
+                "getHeaderField",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            )
             .is_some());
         assert!(r
             .find(cls, "getHeaderField", "(I)Ljava/lang/String;")
@@ -1329,7 +1353,12 @@ mod http_url_connection_tests {
     #[test]
     fn test_build_request_post_body() {
         let p = parse_url("https://example.com:8443/api").unwrap();
-        let req = build_request("POST", &p, &[("Content-Type".to_string(), "application/json".to_string())], b"{}");
+        let req = build_request(
+            "POST",
+            &p,
+            &[("Content-Type".to_string(), "application/json".to_string())],
+            b"{}",
+        );
         let s = String::from_utf8(req).unwrap();
         assert!(s.contains("POST /api HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com:8443\r\n"));
@@ -1477,10 +1506,7 @@ mod http_url_connection_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
-        let res = huc_set_connect_timeout(
-            &mut ctx,
-            &[Value::Object(Some(this)), Value::Int(-1)],
-        );
+        let res = huc_set_connect_timeout(&mut ctx, &[Value::Object(Some(this)), Value::Int(-1)]);
         assert!(res.is_err());
     }
 

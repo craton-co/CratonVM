@@ -92,10 +92,7 @@ const FIXED_LENGTH: usize = 40;
 /// "not set" (the JDK will use its own defaults or skip).
 ///
 /// This replaces the C++ `SystemProps::platformProperties()` in HotSpot.
-fn native_platform_properties(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Allocate a String[] of FIXED_LENGTH (40 elements), all null initially
     let arr = ctx.new_array(ArrayElementType::Reference, FIXED_LENGTH);
 
@@ -188,10 +185,7 @@ fn native_platform_properties(
 /// building a HashMap. A null key terminates the iteration.
 ///
 /// These properties come from the VM (command-line flags, built-in defaults).
-fn native_vm_properties(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let mut props: Vec<(&str, String)> = Vec::new();
 
     // java.home — required by StaticProperty, ClassLoader, etc.
@@ -202,8 +196,14 @@ fn native_vm_properties(
     }
 
     // Spec / VM vendor info
-    props.push(("java.vm.specification.name", "Java Virtual Machine Specification".to_string()));
-    props.push(("java.vm.specification.vendor", "Oracle Corporation".to_string()));
+    props.push((
+        "java.vm.specification.name",
+        "Java Virtual Machine Specification".to_string(),
+    ));
+    props.push((
+        "java.vm.specification.vendor",
+        "Oracle Corporation".to_string(),
+    ));
     props.push(("java.vm.specification.version", "25".to_string()));
     props.push(("java.vm.name", "CratonVM".to_string()));
     props.push(("java.vm.vendor", "Craton".to_string()));
@@ -211,8 +211,14 @@ fn native_vm_properties(
     props.push(("java.vm.info", "mixed mode".to_string()));
 
     // Specification
-    props.push(("java.specification.name", "Java Platform API Specification".to_string()));
-    props.push(("java.specification.vendor", "Oracle Corporation".to_string()));
+    props.push((
+        "java.specification.name",
+        "Java Platform API Specification".to_string(),
+    ));
+    props.push((
+        "java.specification.vendor",
+        "Oracle Corporation".to_string(),
+    ));
     props.push(("java.specification.version", "25".to_string()));
 
     // Class / library paths
@@ -259,9 +265,15 @@ fn native_vm_properties(
     props.push(("java.version", "25.0.1".to_string()));
     props.push(("java.class.version", "69.0".to_string()));
     props.push(("java.runtime.version", "25.0.1+8-LTS-27".to_string()));
-    props.push(("java.runtime.name", "Java(TM) SE Runtime Environment".to_string()));
+    props.push((
+        "java.runtime.name",
+        "Java(TM) SE Runtime Environment".to_string(),
+    ));
     props.push(("java.vendor", "Craton / CratonVM".to_string()));
-    props.push(("java.vendor.url", "https://github.com/nicktretyakov/cratonvm".to_string()));
+    props.push((
+        "java.vendor.url",
+        "https://github.com/nicktretyakov/cratonvm".to_string(),
+    ));
 
     // Misc
     props.push(("java.awt.headless", "true".to_string()));
@@ -332,10 +344,7 @@ fn native_vm_properties(
 
 /// `sun/io/Win32ErrorMode.setErrorMode(J)J` — Windows error mode control.
 /// Returns the previous error mode. We return 0 (no previous mode set).
-fn native_win32_set_error_mode(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_win32_set_error_mode(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(0)))
 }
 
@@ -412,7 +421,10 @@ mod tests {
             other => panic!("expected Object(Some(_)), got {:?}", other),
         };
         let len = ctx.array_length(arr);
-        assert_eq!(len, FIXED_LENGTH, "platformProperties must return {FIXED_LENGTH}-element array");
+        assert_eq!(
+            len, FIXED_LENGTH,
+            "platformProperties must return {FIXED_LENGTH}-element array"
+        );
     }
 
     #[test]
@@ -427,7 +439,10 @@ mod tests {
         let val = ctx.get_array_element(arr, OS_NAME_NDX);
         match val {
             Value::Object(Some(_)) => {} // has a string
-            other => panic!("os.name at index {OS_NAME_NDX} should be a string, got {:?}", other),
+            other => panic!(
+                "os.name at index {OS_NAME_NDX} should be a string, got {:?}",
+                other
+            ),
         }
     }
 
@@ -443,7 +458,10 @@ mod tests {
         let val = ctx.get_array_element(arr, FILE_SEPARATOR_NDX);
         match val {
             Value::Object(Some(_)) => {} // has a string
-            other => panic!("file.separator at index {FILE_SEPARATOR_NDX} should be a string, got {:?}", other),
+            other => panic!(
+                "file.separator at index {FILE_SEPARATOR_NDX} should be a string, got {:?}",
+                other
+            ),
         }
     }
 
@@ -456,8 +474,15 @@ mod tests {
             other => panic!("expected Object(Some(_)), got {:?}", other),
         };
         let len = ctx.array_length(arr);
-        assert!(len >= 2, "vmProperties must return at least one key-value pair");
-        assert_eq!(len % 2, 0, "vmProperties must return even-length array (key-value pairs)");
+        assert!(
+            len >= 2,
+            "vmProperties must return at least one key-value pair"
+        );
+        assert_eq!(
+            len % 2,
+            0,
+            "vmProperties must return even-length array (key-value pairs)"
+        );
     }
 
     #[test]

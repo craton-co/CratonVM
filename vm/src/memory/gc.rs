@@ -27,7 +27,10 @@ pub fn update_all_roots(
     pointer_map: &HashMap<usize, usize>,
 ) {
     if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() {
-        eprintln!("[PRECISE] update_all_roots called, pointer_map.len()={}", pointer_map.len());
+        eprintln!(
+            "[PRECISE] update_all_roots called, pointer_map.len()={}",
+            pointer_map.len()
+        );
     }
     // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
     // across this collection (remap relocated cached roots + re-tag the gen).
@@ -221,10 +224,7 @@ pub fn update_all_roots(
 
     // 9. JNI global references — update stored ObjectRefs inside each Box<ObjectRef>.
     {
-        shared
-            .jni_global_refs
-            .lock()
-            .update_after_gc(pointer_map);
+        shared.jni_global_refs.lock().update_after_gc(pointer_map);
     }
 
     // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
@@ -478,7 +478,9 @@ pub fn verify_heap_object_fields(
     pointer_map: &HashMap<usize, usize>,
 ) {
     use crate::types::Value;
-    use cratonvm_types::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE};
+    use cratonvm_types::{
+        ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+    };
 
     if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
         return;
@@ -530,7 +532,10 @@ pub fn verify_heap_object_fields(
                     if let Some(reason) = classify(target.as_ptr() as usize) {
                         eprintln!(
                             "[heap-stale] {} OBJ {} field[{}] -> 0x{:x}",
-                            reason, class_name(r_cid), i, target.as_ptr() as usize,
+                            reason,
+                            class_name(r_cid),
+                            i,
+                            target.as_ptr() as usize,
                         );
                         reported += 1;
                         if reported >= CAP {
@@ -543,13 +548,15 @@ pub fn verify_heap_object_fields(
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length as usize;
             for i in 0..len {
-                let s_ptr =
-                    unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                 let raw = unsafe { std::ptr::read(s_ptr as *const u64) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(
                         "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
-                        reason, class_name(r_cid), i, raw,
+                        reason,
+                        class_name(r_cid),
+                        i,
+                        raw,
                     );
                     reported += 1;
                     if reported >= CAP {
@@ -613,8 +620,7 @@ fn verify_no_stale_refs(
                     eprintln!(
                         "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
                          relocated addr 0x{:x} (should be 0x{:x})",
-                        fi, cname, mname, li,
-                        addr, pointer_map[&addr],
+                        fi, cname, mname, li, addr, pointer_map[&addr],
                     );
                 }
                 if heavy && addr != 0 {
@@ -638,8 +644,7 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, li, frame.pc,
-                            addr, h.kind, h.gc_flags,
+                            fi, cname, mname, li, frame.pc, addr, h.kind, h.gc_flags,
                         );
                     }
                 }
@@ -654,8 +659,7 @@ fn verify_no_stale_refs(
                     eprintln!(
                         "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
                          relocated addr 0x{:x} (should be 0x{:x})",
-                        fi, cname, mname, si,
-                        addr, pointer_map[&addr],
+                        fi, cname, mname, si, addr, pointer_map[&addr],
                     );
                 }
                 if heavy && addr != 0 {
@@ -677,8 +681,7 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, si, frame.pc,
-                            addr, h.kind, h.gc_flags,
+                            fi, cname, mname, si, frame.pc, addr, h.kind, h.gc_flags,
                         );
                     }
                 }
@@ -736,7 +739,11 @@ mod tests {
         let field0: Value = unsafe { std::ptr::read(field0_ptr as *const Value) };
         assert_eq!(field0.as_int(), Some(42));
 
-        let field1_ptr = unsafe { new_obj.as_ptr().add(crate::memory::heap::HEADER_SIZE + crate::memory::heap::SLOT_SIZE) };
+        let field1_ptr = unsafe {
+            new_obj
+                .as_ptr()
+                .add(crate::memory::heap::HEADER_SIZE + crate::memory::heap::SLOT_SIZE)
+        };
         let field1: Value = unsafe { std::ptr::read(field1_ptr as *const Value) };
         assert_eq!(field1.as_long(), Some(100));
     }

@@ -60,19 +60,19 @@ const MAX_INPUT_SIZE: usize = 1024 * 1024;
 const MAX_NESTING_DEPTH: usize = 64;
 
 // DER tag bytes
-pub const TAG_BOOLEAN:        u8 = 0x01;
-pub const TAG_INTEGER:        u8 = 0x02;
-pub const TAG_BIT_STRING:     u8 = 0x03;
-pub const TAG_OCTET_STRING:   u8 = 0x04;
-pub const TAG_NULL:           u8 = 0x05;
-pub const TAG_OID:            u8 = 0x06;
-pub const TAG_UTF8_STRING:    u8 = 0x0C;
-pub const TAG_PRINTABLE:      u8 = 0x13;
-pub const TAG_TELETEX:        u8 = 0x14;
-pub const TAG_IA5:            u8 = 0x16;
-pub const TAG_BMP:            u8 = 0x1E;
-pub const TAG_SEQUENCE:       u8 = 0x30;
-pub const TAG_SET:            u8 = 0x31;
+pub const TAG_BOOLEAN: u8 = 0x01;
+pub const TAG_INTEGER: u8 = 0x02;
+pub const TAG_BIT_STRING: u8 = 0x03;
+pub const TAG_OCTET_STRING: u8 = 0x04;
+pub const TAG_NULL: u8 = 0x05;
+pub const TAG_OID: u8 = 0x06;
+pub const TAG_UTF8_STRING: u8 = 0x0C;
+pub const TAG_PRINTABLE: u8 = 0x13;
+pub const TAG_TELETEX: u8 = 0x14;
+pub const TAG_IA5: u8 = 0x16;
+pub const TAG_BMP: u8 = 0x1E;
+pub const TAG_SEQUENCE: u8 = 0x30;
+pub const TAG_SET: u8 = 0x31;
 
 // ---------------------------------------------------------------------------
 // Encoder helpers
@@ -169,11 +169,13 @@ fn encode_base128(out: &mut Vec<u8>, mut v: u64) {
 /// otherwise falls back to `UTF8String`.  IA5String is reserved for `EmailAddress`
 /// and `DC` per RFC 5280 §4.1.2.4.
 pub fn pick_string_tag(value: &str) -> u8 {
-    if value.bytes().all(|b| matches!(b,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
-        b' ' | b'\'' | b'(' | b')' | b'+' | b',' | b'-' |
-        b'.' | b'/' | b':' | b'=' | b'?'
-    )) {
+    if value.bytes().all(|b| {
+        matches!(b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+            b' ' | b'\'' | b'(' | b')' | b'+' | b',' | b'-' |
+            b'.' | b'/' | b':' | b'=' | b'?'
+        )
+    }) {
         TAG_PRINTABLE
     } else {
         TAG_UTF8_STRING
@@ -406,8 +408,8 @@ pub fn encode_null() -> Vec<u8> {
 /// the RSA-style `NULL` parameters, or `Some(&pre_encoded_oid)` for EC
 /// named-curve identifiers.
 pub fn encode_algorithm_identifier(oid_dotted: &str, params_der: Option<&[u8]>) -> Vec<u8> {
-    let oid_der = encode_oid(oid_dotted)
-        .unwrap_or_else(|_| encode_tlv(TAG_OID, oid_dotted.as_bytes()));
+    let oid_der =
+        encode_oid(oid_dotted).unwrap_or_else(|_| encode_tlv(TAG_OID, oid_dotted.as_bytes()));
     let mut inner = Vec::with_capacity(oid_der.len() + params_der.map_or(0, |p| p.len()));
     inner.extend_from_slice(&oid_der);
     if let Some(p) = params_der {
@@ -539,8 +541,7 @@ pub struct Extension {
 /// `org.bouncycastle.asn1.x509.Extension.toASN1Primitive` exactly — the
 /// EJBCA → BC interop check drives this rule.
 pub fn encode_extension(ext: &Extension) -> Vec<u8> {
-    let oid_der = encode_oid(&ext.oid)
-        .unwrap_or_else(|_| encode_tlv(TAG_OID, ext.oid.as_bytes()));
+    let oid_der = encode_oid(&ext.oid).unwrap_or_else(|_| encode_tlv(TAG_OID, ext.oid.as_bytes()));
     let crit_der = if ext.critical {
         Some(encode_boolean(true))
     } else {
@@ -597,7 +598,11 @@ pub fn decode_extension(der: &[u8]) -> Result<Extension, DerError> {
         return Err(DerError::BadTag);
     }
     let value = content[pos + vhdr..pos + vhdr + vclen].to_vec();
-    Ok(Extension { oid, critical, value })
+    Ok(Extension {
+        oid,
+        critical,
+        value,
+    })
 }
 
 /// Decode a top-level `Extensions` SEQUENCE.

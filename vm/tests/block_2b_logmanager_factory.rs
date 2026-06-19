@@ -36,7 +36,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -64,9 +68,7 @@ fn ensure_probe_compiled() -> bool {
         .arg(&dir)
         .arg(&src)
         .status();
-    matches!(status, Ok(s) if s.success())
-        && cls.exists()
-        && inner.exists()
+    matches!(status, Ok(s) if s.success()) && cls.exists() && inner.exists()
 }
 
 fn jdk_home() -> Option<PathBuf> {
@@ -111,9 +113,7 @@ fn run_probe(extra_args: &[&str]) -> Option<(String, String, bool)> {
     let jdk = match jdk_home() {
         Some(j) => j,
         None => {
-            eprintln!(
-                "[block_2b] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
-            );
+            eprintln!("[block_2b] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping");
             return None;
         }
     };
@@ -185,7 +185,9 @@ fn block_2b_default_log_manager_when_property_unset() {
 
 #[test]
 fn block_2b_subclass_log_manager_honours_system_property() {
-    let Some((stdout, stderr, success)) = run_probe(&["-Djava.util.logging.manager=LmSubclass$MyLm"]) else {
+    let Some((stdout, stderr, success)) =
+        run_probe(&["-Djava.util.logging.manager=LmSubclass$MyLm"])
+    else {
         return;
     };
     assert!(

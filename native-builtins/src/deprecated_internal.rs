@@ -8,8 +8,8 @@
 //! (not stubs): proper validation, error handling, and security checks.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
@@ -36,8 +36,7 @@ static NEXT_MEM_ADDR: AtomicU64 = AtomicU64::new(0x1_0000_0000); // start above 
 /// Tracked off-heap memory blocks: address -> Vec<u8>.
 #[allow(dead_code)]
 fn off_heap_store() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<u64, Vec<u8>>>> =
-        std::sync::OnceLock::new();
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -64,7 +63,9 @@ fn tracked_free(addr: u64) -> bool {
 #[allow(dead_code)]
 fn tracked_realloc(old_addr: u64, new_size: usize) -> Result<u64, &'static str> {
     let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
-    let old_block = store.remove(&old_addr).ok_or("invalid address for realloc")?;
+    let old_block = store
+        .remove(&old_addr)
+        .ok_or("invalid address for realloc")?;
     let new_addr = NEXT_MEM_ADDR.fetch_add(new_size as u64 + 64, Ordering::Relaxed);
     let mut new_block = vec![0u8; new_size];
     let copy_len = old_block.len().min(new_size);
@@ -424,10 +425,7 @@ fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn native_unsafe_define_class(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe_this, name, byte[], offset, length, classLoader, protectionDomain]
     //
     // WP2.3: routes through `NativeContext::define_class_full` so the
@@ -554,10 +552,7 @@ fn native_tracked_allocate_memory(
 }
 
 #[allow(dead_code)]
-fn native_tracked_free_memory(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_tracked_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe_this, address]
     let addr = match args.get(1) {
         Some(Value::Long(a)) => *a as u64,
@@ -570,10 +565,7 @@ fn native_tracked_free_memory(
     }
     if !tracked_free(addr) {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!(
-                "freeMemory: invalid or already-freed address 0x{:x}",
-                addr
-            ),
+            message: format!("freeMemory: invalid or already-freed address 0x{:x}", addr),
         }
         .into());
     }
@@ -581,10 +573,7 @@ fn native_tracked_free_memory(
 }
 
 #[allow(dead_code)]
-fn native_tracked_realloc_memory(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_tracked_realloc_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe_this, old_address, new_size]
     let old_addr = match args.get(1) {
         Some(Value::Long(a)) => *a as u64,
@@ -617,10 +606,7 @@ fn native_tracked_realloc_memory(
 }
 
 #[allow(dead_code)]
-fn native_tracked_set_memory(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_tracked_set_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe_this, object_or_null, offset, bytes_count, value]
     // For off-heap: object is null, offset is the address
     let addr = match args.get(2) {
@@ -666,10 +652,7 @@ fn native_tracked_set_memory(
 }
 
 #[allow(dead_code)]
-fn native_tracked_copy_memory(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_tracked_copy_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe_this, src_obj, src_offset, dst_obj, dst_offset, bytes]
     let src_offset = match args.get(2) {
         Some(Value::Long(o)) => *o as u64,
@@ -1056,7 +1039,9 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                     layer_names.push("base".to_string());
                 }
 
-                let layers_root = std::path::PathBuf::from(&root_path).join("system").join("layers");
+                let layers_root = std::path::PathBuf::from(&root_path)
+                    .join("system")
+                    .join("layers");
                 for layer in &layer_names {
                     let layer_dir = layers_root.join(layer);
                     if layer_dir.is_dir() {
@@ -1065,7 +1050,9 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 }
 
                 // Include add-on entries if the tree is present.
-                let addons_root = std::path::PathBuf::from(&root_path).join("system").join("add-ons");
+                let addons_root = std::path::PathBuf::from(&root_path)
+                    .join("system")
+                    .join("add-ons");
                 if addons_root.is_dir() {
                     if let Ok(entries) = std::fs::read_dir(&addons_root) {
                         for entry in entries.flatten() {
@@ -1096,10 +1083,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                     "java/io/File",
                     "<init>",
                     "(Ljava/lang/String;)V",
-                    &[
-                        Value::Object(Some(file_obj)),
-                        Value::Object(Some(path_str)),
-                    ],
+                    &[Value::Object(Some(file_obj)), Value::Object(Some(path_str))],
                 )?;
                 ctx.set_array_element(out_arr, i, Value::Object(Some(file_obj)));
             }
@@ -1130,7 +1114,9 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if name.is_empty() { return Ok(Some(Value::Object(None))); }
+            if name.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
             // Split optional `:slot` suffix.
             let (module_part, slot_part) = match name.rfind(':') {
                 Some(i) => (&name[..i], Some(&name[i + 1..])),
@@ -1157,33 +1143,45 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // `org.jboss.modules.ModuleNotFoundException@0` instead of the module
     // name.  Register a native on Throwable that reads class name from the
     // class_manager and detailMessage from field 0, mirroring the JDK.
-    r.register("java/lang/Throwable", "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(obj))) => *obj,
-            _ => return Ok(Some(Value::Object(Some(ctx.create_string("null")))))
-        };
-        let cid = ctx.class_id_of_object(this);
-        let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "Throwable".to_string()).replace('/', ".");
-        // Walk field slots 0..5 probing for a String field — we don't
-        // know the exact layout (Throwable has backtrace:Object at slot 0
-        // and detailMessage:String at slot 1 on HotSpot, but our
-        // synthetic path sometimes allocates with fewer slots).  Use
-        // whichever slot resolves to a non-empty String first.
-        let mut msg = String::new();
-        let n = ctx.object_num_fields(this).min(6);
-        for i in 0..n {
-            if let Value::Object(Some(s)) = ctx.get_field(this, i) {
-                if let Some(text) = ctx.read_string(s) {
-                    if !text.is_empty() {
-                        msg = text;
-                        break;
+    r.register(
+        "java/lang/Throwable",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(obj))) => *obj,
+                _ => return Ok(Some(Value::Object(Some(ctx.create_string("null"))))),
+            };
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx
+                .class_name_of_id(cid)
+                .unwrap_or_else(|| "Throwable".to_string())
+                .replace('/', ".");
+            // Walk field slots 0..5 probing for a String field — we don't
+            // know the exact layout (Throwable has backtrace:Object at slot 0
+            // and detailMessage:String at slot 1 on HotSpot, but our
+            // synthetic path sometimes allocates with fewer slots).  Use
+            // whichever slot resolves to a non-empty String first.
+            let mut msg = String::new();
+            let n = ctx.object_num_fields(this).min(6);
+            for i in 0..n {
+                if let Value::Object(Some(s)) = ctx.get_field(this, i) {
+                    if let Some(text) = ctx.read_string(s) {
+                        if !text.is_empty() {
+                            msg = text;
+                            break;
+                        }
                     }
                 }
             }
-        }
-        let out = if msg.is_empty() { cname } else { format!("{cname}: {msg}") };
-        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
-    });
+            let out = if msg.is_empty() {
+                cname
+            } else {
+                format!("{cname}: {msg}")
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+        },
+    );
 
     // JBoss Modules JDKModuleFinder.findModule — bypass.
     //
@@ -1255,16 +1253,11 @@ fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
     });
 
     // getName()Ljava/lang/String; — return signal name
-    r.register(
-        sig_class,
-        "getName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let name_val = ctx.get_field(this, 0);
-            Ok(Some(name_val))
-        },
-    );
+    r.register(sig_class, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name_val = ctx.get_field(this, 0);
+        Ok(Some(name_val))
+    });
 
     // handle(Signal, SignalHandler) -> SignalHandler — register a handler
     let handler_sig = if sig_class.starts_with("sun") {
@@ -1515,9 +1508,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         // Build a byte array with CAFEBABE magic
-        let class_bytes: Vec<u8> = vec![
-            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34,
-        ];
+        let class_bytes: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34];
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i32));
@@ -1892,7 +1883,10 @@ mod tests {
             "sun/misc/Signal",
             "<init>",
             "(Ljava/lang/String;)V",
-            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(name_str)),
+            ],
         );
         assert!(result.is_ok());
 
@@ -1929,12 +1923,17 @@ mod tests {
             "sun/misc/Signal",
             "<init>",
             "(Ljava/lang/String;)V",
-            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(name_str)),
+            ],
         )
         .unwrap();
 
         // Create a mock handler object
-        let handler_cid = ctx.ensure_class_initialized("sun/misc/SignalHandler").unwrap();
+        let handler_cid = ctx
+            .ensure_class_initialized("sun/misc/SignalHandler")
+            .unwrap();
         let handler_obj = ctx.alloc_object(handler_cid, 2);
 
         // Register handler — first registration returns null (no previous handler)
@@ -1989,7 +1988,10 @@ mod tests {
             "sun/misc/Signal",
             "<init>",
             "(Ljava/lang/String;)V",
-            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(name_str)),
+            ],
         );
         assert!(result.is_err());
     }
@@ -1999,7 +2001,9 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
-        let cid = ctx.ensure_class_initialized("jdk/internal/misc/Signal").unwrap();
+        let cid = ctx
+            .ensure_class_initialized("jdk/internal/misc/Signal")
+            .unwrap();
         let signal_obj = ctx.alloc_object(cid, 4);
         let name_str = ctx.create_string("TERM");
 
@@ -2009,7 +2013,10 @@ mod tests {
             "jdk/internal/misc/Signal",
             "<init>",
             "(Ljava/lang/String;)V",
-            &[Value::Object(Some(signal_obj)), Value::Object(Some(name_str))],
+            &[
+                Value::Object(Some(signal_obj)),
+                Value::Object(Some(name_str)),
+            ],
         );
         assert!(result.is_ok());
 

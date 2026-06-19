@@ -601,7 +601,8 @@ impl IrBuilder {
         let mem_phi = {
             let mut inputs = vec![region];
             inputs.extend_from_slice(&state.mem_inputs);
-            self.graph.add(Op::Phi, IrType::Memory, inputs, Some(target_pc))
+            self.graph
+                .add(Op::Phi, IrType::Memory, inputs, Some(target_pc))
         };
         self.mem = mem_phi;
 
@@ -621,7 +622,9 @@ impl IrBuilder {
             for snap in &state.local_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self.graph.add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi = self
+                .graph
+                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
             local_phis[i] = phi;
             self.locals[i] = phi;
         }
@@ -629,17 +632,15 @@ impl IrBuilder {
         // Operand-stack phis: one per stack slot at the header (usually none).
         let stack_depth = state.stack_snapshots.first().map_or(0, |s| s.len());
         let mut stack_phis = vec![NO_NODE; stack_depth];
-        self.stack = state
-            .stack_snapshots
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        self.stack = state.stack_snapshots.first().cloned().unwrap_or_default();
         for i in 0..stack_depth {
             let mut inputs = vec![region];
             for snap in &state.stack_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self.graph.add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi = self
+                .graph
+                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
             stack_phis[i] = phi;
             self.stack[i] = phi;
         }

@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use cratonvm_types::{self as types, ObjectHeader};
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
-use cratonvm_types::{self as types, ObjectHeader};
 
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
 // SECURITY FIX (V11): wire the L6 `monitors` registry through the lock-order
@@ -446,9 +446,7 @@ impl Monitor {
             while state.owner.is_some() && state.owner != Some(thread_id) {
                 self.entry_condvar
                     .wait_for(&mut state, std::time::Duration::from_millis(5));
-                if !dumped
-                    && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
-                {
+                if !dumped && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire) {
                     emit_wait_site_frames(thread_id);
                     dumped = true;
                 }
@@ -694,8 +692,7 @@ impl Monitor {
                             break;
                         }
                         if !frames_dumped
-                            && stack_dump_wait_flag()
-                                .load(std::sync::atomic::Ordering::Acquire)
+                            && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
                         {
                             emit_wait_site_frames(thread_id);
                             frames_dumped = true;
@@ -881,23 +878,14 @@ impl MonitorTable {
                     let owner = ObjectHeader::thin_lock_owner(cur);
                     let recursion = ObjectHeader::thin_lock_recursion(cur);
                     let monitor = Arc::new(Monitor::new());
-                    monitor.enter_with_recursion(
-                        ThreadId(owner as u64),
-                        (recursion as u32) + 1,
-                    );
-                    let new_mark =
-                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
+                    monitor.enter_with_recursion(ThreadId(owner as u64), (recursion as u32) + 1);
+                    let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
                     // Publish atomically — if the CAS loses, the original
                     // owner mutated the word (either recursive bump or
                     // release). Drop the local monitor and retry.
                     if header
                         .mark_word
-                        .compare_exchange(
-                            cur,
-                            new_mark,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        )
+                        .compare_exchange(cur, new_mark, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
                         monitors.insert(key, monitor.clone());
@@ -910,16 +898,10 @@ impl MonitorTable {
                     // NEUTRAL (or reserved). Create an unowned monitor and
                     // publish it; the caller will `enter` it normally.
                     let monitor = Arc::new(Monitor::new());
-                    let new_mark =
-                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
+                    let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
                     if header
                         .mark_word
-                        .compare_exchange(
-                            cur,
-                            new_mark,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        )
+                        .compare_exchange(cur, new_mark, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
                         monitors.insert(key, monitor.clone());
@@ -1014,8 +996,7 @@ impl MonitorTable {
                         match try_thin_recursive_lock(header, tid32) {
                             Ok(_) => return None,
                             Err(err_mark) => {
-                                if ObjectHeader::mark_state(err_mark)
-                                    == types::MARK_THIN_LOCKED
+                                if ObjectHeader::mark_state(err_mark) == types::MARK_THIN_LOCKED
                                     && ObjectHeader::thin_lock_owner(err_mark) == tid32
                                     && ObjectHeader::thin_lock_recursion(err_mark) == u8::MAX
                                 {
@@ -1026,9 +1007,9 @@ impl MonitorTable {
                                     // more (re-entrant try_enter always
                                     // succeeds) to record the current
                                     // attempted acquisition.
-                                    let m = self
-                                        .inflate_locked(obj_ref, header)
-                                        .expect("monitor inflation invariant: registry/mark-word desync");
+                                    let m = self.inflate_locked(obj_ref, header).expect(
+                                        "monitor inflation invariant: registry/mark-word desync",
+                                    );
                                     if m.try_enter(thread_id) {
                                         return None;
                                     }
@@ -1581,7 +1562,11 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
 impl std::fmt::Debug for MonitorTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-        let count = self.monitors.lock().expect("monitors registry poisoned").len();
+        let count = self
+            .monitors
+            .lock()
+            .expect("monitors registry poisoned")
+            .len();
         f.debug_struct("MonitorTable")
             .field("active_monitors", &count)
             .finish()
@@ -1770,7 +1755,10 @@ mod tests {
         // re-creates the lock), proving no state was lost.
         let mut ran = false;
         table.with_cas_lock(obj, || ran = true);
-        assert!(ran, "CAS lock must be transparently re-created after reclaim");
+        assert!(
+            ran,
+            "CAS lock must be transparently re-created after reclaim"
+        );
     }
 
     /// PERF safety: with monitor reclamation at its DEFAULT (off), an inflated
@@ -2068,7 +2056,11 @@ mod tests {
     /// Returns the active monitor count in the table's fallback registry.
     fn monitor_registry_len(table: &MonitorTable) -> usize {
         // SECURITY FIX (V11): registry is now an OrderedMutex (LockResult).
-        table.monitors.lock().expect("monitors registry poisoned").len()
+        table
+            .monitors
+            .lock()
+            .expect("monitors registry poisoned")
+            .len()
     }
 
     #[test]

@@ -251,9 +251,7 @@ const COMPOSITE_SCHEMAS: &[CompositeSchema] = &[
 /// T19.M1 — Get composite-type schema for `type_name`. Returns None if
 /// the type doesn't have a pre-registered schema. Linear scan — O(5).
 fn composite_schema_for(type_name: &str) -> Option<&'static CompositeSchema> {
-    COMPOSITE_SCHEMAS
-        .iter()
-        .find(|s| s.type_name == type_name)
+    COMPOSITE_SCHEMAS.iter().find(|s| s.type_name == type_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,10 +264,7 @@ fn composite_schema_for(type_name: &str) -> Option<&'static CompositeSchema> {
 ///
 /// Returns `None` if any field along the chain is null/missing — the
 /// caller treats `None` as "don't filter".
-fn method_declaring_class_name(
-    ctx: &dyn NativeContext,
-    method_obj: ObjectRef,
-) -> Option<String> {
+fn method_declaring_class_name(ctx: &dyn NativeContext, method_obj: ObjectRef) -> Option<String> {
     let class_mirror = match ctx.get_field_by_name(method_obj, "clazz") {
         Value::Object(Some(m)) => m,
         _ => return None,
@@ -294,10 +289,7 @@ fn method_name(ctx: &dyn NativeContext, method_obj: ObjectRef) -> Option<String>
 /// `java.lang.Object`. Reads both the declaring class and the name —
 /// matches on both to avoid filtering user-defined methods that
 /// happen to share an Object method name.
-fn is_object_inherited_method(
-    ctx: &dyn NativeContext,
-    method_obj: ObjectRef,
-) -> bool {
+fn is_object_inherited_method(ctx: &dyn NativeContext, method_obj: ObjectRef) -> bool {
     let class_name = match method_declaring_class_name(ctx, method_obj) {
         Some(s) => s,
         None => return false,
@@ -330,10 +322,7 @@ fn is_object_inherited_method(
 /// slot indices — but only if `class_num_total_fields` returns < 3
 /// (i.e. the synthetic stub case). In real-JDK mode we leave those
 /// slots untouched so we don't corrupt `modCount`.
-fn alloc_array_list_from(
-    ctx: &mut dyn NativeContext,
-    elements: &[ObjectRef],
-) -> ObjectRef {
+fn alloc_array_list_from(ctx: &mut dyn NativeContext, elements: &[ObjectRef]) -> ObjectRef {
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     let backing = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
     for (i, &el) in elements.iter().enumerate() {
@@ -410,14 +399,12 @@ fn native_introspector_get_methods(
     // semantics) and skip methods declared on `java.lang.Object`. We also
     // walk superinterfaces transitively because MBean interfaces extend
     // each other (e.g. `MemoryMXBean` extends `PlatformManagedObject`).
-    let mut visited_classes: std::collections::HashSet<u32> =
-        std::collections::HashSet::new();
+    let mut visited_classes: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut method_mirrors: Vec<ObjectRef> = Vec::new();
     // Track (name, descriptor) to avoid duplicates when the same method
     // is declared on both a class and an interface, mirroring
     // `Class.getMethods()` deduplication.
-    let mut seen: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
     let mut work: Vec<cratonvm_types::ClassId> = vec![cid];
     while let Some(current) = work.pop() {
@@ -503,7 +490,9 @@ pub(crate) fn build_method_mirror(
     // "wrong number of arguments". `create_method_object` also populates
     // `exceptionTypes`, annotation byte arrays, and other JDK-named
     // fields the reflective code relies on.
-    if let Some(declaring_class_id) = crate::lang_class::mirror_class_id(ctx, declaring_class_mirror) {
+    if let Some(declaring_class_id) =
+        crate::lang_class::mirror_class_id(ctx, declaring_class_mirror)
+    {
         let meta = cratonvm_native_api::registry::MethodMetadata {
             name: name.to_string(),
             descriptor: descriptor.to_string(),
@@ -517,7 +506,11 @@ pub(crate) fn build_method_mirror(
     // the JDK-named fields we can. Method.invoke will still error, but the
     // mirror is at least non-null for `getName`/`getParameterCount`.
     let method_obj = alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12);
-    ctx.set_field_by_name(method_obj, "clazz", Value::Object(Some(declaring_class_mirror)));
+    ctx.set_field_by_name(
+        method_obj,
+        "clazz",
+        Value::Object(Some(declaring_class_mirror)),
+    );
     let name_str = ctx.create_string(name);
     ctx.set_field_by_name(method_obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(method_obj, "modifiers", Value::Int(modifiers as i32));
@@ -527,11 +520,7 @@ pub(crate) fn build_method_mirror(
         let m = type_descriptor_to_class_mirror(ctx, p);
         ctx.set_array_element(param_arr, i, Value::Object(Some(m)));
     }
-    ctx.set_field_by_name(
-        method_obj,
-        "parameterTypes",
-        Value::Object(Some(param_arr)),
-    );
+    ctx.set_field_by_name(method_obj, "parameterTypes", Value::Object(Some(param_arr)));
     let ret_mirror = type_descriptor_to_class_mirror(ctx, &ret);
     ctx.set_field_by_name(method_obj, "returnType", Value::Object(Some(ret_mirror)));
     method_obj
@@ -619,10 +608,7 @@ pub(crate) fn type_descriptor_to_class_mirror_pub(
     type_descriptor_to_class_mirror(ctx, desc)
 }
 
-fn type_descriptor_to_class_mirror(
-    ctx: &mut dyn NativeContext,
-    desc: &str,
-) -> ObjectRef {
+fn type_descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str) -> ObjectRef {
     match desc.as_bytes().first().copied() {
         Some(b'B') => ctx.primitive_class_mirror("byte"),
         Some(b'C') => ctx.primitive_class_mirror("char"),
@@ -696,10 +682,7 @@ fn type_descriptor_to_class_mirror(
 /// populated to no-op-but-valid defaults. That way the JDK
 /// bytecode never sees an OpenDataException for typed methods we
 /// can't fully translate, but the MBeanInfo is structurally correct.
-fn native_converting_method_from(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let method_obj = match args.first() {
         Some(Value::Object(Some(m))) => *m,
         _ => return Ok(Some(Value::Object(None))),
@@ -804,10 +787,7 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
 ///    `CompositeMapping`-shaped synthetic mapping with the right
 ///    item count. This satisfies `OpenConverter`'s structural checks
 ///    without recursing into per-field type analysis.
-fn native_mapping_for_type(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = `this` (factory)
     // args[1] = the Type to convert
     // args[2] = the factory (recursive parameter)
@@ -941,10 +921,7 @@ fn resolve_type_name(ctx: &dyn NativeContext, type_obj: ObjectRef) -> Option<Str
 ///   here — `OpenConverter` only reads `openType` for cache hits).
 /// - `openClass` = `CompositeData.class` (the standard open class for
 ///   composite mappings).
-fn alloc_composite_mapping(
-    ctx: &mut dyn NativeContext,
-    schema: &CompositeSchema,
-) -> ObjectRef {
+fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
     // CompositeMapping fields match MXBeanMapping (identity layout) +
     // a CompositeType in the openType slot.
     let m = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3);
@@ -955,13 +932,14 @@ fn alloc_composite_mapping(
     ctx.set_field(m, 1, Value::Object(Some(composite_type)));
     // Field 2: openClass (Class<?>) — CompositeData.class mirror, fall
     // back to String.class if the class isn't loadable.
-    let open_class_mirror = match ctx.ensure_class_initialized("javax/management/openmbean/CompositeData") {
-        Ok(cid) => ctx.get_class_mirror(cid),
-        Err(_) => match ctx.ensure_class_initialized("java/lang/String") {
+    let open_class_mirror =
+        match ctx.ensure_class_initialized("javax/management/openmbean/CompositeData") {
             Ok(cid) => ctx.get_class_mirror(cid),
-            Err(_) => ctx.alloc_object(ClassId::new(0), 0),
-        },
-    };
+            Err(_) => match ctx.ensure_class_initialized("java/lang/String") {
+                Ok(cid) => ctx.get_class_mirror(cid),
+                Err(_) => ctx.alloc_object(ClassId::new(0), 0),
+            },
+        };
     ctx.set_field(m, 2, Value::Object(Some(open_class_mirror)));
     m
 }
@@ -977,10 +955,7 @@ fn alloc_composite_mapping(
 /// The synthetic CompositeType passes structural identity checks done
 /// by `OpenConverter.cacheIfRecursive` and avoids re-entering the
 /// recursive type analysis.
-fn alloc_composite_type(
-    ctx: &mut dyn NativeContext,
-    schema: &CompositeSchema,
-) -> ObjectRef {
+fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
     let ct = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8);
 
     // typeName + description (both stored as java.lang.String).
@@ -1149,11 +1124,7 @@ pub(crate) fn build_composite_data(
     composite_type: Option<ObjectRef>,
     items: &[(String, Value)],
 ) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(
-        ctx,
-        "javax/management/openmbean/CompositeDataSupport",
-        4,
-    );
+    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4);
     let map = build_string_keyed_map(ctx, items);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     ctx.set_field_by_name(obj, OPEN_TYPE_FIELD, Value::Object(composite_type));
@@ -1163,13 +1134,15 @@ pub(crate) fn build_composite_data(
 /// Build a `java.util.HashMap` populated with the given String→Value pairs.
 /// Falls back to a synthetic 2-slot map (data array + size) when
 /// `HashMap.put` cannot be invoked (unit-test mock).
-fn build_string_keyed_map(
-    ctx: &mut dyn NativeContext,
-    items: &[(String, Value)],
-) -> ObjectRef {
+fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> ObjectRef {
     // Try the real HashMap path first.
     if let Ok(Some(Value::Object(Some(map)))) = ctx.new_object("java/util/HashMap") {
-        let _ = ctx.invoke("java/util/HashMap", "<init>", "()V", &[Value::Object(Some(map))]);
+        let _ = ctx.invoke(
+            "java/util/HashMap",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(map))],
+        );
         let mut all_ok = true;
         for (k, v) in items {
             let key = ctx.create_string(k);
@@ -1243,17 +1216,22 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
     let cds = "javax/management/openmbean/CompositeDataSupport";
 
     // CompositeData.get(String) -> Object.
-    r.register(cds, "get", "(Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let key = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        Ok(Some(carrier_get(ctx, this, &key)))
-    });
+    r.register(
+        cds,
+        "get",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let key = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(carrier_get(ctx, this, &key)))
+        },
+    );
 
     // CompositeData.containsKey(String) -> boolean.
     r.register(cds, "containsKey", "(Ljava/lang/String;)Z", |ctx, args| {
@@ -1394,11 +1372,7 @@ pub(crate) fn build_tabular_data(
     ctx: &mut dyn NativeContext,
     tabular_type: Option<ObjectRef>,
 ) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(
-        ctx,
-        "javax/management/openmbean/TabularDataSupport",
-        4,
-    );
+    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4);
     let map = build_string_keyed_map(ctx, &[]);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     ctx.set_field_by_name(obj, OPEN_TYPE_FIELD, Value::Object(tabular_type));
@@ -1423,9 +1397,7 @@ fn native_open_converter_to_converter(
 
     // Cycle detector — same logic as native_mapping_for_type.
     if let Some(name) = &normalized {
-        let depth = VISITED_TYPES.with(|v| {
-            v.borrow().iter().filter(|t| t == &name).count()
-        });
+        let depth = VISITED_TYPES.with(|v| v.borrow().iter().filter(|t| t == &name).count());
         if depth >= MAX_MAPPING_DEPTH {
             return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))));
         }
@@ -1486,27 +1458,30 @@ fn alloc_open_converter(
 /// `com/sun/jmx/mbeanserver/MappedMXBeanType.getMappedMXBeanType(Type)`.
 /// Returns a synthetic `MappedMXBeanType` for known composite types,
 /// or a String-mapped type otherwise.
-fn native_mapped_mxbean_type(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_mapped_mxbean_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let type_obj = match args.first() {
         Some(Value::Object(Some(t))) => *t,
-        _ => return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(ctx, None))))),
+        _ => {
+            return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
+                ctx, None,
+            )))))
+        }
     };
     let normalized = resolve_type_name(ctx, type_obj);
 
     if let Some(name) = &normalized {
-        let depth = VISITED_TYPES.with(|v| {
-            v.borrow().iter().filter(|t| t == &name).count()
-        });
+        let depth = VISITED_TYPES.with(|v| v.borrow().iter().filter(|t| t == &name).count());
         if depth >= MAX_MAPPING_DEPTH {
-            return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
+                ctx, None,
+            )))));
         }
     }
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
-            return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
+                ctx, None,
+            )))));
         }
         if let Some(schema) = composite_schema_for(name) {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
@@ -1515,7 +1490,9 @@ fn native_mapped_mxbean_type(
             )))));
         }
     }
-    Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(ctx, None)))))
+    Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
+        ctx, None,
+    )))))
 }
 
 /// T19.M1 — Allocate a `MappedMXBeanType` instance.
@@ -1571,36 +1548,33 @@ mod tests {
     fn test_introspector_get_methods_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jmx_openmbean_natives(&mut r);
-        assert!(
-            r.find(
+        assert!(r
+            .find(
                 "com/sun/jmx/mbeanserver/MBeanIntrospector",
                 "getMethods",
                 "(Ljava/lang/Class;)Ljava/util/List;"
             )
-            .is_some()
-        );
-        assert!(
-            r.find(
+            .is_some());
+        assert!(r
+            .find(
                 "com/sun/jmx/mbeanserver/MXBeanIntrospector",
                 "getMethods",
                 "(Ljava/lang/Class;)Ljava/util/List;"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
     fn test_converting_method_from_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jmx_openmbean_natives(&mut r);
-        assert!(
-            r.find(
+        assert!(r
+            .find(
                 "com/sun/jmx/mbeanserver/ConvertingMethod",
                 "from",
                 "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
@@ -1738,7 +1712,11 @@ mod tests {
         let mut ctx = mock_ctx();
         let r = native_mapping_for_type(
             &mut ctx,
-            &[Value::Object(None), Value::Object(None), Value::Object(None)],
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+            ],
         );
         // null type → identity mapping (non-null), not exception.
         match r {
@@ -1751,10 +1729,8 @@ mod tests {
     fn test_native_introspector_get_methods_with_null_class() {
         let mut ctx = mock_ctx();
         // args[0]=this, args[1]=null class — must not panic.
-        let r = native_introspector_get_methods(
-            &mut ctx,
-            &[Value::Object(None), Value::Object(None)],
-        );
+        let r =
+            native_introspector_get_methods(&mut ctx, &[Value::Object(None), Value::Object(None)]);
         // null Class → null list (caller iterator-loop tolerates null
         // through `instanceof List` check — defensive).
         match r {
@@ -1778,16 +1754,15 @@ mod tests {
 
     #[test]
     fn t19_m1_composite_schema_memory_usage_present() {
-        let s = composite_schema_for("java.lang.management.MemoryUsage")
-            .expect("MemoryUsage schema");
+        let s =
+            composite_schema_for("java.lang.management.MemoryUsage").expect("MemoryUsage schema");
         assert_eq!(s.items.len(), 4);
         assert_eq!(s.items, &["init", "used", "committed", "max"]);
     }
 
     #[test]
     fn t19_m1_composite_schema_thread_info_present() {
-        let s = composite_schema_for("java.lang.management.ThreadInfo")
-            .expect("ThreadInfo schema");
+        let s = composite_schema_for("java.lang.management.ThreadInfo").expect("ThreadInfo schema");
         // ThreadInfo has 17 published item names in JDK 25.
         assert_eq!(s.items.len(), 17);
         assert!(s.items.contains(&"threadId"));
@@ -1798,16 +1773,15 @@ mod tests {
 
     #[test]
     fn t19_m1_composite_schema_lock_info_present() {
-        let s = composite_schema_for("java.lang.management.LockInfo")
-            .expect("LockInfo schema");
+        let s = composite_schema_for("java.lang.management.LockInfo").expect("LockInfo schema");
         assert_eq!(s.items.len(), 2);
         assert_eq!(s.items, &["className", "identityHashCode"]);
     }
 
     #[test]
     fn t19_m1_composite_schema_monitor_info_present() {
-        let s = composite_schema_for("java.lang.management.MonitorInfo")
-            .expect("MonitorInfo schema");
+        let s =
+            composite_schema_for("java.lang.management.MonitorInfo").expect("MonitorInfo schema");
         assert_eq!(s.items.len(), 4);
         assert!(s.items.contains(&"lockedStackDepth"));
         assert!(s.items.contains(&"lockedStackFrame"));
@@ -1815,8 +1789,8 @@ mod tests {
 
     #[test]
     fn t19_m1_composite_schema_stack_trace_element_present() {
-        let s = composite_schema_for("java.lang.StackTraceElement")
-            .expect("StackTraceElement schema");
+        let s =
+            composite_schema_for("java.lang.StackTraceElement").expect("StackTraceElement schema");
         assert_eq!(s.items.len(), 8);
         assert!(s.items.contains(&"className"));
         assert!(s.items.contains(&"methodName"));
@@ -1876,8 +1850,7 @@ mod tests {
 
         // Allocate a synthetic Class mirror that resolves to that
         // name via slot 1 (matches Class.name layout).
-        let class_mirror =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -1911,8 +1884,7 @@ mod tests {
             stack.push("java.lang.String".to_string());
         });
 
-        let class_mirror =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
         let name_str = ctx.create_string("java.lang.String");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -1937,8 +1909,7 @@ mod tests {
         reset_visited();
         let mut ctx = mock_ctx();
 
-        let class_mirror =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
         let name_str = ctx.create_string("com.acme.SomeBean");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -1960,8 +1931,7 @@ mod tests {
     fn t19_m1_problematic_type_short_circuits_without_push() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
         let name_str = ctx.create_string("java.lang.Class");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -1983,8 +1953,7 @@ mod tests {
     fn t19_m1_composite_type_short_circuits_without_recursion() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2007,8 +1976,8 @@ mod tests {
     #[test]
     fn t19_m1_alloc_composite_mapping_returns_non_null() {
         let mut ctx = mock_ctx();
-        let schema = composite_schema_for("java.lang.management.MemoryUsage")
-            .expect("schema present");
+        let schema =
+            composite_schema_for("java.lang.management.MemoryUsage").expect("schema present");
         let m = alloc_composite_mapping(&mut ctx, schema);
         // Verify the openType slot is populated.
         match ctx.get_field(m, 1) {
@@ -2020,8 +1989,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_composite_type_carries_item_names() {
         let mut ctx = mock_ctx();
-        let schema = composite_schema_for("java.lang.management.LockInfo")
-            .expect("schema");
+        let schema = composite_schema_for("java.lang.management.LockInfo").expect("schema");
         let ct = alloc_composite_type(&mut ctx, schema);
         // The mock NativeContext doesn't map our well-known JMX field
         // names (typeName, description, className, isArray, itemNames)
@@ -2037,8 +2005,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_open_converter_with_schema() {
         let mut ctx = mock_ctx();
-        let schema = composite_schema_for("java.lang.management.ThreadInfo")
-            .expect("schema");
+        let schema = composite_schema_for("java.lang.management.ThreadInfo").expect("schema");
         let oc = alloc_open_converter(&mut ctx, Some(schema));
         // identityConverter flag (slot 3) should be 1.
         match ctx.get_field(oc, 3) {
@@ -2072,8 +2039,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_mapped_mxbean_type_composite_for_known() {
         let mut ctx = mock_ctx();
-        let schema = composite_schema_for("java.lang.management.MemoryUsage")
-            .expect("schema");
+        let schema = composite_schema_for("java.lang.management.MemoryUsage").expect("schema");
         let mt = alloc_mapped_mxbean_type(&mut ctx, Some(schema));
         // isBasicType should be 0 for composite.
         match ctx.get_field(mt, 2) {
@@ -2085,19 +2051,15 @@ mod tests {
     #[test]
     fn t19_m1_native_open_converter_to_converter_handles_null() {
         let mut ctx = mock_ctx();
-        let r = native_open_converter_to_converter(
-            &mut ctx,
-            &[Value::Object(None)],
-        )
-        .expect("native call");
+        let r = native_open_converter_to_converter(&mut ctx, &[Value::Object(None)])
+            .expect("native call");
         assert!(matches!(r, Some(Value::Object(Some(_)))));
     }
 
     #[test]
     fn t19_m1_native_mapped_mxbean_type_handles_null() {
         let mut ctx = mock_ctx();
-        let r = native_mapped_mxbean_type(&mut ctx, &[Value::Object(None)])
-            .expect("native call");
+        let r = native_mapped_mxbean_type(&mut ctx, &[Value::Object(None)]).expect("native call");
         assert!(matches!(r, Some(Value::Object(Some(_)))));
     }
 
@@ -2120,28 +2082,26 @@ mod tests {
     fn t19_m1_open_converter_to_converter_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jmx_openmbean_natives(&mut r);
-        assert!(
-            r.find(
+        assert!(r
+            .find(
                 "com/sun/jmx/mbeanserver/OpenConverter",
                 "toConverter",
                 "(Ljava/lang/reflect/Type;)Lcom/sun/jmx/mbeanserver/OpenConverter;"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
     fn t19_m1_mapped_mxbean_type_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jmx_openmbean_natives(&mut r);
-        assert!(
-            r.find(
+        assert!(r
+            .find(
                 "com/sun/jmx/mbeanserver/MappedMXBeanType",
                 "getMappedMXBeanType",
                 "(Ljava/lang/reflect/Type;)Lcom/sun/jmx/mbeanserver/MappedMXBeanType;"
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
@@ -2162,7 +2122,10 @@ mod tests {
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
-        assert_eq!(resolved.as_deref(), Some("java.lang.management.MemoryUsage"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("java.lang.management.MemoryUsage")
+        );
     }
 
     #[test]
@@ -2174,7 +2137,10 @@ mod tests {
         let resolved = resolve_type_name(&ctx, class_mirror);
         // Slashes must be normalized to dots so the lookup against
         // COMPOSITE_TYPE_NAMES succeeds.
-        assert_eq!(resolved.as_deref(), Some("java.lang.management.MemoryUsage"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("java.lang.management.MemoryUsage")
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2186,15 +2152,22 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_jmx_openmbean_natives(&mut r);
         let cds = "javax/management/openmbean/CompositeDataSupport";
-        assert!(r.find(cds, "get", "(Ljava/lang/String;)Ljava/lang/Object;").is_some());
-        assert!(r.find(cds, "containsKey", "(Ljava/lang/String;)Z").is_some());
-        assert!(
-            r.find(cds, "getCompositeType", "()Ljavax/management/openmbean/CompositeType;")
-                .is_some()
-        );
-        assert!(
-            r.find(cds, "getAll", "([Ljava/lang/String;)[Ljava/lang/Object;").is_some()
-        );
+        assert!(r
+            .find(cds, "get", "(Ljava/lang/String;)Ljava/lang/Object;")
+            .is_some());
+        assert!(r
+            .find(cds, "containsKey", "(Ljava/lang/String;)Z")
+            .is_some());
+        assert!(r
+            .find(
+                cds,
+                "getCompositeType",
+                "()Ljavax/management/openmbean/CompositeType;"
+            )
+            .is_some());
+        assert!(r
+            .find(cds, "getAll", "([Ljava/lang/String;)[Ljava/lang/Object;")
+            .is_some());
         let tds = "javax/management/openmbean/TabularDataSupport";
         assert!(
             r.find(

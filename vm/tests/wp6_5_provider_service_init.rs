@@ -76,12 +76,8 @@ fn wp6_5_inner_class_clinits_registered_via_jca() {
     cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
-        r.find(
-            "java/security/Provider$ServiceKey",
-            "<clinit>",
-            "()V"
-        )
-        .is_some(),
+        r.find("java/security/Provider$ServiceKey", "<clinit>", "()V")
+            .is_some(),
         "Provider$ServiceKey.<clinit> must be no-op'd"
     );
     assert!(

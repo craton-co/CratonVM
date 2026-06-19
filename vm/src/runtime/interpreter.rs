@@ -60,22 +60,21 @@ use crate::classloading::resolution::{
     CachedBytecodeMethod, CachedInvokeTarget, MethodHandleKind, RedefineGate, ResolvedField,
     ResolvedMethod,
 };
-use crate::jit::profile::MethodKey;
 use crate::classloading::{find_field_recursive, ClassId};
 use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use crate::runtime::exceptions::convert_class_not_found;
+use crate::jit::profile::MethodKey;
 use crate::memory::gc::{update_all_roots, update_value_ref};
 use crate::memory::heap::ArrayElementType;
 use crate::memory::roots::collect_roots;
+use crate::runtime::exceptions::convert_class_not_found;
 use crate::runtime::frame::Frame;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactTag, CompactValue, ObjectRef, Value};
 use crate::vm::{
     coerce_value_for_return, coerce_value_for_return_validated, create_java_string,
-    create_java_string_from_units,
-    ensure_class_initialized_shared, ensure_system_stdin_object, get_or_create_class_mirror,
-    get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string,
-    set_static_shared, SharedVm,
+    create_java_string_from_units, ensure_class_initialized_shared, ensure_system_stdin_object,
+    get_or_create_class_mirror, get_static_shared, invoke_on_class_shared, invoke_or_native,
+    invoke_shared, read_java_string, set_static_shared, SharedVm,
 };
 
 // ---------------------------------------------------------------------------
@@ -274,7 +273,8 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
     let _ = write!(
         buf,
         "[mtroots] GC reason={} initiator_tid={} alive={} blocked={} frames={}",
-        reason, thread.thread_id.0,
+        reason,
+        thread.thread_id.0,
         shared.thread_registry.alive_count(),
         shared.gc_barrier.blocked_count(),
         thread.frames.len(),
@@ -283,9 +283,16 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
     for frame in thread.frames.iter().rev().take(8) {
         let mut objs: Vec<ObjectRef> = Vec::new();
         frame.scan_local_objects(&mut objs, &shared.heap);
-        let _ = write!(buf, "\n[mtroots]   {}.{} locals=[", frame.class_name(), frame.method_name());
+        let _ = write!(
+            buf,
+            "\n[mtroots]   {}.{} locals=[",
+            frame.class_name(),
+            frame.method_name()
+        );
         for (i, o) in objs.iter().enumerate() {
-            if i > 0 { let _ = write!(buf, " "); }
+            if i > 0 {
+                let _ = write!(buf, " ");
+            }
             let _ = write!(buf, "{:p}", o.as_ptr());
         }
         let _ = write!(buf, "]");
@@ -295,7 +302,12 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
     // snapshot is used instead of its current frames — the suspected gap.
     let states = shared.thread_registry.dump_blocked_states();
     let nblk = states.iter().filter(|(_, b, _)| *b).count();
-    let _ = write!(buf, "\n[mtroots]   thread-census ({} alive, {} in_blocked):", states.len(), nblk);
+    let _ = write!(
+        buf,
+        "\n[mtroots]   thread-census ({} alive, {} in_blocked):",
+        states.len(),
+        nblk
+    );
     for (tid, blk, snap) in states {
         let _ = write!(buf, " t{}{}({})", tid, if blk { "B" } else { "R" }, snap);
     }
@@ -325,8 +337,13 @@ fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location:
                 eprintln!(
                     "[mtroots] SELFCHECK@{} tid={} in_blocked={} kind={:?} method={}.{} \
                      holds RECLAIMED(all-zero) obj @{:p}",
-                    location, thread.thread_id.0, blocked, thread.kind,
-                    frame.class_name(), frame.method_name(), o.as_ptr(),
+                    location,
+                    thread.thread_id.0,
+                    blocked,
+                    thread.kind,
+                    frame.class_name(),
+                    frame.method_name(),
+                    o.as_ptr(),
                 );
             }
         }
@@ -337,7 +354,11 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
-    if shared.heap.needs_gc() || shared.gc_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    if shared.heap.needs_gc()
+        || shared
+            .gc_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
         // Retire TLAB before GC — its memory is in from-space
         thread.tlab.retire();
         // Round-5 fix (CRIT — UAF): the GC initiator never passes through
@@ -363,7 +384,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             if !gc_hits.is_empty() {
                 eprintln!(
                     "[ecwatch-GC] {} CORRUPTED-at-GC of {} watched cells:",
-                    gc_hits.len(), watched,
+                    gc_hits.len(),
+                    watched,
                 );
                 for (holder, idx, expected, now) in gc_hits {
                     eprintln!(
@@ -385,7 +407,9 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // the only mutator — every other thread is implicitly
             // "parked" (it doesn't exist). Construct the token directly.
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
-            let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
+            let result = shared
+                .heap
+                .collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -454,7 +478,11 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     for (i, f) in thread.frames.iter().enumerate().rev().take(60) {
                         eprintln!(
                             "  [{}] {}.{}{} pc={}",
-                            i, f.class_name(), f.method_name(), f.method_descriptor(), f.pc
+                            i,
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
                         );
                     }
                 }
@@ -498,7 +526,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     "After GC",
                     "Young Gen",
                     heap_used,
-                    heap_used, // committed ≈ used for our simple heap
+                    heap_used,     // committed ≈ used for our simple heap
                     heap_used * 2, // max ≈ 2x used estimate
                     now_ns,
                 );
@@ -527,7 +555,9 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // STW invariant: `gc_barrier.wait_for_all()` returned, so
                 // every mutator has parked at its safepoint poll.
                 let stw = cratonvm_gc::collector::StopTheWorldToken::new();
-                let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
+                let result = shared
+                    .heap
+                    .collect_garbage(&stw, &mut roots, &shared.monitors);
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -594,7 +624,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         let mut roots = collect_roots(shared, thread);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         let stw = cratonvm_gc::collector::StopTheWorldToken::new();
-        let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
+        let result = shared
+            .heap
+            .collect_garbage(&stw, &mut roots, &shared.monitors);
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(&result.pointer_map);
@@ -611,7 +643,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // STW invariant: `wait_for_all()` returned — every mutator
             // has parked at its safepoint poll.
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
-            let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
+            let result = shared
+                .heap
+                .collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
@@ -650,7 +684,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // STW invariant: single-threaded fast path — see `maybe_gc`.
         let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
-            &stw, &mut roots, &fin_addrs, &shared.monitors,
+            &stw,
+            &mut roots,
+            &fin_addrs,
+            &shared.monitors,
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
@@ -669,7 +706,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // has parked at its safepoint poll.
             let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
-                &stw, &mut roots, &fin_addrs, &shared.monitors,
+                &stw,
+                &mut roots,
+                &fin_addrs,
+                &shared.monitors,
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
@@ -758,10 +798,7 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
         // Idempotency: skip if user code already invoked clean().
-        let already = matches!(
-            shared.heap.get_field(cleanable, 1),
-            Value::Int(1),
-        );
+        let already = matches!(shared.heap.get_field(cleanable, 1), Value::Int(1),);
         if already {
             continue;
         }
@@ -782,14 +819,7 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         let is_lambda = shared.lambda_proxies.read().contains_key(&class_id);
         if is_lambda {
             // Errors are silently swallowed per the Cleaner contract.
-            let _ = try_lambda_dispatch(
-                shared,
-                thread,
-                action,
-                class_id,
-                "run",
-                &[],
-            );
+            let _ = try_lambda_dispatch(shared, thread, action, class_id, "run", &[]);
             continue;
         }
 
@@ -877,9 +907,8 @@ fn process_references_after_gc(
     // 1. It appears in the pointer map (evacuated/copied during collection), OR
     // 2. It resides in a live (non-collected) heap region (G1: Old/Humongous regions
     //    that weren't in the collection set are still live).
-    let is_marked = |addr: usize| -> bool {
-        pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
-    };
+    let is_marked =
+        |addr: usize| -> bool { pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr) };
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
@@ -931,7 +960,8 @@ fn process_references_after_gc(
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP stale CLEARED ref @0x{:x} (num_fields={})",
-                    actual_addr, shared.heap.num_fields(obj_ref),
+                    actual_addr,
+                    shared.heap.num_fields(obj_ref),
                 );
             }
             continue;
@@ -960,18 +990,18 @@ fn process_references_after_gc(
         // SAFETY: actual_ref and actual_q were produced by process_references (with pointer_map relocation) and point at valid object headers within the heap arena.
         let ref_obj = unsafe { ObjectRef::from_raw(actual_ref as *mut u8) };
         let q_obj = unsafe { ObjectRef::from_raw(actual_q as *mut u8) }; // Cast: GC object pointer conversion
-        // avrora `get_field` OOB fix (residual): `pending_queues` is keyed on
-        // addresses and is re-emitted every GC. A `ReferenceQueue` reachable
-        // only through this pending-enqueue record (no live Java reference) is
-        // reclaimed by the sweep and its slot reused for a bare
-        // `java.lang.Object`; the synthetic head/size writes below would then
-        // trip the `gen_heap` out-of-bounds guard. Checking the POST-relocation
-        // (`actual_q`) layout distinguishes a genuinely-dead queue (reused as a
-        // 0-field `Object`) from a live one (still `>= 2` fields) — a live
-        // queue, even one relocated this cycle, is remapped through
-        // `pointer_map` and keeps its real layout, so legitimate enqueues are
-        // unaffected. A dead queue has no consumer to `poll()` the reference
-        // back out, so dropping the enqueue is correct.
+                                                                         // avrora `get_field` OOB fix (residual): `pending_queues` is keyed on
+                                                                         // addresses and is re-emitted every GC. A `ReferenceQueue` reachable
+                                                                         // only through this pending-enqueue record (no live Java reference) is
+                                                                         // reclaimed by the sweep and its slot reused for a bare
+                                                                         // `java.lang.Object`; the synthetic head/size writes below would then
+                                                                         // trip the `gen_heap` out-of-bounds guard. Checking the POST-relocation
+                                                                         // (`actual_q`) layout distinguishes a genuinely-dead queue (reused as a
+                                                                         // 0-field `Object`) from a live one (still `>= 2` fields) — a live
+                                                                         // queue, even one relocated this cycle, is remapped through
+                                                                         // `pointer_map` and keeps its real layout, so legitimate enqueues are
+                                                                         // unaffected. A dead queue has no consumer to `poll()` the reference
+                                                                         // back out, so dropping the enqueue is correct.
         if shared.heap.num_fields(q_obj) < 2 {
             continue;
         }
@@ -987,16 +1017,21 @@ fn process_references_after_gc(
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP stale ENQUEUE ref @0x{:x} (num_fields={}) into q@0x{:x}",
-                    actual_ref, shared.heap.num_fields(ref_obj), actual_q,
+                    actual_ref,
+                    shared.heap.num_fields(ref_obj),
+                    actual_q,
                 );
             }
             continue;
         }
         // Push onto queue's linked list head (field 0 = head, field 1 = size)
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
-        shared.heap.set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
+        shared
+            .heap
+            .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         shared.heap.set_field(ref_obj, 0, old_head); // REF_FIELD_REFERENT = next ptr
-        let size = match shared.heap.get_field(q_obj, 1) { // RQ_FIELD_SIZE
+        let size = match shared.heap.get_field(q_obj, 1) {
+            // RQ_FIELD_SIZE
             Value::Int(v) => v,
             _ => 0,
         };
@@ -1036,11 +1071,16 @@ fn process_references_after_gc(
         // Same staleness guard as the finalize loop above.
         if is_stale_young(*action_addr) {
             if straystack_enabled() {
-                eprintln!("[refproc] SKIP dead CLEANER action @0x{action_addr:x} (young, not in map)");
+                eprintln!(
+                    "[refproc] SKIP dead CLEANER action @0x{action_addr:x} (young, not in map)"
+                );
             }
             continue;
         }
-        let actual = pointer_map.get(action_addr).copied().unwrap_or(*action_addr);
+        let actual = pointer_map
+            .get(action_addr)
+            .copied()
+            .unwrap_or(*action_addr);
         shared.cleaner_thread.submit_action(actual);
     }
 
@@ -1264,7 +1304,7 @@ fn tlab_alloc_object(
 /// fast path into agreement with them.
 #[inline(always)]
 fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identity_hash_code: i32) {
-    use cratonvm_gc::heap::{ObjectHeader, ObjectKind, ArrayElementType};
+    use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
     let header = ObjectHeader {
         class_id,
         kind: ObjectKind::Object,
@@ -1306,7 +1346,9 @@ fn alloc_object_shared(
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
-    shared.heap.try_alloc_object(class_id, num_fields)
+    shared
+        .heap
+        .try_alloc_object(class_id, num_fields)
         .map(|obj| {
             shared
                 .bytes_allocated_total
@@ -1354,10 +1396,7 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm) {
             bytes,
             path
         ),
-        Err(e) => tracing::error!(
-            "failed to write HPROF heap dump on OutOfMemoryError: {}",
-            e
-        ),
+        Err(e) => tracing::error!("failed to write HPROF heap dump on OutOfMemoryError: {}", e),
     }
 }
 
@@ -1375,12 +1414,15 @@ fn gc_alloc_array(
     // Retire TLAB before GC
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
-    shared.heap.try_alloc_array(class_id, element_type, length).ok_or_else(|| {
-        maybe_dump_heap_on_oom(shared);
-        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
-            message: format!("Java heap space (alloc_array length {})", length),
-        }))
-    })
+    shared
+        .heap
+        .try_alloc_array(class_id, element_type, length)
+        .ok_or_else(|| {
+            maybe_dump_heap_on_oom(shared);
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_array length {})", length),
+            }))
+        })
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
@@ -1490,8 +1532,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
 
         // Build the next cache as we go (frozen frames `0..len-1`); the top is
         // never cached.
-        let mut new_cache: Vec<(u64, Vec<ObjectRef>)> =
-            Vec::with_capacity(len.saturating_sub(1));
+        let mut new_cache: Vec<(u64, Vec<ObjectRef>)> = Vec::with_capacity(len.saturating_sub(1));
         // (a) reused frozen frames — copy their cached roots into the snapshot
         //     and carry the entry forward (move, no re-alloc).
         for i in 0..reuse {
@@ -1855,10 +1896,9 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let marker = cratonvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
 
     // Phase 1: Initial Mark — brief STW pause
-    let initial_mark_done = shared.gc_barrier.brief_stw(
-        thread.thread_id,
-        alive_count,
-        || {
+    let initial_mark_done = shared
+        .gc_barrier
+        .brief_stw(thread.thread_id, alive_count, || {
             // Collect root pointers for old-gen marking
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
@@ -1870,8 +1910,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.initial_mark(&root_ptrs, &*guard);
             }
-        },
-    );
+        });
 
     if !initial_mark_done {
         return; // Another STW was in progress
@@ -1910,10 +1949,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(mut guard) = shared.heap.old_gen_lock() {
         let swept = marker.concurrent_sweep(&mut *guard);
         if swept > 0 {
-            tracing::debug!(
-                "Concurrent GC: swept {} old-gen objects",
-                swept,
-            );
+            tracing::debug!("Concurrent GC: swept {} old-gen objects", swept,);
         }
     }
 }
@@ -1933,10 +1969,9 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
 
     // Phase 1: Initial Mark — brief STW pause
     // Activates SATB write barrier and marks root-reachable objects
-    let initial_mark_done = shared.gc_barrier.brief_stw(
-        thread.thread_id,
-        alive_count,
-        || {
+    let initial_mark_done = shared
+        .gc_barrier
+        .brief_stw(thread.thread_id, alive_count, || {
             // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
             // SATB buffer on the way into initial-mark. Other mutators
             // already flushed on their `safepoint_check` arrival; the
@@ -1954,8 +1989,7 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
                 .collect();
             shared.heap.g1_mark_roots(&all_roots);
             tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
-        },
-    );
+        });
 
     if !initial_mark_done {
         return; // Another STW in progress
@@ -2284,8 +2318,13 @@ pub fn execute(
         );
     }
     if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
-        eprintln!("[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
-                  class_id, method_name, method_descriptor, args.len());
+        eprintln!(
+            "[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
+            class_id,
+            method_name,
+            method_descriptor,
+            args.len()
+        );
     }
     // CRATONVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
     //
@@ -2296,12 +2335,17 @@ pub fn execute(
     // does zero work even when CRATONVM_IAE_TRACE is set. Behaviour is
     // identical — `method_name == "<init>"` was already a required conjunct.
     if method_name == "<init>" && crate::runtime::env_cache::iae_trace_os() {
-        let class_name_for_trace = shared.class_manager.read()
+        let class_name_for_trace = shared
+            .class_manager
+            .read()
             .get_class(class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         if class_name_for_trace.contains("AnnotationScopeMetadataResolver") {
-            eprintln!("[execute] {}.{}{} args={:?}", class_name_for_trace, method_name, method_descriptor, args);
+            eprintln!(
+                "[execute] {}.{}{} args={:?}",
+                class_name_for_trace, method_name, method_descriptor, args
+            );
         }
     }
     // Find the method
@@ -2364,14 +2408,7 @@ pub fn execute(
             if method_name == "forEachOrdered"
                 && method_descriptor == "(Ljava/util/function/Consumer;)V"
             {
-                return execute(
-                    shared,
-                    thread,
-                    class_id,
-                    "forEach",
-                    method_descriptor,
-                    args,
-                );
+                return execute(shared, thread, class_id, "forEach", method_descriptor, args);
             }
             // JVMTI redefine guard: when this class has been redefined in
             // place by an agent, its woven bytecode is authoritative — skip the
@@ -2384,11 +2421,11 @@ pub fn execute(
                     .class_redefine_generation(class_id)
                     > 0;
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
-                if let Some(cb) = shared.native_methods.find(
-                    &class_name_owned,
-                    method_name,
-                    method_descriptor,
-                ) {
+                if let Some(cb) =
+                    shared
+                        .native_methods
+                        .find(&class_name_owned, method_name, method_descriptor)
+                {
                     return crate::vm::safe_native_call(shared, thread, cb, args);
                 }
             }
@@ -2430,10 +2467,7 @@ pub fn execute(
                     // declared as `CacheOverride o = () -> {}`), route through
                     // try_lambda_dispatch so the proxy's SAM impl_handle runs
                     // instead of throwing AbstractMethodError.
-                    let recv_is_lambda = shared
-                        .lambda_proxies
-                        .read()
-                        .contains_key(&recv_cid);
+                    let recv_is_lambda = shared.lambda_proxies.read().contains_key(&recv_cid);
                     if recv_is_lambda {
                         let rest = if args.is_empty() { &[][..] } else { &args[1..] };
                         if let Some(inner) = try_lambda_dispatch(
@@ -2467,7 +2501,11 @@ pub fn execute(
                     {
                         let rest = if args.is_empty() { &[][..] } else { &args[1..] };
                         let result = crate::vm::annotation_proxy_invoke_shared(
-                            shared, thread, recv_obj, method_name, rest,
+                            shared,
+                            thread,
+                            recv_obj,
+                            method_name,
+                            rest,
                         )?;
                         // Unbox primitive-returning members. The proxy stores
                         // its element values as boxed wrappers, but an
@@ -2613,10 +2651,7 @@ pub fn execute(
                         } else {
                             recv_cid
                         };
-                        if recv_concrete
-                            && (has_better || recv_native)
-                            && target_cid != class_id
-                        {
+                        if recv_concrete && (has_better || recv_native) && target_cid != class_id {
                             return crate::vm::invoke_on_class_shared_no_retarget(
                                 shared,
                                 thread,
@@ -2860,770 +2895,845 @@ pub fn execute(
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
-        if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip || native_skip {
+        if env_disable_jit
+            || already_skipped
+            || static_skip_reason.is_some()
+            || fjp_skip
+            || native_skip
+        {
             // Method has known JIT issues — skip JIT.
         } else {
-        {
-            // RBC.5 — consult the JIT cache FIRST. An already-compiled method
-            // needs NO `padded_bytecode` (alloc + memcpy), NO `jit_scan`
-            // (linear bytecode walk) and NO Arc key allocations —
-            // `JitCache::get` takes `&str`. The previous order paid all of
-            // that on EVERY uncached invocation of every JIT-eligible
-            // method. The org/bouncycastle blanket ban happened to
-            // short-circuit it for BC code at the `static_skip_reason` gate,
-            // which made LIFTING the ban look ~4.7× slower on the asn1
-            // RegressionTest even when not a single BC method was compiled
-            // (the ~190s CPU-bound anomaly in
-            // docs/bc-jit-ban-investigation.md).
-            let compiled = {
-                let jit_cache = shared.jit_cache.read();
-                jit_cache.get(&class_name_str, method_name, method_descriptor)
-            };
-            let compiled = compiled.or_else(|| {
-                let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
-                let code_len = code_attr.code.len();
-                let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor) {
-                    Some(s) => s,
-                    None => {
-                        // RBC.4 — seal scan-rejected methods so this path
-                        // doesn't re-run jit_scan on every uncached
-                        // invocation.
+            {
+                // RBC.5 — consult the JIT cache FIRST. An already-compiled method
+                // needs NO `padded_bytecode` (alloc + memcpy), NO `jit_scan`
+                // (linear bytecode walk) and NO Arc key allocations —
+                // `JitCache::get` takes `&str`. The previous order paid all of
+                // that on EVERY uncached invocation of every JIT-eligible
+                // method. The org/bouncycastle blanket ban happened to
+                // short-circuit it for BC code at the `static_skip_reason` gate,
+                // which made LIFTING the ban look ~4.7× slower on the asn1
+                // RegressionTest even when not a single BC method was compiled
+                // (the ~190s CPU-bound anomaly in
+                // docs/bc-jit-ban-investigation.md).
+                let compiled = {
+                    let jit_cache = shared.jit_cache.read();
+                    jit_cache.get(&class_name_str, method_name, method_descriptor)
+                };
+                let compiled = compiled.or_else(|| {
+                    let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
+                    let code_len = code_attr.code.len();
+                    let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
+                    {
+                        Some(s) => s,
+                        None => {
+                            // RBC.4 — seal scan-rejected methods so this path
+                            // doesn't re-run jit_scan on every uncached
+                            // invocation.
+                            shared.jit_skip_set.write().insert(skip_key.clone());
+                            return None;
+                        }
+                    };
+                    // RBC.6 — athrow methods need an EMPTY exception table
+                    // (mirrors jit::try_compile_inner); seal otherwise so the
+                    // probe isn't re-run per call.
+                    if scan.has_athrow && !code_attr.exception_table.is_empty() {
                         shared.jit_skip_set.write().insert(skip_key.clone());
                         return None;
                     }
-                };
-                // RBC.6 — athrow methods need an EMPTY exception table
-                // (mirrors jit::try_compile_inner); seal otherwise so the
-                // probe isn't re-run per call.
-                if scan.has_athrow && !code_attr.exception_table.is_empty() {
-                    shared.jit_skip_set.write().insert(skip_key.clone());
-                    return None;
-                }
-                let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
-                let method_name_arc: Arc<str> = Arc::from(method_name);
-                let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
-                // Resolve multianewarray entries if present
-                let mut mna_info = Vec::new();
-                if !scan.multianewarray_ops.is_empty() {
-                    let cm = shared.class_manager.read();
-                    let class = cm.get_class(class_id)?;
-                    for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                        let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                        let leaf = class_name_ref.trim_start_matches('[');
-                        let leaf_et = match leaf.as_bytes().first() {
-                            Some(b'I') => 10u8,
-                            Some(b'J') => 11,
-                            Some(b'F') => 6,
-                            Some(b'D') => 7,
-                            Some(b'B') => 8,
-                            Some(b'C') => 5,
-                            Some(b'S') => 9,
-                            Some(b'Z') => 4,
-                            _ => 0,
-                        };
-                        mna_info.push((pc, leaf_et));
+                    let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
+                    let method_name_arc: Arc<str> = Arc::from(method_name);
+                    let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
+                    // Resolve multianewarray entries if present
+                    let mut mna_info = Vec::new();
+                    if !scan.multianewarray_ops.is_empty() {
+                        let cm = shared.class_manager.read();
+                        let class = cm.get_class(class_id)?;
+                        for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
+                            let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
+                            let leaf = class_name_ref.trim_start_matches('[');
+                            let leaf_et = match leaf.as_bytes().first() {
+                                Some(b'I') => 10u8,
+                                Some(b'J') => 11,
+                                Some(b'F') => 6,
+                                Some(b'D') => 7,
+                                Some(b'B') => 8,
+                                Some(b'C') => 5,
+                                Some(b'S') => 9,
+                                Some(b'Z') => 4,
+                                _ => 0,
+                            };
+                            mna_info.push((pc, leaf_et));
+                        }
                     }
-                }
-                // Resolve typecheck entries (checkcast/instanceof) if present
-                let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
-                let mut owned_jit_strings: Vec<Box<str>> = Vec::new();
-                if !scan.typecheck_ops.is_empty() {
-                    let cm_lock = shared.class_manager.read();
-                    let class = cm_lock.get_class(class_id)?;
-                    for &(pc, cp_idx) in &scan.typecheck_ops {
-                        let class_name = class.constant_pool.get_class_name(cp_idx)?;
-                        let boxed: Box<str> = class_name.to_string().into_boxed_str();
-                        let ptr = boxed.as_ptr();
-                        let len = boxed.len();
-                        owned_jit_strings.push(boxed);
-                        typecheck_info.push((pc, ptr, len));
-                    }
-                }
-                // Resolve static field entries (getstatic/putstatic) if present
-                let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
-                if !scan.static_field_ops.is_empty() {
-                    for &(pc, cp_idx) in &scan.static_field_ops {
-                        let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+                    // Resolve typecheck entries (checkcast/instanceof) if present
+                    let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
+                    let mut owned_jit_strings: Vec<Box<str>> = Vec::new();
+                    if !scan.typecheck_ops.is_empty() {
                         let cm_lock = shared.class_manager.read();
                         let class = cm_lock.get_class(class_id)?;
-                        let nat_idx = match class.constant_pool.get(cp_idx) {
-                            Some(ConstantPoolEntry::FieldReference {
-                                name_and_type_index,
-                                ..
-                            }) => *name_and_type_index,
-                            _ => return None,
-                        };
-                        let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                        let type_tag = *descriptor.as_bytes().first()?;
-                        static_field_info.push((
-                            pc,
-                            field.declaring_class_id.as_u32(),
-                            field.field_index,
-                            type_tag,
-                            field.is_volatile,
-                        ));
-                    }
-                }
-                // Resolve invoke entries (invokevirtual/invokespecial/invokeinterface) if present
-                let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
-                let mut owned_jit_invoke_infos: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
-                let mut direct_calls_early: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
-                if !scan.invoke_ops.is_empty() {
-                    let cm_lock = shared.class_manager.read();
-                    let class = cm_lock.get_class(class_id)?;
-                    for &(pc, cp_idx, opcode) in &scan.invoke_ops {
-                        // Resolve method reference from constant pool
-                        let (ref_class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
-                            Some(ConstantPoolEntry::MethodReference {
-                                class_index,
-                                name_and_type_index,
-                                ..
-                            }) => (*class_index, *name_and_type_index),
-                            Some(ConstantPoolEntry::InterfaceMethodReference {
-                                class_index,
-                                name_and_type_index,
-                                ..
-                            }) => (*class_index, *name_and_type_index),
-                            _ => continue,
-                        };
-                        let target_class = match class.constant_pool.get_class_name(ref_class_idx) {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let (method_name_ref, descriptor_ref) =
-                            match class.constant_pool.get_name_and_type(nat_idx) {
-                                Some(pair) => pair,
-                                None => continue,
-                            };
-                        // Count JIT arg slots (receiver + params for virtual, just params for static)
-                        let param_count = crate::jit::count_param_slots(descriptor_ref);
-                        let invoke_kind = match opcode {
-                            0xb6 => 0u8, // invokevirtual
-                            0xb7 => 1,   // invokespecial
-                            0xb9 => 2,   // invokeinterface
-                            0xb8 => 3,   // invokestatic
-                            _ => continue,
-                        };
-                        // Skip self-calls (invokestatic targeting the same method) —
-                        // these are handled by the self_call_patches mechanism
-                        if invoke_kind == 3
-                            && target_class == &*class_name_str
-                            && method_name_ref == method_name
-                            && descriptor_ref == method_descriptor
-                        {
-                            continue;
-                        }
-                        // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
-                        if invoke_kind == 3
-                            && target_class == "java/lang/Math"
-                            && method_name_ref == "sqrt"
-                            && descriptor_ref == "(D)D"
-                        {
-                            direct_calls_early.push((
-                                pc,
-                                crate::jit::JitDirectCall {
-                                    entry: crate::jit::MATH_SQRT_INTRINSIC,
-                                    needs_context: false,
-                                    num_params: 1,
-                                    return_type: b'D',
-                                    guard_class_id: 0,
-                                },
-                            ));
-                            continue;
-                        }
-                        let num_jit_args = if invoke_kind == 3 {
-                            param_count
-                        } else {
-                            param_count + 1
-                        }; // +1 for receiver
-                        let return_type = crate::jit::return_type(descriptor_ref);
-                        // Store strings in owned vec; take raw pointers for JIT metadata
-                        let class_box: Box<str> = target_class.to_string().into_boxed_str();
-                        let method_box: Box<str> = method_name_ref.to_string().into_boxed_str();
-                        let desc_box: Box<str> = descriptor_ref.to_string().into_boxed_str();
-                        let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                        let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                        let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                        owned_jit_strings.push(class_box);
-                        owned_jit_strings.push(method_box);
-                        owned_jit_strings.push(desc_box);
-                        // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings, which outlives the JitInvokeInfo.
-                        let info = Box::new(crate::jit::JitInvokeInfo {
-                            class_name: unsafe { &*class_ref },
-                            method_name: unsafe { &*method_ref },
-                            descriptor: unsafe { &*desc_ref },
-                            num_jit_args,
-                            return_type,
-                            invoke_kind,
-                        });
-                        let info_ptr: *const _ = &*info;
-                        owned_jit_invoke_infos.push(info);
-                        invoke_info.push((pc, info_ptr));
-                    }
-                }
-                // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
-                // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
-                // expensive class loading cascades during JIT of synthetic code.
-                // Tuple: (pc, class_id, num_fields, has_primitive_init, has_finalizer).
-                // The last two are conservative true/true here so the JIT goes through
-                // the post-init helper — matches pre-CRIT-2 behavior. A follow-up should
-                // extract the real flags from class metadata to enable the skip path.
-                let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
-                let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
-                let is_real_class = shared.class_manager.read()
-                    .get_class(class_id)
-                    .map(|c| !c.is_synthetic_stub)
-                    .unwrap_or(false);
-                if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
-                    // Collect class names from constant pool (read lock)
-                    let new_class_names: Vec<(usize, Option<String>)> = {
-                        let cm_lock = shared.class_manager.read();
-                        if let Some(class) = cm_lock.get_class(class_id) {
-                            scan.new_ops.iter()
-                                .map(|&(pc_new, cp_idx)| {
-                                    (pc_new, class.constant_pool.get_class_name(cp_idx).map(|s| s.to_string()))
-                                })
-                                .collect()
-                        } else { Vec::new() }
-                    };
-                    let arr_class_names: Vec<(usize, Option<String>)> = {
-                        let cm_lock = shared.class_manager.read();
-                        if let Some(class) = cm_lock.get_class(class_id) {
-                            scan.anewarray_ops.iter()
-                                .map(|&(pc_arr, cp_idx)| {
-                                    (pc_arr, class.constant_pool.get_class_name(cp_idx).map(|s| s.to_string()))
-                                })
-                                .collect()
-                        } else { Vec::new() }
-                    };
-                    // Resolve class names to ClassIds (write lock for loading)
-                    for (pc_new, name_opt) in new_class_names {
-                        if let Some(name) = name_opt {
-                            let load_result = shared.load_class_concurrent(&name);
-                            if let Ok(target_id) = load_result {
-                                let num_fields = shared.class_manager.read()
-                                    .get_class(target_id)
-                                    .map(|c| c.num_total_fields).unwrap_or(0);
-                                new_info.push((pc_new, target_id.as_u32(), num_fields, true, true));
-                            } else {
-                                new_info.push((pc_new, 0, 0, true, true));
-                            }
+                        for &(pc, cp_idx) in &scan.typecheck_ops {
+                            let class_name = class.constant_pool.get_class_name(cp_idx)?;
+                            let boxed: Box<str> = class_name.to_string().into_boxed_str();
+                            let ptr = boxed.as_ptr();
+                            let len = boxed.len();
+                            owned_jit_strings.push(boxed);
+                            typecheck_info.push((pc, ptr, len));
                         }
                     }
-                    for (pc_arr, name_opt) in arr_class_names {
-                        if let Some(name) = name_opt {
-                            if let Ok(target_id) = shared.load_class_concurrent(&name) {
-                                anewarray_info.push((pc_arr, target_id.as_u32()));
-                            } else {
-                                anewarray_info.push((pc_arr, 0));
-                            }
-                        }
-                    }
-                }
-
-                // Resolve instance field info for getfield/putfield (M5 fix)
-                let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
-                if !scan.field_ops.is_empty() {
-                    for &(pc_f, cp_idx) in &scan.field_ops {
-                        if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
+                    // Resolve static field entries (getstatic/putstatic) if present
+                    let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
+                    if !scan.static_field_ops.is_empty() {
+                        for &(pc, cp_idx) in &scan.static_field_ops {
+                            let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
                             let cm_lock = shared.class_manager.read();
-                            if let Some(class) = cm_lock.get_class(class_id) {
-                                let nat_idx = match class.constant_pool.get(cp_idx) {
-                                    Some(ConstantPoolEntry::FieldReference {
-                                        name_and_type_index, ..
-                                    }) => *name_and_type_index,
-                                    _ => continue,
-                                };
-                                if let Some((_, descriptor)) = class.constant_pool.get_name_and_type(nat_idx) {
-                                    let type_tag = *descriptor.as_bytes().first().unwrap_or(&b'I');
-                                    field_info.push((pc_f, field.field_index, type_tag));
-                                }
-                            }
+                            let class = cm_lock.get_class(class_id)?;
+                            let nat_idx = match class.constant_pool.get(cp_idx) {
+                                Some(ConstantPoolEntry::FieldReference {
+                                    name_and_type_index,
+                                    ..
+                                }) => *name_and_type_index,
+                                _ => return None,
+                            };
+                            let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                            let type_tag = *descriptor.as_bytes().first()?;
+                            static_field_info.push((
+                                pc,
+                                field.declaring_class_id.as_u32(),
+                                field.field_index,
+                                type_tag,
+                                field.is_volatile,
+                            ));
                         }
                     }
-                }
-
-                // Resolve ldc/ldc_w constants (int, float).
-                // Skip early compilation for methods with String/Class ldc —
-                // those will be handled by OSR which can wire callees as direct calls.
-                let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
-                let mut has_string_ldc = false;
-                if !scan.ldc_ops.is_empty() {
-                    let cm_lock = shared.class_manager.read();
-                    if let Some(class) = cm_lock.get_class(class_id) {
-                        for &(pc_ldc, cp_idx) in &scan.ldc_ops {
-                            match class.constant_pool.get(cp_idx) {
-                                Some(ConstantPoolEntry::Integer(v)) => {
-                                    ldc_info_early.push((pc_ldc, *v as i64)); // Cast: JIT ABI — i64 register convention
-                                }
-                                Some(ConstantPoolEntry::Float(v)) => {
-                                    ldc_info_early.push((pc_ldc, v.to_bits() as i64)); // Cast: JIT ABI -- float bits to i64
-                                }
-                                _ => { has_string_ldc = true; }
-                            }
-                        }
-                    }
-                }
-                // Methods with String ldc cannot be early-compiled (no string interning).
-                // Fall through to interpreted execution; OSR will compile later with
-                // proper callee wiring and string resolution.
-                // Use goto to break out of the JIT compilation block.
-                if has_string_ldc {
-                    // Mark as skipped so we don't retry
-                    shared.jit_skip_set.write().insert(skip_key.clone());
-                }
-
-                // Resolve ldc2_w constants (long, double)
-                let mut ldc2w_info_early: Vec<(usize, i64)> = Vec::new();
-                if !scan.ldc2w_ops.is_empty() {
-                    let cm_lock = shared.class_manager.read();
-                    if let Some(class) = cm_lock.get_class(class_id) {
-                        for &(pc_ldc, cp_idx) in &scan.ldc2w_ops {
-                            let val = match class.constant_pool.get(cp_idx) {
-                                Some(ConstantPoolEntry::Long(v)) => *v,
-                                Some(ConstantPoolEntry::Double(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                    // Resolve invoke entries (invokevirtual/invokespecial/invokeinterface) if present
+                    let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> =
+                        Vec::new();
+                    let mut owned_jit_invoke_infos: Vec<Box<crate::jit::JitInvokeInfo>> =
+                        Vec::new();
+                    let mut direct_calls_early: Vec<(usize, crate::jit::JitDirectCall)> =
+                        Vec::new();
+                    if !scan.invoke_ops.is_empty() {
+                        let cm_lock = shared.class_manager.read();
+                        let class = cm_lock.get_class(class_id)?;
+                        for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                            // Resolve method reference from constant pool
+                            let (ref_class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                                Some(ConstantPoolEntry::MethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                Some(ConstantPoolEntry::InterfaceMethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
                                 _ => continue,
                             };
-                            ldc2w_info_early.push((pc_ldc, val));
-                        }
-                    }
-                }
-
-                // Skip compilation for methods with String ldc (fall through to interpreter)
-                if has_string_ldc { return None; }
-
-                // Category-2 (long/double) PARAMETER guard.
-                //
-                // This early-compile path passes `param_slots = args.len()` to the
-                // bare `x64::compile`, which lays parameters out sequentially by
-                // argument index (one JVM slot each). That is wrong whenever a
-                // parameter is a long/double: those occupy TWO JVM local slots, so
-                // every parameter after the first category-2 one is read from the
-                // wrong (un-populated) slot. Concrete symptom: a `(long,long)long`
-                // lambda body (`lload_0; lload_2; ladd`) read its 2nd argument from
-                // the empty `locals[2]`, so e.g. `Long::sum(100,23)` returned 100.
-                //
-                // The hot-path `jit::try_compile` handles this correctly via
-                // `compute_param_jvm_slots` + `compile_with_param_slots`. Bail here
-                // (fall through to the interpreter); the method still JIT-compiles
-                // later through the correct path once it goes hot. We do NOT add it
-                // to `jit_skip_set` so that path remains available.
-                if crate::jit::count_param_slots_jvm_spec(method_descriptor)
-                    != crate::jit::count_param_slots(method_descriptor)
-                {
-                    return None;
-                }
-
-                // Try to compile
-                let param_slots = args.len();
-                let helpers = crate::jit::helpers::build_helpers();
-                let mut cm = crate::jit::x64::compile(
-                    &padded,
-                    code_len,
-                    param_slots,
-                    code_attr.max_locals as usize, // Widening: u16 to usize
-                    scan.needs_heap,
-                    mna_info,
-                    field_info,
-                    typecheck_info,
-                    static_field_info,
-                    new_info,
-                    anewarray_info,
-                    invoke_info,
-                    direct_calls_early,
-                    Vec::new(), // mic_slots — this early-compile path does
-                                // not yet allocate MICs (see existing TODO);
-                                // dispatch goes through the slow-path helper.
-                    Vec::new(), // pic_slots (HIGH-7) — eager PIC allocation
-                                // is wired in `jit::try_compile` (the main
-                                // hot-path entry). This early-compile path
-                                // emits the slow-path helper for every
-                                // invokevirtual/invokeinterface; promoting
-                                // it to inline PIC dispatch is a follow-up
-                                // (would mirror the MIC TODO above and
-                                // allocate `Box<JitPICSlot>` per
-                                // polymorphic call site in `invoke_info`).
-                    ldc_info_early,
-                    ldc2w_info_early,
-                    std::collections::HashMap::new(), // branch_hints
-                    std::collections::HashMap::new(), // loop_unroll_hints
-                    &helpers,
-                    scan.non_escaping_new.clone(), // escape analysis results
-                    std::collections::HashMap::new(), // inline_sites
-                    None, // string_layout — String intrinsics land in a later wave
-                )?;
-                // Attach owned metadata to compiled method
-                cm._jit_strings = owned_jit_strings;
-                cm._jit_invoke_infos = owned_jit_invoke_infos;
-                let code_size = 0usize; // TODO: expose compiled code size
-                // Round-7 HIGH-2 fix: do NOT hold `jit_cache.write()` across
-                // `flight_recorder.lock()`.  The global JIT cache writer
-                // would otherwise serialise JFR formatting for every
-                // sibling compiler thread.  Two-phase: (1) put + get under
-                // the JIT cache write, drop it; (2) JFR event emitted with
-                // only the flight_recorder lock held.
-                let cached_result = {
-                    let mut jit_cache = shared.jit_cache.write();
-                    jit_cache.put(
-                        class_name_arc.clone(),
-                        method_name_arc.clone(),
-                        descriptor_arc.clone(),
-                        cm,
-                    );
-                    jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
-                    // `jit_cache` write-lock dropped here at end of scope.
-                };
-                // This first-call path compiles thousands of methods per run
-                // (everything reached via `invoke_method_shared`, incl. the
-                // reflective-invoke chain), and was the only compile site with
-                // NO success logging — which made the Bug-4 testAdHocData JIT
-                // execution invisible to CRATONVM_DBG_JITC-based bisection.
-                if let Some(c) = &cached_result {
-                    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
-                        eprintln!(
-                            "[cratonvm-jitc] first-compile {}.{}{} entry={:p} len={}",
-                            class_name_arc,
-                            method_name_arc,
-                            descriptor_arc,
-                            c.entry_ptr(),
-                            c.code_bytes().len()
-                        );
-                    }
-                    crate::jit::disasm::maybe_dump_annotated(
-                        "first",
-                        &class_name_arc,
-                        &method_name_arc,
-                        &descriptor_arc,
-                        c.entry_ptr(),
-                        c.code_bytes(),
-                        c.osr_pc_to_native.as_deref(),
-                        c.osr_local_assignments.as_deref(),
-                    );
-                }
-                // Record JFR compilation event — flight_recorder lock taken
-                // *after* the JIT cache write has been released.
-                //
-                // Round-9 cross-cutting LOW-11: the previous implementation
-                // called `format!("{}.{}:{}", ...)` here which allocated a
-                // fresh `String` on every JIT compile. A thread-local scratch
-                // buffer lets us `write!` the formatted key into a reused
-                // allocation, then borrow it as `&str` for the emit call.
-                // The buffer is cleared (not freed) on each entry so capacity
-                // carries across compiles.
-                {
-                    let now_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default().as_nanos() as u64; // Cast: duration to u64 nanoseconds
-                    thread_local! {
-                        static METHOD_KEY_SCRATCH: std::cell::RefCell<String> =
-                            std::cell::RefCell::new(String::with_capacity(256));
-                    }
-                    METHOD_KEY_SCRATCH.with(|cell| {
-                        use std::fmt::Write as _;
-                        let mut buf = cell.borrow_mut();
-                        buf.clear();
-                        // `write!` into a `String` is infallible; discard the
-                        // formatter `Result` rather than `unwrap`-ing it so we
-                        // stay clean under the file-level
-                        // `clippy::unwrap_used = deny`.
-                        let _ = write!(
-                            &mut *buf,
-                            "{}.{}:{}",
-                            class_name_arc, method_name_arc, descriptor_arc,
-                        );
-                        let mut jfr = shared.flight_recorder.lock();
-                        // Round-9 HIGH-5: convert the scratch buffer to an
-                        // `Arc<str>` once and pass it to the `_arc` variant so
-                        // the emit path doesn't re-do `Arc::from(&str)`.
-                        let method_arc: Arc<str> = Arc::from(buf.as_str());
-                        cratonvm_jfr::builtin::emit_compilation_event_arc(
-                            &mut jfr, method_arc,
-                            1, // compile_id
-                            2, // tier (C2-equivalent)
-                            true, // success
-                            false, // not OSR
-                            // Truncation-checked: code_size to i32; JVM method code limited to 64K
-                            i32::try_from(code_size).unwrap_or(i32::MAX), 0, // code_size, inlined_bytes
-                            now_ns, 0, // start_time, duration (not tracked)
-                        );
-                    });
-                }
-                cached_result
-            });
-
-            if compiled.is_none() {
-                // RBC.4 — seal first-call compile failures for the same
-                // reason as the scan-reject seal above: without it every
-                // uncached invocation of a backend-bailing method re-ran
-                // resolution + x64 codegen here. (A method sealed by a
-                // transient resolver miss can still be compiled later by
-                // the invocation-counter upgrade path; the cache fast-path
-                // then routes calls to it.)
-                shared.jit_skip_set.write().insert(skip_key.clone());
-            }
-            if let Some(compiled) = compiled {
-                if crate::runtime::env_cache::jit_entry_dbg() {
-                    eprintln!("[JIT_ENTRY] {}.{}{}", class_name_str, method_name, method_descriptor);
-                }
-                // Ensure all classes referenced by static field ops are initialized.
-                // The JIT directly accesses static field memory, bypassing the
-                // interpreter's ensure_class_initialized_shared call.
-                //
-                // RBC.5 — the class-id list now comes from the artifact
-                // (`static_init_classes`, recorded by `x64::compile` from the
-                // already-resolved `static_field_info`), and the ensure-walk
-                // runs ONCE per artifact (`static_inits_done`) instead of
-                // re-resolving every constant-pool ref + re-taking the init
-                // locks on every single call. A failed init does NOT set the
-                // done-flag, so it is retried on the next call exactly like
-                // the per-call code it replaces.
-                if !compiled.static_init_classes.is_empty()
-                    && !compiled
-                        .static_inits_done
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    let mut all_ok = true;
-                    for &cid_raw in &compiled.static_init_classes {
-                        match ensure_class_initialized_shared(
-                            shared,
-                            thread,
-                            ClassId::new(cid_raw),
-                        ) {
-                            Ok(()) => {}
-                            Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                                // Class init failed (e.g. ExceptionInInitializerError).
-                                // Don't propagate directly — fall through to interpreter
-                                // so the exception table can catch it.
-                                jit_early_exception = Some(exc);
-                                all_ok = false;
-                                break;
+                            let target_class =
+                                match class.constant_pool.get_class_name(ref_class_idx) {
+                                    Some(n) => n,
+                                    None => continue,
+                                };
+                            let (method_name_ref, descriptor_ref) =
+                                match class.constant_pool.get_name_and_type(nat_idx) {
+                                    Some(pair) => pair,
+                                    None => continue,
+                                };
+                            // Count JIT arg slots (receiver + params for virtual, just params for static)
+                            let param_count = crate::jit::count_param_slots(descriptor_ref);
+                            let invoke_kind = match opcode {
+                                0xb6 => 0u8, // invokevirtual
+                                0xb7 => 1,   // invokespecial
+                                0xb9 => 2,   // invokeinterface
+                                0xb8 => 3,   // invokestatic
+                                _ => continue,
+                            };
+                            // Skip self-calls (invokestatic targeting the same method) —
+                            // these are handled by the self_call_patches mechanism
+                            if invoke_kind == 3
+                                && target_class == &*class_name_str
+                                && method_name_ref == method_name
+                                && descriptor_ref == method_descriptor
+                            {
+                                continue;
                             }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    if all_ok {
-                        compiled
-                            .static_inits_done
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                // Skip JIT execution if class init already produced an exception
-                if jit_early_exception.is_some() {
-                    // Fall through to interpreter to handle via exception table
-                } else {
-                // Convert Value args to i64 for JIT calling convention
-                let ret_type = crate::jit::return_type(method_descriptor);
-                // Windows x64 ABI: 4 register args; SysV: 6 register args
-                const MAX_JIT_ARGS: usize = if cfg!(target_os = "windows") { 4 } else { 6 };
-                let mut jit_args = [0i64; 6];
-                let mut jit_count = 0;
-                for arg in args {
-                    // Bail out before writing past the end of `jit_args`. The
-                    // post-loop guard further narrows to MAX_JIT_ARGS, but
-                    // that check fires too late on its own: a Java method with
-                    // 7+ args (common in libraries like Lucene) would panic
-                    // here with "index out of bounds: the len is 6 but the
-                    // index is 6" on `jit_args[6]` before the post-loop guard
-                    // ever runs. Bail with the existing usize::MAX sentinel
-                    // so the interpreter handles the call instead.
-                    if jit_count >= jit_args.len() {
-                        jit_count = usize::MAX;
-                        break;
-                    }
-                    match arg {
-                        Value::Int(v) => {
-                            jit_args[jit_count] = *v as i64; // Cast: JIT ABI -- i64 register convention
-                            jit_count += 1;
-                        }
-                        Value::Long(v) => {
-                            jit_args[jit_count] = *v;
-                            jit_count += 1;
-                        }
-                        Value::Object(Some(obj)) => {
-                            jit_args[jit_count] = obj.as_ptr() as i64; // Cast: JIT ABI -- pointer to i64 register
-                            jit_count += 1;
-                        }
-                        Value::Object(None) => {
-                            jit_args[jit_count] = 0;
-                            jit_count += 1;
-                        }
-                        Value::Float(v) => {
-                            jit_args[jit_count] = v.to_bits() as i64; // Cast: JIT ABI -- float bits to i64
-                            jit_count += 1;
-                        }
-                        Value::Double(v) => {
-                            jit_args[jit_count] = v.to_bits() as i64; // Cast: JIT ABI -- float bits to i64
-                            jit_count += 1;
-                        }
-                        _ => {
-                            // Unsupported arg type: can't use JIT
-                            jit_count = usize::MAX;
-                            break;
-                        }
-                    }
-                }
-                if jit_count != usize::MAX && jit_count <= MAX_JIT_ARGS {
-                    // Set JIT thread context for invoke dispatch callbacks.
-                    // Save the old pointer so re-entrant JIT calls don't lose it.
-                    let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
-                    // NEW-1.5 + T1.1.a: record the native stack pointer so the
-                    // GC root scanner can walk our JIT spill region. When the
-                    // compiled method carries precise oop maps
-                    // (`has_precise_oop_maps() == true`), the walker
-                    // enumerates exact oop slots and backstops with a
-                    // conservative sweep. Otherwise the walker falls back to
-                    // the pure conservative scan. The guard pops on drop so
-                    // it's panic-safe.
-                    let _jit_root_guard =
-                        crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
-                            &compiled,
-                        );
-                    let jit_result = {
-                        let compiled_ref = &compiled;
-                        let args_slice = &jit_args[..jit_count];
-                        let needs_heap = compiled_ref.needs_heap();
-                        let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
-                        // task #44: migrated from `call`/`call_with_context` (panicking shims)
-                        // to `try_call`/`try_call_with_context`. A JIT runtime invocation
-                        // failure (invalid code pointer / too-many-args) surfaces as
-                        // `Err(CompileError)` instead of being silently downgraded to 0.
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if needs_heap {
-                                // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                                unsafe { compiled_ref.try_call_with_context(vm_ptr, args_slice) }
+                            // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
+                            if invoke_kind == 3
+                                && target_class == "java/lang/Math"
+                                && method_name_ref == "sqrt"
+                                && descriptor_ref == "(D)D"
+                            {
+                                direct_calls_early.push((
+                                    pc,
+                                    crate::jit::JitDirectCall {
+                                        entry: crate::jit::MATH_SQRT_INTRINSIC,
+                                        needs_context: false,
+                                        num_params: 1,
+                                        return_type: b'D',
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                                continue;
+                            }
+                            let num_jit_args = if invoke_kind == 3 {
+                                param_count
                             } else {
-                                // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                                unsafe { compiled_ref.try_call(args_slice) }
+                                param_count + 1
+                            }; // +1 for receiver
+                            let return_type = crate::jit::return_type(descriptor_ref);
+                            // Store strings in owned vec; take raw pointers for JIT metadata
+                            let class_box: Box<str> = target_class.to_string().into_boxed_str();
+                            let method_box: Box<str> = method_name_ref.to_string().into_boxed_str();
+                            let desc_box: Box<str> = descriptor_ref.to_string().into_boxed_str();
+                            let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                            let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                            let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                            owned_jit_strings.push(class_box);
+                            owned_jit_strings.push(method_box);
+                            owned_jit_strings.push(desc_box);
+                            // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings, which outlives the JitInvokeInfo.
+                            let info = Box::new(crate::jit::JitInvokeInfo {
+                                class_name: unsafe { &*class_ref },
+                                method_name: unsafe { &*method_ref },
+                                descriptor: unsafe { &*desc_ref },
+                                num_jit_args,
+                                return_type,
+                                invoke_kind,
+                            });
+                            let info_ptr: *const _ = &*info;
+                            owned_jit_invoke_infos.push(info);
+                            invoke_info.push((pc, info_ptr));
+                        }
+                    }
+                    // Resolve new/anewarray info (Phase 39: correct ClassId + field count for JIT new)
+                    // Only resolve for non-synthetic classes (real JDK bytecode) to avoid
+                    // expensive class loading cascades during JIT of synthetic code.
+                    // Tuple: (pc, class_id, num_fields, has_primitive_init, has_finalizer).
+                    // The last two are conservative true/true here so the JIT goes through
+                    // the post-init helper — matches pre-CRIT-2 behavior. A follow-up should
+                    // extract the real flags from class metadata to enable the skip path.
+                    let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
+                    let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+                    let is_real_class = shared
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| !c.is_synthetic_stub)
+                        .unwrap_or(false);
+                    if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty())
+                    {
+                        // Collect class names from constant pool (read lock)
+                        let new_class_names: Vec<(usize, Option<String>)> = {
+                            let cm_lock = shared.class_manager.read();
+                            if let Some(class) = cm_lock.get_class(class_id) {
+                                scan.new_ops
+                                    .iter()
+                                    .map(|&(pc_new, cp_idx)| {
+                                        (
+                                            pc_new,
+                                            class
+                                                .constant_pool
+                                                .get_class_name(cp_idx)
+                                                .map(|s| s.to_string()),
+                                        )
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
                             }
-                        }))
-                    };
-                    // Restore the saved JIT thread pointer (supports re-entrancy)
-                    crate::jit::helpers::restore_jit_thread(saved_jit_thread);
-                    // Check for pending Java exception from JIT dispatch callbacks.
-                    // jit_invoke_dispatch stores exceptions in TLS when a callee throws.
-                    // We do NOT return Err here — the current method's exception table
-                    // hasn't been consulted yet (no frame pushed). Instead, save the
-                    // exception and fall through to the interpreter, which will push a
-                    // frame and route through the exception table.
-                    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
-                        // Stash the exception in a variable visible to the interpreter
-                        // loop that runs below (after frame push).
-                        jit_early_exception = Some(exc);
-                    } else {
-                    let result = match jit_result {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(jit_err)) => {
-                            // task #44: surface `try_call*` Err as InternalError
-                            // instead of the old silent return-0 fallback.
-                            return Err(MethodCallFailed::InternalError(VmError::Internal {
-                                message: format!("JIT call failed: {jit_err}"),
-                            }));
+                        };
+                        let arr_class_names: Vec<(usize, Option<String>)> = {
+                            let cm_lock = shared.class_manager.read();
+                            if let Some(class) = cm_lock.get_class(class_id) {
+                                scan.anewarray_ops
+                                    .iter()
+                                    .map(|&(pc_arr, cp_idx)| {
+                                        (
+                                            pc_arr,
+                                            class
+                                                .constant_pool
+                                                .get_class_name(cp_idx)
+                                                .map(|s| s.to_string()),
+                                        )
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        // Resolve class names to ClassIds (write lock for loading)
+                        for (pc_new, name_opt) in new_class_names {
+                            if let Some(name) = name_opt {
+                                let load_result = shared.load_class_concurrent(&name);
+                                if let Ok(target_id) = load_result {
+                                    let num_fields = shared
+                                        .class_manager
+                                        .read()
+                                        .get_class(target_id)
+                                        .map(|c| c.num_total_fields)
+                                        .unwrap_or(0);
+                                    new_info.push((
+                                        pc_new,
+                                        target_id.as_u32(),
+                                        num_fields,
+                                        true,
+                                        true,
+                                    ));
+                                } else {
+                                    new_info.push((pc_new, 0, 0, true, true));
+                                }
+                            }
                         }
-                        Err(panic_payload) => {
-                            return Err(jit_panic_to_exception(shared, thread, panic_payload));
+                        for (pc_arr, name_opt) in arr_class_names {
+                            if let Some(name) = name_opt {
+                                if let Ok(target_id) = shared.load_class_concurrent(&name) {
+                                    anewarray_info.push((pc_arr, target_id.as_u32()));
+                                } else {
+                                    anewarray_info.push((pc_arr, 0));
+                                }
+                            }
                         }
-                    };
-                    // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on
-                    // EVERY JIT return path, not only the `i64::MIN` deopt arm.
-                    // A void-return store helper (`jit_iastore`/`jit_bastore`/
-                    // `jit_aastore`) that hits a null array sets the flag and
-                    // returns; without this hoist, the flag would leak to the
-                    // next unrelated JIT helper call. The drain runs before any
-                    // normal-return path so the NPE surfaces at the right method.
+                    }
+
+                    // Resolve instance field info for getfield/putfield (M5 fix)
+                    let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
+                    if !scan.field_ops.is_empty() {
+                        for &(pc_f, cp_idx) in &scan.field_ops {
+                            if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
+                                let cm_lock = shared.class_manager.read();
+                                if let Some(class) = cm_lock.get_class(class_id) {
+                                    let nat_idx = match class.constant_pool.get(cp_idx) {
+                                        Some(ConstantPoolEntry::FieldReference {
+                                            name_and_type_index,
+                                            ..
+                                        }) => *name_and_type_index,
+                                        _ => continue,
+                                    };
+                                    if let Some((_, descriptor)) =
+                                        class.constant_pool.get_name_and_type(nat_idx)
+                                    {
+                                        let type_tag =
+                                            *descriptor.as_bytes().first().unwrap_or(&b'I');
+                                        field_info.push((pc_f, field.field_index, type_tag));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Resolve ldc/ldc_w constants (int, float).
+                    // Skip early compilation for methods with String/Class ldc —
+                    // those will be handled by OSR which can wire callees as direct calls.
+                    let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
+                    let mut has_string_ldc = false;
+                    if !scan.ldc_ops.is_empty() {
+                        let cm_lock = shared.class_manager.read();
+                        if let Some(class) = cm_lock.get_class(class_id) {
+                            for &(pc_ldc, cp_idx) in &scan.ldc_ops {
+                                match class.constant_pool.get(cp_idx) {
+                                    Some(ConstantPoolEntry::Integer(v)) => {
+                                        ldc_info_early.push((pc_ldc, *v as i64));
+                                        // Cast: JIT ABI — i64 register convention
+                                    }
+                                    Some(ConstantPoolEntry::Float(v)) => {
+                                        ldc_info_early.push((pc_ldc, v.to_bits() as i64));
+                                        // Cast: JIT ABI -- float bits to i64
+                                    }
+                                    _ => {
+                                        has_string_ldc = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Methods with String ldc cannot be early-compiled (no string interning).
+                    // Fall through to interpreted execution; OSR will compile later with
+                    // proper callee wiring and string resolution.
+                    // Use goto to break out of the JIT compilation block.
+                    if has_string_ldc {
+                        // Mark as skipped so we don't retry
+                        shared.jit_skip_set.write().insert(skip_key.clone());
+                    }
+
+                    // Resolve ldc2_w constants (long, double)
+                    let mut ldc2w_info_early: Vec<(usize, i64)> = Vec::new();
+                    if !scan.ldc2w_ops.is_empty() {
+                        let cm_lock = shared.class_manager.read();
+                        if let Some(class) = cm_lock.get_class(class_id) {
+                            for &(pc_ldc, cp_idx) in &scan.ldc2w_ops {
+                                let val = match class.constant_pool.get(cp_idx) {
+                                    Some(ConstantPoolEntry::Long(v)) => *v,
+                                    Some(ConstantPoolEntry::Double(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                                    _ => continue,
+                                };
+                                ldc2w_info_early.push((pc_ldc, val));
+                            }
+                        }
+                    }
+
+                    // Skip compilation for methods with String ldc (fall through to interpreter)
+                    if has_string_ldc {
+                        return None;
+                    }
+
+                    // Category-2 (long/double) PARAMETER guard.
                     //
-                    // Round-9/10 HIGH fix: route the NPE through the JIT'd
-                    // method's exception table instead of throwing it past
-                    // the method boundary. Building a real
-                    // java/lang/NullPointerException object and stashing it
-                    // into `jit_early_exception` reuses the existing
-                    // post-frame-push routing at ~line 2340, which calls
-                    // `find_exception_handler_any_pc` against the about-to-be-
-                    // pushed frame. Without this, an in-method
-                    // `try { ... } catch (NullPointerException npe) { ... }`
-                    // surrounding a JIT'd null-array store would silently
-                    // bubble the NPE to the caller instead of running the
-                    // catch block. The `InternalError` fallback handles the
-                    // rt.jar-not-loaded boot path (no NPE class yet).
-                    let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
-                        match crate::runtime::exceptions::throw_runtime_error(
-                            shared,
-                            thread,
-                            RuntimeError::NullPointerException { message: None },
-                        ) {
-                            MethodCallFailed::ExceptionThrown(exc) => {
-                                jit_early_exception = Some(exc);
-                                true
-                            }
-                            other => return Err(other),
-                        }
-                    } else {
-                        false
+                    // This early-compile path passes `param_slots = args.len()` to the
+                    // bare `x64::compile`, which lays parameters out sequentially by
+                    // argument index (one JVM slot each). That is wrong whenever a
+                    // parameter is a long/double: those occupy TWO JVM local slots, so
+                    // every parameter after the first category-2 one is read from the
+                    // wrong (un-populated) slot. Concrete symptom: a `(long,long)long`
+                    // lambda body (`lload_0; lload_2; ladd`) read its 2nd argument from
+                    // the empty `locals[2]`, so e.g. `Long::sum(100,23)` returned 100.
+                    //
+                    // The hot-path `jit::try_compile` handles this correctly via
+                    // `compute_param_jvm_slots` + `compile_with_param_slots`. Bail here
+                    // (fall through to the interpreter); the method still JIT-compiles
+                    // later through the correct path once it goes hot. We do NOT add it
+                    // to `jit_skip_set` so that path remains available.
+                    if crate::jit::count_param_slots_jvm_spec(method_descriptor)
+                        != crate::jit::count_param_slots(method_descriptor)
+                    {
+                        return None;
+                    }
+
+                    // Try to compile
+                    let param_slots = args.len();
+                    let helpers = crate::jit::helpers::build_helpers();
+                    let mut cm = crate::jit::x64::compile(
+                        &padded,
+                        code_len,
+                        param_slots,
+                        code_attr.max_locals as usize, // Widening: u16 to usize
+                        scan.needs_heap,
+                        mna_info,
+                        field_info,
+                        typecheck_info,
+                        static_field_info,
+                        new_info,
+                        anewarray_info,
+                        invoke_info,
+                        direct_calls_early,
+                        Vec::new(), // mic_slots — this early-compile path does
+                        // not yet allocate MICs (see existing TODO);
+                        // dispatch goes through the slow-path helper.
+                        Vec::new(), // pic_slots (HIGH-7) — eager PIC allocation
+                        // is wired in `jit::try_compile` (the main
+                        // hot-path entry). This early-compile path
+                        // emits the slow-path helper for every
+                        // invokevirtual/invokeinterface; promoting
+                        // it to inline PIC dispatch is a follow-up
+                        // (would mirror the MIC TODO above and
+                        // allocate `Box<JitPICSlot>` per
+                        // polymorphic call site in `invoke_info`).
+                        ldc_info_early,
+                        ldc2w_info_early,
+                        std::collections::HashMap::new(), // branch_hints
+                        std::collections::HashMap::new(), // loop_unroll_hints
+                        &helpers,
+                        scan.non_escaping_new.clone(), // escape analysis results
+                        std::collections::HashMap::new(), // inline_sites
+                        None, // string_layout — String intrinsics land in a later wave
+                    )?;
+                    // Attach owned metadata to compiled method
+                    cm._jit_strings = owned_jit_strings;
+                    cm._jit_invoke_infos = owned_jit_invoke_infos;
+                    let code_size = 0usize; // TODO: expose compiled code size
+                                            // Round-7 HIGH-2 fix: do NOT hold `jit_cache.write()` across
+                                            // `flight_recorder.lock()`.  The global JIT cache writer
+                                            // would otherwise serialise JFR formatting for every
+                                            // sibling compiler thread.  Two-phase: (1) put + get under
+                                            // the JIT cache write, drop it; (2) JFR event emitted with
+                                            // only the flight_recorder lock held.
+                    let cached_result = {
+                        let mut jit_cache = shared.jit_cache.write();
+                        jit_cache.put(
+                            class_name_arc.clone(),
+                            method_name_arc.clone(),
+                            descriptor_arc.clone(),
+                            cm,
+                        );
+                        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                        // `jit_cache` write-lock dropped here at end of scope.
                     };
-                    // Round-11 fix (AIOOBE leak): complete the NPE drain for the
-                    // pending-AIOOBE flag, drained AFTER the NPE (a frame cannot
-                    // have both pending at once, matching JVM semantics). A JIT
-                    // void-return store helper that hits an out-of-bounds index
-                    // sets `JIT_PENDING_AIOOBE` and returns normally (it cannot
-                    // use the i64::MIN sentinel), so without this drain the
-                    // ArrayIndexOutOfBoundsException would leak to the next
-                    // unrelated JIT helper call. Stash it into
-                    // `jit_early_exception` so the post-frame-push handler walker
-                    // (~line 2340) can catch it in the JIT'd method, mirroring
-                    // the NPE block above. The `create_exception_object` error
-                    // arm covers the rt.jar-not-loaded boot path (no AIOOBE class
-                    // yet).
-                    let aioobe_routed =
-                        if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
-                            let msg = format!("Index {index} out of bounds for length {length}");
-                            match crate::runtime::exceptions::create_exception_object(
+                    // This first-call path compiles thousands of methods per run
+                    // (everything reached via `invoke_method_shared`, incl. the
+                    // reflective-invoke chain), and was the only compile site with
+                    // NO success logging — which made the Bug-4 testAdHocData JIT
+                    // execution invisible to CRATONVM_DBG_JITC-based bisection.
+                    if let Some(c) = &cached_result {
+                        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!(
+                                "[cratonvm-jitc] first-compile {}.{}{} entry={:p} len={}",
+                                class_name_arc,
+                                method_name_arc,
+                                descriptor_arc,
+                                c.entry_ptr(),
+                                c.code_bytes().len()
+                            );
+                        }
+                        crate::jit::disasm::maybe_dump_annotated(
+                            "first",
+                            &class_name_arc,
+                            &method_name_arc,
+                            &descriptor_arc,
+                            c.entry_ptr(),
+                            c.code_bytes(),
+                            c.osr_pc_to_native.as_deref(),
+                            c.osr_local_assignments.as_deref(),
+                        );
+                    }
+                    // Record JFR compilation event — flight_recorder lock taken
+                    // *after* the JIT cache write has been released.
+                    //
+                    // Round-9 cross-cutting LOW-11: the previous implementation
+                    // called `format!("{}.{}:{}", ...)` here which allocated a
+                    // fresh `String` on every JIT compile. A thread-local scratch
+                    // buffer lets us `write!` the formatted key into a reused
+                    // allocation, then borrow it as `&str` for the emit call.
+                    // The buffer is cleared (not freed) on each entry so capacity
+                    // carries across compiles.
+                    {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64; // Cast: duration to u64 nanoseconds
+                        thread_local! {
+                            static METHOD_KEY_SCRATCH: std::cell::RefCell<String> =
+                                std::cell::RefCell::new(String::with_capacity(256));
+                        }
+                        METHOD_KEY_SCRATCH.with(|cell| {
+                            use std::fmt::Write as _;
+                            let mut buf = cell.borrow_mut();
+                            buf.clear();
+                            // `write!` into a `String` is infallible; discard the
+                            // formatter `Result` rather than `unwrap`-ing it so we
+                            // stay clean under the file-level
+                            // `clippy::unwrap_used = deny`.
+                            let _ = write!(
+                                &mut *buf,
+                                "{}.{}:{}",
+                                class_name_arc, method_name_arc, descriptor_arc,
+                            );
+                            let mut jfr = shared.flight_recorder.lock();
+                            // Round-9 HIGH-5: convert the scratch buffer to an
+                            // `Arc<str>` once and pass it to the `_arc` variant so
+                            // the emit path doesn't re-do `Arc::from(&str)`.
+                            let method_arc: Arc<str> = Arc::from(buf.as_str());
+                            cratonvm_jfr::builtin::emit_compilation_event_arc(
+                                &mut jfr,
+                                method_arc,
+                                1,     // compile_id
+                                2,     // tier (C2-equivalent)
+                                true,  // success
+                                false, // not OSR
+                                // Truncation-checked: code_size to i32; JVM method code limited to 64K
+                                i32::try_from(code_size).unwrap_or(i32::MAX),
+                                0, // code_size, inlined_bytes
+                                now_ns,
+                                0, // start_time, duration (not tracked)
+                            );
+                        });
+                    }
+                    cached_result
+                });
+
+                if compiled.is_none() {
+                    // RBC.4 — seal first-call compile failures for the same
+                    // reason as the scan-reject seal above: without it every
+                    // uncached invocation of a backend-bailing method re-ran
+                    // resolution + x64 codegen here. (A method sealed by a
+                    // transient resolver miss can still be compiled later by
+                    // the invocation-counter upgrade path; the cache fast-path
+                    // then routes calls to it.)
+                    shared.jit_skip_set.write().insert(skip_key.clone());
+                }
+                if let Some(compiled) = compiled {
+                    if crate::runtime::env_cache::jit_entry_dbg() {
+                        eprintln!(
+                            "[JIT_ENTRY] {}.{}{}",
+                            class_name_str, method_name, method_descriptor
+                        );
+                    }
+                    // Ensure all classes referenced by static field ops are initialized.
+                    // The JIT directly accesses static field memory, bypassing the
+                    // interpreter's ensure_class_initialized_shared call.
+                    //
+                    // RBC.5 — the class-id list now comes from the artifact
+                    // (`static_init_classes`, recorded by `x64::compile` from the
+                    // already-resolved `static_field_info`), and the ensure-walk
+                    // runs ONCE per artifact (`static_inits_done`) instead of
+                    // re-resolving every constant-pool ref + re-taking the init
+                    // locks on every single call. A failed init does NOT set the
+                    // done-flag, so it is retried on the next call exactly like
+                    // the per-call code it replaces.
+                    if !compiled.static_init_classes.is_empty()
+                        && !compiled
+                            .static_inits_done
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        let mut all_ok = true;
+                        for &cid_raw in &compiled.static_init_classes {
+                            match ensure_class_initialized_shared(
                                 shared,
                                 thread,
-                                "java/lang/ArrayIndexOutOfBoundsException",
-                                Some(&msg),
+                                ClassId::new(cid_raw),
                             ) {
-                                Ok(exc) => {
+                                Ok(()) => {}
+                                Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                                    // Class init failed (e.g. ExceptionInInitializerError).
+                                    // Don't propagate directly — fall through to interpreter
+                                    // so the exception table can catch it.
                                     jit_early_exception = Some(exc);
-                                    true
+                                    all_ok = false;
+                                    break;
                                 }
-                                Err(other) => return Err(other),
-                            }
-                        } else {
-                            false
-                        };
-                    // Deopt sentinel: i64::MIN means the JIT method was deoptimized
-                    // via jit_uncommon_trap.  Fall through to the interpreter to
-                    // re-execute the method from scratch.
-                    // If an NPE or AIOOBE was routed above, also fall through so
-                    // the post-frame-push exception handler walker (~line 2340)
-                    // gets a chance to catch it in the JIT'd method.
-                    if !npe_routed && !aioobe_routed && result != i64::MIN {
-                    return match ret_type {
-                        // Cast: JIT ABI -- i64 register convention
-                        b'I' | b'Z' | b'B' | b'C' | b'S' => Ok(Some(Value::Int(result as i32))),
-                        b'J' => Ok(Some(Value::Long(result))),
-                        b'F' => Ok(Some(Value::Float(f32::from_bits(result as u32)))), // Cast: JIT ABI -- i64 register convention
-                        b'D' => Ok(Some(Value::Double(f64::from_bits(result as u64)))), // Cast: JIT ABI -- i64 register convention
-                        b'[' | b'L' => {
-                            if result == 0 {
-                                Ok(Some(Value::Object(None)))
-                            } else {
-                                // SAFETY: result is a non-zero JIT return value encoding a heap pointer to a valid object header.
-                                Ok(Some(Value::Object(Some(unsafe {
-                                    crate::types::ObjectRef::from_raw(result as *mut u8) // Cast: JIT ABI — i64 register convention
-                                }))))
+                                Err(e) => return Err(e),
                             }
                         }
-                        _ => Ok(None),
-                    };
+                        if all_ok {
+                            compiled
+                                .static_inits_done
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                     }
-                    // Deoptimized — pending-NPE drain was hoisted above the
-                    // i64::MIN branch (round-8 CRIT fix); fall through to
-                    // interpreter execution.
-                    }
+                    // Skip JIT execution if class init already produced an exception
+                    if jit_early_exception.is_some() {
+                        // Fall through to interpreter to handle via exception table
+                    } else {
+                        // Convert Value args to i64 for JIT calling convention
+                        let ret_type = crate::jit::return_type(method_descriptor);
+                        // Windows x64 ABI: 4 register args; SysV: 6 register args
+                        const MAX_JIT_ARGS: usize = if cfg!(target_os = "windows") { 4 } else { 6 };
+                        let mut jit_args = [0i64; 6];
+                        let mut jit_count = 0;
+                        for arg in args {
+                            // Bail out before writing past the end of `jit_args`. The
+                            // post-loop guard further narrows to MAX_JIT_ARGS, but
+                            // that check fires too late on its own: a Java method with
+                            // 7+ args (common in libraries like Lucene) would panic
+                            // here with "index out of bounds: the len is 6 but the
+                            // index is 6" on `jit_args[6]` before the post-loop guard
+                            // ever runs. Bail with the existing usize::MAX sentinel
+                            // so the interpreter handles the call instead.
+                            if jit_count >= jit_args.len() {
+                                jit_count = usize::MAX;
+                                break;
+                            }
+                            match arg {
+                                Value::Int(v) => {
+                                    jit_args[jit_count] = *v as i64; // Cast: JIT ABI -- i64 register convention
+                                    jit_count += 1;
+                                }
+                                Value::Long(v) => {
+                                    jit_args[jit_count] = *v;
+                                    jit_count += 1;
+                                }
+                                Value::Object(Some(obj)) => {
+                                    jit_args[jit_count] = obj.as_ptr() as i64; // Cast: JIT ABI -- pointer to i64 register
+                                    jit_count += 1;
+                                }
+                                Value::Object(None) => {
+                                    jit_args[jit_count] = 0;
+                                    jit_count += 1;
+                                }
+                                Value::Float(v) => {
+                                    jit_args[jit_count] = v.to_bits() as i64; // Cast: JIT ABI -- float bits to i64
+                                    jit_count += 1;
+                                }
+                                Value::Double(v) => {
+                                    jit_args[jit_count] = v.to_bits() as i64; // Cast: JIT ABI -- float bits to i64
+                                    jit_count += 1;
+                                }
+                                _ => {
+                                    // Unsupported arg type: can't use JIT
+                                    jit_count = usize::MAX;
+                                    break;
+                                }
+                            }
+                        }
+                        if jit_count != usize::MAX && jit_count <= MAX_JIT_ARGS {
+                            // Set JIT thread context for invoke dispatch callbacks.
+                            // Save the old pointer so re-entrant JIT calls don't lose it.
+                            let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
+                            // NEW-1.5 + T1.1.a: record the native stack pointer so the
+                            // GC root scanner can walk our JIT spill region. When the
+                            // compiled method carries precise oop maps
+                            // (`has_precise_oop_maps() == true`), the walker
+                            // enumerates exact oop slots and backstops with a
+                            // conservative sweep. Otherwise the walker falls back to
+                            // the pure conservative scan. The guard pops on drop so
+                            // it's panic-safe.
+                            let _jit_root_guard =
+                                crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
+                                    &compiled,
+                                );
+                            let jit_result = {
+                                let compiled_ref = &compiled;
+                                let args_slice = &jit_args[..jit_count];
+                                let needs_heap = compiled_ref.needs_heap();
+                                let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
+                                                                        // task #44: migrated from `call`/`call_with_context` (panicking shims)
+                                                                        // to `try_call`/`try_call_with_context`. A JIT runtime invocation
+                                                                        // failure (invalid code pointer / too-many-args) surfaces as
+                                                                        // `Err(CompileError)` instead of being silently downgraded to 0.
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    if needs_heap {
+                                        // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
+                                        unsafe {
+                                            compiled_ref.try_call_with_context(vm_ptr, args_slice)
+                                        }
+                                    } else {
+                                        // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
+                                        unsafe { compiled_ref.try_call(args_slice) }
+                                    }
+                                }))
+                            };
+                            // Restore the saved JIT thread pointer (supports re-entrancy)
+                            crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+                            // Check for pending Java exception from JIT dispatch callbacks.
+                            // jit_invoke_dispatch stores exceptions in TLS when a callee throws.
+                            // We do NOT return Err here — the current method's exception table
+                            // hasn't been consulted yet (no frame pushed). Instead, save the
+                            // exception and fall through to the interpreter, which will push a
+                            // frame and route through the exception table.
+                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                                // Stash the exception in a variable visible to the interpreter
+                                // loop that runs below (after frame push).
+                                jit_early_exception = Some(exc);
+                            } else {
+                                let result = match jit_result {
+                                    Ok(Ok(v)) => v,
+                                    Ok(Err(jit_err)) => {
+                                        // task #44: surface `try_call*` Err as InternalError
+                                        // instead of the old silent return-0 fallback.
+                                        return Err(MethodCallFailed::InternalError(
+                                            VmError::Internal {
+                                                message: format!("JIT call failed: {jit_err}"),
+                                            },
+                                        ));
+                                    }
+                                    Err(panic_payload) => {
+                                        return Err(jit_panic_to_exception(
+                                            shared,
+                                            thread,
+                                            panic_payload,
+                                        ));
+                                    }
+                                };
+                                // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on
+                                // EVERY JIT return path, not only the `i64::MIN` deopt arm.
+                                // A void-return store helper (`jit_iastore`/`jit_bastore`/
+                                // `jit_aastore`) that hits a null array sets the flag and
+                                // returns; without this hoist, the flag would leak to the
+                                // next unrelated JIT helper call. The drain runs before any
+                                // normal-return path so the NPE surfaces at the right method.
+                                //
+                                // Round-9/10 HIGH fix: route the NPE through the JIT'd
+                                // method's exception table instead of throwing it past
+                                // the method boundary. Building a real
+                                // java/lang/NullPointerException object and stashing it
+                                // into `jit_early_exception` reuses the existing
+                                // post-frame-push routing at ~line 2340, which calls
+                                // `find_exception_handler_any_pc` against the about-to-be-
+                                // pushed frame. Without this, an in-method
+                                // `try { ... } catch (NullPointerException npe) { ... }`
+                                // surrounding a JIT'd null-array store would silently
+                                // bubble the NPE to the caller instead of running the
+                                // catch block. The `InternalError` fallback handles the
+                                // rt.jar-not-loaded boot path (no NPE class yet).
+                                let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                                    match crate::runtime::exceptions::throw_runtime_error(
+                                        shared,
+                                        thread,
+                                        RuntimeError::NullPointerException { message: None },
+                                    ) {
+                                        MethodCallFailed::ExceptionThrown(exc) => {
+                                            jit_early_exception = Some(exc);
+                                            true
+                                        }
+                                        other => return Err(other),
+                                    }
+                                } else {
+                                    false
+                                };
+                                // Round-11 fix (AIOOBE leak): complete the NPE drain for the
+                                // pending-AIOOBE flag, drained AFTER the NPE (a frame cannot
+                                // have both pending at once, matching JVM semantics). A JIT
+                                // void-return store helper that hits an out-of-bounds index
+                                // sets `JIT_PENDING_AIOOBE` and returns normally (it cannot
+                                // use the i64::MIN sentinel), so without this drain the
+                                // ArrayIndexOutOfBoundsException would leak to the next
+                                // unrelated JIT helper call. Stash it into
+                                // `jit_early_exception` so the post-frame-push handler walker
+                                // (~line 2340) can catch it in the JIT'd method, mirroring
+                                // the NPE block above. The `create_exception_object` error
+                                // arm covers the rt.jar-not-loaded boot path (no AIOOBE class
+                                // yet).
+                                let aioobe_routed = if let Some((index, length)) =
+                                    crate::jit::helpers::take_jit_pending_aioobe()
+                                {
+                                    let msg =
+                                        format!("Index {index} out of bounds for length {length}");
+                                    match crate::runtime::exceptions::create_exception_object(
+                                        shared,
+                                        thread,
+                                        "java/lang/ArrayIndexOutOfBoundsException",
+                                        Some(&msg),
+                                    ) {
+                                        Ok(exc) => {
+                                            jit_early_exception = Some(exc);
+                                            true
+                                        }
+                                        Err(other) => return Err(other),
+                                    }
+                                } else {
+                                    false
+                                };
+                                // Deopt sentinel: i64::MIN means the JIT method was deoptimized
+                                // via jit_uncommon_trap.  Fall through to the interpreter to
+                                // re-execute the method from scratch.
+                                // If an NPE or AIOOBE was routed above, also fall through so
+                                // the post-frame-push exception handler walker (~line 2340)
+                                // gets a chance to catch it in the JIT'd method.
+                                if !npe_routed && !aioobe_routed && result != i64::MIN {
+                                    return match ret_type {
+                                        // Cast: JIT ABI -- i64 register convention
+                                        b'I' | b'Z' | b'B' | b'C' | b'S' => {
+                                            Ok(Some(Value::Int(result as i32)))
+                                        }
+                                        b'J' => Ok(Some(Value::Long(result))),
+                                        b'F' => {
+                                            Ok(Some(Value::Float(f32::from_bits(result as u32))))
+                                        } // Cast: JIT ABI -- i64 register convention
+                                        b'D' => {
+                                            Ok(Some(Value::Double(f64::from_bits(result as u64))))
+                                        } // Cast: JIT ABI -- i64 register convention
+                                        b'[' | b'L' => {
+                                            if result == 0 {
+                                                Ok(Some(Value::Object(None)))
+                                            } else {
+                                                // SAFETY: result is a non-zero JIT return value encoding a heap pointer to a valid object header.
+                                                Ok(Some(Value::Object(Some(unsafe {
+                                                    crate::types::ObjectRef::from_raw(
+                                                        result as *mut u8,
+                                                    ) // Cast: JIT ABI — i64 register convention
+                                                }))))
+                                            }
+                                        }
+                                        _ => Ok(None),
+                                    };
+                                }
+                                // Deoptimized — pending-NPE drain was hoisted above the
+                                // i64::MIN branch (round-8 CRIT fix); fall through to
+                                // interpreter execution.
+                            }
+                        }
+                    } // end else (jit_early_exception.is_none())
                 }
-            } // end else (jit_early_exception.is_none())
             }
-        }
         } // end if !already_skipped
     } // end JIT block
 
@@ -3671,7 +3781,13 @@ pub fn execute(
 
     // Push frame onto thread
     if crate::runtime::env_cache::frame_trace() {
-        eprintln!("[FRAME_PUSH/invoke_method_shared] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+        eprintln!(
+            "[FRAME_PUSH/invoke_method_shared] depth={} {}.{}{}",
+            thread.frames.len(),
+            frame.class_name(),
+            frame.method_name(),
+            frame.method_descriptor()
+        );
     }
     push_frame_and_fire_entry(thread, frame);
 
@@ -3692,7 +3808,9 @@ pub fn execute(
         match find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc) {
             Some((handler_pc, exc_ref)) => {
                 thread.frames[frame_idx].stack.clear();
-                let _ = thread.frames[frame_idx].stack.push(Value::Object(Some(exc_ref)));
+                let _ = thread.frames[frame_idx]
+                    .stack
+                    .push(Value::Object(Some(exc_ref)));
                 thread.frames[frame_idx].pc = handler_pc;
                 fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
                 // Fall through to execute_frame which will resume at handler_pc
@@ -3737,8 +3855,12 @@ pub fn execute(
             if let Some(f) = thread.frames.last() {
                 eprintln!(
                     "[PANIC_IN] {}.{}{} pc={} max_stack={} :: {}",
-                    f.class_name(), f.method_name(), f.method_descriptor(),
-                    f.pc, f.max_stack, msg
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc,
+                    f.max_stack,
+                    msg
                 );
             }
             Err(MethodCallFailed::InternalError(VmError::Runtime(
@@ -3808,7 +3930,6 @@ fn method_key_parts<'a>(
     )
 }
 
-
 // ---------------------------------------------------------------------------
 // Frame pop helper (releases synchronized monitor if present)
 // ---------------------------------------------------------------------------
@@ -3857,7 +3978,13 @@ pub fn pop_and_recycle_frame_with_reason(
     fire_jvmti_frame_pop_if_requested(thread, was_popped_by_exception);
     if let Some(f) = thread.frames.pop() {
         if crate::runtime::env_cache::frame_trace() {
-            eprintln!("[FRAME_POP] depth={} {}.{}{}", thread.frames.len(), f.class_name(), f.method_name(), f.method_descriptor());
+            eprintln!(
+                "[FRAME_POP] depth={} {}.{}{}",
+                thread.frames.len(),
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor()
+            );
         }
         if let Some(obj) = f.monitor_on_exit {
             // B8: implicit monitorexit on synchronized-method frame pop.
@@ -3876,11 +4003,7 @@ pub fn pop_and_recycle_frame_with_reason(
                 );
             }
         }
-        thread.recycle_frame_with_shared(
-            f,
-            &shared.operand_stack_pool,
-            &shared.tag_pool,
-        );
+        thread.recycle_frame_with_shared(f, &shared.operand_stack_pool, &shared.tag_pool);
     }
 }
 
@@ -4048,20 +4171,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             let mut exc_pc = invoke_pc;
             let current_exc = exc;
             loop {
-                match find_exception_handler(
-                    shared,
-                    &thread.frames[frame_idx],
-                    exc_pc,
-                    current_exc,
-                ) {
+                match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
+                {
                     Some((handler_pc, exc_ref)) => {
                         thread.frames[frame_idx].stack.clear();
                         thread.frames[frame_idx]
                             .stack
                             .push(Value::Object(Some(exc_ref)))
-                            .map_err(|e| {
-                                MethodCallFailed::InternalError(VmError::Runtime(e))
-                            })?;
+                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
                         thread.frames[frame_idx].pc = handler_pc;
                         fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
                         break;
@@ -4071,12 +4188,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             // T17.Δ — exception-unwind of this frame.
                             pop_and_recycle_frame_with_reason(shared, thread, true);
                             frame_idx -= 1;
-                            exc_pc =
-                                thread.frames[frame_idx].last_instr_pc;
+                            exc_pc = thread.frames[frame_idx].last_instr_pc;
                         } else {
-                            return Err(MethodCallFailed::ExceptionThrown(
-                                current_exc,
-                            ));
+                            return Err(MethodCallFailed::ExceptionThrown(current_exc));
                         }
                     }
                 }
@@ -4091,12 +4205,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let f = &thread.frames[frame_idx];
                     eprintln!(
                         "[AIOOBE2] index={} class={} method={}{} pc={}",
-                        index, f.class_name(), f.method_name(), f.method_descriptor(), invoke_pc
+                        index,
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        invoke_pc
                     );
                 }
             }
-            let exc_result =
-                super::exceptions::throw_runtime_error(shared, thread, re);
+            let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
                     let mut exc_pc = invoke_pc;
@@ -4125,8 +4242,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     // T17.Δ — exception-unwind.
                                     pop_and_recycle_frame_with_reason(shared, thread, true);
                                     frame_idx -= 1;
-                                    exc_pc =
-                                        thread.frames[frame_idx].last_instr_pc;
+                                    exc_pc = thread.frames[frame_idx].last_instr_pc;
                                 } else {
                                     // Perf: the previous `exc_class` / `caller` /
                                     // `mname` bindings here each took a
@@ -4136,9 +4252,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     // (no trace site consumed them). Dropped —
                                     // behaviour is identical (pure, discarded
                                     // computations).
-                                    return Err(MethodCallFailed::ExceptionThrown(
-                                        current_exc,
-                                    ));
+                                    return Err(MethodCallFailed::ExceptionThrown(current_exc));
                                 }
                             }
                         }
@@ -4200,12 +4314,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // iload_0..3 with superinstruction look-ahead
                 0x1a | 0x1b | 0x1c | 0x1d => {
                     let local_idx = (opcode - 0x1a) as usize; // Cast: bytecode operand decoding
-                    // Peek at the next opcode for superinstruction fusion.
-                    // b1 is already pre-read as the byte at saved_pc+1.
-                    // Check if the next byte is another iload_N (for two-operand fusions).
+                                                              // Peek at the next opcode for superinstruction fusion.
+                                                              // b1 is already pre-read as the byte at saved_pc+1.
+                                                              // Check if the next byte is another iload_N (for two-operand fusions).
                     if b1 >= 0x1a && b1 <= 0x1d && saved_pc + 2 < code_len {
                         let local_y = (b1 - 0x1a) as usize; // Widening: index conversion
-                        // SAFETY: code_ptr points to the method's bytecode array; saved_pc + 2 < code_len is checked above.
+                                                            // SAFETY: code_ptr points to the method's bytecode array; saved_pc + 2 < code_len is checked above.
                         let next2 = unsafe { *code_ptr.add(saved_pc + 2) };
                         // iload_X; iload_Y; iadd → push locals[X] + locals[Y]
                         // Round-3: typed int helpers avoid the Value enum round-trip
@@ -4241,15 +4355,29 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 }
                                 if taken {
                                     let offset = ((ob1 as i16) << 8) | (ob2 as i16); // Cast: bytecode operand decoding
-                                    // Cast: signed branch offset arithmetic
+                                                                                     // Cast: signed branch offset arithmetic
                                     frame.pc = ((saved_pc + 2) as isize + offset as isize) as usize;
                                     if offset < 0 {
-                                        if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc + 2); }
+                                        if pgo_enabled {
+                                            let (cid, mn, md) = method_key_parts(frame);
+                                            shared.profile_store.record_backedge_borrowed(
+                                                cid,
+                                                mn,
+                                                md,
+                                                saved_pc + 2,
+                                            );
+                                        }
                                         frame.backward_count += 1;
 
                                         let entry_pc = frame.pc;
                                         let _ = frame;
-                                        match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                        match try_osr_with_backoff(
+                                            shared,
+                                            thread,
+                                            &mut frame_idx,
+                                            initial_frame_idx,
+                                            entry_pc,
+                                        ) {
                                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                             OsrBackoffOutcome::ContinueDispatch => continue,
                                             OsrBackoffOutcome::Skip => {}
@@ -4270,8 +4398,11 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         let next2 = unsafe { *code_ptr.add(saved_pc + 2) };
                         let next3 = unsafe { *code_ptr.add(saved_pc + 3) };
                         // istore_0..3 opcodes are 0x3b..0x3e
-                        if next2 == 0x60 && next3 >= 0x3b && next3 <= 0x3e
-                            && (next3 - 0x3b) as usize == local_idx // Cast: bytecode operand decoding
+                        if next2 == 0x60
+                            && next3 >= 0x3b
+                            && next3 <= 0x3e
+                            && (next3 - 0x3b) as usize == local_idx
+                        // Cast: bytecode operand decoding
                         {
                             let cv = frame.get_local_compact_unchecked(local_idx);
                             if let Some(v) = cv.as_int() {
@@ -4294,7 +4425,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     }
                     // No superinstruction matched — fall back to plain iload.
                     // Round-3: push the raw CompactValue (no Value round-trip).
-                    frame.stack.push_compact(frame.get_local_compact_unchecked(local_idx));
+                    frame
+                        .stack
+                        .push_compact(frame.get_local_compact_unchecked(local_idx));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -4336,11 +4469,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x2a => {
                     let cv = frame.get_local_compact_unchecked(0);
                     if cv.tag() == CompactTag::Long {
-                        let v = coerce_value_for_return_validated(
-                            shared,
-                            cv.to_value(),
-                            b'L',
-                        );
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
                         frame.stack.push_unchecked(v);
                     } else {
                         frame.stack.push_compact(cv);
@@ -4351,11 +4480,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x2b => {
                     let cv = frame.get_local_compact_unchecked(1);
                     if cv.tag() == CompactTag::Long {
-                        let v = coerce_value_for_return_validated(
-                            shared,
-                            cv.to_value(),
-                            b'L',
-                        );
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
                         frame.stack.push_unchecked(v);
                     } else {
                         frame.stack.push_compact(cv);
@@ -4366,11 +4491,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x2c => {
                     let cv = frame.get_local_compact_unchecked(2);
                     if cv.tag() == CompactTag::Long {
-                        let v = coerce_value_for_return_validated(
-                            shared,
-                            cv.to_value(),
-                            b'L',
-                        );
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
                         frame.stack.push_unchecked(v);
                     } else {
                         frame.stack.push_compact(cv);
@@ -4381,11 +4502,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x2d => {
                     let cv = frame.get_local_compact_unchecked(3);
                     if cv.tag() == CompactTag::Long {
-                        let v = coerce_value_for_return_validated(
-                            shared,
-                            cv.to_value(),
-                            b'L',
-                        );
+                        let v = coerce_value_for_return_validated(shared, cv.to_value(), b'L');
                         frame.stack.push_unchecked(v);
                     } else {
                         frame.stack.push_compact(cv);
@@ -4565,13 +4682,24 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                     if offset < 0 {
                         // Backward branch — record back-edge for PGO loop trip profiling
-                        if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                        if pgo_enabled {
+                            let (cid, mn, md) = method_key_parts(frame);
+                            shared
+                                .profile_store
+                                .record_backedge_borrowed(cid, mn, md, saved_pc);
+                        }
                         // Backward branch — increment OSR counter
                         frame.backward_count += 1;
 
                         let entry_pc = frame.pc;
                         let _ = frame; // drop borrow before try_osr
-                        match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                        match try_osr_with_backoff(
+                            shared,
+                            thread,
+                            &mut frame_idx,
+                            initial_frame_idx,
+                            entry_pc,
+                        ) {
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
                             OsrBackoffOutcome::Skip => {}
@@ -4585,17 +4713,33 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va >= vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
 
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4612,17 +4756,33 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va < vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
 
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4639,16 +4799,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va <= vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4665,16 +4841,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va > vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4691,16 +4883,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va != vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4717,16 +4925,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
                     let taken = va == vb;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4800,9 +5024,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if crate::runtime::env_cache::trace_sb_filter() {
                         let cn = frame.class_name();
                         let mn = frame.method_name();
-                        let interesting = (cn.contains("FilteringSpringBootCondition") && mn == "match")
-                            || (cn.contains("ImportCandidates") && (mn == "getCandidates" || mn == "readCandidateConfigurations" || mn == "load" || mn == "stripComment"))
-                            || (cn.contains("AutoConfigurationImportSelector") && (mn == "removeDuplicates" || mn == "getCandidateConfigurations" || mn == "getAutoConfigurationImportFilters" || mn == "getExclusions"))
+                        let interesting = (cn.contains("FilteringSpringBootCondition")
+                            && mn == "match")
+                            || (cn.contains("ImportCandidates")
+                                && (mn == "getCandidates"
+                                    || mn == "readCandidateConfigurations"
+                                    || mn == "load"
+                                    || mn == "stripComment"))
+                            || (cn.contains("AutoConfigurationImportSelector")
+                                && (mn == "removeDuplicates"
+                                    || mn == "getCandidateConfigurations"
+                                    || mn == "getAutoConfigurationImportFilters"
+                                    || mn == "getExclusions"))
                             || (cn.contains("ConfigurationClassFilter") && mn == "filter")
                             || (cn.contains("AutoConfigurationEntry") && mn == "getConfigurations");
                         if interesting {
@@ -4814,7 +5047,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     // Try to read as String first
                                     if let Some(s) = crate::vm::read_java_string(&shared.heap, r) {
                                         format!(" cid={:?} kind={:?} STRING=\"{}\"", cid, kind, s)
-                                    } else if matches!(kind, crate::memory::heap::ObjectKind::Object) {
+                                    } else if matches!(
+                                        kind,
+                                        crate::memory::heap::ObjectKind::Object
+                                    ) {
                                         // Read ArrayList-style 'size' field heuristically — sample
                                         // field 0..3 to find any Int-typed field
                                         let mut fields_desc = String::new();
@@ -4822,7 +5058,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                             let v = shared.heap.get_field(r, fi);
                                             fields_desc.push_str(&format!("f{}={:?} ", fi, v));
                                         }
-                                        format!(" cid={:?} kind={:?} fields=[{}]", cid, kind, fields_desc)
+                                        format!(
+                                            " cid={:?} kind={:?} fields=[{}]",
+                                            cid, kind, fields_desc
+                                        )
                                     } else {
                                         // Try array
                                         let len = shared.heap.array_length(r);
@@ -4830,9 +5069,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                         let to_read = len.min(20);
                                         for i in 0..to_read {
                                             match shared.heap.get_array_element(r, i) {
-                                                Ok(Value::Int(v)) => samples.push_str(&format!("{},", v)),
+                                                Ok(Value::Int(v)) => {
+                                                    samples.push_str(&format!("{},", v))
+                                                }
                                                 Ok(Value::Object(Some(oo))) => {
-                                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, oo) {
+                                                    if let Some(s) = crate::vm::read_java_string(
+                                                        &shared.heap,
+                                                        oo,
+                                                    ) {
                                                         samples.push_str(&format!("\"{}\",", s));
                                                     } else {
                                                         samples.push_str("O,");
@@ -4842,7 +5086,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                                 _ => samples.push('?'),
                                             }
                                         }
-                                        format!(" cid={:?} kind={:?} array_len={} samples=[{}]", cid, kind, len, samples)
+                                        format!(
+                                            " cid={:?} kind={:?} array_len={} samples=[{}]",
+                                            cid, kind, len, samples
+                                        )
                                     }
                                 }
                                 _ => String::new(),
@@ -4879,16 +5126,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x9e => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val <= 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4904,16 +5167,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x9c => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val >= 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4929,16 +5208,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x9d => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val > 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4954,16 +5249,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x9b => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val < 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -4979,16 +5290,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x9a => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val != 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -5004,16 +5331,32 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x99 => {
                     let val = frame.stack.pop_int_unchecked();
                     let taken = val == 0;
-                    if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_branch_borrowed(cid, mn, md, saved_pc, taken); }
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(frame);
+                        shared
+                            .profile_store
+                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
+                    }
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
                         if offset < 0 {
-                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            if pgo_enabled {
+                                let (cid, mn, md) = method_key_parts(frame);
+                                shared
+                                    .profile_store
+                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
+                            }
                             frame.backward_count += 1;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
                                 OsrBackoffOutcome::Skip => {}
@@ -5031,9 +5374,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // JVM spec: i2l sign-extends int → long (lossless).
                     // Direct CompactValue push avoids any Value → CompactValue
                     // boundary tagging drift on long slots.
-                    frame
-                        .stack
-                        .push_long_unchecked(i64::from(val));
+                    frame.stack.push_long_unchecked(i64::from(val));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5047,9 +5388,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame
-                        .stack
-                        .push_long_unchecked(va.wrapping_add(vb));
+                    frame.stack.push_long_unchecked(va.wrapping_add(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5059,9 +5398,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame
-                        .stack
-                        .push_long_unchecked(va.wrapping_sub(vb));
+                    frame.stack.push_long_unchecked(va.wrapping_sub(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5071,9 +5408,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame
-                        .stack
-                        .push_long_unchecked(va.wrapping_mul(vb));
+                    frame.stack.push_long_unchecked(va.wrapping_mul(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5085,22 +5420,30 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // `Value::Int`, dropping bits 32-46 on re-encode. push_compact
                 // preserves every bit and skips the Value decode/encode.
                 0x1e => {
-                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(0));
+                    frame
+                        .stack
+                        .push_compact_long(frame.get_local_compact_unchecked(0));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x1f => {
-                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(1));
+                    frame
+                        .stack
+                        .push_compact_long(frame.get_local_compact_unchecked(1));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x20 => {
-                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(2));
+                    frame
+                        .stack
+                        .push_compact_long(frame.get_local_compact_unchecked(2));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x21 => {
-                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(3));
+                    frame
+                        .stack
+                        .push_compact_long(frame.get_local_compact_unchecked(3));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5195,7 +5538,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x78 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    frame.stack.push_int_unchecked(va.wrapping_shl(vb as u32 & 0x1f));
+                    frame
+                        .stack
+                        .push_int_unchecked(va.wrapping_shl(vb as u32 & 0x1f));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5203,7 +5548,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x7a => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    frame.stack.push_int_unchecked(va.wrapping_shr(vb as u32 & 0x1f));
+                    frame
+                        .stack
+                        .push_int_unchecked(va.wrapping_shr(vb as u32 & 0x1f));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5211,9 +5558,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x7c => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    frame.stack.push_int_unchecked(
-                        ((va as u32).wrapping_shr(vb as u32 & 0x1f)) as i32,
-                    );
+                    frame
+                        .stack
+                        .push_int_unchecked(((va as u32).wrapping_shr(vb as u32 & 0x1f)) as i32);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5228,9 +5575,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x75 => {
                     let cv = frame.stack.pop_compact();
                     let v = cv.as_long_unchecked();
-                    frame
-                        .stack
-                        .push_long_unchecked(v.wrapping_neg());
+                    frame.stack.push_long_unchecked(v.wrapping_neg());
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5271,9 +5616,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
                     if vb != 0 {
-                        frame
-                            .stack
-                            .push_long_unchecked(va.wrapping_div(vb));
+                        frame.stack.push_long_unchecked(va.wrapping_div(vb));
                         frame.pc = saved_pc + 1;
                         continue;
                     }
@@ -5288,9 +5631,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
                     if vb != 0 {
-                        frame
-                            .stack
-                            .push_long_unchecked(va.wrapping_rem(vb));
+                        frame.stack.push_long_unchecked(va.wrapping_rem(vb));
                         frame.pc = saved_pc + 1;
                         continue;
                     }
@@ -5500,9 +5841,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // JVM spec: i2d widens int to double (lossless).
                     // Direct CompactValue push keeps the 8-byte slot
                     // tagged with the Double NaN-box encoding.
-                    frame
-                        .stack
-                        .push_double_unchecked(f64::from(val));
+                    frame.stack.push_double_unchecked(f64::from(val));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -5605,8 +5944,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
                 0x16 | 0x18 if (b1 as usize) < frame.max_locals as usize => {
                     let cv = frame.get_local_compact_unchecked(b1 as usize); // Cast: bytecode operand decoding
-                    // Mark the slot's category so a NaN-tag-colliding long is
-                    // popped bit-exact (lload) rather than sign-extended.
+                                                                             // Mark the slot's category so a NaN-tag-colliding long is
+                                                                             // popped bit-exact (lload) rather than sign-extended.
                     if opcode == 0x16 {
                         frame.stack.push_compact_long(cv);
                     } else {
@@ -5701,9 +6040,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             // dastore: untagged slot is raw f64 bits.
                             use crate::types::CompactTag;
                             match cv.tag() {
-                                CompactTag::Double => {
-                                    Value::Double(f64::from_bits(cv.to_bits()))
-                                }
+                                CompactTag::Double => Value::Double(f64::from_bits(cv.to_bits())),
                                 CompactTag::Long => {
                                     // Rare: NaN-tagged-collision long landing
                                     // in a double slot; reinterpret the bits.
@@ -5754,8 +6091,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // aastore (0x53) — needs SATB pre-barrier + write barrier
                 0x53 => {
-                    let value =
-                        coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
+                    let value = coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
                     // Round-3: typed int pop for the array index.
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
@@ -5776,7 +6112,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         // type info, so this is additive and never a false ASE.
                         if let Value::Object(Some(elem_ref)) = value {
                             if shared.heap.kind_of(arr_ref) == cratonvm_types::ObjectKind::Array
-                                && shared.heap.element_type_of(arr_ref) == ArrayElementType::Reference
+                                && shared.heap.element_type_of(arr_ref)
+                                    == ArrayElementType::Reference
                                 && !aastore_element_assignable(shared, arr_ref, elem_ref)
                             {
                                 let _ = frame;
@@ -5795,7 +6132,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         // SATB pre-barrier: log old array element before overwrite
                         // Widening: index conversion
-                        if let Ok(old_elem) = shared.heap.get_array_element(arr_ref, index as usize) {
+                        if let Ok(old_elem) = shared.heap.get_array_element(arr_ref, index as usize)
+                        {
                             shared.heap.satb_barrier(old_elem);
                         }
                         match shared
@@ -5848,7 +6186,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // path" — but the dispatch had it inverted, so `vtable_fast`'s
                     // 3 RwLocks + 2 hierarchy walks ran on EVERY virtual call and
                     // the inline cache was never consulted.)
-                    let cached_result = execute_invokevirtual_cached(shared, thread, frame_idx, cp_index, saved_pc, false);
+                    let cached_result = execute_invokevirtual_cached(
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                    );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -5870,7 +6210,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     }
                     // Miss path — VtableManager lock-free dispatch; a hit here
                     // populates invoke_cache for the next call.
-                    match execute_invokevirtual_vtable_fast(shared, thread, frame_idx, cp_index, saved_pc) {
+                    match execute_invokevirtual_vtable_fast(
+                        shared, thread, frame_idx, cp_index, saved_pc,
+                    ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -5890,8 +6232,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         Err(e) => return Err(e),
                     }
                     match execute_invoke(shared, thread, frame_idx, cp_index, false) {
-                        Ok(CachedCallResult::FramePushed) => { frame_idx = thread.frames.len() - 1; continue; }
-                        Ok(_) => { continue; }
+                        Ok(CachedCallResult::FramePushed) => {
+                            frame_idx = thread.frames.len() - 1;
+                            continue;
+                        }
+                        Ok(_) => {
+                            continue;
+                        }
                         Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                             pending_runtime_error = Some((re, saved_pc));
                             continue;
@@ -5908,7 +6255,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
-                    let cached_result = execute_invokevirtual_cached(shared, thread, frame_idx, cp_index, saved_pc, true);
+                    let cached_result = execute_invokevirtual_cached(
+                        shared, thread, frame_idx, cp_index, saved_pc, true,
+                    );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -5929,8 +6278,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         Err(e) => return Err(e),
                     }
                     match execute_invoke(shared, thread, frame_idx, cp_index, true) {
-                        Ok(CachedCallResult::FramePushed) => { frame_idx = thread.frames.len() - 1; continue; }
-                        Ok(_) => { continue; }
+                        Ok(CachedCallResult::FramePushed) => {
+                            frame_idx = thread.frames.len() - 1;
+                            continue;
+                        }
+                        Ok(_) => {
+                            continue;
+                        }
                         Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                             pending_runtime_error = Some((re, saved_pc));
                             continue;
@@ -5947,7 +6301,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
-                    let cached_result = execute_invokestatic_cached(shared, thread, frame_idx, cp_index);
+                    let cached_result =
+                        execute_invokestatic_cached(shared, thread, frame_idx, cp_index);
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -5968,8 +6323,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         Err(e) => return Err(e),
                     }
                     match execute_invokestatic(shared, thread, frame_idx, cp_index) {
-                        Ok(CachedCallResult::FramePushed) => { frame_idx = thread.frames.len() - 1; continue; }
-                        Ok(_) => { continue; }
+                        Ok(CachedCallResult::FramePushed) => {
+                            frame_idx = thread.frames.len() - 1;
+                            continue;
+                        }
+                        Ok(_) => {
+                            continue;
+                        }
                         Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                             pending_runtime_error = Some((re, saved_pc));
                             continue;
@@ -5993,7 +6353,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // concrete (name, desc) → slot mapping regardless of
                     // whether the call-site is invokevirtual or
                     // invokeinterface.
-                    match execute_invokevirtual_vtable_fast(shared, thread, frame_idx, cp_index, saved_pc) {
+                    match execute_invokevirtual_vtable_fast(
+                        shared, thread, frame_idx, cp_index, saved_pc,
+                    ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -6012,7 +6374,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         Err(e) => return Err(e),
                     }
-                    let cached_result = execute_invokevirtual_cached(shared, thread, frame_idx, cp_index, saved_pc, false);
+                    let cached_result = execute_invokevirtual_cached(
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                    );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -6035,8 +6399,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // invokeinterface: thread is_interface=true so γ's stash
                     // arms the default-method rescue.
                     match execute_invoke_kind(shared, thread, frame_idx, cp_index, false, true) {
-                        Ok(CachedCallResult::FramePushed) => { frame_idx = thread.frames.len() - 1; continue; }
-                        Ok(_) => { continue; }
+                        Ok(CachedCallResult::FramePushed) => {
+                            frame_idx = thread.frames.len() - 1;
+                            continue;
+                        }
+                        Ok(_) => {
+                            continue;
+                        }
                         Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                             pending_runtime_error = Some((re, saved_pc));
                             continue;
@@ -6080,8 +6449,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         // release builds compile update_diag_ctx to an empty function.
         #[cfg(debug_assertions)]
         {
-            let opcode_byte = thread
-                .frames[frame_idx]
+            let opcode_byte = thread.frames[frame_idx]
                 .code
                 .get(saved_pc)
                 .copied()
@@ -6117,11 +6485,22 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let f = &thread.frames[frame_idx];
                     eprintln!(
                         "[DBG_UNDERFLOW] at {}.{}{} bci={} opcode={:?} stack_len={}",
-                        f.class_name(), f.method_name(), f.method_descriptor(),
-                        saved_pc, instruction, f.stack.len(),
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        saved_pc,
+                        instruction,
+                        f.stack.len(),
                     );
                     for (i, fr) in thread.frames.iter().enumerate().rev() {
-                        eprintln!("    [{}] {}.{}{} pc={}", i, fr.class_name(), fr.method_name(), fr.method_descriptor(), fr.pc);
+                        eprintln!(
+                            "    [{}] {}.{}{} pc={}",
+                            i,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.method_descriptor(),
+                            fr.pc
+                        );
                     }
                 }
             }
@@ -6167,11 +6546,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         // T18.K4 — route J/D through the tag-exact push so
                         // invoke* callees returning longs/doubles keep
                         // their tag on the caller's operand stack.
-                        push_invoke_return_value(
-                            &mut thread.frames[frame_idx].stack,
-                            v,
-                        )
-                        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+                        push_invoke_return_value(&mut thread.frames[frame_idx].stack, v)
+                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
                     }
                     continue;
                 }
@@ -6201,8 +6577,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // Convert VM-generated RuntimeErrors (AIOOBE, NPE, CCE, etc.)
                 // into real Java exception objects so they can be caught by
                 // Java try/catch blocks.
-                let exc_result =
-                    super::exceptions::throw_runtime_error(shared, thread, re);
+                let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
                 match exc_result {
                     MethodCallFailed::ExceptionThrown(exc) => {
                         // Route through the ExceptionThrown handler below
@@ -6224,7 +6599,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                             MethodCallFailed::InternalError(VmError::Runtime(e))
                                         })?;
                                     thread.frames[frame_idx].pc = handler_pc;
-                                    fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                                    fire_jvmti_exception_catch(
+                                        &thread.frames[frame_idx],
+                                        handler_pc,
+                                    );
                                     break;
                                 }
                                 None => {
@@ -6233,12 +6611,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                         // frame is unwinding an exception.
                                         pop_and_recycle_frame_with_reason(shared, thread, true);
                                         frame_idx -= 1;
-                                        exc_pc =
-                                            thread.frames[frame_idx].last_instr_pc;
+                                        exc_pc = thread.frames[frame_idx].last_instr_pc;
                                     } else {
-                                        return Err(MethodCallFailed::ExceptionThrown(
-                                            current_exc,
-                                        ));
+                                        return Err(MethodCallFailed::ExceptionThrown(current_exc));
                                     }
                                 }
                             }
@@ -6383,7 +6758,9 @@ pub(crate) fn synth_method_id(frame: &Frame) -> u64 {
 /// pushed). Costs a single Acquire load when no agent is attached.
 #[inline]
 fn fire_jvmti_method_entry(thread: &JvmThread, frame: &Frame) {
-    if !crate::runtime::jvmti::any_method_entry_listener_active() { return; }
+    if !crate::runtime::jvmti::any_method_entry_listener_active() {
+        return;
+    }
     let method_id = synth_method_id(frame);
     crate::runtime::jvmti::fire_method_entry(thread.thread_id.0, method_id);
 }
@@ -6391,7 +6768,9 @@ fn fire_jvmti_method_entry(thread: &JvmThread, frame: &Frame) {
 /// Fire `MethodExit` for a normal return with the given return value.
 #[inline]
 fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value: &Option<Value>) {
-    if !crate::runtime::jvmti::any_method_exit_listener_active() { return; }
+    if !crate::runtime::jvmti::any_method_exit_listener_active() {
+        return;
+    }
     let method_id = synth_method_id(frame);
     let lv = to_local_value(return_value.as_ref());
     crate::runtime::jvmti::fire_method_exit(thread.thread_id.0, method_id, false, lv);
@@ -6408,7 +6787,9 @@ fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value
 #[allow(dead_code)]
 #[inline]
 fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
-    if !crate::runtime::jvmti::any_method_exit_listener_active() { return; }
+    if !crate::runtime::jvmti::any_method_exit_listener_active() {
+        return;
+    }
     let method_id = synth_method_id(frame);
     crate::runtime::jvmti::fire_method_exit(
         thread.thread_id.0,
@@ -6423,10 +6804,18 @@ fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
 /// so that a single `NotifyFramePop` call yields exactly one event.
 #[inline]
 fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_exception: bool) {
-    if !crate::runtime::jvmti::any_frame_pop_listener_active() { return; }
-    if thread.frame_pop_requests.is_empty() { return; }
+    if !crate::runtime::jvmti::any_frame_pop_listener_active() {
+        return;
+    }
+    if thread.frame_pop_requests.is_empty() {
+        return;
+    }
     let current_depth = thread.frames.len().saturating_sub(1) as u32;
-    if let Some(pos) = thread.frame_pop_requests.iter().position(|d| *d == current_depth) {
+    if let Some(pos) = thread
+        .frame_pop_requests
+        .iter()
+        .position(|d| *d == current_depth)
+    {
         let frame = &thread.frames[thread.frames.len() - 1];
         let method_id = synth_method_id(frame);
         let tid = thread.thread_id.0;
@@ -6440,10 +6829,17 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
 /// (the per-event flag) plus one predicted branch.  No work otherwise.
 #[inline]
 fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
-    if !crate::runtime::jvmti::any_single_step_listener_active() { return; }
+    if !crate::runtime::jvmti::any_single_step_listener_active() {
+        return;
+    }
     // Per-thread gate: if this thread has not enabled single-step the
     // event does not fire even though some other thread may have.
-    if !thread.single_step_enabled.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    if !thread
+        .single_step_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
     let method_id = synth_method_id(frame);
     crate::runtime::jvmti::fire_single_step(thread.thread_id.0, method_id, saved_pc as i64);
 }
@@ -6477,10 +6873,16 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
             || cn.contains("OnWebApplicationCondition")
             || cn.contains("AutoConfigurationImportSelector")
             || cn.contains("AutoConfigurationImportFilter")
-            || (cn.contains("SpringFactoriesLoader") && (mn == "loadFactories" || mn == "loadFactoryNames" || mn == "load"))
+            || (cn.contains("SpringFactoriesLoader")
+                && (mn == "loadFactories" || mn == "loadFactoryNames" || mn == "load"))
             || cn.contains("ImportCandidates")
         {
-            eprintln!("[SBF-TRACE] enter {}.{}{}", cn, mn, frame_ref.method_descriptor());
+            eprintln!(
+                "[SBF-TRACE] enter {}.{}{}",
+                cn,
+                mn,
+                frame_ref.method_descriptor()
+            );
         }
     }
 }
@@ -6741,9 +7143,7 @@ fn route_jit_exception_through_method(
             if entry.catch_type == 0 {
                 continue;
             }
-        } else if throw_pc < entry.start_pc as usize
-            || throw_pc >= entry.end_pc as usize
-        {
+        } else if throw_pc < entry.start_pc as usize || throw_pc >= entry.end_pc as usize {
             continue;
         }
 
@@ -6837,7 +7237,13 @@ fn route_jit_exception_through_method(
         &mut thread.stacks_pool,
     );
     if crate::runtime::env_cache::frame_trace() {
-        eprintln!("[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+        eprintln!(
+            "[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}",
+            thread.frames.len(),
+            frame.class_name(),
+            frame.method_name(),
+            frame.method_descriptor()
+        );
     }
     push_frame_and_fire_entry(thread, frame);
     let new_idx = thread.frames.len() - 1;
@@ -6990,7 +7396,9 @@ fn execute_instruction(
         Instruction::Lload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
             // Mark KIND_LONG so a NaN-tag-colliding long pops bit-exact.
-            thread.frames[frame_idx].stack.push_compact_long_checked(cv)?;
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_long_checked(cv)?;
         }
         Instruction::Fload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
@@ -6998,7 +7406,9 @@ fn execute_instruction(
         }
         Instruction::Dload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact_double_checked(cv)?;
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_double_checked(cv)?;
         }
         Instruction::Aload(idx) => {
             // Mirror `Instruction::Astore` / fast-path `aload`: JNI may leave a
@@ -7006,10 +7416,7 @@ fn execute_instruction(
             // keep raw bits and the next `if_acmpeq` / `invokevirtual` can AV
             // (Letsgo after `ConfigurationClassEnhancer.enhance` in
             // `ConfigurationClassPostProcessor.enhanceConfigurationClasses`).
-            let v = coerce_value_for_return(
-                thread.frames[frame_idx].get_local(*idx),
-                b'L',
-            );
+            let v = coerce_value_for_return(thread.frames[frame_idx].get_local(*idx), b'L');
             thread.frames[frame_idx].stack.push(v)?;
         }
 
@@ -7045,16 +7452,11 @@ fn execute_instruction(
                 let npe_mname = thread.frames[frame_idx].method_name_arc();
                 let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
                 let npe_bci = thread.frames[frame_idx].last_instr_pc;
-                pop_object_ref_ctx_with(
-                    &mut thread.frames[frame_idx].stack,
-                    &shared.heap,
-                    || {
-                        helpful_npe_opcode_message_parts(
-                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
-                            &action, 1,
-                        )
-                    },
-                )?
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 1,
+                    )
+                })?
             } else {
                 pop_object_ref_ctx(
                     &mut thread.frames[frame_idx].stack,
@@ -7070,7 +7472,9 @@ fn execute_instruction(
                         let mth = thread.frames[frame_idx].method_name().to_string();
                         let pc = thread.frames[frame_idx].pc;
                         let alen = shared.heap.array_length(array_ref);
-                        eprintln!("AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}");
+                        eprintln!(
+                            "AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}"
+                        );
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
@@ -7129,18 +7533,22 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
-                if jep358 {
-                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
-                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Object,
-                    );
-                    helpful_npe_opcode_message_parts(
-                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
-                    )
-                } else {
-                    format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
-                }
-            })?;
+            let array_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                    if jep358 {
+                        let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                            crate::runtime::exceptions::helpful_npe::ArrayElemKind::Object,
+                        );
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                        )
+                    } else {
+                        format!(
+                            "aastore in {}.{} pc={}",
+                            _diag_class, _diag_method, _diag_pc
+                        )
+                    }
+                })?;
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws
@@ -7198,24 +7606,29 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
-                if jep358 {
-                    use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
-                    let elem = match instruction {
-                        Instruction::Iastore => ArrayElemKind::Int,
-                        Instruction::Fastore => ArrayElemKind::Float,
-                        Instruction::Bastore => ArrayElemKind::Byte,
-                        Instruction::Castore => ArrayElemKind::Char,
-                        _ => ArrayElemKind::Short, // Sastore
-                    };
-                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(elem);
-                    helpful_npe_opcode_message_parts(
-                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
-                    )
-                } else {
-                    format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
-                }
-            })?;
+            let array_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                    if jep358 {
+                        use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
+                        let elem = match instruction {
+                            Instruction::Iastore => ArrayElemKind::Int,
+                            Instruction::Fastore => ArrayElemKind::Float,
+                            Instruction::Bastore => ArrayElemKind::Byte,
+                            Instruction::Castore => ArrayElemKind::Char,
+                            _ => ArrayElemKind::Short, // Sastore
+                        };
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_array_store(elem);
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                        )
+                    } else {
+                        format!(
+                            "Xastore in {}.{} pc={}",
+                            _diag_class, _diag_method, _diag_pc
+                        )
+                    }
+                })?;
             // bc math-ec 0x4 smear hunt — see the Lastore twin below.
             if arrstore_enabled() {
                 arrstore_check(shared, thread, array_ref, index, "iastore");
@@ -7249,18 +7662,22 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
-                if jep358 {
-                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
-                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Long,
-                    );
-                    helpful_npe_opcode_message_parts(
-                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
-                    )
-                } else {
-                    format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
-                }
-            })?;
+            let array_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                    if jep358 {
+                        let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                            crate::runtime::exceptions::helpful_npe::ArrayElemKind::Long,
+                        );
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                        )
+                    } else {
+                        format!(
+                            "lastore in {}.{} pc={}",
+                            _diag_class, _diag_method, _diag_pc
+                        )
+                    }
+                })?;
             // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
             // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
             // points at reused memory whose "header" is garbage math data —
@@ -7290,18 +7707,22 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
-                if jep358 {
-                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
-                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Double,
-                    );
-                    helpful_npe_opcode_message_parts(
-                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
-                    )
-                } else {
-                    format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
-                }
-            })?;
+            let array_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                    if jep358 {
+                        let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                            crate::runtime::exceptions::helpful_npe::ArrayElemKind::Double,
+                        );
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                        )
+                    } else {
+                        format!(
+                            "dastore in {}.{} pc={}",
+                            _diag_class, _diag_method, _diag_pc
+                        )
+                    }
+                })?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -7477,8 +7898,10 @@ fn execute_instruction(
                 .get_local_compact(*index)
                 .as_int()
                 .unwrap_or(0);
-            thread.frames[frame_idx]
-                .set_local_compact(*index, CompactValue::int(val.wrapping_add(*constant as i32))); // Cast: bytecode operand decoding
+            thread.frames[frame_idx].set_local_compact(
+                *index,
+                CompactValue::int(val.wrapping_add(*constant as i32)),
+            ); // Cast: bytecode operand decoding
         }
 
         // -- Long arithmetic --
@@ -7494,7 +7917,9 @@ fn execute_instruction(
                 }
                 .into());
             }
-            thread.frames[frame_idx].stack.push_long(a.wrapping_div(b))?;
+            thread.frames[frame_idx]
+                .stack
+                .push_long(a.wrapping_div(b))?;
         }
         Instruction::Lrem => {
             let b = thread.frames[frame_idx].stack.pop_long()?;
@@ -7505,7 +7930,9 @@ fn execute_instruction(
                 }
                 .into());
             }
-            thread.frames[frame_idx].stack.push_long(a.wrapping_rem(b))?;
+            thread.frames[frame_idx]
+                .stack
+                .push_long(a.wrapping_rem(b))?;
         }
         Instruction::Lneg => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
@@ -7568,9 +7995,7 @@ fn execute_instruction(
         Instruction::I2l => {
             let v = thread.frames[frame_idx].stack.pop_int()?;
             // JVM spec: i2l sign-extends int to long (lossless).
-            thread.frames[frame_idx]
-                .stack
-                .push_long(i64::from(v))?;
+            thread.frames[frame_idx].stack.push_long(i64::from(v))?;
         }
         Instruction::I2f => {
             let v = thread.frames[frame_idx].stack.pop_int()?;
@@ -7582,9 +8007,7 @@ fn execute_instruction(
         Instruction::I2d => {
             let v = thread.frames[frame_idx].stack.pop_int()?;
             // JVM spec: i2d widens int to double (lossless).
-            thread.frames[frame_idx]
-                .stack
-                .push_double(f64::from(v))?;
+            thread.frames[frame_idx].stack.push_double(f64::from(v))?;
         }
         Instruction::L2i => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
@@ -7603,9 +8026,7 @@ fn execute_instruction(
             // JVM spec: l2d converts long to double (may lose precision on
             // magnitudes above 2^53).  The `as f64` cast matches the JVM's
             // round-to-nearest-even rule on all Rust-supported targets.
-            thread.frames[frame_idx]
-                .stack
-                .push_double(v as f64)?;
+            thread.frames[frame_idx].stack.push_double(v as f64)?;
         }
         Instruction::F2i => {
             let v = thread.frames[frame_idx].stack.pop_float()?;
@@ -7619,16 +8040,12 @@ fn execute_instruction(
             // in-range values truncate toward zero.  `float_to_long` handles
             // all four branches; a plain `as i64` cast would also saturate on
             // x86-64 but the helper keeps the semantics target-independent.
-            thread.frames[frame_idx]
-                .stack
-                .push_long(float_to_long(v))?;
+            thread.frames[frame_idx].stack.push_long(float_to_long(v))?;
         }
         Instruction::F2d => {
             let v = thread.frames[frame_idx].stack.pop_float()?;
             // JVM spec: f2d widens float to double (lossless).
-            thread.frames[frame_idx]
-                .stack
-                .push_double(f64::from(v))?;
+            thread.frames[frame_idx].stack.push_double(f64::from(v))?;
         }
         Instruction::D2i => {
             let v = thread.frames[frame_idx].stack.pop_double()?;
@@ -7877,7 +8294,8 @@ fn execute_instruction(
             } else {
                 *default
             };
-            thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize; // Widening: index conversion
+            thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
+            // Widening: index conversion
         }
         Instruction::Lookupswitch { default, pairs } => {
             let key = thread.frames[frame_idx].stack.pop_int()?;
@@ -7886,7 +8304,8 @@ fn execute_instruction(
                 .find(|(k, _)| *k == key)
                 .map(|(_, off)| *off)
                 .unwrap_or(*default);
-            thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize; // Widening: index conversion
+            thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
+            // Widening: index conversion
         }
 
         // -- Returns --
@@ -7968,9 +8387,7 @@ fn execute_instruction(
                 let cm = shared.class_manager.read();
                 cm.get_class(field.declaring_class_id)
                     .filter(|c| &*c.name == "java/lang/System")
-                    .and_then(|c| {
-                        c.fields.get(field.field_index).map(|f| f.name.to_string())
-                    })
+                    .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))
             };
             // T10.9.D K3 — Resolve the field's declared descriptor byte so
             // category-2 primitives (J/D) get pushed with the correct
@@ -7978,8 +8395,7 @@ fn execute_instruction(
             // The Value boundary would encode `Value::Long(x)` as untagged
             // raw bits; a later `to_value()` decodes those bits as
             // `Value::Double`, silently corrupting the long on every read.
-            let desc_byte =
-                Some(field.desc_byte);
+            let desc_byte = Some(field.desc_byte);
             if let Some(ref fname) = field_name_for_intercept {
                 if fname == "out" || fname == "err" {
                     // Honor System.setOut/setErr: a user-installed stream wins
@@ -8004,7 +8420,11 @@ fn execute_instruction(
                         Some(s) => s,
                         None => {
                             let (out, err) = shared.ensure_system_streams();
-                            if fname == "out" { out } else { err }
+                            if fname == "out" {
+                                out
+                            } else {
+                                err
+                            }
                         }
                     };
                     thread.frames[frame_idx]
@@ -8019,7 +8439,8 @@ fn execute_instruction(
                 } else {
                     // Normal getstatic for other System fields
                     ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                    let value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                    let value =
+                        get_static_shared(shared, field.declaring_class_id, field.field_index);
                     if field.is_volatile {
                         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                     }
@@ -8073,12 +8494,8 @@ fn execute_instruction(
             // `pop()?` decodes untagged long bits as Value::Double, which
             // then re-encodes as a double on the next push — silently
             // corrupting every J/D static.
-            let desc_byte =
-                Some(field.desc_byte);
-            let value = pop_static_field_value(
-                &mut thread.frames[frame_idx].stack,
-                desc_byte,
-            )?;
+            let desc_byte = Some(field.desc_byte);
+            let value = pop_static_field_value(&mut thread.frames[frame_idx].stack, desc_byte)?;
             // SATB barrier: log old static field value before overwriting
             let old_static = get_static_shared(shared, field.declaring_class_id, field.field_index);
             shared.heap.satb_barrier(old_static);
@@ -8118,17 +8535,22 @@ fn execute_instruction(
             } else {
                 None
             };
-            let obj_ref = pop_object_ref_ctx_with(
-                &mut thread.frames[frame_idx].stack,
-                &shared.heap,
-                || {
+            let obj_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if let Some((code, mname, mdesc, bci)) = &npe_parts {
                         let action = crate::runtime::exceptions::helpful_npe::action_read_field(
                             field_name.as_deref().unwrap_or("?"),
                         );
                         helpful_npe_opcode_message_parts(
-                            shared, current_class_id, code, mname, mdesc, *bci, &action, 0,
+                            shared,
+                            current_class_id,
+                            code,
+                            mname,
+                            mdesc,
+                            *bci,
+                            &action,
+                            0,
                         )
                     } else {
                         format!(
@@ -8136,8 +8558,7 @@ fn execute_instruction(
                             field_name.as_deref().unwrap_or("?")
                         )
                     }
-                },
-            )?;
+                })?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -8149,12 +8570,18 @@ fn execute_instruction(
             // only ever reachable when its var is set (and `any_field_diag()` is
             // then `true`). See `env_cache::any_field_diag`.
             if crate::runtime::env_cache::any_field_diag() {
-            if crate::runtime::env_cache::field_addr_dbg() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if let Some(fname) = field_name.as_deref() {
-                    if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
-                        let raw = shared.heap.get_field(obj_ref, field.field_index);
-                        eprintln!(
+                if crate::runtime::env_cache::field_addr_dbg() {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some(fname) = field_name.as_deref() {
+                        if matches!(
+                            fname,
+                            "unsharedLongs"
+                                | "threadFactory"
+                                | "runningThreads"
+                                | "submittedTaskCounter"
+                        ) {
+                            let raw = shared.heap.get_field(obj_ref, field.field_index);
+                            eprintln!(
                             "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
                             fname,
                             obj_ref.as_ptr() as usize,
@@ -8163,57 +8590,61 @@ fn execute_instruction(
                             matches!(raw, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
-                    }
-                }
-            }
-            // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
-            // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
-            // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
-            // Log the Java frame stack + field + a Rust backtrace (to name the
-            // native that drove this method via invoke_virtual), then raise NPE
-            // instead of dereferencing the wild pointer.
-            if crate::runtime::env_cache::badrecv_dbg() {
-                let p = obj_ref.as_ptr() as usize;
-                if p != 0 && shared.heap.is_heap_addr(p).is_none() {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static N: AtomicUsize = AtomicUsize::new(0);
-                    let n = N.fetch_add(1, Ordering::Relaxed);
-                    if n < 8 {
-                        let field_name = resolve_field_name(shared, current_class_id, *index);
-                        let cn = thread.frames[frame_idx].class_name().to_string();
-                        let mn = thread.frames[frame_idx].method_name().to_string();
-                        let pc = thread.frames[frame_idx].pc;
-                        eprintln!(
-                            "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
-                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
-                            field.field_index, field.is_reference,
-                        );
-                        eprintln!("[BADRECV #{n}] Java frames (innermost first):");
-                        for f in thread.frames.iter().rev().take(24) {
-                            eprintln!("    {}.{}", f.class_name(), f.method_name());
                         }
-                        eprintln!(
-                            "[BADRECV #{n}] Rust backtrace:\n{}",
-                            std::backtrace::Backtrace::force_capture()
-                        );
-                        use std::io::Write;
-                        let _ = std::io::stderr().flush();
                     }
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
-                    }
-                    .into());
                 }
-            }
-            if crate::runtime::env_cache::hashtableofint_trace() {
-                let cname = thread.frames[frame_idx].class_name();
-                let mname = thread.frames[frame_idx].method_name();
-                if cname.contains("HashtableOfInt") {
-                    let field_name = resolve_field_name(shared, current_class_id, *index);
-                    let v = shared.heap.get_field(obj_ref, field.field_index);
-                    let nf = shared.class_manager.read().get_class(field.declaring_class_id)
-                        .map(|c| c.num_total_fields).unwrap_or(0);
-                    eprintln!(
+                // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
+                // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
+                // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
+                // Log the Java frame stack + field + a Rust backtrace (to name the
+                // native that drove this method via invoke_virtual), then raise NPE
+                // instead of dereferencing the wild pointer.
+                if crate::runtime::env_cache::badrecv_dbg() {
+                    let p = obj_ref.as_ptr() as usize;
+                    if p != 0 && shared.heap.is_heap_addr(p).is_none() {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static N: AtomicUsize = AtomicUsize::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 {
+                            let field_name = resolve_field_name(shared, current_class_id, *index);
+                            let cn = thread.frames[frame_idx].class_name().to_string();
+                            let mn = thread.frames[frame_idx].method_name().to_string();
+                            let pc = thread.frames[frame_idx].pc;
+                            eprintln!(
+                                "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
+                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
+                                field.field_index, field.is_reference,
+                            );
+                            eprintln!("[BADRECV #{n}] Java frames (innermost first):");
+                            for f in thread.frames.iter().rev().take(24) {
+                                eprintln!("    {}.{}", f.class_name(), f.method_name());
+                            }
+                            eprintln!(
+                                "[BADRECV #{n}] Rust backtrace:\n{}",
+                                std::backtrace::Backtrace::force_capture()
+                            );
+                            use std::io::Write;
+                            let _ = std::io::stderr().flush();
+                        }
+                        return Err(RuntimeError::NullPointerException {
+                            message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
+                        }
+                        .into());
+                    }
+                }
+                if crate::runtime::env_cache::hashtableofint_trace() {
+                    let cname = thread.frames[frame_idx].class_name();
+                    let mname = thread.frames[frame_idx].method_name();
+                    if cname.contains("HashtableOfInt") {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        let v = shared.heap.get_field(obj_ref, field.field_index);
+                        let nf = shared
+                            .class_manager
+                            .read()
+                            .get_class(field.declaring_class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        eprintln!(
                         "[HTI-GET] {cname}.{mname} cp#{idx} fld={field_name:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
                         idx = *index,
                         decl = field.declaring_class_id,
@@ -8221,28 +8652,28 @@ fn execute_instruction(
                         ir = field.is_reference,
                         op = obj_ref.as_ptr(),
                     );
+                    }
                 }
-            }
-            if crate::runtime::env_cache::bd_debug() {
-                let mname = thread.frames[frame_idx].method_name().to_string();
-                let cname = thread.frames[frame_idx].class_name().to_string();
-                if cname.contains("BigDecimal") && mname == "intValue" {
-                    let field_name = resolve_field_name(shared, current_class_id, *index);
-                    let v = if field.is_volatile {
-                        shared.heap.get_field_volatile(obj_ref, field.field_index)
-                    } else {
-                        shared.heap.get_field(obj_ref, field.field_index)
-                    };
-                    eprintln!("[Getfield in BigDecimal.intValue] cp_index={} field_name={:?} field_index={} is_ref={} obj={:p} value={:?}",
+                if crate::runtime::env_cache::bd_debug() {
+                    let mname = thread.frames[frame_idx].method_name().to_string();
+                    let cname = thread.frames[frame_idx].class_name().to_string();
+                    if cname.contains("BigDecimal") && mname == "intValue" {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        let v = if field.is_volatile {
+                            shared.heap.get_field_volatile(obj_ref, field.field_index)
+                        } else {
+                            shared.heap.get_field(obj_ref, field.field_index)
+                        };
+                        eprintln!("[Getfield in BigDecimal.intValue] cp_index={} field_name={:?} field_index={} is_ref={} obj={:p} value={:?}",
                               *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
+                    }
                 }
-            }
             } // end `if any_field_diag()` — consolidated getfield diagnostics
-            // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
-            // records only is_reference/is_volatile, so we re-read the first
-            // byte of the descriptor from the constant pool to choose the
-            // direct CompactValue push path for J/D.  Two field loads — no
-            // hashmap work on the fast path.
+              // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
+              // records only is_reference/is_volatile, so we re-read the first
+              // byte of the descriptor from the constant pool to choose the
+              // direct CompactValue push path for J/D.  Two field loads — no
+              // hashmap work on the fast path.
             let desc_byte = Some(field.desc_byte);
             // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Fast path: no
             // watchpoint registered ⇒ one HashMap read returning None.
@@ -8303,9 +8734,7 @@ fn execute_instruction(
                     Value::Long(x) => f64::from_bits(x as u64),
                     Value::Int(x) => x as f64,
                     Value::Object(None) | Value::Uninitialized => 0.0,
-                    Value::Object(Some(raw)) => {
-                        f64::from_bits(raw.as_ptr() as usize as u64)
-                    }
+                    Value::Object(Some(raw)) => f64::from_bits(raw.as_ptr() as usize as u64),
                     Value::Float(x) => x as f64,
                     Value::ReturnAddress(pc) => pc as f64,
                 };
@@ -8444,18 +8873,22 @@ fn execute_instruction(
             } else {
                 None
             };
-            let obj_ref = pop_object_ref_ctx_with(
-                &mut thread.frames[frame_idx].stack,
-                &shared.heap,
-                || {
+            let obj_ref =
+                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if let Some((code, mname, mdesc, bci)) = &npe_parts {
-                        let action =
-                            crate::runtime::exceptions::helpful_npe::action_assign_field(
-                                field_name.as_deref().unwrap_or("?"),
-                            );
+                        let action = crate::runtime::exceptions::helpful_npe::action_assign_field(
+                            field_name.as_deref().unwrap_or("?"),
+                        );
                         helpful_npe_opcode_message_parts(
-                            shared, current_class_id, code, mname, mdesc, *bci, &action, 1,
+                            shared,
+                            current_class_id,
+                            code,
+                            mname,
+                            mdesc,
+                            *bci,
+                            &action,
+                            1,
                         )
                     } else {
                         format!(
@@ -8463,8 +8896,7 @@ fn execute_instruction(
                             field_name.as_deref().unwrap_or("?")
                         )
                     }
-                },
-            );
+                });
             // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
             // locals when a putfield pops a null receiver. Diagnoses the
             // "Cannot write field X because the object is null" family (a JIT'd
@@ -8514,14 +8946,20 @@ fn execute_instruction(
             // byte-for-byte identical to the original sequence. See
             // `env_cache::any_field_diag`.
             if crate::runtime::env_cache::any_field_diag() {
-            // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
-            // fields — object address + resolved slot — to localize a write
-            // that doesn't reach the read site.
-            if crate::runtime::env_cache::field_addr_dbg() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if let Some(fname) = field_name.as_deref() {
-                    if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
-                        eprintln!(
+                // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
+                // fields — object address + resolved slot — to localize a write
+                // that doesn't reach the read site.
+                if crate::runtime::env_cache::field_addr_dbg() {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some(fname) = field_name.as_deref() {
+                        if matches!(
+                            fname,
+                            "unsharedLongs"
+                                | "threadFactory"
+                                | "runningThreads"
+                                | "submittedTaskCounter"
+                        ) {
+                            eprintln!(
                             "[FIELDADDR] PUT {} obj=0x{:x} slot={} num_slots={} valObj={} in {}",
                             fname,
                             obj_ref.as_ptr() as usize,
@@ -8530,51 +8968,58 @@ fn execute_instruction(
                             matches!(value, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
+                        }
                     }
                 }
-            }
-            // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
-            // receiver reaching putfield. The corruption's reliable face is the
-            // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
-            // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
-            // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
-            // (real obj forwarded → forwarding_ptr low bits). Dump the Java
-            // stack + receiver so we can trace where the stale ref originates
-            // (operand-stack slot not remapped after a young GC). Rate-limited.
-            if straystack_enabled() {
-                let h = shared.heap.get_header(obj_ref);
-                let ns = h.num_slots as usize;
-                if field.field_index >= ns || h.num_slots > (1 << 24) {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static N: AtomicUsize = AtomicUsize::new(0);
-                    let k = N.fetch_add(1, Ordering::Relaxed);
-                    if k < 12 {
-                        let field_name = resolve_field_name(shared, current_class_id, *index);
-                        eprintln!(
+                // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
+                // receiver reaching putfield. The corruption's reliable face is the
+                // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
+                // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
+                // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
+                // (real obj forwarded → forwarding_ptr low bits). Dump the Java
+                // stack + receiver so we can trace where the stale ref originates
+                // (operand-stack slot not remapped after a young GC). Rate-limited.
+                if straystack_enabled() {
+                    let h = shared.heap.get_header(obj_ref);
+                    let ns = h.num_slots as usize;
+                    if field.field_index >= ns || h.num_slots > (1 << 24) {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static N: AtomicUsize = AtomicUsize::new(0);
+                        let k = N.fetch_add(1, Ordering::Relaxed);
+                        if k < 12 {
+                            let field_name = resolve_field_name(shared, current_class_id, *index);
+                            eprintln!(
                             "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
                             obj_ref.as_ptr() as usize,
                             h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
                             field_name.as_deref().unwrap_or("?"),
                             field.field_index, field.is_reference, value,
                         );
-                        eprintln!("[straystack] Java stack (top first):");
-                        for f in thread.frames.iter().rev().take(28) {
-                            eprintln!(
-                                "[straystack]   {}.{}{} pc={}",
-                                f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
-                            );
+                            eprintln!("[straystack] Java stack (top first):");
+                            for f in thread.frames.iter().rev().take(28) {
+                                eprintln!(
+                                    "[straystack]   {}.{}{} pc={}",
+                                    f.class_name(),
+                                    f.method_name(),
+                                    f.method_descriptor(),
+                                    f.pc,
+                                );
+                            }
                         }
                     }
                 }
-            }
-            if crate::runtime::env_cache::hashtableofint_trace() {
-                let cname = thread.frames[frame_idx].class_name();
-                let mname = thread.frames[frame_idx].method_name();
-                if cname.contains("HashtableOfInt") {
-                    let field_name = resolve_field_name(shared, current_class_id, *index);
-                    let nf = shared.class_manager.read().get_class(field.declaring_class_id)
-                        .map(|c| c.num_total_fields).unwrap_or(0);
-                    eprintln!(
+                if crate::runtime::env_cache::hashtableofint_trace() {
+                    let cname = thread.frames[frame_idx].class_name();
+                    let mname = thread.frames[frame_idx].method_name();
+                    if cname.contains("HashtableOfInt") {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        let nf = shared
+                            .class_manager
+                            .read()
+                            .get_class(field.declaring_class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        eprintln!(
                         "[HTI-PUT] {cname}.{mname} cp#{idx} fld={fn2:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
                         idx = *index,
                         fn2 = field_name,
@@ -8584,27 +9029,45 @@ fn execute_instruction(
                         op = obj_ref.as_ptr(),
                         v = value,
                     );
+                    }
                 }
-            }
-            if crate::runtime::env_cache::baos_dbg() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
-                    let cm = shared.class_manager.read();
-                    let recv_cid = shared.heap.class_id_of(obj_ref);
-                    let rn = cm.get_class(recv_cid).map(|c| c.name.to_string()).unwrap_or_default();
-                    let rnf = cm.get_class(recv_cid).map(|c| c.num_total_fields).unwrap_or(0);
-                    let rffi = cm.get_class(recv_cid).map(|c| c.first_field_index).unwrap_or(0);
-                    let dn = cm.get_class(field.declaring_class_id).map(|c| c.name.to_string()).unwrap_or_default();
-                    let dnf = cm.get_class(field.declaring_class_id).map(|c| c.num_total_fields).unwrap_or(0);
-                    let dffi = cm.get_class(field.declaring_class_id).map(|c| c.first_field_index).unwrap_or(0);
-                    eprintln!(
+                if crate::runtime::env_cache::baos_dbg() {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
+                        let cm = shared.class_manager.read();
+                        let recv_cid = shared.heap.class_id_of(obj_ref);
+                        let rn = cm
+                            .get_class(recv_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        let rnf = cm
+                            .get_class(recv_cid)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let rffi = cm
+                            .get_class(recv_cid)
+                            .map(|c| c.first_field_index)
+                            .unwrap_or(0);
+                        let dn = cm
+                            .get_class(field.declaring_class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        let dnf = cm
+                            .get_class(field.declaring_class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let dffi = cm
+                            .get_class(field.declaring_class_id)
+                            .map(|c| c.first_field_index)
+                            .unwrap_or(0);
+                        eprintln!(
                         "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
                         fld = field_name, fi = field.field_index, v = value,
                     );
+                    }
                 }
-            }
             } // end `if any_field_diag()` — consolidated putfield diagnostics
-            // T17.Δ.4 — JVMTI FieldModification watchpoint.
+              // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
                 crate::runtime::jvmti::fire_field_modification_if_watched(
@@ -8625,9 +9088,7 @@ fn execute_instruction(
             // and nulls don't enter SATB.
             let old_value = shared.heap.get_field(obj_ref, field.field_index);
             if let Value::Object(Some(old_ref)) = old_value {
-                shared
-                    .heap
-                    .write_barrier_pre(std::ptr::null_mut(), old_ref);
+                shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
             }
             if field.is_volatile {
                 shared
@@ -8734,7 +9195,10 @@ fn execute_instruction(
                 eprintln!("[NSEE-TRACE] new java/util/NoSuchElementException at:");
                 let cm = shared.class_manager.read();
                 for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                    let cn = cm.get_class(f.class_id).map(|c| c.name.clone()).unwrap_or_default();
+                    let cn = cm
+                        .get_class(f.class_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
                     eprintln!("[NSEE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                 }
             }
@@ -8767,7 +9231,13 @@ fn execute_instruction(
                 }
             };
             // Widening: index conversion
-            let arr = gc_alloc_array(shared, thread, ClassId::new(0), element_type, length as usize)?;
+            let arr = gc_alloc_array(
+                shared,
+                thread,
+                ClassId::new(0),
+                element_type,
+                length as usize,
+            )?;
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(arr)))?;
@@ -8809,7 +9279,13 @@ fn execute_instruction(
                 })?
             };
             // Widening: index conversion
-            let arr = gc_alloc_array(shared, thread, component_class_id, ArrayElementType::Reference, length as usize)?;
+            let arr = gc_alloc_array(
+                shared,
+                thread,
+                component_class_id,
+                ArrayElementType::Reference,
+                length as usize,
+            )?;
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(arr)))?;
@@ -8840,11 +9316,9 @@ fn execute_instruction(
                 &shared.heap,
                 || {
                     if jep358 {
-                        let action =
-                            crate::runtime::exceptions::helpful_npe::action_array_length();
+                        let action = crate::runtime::exceptions::helpful_npe::action_array_length();
                         helpful_npe_opcode_message_parts(
-                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
-                            &action, 0,
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
                         )
                     } else {
                         format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")
@@ -8856,7 +9330,13 @@ fn execute_instruction(
                     if crate::runtime::env_cache::iae_trace_os() {
                         eprintln!("[ARRAYLEN-DIAG] failure in {current_class_name}.{mname}{mdesc} pc={pc}");
                         for (i, f) in thread.frames.iter().enumerate().rev() {
-                            eprintln!("  frame[{i}]: {}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc);
+                            eprintln!(
+                                "  frame[{i}]: {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc
+                            );
                         }
                     }
                     return Err(e);
@@ -8968,7 +9448,12 @@ fn execute_instruction(
                                     .get_class(f.class_id)
                                     .map(|c| c.name.clone())
                                     .unwrap_or_default();
-                                eprintln!("IAE-ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                                eprintln!(
+                                    "IAE-ATHROW-STK[{i}] {}.{} pc={}",
+                                    cn,
+                                    f.method_name(),
+                                    f.pc
+                                );
                             }
                         }
                     }
@@ -8988,7 +9473,8 @@ fn execute_instruction(
                             .unwrap_or_default();
                         let mut msg = String::from("<no msg>");
                         for fi in 0..8 {
-                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi) {
+                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi)
+                            {
                                 if let Some(s) = read_java_string(&shared.heap, msg_ref) {
                                     if !s.is_empty() {
                                         msg = format!("field{fi}={s}");
@@ -9034,7 +9520,8 @@ fn execute_instruction(
                         // but synthetic stubs may differ — so probe a range).
                         let mut detail = String::new();
                         for fi in 0..8 {
-                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi) {
+                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi)
+                            {
                                 if let Some(s) = read_java_string(&shared.heap, msg_ref) {
                                     if !s.is_empty() {
                                         detail = s;
@@ -9043,8 +9530,7 @@ fn execute_instruction(
                                 }
                             }
                         }
-                        if exc_class_name == "java/lang/NullPointerException"
-                            && detail == "charset"
+                        if exc_class_name == "java/lang/NullPointerException" && detail == "charset"
                         {
                             eprintln!(
                                 "[CHARSET-NPE] NullPointerException(\"charset\") thrown via athrow \
@@ -9089,16 +9575,26 @@ fn execute_instruction(
                             "java/lang/OutOfMemoryError" => Some("java.lang.OutOfMemoryError"),
                             "java/lang/StackOverflowError" => Some("java.lang.StackOverflowError"),
                             "java/lang/AssertionError" => Some("java.lang.AssertionError"),
-                            "java/lang/NoClassDefFoundError" => Some("java.lang.NoClassDefFoundError"),
+                            "java/lang/NoClassDefFoundError" => {
+                                Some("java.lang.NoClassDefFoundError")
+                            }
                             "java/lang/NoSuchFieldError" => Some("java.lang.NoSuchFieldError"),
                             "java/lang/NoSuchMethodError" => Some("java.lang.NoSuchMethodError"),
-                            "java/lang/AbstractMethodError" => Some("java.lang.AbstractMethodError"),
-                            "java/lang/IncompatibleClassChangeError" => Some("java.lang.IncompatibleClassChangeError"),
+                            "java/lang/AbstractMethodError" => {
+                                Some("java.lang.AbstractMethodError")
+                            }
+                            "java/lang/IncompatibleClassChangeError" => {
+                                Some("java.lang.IncompatibleClassChangeError")
+                            }
                             "java/lang/LinkageError" => Some("java.lang.LinkageError"),
                             "java/lang/VerifyError" => Some("java.lang.VerifyError"),
                             "java/lang/ClassFormatError" => Some("java.lang.ClassFormatError"),
-                            "java/lang/UnsatisfiedLinkError" => Some("java.lang.UnsatisfiedLinkError"),
-                            "java/lang/ExceptionInInitializerError" => Some("java.lang.ExceptionInInitializerError"),
+                            "java/lang/UnsatisfiedLinkError" => {
+                                Some("java.lang.UnsatisfiedLinkError")
+                            }
+                            "java/lang/ExceptionInInitializerError" => {
+                                Some("java.lang.ExceptionInInitializerError")
+                            }
                             "java/lang/InternalError" => Some("java.lang.InternalError"),
                             _ => None,
                         };
@@ -9110,15 +9606,11 @@ fn execute_instruction(
                             // refcount bump instead of an allocation.
                             static EMPTY_MSG: std::sync::OnceLock<Arc<str>> =
                                 std::sync::OnceLock::new();
-                            let empty_msg =
-                                EMPTY_MSG.get_or_init(|| Arc::from(""));
+                            let empty_msg = EMPTY_MSG.get_or_init(|| Arc::from(""));
                             let message: Arc<str> = match shared.heap.get_field(obj_ref, 1) {
-                                Value::Object(Some(msg_ref)) => {
-                                    Arc::from(
-                                        read_java_string(&shared.heap, msg_ref)
-                                            .unwrap_or_default(),
-                                    )
-                                }
+                                Value::Object(Some(msg_ref)) => Arc::from(
+                                    read_java_string(&shared.heap, msg_ref).unwrap_or_default(),
+                                ),
                                 _ => Arc::clone(empty_msg),
                             };
                             let now_ns = std::time::SystemTime::now()
@@ -9143,8 +9635,7 @@ fn execute_instruction(
                     // operand stack (depth 0). Falls back to the legacy
                     // `cannot throw null` text when the flag is off.
                     let message = if crate::runtime::env_cache::helpful_npe_opcodes() {
-                        let action =
-                            crate::runtime::exceptions::helpful_npe::action_throw();
+                        let action = crate::runtime::exceptions::helpful_npe::action_throw();
                         Some(helpful_npe_opcode_message(
                             shared, thread, frame_idx, &action, 0,
                         ))
@@ -9216,7 +9707,11 @@ fn execute_instruction(
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
-                            || annotation_proxy_satisfies_target(shared, obj_ref, &target_class_name)
+                            || annotation_proxy_satisfies_target(
+                                shared,
+                                obj_ref,
+                                &target_class_name,
+                            )
                     };
                     if !cast_ok {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -9252,18 +9747,15 @@ fn execute_instruction(
                         // app loader is the spec-correct standin and lets
                         // the caller's `loadClass` chain proceed instead
                         // of poisoning `<clinit>` with an EIIE.
-                        let is_classloader_target = target_class_name
-                            == "java/lang/ClassLoader"
+                        let is_classloader_target = target_class_name == "java/lang/ClassLoader"
                             || target_class_name == "java/security/SecureClassLoader"
-                            || target_class_name
-                                == "jdk/internal/loader/BuiltinClassLoader"
+                            || target_class_name == "jdk/internal/loader/BuiltinClassLoader"
                             || target_class_name
                                 == "jdk/internal/loader/ClassLoaders$AppClassLoader"
                             || target_class_name
                                 == "jdk/internal/loader/ClassLoaders$PlatformClassLoader";
-                        let obj_is_bare_object =
-                            actual_class_id == ClassId::new(0)
-                                || obj_class_name == "java/lang/Object";
+                        let obj_is_bare_object = actual_class_id == ClassId::new(0)
+                            || obj_class_name == "java/lang/Object";
                         if is_classloader_target && obj_is_bare_object {
                             if let Some(loader_obj) =
                                 cratonvm_native_builtins::classloader::peek_app_loader()
@@ -9351,7 +9843,11 @@ fn execute_instruction(
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
-                            || annotation_proxy_satisfies_target(shared, obj_ref, &target_class_name)
+                            || annotation_proxy_satisfies_target(
+                                shared,
+                                obj_ref,
+                                &target_class_name,
+                            )
                         {
                             1
                         } else {
@@ -9405,11 +9901,9 @@ fn execute_instruction(
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
                     if jep358 {
-                        let action =
-                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        let action = crate::runtime::exceptions::helpful_npe::action_monitor();
                         helpful_npe_opcode_message_parts(
-                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
-                            &action, 0,
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
                         )
                     } else {
                         // SAFETY: cls/mth originate from `frame_ref.inner`,
@@ -9473,7 +9967,9 @@ fn execute_instruction(
                     // exit event is emitted, but the gate is in place so the
                     // exit handler below can safely consult it without
                     // re-checking the (potentially flipped) global flag.
-                    shared.monitors.set_jfr_enter_recorded(obj_ref, thread.thread_id);
+                    shared
+                        .monitors
+                        .set_jfr_enter_recorded(obj_ref, thread.thread_id);
                 }
             }
         }
@@ -9493,11 +9989,9 @@ fn execute_instruction(
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
                     if jep358 {
-                        let action =
-                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        let action = crate::runtime::exceptions::helpful_npe::action_monitor();
                         helpful_npe_opcode_message_parts(
-                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
-                            &action, 0,
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 0,
                         )
                     } else {
                         // SAFETY: see Monitorenter — frame metadata is stable
@@ -9537,7 +10031,8 @@ fn execute_instruction(
             thread.frames[frame_idx]
                 .stack
                 .push(Value::ReturnAddress(return_addr))?;
-            thread.frames[frame_idx].pc = (saved_pc as i64 + *offset as i64) as usize; // Widening: index conversion
+            thread.frames[frame_idx].pc = (saved_pc as i64 + *offset as i64) as usize;
+            // Widening: index conversion
         }
         Instruction::Ret(index) => {
             let val = thread.frames[frame_idx].get_local(*index);
@@ -9670,9 +10165,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     }
 
     // Always-true targets per the `Proxy` contract.
-    if target_class_name == "java/io/Serializable"
-        || target_class_name == "java/lang/Object"
-    {
+    if target_class_name == "java/io/Serializable" || target_class_name == "java/lang/Object" {
         return true;
     }
 
@@ -9766,11 +10259,7 @@ pub(crate) fn proxy_instance_satisfies_target(
         }
         // Superinterface walk: target is a superinterface of `iface_cid`?
         if let Some(tcid) = target_cid {
-            if shared
-                .class_manager
-                .read()
-                .is_subclass_of(iface_cid, tcid)
-            {
+            if shared.class_manager.read().is_subclass_of(iface_cid, tcid) {
                 return true;
             }
         }
@@ -9797,13 +10286,13 @@ fn lambda_proxy_satisfies(
     if let Some(call_site) = proxies.get(&obj_class_id) {
         let iface_name = call_site.functional_interface.clone();
         drop(proxies); // release lock before loading
-        // Lambdas produced by LambdaMetafactory.altMetafactory (used by e.g.
-        // `Comparator.comparing`, `Comparator.comparingInt`) always include
-        // `java.io.Serializable` as a marker interface. We don't currently track
-        // the altMetafactory flags, so accept Serializable universally — this
-        // matches the observable behavior of the real JDK's `altMetafactory`
-        // with FLAG_SERIALIZABLE and keeps the checkcast at pc=11 in
-        // `Comparator.comparing(Function)` from failing.
+                       // Lambdas produced by LambdaMetafactory.altMetafactory (used by e.g.
+                       // `Comparator.comparing`, `Comparator.comparingInt`) always include
+                       // `java.io.Serializable` as a marker interface. We don't currently track
+                       // the altMetafactory flags, so accept Serializable universally — this
+                       // matches the observable behavior of the real JDK's `altMetafactory`
+                       // with FLAG_SERIALIZABLE and keeps the checkcast at pc=11 in
+                       // `Comparator.comparing(Function)` from failing.
         let target_name = shared
             .class_manager
             .read()
@@ -9831,7 +10320,10 @@ fn lambda_proxy_satisfies(
 /// Compute the JVM array descriptor (e.g. `"[I"`, `"[Ljava/lang/String;"`)
 /// for a heap object that is known to be an array. Returns `None` if the
 /// object is not actually an array.
-pub(crate) fn array_descriptor_of(shared: &SharedVm, obj_ref: cratonvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn array_descriptor_of(
+    shared: &SharedVm,
+    obj_ref: cratonvm_types::ObjectRef,
+) -> Option<String> {
     if shared.heap.kind_of(obj_ref) != cratonvm_types::ObjectKind::Array {
         return None;
     }
@@ -9940,19 +10432,11 @@ pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_n
     if src_comp == "java/lang/Object" {
         return true;
     }
-    let src_id = match shared
-        .class_manager
-        .write()
-        .load_class(&src_comp)
-    {
+    let src_id = match shared.class_manager.write().load_class(&src_comp) {
         Ok(id) => id,
         Err(_) => return false,
     };
-    let tgt_id = match shared
-        .class_manager
-        .write()
-        .load_class(&tgt_comp)
-    {
+    let tgt_id = match shared.class_manager.write().load_class(&tgt_comp) {
         Ok(id) => id,
         Err(_) => return false,
     };
@@ -10160,11 +10644,7 @@ fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> b
 /// relationships in the ClassStore because they were created in Rust without
 /// loading a real .class file. This function provides a name-based fallback
 /// for common patterns where a concrete inner class should satisfy an interface.
-fn synthetic_implements(
-    shared: &SharedVm,
-    obj_class_id: ClassId,
-    target_class_name: &str,
-) -> bool {
+fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_name: &str) -> bool {
     let obj_class_name = shared
         .class_manager
         .read()
@@ -10315,9 +10795,10 @@ fn convert_ldc_class_format_error(
     thread: &mut JvmThread,
     err: MethodCallFailed,
 ) -> MethodCallFailed {
-    if let MethodCallFailed::InternalError(VmError::Linkage(
-        LinkageError::ClassFormatError { ref message, .. },
-    )) = err
+    if let MethodCallFailed::InternalError(VmError::Linkage(LinkageError::ClassFormatError {
+        ref message,
+        ..
+    })) = err
     {
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -10374,10 +10855,12 @@ fn execute_ldc(
             // `ClassFormatError` (B5) rather than an uncatchable
             // `VmError::Internal`, so unverified bytecode under
             // `skip_verification` does not hard-abort the VM.
-            .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
-                class_name: class.name.to_string(),
-                message: format!("ldc: invalid constant pool index {index}"),
-            }))?;
+            .ok_or_else(|| {
+                VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: class.name.to_string(),
+                    message: format!("ldc: invalid constant pool index {index}"),
+                })
+            })?;
 
         match entry {
             ConstantPoolEntry::Integer(v) => LdcValue::Int(*v),
@@ -10391,10 +10874,12 @@ fn execute_ldc(
                     let s = class
                         .constant_pool
                         .get_utf8(*string_index)
-                        .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
-                            class_name: class.name.to_string(),
-                            message: format!("ldc: invalid string_index {string_index}"),
-                        }))?
+                        .ok_or_else(|| {
+                            VmError::Linkage(LinkageError::ClassFormatError {
+                                class_name: class.name.to_string(),
+                                message: format!("ldc: invalid string_index {string_index}"),
+                            })
+                        })?
                         .to_string();
                     LdcValue::Str(s)
                 }
@@ -10403,10 +10888,12 @@ fn execute_ldc(
                 let name = class
                     .constant_pool
                     .get_utf8(*name_index)
-                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
-                        class_name: class.name.to_string(),
-                        message: format!("ldc: invalid class name_index {name_index}"),
-                    }))?
+                    .ok_or_else(|| {
+                        VmError::Linkage(LinkageError::ClassFormatError {
+                            class_name: class.name.to_string(),
+                            message: format!("ldc: invalid class name_index {name_index}"),
+                        })
+                    })?
                     .to_string();
                 LdcValue::ClassRef(name)
             }
@@ -10417,12 +10904,14 @@ fn execute_ldc(
                 let (name, descriptor) = class
                     .constant_pool
                     .get_name_and_type(*name_and_type_index)
-                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
-                        class_name: class.name.to_string(),
-                        message: format!(
-                            "ldc: invalid condy name_and_type at #{name_and_type_index}"
-                        ),
-                    }))?;
+                    .ok_or_else(|| {
+                        VmError::Linkage(LinkageError::ClassFormatError {
+                            class_name: class.name.to_string(),
+                            message: format!(
+                                "ldc: invalid condy name_and_type at #{name_and_type_index}"
+                            ),
+                        })
+                    })?;
                 LdcValue::Dynamic {
                     bsm_index: *bootstrap_method_attr_index,
                     name: name.to_string(),
@@ -10445,21 +10934,31 @@ fn execute_ldc(
         LdcValue::Float(v) => thread.frames[frame_idx].stack.push(Value::Float(v))?,
         LdcValue::Str(s) => {
             let obj_ref = create_java_string(shared, &s);
-            thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::WideStr(units) => {
             let obj_ref = create_java_string_from_units(shared, &units);
-            thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::ClassRef(class_name) => {
             if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
-                eprintln!("[DBG_TOARRAY] LDC class={:?} in {}", class_name, thread.frames[frame_idx].class_name());
+                eprintln!(
+                    "[DBG_TOARRAY] LDC class={:?} in {}",
+                    class_name,
+                    thread.frames[frame_idx].class_name()
+                );
             }
             let class_id = shared
                 .load_class_concurrent(&class_name)
                 .map_err(|e| convert_class_not_found(shared, thread, &class_name, e.into()))?;
             let mirror = get_or_create_class_mirror(shared, class_id);
-            thread.frames[frame_idx].stack.push(Value::Object(Some(mirror)))?;
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(mirror)))?;
         }
         LdcValue::Dynamic {
             bsm_index,
@@ -10496,16 +10995,21 @@ fn execute_ldc(
                     bsm.bootstrap_method_ref,
                 )?;
                 // Resolve bootstrap argument class names for getStaticFinal etc.
-                let extra: Vec<String> = bsm.bootstrap_arguments.iter()
+                let extra: Vec<String> = bsm
+                    .bootstrap_arguments
+                    .iter()
                     .filter_map(|&idx| {
                         crate::runtime::invokedynamic::resolve_string_constant(
-                            &class.constant_pool, idx,
-                        ).or_else(|| {
+                            &class.constant_pool,
+                            idx,
+                        )
+                        .or_else(|| {
                             // Try resolving as ClassReference
                             match class.constant_pool.get(idx) {
-                                Some(ConstantPoolEntry::ClassReference { name_index }) => {
-                                    class.constant_pool.get_utf8(*name_index).map(|s| s.to_string())
-                                }
+                                Some(ConstantPoolEntry::ClassReference { name_index }) => class
+                                    .constant_pool
+                                    .get_utf8(*name_index)
+                                    .map(|s| s.to_string()),
                                 _ => None,
                             }
                         })
@@ -10515,7 +11019,14 @@ fn execute_ldc(
             };
 
             // Compute the result based on common bootstrap methods.
-            let result = resolve_condy_value(shared, &bsm_class, &bsm_method, &name, &descriptor, &bsm_extra_args)?;
+            let result = resolve_condy_value(
+                shared,
+                &bsm_class,
+                &bsm_method,
+                &name,
+                &descriptor,
+                &bsm_extra_args,
+            )?;
 
             // Cache the result
             shared
@@ -10548,7 +11059,8 @@ fn resolve_condy_value(
             // Load the static final field value from the named class.
             // The declaring class may come from bsm_extra_args[0] (4-arg variant)
             // or from the type descriptor itself (3-arg variant).
-            let declaring_class = bsm_extra_args.first()
+            let declaring_class = bsm_extra_args
+                .first()
                 .map(|s| s.as_str())
                 .unwrap_or_else(|| {
                     // Fall back to the type descriptor
@@ -10668,15 +11180,12 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
     // returns `None` for out-of-range entries, so mapping the miss to
     // `ClassFormatError` (rather than a panic) satisfies JVMS §4.4.5 for
     // ldc2_w which only accepts CONSTANT_Long_info / CONSTANT_Double_info.
-    let entry = class
-        .constant_pool
-        .get(index)
-        .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+    let entry = class.constant_pool.get(index).ok_or_else(|| {
+        VmError::Linkage(LinkageError::ClassFormatError {
             class_name: class.name.to_string(),
-            message: format!(
-                "ldc2_w: constant-pool index {index} out of range"
-            ),
-        }))?;
+            message: format!("ldc2_w: constant-pool index {index} out of range"),
+        })
+    })?;
 
     // The constant pool already carries the Long/Double tag — use it to push
     // directly as a tagged CompactValue slot, avoiding any Value-enum
@@ -10687,9 +11196,7 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
         _ => {
             return Err(VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: class.name.to_string(),
-                message: format!(
-                    "ldc2_w: expected Long or Double at cp#{index}"
-                ),
+                message: format!("ldc2_w: expected Long or Double at cp#{index}"),
             })
             .into());
         }
@@ -10777,15 +11284,24 @@ fn resolve_field_ref(
                     let (declaring_id, index, is_static) = if f.is_static() {
                         (field_class_id, static_idx, true)
                     } else {
-                        (field_class_id, class.first_field_index + instance_idx, false)
+                        (
+                            field_class_id,
+                            class.first_field_index + instance_idx,
+                            false,
+                        )
                     };
                     // Module access check (JPMS §5.4.4)
                     crate::classloading::access_control::check_module_access_by_id(
-                        current_class_id, declaring_id, &cm,
+                        current_class_id,
+                        declaring_id,
+                        &cm,
                     )?;
 
                     let is_ref = f.descriptor.starts_with('L') || f.descriptor.starts_with('[');
-                    if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static && index >= class.num_total_fields {
+                    if std::env::var("CRATON_FIELD_TRACE").is_ok()
+                        && !is_static
+                        && index >= class.num_total_fields
+                    {
                         eprintln!("[FIELD-TRACE] OOB resolve(own): decl={} field={} field_index={} num_total_fields={} first_field_index={}",
                             class.name, field_name, index, class.num_total_fields, class.first_field_index);
                     }
@@ -10809,11 +11325,10 @@ fn resolve_field_ref(
         found
     };
     if let Some(resolved) = own_resolved {
-        shared.resolution_cache.write().put_field(
-            current_class_id,
-            cp_index,
-            resolved.clone(),
-        );
+        shared
+            .resolution_cache
+            .write()
+            .put_field(current_class_id, cp_index, resolved.clone());
         return Ok(resolved);
     }
 
@@ -10832,13 +11347,22 @@ fn resolve_field_ref(
 
         // Module access check (JPMS §5.4.4)
         crate::classloading::access_control::check_module_access_by_id(
-            current_class_id, decl_id, &cm,
+            current_class_id,
+            decl_id,
+            &cm,
         )?;
 
         // Extract what we need before dropping the lock
         let is_ref = field.descriptor.starts_with('L') || field.descriptor.starts_with('[');
         let desc_byte = field.descriptor.as_bytes().first().copied().unwrap_or(0);
-        (field_idx, field.is_static(), field.is_volatile(), decl_id, is_ref, desc_byte)
+        (
+            field_idx,
+            field.is_static(),
+            field.is_volatile(),
+            decl_id,
+            is_ref,
+            desc_byte,
+        )
     };
 
     let resolved = ResolvedField {
@@ -10871,11 +11395,7 @@ fn resolve_field_ref(
 ///
 /// Used at the getstatic/putstatic opcode boundary to build a
 /// `NoClassDefFoundError` message when class resolution fails.
-fn field_ref_class_name(
-    shared: &SharedVm,
-    class_id: ClassId,
-    cp_index: u16,
-) -> Option<String> {
+fn field_ref_class_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<String> {
     let cm = shared.class_manager.read();
     let class = cm.get_class(class_id)?;
     if let Some(ConstantPoolEntry::FieldReference { class_index, .. }) =
@@ -10927,11 +11447,11 @@ fn narrow_int_to_field_type(value: Value, desc_byte: u8) -> Value {
     match value {
         Value::Int(x) => {
             let narrowed = match desc_byte {
-                b'B' => x as i8 as i32,   // byte: sign-extend low 8 bits
-                b'S' => x as i16 as i32,  // short: sign-extend low 16 bits
-                b'C' => x as u16 as i32,  // char: zero-extend low 16 bits
-                b'Z' => x & 1,            // boolean: JVMS stores only bit 0
-                _ => return value,        // I and non-sub-int: unchanged
+                b'B' => x as i8 as i32,  // byte: sign-extend low 8 bits
+                b'S' => x as i16 as i32, // short: sign-extend low 16 bits
+                b'C' => x as u16 as i32, // char: zero-extend low 16 bits
+                b'Z' => x & 1,           // boolean: JVMS stores only bit 0
+                _ => return value,       // I and non-sub-int: unchanged
             };
             Value::Int(narrowed)
         }
@@ -11208,9 +11728,17 @@ fn pop_coerced_invoke_args_virtual(
     // `decode_by_descriptor(b'J')`'s i2l-widening fallback.
     let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
+        tmp_cv.push(
+            thread.frames[frame_idx]
+                .stack
+                .pop_compact_with_long_mark()?,
+        );
     }
-    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
+    tmp_cv.push(
+        thread.frames[frame_idx]
+            .stack
+            .pop_compact_with_long_mark()?,
+    );
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
@@ -11247,7 +11775,11 @@ fn pop_coerced_invoke_args_static(
     // Value::Object — the descriptor-aware decode keeps the long bits.
     let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
+        tmp_cv.push(
+            thread.frames[frame_idx]
+                .stack
+                .pop_compact_with_long_mark()?,
+        );
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
@@ -11294,10 +11826,7 @@ struct CpPoolResolver<'a> {
 }
 
 impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
-    fn field_ref(
-        &self,
-        cp_index: u16,
-    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+    fn field_ref(&self, cp_index: u16) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
         use crate::runtime::exceptions::helpful_npe::CpRef;
         let cm = self.shared.class_manager.read_recursive();
         let class = cm.get_class(self.class_id)?;
@@ -11306,8 +11835,13 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
             name_and_type_index,
         }) = class.constant_pool.get(cp_index)
         {
-            let owner = class.constant_pool.get_class_name(*class_index)?.to_string();
-            let (name, _) = class.constant_pool.get_name_and_type(*name_and_type_index)?;
+            let owner = class
+                .constant_pool
+                .get_class_name(*class_index)?
+                .to_string();
+            let (name, _) = class
+                .constant_pool
+                .get_name_and_type(*name_and_type_index)?;
             Some(CpRef::Field {
                 owner_internal: owner,
                 name: name.to_string(),
@@ -11317,10 +11851,7 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
         }
     }
 
-    fn method_ref(
-        &self,
-        cp_index: u16,
-    ) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
+    fn method_ref(&self, cp_index: u16) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
         use crate::runtime::exceptions::helpful_npe::CpRef;
         let cm = self.shared.class_manager.read_recursive();
         let class = cm.get_class(self.class_id)?;
@@ -11408,8 +11939,7 @@ fn helpful_npe_invoke_message(
         method_name: &m_name,
         method_descriptor: &m_desc,
     };
-    let expr =
-        helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
+    let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
     helpful_npe::combine(&action, expr.as_deref())
 }
 
@@ -11506,9 +12036,8 @@ fn execute_invoke_kind(
     // an interface so a malformed CP entry can't poison nested dispatch.
     let cp_resolved_class_id: Option<ClassId> = if is_interface {
         let cm = shared.class_manager.read();
-        cm.get_loaded_class_id(&method_class_name).and_then(|cid| {
-            cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
-        })
+        cm.get_loaded_class_id(&method_class_name)
+            .and_then(|cid| cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid))
     } else {
         None
     };
@@ -11525,21 +12054,30 @@ fn execute_invoke_kind(
     // docs/bc-ec-mod-mododdinverse-investigation.md.
     let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
+        tmp_cv.push(
+            thread.frames[frame_idx]
+                .stack
+                .pop_compact_with_long_mark()?,
+        );
     }
-    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?); // receiver
+    tmp_cv.push(
+        thread.frames[frame_idx]
+            .stack
+            .pop_compact_with_long_mark()?,
+    ); // receiver
     tmp_cv.reverse();
     let recv_val = tmp_cv[0].0.decode_by_descriptor(b'L');
-    if crate::runtime::env_cache::dbg_jetty2()
-        && &*method_name == "getClasspath"
-    {
+    if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
         eprintln!(
             "[jetty2-eik] execute_invoke_kind {}.{}{} receiver={:?}",
             &*method_class_name, &*method_name, &*method_descriptor, recv_val
         );
     }
     let mut args = Vec::with_capacity(total_args);
-    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", recv_val));
+    args.push(coerce_invoke_arg_for_descriptor(
+        "Ljava/lang/Object;",
+        recv_val,
+    ));
     for i in 0..num_params {
         let pd = param_descs
             .get(i)
@@ -11621,10 +12159,7 @@ fn execute_invoke_kind(
                     let ret = crate::jit::return_type(&method_descriptor);
                     let value = coerce_value_for_return(value, ret);
                     // T18.K4 — tag-exact push for J/D lambda return values.
-                    push_invoke_return_value(
-                        &mut thread.frames[frame_idx].stack,
-                        value,
-                    )?;
+                    push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
                     // Hypothesis (b): lambda dispatch may have transitively
                     // run a native through `safe_native_call`; clear the
                     // pending-return field now that the value lives on the
@@ -11711,9 +12246,8 @@ fn execute_invoke_kind(
                         // stale-pointer regression — and falls back to
                         // the CP method-ref class so dispatch has a
                         // chance to succeed instead of NPE'ing.
-                        let header_bytes: [u8; 16] = unsafe {
-                            std::ptr::read(obj_ref.as_ptr() as *const [u8; 16])
-                        };
+                        let header_bytes: [u8; 16] =
+                            unsafe { std::ptr::read(obj_ref.as_ptr() as *const [u8; 16]) };
                         if header_bytes == [0u8; 16] {
                             // "Zeroed-a-live-object" detector consumer
                             // (CRATONVM_DBG_SWEEP_ZERO): this receiver lost its
@@ -11724,9 +12258,7 @@ fn execute_invoke_kind(
                             // ref was a register/native-stack root the sweep
                             // couldn't see — `CRATONVM_DBG_SWEEP_EDGES` silent).
                             if let Some((cid, kind, cycle, reason, initiator, blocked)) =
-                                cratonvm_gc::gen_heap::sweep_zero_lookup(
-                                    obj_ref.as_ptr() as usize,
-                                )
+                                cratonvm_gc::gen_heap::sweep_zero_lookup(obj_ref.as_ptr() as usize)
                             {
                                 // try_read (not read): this is a debug-only leaf
                                 // path; never risk a re-entrant class_manager
@@ -11764,7 +12296,12 @@ fn execute_invoke_kind(
                                 {
                                     use std::fmt::Write as _;
                                     for f in thread.frames.iter().rev().take(8) {
-                                        let _ = write!(stk, "\n[sweep-zero]     at {}.{}", f.class_name(), f.method_name());
+                                        let _ = write!(
+                                            stk,
+                                            "\n[sweep-zero]     at {}.{}",
+                                            f.class_name(),
+                                            f.method_name()
+                                        );
                                     }
                                 }
                                 eprintln!(
@@ -11774,10 +12311,20 @@ fn execute_invoke_kind(
                                      register/native-stack root the marker missed \
                                      [gc reason={} initiator_tid={} blocked_threads={}] \
                                      [holder tid={} in_blocked={} kind={:?}]{}",
-                                    obj_ref.as_ptr(), orig, cid, kind, cycle,
-                                    &*method_class_name, &*method_name,
-                                    reason_s, initiator, blocked,
-                                    thread.thread_id.0, holder_blocked, thread.kind, stk,
+                                    obj_ref.as_ptr(),
+                                    orig,
+                                    cid,
+                                    kind,
+                                    cycle,
+                                    &*method_class_name,
+                                    &*method_name,
+                                    reason_s,
+                                    initiator,
+                                    blocked,
+                                    thread.thread_id.0,
+                                    holder_blocked,
+                                    thread.kind,
+                                    stk,
                                 );
                             }
                             // WildFly / JBoss Modules often hits this path on
@@ -11832,9 +12379,8 @@ fn execute_invoke_kind(
                                             // local: a non-zero hash means it
                                             // looks live, all-zero means it
                                             // shares the stale fate.
-                                            let bytes: [u8; 16] = unsafe {
-                                                std::ptr::read(addr as *const [u8; 16])
-                                            };
+                                            let bytes: [u8; 16] =
+                                                unsafe { std::ptr::read(addr as *const [u8; 16]) };
                                             let all_zero = bytes == [0u8; 16];
                                             eprintln!(
                                                 "      LOCAL[{}] -> 0x{:x} all_zero_header={} {}",
@@ -11848,9 +12394,8 @@ fn execute_invoke_kind(
                                             let addr = o.as_ptr() as usize;
                                             let marker =
                                                 if addr == stale_addr { "STALE" } else { "" };
-                                            let bytes: [u8; 16] = unsafe {
-                                                std::ptr::read(addr as *const [u8; 16])
-                                            };
+                                            let bytes: [u8; 16] =
+                                                unsafe { std::ptr::read(addr as *const [u8; 16]) };
                                             let all_zero = bytes == [0u8; 16];
                                             eprintln!(
                                                 "      STACK[{}] -> 0x{:x} all_zero_header={} {}",
@@ -11885,10 +12430,7 @@ fn execute_invoke_kind(
                             // dispatch on Object so subclass overrides
                             // through the slow path's Object-fallback
                             // logic still apply.
-                            if crate::vm::is_object_member(
-                                &method_name,
-                                &method_descriptor,
-                            ) {
+                            if crate::vm::is_object_member(&method_name, &method_descriptor) {
                                 Arc::from("java/lang/Object")
                             } else {
                                 method_class_name.clone()
@@ -11900,7 +12442,9 @@ fn execute_invoke_kind(
                         // interface class so the native default method is found.
                         let lambda_iface = {
                             let proxies = shared.lambda_proxies.read();
-                            proxies.get(&cid).map(|lcs| lcs.functional_interface.clone())
+                            proxies
+                                .get(&cid)
+                                .map(|lcs| lcs.functional_interface.clone())
                         };
                         if let Some(iface) = lambda_iface {
                             iface
@@ -11937,24 +12481,18 @@ fn execute_invoke_kind(
                             // `Object.loadClass`.
                             let cm_read = shared.class_manager.read();
                             let recv_class = cm_read.get_class(cid);
-                            let recv_is_iface = recv_class
-                                .map(|c| c.is_interface())
-                                .unwrap_or(false);
-                            let recv_name_opt = recv_class
-                                .map(|c| Arc::from(&*c.name));
+                            let recv_is_iface =
+                                recv_class.map(|c| c.is_interface()).unwrap_or(false);
+                            let recv_name_opt = recv_class.map(|c| Arc::from(&*c.name));
                             drop(cm_read);
                             let recv_is_bare_object = recv_name_opt
                                 .as_ref()
                                 .map(|n: &Arc<str>| &**n == "java/lang/Object")
                                 .unwrap_or(false);
-                            let cp_is_not_object =
-                                &*method_class_name != "java/lang/Object";
+                            let cp_is_not_object = &*method_class_name != "java/lang/Object";
                             if (recv_is_iface || recv_is_bare_object)
                                 && cp_is_not_object
-                                && !crate::vm::is_object_member(
-                                    &method_name,
-                                    &method_descriptor,
-                                )
+                                && !crate::vm::is_object_member(&method_name, &method_descriptor)
                                 && recv_name_opt
                                     .as_ref()
                                     .map(|n: &Arc<str>| &**n != &*method_class_name)
@@ -11982,7 +12520,10 @@ fn execute_invoke_kind(
                             .unwrap_or_default();
                         eprintln!(
                             "  [{i}] {}.{}{} pc={}",
-                            cn, f.method_name(), f.method_descriptor(), f.pc
+                            cn,
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
                         );
                     }
                 }
@@ -12004,7 +12545,10 @@ fn execute_invoke_kind(
                     // `native-builtins/src/lib.rs` as a native override that
                     // treats null module as `isSystem=true`.
                     if crate::runtime::env_cache::npe_invoke_dbg() {
-                        eprintln!("[NPE-DBG] invokevirtual null receiver: {}.{}", method_class_name, method_name);
+                        eprintln!(
+                            "[NPE-DBG] invokevirtual null receiver: {}.{}",
+                            method_class_name, method_name
+                        );
                     }
                     // Round 63 — `org/springframework/core/convert/support/
                     // GenericConversionService$Converters.getClassHierarchy`
@@ -12027,9 +12571,7 @@ fn execute_invoke_kind(
                             || &*method_name == "getSuperclass"
                             || &*method_name == "arrayType"
                         {
-                            thread.frames[frame_idx]
-                                .stack
-                                .push(Value::Object(None))?;
+                            thread.frames[frame_idx].stack.push(Value::Object(None))?;
                             return Ok(CachedCallResult::Handled);
                         }
                         if &*method_name == "getInterfaces" {
@@ -12069,9 +12611,7 @@ fn execute_invoke_kind(
                                 | "getAuthority"
                         )
                     {
-                        thread.frames[frame_idx]
-                            .stack
-                            .push(Value::Object(None))?;
+                        thread.frames[frame_idx].stack.push(Value::Object(None))?;
                         return Ok(CachedCallResult::Handled);
                     }
                     if &*method_class_name == "java/io/File" {
@@ -12091,19 +12631,18 @@ fn execute_invoke_kind(
                                 | "listFiles"
                                 | "list"
                         ) {
-                            thread.frames[frame_idx]
-                                .stack
-                                .push(Value::Object(None))?;
+                            thread.frames[frame_idx].stack.push(Value::Object(None))?;
                             return Ok(CachedCallResult::Handled);
                         }
                         if matches!(
                             &*method_name,
-                            "length" | "lastModified" | "getTotalSpace"
-                                | "getFreeSpace" | "getUsableSpace"
+                            "length"
+                                | "lastModified"
+                                | "getTotalSpace"
+                                | "getFreeSpace"
+                                | "getUsableSpace"
                         ) {
-                            thread.frames[frame_idx]
-                                .stack
-                                .push(Value::Long(0))?;
+                            thread.frames[frame_idx].stack.push(Value::Long(0))?;
                             return Ok(CachedCallResult::Handled);
                         }
                         if matches!(
@@ -12120,9 +12659,7 @@ fn execute_invoke_kind(
                                 | "mkdir"
                                 | "mkdirs"
                         ) {
-                            thread.frames[frame_idx]
-                                .stack
-                                .push(Value::Int(0))?;
+                            thread.frames[frame_idx].stack.push(Value::Int(0))?;
                             return Ok(CachedCallResult::Handled);
                         }
                     }
@@ -12138,13 +12675,12 @@ fn execute_invoke_kind(
                     // and surface as `IllegalArgumentException: invalid
                     // version "null"` (Felix framework bootstrap). The hack
                     // is removed so the spec-compliant NPE below fires.
-                    if crate::runtime::env_cache::modstatic_dbg()
-                        && &*method_name == "set"
-                    {
+                    if crate::runtime::env_cache::modstatic_dbg() && &*method_name == "set" {
                         let cm = shared.class_manager.read();
                         eprintln!("MODSTATIC: NPE 'set on null' frames:");
                         for (i, f) in thread.frames.iter().enumerate().rev().take(12) {
-                            let cn = cm.get_class(f.class_id)
+                            let cn = cm
+                                .get_class(f.class_id)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_default();
                             eprintln!("  [{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
@@ -12179,10 +12715,22 @@ fn execute_invoke_kind(
                     }
                     if std::env::var_os("CRATONVM_DBG_NPE_STACK").is_some() {
                         let cm = shared.class_manager.read();
-                        eprintln!("[CRATONVM_DBG_NPE_STACK] NPE invoke {}.{}{} — stack:", &*method_class_name, &*method_name, &*method_descriptor);
+                        eprintln!(
+                            "[CRATONVM_DBG_NPE_STACK] NPE invoke {}.{}{} — stack:",
+                            &*method_class_name, &*method_name, &*method_descriptor
+                        );
                         for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                            let cn = cm.get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
-                            eprintln!("  [{i}] {}.{}{} pc={}", cn, f.method_name(), f.method_descriptor(), f.pc);
+                            let cn = cm
+                                .get_class(f.class_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "  [{i}] {}.{}{} pc={}",
+                                cn,
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc
+                            );
                         }
                     }
                     // JEP 358: build the HotSpot-style extended NPE message —
@@ -12234,47 +12782,65 @@ fn execute_invoke_kind(
             if let Value::Object(Some(proxy_ref)) = &args[0] {
                 let class_id = shared.heap.class_id_of(*proxy_ref);
                 let mirror = crate::vm::get_or_create_class_mirror(shared, class_id);
-                thread.frames[frame_idx].stack.push(Value::Object(Some(mirror)))?;
+                thread.frames[frame_idx]
+                    .stack
+                    .push(Value::Object(Some(mirror)))?;
                 return Ok(CachedCallResult::Handled);
             }
         }
         if let Value::Object(Some(proxy_ref)) = &args[0] {
             let result = crate::vm::proxy_invoke_handler_shared(
-                shared, thread, *proxy_ref, &method_name, &method_descriptor, &args[1..],
+                shared,
+                thread,
+                *proxy_ref,
+                &method_name,
+                &method_descriptor,
+                &args[1..],
             )?;
             if let Some(value) = result {
                 // Unbox the result if the method returns a primitive type
-                let ret_char = method_descriptor.rsplit(')').nth(0).unwrap_or("L").chars().next().unwrap_or('L');
+                let ret_char = method_descriptor
+                    .rsplit(')')
+                    .nth(0)
+                    .unwrap_or("L")
+                    .chars()
+                    .next()
+                    .unwrap_or('L');
                 let unboxed = match ret_char {
                     'I' | 'Z' | 'B' | 'C' | 'S' => {
                         if let Value::Object(Some(obj)) = value {
                             shared.heap.get_field(obj, 0)
-                        } else { value }
+                        } else {
+                            value
+                        }
                     }
                     'J' => {
                         if let Value::Object(Some(obj)) = value {
                             shared.heap.get_field(obj, 0)
-                        } else { value }
+                        } else {
+                            value
+                        }
                     }
                     'F' => {
                         if let Value::Object(Some(obj)) = value {
                             shared.heap.get_field(obj, 0)
-                        } else { value }
+                        } else {
+                            value
+                        }
                     }
                     'D' => {
                         if let Value::Object(Some(obj)) = value {
                             shared.heap.get_field(obj, 0)
-                        } else { value }
+                        } else {
+                            value
+                        }
                     }
                     _ => value, // Object return type — no unboxing
                 };
                 let ret = crate::jit::return_type(&method_descriptor);
                 let pushed = coerce_value_for_return(unboxed, ret);
                 // T18.K4 — tag-exact push for J/D proxy return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    pushed,
-                )?;
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, pushed)?;
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -12304,26 +12870,35 @@ fn execute_invoke_kind(
         if let Value::Object(Some(ann_ref)) = &args[0] {
             let invoke_args: &[Value] = if args.len() >= 1 { &args[1..] } else { &[] };
             let result = crate::vm::annotation_proxy_invoke_shared(
-                shared, thread, *ann_ref, &method_name, invoke_args,
+                shared,
+                thread,
+                *ann_ref,
+                &method_name,
+                invoke_args,
             )?;
             if let Some(value) = result {
                 // Unbox the result if the method returns a primitive type
-                let ret_char = method_descriptor.rsplit(')').nth(0).unwrap_or("L").chars().next().unwrap_or('L');
+                let ret_char = method_descriptor
+                    .rsplit(')')
+                    .nth(0)
+                    .unwrap_or("L")
+                    .chars()
+                    .next()
+                    .unwrap_or('L');
                 let unboxed = match ret_char {
                     'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
                         if let Value::Object(Some(obj)) = value {
                             shared.heap.get_field(obj, 0)
-                        } else { value }
+                        } else {
+                            value
+                        }
                     }
                     _ => value,
                 };
                 let ret = crate::jit::return_type(&method_descriptor);
                 let pushed = coerce_value_for_return(unboxed, ret);
                 // T18.K4 — tag-exact push for J/D annotation-proxy return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    pushed,
-                )?;
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, pushed)?;
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -12353,7 +12928,14 @@ fn execute_invoke_kind(
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
     match try_stackless_invoke(
-        shared, thread, frame_idx, &invoke_class, &method_name, &method_descriptor, &args, false,
+        shared,
+        thread,
+        frame_idx,
+        &invoke_class,
+        &method_name,
+        &method_descriptor,
+        &args,
+        false,
     )? {
         CachedCallResult::FramePushed => {
             if is_special {
@@ -12394,10 +12976,7 @@ fn execute_invoke_kind(
             value
         };
         // T18.K4 — tag-exact push for J/D fallback invoke return values.
-        push_invoke_return_value(
-            &mut thread.frames[frame_idx].stack,
-            value,
-        )?;
+        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         // Hypothesis (b): a `safe_native_call` reached via `invoke_shared`
         // (recursive slow path) sets `thread.native_pending_return` on object
         // returns but the clear-after-push helper is only invoked in the
@@ -12831,10 +13410,10 @@ pub(crate) fn try_lambda_dispatch(
         // Bridge here: if a non-SAM method is `apply` on a Scala
         // specialized function interface, unbox args → call SAM → box.
         if method_name == "apply"
-            && call_site.functional_interface.starts_with("scala/runtime/java8/JFunction")
             && call_site
-                .sam_method_name
-                .starts_with("apply$mc")
+                .functional_interface
+                .starts_with("scala/runtime/java8/JFunction")
+            && call_site.sam_method_name.starts_with("apply$mc")
         {
             // Parse the specialization tag from the SAM name, e.g.
             // "apply$mcII$sp" → ("I","I") for (I)I.
@@ -12892,8 +13471,7 @@ pub(crate) fn try_lambda_dispatch(
 
                 // Execute the SAM path directly (mirrors the code below).
                 let num_captures = lcs.capture_types.len();
-                let mut full_args: Vec<Value> =
-                    Vec::with_capacity(num_captures + unboxed.len());
+                let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + unboxed.len());
                 for i in 0..num_captures {
                     full_args.push(shared.heap.get_field(obj_ref, i));
                 }
@@ -12916,9 +13494,10 @@ pub(crate) fn try_lambda_dispatch(
                                 shared,
                                 "lambda-dispatch",
                                 "virtual-no-receiver",
-                                &format!("class={} member={}",
-                                    lcs.impl_handle.class_name,
-                                    lcs.impl_handle.member_name),
+                                &format!(
+                                    "class={} member={}",
+                                    lcs.impl_handle.class_name, lcs.impl_handle.member_name
+                                ),
                             );
                             return Ok(None);
                         }
@@ -12948,10 +13527,10 @@ pub(crate) fn try_lambda_dispatch(
                             shared,
                             "lambda-dispatch",
                             "unsupported-handle-kind",
-                            &format!("kind={:?} class={} member={}",
-                                other,
-                                lcs.impl_handle.class_name,
-                                lcs.impl_handle.member_name),
+                            &format!(
+                                "kind={:?} class={} member={}",
+                                other, lcs.impl_handle.class_name, lcs.impl_handle.member_name
+                            ),
                         );
                         return Ok(None);
                     }
@@ -12971,14 +13550,62 @@ pub(crate) fn try_lambda_dispatch(
                 let raw = result_val.unwrap_or(Value::Object(None));
                 let boxed = match (ret_ch, raw) {
                     ('V', _) => Some(Value::Object(None)),
-                    ('Z', Value::Int(i)) => Some(box_one(shared, thread, "java/lang/Boolean", "(Z)Ljava/lang/Boolean;", Value::Int(i))?),
-                    ('B', Value::Int(i)) => Some(box_one(shared, thread, "java/lang/Byte", "(B)Ljava/lang/Byte;", Value::Int(i))?),
-                    ('S', Value::Int(i)) => Some(box_one(shared, thread, "java/lang/Short", "(S)Ljava/lang/Short;", Value::Int(i))?),
-                    ('C', Value::Int(i)) => Some(box_one(shared, thread, "java/lang/Character", "(C)Ljava/lang/Character;", Value::Int(i))?),
-                    ('I', Value::Int(i)) => Some(box_one(shared, thread, "java/lang/Integer", "(I)Ljava/lang/Integer;", Value::Int(i))?),
-                    ('J', Value::Long(l)) => Some(box_one(shared, thread, "java/lang/Long", "(J)Ljava/lang/Long;", Value::Long(l))?),
-                    ('F', Value::Float(f)) => Some(box_one(shared, thread, "java/lang/Float", "(F)Ljava/lang/Float;", Value::Float(f))?),
-                    ('D', Value::Double(d)) => Some(box_one(shared, thread, "java/lang/Double", "(D)Ljava/lang/Double;", Value::Double(d))?),
+                    ('Z', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Boolean",
+                        "(Z)Ljava/lang/Boolean;",
+                        Value::Int(i),
+                    )?),
+                    ('B', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Byte",
+                        "(B)Ljava/lang/Byte;",
+                        Value::Int(i),
+                    )?),
+                    ('S', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Short",
+                        "(S)Ljava/lang/Short;",
+                        Value::Int(i),
+                    )?),
+                    ('C', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Character",
+                        "(C)Ljava/lang/Character;",
+                        Value::Int(i),
+                    )?),
+                    ('I', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Integer",
+                        "(I)Ljava/lang/Integer;",
+                        Value::Int(i),
+                    )?),
+                    ('J', Value::Long(l)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Long",
+                        "(J)Ljava/lang/Long;",
+                        Value::Long(l),
+                    )?),
+                    ('F', Value::Float(f)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Float",
+                        "(F)Ljava/lang/Float;",
+                        Value::Float(f),
+                    )?),
+                    ('D', Value::Double(d)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Double",
+                        "(D)Ljava/lang/Double;",
+                        Value::Double(d),
+                    )?),
                     (_, v) => Some(v),
                 };
                 return Ok(Some(boxed));
@@ -12993,8 +13620,8 @@ pub(crate) fn try_lambda_dispatch(
         // Try common descriptor patterns for default methods.
         let iface = &call_site.functional_interface;
         let descriptors = [
-            format!("(L{iface};)L{iface};"),   // andThen/compose/and/or
-            format!("()L{iface};"),              // negate/identity
+            format!("(L{iface};)L{iface};"), // andThen/compose/and/or
+            format!("()L{iface};"),          // negate/identity
         ];
         for desc in &descriptors {
             if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
@@ -13062,7 +13689,9 @@ pub(crate) fn try_lambda_dispatch(
                     result.is_some(),
                 );
             }
-            Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, result)?))
+            Ok(Some(coerce_return(
+                shared, thread, &sam_ret, &impl_ret, result,
+            )?))
         }
         MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
             // Virtual/interface: first arg is receiver, rest are parameters.
@@ -13097,10 +13726,7 @@ pub(crate) fn try_lambda_dispatch(
             // item is a lambda proxy, never a concrete CacheOverride.
             if let Value::Object(Some(r)) = &full_args[0] {
                 let rcv_class_id = shared.heap.class_id_of(*r);
-                let recv_is_lambda = shared
-                    .lambda_proxies
-                    .read()
-                    .contains_key(&rcv_class_id);
+                let recv_is_lambda = shared.lambda_proxies.read().contains_key(&rcv_class_id);
                 if recv_is_lambda {
                     let inner = try_lambda_dispatch(
                         shared,
@@ -13144,14 +13770,16 @@ pub(crate) fn try_lambda_dispatch(
             let result = match &result {
                 Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError { .. },
-                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name => invoke_or_native(
-                    shared,
-                    thread,
-                    &call_site.impl_handle.class_name,
-                    &call_site.impl_handle.member_name,
-                    &call_site.impl_handle.descriptor,
-                    &full_args,
-                ),
+                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name => {
+                    invoke_or_native(
+                        shared,
+                        thread,
+                        &call_site.impl_handle.class_name,
+                        &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
+                        &full_args,
+                    )
+                }
                 _ => result,
             };
             let r = result?;
@@ -13193,7 +13821,9 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             )?;
-            Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, result)?))
+            Ok(Some(coerce_return(
+                shared, thread, &sam_ret, &impl_ret, result,
+            )?))
         }
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
@@ -13653,15 +14283,11 @@ fn intercept_classloader_set_default_assertion_status(
     if method_name != "setDefaultAssertionStatus" || method_descriptor != "(Z)V" {
         return None;
     }
-    let cb = shared.native_methods.find(
-        "java/lang/ClassLoader",
-        "setDefaultAssertionStatus",
-        "(Z)V",
-    )?;
-    Some(
-        crate::vm::safe_native_call(shared, thread, cb, args)
-            .map(|_| CachedCallResult::Handled),
-    )
+    let cb =
+        shared
+            .native_methods
+            .find("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")?;
+    Some(crate::vm::safe_native_call(shared, thread, cb, args).map(|_| CachedCallResult::Handled))
 }
 
 /// Surefire `LazyLauncher` implements `Launcher`. Some dispatch paths key the
@@ -13682,7 +14308,9 @@ fn surefire_lazy_launcher_discover_native(
     if method_name != "discover" || descriptor != DESC_DISCOVER {
         return None;
     }
-    let cb = shared.native_methods.find(LAZY, "discover", DESC_DISCOVER)?;
+    let cb = shared
+        .native_methods
+        .find(LAZY, "discover", DESC_DISCOVER)?;
     let cid = shared.heap.class_id_of(recv_obj);
     let cm = shared.class_manager.read();
     let ok = cm
@@ -13766,11 +14394,11 @@ fn try_stackless_invoke(
         && method_name == "invoke"
         && descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) = shared.native_methods.find(
-            "java/lang/reflect/Method",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/reflect/Method", method_name, descriptor)
+        {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 push_invoke_return_value(
@@ -13789,11 +14417,11 @@ fn try_stackless_invoke(
         && method_name == "newInstance"
         && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) = shared.native_methods.find(
-            "java/lang/reflect/Constructor",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/reflect/Constructor", method_name, descriptor)
+        {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 push_invoke_return_value(
@@ -13821,37 +14449,49 @@ fn try_stackless_invoke(
         }
         _ => None,
     }
-    .or_else(|| shared.native_methods.find(class_name, method_name, descriptor))
-        .or_else(|| {
-            if method_name == "<init>" { return None; }
-            // For virtual calls, skip hierarchy walk if the class has its own bytecode
-            if !walk_native_hierarchy {
-                let cm = shared.class_manager.read();
-                let has_own_bytecode = cm.get_loaded_class_id(class_name)
-                    .and_then(|cid| cm.get_class(cid))
-                    .map(|cls| cls.find_method(method_name, descriptor).is_some())
-                    .unwrap_or(false);
-                if has_own_bytecode { return None; }
-            }
+    .or_else(|| {
+        shared
+            .native_methods
+            .find(class_name, method_name, descriptor)
+    })
+    .or_else(|| {
+        if method_name == "<init>" {
+            return None;
+        }
+        // For virtual calls, skip hierarchy walk if the class has its own bytecode
+        if !walk_native_hierarchy {
             let cm = shared.class_manager.read();
-            let mut cid = cm.get_loaded_class_id(class_name)?;
-            loop {
-                let parent_id = cm.get_class(cid)?.superclass?;
-                let parent = cm.get_class(parent_id)?;
-                // S107 collection-toString fix: if this parent has its own
-                // bytecode for the method (e.g. AbstractCollection.toString),
-                // the bytecode override wins over any deeper native ancestor
-                // (e.g. Object.toString). Stop walking — return None so the
-                // bytecode dispatch path executes.
-                if parent.find_method(method_name, descriptor).is_some() {
-                    return None;
-                }
-                if let Some(cb) = shared.native_methods.find(&parent.name, method_name, descriptor) {
-                    return Some(cb);
-                }
-                cid = parent_id;
+            let has_own_bytecode = cm
+                .get_loaded_class_id(class_name)
+                .and_then(|cid| cm.get_class(cid))
+                .map(|cls| cls.find_method(method_name, descriptor).is_some())
+                .unwrap_or(false);
+            if has_own_bytecode {
+                return None;
             }
-        });
+        }
+        let cm = shared.class_manager.read();
+        let mut cid = cm.get_loaded_class_id(class_name)?;
+        loop {
+            let parent_id = cm.get_class(cid)?.superclass?;
+            let parent = cm.get_class(parent_id)?;
+            // S107 collection-toString fix: if this parent has its own
+            // bytecode for the method (e.g. AbstractCollection.toString),
+            // the bytecode override wins over any deeper native ancestor
+            // (e.g. Object.toString). Stop walking — return None so the
+            // bytecode dispatch path executes.
+            if parent.find_method(method_name, descriptor).is_some() {
+                return None;
+            }
+            if let Some(cb) = shared
+                .native_methods
+                .find(&parent.name, method_name, descriptor)
+            {
+                return Some(cb);
+            }
+            cid = parent_id;
+        }
+    });
     // JVMTI redefine guard: when an agent (e.g. a Mockito inline mock) has
     // redefined this class, its woven bytecode is authoritative. Drop any
     // native override so dispatch falls through to the (instrumented)
@@ -13861,12 +14501,26 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
-    if crate::runtime::env_cache::bd_debug() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
-        eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
-                  class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
+    if crate::runtime::env_cache::bd_debug()
+        && (method_name == "intValue"
+            || (class_name.contains("BigDecimal")
+                && (method_name == "<init>" || method_name == "intValue")))
+    {
+        eprintln!(
+            "[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
+            class_name,
+            method_name,
+            descriptor,
+            native_cb.is_some(),
+            walk_native_hierarchy
+        );
     }
-    if method_name == "<init>" && std::env::var_os("CRATONVM_DBG_STTRACE").is_some()
-        && (class_name.contains("Exception") || class_name.contains("Throwable") || class_name.contains("Error")) {
+    if method_name == "<init>"
+        && std::env::var_os("CRATONVM_DBG_STTRACE").is_some()
+        && (class_name.contains("Exception")
+            || class_name.contains("Throwable")
+            || class_name.contains("Error"))
+    {
         eprintln!("STTRACE_DBG_TSI class={class_name} desc={descriptor} native_cb={} walk={walk_native_hierarchy}",
                   native_cb.is_some());
     }
@@ -13925,7 +14579,10 @@ fn try_stackless_invoke(
     // 4. Find method in class hierarchy
     let cm = shared.class_manager.read();
     let (method, declaring_id) = match crate::classloading::find_method_recursive(
-        class_id, method_name, descriptor, &cm.class_store,
+        class_id,
+        method_name,
+        descriptor,
+        &cm.class_store,
     ) {
         Some(r) => r,
         None => {
@@ -13945,7 +14602,10 @@ fn try_stackless_invoke(
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         drop(cm);
-        if let Some(callback) = shared.native_methods.find(&declaring_name, method_name, descriptor) {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&declaring_name, method_name, descriptor)
+        {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
@@ -14006,7 +14666,10 @@ fn try_stackless_invoke(
     if !(declaring_is_interface && !is_static)
         && !native_shadow_suppressed_by_redefine(shared, &class_name_arc)
     {
-        if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name_arc, method_name, descriptor)
+        {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
@@ -14113,18 +14776,29 @@ fn try_stackless_invoke(
     let invoke_covered_by_handler = {
         let caller = &thread.frames[frame_idx];
         let invoke_pc = caller.last_instr_pc;
-        caller.exception_table().iter().any(|e| {
-            invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize
-        })
+        caller
+            .exception_table()
+            .iter()
+            .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize)
     };
-    if is_tail_call && thread.frames[frame_idx].monitor_on_exit.is_none() && !invoke_covered_by_handler {
+    if is_tail_call
+        && thread.frames[frame_idx].monitor_on_exit.is_none()
+        && !invoke_covered_by_handler
+    {
         // Replace the caller frame in-place with the callee
         let code = padded_bytecode(&code_attr.code);
         if crate::runtime::env_cache::frame_trace() {
             let caller = &thread.frames[frame_idx];
-            eprintln!("[FRAME_TCO] at frame_idx={} replacing {}.{}{} with {}.{}{}",
-                frame_idx, caller.class_name(), caller.method_name(), caller.method_descriptor(),
-                class_name_arc, method_name, descriptor);
+            eprintln!(
+                "[FRAME_TCO] at frame_idx={} replacing {}.{}{} with {}.{}{}",
+                frame_idx,
+                caller.class_name(),
+                caller.method_name(),
+                caller.method_descriptor(),
+                class_name_arc,
+                method_name,
+                descriptor
+            );
         }
         thread.frames[frame_idx].reset_for_tail_call(
             declaring_id,
@@ -14180,7 +14854,13 @@ fn try_stackless_invoke(
     );
     frame.monitor_on_exit = monitor_obj;
     if crate::runtime::env_cache::frame_trace() {
-        eprintln!("[FRAME_PUSH/stackless] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+        eprintln!(
+            "[FRAME_PUSH/stackless] depth={} {}.{}{}",
+            thread.frames.len(),
+            frame.class_name(),
+            frame.method_name(),
+            frame.method_descriptor()
+        );
     }
     push_frame_and_fire_entry(thread, frame);
 
@@ -14202,7 +14882,10 @@ fn execute_invokestatic(
     // Walk the superclass chain because the constant pool may reference a subclass
     // while the native is registered on the declaring superclass.
     // Skip hierarchy walk for <init> — constructors are NOT inherited.
-    let direct_native = shared.native_methods.find(&method_class_name, &method_name, &method_descriptor).is_some();
+    let direct_native = shared
+        .native_methods
+        .find(&method_class_name, &method_name, &method_descriptor)
+        .is_some();
     let is_native = direct_native
         || (method_name.as_ref() != "<init>" && {
             let cm = shared.class_manager.read();
@@ -14210,7 +14893,11 @@ fn execute_invokestatic(
             if let Some(mut cid) = cm.get_loaded_class_id(&method_class_name) {
                 while let Some(pid) = cm.get_class(cid).and_then(|c| c.superclass) {
                     if let Some(p) = cm.get_class(pid) {
-                        if shared.native_methods.find(&p.name, &method_name, &method_descriptor).is_some() {
+                        if shared
+                            .native_methods
+                            .find(&p.name, &method_name, &method_descriptor)
+                            .is_some()
+                        {
                             found = true;
                             break;
                         }
@@ -14247,7 +14934,11 @@ fn execute_invokestatic(
     // path (`decode_by_descriptor(b'J')`) reinterprets the raw bits.
     let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
+        tmp_cv.push(
+            thread.frames[frame_idx]
+                .stack
+                .pop_compact_with_long_mark()?,
+        );
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
@@ -14301,7 +14992,14 @@ fn execute_invokestatic(
     // Try stackless frame push for bytecode methods
     // For invokestatic, walk the native hierarchy to find inherited natives.
     match try_stackless_invoke(
-        shared, thread, frame_idx, &method_class_name, &method_name, &method_descriptor, &args, true,
+        shared,
+        thread,
+        frame_idx,
+        &method_class_name,
+        &method_name,
+        &method_descriptor,
+        &args,
+        true,
     )? {
         CachedCallResult::FramePushed => {
             populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
@@ -14331,10 +15029,7 @@ fn execute_invokestatic(
             value
         };
         // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
-        push_invoke_return_value(
-            &mut thread.frames[frame_idx].stack,
-            value,
-        )?;
+        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
         // path. `invoke_or_native` may recursively run `safe_native_call` which
         // pins the object return in `thread.native_pending_return`; without
@@ -14434,7 +15129,9 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
     let mut cv_buf: [(CompactValue, bool); MAX_INTRINSIC_ARGS] =
         [(CompactValue::uninitialized(), false); MAX_INTRINSIC_ARGS];
     for i in (0..total).rev() {
-        cv_buf[i] = thread.frames[frame_idx].stack.pop_compact_with_long_mark()?;
+        cv_buf[i] = thread.frames[frame_idx]
+            .stack
+            .pop_compact_with_long_mark()?;
     }
     let base = if with_receiver {
         buf[0] = coerce_invoke_arg_for_descriptor(
@@ -14452,10 +15149,8 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
         let (cv, is_long) = cv_buf[base + i];
-        buf[base + i] = coerce_invoke_arg_for_descriptor(
-            pd,
-            decode_arg_kind_aware(cv, is_long, pd_byte),
-        );
+        buf[base + i] =
+            coerce_invoke_arg_for_descriptor(pd, decode_arg_kind_aware(cv, is_long, pd_byte));
     }
     Ok(&buf[..total])
 }
@@ -14471,7 +15166,11 @@ fn populate_invoke_cache(
     is_special: bool,
 ) {
     // Check if already cached
-    if thread.invoke_cache.get(caller_class_id, cp_index, is_special).is_some() {
+    if thread
+        .invoke_cache
+        .get(caller_class_id, cp_index, is_special)
+        .is_some()
+    {
         return;
     }
 
@@ -14482,7 +15181,9 @@ fn populate_invoke_cache(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, is_special, None);
     if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
-        thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+        thread
+            .invoke_cache
+            .put(caller_class_id, cp_index, is_special, target);
         return;
     }
 
@@ -14517,12 +15218,9 @@ fn populate_invoke_cache(
         // a receiver — is never cached here; that case is left to the slow
         // path. `intrinsics_disabled()` is the differential-test off-switch.
         if !is_special && !crate::runtime::env_cache::intrinsics_disabled() {
-            if let Some(kind) = cratonvm_native_builtins::intrinsics::lookup(
-                &class_name,
-                &method_name,
-                &descriptor,
-            )
-            .filter(|k| cratonvm_native_builtins::intrinsics::is_static(*k))
+            if let Some(kind) =
+                cratonvm_native_builtins::intrinsics::lookup(&class_name, &method_name, &descriptor)
+                    .filter(|k| cratonvm_native_builtins::intrinsics::is_static(*k))
             {
                 // Phase 3 — split the descriptor ONCE here so the
                 // steady-state dispatch path never re-resolves or re-parses.
@@ -14553,8 +15251,12 @@ fn populate_invoke_cache(
             num_params: num_params as u16, // Widening: parameter count conversion
             gate,
         };
-        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-        thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+        shared
+            .shared_resolution
+            .insert_promoted_invoke(promoted_key, target.clone());
+        thread
+            .invoke_cache
+            .put(caller_class_id, cp_index, is_special, target);
         return;
     }
 
@@ -14582,10 +15284,7 @@ fn populate_invoke_cache(
 
     if method.is_native() {
         // Already handled above, but the method might be native in a superclass
-        let declaring_name = store
-            .get(declaring_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
+        let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
         if let Some(callback) =
             shared
                 .native_methods
@@ -14593,17 +15292,19 @@ fn populate_invoke_cache(
         {
             // WP2.4-F1: gate bound to the *declaring* class — that's the
             // class whose method body could be replaced via redefine.
-            let gate = RedefineGate::snapshot(
-                cm.class_redefine_generation_handle(declaring_id),
-            );
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
             drop(cm);
             let target = CachedInvokeTarget::Native {
                 callback,
                 num_params: num_params as u16, // Widening: parameter count conversion
                 gate,
             };
-            shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-            thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+            shared
+                .shared_resolution
+                .insert_promoted_invoke(promoted_key, target.clone());
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, is_special, target);
         }
         return;
     }
@@ -14613,10 +15314,7 @@ fn populate_invoke_cache(
     };
 
     let source_file = class.source_file.as_deref().map(Arc::from);
-    let declaring_class_name = store
-        .get(declaring_id)
-        .map(|c| &*c.name)
-        .unwrap_or("");
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
 
     let cached = CachedBytecodeMethod {
         declaring_class_id: declaring_id,
@@ -14638,17 +15336,19 @@ fn populate_invoke_cache(
     // bump the same `Arc<AtomicU32>` (because `class_redefine_generation_handle`
     // is now `&self` and shares state via the inner `RwLock<HashMap>`),
     // so the next cache hit will observe the bump and auto-evict.
-    let gate = RedefineGate::snapshot(
-        cm.class_redefine_generation_handle(declaring_id),
-    );
+    let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
     drop(cm);
     let target = CachedInvokeTarget::Bytecode {
         cached: std::sync::Arc::new(cached),
         gate,
     };
     // T10.4 — promote so sibling threads skip the class_manager walk.
-    shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-    thread.invoke_cache.put(caller_class_id, cp_index, is_special, target);
+    shared
+        .shared_resolution
+        .insert_promoted_invoke(promoted_key, target.clone());
+    thread
+        .invoke_cache
+        .put(caller_class_id, cp_index, is_special, target);
 }
 
 /// Fast invokestatic using the invoke cache (stackless dispatch).
@@ -14742,14 +15442,7 @@ fn execute_invokestatic_cached(
                 false,
                 &mut arg_buf,
             )?;
-            invoke_cached_intrinsic(
-                shared,
-                thread,
-                frame_idx,
-                callback,
-                args,
-                return_type,
-            )?;
+            invoke_cached_intrinsic(shared, thread, frame_idx, callback, args, return_type)?;
             Ok(CachedCallResult::Handled)
         }
         CachedInvokeTarget::Jit {
@@ -14759,19 +15452,20 @@ fn execute_invokestatic_cached(
             needs_heap,
             cached,
             gate: _,
+        } => execute_jit_call(
+            shared,
+            thread,
+            frame_idx,
+            &compiled,
+            num_params,
+            return_type,
+            needs_heap,
+            &cached,
+        ),
+        CachedInvokeTarget::Bytecode {
+            ref cached,
+            gate: ref entry_gate,
         } => {
-            execute_jit_call(
-                shared,
-                thread,
-                frame_idx,
-                &compiled,
-                num_params,
-                return_type,
-                needs_heap,
-                &cached,
-            )
-        }
-        CachedInvokeTarget::Bytecode { ref cached, gate: ref entry_gate } => {
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
             {
@@ -14833,7 +15527,8 @@ fn execute_invokestatic_cached(
                 for &b in cached.method_descriptor.as_bytes() {
                     h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
                 }
-                ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64) // Widening: class ID to u64 for hash key
+                ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+                // Widening: class ID to u64 for hash key
             };
             // BUG-2: hot-method promotion for short-but-very-hot methods.
             //
@@ -14881,107 +15576,109 @@ fn execute_invokestatic_cached(
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
             if should_attempt {
-            // Consult tiered compilation manager for recommended tier
-            let tiered_key = crate::jit::tiered::MethodKey::new(
-                cached.class_name.as_ref(),
-                cached.method_name.as_ref(),
-                cached.method_descriptor.as_ref(),
-            );
-            // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
-            // default-OFF behind `CRATONVM_BG_COMPILE`.
-            //
-            //  * Flag ON  — start the background compile thread once (idempotent)
-            //    with the REAL compile closure below, then ENQUEUE-ONLY: the
-            //    tiered manager's `on_method_invocation` pushes a CompilationTask
-            //    at the recommended tier and the worker compiles it off the
-            //    mutator (publishing into `shared.jit_cache`). The mutator does
-            //    NOT compile inline; it keeps interpreting until the worker
-            //    publishes, at which point the `jit_cache` fast-path at the top
-            //    of the `Bytecode` arm flips this call site to `Jit`.
-            //  * Flag OFF (default) — never start the worker; keep the existing
-            //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
-            //    off-thread pipeline cannot regress steady-state behaviour until
-            //    proven. (`on_method_invocation` still enqueues, but with no
-            //    worker draining the queue this is the historical no-op.)
-            let bg_compile_on = crate::runtime::env_cache::bg_compile();
-            if bg_compile_on {
-                // Real off-thread compile closure. Captures a `Weak<SharedVm>`
-                // (the worker outlives no Arc of its own) and, per drained task,
-                // upgrades it and runs the same codegen entry point the inline
-                // path uses — `try_jit_compile_callee` does the by-name lookup +
-                // `jit::try_compile` + `shared.jit_cache` publish. Returns the
-                // wall-clock compile time in ms for the tiered stats.
-                let weak_vm: std::sync::Weak<SharedVm> = shared
-                    .self_arc
-                    .read()
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_default();
-                crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-                    Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
-                        background_compile_task(&weak_vm, task)
-                    })
-                });
-            }
-            let recommended_tier =
-                shared.tiered_manager.on_method_invocation(&tiered_key);
-            if let Some(tier) = recommended_tier {
-                if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
-                    eprintln!(
-                        "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={} bg={}",
-                        cached.class_name,
-                        cached.method_name,
-                        cached.method_descriptor,
-                        tier,
-                        invoc_count,
-                        bg_compile_on,
-                    );
-                }
-            }
-            // When background compilation is ON the mutator does NOT compile
-            // inline — the worker owns codegen. Skip straight to interpreted
-            // execution; a later call picks up the published JIT entry via the
-            // `jit_cache` fast-path above.
-            if !bg_compile_on {
-            // WP2.4-F1: pass the bytecode entry's gate to inherit
-            // the staleness binding — the JIT'd body executes the same
-            // declaring class, so a future `redefine_class` must
-            // invalidate this JIT entry too.
-            let upgrade_result = try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
-            if upgrade_result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
-                eprintln!(
-                    "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
-                    cached.class_name, cached.method_name, cached.method_descriptor, invoc_count
+                // Consult tiered compilation manager for recommended tier
+                let tiered_key = crate::jit::tiered::MethodKey::new(
+                    cached.class_name.as_ref(),
+                    cached.method_name.as_ref(),
+                    cached.method_descriptor.as_ref(),
                 );
-            }
-            if let Some(jit_target) = upgrade_result {
-                // Upgrade cache entry to Jit for future calls
-                thread
-                    .invoke_cache
-                    .put(caller_class_id, cp_index, false, jit_target.clone());
-                // Execute via JIT right now
-                if let CachedInvokeTarget::Jit {
-                    compiled,
-                    num_params,
-                    return_type,
-                    needs_heap,
-                    cached,
-                    gate: _,
-                } = jit_target
-                {
-                    return execute_jit_call(
-                        shared,
-                        thread,
-                        frame_idx,
-                        &compiled,
-                        num_params,
-                        return_type,
-                        needs_heap,
-                        &cached,
-                    );
+                // wire-tiered-manager increment 2: OFF-THREAD codegen, gated
+                // default-OFF behind `CRATONVM_BG_COMPILE`.
+                //
+                //  * Flag ON  — start the background compile thread once (idempotent)
+                //    with the REAL compile closure below, then ENQUEUE-ONLY: the
+                //    tiered manager's `on_method_invocation` pushes a CompilationTask
+                //    at the recommended tier and the worker compiles it off the
+                //    mutator (publishing into `shared.jit_cache`). The mutator does
+                //    NOT compile inline; it keeps interpreting until the worker
+                //    publishes, at which point the `jit_cache` fast-path at the top
+                //    of the `Bytecode` arm flips this call site to `Jit`.
+                //  * Flag OFF (default) — never start the worker; keep the existing
+                //    inline `try_jit_upgrade_with_gate` path EXACTLY as before so the
+                //    off-thread pipeline cannot regress steady-state behaviour until
+                //    proven. (`on_method_invocation` still enqueues, but with no
+                //    worker draining the queue this is the historical no-op.)
+                let bg_compile_on = crate::runtime::env_cache::bg_compile();
+                if bg_compile_on {
+                    // Real off-thread compile closure. Captures a `Weak<SharedVm>`
+                    // (the worker outlives no Arc of its own) and, per drained task,
+                    // upgrades it and runs the same codegen entry point the inline
+                    // path uses — `try_jit_compile_callee` does the by-name lookup +
+                    // `jit::try_compile` + `shared.jit_cache` publish. Returns the
+                    // wall-clock compile time in ms for the tiered stats.
+                    let weak_vm: std::sync::Weak<SharedVm> =
+                        shared.self_arc.read().as_ref().cloned().unwrap_or_default();
+                    crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+                        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
+                            background_compile_task(&weak_vm, task)
+                        })
+                    });
                 }
-            }
-            } // end !bg_compile_on inline-upgrade path
+                let recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
+                if let Some(tier) = recommended_tier {
+                    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] tiered-enqueue {}.{}{} tier={:?} invoc_count={} bg={}",
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
+                            tier,
+                            invoc_count,
+                            bg_compile_on,
+                        );
+                    }
+                }
+                // When background compilation is ON the mutator does NOT compile
+                // inline — the worker owns codegen. Skip straight to interpreted
+                // execution; a later call picks up the published JIT entry via the
+                // `jit_cache` fast-path above.
+                if !bg_compile_on {
+                    // WP2.4-F1: pass the bytecode entry's gate to inherit
+                    // the staleness binding — the JIT'd body executes the same
+                    // declaring class, so a future `redefine_class` must
+                    // invalidate this JIT entry too.
+                    let upgrade_result =
+                        try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
+                    if upgrade_result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
+                            invoc_count
+                        );
+                    }
+                    if let Some(jit_target) = upgrade_result {
+                        // Upgrade cache entry to Jit for future calls
+                        thread.invoke_cache.put(
+                            caller_class_id,
+                            cp_index,
+                            false,
+                            jit_target.clone(),
+                        );
+                        // Execute via JIT right now
+                        if let CachedInvokeTarget::Jit {
+                            compiled,
+                            num_params,
+                            return_type,
+                            needs_heap,
+                            cached,
+                            gate: _,
+                        } = jit_target
+                        {
+                            return execute_jit_call(
+                                shared,
+                                thread,
+                                frame_idx,
+                                &compiled,
+                                num_params,
+                                return_type,
+                                needs_heap,
+                                &cached,
+                            );
+                        }
+                    }
+                } // end !bg_compile_on inline-upgrade path
             } // end invocation threshold check
 
             // Fallback: interpreted execution
@@ -15056,7 +15753,13 @@ fn execute_invokestatic_cached(
             );
             frame.monitor_on_exit = monitor_obj;
             if crate::runtime::env_cache::frame_trace() {
-                eprintln!("[FRAME_PUSH/stackless_cached] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+                eprintln!(
+                    "[FRAME_PUSH/stackless_cached] depth={} {}.{}{}",
+                    thread.frames.len(),
+                    frame.class_name(),
+                    frame.method_name(),
+                    frame.method_descriptor()
+                );
             }
             push_frame_and_fire_entry(thread, frame);
             Ok(CachedCallResult::FramePushed)
@@ -15210,424 +15913,451 @@ fn try_osr(
     // regressed the DEFAULT (ban-on) BC suites ~2×. Such artifacts get one
     // fresh OSR recompile below (replacing them in the cache), after which
     // reuse kicks in.
-    let osr_reused = matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    let osr_reused =
+        matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
     let compiled = if osr_reused {
         cached_osr
     } else {
-    (|| -> Option<_> {
-        // RBC.2 — honor the permanent bail-list here too. This OSR path
-        // calls `x64::compile` directly (not `jit::try_compile`), so it
-        // used to bypass the bail-list short-circuit and re-ran the FULL
-        // compile pipeline on every OSR trigger of a permanently
-        // uncompilable hot method (observed: 35,923 wasted pipelines on
-        // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
-        if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
-            return None;
-        }
-        let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
-        let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
-            Some(s) => s,
-            None => {
-                // RBC.4 — scan rejects are permanent (see jit::try_compile_inner).
-                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+        (|| -> Option<_> {
+            // RBC.2 — honor the permanent bail-list here too. This OSR path
+            // calls `x64::compile` directly (not `jit::try_compile`), so it
+            // used to bypass the bail-list short-circuit and re-ran the FULL
+            // compile pipeline on every OSR trigger of a permanently
+            // uncompilable hot method (observed: 35,923 wasted pipelines on
+            // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
+            if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
                 return None;
             }
-        };
-        // RBC.6 — never OSR an athrow method: the OSR bail path resumes
-        // interpretation at the back-edge, so an athrow lowering that ran
-        // side effects natively before throwing could see them re-applied.
-        // Method-entry compilation (which propagates cleanly through the
-        // JIT-return exception drains) remains available, so do NOT
-        // bail-list here.
-        if scan.has_athrow {
-            return None;
-        }
-
-        // Resolve multianewarray
-        let mut mna_info = Vec::new();
-        if !scan.multianewarray_ops.is_empty() {
-            let cm = shared.class_manager.read();
-            let class = cm.get_class(class_id)?;
-            for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                let leaf = class_name_ref.trim_start_matches('[');
-                let leaf_et = match leaf.as_bytes().first() {
-                    Some(b'I') => 10u8,
-                    Some(b'J') => 11,
-                    Some(b'F') => 6,
-                    Some(b'D') => 7,
-                    Some(b'B') => 8,
-                    Some(b'C') => 5,
-                    Some(b'S') => 9,
-                    Some(b'Z') => 4,
-                    _ => 0,
-                };
-                mna_info.push((pc, leaf_et));
+            let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
+            let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
+                Some(s) => s,
+                None => {
+                    // RBC.4 — scan rejects are permanent (see jit::try_compile_inner).
+                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    return None;
+                }
+            };
+            // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+            // interpretation at the back-edge, so an athrow lowering that ran
+            // side effects natively before throwing could see them re-applied.
+            // Method-entry compilation (which propagates cleanly through the
+            // JIT-return exception drains) remains available, so do NOT
+            // bail-list here.
+            if scan.has_athrow {
+                return None;
             }
-        }
 
-        // Resolve typecheck
-        let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
-        let mut owned_jit_strings2: Vec<Box<str>> = Vec::new();
-        if !scan.typecheck_ops.is_empty() {
-            let cm_lock = shared.class_manager.read();
-            let class = cm_lock.get_class(class_id)?;
-            for &(pc, cp_idx) in &scan.typecheck_ops {
-                let cn = class.constant_pool.get_class_name(cp_idx)?;
-                let boxed: Box<str> = cn.to_string().into_boxed_str();
-                let ptr = boxed.as_ptr();
-                let len = boxed.len();
-                owned_jit_strings2.push(boxed);
-                typecheck_info.push((pc, ptr, len));
+            // Resolve multianewarray
+            let mut mna_info = Vec::new();
+            if !scan.multianewarray_ops.is_empty() {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(class_id)?;
+                for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
+                    let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
+                    let leaf = class_name_ref.trim_start_matches('[');
+                    let leaf_et = match leaf.as_bytes().first() {
+                        Some(b'I') => 10u8,
+                        Some(b'J') => 11,
+                        Some(b'F') => 6,
+                        Some(b'D') => 7,
+                        Some(b'B') => 8,
+                        Some(b'C') => 5,
+                        Some(b'S') => 9,
+                        Some(b'Z') => 4,
+                        _ => 0,
+                    };
+                    mna_info.push((pc, leaf_et));
+                }
             }
-        }
 
-        // Resolve static fields
-        let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
-        if !scan.static_field_ops.is_empty() {
-            for &(pc, cp_idx) in &scan.static_field_ops {
-                let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+            // Resolve typecheck
+            let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
+            let mut owned_jit_strings2: Vec<Box<str>> = Vec::new();
+            if !scan.typecheck_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                static_field_info.push((
-                    pc,
-                    field.declaring_class_id.as_u32(),
-                    field.field_index,
-                    type_tag,
-                    field.is_volatile,
-                ));
+                for &(pc, cp_idx) in &scan.typecheck_ops {
+                    let cn = class.constant_pool.get_class_name(cp_idx)?;
+                    let boxed: Box<str> = cn.to_string().into_boxed_str();
+                    let ptr = boxed.as_ptr();
+                    let len = boxed.len();
+                    owned_jit_strings2.push(boxed);
+                    typecheck_info.push((pc, ptr, len));
+                }
             }
-        }
 
-        // Resolve instance fields for getfield/putfield. Without this, the
-        // OSR-compiled method had no `field_info` and every getfield/putfield
-        // fell back to the `(pc, 0, b'I')` default in `compile_op_getfield` /
-        // `compile_op_putfield` — silently routing every instance-field write
-        // through `jit_putfield_int` into slot 0 with the wrong type tag.
-        // Manifested in `org/eclipse/jdt/internal/compiler/util/HashtableOfInt`
-        // (Eclipse JDT BatchCompiler boot): the OSR-compiled `rehash()`
-        // stored the new `int[]` into `keyTable`'s slot tagged as
-        // `Value::Int(low32_of_ptr)`, and the next `put()` then read back the
-        // bogus tag and crashed at `arraylength` with
-        //   `expected object reference, got int(N)`.
-        // Mirrors the field_info collection in the first-call JIT compile
-        // path (this file, ~line 1915) and `resolve_inline_site` (~line 13367).
-        let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
-        if !scan.field_ops.is_empty() {
-            for &(pc, cp_idx) in &scan.field_ops {
-                let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+            // Resolve static fields
+            let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
+            if !scan.static_field_ops.is_empty() {
+                for &(pc, cp_idx) in &scan.static_field_ops {
+                    let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+                    let cm_lock = shared.class_manager.read();
+                    let class = cm_lock.get_class(class_id)?;
+                    let nat_idx = match class.constant_pool.get(cp_idx) {
+                        Some(ConstantPoolEntry::FieldReference {
+                            name_and_type_index,
+                            ..
+                        }) => *name_and_type_index,
+                        _ => return None,
+                    };
+                    let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                    let type_tag = *descriptor.as_bytes().first()?;
+                    static_field_info.push((
+                        pc,
+                        field.declaring_class_id.as_u32(),
+                        field.field_index,
+                        type_tag,
+                        field.is_volatile,
+                    ));
+                }
+            }
+
+            // Resolve instance fields for getfield/putfield. Without this, the
+            // OSR-compiled method had no `field_info` and every getfield/putfield
+            // fell back to the `(pc, 0, b'I')` default in `compile_op_getfield` /
+            // `compile_op_putfield` — silently routing every instance-field write
+            // through `jit_putfield_int` into slot 0 with the wrong type tag.
+            // Manifested in `org/eclipse/jdt/internal/compiler/util/HashtableOfInt`
+            // (Eclipse JDT BatchCompiler boot): the OSR-compiled `rehash()`
+            // stored the new `int[]` into `keyTable`'s slot tagged as
+            // `Value::Int(low32_of_ptr)`, and the next `put()` then read back the
+            // bogus tag and crashed at `arraylength` with
+            //   `expected object reference, got int(N)`.
+            // Mirrors the field_info collection in the first-call JIT compile
+            // path (this file, ~line 1915) and `resolve_inline_site` (~line 13367).
+            let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
+            if !scan.field_ops.is_empty() {
+                for &(pc, cp_idx) in &scan.field_ops {
+                    let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+                    let cm_lock = shared.class_manager.read();
+                    let class = cm_lock.get_class(class_id)?;
+                    let nat_idx = match class.constant_pool.get(cp_idx) {
+                        Some(ConstantPoolEntry::FieldReference {
+                            name_and_type_index,
+                            ..
+                        }) => *name_and_type_index,
+                        _ => return None,
+                    };
+                    let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                    let type_tag = *descriptor.as_bytes().first()?;
+                    field_info.push((pc, field.field_index, type_tag));
+                }
+            }
+
+            // Resolve invokes — collect info under lock, then compile callees after release
+            let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
+            let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
+            let mut direct_calls2: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
+            // Pending invokestatic callee compilations: (pc, class, method, desc, param_count)
+            let mut pending_callee_compiles: Vec<(usize, String, String, String, usize)> =
+                Vec::new();
+            if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                field_info.push((pc, field.field_index, type_tag));
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    let (ref_class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                        Some(ConstantPoolEntry::MethodReference {
+                            class_index,
+                            name_and_type_index,
+                            ..
+                        }) => (*class_index, *name_and_type_index),
+                        Some(ConstantPoolEntry::InterfaceMethodReference {
+                            class_index,
+                            name_and_type_index,
+                            ..
+                        }) => (*class_index, *name_and_type_index),
+                        _ => continue,
+                    };
+                    let target_class = class.constant_pool.get_class_name(ref_class_idx)?;
+                    let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                    let param_count = crate::jit::count_param_slots(desc);
+                    let invoke_kind = match opcode {
+                        0xb6 => 0u8,
+                        0xb7 => 1,
+                        0xb9 => 2,
+                        0xb8 => 3,
+                        _ => continue,
+                    };
+
+                    // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
+                    if invoke_kind == 3
+                        && target_class == "java/lang/Math"
+                        && mn == "sqrt"
+                        && desc == "(D)D"
+                    {
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry: crate::jit::MATH_SQRT_INTRINSIC,
+                                needs_context: false,
+                                num_params: 1,
+                                return_type: b'D',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+
+                    // For invokestatic, schedule eager callee compilation (after lock release)
+                    if invoke_kind == 3 {
+                        pending_callee_compiles.push((
+                            pc,
+                            target_class.to_string(),
+                            mn.to_string(),
+                            desc.to_string(),
+                            param_count,
+                        ));
+                        continue;
+                    }
+
+                    let num_jit_args = param_count + 1; // +1 for receiver (non-static)
+                    let return_type = crate::jit::return_type(desc);
+                    let class_box: Box<str> = target_class.to_string().into_boxed_str();
+                    let method_box: Box<str> = mn.to_string().into_boxed_str();
+                    let desc_box: Box<str> = desc.to_string().into_boxed_str();
+                    let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    owned_jit_strings2.push(class_box);
+                    owned_jit_strings2.push(method_box);
+                    owned_jit_strings2.push(desc_box);
+                    // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
+                    let info = Box::new(crate::jit::JitInvokeInfo {
+                        class_name: unsafe { &*class_ref },
+                        method_name: unsafe { &*method_ref },
+                        descriptor: unsafe { &*desc_ref },
+                        num_jit_args,
+                        return_type,
+                        invoke_kind,
+                    });
+                    let info_ptr: *const _ = &*info;
+                    owned_jit_invoke_infos2.push(info);
+                    invoke_info.push((pc, info_ptr));
+                }
             }
-        }
 
-        // Resolve invokes — collect info under lock, then compile callees after release
-        let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
-        let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
-        let mut direct_calls2: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
-        // Pending invokestatic callee compilations: (pc, class, method, desc, param_count)
-        let mut pending_callee_compiles: Vec<(usize, String, String, String, usize)> = Vec::new();
-        if !scan.invoke_ops.is_empty() {
-            let cm_lock = shared.class_manager.read();
-            let class = cm_lock.get_class(class_id)?;
-            for &(pc, cp_idx, opcode) in &scan.invoke_ops {
-                let (ref_class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    Some(ConstantPoolEntry::InterfaceMethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    _ => continue,
-                };
-                let target_class = class.constant_pool.get_class_name(ref_class_idx)?;
-                let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let param_count = crate::jit::count_param_slots(desc);
-                let invoke_kind = match opcode {
-                    0xb6 => 0u8,
-                    0xb7 => 1,
-                    0xb9 => 2,
-                    0xb8 => 3,
-                    _ => continue,
-                };
-
-                // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
-                if invoke_kind == 3
-                    && target_class == "java/lang/Math"
-                    && mn == "sqrt"
-                    && desc == "(D)D"
+            // Eagerly compile invokestatic callees (class_manager lock released)
+            for (ipc, callee_class, callee_method, callee_desc, param_count) in
+                pending_callee_compiles
+            {
+                if let Some((entry, needs_ctx)) =
+                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc)
                 {
                     direct_calls2.push((
-                        pc,
+                        ipc,
                         crate::jit::JitDirectCall {
-                            entry: crate::jit::MATH_SQRT_INTRINSIC,
-                            needs_context: false,
-                            num_params: 1,
-                            return_type: b'D',
+                            entry,
+                            needs_context: needs_ctx,
+                            num_params: param_count,
+                            return_type: crate::jit::return_type(&callee_desc),
                             guard_class_id: 0,
                         },
                     ));
-                    continue;
+                } else {
+                    // Compilation failed — fall back to dispatch helper
+                    let class_box: Box<str> = callee_class.into_boxed_str();
+                    let method_box: Box<str> = callee_method.into_boxed_str();
+                    let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
+                    let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
+                    owned_jit_strings2.push(class_box);
+                    owned_jit_strings2.push(method_box);
+                    owned_jit_strings2.push(desc_box);
+                    let return_type = crate::jit::return_type(&callee_desc);
+                    // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
+                    let info = Box::new(crate::jit::JitInvokeInfo {
+                        class_name: unsafe { &*class_ref },
+                        method_name: unsafe { &*method_ref },
+                        descriptor: unsafe { &*desc_ref },
+                        num_jit_args: param_count,
+                        return_type,
+                        invoke_kind: 3,
+                    });
+                    let info_ptr: *const _ = &*info;
+                    owned_jit_invoke_infos2.push(info);
+                    invoke_info.push((ipc, info_ptr));
                 }
+            }
 
-                // For invokestatic, schedule eager callee compilation (after lock release)
-                if invoke_kind == 3 {
-                    pending_callee_compiles.push((
-                        pc,
-                        target_class.to_string(),
-                        mn.to_string(),
-                        desc.to_string(),
-                        param_count,
-                    ));
-                    continue;
+            // Resolve ldc/ldc_w constants
+            let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
+            if !scan.ldc_ops.is_empty() {
+                let cm_lock = shared.class_manager.read();
+                let class = cm_lock.get_class(class_id)?;
+                for &(pc, cp_idx) in &scan.ldc_ops {
+                    let val = match class.constant_pool.get(cp_idx) {
+                        Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
+                        Some(ConstantPoolEntry::Float(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        _ => return None, // String/other ldc — bail out of OSR
+                    };
+                    ldc_info2.push((pc, val));
                 }
-
-                let num_jit_args = param_count + 1; // +1 for receiver (non-static)
-                let return_type = crate::jit::return_type(desc);
-                let class_box: Box<str> = target_class.to_string().into_boxed_str();
-                let method_box: Box<str> = mn.to_string().into_boxed_str();
-                let desc_box: Box<str> = desc.to_string().into_boxed_str();
-                let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                owned_jit_strings2.push(class_box);
-                owned_jit_strings2.push(method_box);
-                owned_jit_strings2.push(desc_box);
-                // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
-                let info = Box::new(crate::jit::JitInvokeInfo {
-                    class_name: unsafe { &*class_ref },
-                    method_name: unsafe { &*method_ref },
-                    descriptor: unsafe { &*desc_ref },
-                    num_jit_args,
-                    return_type,
-                    invoke_kind,
-                });
-                let info_ptr: *const _ = &*info;
-                owned_jit_invoke_infos2.push(info);
-                invoke_info.push((pc, info_ptr));
             }
-        }
 
-        // Eagerly compile invokestatic callees (class_manager lock released)
-        for (ipc, callee_class, callee_method, callee_desc, param_count) in pending_callee_compiles {
-            if let Some((entry, needs_ctx)) = try_jit_compile_callee(
-                shared, &callee_class, &callee_method, &callee_desc,
-            ) {
-                direct_calls2.push((
-                    ipc,
-                    crate::jit::JitDirectCall {
-                        entry,
-                        needs_context: needs_ctx,
-                        num_params: param_count,
-                        return_type: crate::jit::return_type(&callee_desc),
-                        guard_class_id: 0,
-                    },
-                ));
-            } else {
-                // Compilation failed — fall back to dispatch helper
-                let class_box: Box<str> = callee_class.into_boxed_str();
-                let method_box: Box<str> = callee_method.into_boxed_str();
-                let desc_box: Box<str> = callee_desc.clone().into_boxed_str();
-                let class_ref = &*class_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                let method_ref = &*method_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                let desc_ref = &*desc_box as *const str; // Cast: string slice to raw pointer for JIT lifetime
-                owned_jit_strings2.push(class_box);
-                owned_jit_strings2.push(method_box);
-                owned_jit_strings2.push(desc_box);
-                let return_type = crate::jit::return_type(&callee_desc);
-                // SAFETY: class_ref, method_ref, desc_ref point into the boxed strs that were just pushed to owned_jit_strings2, which outlives the JitInvokeInfo.
-                let info = Box::new(crate::jit::JitInvokeInfo {
-                    class_name: unsafe { &*class_ref },
-                    method_name: unsafe { &*method_ref },
-                    descriptor: unsafe { &*desc_ref },
-                    num_jit_args: param_count,
-                    return_type,
-                    invoke_kind: 3,
-                });
-                let info_ptr: *const _ = &*info;
-                owned_jit_invoke_infos2.push(info);
-                invoke_info.push((ipc, info_ptr));
-            }
-        }
-
-        // Resolve ldc/ldc_w constants
-        let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
-        if !scan.ldc_ops.is_empty() {
-            let cm_lock = shared.class_manager.read();
-            let class = cm_lock.get_class(class_id)?;
-            for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                    Some(ConstantPoolEntry::Float(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => return None, // String/other ldc — bail out of OSR
-                };
-                ldc_info2.push((pc, val));
-            }
-        }
-
-        // Resolve ldc2_w constants
-        let mut ldc2w_info2: Vec<(usize, i64)> = Vec::new();
-        if !scan.ldc2w_ops.is_empty() {
-            let cm_lock = shared.class_manager.read();
-            let class = cm_lock.get_class(class_id)?;
-            for &(pc, cp_idx) in &scan.ldc2w_ops {
-                let val = match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Long(v) => *v,
-                    ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => return None,
-                };
-                ldc2w_info2.push((pc, val));
-            }
-        }
-
-        // Resolve new/anewarray info for stackless path (mirrors first JIT site)
-        let mut new_info2: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
-        let mut anewarray_info2: Vec<(usize, u32)> = Vec::new();
-        let is_real_class2 = shared.class_manager.read()
-            .get_class(class_id)
-            .map(|c| !c.is_synthetic_stub)
-            .unwrap_or(false);
-        if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
-            let new_class_names: Vec<(usize, Option<String>)> = {
+            // Resolve ldc2_w constants
+            let mut ldc2w_info2: Vec<(usize, i64)> = Vec::new();
+            if !scan.ldc2w_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
-                if let Some(class) = cm_lock.get_class(class_id) {
-                    scan.new_ops.iter()
-                        .map(|&(pc_new, cp_idx)| {
-                            (pc_new, class.constant_pool.get_class_name(cp_idx).map(|s| s.to_string()))
-                        })
-                        .collect()
-                } else { Vec::new() }
-            };
-            let arr_class_names: Vec<(usize, Option<String>)> = {
-                let cm_lock = shared.class_manager.read();
-                if let Some(class) = cm_lock.get_class(class_id) {
-                    scan.anewarray_ops.iter()
-                        .map(|&(pc_arr, cp_idx)| {
-                            (pc_arr, class.constant_pool.get_class_name(cp_idx).map(|s| s.to_string()))
-                        })
-                        .collect()
-                } else { Vec::new() }
-            };
-            for (pc_new, name_opt) in new_class_names {
-                if let Some(name) = name_opt {
-                    let load_result = shared.load_class_concurrent(&name);
-                    if let Ok(target_id) = load_result {
-                        let num_fields = shared.class_manager.read()
-                            .get_class(target_id)
-                            .map(|c| c.num_total_fields).unwrap_or(0);
-                        new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                let class = cm_lock.get_class(class_id)?;
+                for &(pc, cp_idx) in &scan.ldc2w_ops {
+                    let val = match class.constant_pool.get(cp_idx)? {
+                        ConstantPoolEntry::Long(v) => *v,
+                        ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        _ => return None,
+                    };
+                    ldc2w_info2.push((pc, val));
+                }
+            }
+
+            // Resolve new/anewarray info for stackless path (mirrors first JIT site)
+            let mut new_info2: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
+            let mut anewarray_info2: Vec<(usize, u32)> = Vec::new();
+            let is_real_class2 = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| !c.is_synthetic_stub)
+                .unwrap_or(false);
+            if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
+                let new_class_names: Vec<(usize, Option<String>)> = {
+                    let cm_lock = shared.class_manager.read();
+                    if let Some(class) = cm_lock.get_class(class_id) {
+                        scan.new_ops
+                            .iter()
+                            .map(|&(pc_new, cp_idx)| {
+                                (
+                                    pc_new,
+                                    class
+                                        .constant_pool
+                                        .get_class_name(cp_idx)
+                                        .map(|s| s.to_string()),
+                                )
+                            })
+                            .collect()
                     } else {
-                        new_info2.push((pc_new, 0, 0, true, true));
+                        Vec::new()
+                    }
+                };
+                let arr_class_names: Vec<(usize, Option<String>)> = {
+                    let cm_lock = shared.class_manager.read();
+                    if let Some(class) = cm_lock.get_class(class_id) {
+                        scan.anewarray_ops
+                            .iter()
+                            .map(|&(pc_arr, cp_idx)| {
+                                (
+                                    pc_arr,
+                                    class
+                                        .constant_pool
+                                        .get_class_name(cp_idx)
+                                        .map(|s| s.to_string()),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                for (pc_new, name_opt) in new_class_names {
+                    if let Some(name) = name_opt {
+                        let load_result = shared.load_class_concurrent(&name);
+                        if let Ok(target_id) = load_result {
+                            let num_fields = shared
+                                .class_manager
+                                .read()
+                                .get_class(target_id)
+                                .map(|c| c.num_total_fields)
+                                .unwrap_or(0);
+                            new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                        } else {
+                            new_info2.push((pc_new, 0, 0, true, true));
+                        }
+                    }
+                }
+                for (pc_arr, name_opt) in arr_class_names {
+                    if let Some(name) = name_opt {
+                        if let Ok(target_id) = shared.load_class_concurrent(&name) {
+                            anewarray_info2.push((pc_arr, target_id.as_u32()));
+                        } else {
+                            anewarray_info2.push((pc_arr, 0));
+                        }
                     }
                 }
             }
-            for (pc_arr, name_opt) in arr_class_names {
-                if let Some(name) = name_opt {
-                    if let Ok(target_id) = shared.load_class_concurrent(&name) {
-                        anewarray_info2.push((pc_arr, target_id.as_u32()));
-                    } else {
-                        anewarray_info2.push((pc_arr, 0));
-                    }
-                }
-            }
-        }
 
-        // Prologue argument-slot count. `count_param_slots` returns only
-        // the declared descriptor parameters; an instance method also
-        // receives the implicit `this` as JVM local 0, so the prologue
-        // must load `1 + declared` argument registers. Omitting `this`
-        // makes the prologue zero-init local 0 — the OSR-compiled method
-        // would then run with a null receiver.
-        let osr_method_is_static = shared
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|class| {
-                class
-                    .methods
-                    .iter()
-                    .find(|m| {
-                        &*m.name == method_name_check
-                            && &*m.descriptor == method_descriptor.as_str()
-                    })
-                    .map(|m| m.is_static())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        let param_slots = crate::jit::count_param_slots(&method_descriptor)
-            + if osr_method_is_static { 0 } else { 1 };
-        let helpers = crate::jit::helpers::build_helpers();
-        let mut cm = crate::jit::x64::compile(
-            &code,
-            code_len,
-            param_slots,
-            thread.frames[frame_idx].max_locals as usize, // Widening: u16 to usize
-            scan.needs_heap,
-            mna_info,
-            field_info,
-            typecheck_info,
-            static_field_info,
-            new_info2,
-            anewarray_info2,
-            invoke_info,
-            direct_calls2,
-            Vec::new(), // mic_slots — OSR-recompile path; dispatch still
-                        // goes through the slow-path helper.
-            Vec::new(), // pic_slots (HIGH-7) — OSR-recompile path. Eager
-                        // PIC allocation is wired in `jit::try_compile`;
-                        // this codepath emits the slow-path helper for
-                        // every invokevirtual/invokeinterface.
-            ldc_info2,
-            ldc2w_info2,
-            std::collections::HashMap::new(), // branch_hints
-            std::collections::HashMap::new(), // loop_unroll_hints
-            &helpers,
-            scan.non_escaping_new.clone(), // escape analysis results
-            std::collections::HashMap::new(), // inline_sites
-            None, // string_layout — String intrinsics land in a later wave
-        );
-        let Some(mut cm) = cm else {
-            // RBC.2 — a backend bail here is just as permanent as one in
-            // `jit::try_compile`; record it so neither this OSR path nor
-            // the invocation-counter path re-runs the pipeline.
-            crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
-            return None;
-        };
-        cm.compiled_via_osr = true;
-        cm._jit_strings = owned_jit_strings2;
-        cm._jit_invoke_infos = owned_jit_invoke_infos2;
-        let mut jit_cache = shared.jit_cache.write();
-        jit_cache.put(
-            class_name_arc.clone(),
-            method_name_arc.clone(),
-            descriptor_arc.clone(),
-            cm,
-        );
-        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
-    })()
+            // Prologue argument-slot count. `count_param_slots` returns only
+            // the declared descriptor parameters; an instance method also
+            // receives the implicit `this` as JVM local 0, so the prologue
+            // must load `1 + declared` argument registers. Omitting `this`
+            // makes the prologue zero-init local 0 — the OSR-compiled method
+            // would then run with a null receiver.
+            let osr_method_is_static = shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| {
+                    class
+                        .methods
+                        .iter()
+                        .find(|m| {
+                            &*m.name == method_name_check
+                                && &*m.descriptor == method_descriptor.as_str()
+                        })
+                        .map(|m| m.is_static())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let param_slots = crate::jit::count_param_slots(&method_descriptor)
+                + if osr_method_is_static { 0 } else { 1 };
+            let helpers = crate::jit::helpers::build_helpers();
+            let mut cm = crate::jit::x64::compile(
+                &code,
+                code_len,
+                param_slots,
+                thread.frames[frame_idx].max_locals as usize, // Widening: u16 to usize
+                scan.needs_heap,
+                mna_info,
+                field_info,
+                typecheck_info,
+                static_field_info,
+                new_info2,
+                anewarray_info2,
+                invoke_info,
+                direct_calls2,
+                Vec::new(), // mic_slots — OSR-recompile path; dispatch still
+                // goes through the slow-path helper.
+                Vec::new(), // pic_slots (HIGH-7) — OSR-recompile path. Eager
+                // PIC allocation is wired in `jit::try_compile`;
+                // this codepath emits the slow-path helper for
+                // every invokevirtual/invokeinterface.
+                ldc_info2,
+                ldc2w_info2,
+                std::collections::HashMap::new(), // branch_hints
+                std::collections::HashMap::new(), // loop_unroll_hints
+                &helpers,
+                scan.non_escaping_new.clone(), // escape analysis results
+                std::collections::HashMap::new(), // inline_sites
+                None, // string_layout — String intrinsics land in a later wave
+            );
+            let Some(mut cm) = cm else {
+                // RBC.2 — a backend bail here is just as permanent as one in
+                // `jit::try_compile`; record it so neither this OSR path nor
+                // the invocation-counter path re-runs the pipeline.
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                return None;
+            };
+            cm.compiled_via_osr = true;
+            cm._jit_strings = owned_jit_strings2;
+            cm._jit_invoke_infos = owned_jit_invoke_infos2;
+            let mut jit_cache = shared.jit_cache.write();
+            jit_cache.put(
+                class_name_arc.clone(),
+                method_name_arc.clone(),
+                descriptor_arc.clone(),
+                cm,
+            );
+            jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+        })()
     };
 
     let compiled = match compiled {
@@ -15639,8 +16369,12 @@ fn try_osr(
         eprintln!(
             "[cratonvm-jitc] OSR-{} {}.{}{} entry_pc={} entry={:p} len={}",
             if osr_reused { "reuse" } else { "compile" },
-            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc,
-            compiled.entry_ptr(), compiled.code_bytes().len()
+            &*class_name_arc,
+            &*method_name_arc,
+            &*descriptor_arc,
+            entry_pc,
+            compiled.entry_ptr(),
+            compiled.code_bytes().len()
         );
     }
     if !osr_reused {
@@ -15664,8 +16398,7 @@ fn try_osr(
     if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
         eprintln!(
             "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?}",
-            &*class_name_arc, &*method_name_arc, &*descriptor_arc,
-            entry_pc, num_locals, jit_locals
+            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, num_locals, jit_locals
         );
     }
 
@@ -15698,7 +16431,9 @@ fn try_osr(
         if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
             eprintln!(
                 "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
-                _qd0, now, _qd0 + 1
+                _qd0,
+                now,
+                _qd0 + 1
             );
         }
     }
@@ -15763,12 +16498,9 @@ fn try_osr(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
-                    shared,
-                    &thread.frames[frame_idx],
-                    entry_pc,
-                    exc,
-                ) {
+                if let Some((handler_pc, exc_ref)) =
+                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
+                {
                     let frame = &mut thread.frames[frame_idx];
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
@@ -15806,12 +16538,9 @@ fn try_osr(
             Some(&msg),
         ) {
             Ok(exc) => {
-                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
-                    shared,
-                    &thread.frames[frame_idx],
-                    entry_pc,
-                    exc,
-                ) {
+                if let Some((handler_pc, exc_ref)) =
+                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
+                {
                     let frame = &mut thread.frames[frame_idx];
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
@@ -15987,15 +16716,21 @@ fn try_jit_upgrade_with_gate(
     {
         if shared
             .native_methods
-            .find(&cached.class_name, &cached.method_name, &cached.method_descriptor)
+            .find(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
             .is_some()
         {
             if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
                 && cached.class_name.contains("LazyProjection")
                 && &*cached.method_name == "equals"
             {
-                eprintln!("[BBLP-upgrade] direct-native skip {}.{}{}",
-                    cached.class_name, cached.method_name, cached.method_descriptor);
+                eprintln!(
+                    "[BBLP-upgrade] direct-native skip {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
             }
             return None;
         }
@@ -16013,8 +16748,13 @@ fn try_jit_upgrade_with_gate(
                             && cached.class_name.contains("LazyProjection")
                             && &*cached.method_name == "equals"
                         {
-                            eprintln!("[BBLP-upgrade] parent-native skip {}.{}{} via parent={}",
-                                cached.class_name, cached.method_name, cached.method_descriptor, parent.name);
+                            eprintln!(
+                                "[BBLP-upgrade] parent-native skip {}.{}{} via parent={}",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                parent.name
+                            );
                         }
                         return None;
                     }
@@ -16026,8 +16766,10 @@ fn try_jit_upgrade_with_gate(
             && cached.class_name.contains("LazyProjection")
             && &*cached.method_name == "equals"
         {
-            eprintln!("[BBLP-upgrade] no native shadow, COMPILING {}.{}{}",
-                cached.class_name, cached.method_name, cached.method_descriptor);
+            eprintln!(
+                "[BBLP-upgrade] no native shadow, COMPILING {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor
+            );
         }
     }
     // W2-CHM: honor the JIT skip list on this caller-method-counter
@@ -16048,17 +16790,19 @@ fn try_jit_upgrade_with_gate(
         } else {
             crate::jit::skip_list::SkipPolicy::Conservative
         };
-        let init_complexity = if &*cached.method_name == "<init>" || &*cached.method_name == "<clinit>" {
-            // Re-classify the constructor body so trivial `<init>` /
-            // `<clinit>` chains stay JIT-eligible (matches the
-            // first-call compile path's gate at line ~1107).
-            crate::jit::skip_list::classify_init_complexity(&cached.code)
-        } else {
-            crate::jit::skip_list::InitComplexity::Unknown
-        };
+        let init_complexity =
+            if &*cached.method_name == "<init>" || &*cached.method_name == "<clinit>" {
+                // Re-classify the constructor body so trivial `<init>` /
+                // `<clinit>` chains stay JIT-eligible (matches the
+                // first-call compile path's gate at line ~1107).
+                crate::jit::skip_list::classify_init_complexity(&cached.code)
+            } else {
+                crate::jit::skip_list::InitComplexity::Unknown
+            };
         let is_interface_default = {
             let cm = shared.class_manager.read();
-            cm.get_class(cached.declaring_class_id).map_or(false, |c| c.is_interface())
+            cm.get_class(cached.declaring_class_id)
+                .map_or(false, |c| c.is_interface())
         };
         if crate::jit::skip_list::should_skip_jit_with_init(
             &cached.class_name,
@@ -16291,7 +17035,8 @@ fn try_jit_upgrade_with_gate(
                 if let Some(compiled) =
                     jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
                 {
-                    return Some((compiled.entry_ptr() as usize, compiled.needs_context())); // Cast: JIT entry point to address
+                    return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
+                    // Cast: JIT entry point to address
                 }
             }
 
@@ -16408,7 +17153,12 @@ fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
-                Some((field.declaring_class_id.as_u32(), field.field_index, type_tag, field.is_volatile))
+                Some((
+                    field.declaring_class_id.as_u32(),
+                    field.field_index,
+                    type_tag,
+                    field.is_volatile,
+                ))
             };
             let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
                 let cm = shared.class_manager.read();
@@ -16571,7 +17321,10 @@ fn try_jit_upgrade_with_gate(
     // codegen (`try_emit_inline`) snapshots+rolls back on any unsupported
     // bytecode, so a bail falls through to the existing direct-call/dispatch
     // path. Previously wired only into `try_jit_compile_callee_slow`.
-    let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
+    let inline_resolver = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
     // Main-path small-method inlining is GATED default-OFF behind
@@ -16596,7 +17349,11 @@ fn try_jit_upgrade_with_gate(
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
-        if main_inline_on { Some(&inline_resolver) } else { None },
+        if main_inline_on {
+            Some(&inline_resolver)
+        } else {
+            None
+        },
         // String call-site intrinsics (length/charAt/hashCode/equals/…): resolve
         // java/lang/String's value/coder/hash field layout so the JIT inlines
         // these accessors instead of crossing the VM→native boundary per call
@@ -16625,8 +17382,11 @@ fn try_jit_upgrade_with_gate(
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
             "[cratonvm-jitc] upgrade-OK {}.{}{} entry={:p} len={}",
-            cached.class_name, cached.method_name, cached.method_descriptor,
-            compiled_arc.entry_ptr(), compiled_arc.code_bytes().len()
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            compiled_arc.entry_ptr(),
+            compiled_arc.code_bytes().len()
         );
     }
     crate::jit::disasm::maybe_dump(
@@ -16680,7 +17440,9 @@ pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool 
     let mut cid = start_cid;
     // Bound the walk so a corrupt/circular hierarchy can't loop forever.
     for _ in 0..64 {
-        let Some(class) = cm.get_class(cid) else { return false; };
+        let Some(class) = cm.get_class(cid) else {
+            return false;
+        };
         if &*class.name == "java/util/concurrent/ForkJoinTask" {
             return true;
         }
@@ -16734,7 +17496,11 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
         h = (h ^ 0xff).wrapping_mul(FNV_PRIME);
     }
     // 0 is the table's "empty slot" sentinel.
-    if h == 0 { 1 } else { h }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 
 /// Compile a callee method by name, storing it in the JIT cache.
@@ -16766,7 +17532,8 @@ pub fn try_jit_compile_callee(
     {
         let jit_cache = shared.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor) {
-            return Some((compiled.entry_ptr() as usize, compiled.needs_context())); // Cast: JIT entry point to address
+            return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
+            // Cast: JIT entry point to address
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -16869,7 +17636,11 @@ fn try_jit_compile_callee_slow(
     // ATNConfig/DFAState `hashCode` are ~58% of the Groovy-parse profile) never
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
-    if shared.native_methods.find(class_name, method_name, descriptor).is_some() {
+    if shared
+        .native_methods
+        .find(class_name, method_name, descriptor)
+        .is_some()
+    {
         return None;
     }
     // Look up the method bytecode
@@ -16973,14 +17744,20 @@ fn try_jit_compile_callee_slow(
     let resolver = |cp_idx: u16| -> Option<String> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
-        class.constant_pool.get_class_name(cp_idx).map(|s| s.to_string())
+        class
+            .constant_pool
+            .get_class_name(cp_idx)
+            .map(|s| s.to_string())
     };
     let field_resolver = |cp_idx: u16| -> Option<(usize, u8)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
-            Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+            Some(ConstantPoolEntry::FieldReference {
+                name_and_type_index,
+                ..
+            }) => *name_and_type_index,
             _ => return None,
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
@@ -16992,26 +17769,44 @@ fn try_jit_compile_callee_slow(
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
-            Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+            Some(ConstantPoolEntry::FieldReference {
+                name_and_type_index,
+                ..
+            }) => *name_and_type_index,
             _ => return None,
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
-        Some((field.declaring_class_id.as_u32(), field.field_index, type_tag, field.is_volatile))
+        Some((
+            field.declaring_class_id.as_u32(),
+            field.field_index,
+            type_tag,
+            field.is_volatile,
+        ))
     };
     let invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
         let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
-            Some(ConstantPoolEntry::MethodReference { class_index, name_and_type_index, .. }) =>
-                (*class_index, *name_and_type_index),
-            Some(ConstantPoolEntry::InterfaceMethodReference { class_index, name_and_type_index, .. }) =>
-                (*class_index, *name_and_type_index),
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index),
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-        Some((target_class.to_string(), method_name.to_string(), descriptor.to_string()))
+        Some((
+            target_class.to_string(),
+            method_name.to_string(),
+            descriptor.to_string(),
+        ))
     };
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
@@ -17072,7 +17867,10 @@ fn try_jit_compile_callee_slow(
     let helpers = crate::jit::helpers::build_helpers();
 
     // Build inline resolver for method inlining (Session 31)
-    let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
+    let inline_resolver = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
 
@@ -17100,8 +17898,11 @@ fn try_jit_compile_callee_slow(
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
             "[cratonvm-jitc] full-compile {}.{}{} entry={:p} len={}",
-            cached.class_name, cached.method_name, cached.method_descriptor,
-            compiled.entry_ptr(), compiled.code_bytes().len()
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            compiled.entry_ptr(),
+            compiled.code_bytes().len()
         );
     }
     crate::jit::disasm::maybe_dump(
@@ -17133,10 +17934,10 @@ fn try_jit_compile_callee_slow(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64; // Cast: duration to u64 nanoseconds
-    // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
-    // `_arc` variant instead of letting `emit_compilation_event` reallocate
-    // a fresh Arc from `&str` internally. Built before the lock so the alloc
-    // is outside the `flight_recorder` critical section.
+                            // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
+                            // `_arc` variant instead of letting `emit_compilation_event` reallocate
+                            // a fresh Arc from `&str` internally. Built before the lock so the alloc
+                            // is outside the `flight_recorder` critical section.
     let method_desc: Arc<str> = Arc::from(format!(
         "{}::{}{}",
         cached.class_name, cached.method_name, cached.method_descriptor
@@ -17404,14 +18205,14 @@ fn resolve_inline_site(
     let inline_no_static = std::env::var_os("CRATONVM_INLINE_ALLOW_STATIC").is_none();
     while scan_pc < code_len {
         match code[scan_pc] {
-            0xaa | 0xab => return None, // tableswitch, lookupswitch
+            0xaa | 0xab => return None,        // tableswitch, lookupswitch
             0xbb | 0xbd | 0xc5 => return None, // new, anewarray, multianewarray
-            0xbf => return None, // athrow
-            0xc0 | 0xc1 => return None, // checkcast, instanceof
-            0xc2 | 0xc3 => return None, // monitorenter, monitorexit
-            0xb6 | 0xb9 => return None, // invokevirtual, invokeinterface
-            0xb7 | 0xb8 => return None, // invokespecial, invokestatic
-            0xba => return None, // invokedynamic
+            0xbf => return None,               // athrow
+            0xc0 | 0xc1 => return None,        // checkcast, instanceof
+            0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
+            0xb6 | 0xb9 => return None,        // invokevirtual, invokeinterface
+            0xb7 | 0xb8 => return None,        // invokespecial, invokestatic
+            0xba => return None,               // invokedynamic
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
             // NOT emit — it bails on these. Rejecting them HERE keeps the
@@ -17421,15 +18222,35 @@ fn resolve_inline_site(
             // dispatch-helper fallback. (Array-load inlining is a follow-up.)
             0x2e..=0x35 => return None, // iaload..saload
             0x4f..=0x56 => return None, // iastore..sastore
-            0xbe => return None, // arraylength
-            0xb4 | 0xb5 => { has_field_ops = true; scan_pc += 3; continue; }
-            0xb2 | 0xb3 => {
-                if inline_no_static { return None; }
-                has_static_field_ops = true; scan_pc += 3; continue;
+            0xbe => return None,        // arraylength
+            0xb4 | 0xb5 => {
+                has_field_ops = true;
+                scan_pc += 3;
+                continue;
             }
-            0x12 => { has_ldc = true; scan_pc += 2; continue; }
-            0x13 => { has_ldc = true; scan_pc += 3; continue; }
-            0x14 => { has_ldc2w = true; scan_pc += 3; continue; }
+            0xb2 | 0xb3 => {
+                if inline_no_static {
+                    return None;
+                }
+                has_static_field_ops = true;
+                scan_pc += 3;
+                continue;
+            }
+            0x12 => {
+                has_ldc = true;
+                scan_pc += 2;
+                continue;
+            }
+            0x13 => {
+                has_ldc = true;
+                scan_pc += 3;
+                continue;
+            }
+            0x14 => {
+                has_ldc2w = true;
+                scan_pc += 3;
+                continue;
+            }
             _ => {}
         }
         // `wide`-aware length so the walk stays in sync over a `wide iinc`
@@ -17456,10 +18277,14 @@ fn resolve_inline_site(
             if matches!(code[fpc], 0xb4 | 0xb5) && fpc + 2 < code_len {
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+                    Some(ConstantPoolEntry::FieldReference {
+                        name_and_type_index,
+                        ..
+                    }) => *name_and_type_index,
                     _ => return None,
                 };
-                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
+                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx)
+                {
                     let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
                     field_sites.push((fpc, cp_idx, type_tag));
                 }
@@ -17477,10 +18302,14 @@ fn resolve_inline_site(
             if matches!(code[fpc], 0xb2 | 0xb3) && fpc + 2 < code_len {
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+                    Some(ConstantPoolEntry::FieldReference {
+                        name_and_type_index,
+                        ..
+                    }) => *name_and_type_index,
                     _ => return None,
                 };
-                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
+                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx)
+                {
                     let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
                     static_sites.push((fpc, cp_idx, type_tag));
                 }
@@ -17599,10 +18428,27 @@ fn resolve_inline_site(
 /// never reach a length query.
 fn inline_bytecode_length(opcode: u8) -> usize {
     match opcode {
-        0x00..=0x0f | 0x1a..=0x35 | 0x3b..=0x83 | 0x85..=0x98 |
-        0xac..=0xb1 | 0xbe | 0xbf | 0xc2 | 0xc3 => 1,
+        0x00..=0x0f
+        | 0x1a..=0x35
+        | 0x3b..=0x83
+        | 0x85..=0x98
+        | 0xac..=0xb1
+        | 0xbe
+        | 0xbf
+        | 0xc2
+        | 0xc3 => 1,
         0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xbc | 0xa9 => 2,
-        0x11 | 0x13 | 0x14 | 0x99..=0xa8 | 0xb2..=0xb8 | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 | 0xbb => 3,
+        0x11
+        | 0x13
+        | 0x14
+        | 0x99..=0xa8
+        | 0xb2..=0xb8
+        | 0xbd
+        | 0xc0
+        | 0xc1
+        | 0xc6
+        | 0xc7
+        | 0xbb => 3,
         0x84 => 3, // iinc
         0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         0xc4 => 4, // wide: lower bound — see inline_instr_length for the real length
@@ -17634,7 +18480,6 @@ fn inline_instr_length(code: &[u8], pc: usize) -> usize {
     }
     inline_bytecode_length(code[pc])
 }
-
 
 /// Extract the array index from an AIOOBE panic message.
 pub fn parse_aioobe_index(msg: &str) -> i32 {
@@ -17744,7 +18589,9 @@ fn execute_jit_call(
     let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
         [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
-        let (cv, is_long) = thread.frames[frame_idx].stack.pop_compact_with_long_mark_unchecked();
+        let (cv, is_long) = thread.frames[frame_idx]
+            .stack
+            .pop_compact_with_long_mark_unchecked();
         saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
             nth_param_tag_byte(&cached.method_descriptor, i)
@@ -17843,7 +18690,13 @@ fn execute_jit_call(
             let _ = crate::jit::helpers::take_jit_deopt_pending();
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
             return route_jit_exception_through_method(
-                shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
+                shared,
+                thread,
+                frame_idx,
+                cached,
+                usize::MAX,
+                exc,
+                &exc_locals,
             );
         }
         match jit_result {
@@ -17906,7 +18759,13 @@ fn execute_jit_call(
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    &exc_locals,
                 );
             }
             other => return Err(other),
@@ -17938,7 +18797,13 @@ fn execute_jit_call(
             Ok(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    &exc_locals,
                 );
             }
             Err(other) => return Err(other),
@@ -17993,7 +18858,9 @@ fn execute_jit_call(
         // routing above supersedes the old uncatchable InternalError below).
         if let Some((index, _length)) = crate::jit::helpers::take_jit_pending_aioobe() {
             if aioobe_dbg() {
-                eprintln!("[AIOOBE-JIT] idx={index} len={_length} — JIT-compiled bounds check failed");
+                eprintln!(
+                    "[AIOOBE-JIT] idx={index} len={_length} — JIT-compiled bounds check failed"
+                );
                 for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                     let cn = shared
                         .class_manager
@@ -18200,7 +19067,13 @@ fn execute_jit_call_decoded(
             // consumes the deopt. Mirrors `execute_jit_call`.
             let _ = crate::jit::helpers::take_jit_deopt_pending();
             return route_jit_exception_through_method(
-                shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
+                shared,
+                thread,
+                frame_idx,
+                cached,
+                usize::MAX,
+                exc,
+                args_slice,
             )
             .map(Some);
         }
@@ -18232,7 +19105,13 @@ fn execute_jit_call_decoded(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    args_slice,
                 )
                 .map(Some);
             }
@@ -18249,7 +19128,13 @@ fn execute_jit_call_decoded(
         ) {
             Ok(exc) => {
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
+                    shared,
+                    thread,
+                    frame_idx,
+                    cached,
+                    usize::MAX,
+                    exc,
+                    args_slice,
                 )
                 .map(Some);
             }
@@ -18295,11 +19180,15 @@ fn execute_jit_call_decoded(
         }
         b'F' => {
             let f = f32::from_bits(result as u32); // Cast: JIT ABI -- i64 register convention
-            thread.frames[frame_idx].stack.push_unchecked(Value::Float(f));
+            thread.frames[frame_idx]
+                .stack
+                .push_unchecked(Value::Float(f));
         }
         b'D' => {
             let d = f64::from_bits(result as u64); // Cast: JIT ABI -- i64 register convention
-            thread.frames[frame_idx].stack.push_unchecked(Value::Double(d));
+            thread.frames[frame_idx]
+                .stack
+                .push_unchecked(Value::Double(d));
         }
         b'[' | b'L' => {
             if result == 0 {
@@ -18391,9 +19280,7 @@ fn execute_invokevirtual_vtable_fast(
     // down the operand stack from the top.
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
-    if crate::runtime::env_cache::dbg_jetty2()
-        && &*method_name == "getClasspath"
-    {
+    if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
         eprintln!(
             "[jetty2-vtfast] {}{} receiver={:?}",
             &*method_name, &*method_descriptor, receiver_val
@@ -18435,11 +19322,22 @@ fn execute_invokevirtual_vtable_fast(
         && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
     {
         let cm = shared.class_manager.read();
-        let caller = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
-        let rcv = cm.get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        let caller = cm
+            .get_class(caller_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let rcv = cm
+            .get_class(receiver_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
         let declaring = crate::classloading::find_method_recursive(
-            receiver_class_id, &method_name, &method_descriptor, &cm.class_store,
-        ).and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string())).unwrap_or_default();
+            receiver_class_id,
+            &method_name,
+            &method_descriptor,
+            &cm.class_store,
+        )
+        .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
+        .unwrap_or_default();
         eprintln!("[vdisp] VTFAST caller={caller} method={method_name}{method_descriptor} receiver_class={rcv} declaring={declaring}");
     }
 
@@ -18519,9 +19417,7 @@ fn execute_invokevirtual_vtable_fast(
     // invoke_cache entry populated by prior slow-path calls is honored.
     {
         let cm = shared.class_manager.read();
-        let rcv_name_owned = cm
-            .get_class(receiver_class_id)
-            .map(|c| c.name.clone());
+        let rcv_name_owned = cm.get_class(receiver_class_id).map(|c| c.name.clone());
         if let Some(rcv_name) = rcv_name_owned.as_ref() {
             // JVMTI redefine guard: a class redefined in place by an agent has
             // authoritative woven bytecode, so the per-class native shadows
@@ -18591,7 +19487,9 @@ fn execute_invokevirtual_vtable_fast(
                     // the parent has BOTH bytecode AND a Rust native, the
                     // native wins. See `populate_virtual_invoke_cache` for
                     // the LinkedHashMap-overlay rationale.
-                    let has_bytecode = parent.find_method(&method_name, &method_descriptor).is_some();
+                    let has_bytecode = parent
+                        .find_method(&method_name, &method_descriptor)
+                        .is_some();
                     // Suppress an inherited native shadow when the declaring
                     // parent has been redefined by an agent (woven bytecode wins).
                     let parent_redefined = crate::classloading::any_class_redefined()
@@ -18823,7 +19721,10 @@ fn execute_invokevirtual_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
-    let target = match thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
+    let target = match thread
+        .invoke_cache
+        .get(caller_class_id, cp_index, is_special)
+    {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
@@ -18838,13 +19739,19 @@ fn execute_invokevirtual_cached(
     // fast-path on the global `any_class_redefined` flag.
     if crate::classloading::any_class_redefined() {
         let shadow_cid = match &target {
-            CachedInvokeTarget::VirtualNative { receiver_class_id, .. } => Some(*receiver_class_id),
-            CachedInvokeTarget::Intrinsic { receiver_class_id, .. } => *receiver_class_id,
+            CachedInvokeTarget::VirtualNative {
+                receiver_class_id, ..
+            } => Some(*receiver_class_id),
+            CachedInvokeTarget::Intrinsic {
+                receiver_class_id, ..
+            } => *receiver_class_id,
             _ => None,
         };
         if let Some(cid) = shadow_cid {
             if shared.class_manager.read().class_redefine_generation(cid) > 0 {
-                thread.invoke_cache.evict(caller_class_id, cp_index, is_special);
+                thread
+                    .invoke_cache
+                    .evict(caller_class_id, cp_index, is_special);
                 return Ok(CachedCallResult::CacheMiss);
             }
         }
@@ -18855,16 +19762,32 @@ fn execute_invokevirtual_cached(
         let mn = thread.frames[frame_idx].method_name();
         if cn.ends_with("/InfoCmp") && mn == "getInfoCmp" && site_pc == 38 {
             let tname = match &target {
-                CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } =>
-                    format!("VirtualBytecode rc={} class={} {}{}", receiver_class_id.as_u32(), cached.class_name, cached.method_name, cached.method_descriptor),
-                CachedInvokeTarget::VirtualNative { receiver_class_id, .. } =>
-                    format!("VirtualNative rc={}", receiver_class_id.as_u32()),
+                CachedInvokeTarget::VirtualBytecode {
+                    receiver_class_id,
+                    cached,
+                    ..
+                } => format!(
+                    "VirtualBytecode rc={} class={} {}{}",
+                    receiver_class_id.as_u32(),
+                    cached.class_name,
+                    cached.method_name,
+                    cached.method_descriptor
+                ),
+                CachedInvokeTarget::VirtualNative {
+                    receiver_class_id, ..
+                } => format!("VirtualNative rc={}", receiver_class_id.as_u32()),
                 CachedInvokeTarget::Native { .. } => "Native".to_string(),
                 CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
-                CachedInvokeTarget::Bytecode { cached, .. } => format!("Bytecode class={} {}{}", cached.class_name, cached.method_name, cached.method_descriptor),
+                CachedInvokeTarget::Bytecode { cached, .. } => format!(
+                    "Bytecode class={} {}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                ),
                 _ => format!("{:?}", target),
             };
-            eprintln!("[PB-DIAG-INVOKE] caller={}.{} pc={} cp_idx={} is_special={} target={}", cn, mn, site_pc, cp_index, is_special, tname);
+            eprintln!(
+                "[PB-DIAG-INVOKE] caller={}.{} pc={} cp_idx={} is_special={} target={}",
+                cn, mn, site_pc, cp_index, is_special, tname
+            );
         }
     }
 
@@ -18898,7 +19821,8 @@ fn execute_invokevirtual_cached(
                     // interception in `execute_invoke`, not Object's bytecode.
                     if !is_special {
                         let cm = shared.class_manager.read();
-                        let is_ann_proxy = cm.get_class(actual_class_id)
+                        let is_ann_proxy = cm
+                            .get_class(actual_class_id)
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
                             .unwrap_or(false);
                         drop(cm);
@@ -19026,24 +19950,16 @@ fn execute_invokevirtual_cached(
                                 for &b in cached.method_descriptor.as_bytes() {
                                     h = h.wrapping_mul(31).wrapping_add(b as u32);
                                 }
-                                ((cached.declaring_class_id.as_u32() as u64) << 32)
-                                    | (h as u64)
+                                ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
                             };
                             const JIT_RETRY_STRIDE: u32 = 64;
-                            let threshold =
-                                crate::runtime::env_cache::jit_invocation_threshold();
-                            let cnt =
-                                shared.profile_store.increment_invocation(invoc_key);
+                            let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                            let cnt = shared.profile_store.increment_invocation(invoc_key);
                             let should_attempt = cnt >= threshold
-                                && (cnt == threshold
-                                    || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                                && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
                             if should_attempt {
                                 if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
-                                    try_jit_upgrade_with_gate(
-                                        shared,
-                                        &cached,
-                                        entry_gate.clone(),
-                                    )
+                                    try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {
                                     return Some(compiled);
                                 }
@@ -19051,8 +19967,7 @@ fn execute_invokevirtual_cached(
                             None
                         });
                         if let Some(compiled) = compiled_opt {
-                            let ret =
-                                crate::jit::return_type(&cached.method_descriptor);
+                            let ret = crate::jit::return_type(&cached.method_descriptor);
                             let heap = compiled.needs_heap();
                             // total_args = receiver + declared params; the decoded
                             // dispatcher treats arg 0 as the receiver.
@@ -19108,7 +20023,13 @@ fn execute_invokevirtual_cached(
                     );
                     frame.monitor_on_exit = monitor_obj;
                     if crate::runtime::env_cache::frame_trace() {
-                        eprintln!("[FRAME_PUSH/vcached] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+                        eprintln!(
+                            "[FRAME_PUSH/vcached] depth={} {}.{}{}",
+                            thread.frames.len(),
+                            frame.class_name(),
+                            frame.method_name(),
+                            frame.method_descriptor()
+                        );
                     }
                     push_frame_and_fire_entry(thread, frame);
                     Ok(CachedCallResult::FramePushed)
@@ -19152,7 +20073,8 @@ fn execute_invokevirtual_cached(
                     // `execute_invoke`'s spec-compliant interception layer.
                     if !is_special {
                         let cm = shared.class_manager.read();
-                        let is_ann_proxy = cm.get_class(actual_class_id)
+                        let is_ann_proxy = cm
+                            .get_class(actual_class_id)
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
                             .unwrap_or(false);
                         drop(cm);
@@ -19205,8 +20127,7 @@ fn execute_invokevirtual_cached(
         } => {
             if let Some(guard_class_id) = receiver_class_id {
                 let num_params_usize = num_params as usize;
-                let receiver_val =
-                    thread.frames[frame_idx].stack.peek_at(num_params_usize);
+                let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params_usize);
                 match receiver_val {
                     Value::Object(Some(obj_ref)) => {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -19230,8 +20151,7 @@ fn execute_invokevirtual_cached(
                         // (receiver included) into a stack buffer — no
                         // resolve, no descriptor parse, no heap alloc on the
                         // steady-state path.
-                        let mut arg_buf =
-                            [Value::Uninitialized; MAX_INTRINSIC_ARGS];
+                        let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
                         let args = pop_coerced_invoke_args_intrinsic(
                             thread,
                             frame_idx,
@@ -19327,7 +20247,13 @@ fn execute_invokevirtual_cached(
                 &mut thread.stacks_pool,
             );
             if crate::runtime::env_cache::frame_trace() {
-                eprintln!("[FRAME_PUSH/vcached2] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
+                eprintln!(
+                    "[FRAME_PUSH/vcached2] depth={} {}.{}{}",
+                    thread.frames.len(),
+                    frame.class_name(),
+                    frame.method_name(),
+                    frame.method_descriptor()
+                );
             }
             push_frame_and_fire_entry(thread, frame);
             Ok(CachedCallResult::FramePushed)
@@ -19376,7 +20302,9 @@ fn populate_virtual_invoke_cache(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, false, Some(receiver_class_id));
     if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
-        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+        thread
+            .invoke_cache
+            .put(caller_class_id, cp_index, false, target);
         return;
     }
 
@@ -19400,14 +20328,27 @@ fn populate_virtual_invoke_cache(
         && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
     {
         let cm = shared.class_manager.read();
-        let caller = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
-        let rcv = cm.get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
-        let cp_static = cm.get_class(caller_class_id)
+        let caller = cm
+            .get_class(caller_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let rcv = cm
+            .get_class(receiver_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let cp_static = cm
+            .get_class(caller_class_id)
             .and_then(|_| resolve_method_ref(shared, caller_class_id, cp_index).ok())
-            .map(|(cn, _, _, _)| cn.to_string()).unwrap_or_default();
+            .map(|(cn, _, _, _)| cn.to_string())
+            .unwrap_or_default();
         let declaring = crate::classloading::find_method_recursive(
-            receiver_class_id, &method_name, &descriptor, &cm.class_store,
-        ).and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string())).unwrap_or_default();
+            receiver_class_id,
+            &method_name,
+            &descriptor,
+            &cm.class_store,
+        )
+        .and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string()))
+        .unwrap_or_default();
         eprintln!("[vdisp] POPULATE caller={caller} cp_static={cp_static} method={method_name}{descriptor} receiver_class={rcv} declaring={declaring}");
     }
 
@@ -19488,9 +20429,8 @@ fn populate_virtual_invoke_cache(
                 // Gate bound to the receiver class — a redefine of the
                 // receiver swaps the dispatched body, mirroring the
                 // `VirtualNative` gate binding below.
-                let gate = RedefineGate::snapshot(
-                    cm.class_redefine_generation_handle(receiver_class_id),
-                );
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
                 drop(cm);
                 // Phase 3 — split the descriptor ONCE here so the
                 // steady-state dispatch path never re-resolves or re-parses.
@@ -19535,13 +20475,19 @@ fn populate_virtual_invoke_cache(
             .get_class(receiver_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        let lookup_name = if rcv_name.starts_with('[') { "java/lang/Object".to_string() } else { rcv_name };
-        if let Some(callback) = shared.native_methods.find(&lookup_name, &method_name, &descriptor) {
+        let lookup_name = if rcv_name.starts_with('[') {
+            "java/lang/Object".to_string()
+        } else {
+            rcv_name
+        };
+        if let Some(callback) = shared
+            .native_methods
+            .find(&lookup_name, &method_name, &descriptor)
+        {
             // WP2.4-F1: gate bound to the receiver class (where dispatch
             // landed). A redefine of the receiver swaps the method body.
-            let gate = RedefineGate::snapshot(
-                cm.class_redefine_generation_handle(receiver_class_id),
-            );
+            let gate =
+                RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
             drop(cm);
             let target = CachedInvokeTarget::VirtualNative {
                 receiver_class_id,
@@ -19550,8 +20496,12 @@ fn populate_virtual_invoke_cache(
                 gate,
             };
             // T10.4 — promote so sibling threads skip the class_manager walk.
-            shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-            thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+            shared
+                .shared_resolution
+                .insert_promoted_invoke(promoted_key, target.clone());
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, false, target);
             return;
         }
         // FJP fix: walk the parent chain looking for natives registered on
@@ -19582,29 +20532,58 @@ fn populate_virtual_invoke_cache(
             // Skip the ancestor-native promotion entirely — fall through
             // to the bytecode dispatch path below.
         } else {
-        let mut cid = receiver_class_id;
-        while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-            if let Some(parent) = cm.get_class(parent_id) {
-                // S107 collection-toString fix: if this parent has its own
-                // bytecode for the method (e.g. AbstractCollection.toString),
-                // the bytecode override wins over any deeper native ancestor
-                // (e.g. Object.toString). Stop walking so the bytecode dispatch
-                // path runs (via find_method_recursive below).
-                //
-                // Round 19 (peaceful-sammet) — IMPORTANT exception: if the
-                // parent has BOTH its own bytecode AND a Rust native registered
-                // for this method, the native wins. Our LinkedHashMap natives
-                // store state in an external overlay (not real fields), so
-                // executing JDK bytecode for inherited callers like
-                // `AnnotationAttributes` (which extends `LinkedHashMap`) walks
-                // empty real fields and returns empty `entrySet()` /
-                // `keySet()`, breaking Spring's
-                // `MetadataReader.getAnnotationAttributes("...Import", true)`
-                // for `@EnableAutoConfiguration` and surfacing as
-                // `MissingWebServerFactoryBean` on Spring Boot startup.
-                let parent_name = parent.name.to_string();
-                if parent.find_method(&method_name, &descriptor).is_some() {
-                    if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
+            let mut cid = receiver_class_id;
+            while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                if let Some(parent) = cm.get_class(parent_id) {
+                    // S107 collection-toString fix: if this parent has its own
+                    // bytecode for the method (e.g. AbstractCollection.toString),
+                    // the bytecode override wins over any deeper native ancestor
+                    // (e.g. Object.toString). Stop walking so the bytecode dispatch
+                    // path runs (via find_method_recursive below).
+                    //
+                    // Round 19 (peaceful-sammet) — IMPORTANT exception: if the
+                    // parent has BOTH its own bytecode AND a Rust native registered
+                    // for this method, the native wins. Our LinkedHashMap natives
+                    // store state in an external overlay (not real fields), so
+                    // executing JDK bytecode for inherited callers like
+                    // `AnnotationAttributes` (which extends `LinkedHashMap`) walks
+                    // empty real fields and returns empty `entrySet()` /
+                    // `keySet()`, breaking Spring's
+                    // `MetadataReader.getAnnotationAttributes("...Import", true)`
+                    // for `@EnableAutoConfiguration` and surfacing as
+                    // `MissingWebServerFactoryBean` on Spring Boot startup.
+                    let parent_name = parent.name.to_string();
+                    if parent.find_method(&method_name, &descriptor).is_some() {
+                        if let Some(callback) =
+                            shared
+                                .native_methods
+                                .find(&parent_name, &method_name, &descriptor)
+                        {
+                            let gate = RedefineGate::snapshot(
+                                cm.class_redefine_generation_handle(receiver_class_id),
+                            );
+                            drop(cm);
+                            let target = CachedInvokeTarget::VirtualNative {
+                                receiver_class_id,
+                                callback,
+                                num_params: num_params as u16,
+                                gate,
+                            };
+                            shared
+                                .shared_resolution
+                                .insert_promoted_invoke(promoted_key, target.clone());
+                            thread
+                                .invoke_cache
+                                .put(caller_class_id, cp_index, false, target);
+                            return;
+                        }
+                        break;
+                    }
+                    if let Some(callback) =
+                        shared
+                            .native_methods
+                            .find(&parent_name, &method_name, &descriptor)
+                    {
                         let gate = RedefineGate::snapshot(
                             cm.class_redefine_generation_handle(receiver_class_id),
                         );
@@ -19615,30 +20594,17 @@ fn populate_virtual_invoke_cache(
                             num_params: num_params as u16,
                             gate,
                         };
-                        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-                        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                        shared
+                            .shared_resolution
+                            .insert_promoted_invoke(promoted_key, target.clone());
+                        thread
+                            .invoke_cache
+                            .put(caller_class_id, cp_index, false, target);
                         return;
                     }
-                    break;
                 }
-                if let Some(callback) = shared.native_methods.find(&parent_name, &method_name, &descriptor) {
-                    let gate = RedefineGate::snapshot(
-                        cm.class_redefine_generation_handle(receiver_class_id),
-                    );
-                    drop(cm);
-                    let target = CachedInvokeTarget::VirtualNative {
-                        receiver_class_id,
-                        callback,
-                        num_params: num_params as u16,
-                        gate,
-                    };
-                    shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-                    thread.invoke_cache.put(caller_class_id, cp_index, false, target);
-                    return;
-                }
+                cid = parent_id;
             }
-            cid = parent_id;
-        }
         }
     }
 
@@ -19655,19 +20621,14 @@ fn populate_virtual_invoke_cache(
     };
 
     if method.is_native() {
-        let declaring_name = store
-            .get(declaring_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
+        let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
         if let Some(callback) =
             shared
                 .native_methods
                 .find(declaring_name, &method_name, &descriptor)
         {
             // WP2.4-F1: gate bound to the declaring class.
-            let gate = RedefineGate::snapshot(
-                cm.class_redefine_generation_handle(declaring_id),
-            );
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
             drop(cm);
             let target = CachedInvokeTarget::VirtualNative {
                 receiver_class_id,
@@ -19676,8 +20637,12 @@ fn populate_virtual_invoke_cache(
                 gate,
             };
             // T10.4 — promote so sibling threads skip this walk.
-            shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-            thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+            shared
+                .shared_resolution
+                .insert_promoted_invoke(promoted_key, target.clone());
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, false, target);
         }
         return;
     }
@@ -19696,23 +20661,17 @@ fn populate_virtual_invoke_cache(
     // bytecode would re-introduce the layout mismatch on every dispatch
     // through this call-site.
     {
-        let declaring_name = store
-            .get(declaring_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
-        let force = force_native_over_real_jdk_bytecode(
-            declaring_name,
-            &method_name,
-            &descriptor,
-        ) || (matches!(
-            declaring_name,
-            "java/util/HashMap"
-            | "java/util/LinkedHashMap"
-            | "java/util/Hashtable"
-            | "java/util/concurrent/ConcurrentHashMap"
-        ) && matches!(
-            &*method_name,
-            "computeIfAbsent" | "compute" | "computeIfPresent"
+        let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+        let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
+            || (matches!(
+                declaring_name,
+                "java/util/HashMap"
+                    | "java/util/LinkedHashMap"
+                    | "java/util/Hashtable"
+                    | "java/util/concurrent/ConcurrentHashMap"
+            ) && matches!(
+                &*method_name,
+                "computeIfAbsent" | "compute" | "computeIfPresent"
             | "merge" | "putIfAbsent" | "replace"
             | "forEach" | "replaceAll" | "getOrDefault"
             | "putMapEntries" | "putAll"
@@ -19728,16 +20687,15 @@ fn populate_virtual_invoke_cache(
             // store data in a side-store, so the JDK bytecode sees an empty
             // table. See companion entry in `force_native_over_real_jdk_bytecode`.
             | "keys" | "elements"
-        ));
+            ));
         if force {
             if let Some(callback) =
                 shared
                     .native_methods
                     .find(declaring_name, &method_name, &descriptor)
             {
-                let gate = RedefineGate::snapshot(
-                    cm.class_redefine_generation_handle(declaring_id),
-                );
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
                 drop(cm);
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
@@ -19745,8 +20703,12 @@ fn populate_virtual_invoke_cache(
                     num_params: num_params as u16,
                     gate,
                 };
-                shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-                thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, false, target);
                 return;
             }
         }
@@ -19756,19 +20718,14 @@ fn populate_virtual_invoke_cache(
     // `Constructor.newInstance`; the monomorphic fast path skips
     // `try_stackless_invoke` and would execute JDK bytecode instead of the
     // Rust overrides registered in `register_essential_natives`.
-    let declaring_for_reflect = store
-        .get(declaring_id)
-        .map(|c| &*c.name)
-        .unwrap_or("");
+    let declaring_for_reflect = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
     if let Some(callback) = native_override_for_cached_reflect_invoke(
         shared,
         declaring_for_reflect,
         method_name.as_ref(),
         descriptor.as_ref(),
     ) {
-        let gate = RedefineGate::snapshot(
-            cm.class_redefine_generation_handle(receiver_class_id),
-        );
+        let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
         drop(cm);
         let target = CachedInvokeTarget::VirtualNative {
             receiver_class_id,
@@ -19776,8 +20733,12 @@ fn populate_virtual_invoke_cache(
             num_params: num_params as u16,
             gate,
         };
-        shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-        thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+        shared
+            .shared_resolution
+            .insert_promoted_invoke(promoted_key, target.clone());
+        thread
+            .invoke_cache
+            .put(caller_class_id, cp_index, false, target);
         return;
     }
 
@@ -19787,10 +20748,7 @@ fn populate_virtual_invoke_cache(
 
     let class = cm.get_class(declaring_id);
     let source_file = class.and_then(|c| c.source_file.as_deref()).map(Arc::from);
-    let declaring_class_name = store
-        .get(declaring_id)
-        .map(|c| &*c.name)
-        .unwrap_or("");
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
 
     let cached = CachedBytecodeMethod {
         declaring_class_id: declaring_id,
@@ -19811,9 +20769,7 @@ fn populate_virtual_invoke_cache(
     // we get the same Arc<AtomicU32> that `redefine_class` will later
     // bump.  Bind to the declaring class — that's the class whose
     // method body lives in `cached`.
-    let gate = RedefineGate::snapshot(
-        cm.class_redefine_generation_handle(declaring_id),
-    );
+    let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
     drop(cm);
     let target = CachedInvokeTarget::VirtualBytecode {
         receiver_class_id,
@@ -19822,8 +20778,12 @@ fn populate_virtual_invoke_cache(
     };
     // T10.4 — promote so sibling threads dispatching the same call-site
     // skip the class_manager read-lock and find_method_recursive walk.
-    shared.shared_resolution.insert_promoted_invoke(promoted_key, target.clone());
-    thread.invoke_cache.put(caller_class_id, cp_index, false, target);
+    shared
+        .shared_resolution
+        .insert_promoted_invoke(promoted_key, target.clone());
+    thread
+        .invoke_cache
+        .put(caller_class_id, cp_index, false, target);
 }
 
 /// Returns (class_name, method_name, descriptor, num_params).
@@ -19892,8 +20852,8 @@ fn resolve_method_ref(
         .constant_pool
         .get_name_and_type(nat_idx)
         .ok_or_else(|| VmError::Internal {
-            message: format!("invalid name_and_type at cp#{nat_idx}"),
-        })?;
+        message: format!("invalid name_and_type at cp#{nat_idx}"),
+    })?;
 
     let method_name: Arc<str> = Arc::from(method_name_str);
     let method_descriptor: Arc<str> = Arc::from(method_descriptor_str);
@@ -19902,7 +20862,9 @@ fn resolve_method_ref(
     // Module access check (JPMS §5.4.4): verify accessor can reach the target class's module.
     if let Some(target_id) = cm.get_loaded_class_id(&class_name) {
         crate::classloading::access_control::check_module_access_by_id(
-            current_class_id, target_id, &cm,
+            current_class_id,
+            target_id,
+            &cm,
         )?;
     }
 
@@ -20169,14 +21131,17 @@ fn branch_target(saved_pc: usize, offset: i16) -> usize {
 
 /// Test whether two reference values are the same object (identity comparison).
 /// Exposed as `pub` for testing from vm.rs.
-pub fn test_refs_equal(a: &Value, b: &Value) -> bool { refs_equal(a, b) }
+pub fn test_refs_equal(a: &Value, b: &Value) -> bool {
+    refs_equal(a, b)
+}
 
 #[inline]
 fn value_as_object_ptr(v: &Value) -> Option<*mut u8> {
     match v {
         Value::Object(Some(o)) => Some(o.as_ptr()),
-        Value::Long(bits) => crate::types::jlong_bits_as_aligned_object_ptr(*bits as u64)
-            .map(|p| p as *mut u8),
+        Value::Long(bits) => {
+            crate::types::jlong_bits_as_aligned_object_ptr(*bits as u64).map(|p| p as *mut u8)
+        }
         _ => None,
     }
 }
@@ -20335,23 +21300,31 @@ fn alloc_multi_array(
         } else {
             ArrayElementType::Reference
         };
-        let arr = shared.heap.try_alloc_array(ClassId::new(0), element_type, length)
-            .ok_or_else(|| MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::OutOfMemoryError {
-                    message: format!("Java heap space (multianewarray leaf dim, length={})", length),
-                },
-            )))?;
+        let arr = shared
+            .heap
+            .try_alloc_array(ClassId::new(0), element_type, length)
+            .ok_or_else(|| {
+                MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+                    message: format!(
+                        "Java heap space (multianewarray leaf dim, length={})",
+                        length
+                    ),
+                }))
+            })?;
         Ok(arr)
     } else {
         // Intermediate dimensions: always Reference (array of arrays)
         let arr = shared
             .heap
             .try_alloc_array(ClassId::new(0), ArrayElementType::Reference, length)
-            .ok_or_else(|| MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::OutOfMemoryError {
-                    message: format!("Java heap space (multianewarray dim {}, length={})", depth, length),
-                },
-            )))?;
+            .ok_or_else(|| {
+                MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+                    message: format!(
+                        "Java heap space (multianewarray dim {}, length={})",
+                        depth, length
+                    ),
+                }))
+            })?;
         for i in 0..length {
             let sub_array =
                 alloc_multi_array(shared, sizes, depth + 1, leaf_et, total_array_depth)?;
@@ -20510,10 +21483,13 @@ mod tests {
         // Picocli's layout: invokestatic at 24, areturn at 27. The handler
         // covers [22, 27), so invoke_pc=24 must be detected as "covered".
         let invoke_pc = 24usize;
-        let covered = table.iter().any(|e| {
-            invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize
-        });
-        assert!(covered, "invoke at pc=24 must be flagged as inside [22,27) handler range");
+        let covered = table
+            .iter()
+            .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize);
+        assert!(
+            covered,
+            "invoke at pc=24 must be flagged as inside [22,27) handler range"
+        );
 
         // Negative case: an invoke at pc=30 is past the try region — TCO
         // remains safe there.
@@ -20521,13 +21497,16 @@ mod tests {
         let covered_outside = table.iter().any(|e| {
             invoke_pc_outside >= e.start_pc as usize && invoke_pc_outside < e.end_pc as usize
         });
-        assert!(!covered_outside, "invoke at pc=30 must NOT be flagged (outside any handler)");
+        assert!(
+            !covered_outside,
+            "invoke at pc=30 must NOT be flagged (outside any handler)"
+        );
 
         // Empty exception table — TCO always safe, predicate returns false.
         let empty: &[ExceptionTableEntry] = &[];
-        let covered_empty = empty.iter().any(|e| {
-            invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize
-        });
+        let covered_empty = empty
+            .iter()
+            .any(|e| invoke_pc >= e.start_pc as usize && invoke_pc < e.end_pc as usize);
         assert!(!covered_empty, "empty exception table must never flag");
     }
 
@@ -20564,8 +21543,8 @@ mod tests {
     /// Returns `(production_hits, scanned_lines)`. The test fails if
     /// `production_hits` is not zero.
     fn scan_production_section(path: &str, needles: &[&str]) -> (usize, usize) {
-        let src = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let src =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
 
         let mut hits = 0usize;
         let mut scanned = 0usize;
@@ -20583,11 +21562,7 @@ mod tests {
             // A real `#[cfg(test)]` attribute (not a `//`/`//!`/`*` comment
             // mentioning it) opens a test-gated item to skip.
             let is_comment = trimmed.starts_with("//") || trimmed.starts_with("*");
-            if !is_comment
-                && skip_depth == 0
-                && !pending
-                && trimmed.starts_with("#[cfg(test)]")
-            {
+            if !is_comment && skip_depth == 0 && !pending && trimmed.starts_with("#[cfg(test)]") {
                 pending = true;
                 continue; // skip the attribute line itself
             }
@@ -20780,7 +21755,14 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let outer = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
 
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
@@ -20804,7 +21786,14 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![0, 5];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let outer = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 0);
     }
 
@@ -20817,7 +21806,14 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![7];
-        let arr = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let arr = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(arr), 7);
     }
 
@@ -20830,7 +21826,14 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![2, 3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let outer = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 2);
 
         let mid_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -21099,40 +22102,76 @@ mod tests {
     #[test]
     fn narrow_field_byte_sign_extends() {
         // 0x1234_5680 -> low byte 0x80 -> -128 (sign-extended)
-        assert_eq!(narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'B'), Value::Int(-128));
-        assert_eq!(narrow_int_to_field_type(Value::Int(127), b'B'), Value::Int(127));
-        assert_eq!(narrow_int_to_field_type(Value::Int(256), b'B'), Value::Int(0));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'B'),
+            Value::Int(-128)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(127), b'B'),
+            Value::Int(127)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(256), b'B'),
+            Value::Int(0)
+        );
     }
 
     #[test]
     fn narrow_field_short_sign_extends() {
         // low 16 bits 0x8000 -> -32768
-        assert_eq!(narrow_int_to_field_type(Value::Int(0x0001_8000u32 as i32), b'S'), Value::Int(-32768));
-        assert_eq!(narrow_int_to_field_type(Value::Int(32767), b'S'), Value::Int(32767));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(0x0001_8000u32 as i32), b'S'),
+            Value::Int(-32768)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(32767), b'S'),
+            Value::Int(32767)
+        );
     }
 
     #[test]
     fn narrow_field_char_zero_extends() {
         // char is unsigned: low 16 bits 0xFFFF -> 65535 (NOT -1)
-        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'C'), Value::Int(65535));
-        assert_eq!(narrow_int_to_field_type(Value::Int(0x10000), b'C'), Value::Int(0));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(-1), b'C'),
+            Value::Int(65535)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(0x10000), b'C'),
+            Value::Int(0)
+        );
     }
 
     #[test]
     fn narrow_field_boolean_masks_bit0() {
         assert_eq!(narrow_int_to_field_type(Value::Int(2), b'Z'), Value::Int(0));
         assert_eq!(narrow_int_to_field_type(Value::Int(3), b'Z'), Value::Int(1));
-        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'Z'), Value::Int(1));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(-1), b'Z'),
+            Value::Int(1)
+        );
     }
 
     #[test]
     fn narrow_field_int_and_others_unchanged() {
         // 'I' and any non-sub-int descriptor pass through untouched.
-        assert_eq!(narrow_int_to_field_type(Value::Int(-1), b'I'), Value::Int(-1));
-        assert_eq!(narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'L'), Value::Int(0x1234_5680u32 as i32));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(-1), b'I'),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Int(0x1234_5680u32 as i32), b'L'),
+            Value::Int(0x1234_5680u32 as i32)
+        );
         // Non-Int carriers pass through regardless of descriptor.
-        assert_eq!(narrow_int_to_field_type(Value::Long(5), b'B'), Value::Long(5));
-        assert_eq!(narrow_int_to_field_type(Value::Object(None), b'B'), Value::Object(None));
+        assert_eq!(
+            narrow_int_to_field_type(Value::Long(5), b'B'),
+            Value::Long(5)
+        );
+        assert_eq!(
+            narrow_int_to_field_type(Value::Object(None), b'B'),
+            Value::Object(None)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -21255,10 +22294,7 @@ mod tests {
     #[test]
     fn count_method_params_object_return() {
         // Return type should NOT be counted
-        assert_eq!(
-            count_method_params("(I)Ljava/lang/String;"),
-            1
-        );
+        assert_eq!(count_method_params("(I)Ljava/lang/String;"), 1);
     }
 
     // -- branch_target edge cases --
@@ -21290,7 +22326,8 @@ mod tests {
 
         // 2D array with int leaves: int[3][4]
         let sizes = vec![3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len()).unwrap();
+        let outer =
+            alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -21315,7 +22352,14 @@ mod tests {
 
         // 4D: [2][2][2][2]
         let sizes = vec![2, 2, 2, 2];
-        let d0 = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let d0 = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(d0), 2);
 
         // Walk down to depth 3
@@ -21379,7 +22423,10 @@ mod tests {
         // can store char[] references into it via aastore). All slots start
         // as null Object refs.
         let slot = vm.shared.heap.get_array_element(inner, 5).unwrap();
-        assert!(matches!(slot, Value::Object(None)), "inner slot must be null Object, got {slot:?}");
+        assert!(
+            matches!(slot, Value::Object(None)),
+            "inner slot must be null Object, got {slot:?}"
+        );
     }
 
     #[test]
@@ -21392,7 +22439,14 @@ mod tests {
 
         // [1][1] — minimal non-zero multi-array
         let sizes = vec![1, 1];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
+        let outer = alloc_multi_array(
+            &vm.shared,
+            &sizes,
+            0,
+            ArrayElementType::Reference,
+            sizes.len(),
+        )
+        .unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 1);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -21472,17 +22526,26 @@ mod tests {
 
     #[test]
     fn widen_primitive_long_to_float() {
-        assert_eq!(widen_primitive("J", "F", Value::Long(100)), Value::Float(100.0));
+        assert_eq!(
+            widen_primitive("J", "F", Value::Long(100)),
+            Value::Float(100.0)
+        );
     }
 
     #[test]
     fn widen_primitive_long_to_double() {
-        assert_eq!(widen_primitive("J", "D", Value::Long(100)), Value::Double(100.0));
+        assert_eq!(
+            widen_primitive("J", "D", Value::Long(100)),
+            Value::Double(100.0)
+        );
     }
 
     #[test]
     fn widen_primitive_float_to_double() {
-        assert_eq!(widen_primitive("F", "D", Value::Float(1.5)), Value::Double(1.5));
+        assert_eq!(
+            widen_primitive("F", "D", Value::Float(1.5)),
+            Value::Double(1.5)
+        );
     }
 
     #[test]
@@ -21517,7 +22580,7 @@ mod tests {
             catch_type: 0, // catch-all for simplicity
         };
         let invoke_pc = 24usize; // Class.forName at invoke_pc 24 (3-byte insn)
-        // JVMS range is inclusive-start, exclusive-end.
+                                 // JVMS range is inclusive-start, exclusive-end.
         assert!(invoke_pc >= entry.start_pc as usize);
         assert!(invoke_pc < entry.end_pc as usize);
 
@@ -21558,7 +22621,9 @@ mod tests {
         // Wire check: inserting a promoted target via SharedResolutionState
         // on a live SharedVm and reading it back via get_promoted_invoke
         // yields the same target without touching class_manager.
-        use crate::classloading::resolution::{CachedBytecodeMethod, CachedInvokeTarget, RedefineGate};
+        use crate::classloading::resolution::{
+            CachedBytecodeMethod, CachedInvokeTarget, RedefineGate,
+        };
         use crate::config::VmConfig;
         use crate::runtime::lockfree_resolve::PromotedInvokeKey;
         use crate::vm::Vm;
@@ -21592,7 +22657,11 @@ mod tests {
         );
         let got = vm.shared.shared_resolution.get_promoted_invoke(&key);
         match got {
-            Some(CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached: got_cached, gate: _ }) => {
+            Some(CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id,
+                cached: got_cached,
+                gate: _,
+            }) => {
                 assert_eq!(receiver_class_id, ClassId::new(12345));
                 assert_eq!(got_cached.method_name.as_ref(), "hi");
             }
@@ -21648,9 +22717,7 @@ mod tests {
             2
         );
         assert!(vm.shared.operand_stack_pool.acquire_hit_count() > before_op_hits);
-        assert!(
-            vm.shared.operand_stack_pool.release_stored_count() > before_op_stored
-        );
+        assert!(vm.shared.operand_stack_pool.release_stored_count() > before_op_stored);
 
         // FIX: restore the global stat gate to its prior state so this test
         // does not leak `VEC_POOL_STATS_ENABLED = true` into sibling tests
@@ -21839,10 +22906,7 @@ mod tests {
         stack
             .push_long(double_to_long(1_234_567_890.5))
             .expect("push_long");
-        assert_eq!(
-            stack.peek_compact().as_long_unchecked(),
-            1_234_567_890i64
-        );
+        assert_eq!(stack.peek_compact().as_long_unchecked(), 1_234_567_890i64);
 
         // Saturation edges: JVM §2.8.3.
         assert_eq!(double_to_long(f64::NAN), 0i64);
@@ -21941,8 +23005,7 @@ mod tests {
         // A long at an arbitrary bit pattern exercises the non-NaN
         // branch of the `long`/`double` codec.
         let lv: i64 = 0x0DEA_DBEE_FCAF_EBAB_u64 as i64;
-        push_invoke_return_value(&mut stack, Value::Long(lv))
-            .expect("push must succeed");
+        push_invoke_return_value(&mut stack, Value::Long(lv)).expect("push must succeed");
         assert_eq!(stack.pop_long().expect("J must decode as long"), lv);
     }
 
@@ -21952,8 +23015,7 @@ mod tests {
         let mut stack = ValueStack::new(8);
         // A finite, non-NaN double — round-trips exactly.
         let dv: f64 = std::f64::consts::PI;
-        push_invoke_return_value(&mut stack, Value::Double(dv))
-            .expect("push must succeed");
+        push_invoke_return_value(&mut stack, Value::Double(dv)).expect("push must succeed");
         let popped = stack.pop_double().expect("D must decode as double");
         assert_eq!(popped.to_bits(), dv.to_bits());
     }
@@ -21991,8 +23053,7 @@ mod tests {
         // Object returns also fall through to `push(Value)` — confirm
         // the tag-aware branch does not accidentally swallow the
         // reference.
-        push_invoke_return_value(&mut stack, Value::Object(None))
-            .expect("null reference push");
+        push_invoke_return_value(&mut stack, Value::Object(None)).expect("null reference push");
         let popped = stack.pop().expect("non-empty");
         assert!(matches!(popped, Value::Object(None)));
     }
@@ -22424,7 +23485,7 @@ mod tests {
 
         // Path 2: verify VmHeap::next_identity_hash never returns 0
         // (matching the legacy non-TLAB allocators).
-        use cratonvm_gc::vm_heap::{VmHeap, GcBackend};
+        use cratonvm_gc::vm_heap::{GcBackend, VmHeap};
         let heap = VmHeap::new(GcBackend::Generational, 1024 * 1024);
         for _ in 0..16 {
             assert_ne!(
@@ -22553,12 +23614,11 @@ mod tests {
         use crate::vm::Vm;
 
         let mut vm = Vm::new(VmConfig::new());
-        let err = MethodCallFailed::InternalError(VmError::Linkage(
-            LinkageError::ClassFormatError {
+        let err =
+            MethodCallFailed::InternalError(VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: "Demo".to_string(),
                 message: "ldc: invalid constant pool index 99".to_string(),
-            },
-        ));
+            }));
         let out = convert_ldc_class_format_error(&vm.shared, &mut vm.main_thread, err);
         // Either a real Java exception (rt.jar available) or the original
         // error preserved (rt.jar absent in the test harness). It must

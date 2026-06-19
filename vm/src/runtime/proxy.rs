@@ -245,28 +245,19 @@ mod tests {
 
     #[test]
     fn count_descriptor_params_objects_and_arrays() {
-        assert_eq!(
-            count_descriptor_params("(Ljava/lang/String;)V"),
-            1
-        );
+        assert_eq!(count_descriptor_params("(Ljava/lang/String;)V"), 1);
         assert_eq!(
             count_descriptor_params("(Ljava/lang/String;Ljava/lang/Object;)V"),
             2
         );
         assert_eq!(count_descriptor_params("([I)V"), 1);
         assert_eq!(count_descriptor_params("([[I)V"), 1);
-        assert_eq!(
-            count_descriptor_params("([Ljava/lang/String;)V"),
-            1
-        );
+        assert_eq!(count_descriptor_params("([Ljava/lang/String;)V"), 1);
     }
 
     #[test]
     fn count_descriptor_params_mixed() {
-        assert_eq!(
-            count_descriptor_params("(ILjava/lang/String;[J)V"),
-            3
-        );
+        assert_eq!(count_descriptor_params("(ILjava/lang/String;[J)V"), 3);
     }
 
     #[test]

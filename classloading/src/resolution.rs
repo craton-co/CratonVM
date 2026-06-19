@@ -495,12 +495,16 @@ impl ResolutionCache {
         });
         // Call sites + condy: key match only. (Their resolved values
         // carry no reachable declaring-class link.)
-        self.call_sites.retain(|(key_class, _), _| *key_class != class_id);
-        self.condy.retain(|(key_class, _), _| *key_class != class_id);
+        self.call_sites
+            .retain(|(key_class, _), _| *key_class != class_id);
+        self.condy
+            .retain(|(key_class, _), _| *key_class != class_id);
         // Rebuild the FIFO trackers so they stay in sync with the maps:
         // keep only keys still present, preserving insertion order.
-        self.fields_order.retain(|key| self.fields.contains_key(key));
-        self.methods_order.retain(|key| self.methods.contains_key(key));
+        self.fields_order
+            .retain(|key| self.fields.contains_key(key));
+        self.methods_order
+            .retain(|key| self.methods.contains_key(key));
         self.call_sites_order
             .retain(|key| self.call_sites.contains_key(key));
         self.condy_order.retain(|key| self.condy.contains_key(key));
@@ -632,7 +636,10 @@ impl CachedEntry {
         // Born with the bit SET so a freshly-inserted entry survives the
         // immediately-following sweep (it is by definition the most
         // recently used).
-        Self { value, used: AtomicBool::new(true) }
+        Self {
+            value,
+            used: AtomicBool::new(true),
+        }
     }
 }
 
@@ -648,7 +655,11 @@ pub struct LinkResolver {
     /// CLOCK reference bit so the table can be capped at [`CACHE_CAP`]
     /// without per-hit LRU bookkeeping. See [`Self::evict_clock`].
     cache: parking_lot::RwLock<
-        hashbrown::HashMap<(ClassId, Arc<str>, Arc<str>), CachedEntry, crate::fx_hash::FxBuildHasher>,
+        hashbrown::HashMap<
+            (ClassId, Arc<str>, Arc<str>),
+            CachedEntry,
+            crate::fx_hash::FxBuildHasher,
+        >,
     >,
 }
 
@@ -656,9 +667,10 @@ impl LinkResolver {
     /// Build an empty resolver.
     pub fn new() -> Self {
         Self {
-            cache: parking_lot::RwLock::new(
-                hashbrown::HashMap::with_capacity_and_hasher(256, Default::default()),
-            ),
+            cache: parking_lot::RwLock::new(hashbrown::HashMap::with_capacity_and_hasher(
+                256,
+                Default::default(),
+            )),
         }
     }
 
@@ -693,20 +705,13 @@ impl LinkResolver {
     /// hashbrown's `raw_entry` API so a cache hit costs a hash + a key
     /// comparison — no Arc clones until we know we'll write into the
     /// cache.
-    pub fn get(
-        &self,
-        class_id: ClassId,
-        name: &str,
-        descriptor: &str,
-    ) -> Option<ResolvedMember> {
+    pub fn get(&self, class_id: ClassId, name: &str, descriptor: &str) -> Option<ResolvedMember> {
         let guard = self.cache.read();
         let hash = Self::hash_key(guard.hasher(), class_id, name, descriptor);
         guard
             .raw_entry()
             .from_hash(hash, |(k_cid, k_name, k_desc)| {
-                *k_cid == class_id
-                    && k_name.as_ref() == name
-                    && k_desc.as_ref() == descriptor
+                *k_cid == class_id && k_name.as_ref() == name && k_desc.as_ref() == descriptor
             })
             .map(|(_, entry)| {
                 // PERF (CLOCK): mark recently-used through the shared read
@@ -855,7 +860,10 @@ impl LinkResolver {
         if guard.len() >= CACHE_CAP {
             Self::evict_clock(&mut guard);
         }
-        guard.insert((class_id, name_arc, desc_arc), CachedEntry::new(resolved.clone()));
+        guard.insert(
+            (class_id, name_arc, desc_arc),
+            CachedEntry::new(resolved.clone()),
+        );
         resolved
     }
 
@@ -884,36 +892,35 @@ impl LinkResolver {
         store: &crate::class::ClassStore,
     ) -> ResolvedMember {
         self.resolve_or_compute(class_id, name, descriptor, || {
-            let resolved = match crate::class::find_method_recursive(
-                class_id, name, descriptor, store,
-            ) {
-                Some((_, declaring)) => {
-                    // Locate the position inside the declaring class's
-                    // methods vec so callers can re-fetch the
-                    // `ClassFileMethod` via the store.
-                    match store.get(declaring) {
-                        Some(decl) => match decl
-                            .methods
-                            .iter()
-                            .position(|m| &*m.name == name && &*m.descriptor == descriptor)
-                        {
-                            Some(idx) => ResolvedMember::Method {
-                                declaring_class_id: declaring,
-                                index: idx as u32,
+            let resolved =
+                match crate::class::find_method_recursive(class_id, name, descriptor, store) {
+                    Some((_, declaring)) => {
+                        // Locate the position inside the declaring class's
+                        // methods vec so callers can re-fetch the
+                        // `ClassFileMethod` via the store.
+                        match store.get(declaring) {
+                            Some(decl) => match decl
+                                .methods
+                                .iter()
+                                .position(|m| &*m.name == name && &*m.descriptor == descriptor)
+                            {
+                                Some(idx) => ResolvedMember::Method {
+                                    declaring_class_id: declaring,
+                                    index: idx as u32,
+                                },
+                                // Defensive: walk succeeded but position
+                                // lookup failed (would only happen if the
+                                // store mutated between the two calls,
+                                // which a single `&store` borrow prevents).
+                                // Treat as NotFound so we don't return a
+                                // bogus index.
+                                None => ResolvedMember::NotFound,
                             },
-                            // Defensive: walk succeeded but position
-                            // lookup failed (would only happen if the
-                            // store mutated between the two calls,
-                            // which a single `&store` borrow prevents).
-                            // Treat as NotFound so we don't return a
-                            // bogus index.
                             None => ResolvedMember::NotFound,
-                        },
-                        None => ResolvedMember::NotFound,
+                        }
                     }
-                }
-                None => ResolvedMember::NotFound,
-            };
+                    None => ResolvedMember::NotFound,
+                };
             (
                 cratonvm_types::intern_arc(name),
                 cratonvm_types::intern_arc(descriptor),
@@ -934,15 +941,13 @@ impl LinkResolver {
         store: &crate::class::ClassStore,
     ) -> ResolvedMember {
         self.resolve_or_compute(class_id, name, "", || {
-            let resolved = match crate::class::find_field_recursive(
-                class_id, name, store,
-            ) {
+            let resolved = match crate::class::find_field_recursive(class_id, name, store) {
                 Some((field_index, field, declaring)) => ResolvedMember::Field {
                     declaring_class_id: declaring,
                     absolute_index: field_index as u32,
-                    is_static: field.access_flags.contains(
-                        cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
-                    ),
+                    is_static: field
+                        .access_flags
+                        .contains(cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC),
                 },
                 None => ResolvedMember::NotFound,
             };
@@ -965,10 +970,12 @@ impl LinkResolver {
                 return false;
             }
             match &entry.value {
-                ResolvedMember::Method { declaring_class_id, .. }
-                | ResolvedMember::Field { declaring_class_id, .. } => {
-                    *declaring_class_id != class_id
+                ResolvedMember::Method {
+                    declaring_class_id, ..
                 }
+                | ResolvedMember::Field {
+                    declaring_class_id, ..
+                } => *declaring_class_id != class_id,
                 ResolvedMember::NotFound => true,
             }
         });
@@ -1052,7 +1059,10 @@ impl RedefineGate {
     #[inline]
     pub fn snapshot(counter: Arc<AtomicU32>) -> Self {
         let generation = counter.load(Ordering::Acquire);
-        Self { generation, counter }
+        Self {
+            generation,
+            counter,
+        }
     }
 
     /// Build a gate that always reports fresh — used for entries that don't
@@ -1223,11 +1233,20 @@ impl InvokeCache {
     /// through to the slow path which re-resolves against the freshly
     /// installed bytecode.  See [`RedefineGate`] for the underlying check.
     #[inline]
-    pub fn get(&mut self, caller_class: ClassId, cp_index: u16, is_special: bool) -> Option<&CachedInvokeTarget> {
+    pub fn get(
+        &mut self,
+        caller_class: ClassId,
+        cp_index: u16,
+        is_special: bool,
+    ) -> Option<&CachedInvokeTarget> {
         let key = (caller_class, cp_index, is_special);
         // WP2.4-F1: O(1) generation check on hit. If the entry is stale,
         // remove it and pretend we never had it; the caller will repopulate.
-        let stale = self.entries.get(&key).map(|t| t.is_stale()).unwrap_or(false);
+        let stale = self
+            .entries
+            .get(&key)
+            .map(|t| t.is_stale())
+            .unwrap_or(false);
         if stale {
             self.entries.remove(&key);
             return None;
@@ -1235,8 +1254,15 @@ impl InvokeCache {
         self.entries.get(&key)
     }
 
-    pub fn put(&mut self, caller_class: ClassId, cp_index: u16, is_special: bool, target: CachedInvokeTarget) {
-        self.entries.insert((caller_class, cp_index, is_special), target);
+    pub fn put(
+        &mut self,
+        caller_class: ClassId,
+        cp_index: u16,
+        is_special: bool,
+        target: CachedInvokeTarget,
+    ) {
+        self.entries
+            .insert((caller_class, cp_index, is_special), target);
     }
 
     /// Clear all cached invoke targets. Used to invalidate stale entries after
@@ -1507,8 +1533,8 @@ mod tests {
     /// does) renders the snapshotted entry stale.
     #[test]
     fn invoke_cache_evicts_stale_entry_after_redefine_bump() {
-        use std::sync::Arc;
         use std::sync::atomic::Ordering;
+        use std::sync::Arc;
         let mut cache = InvokeCache::new();
         let caller = ClassId::new(7);
         let cp_index = 11u16;
@@ -1541,8 +1567,10 @@ mod tests {
         counter.fetch_add(1, Ordering::Release);
 
         // Next hit — entry is stale, getter must auto-evict and return None.
-        assert!(cache.get(caller, cp_index, false).is_none(),
-                "stale entry must be evicted after redefine bump");
+        assert!(
+            cache.get(caller, cp_index, false).is_none(),
+            "stale entry must be evicted after redefine bump"
+        );
 
         // Subsequent populate with a fresh snapshot succeeds.
         let new_cached = Arc::new(CachedBytecodeMethod {
@@ -1559,10 +1587,15 @@ mod tests {
             is_synchronized: false,
             is_static: true,
         });
-        cache.put(caller, cp_index, false, CachedInvokeTarget::Bytecode {
-            cached: new_cached,
-            gate: RedefineGate::snapshot(Arc::clone(&counter)),
-        });
+        cache.put(
+            caller,
+            cp_index,
+            false,
+            CachedInvokeTarget::Bytecode {
+                cached: new_cached,
+                gate: RedefineGate::snapshot(Arc::clone(&counter)),
+            },
+        );
         let hit = cache.get(caller, cp_index, false).expect("fresh entry hit");
         match hit {
             CachedInvokeTarget::Bytecode { cached, .. } => {
@@ -1707,12 +1740,18 @@ mod tests {
             class_a,
             Arc::clone(&name),
             Arc::clone(&desc),
-            ResolvedMember::Method { declaring_class_id: class_b, index: 7 },
+            ResolvedMember::Method {
+                declaring_class_id: class_b,
+                index: 7,
+            },
         );
 
         // Hit.
         match resolver.get(class_a, &name, &desc) {
-            Some(ResolvedMember::Method { declaring_class_id, index }) => {
+            Some(ResolvedMember::Method {
+                declaring_class_id,
+                index,
+            }) => {
                 assert_eq!(declaring_class_id, class_b);
                 assert_eq!(index, 7);
             }
@@ -1789,7 +1828,10 @@ mod tests {
             )
         });
         match got {
-            ResolvedMember::Method { declaring_class_id, index } => {
+            ResolvedMember::Method {
+                declaring_class_id,
+                index,
+            } => {
                 assert_eq!(
                     declaring_class_id, class_winner,
                     "race loser should have returned the winner's entry"
@@ -1800,7 +1842,10 @@ mod tests {
         }
         // Cache must still hold the winner's entry, not the loser's.
         match resolver.get(class_a, "m", "()V").expect("entry present") {
-            ResolvedMember::Method { declaring_class_id, index } => {
+            ResolvedMember::Method {
+                declaring_class_id,
+                index,
+            } => {
                 assert_eq!(declaring_class_id, class_winner);
                 assert_eq!(index, 7);
             }
@@ -1825,7 +1870,10 @@ mod tests {
             hot_class,
             hot_name.clone(),
             desc.clone(),
-            ResolvedMember::Method { declaring_class_id: hot_class, index: 0 },
+            ResolvedMember::Method {
+                declaring_class_id: hot_class,
+                index: 0,
+            },
         );
 
         // Flood the cache with far more than CACHE_CAP distinct triples,
@@ -1838,7 +1886,10 @@ mod tests {
                 cid,
                 name,
                 desc.clone(),
-                ResolvedMember::Method { declaring_class_id: cid, index: i as u32 },
+                ResolvedMember::Method {
+                    declaring_class_id: cid,
+                    index: i as u32,
+                },
             );
             if i % 64 == 0 {
                 // Keep the hot entry's reference bit set.

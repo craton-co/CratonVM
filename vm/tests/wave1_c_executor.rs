@@ -28,7 +28,11 @@ use std::time::Duration;
 
 fn probe_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().join("apps").join("executor_probe")
+    manifest
+        .parent()
+        .unwrap()
+        .join("apps")
+        .join("executor_probe")
 }
 
 fn cratonvm_binary() -> Option<PathBuf> {
@@ -40,7 +44,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {

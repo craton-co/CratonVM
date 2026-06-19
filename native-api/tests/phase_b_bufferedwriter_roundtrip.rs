@@ -13,7 +13,11 @@ use cratonvm_native_api::fd_table::FileDescriptorTable;
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("cratonvm_phase_b_{}_{}.txt", name, std::process::id()));
+    p.push(format!(
+        "cratonvm_phase_b_{}_{}.txt",
+        name,
+        std::process::id()
+    ));
     p
 }
 

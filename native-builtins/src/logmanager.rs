@@ -519,14 +519,20 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Int(1)))
 }
 
-fn native_read_configuration_no_arg(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_read_configuration_no_arg(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Security: we deliberately do NOT parse untrusted logging config —
     // any path that would load a properties file is suppressed. The
     // process-wide tracing subscriber already governs effective levels.
     Ok(None)
 }
 
-fn native_read_configuration_with_stream(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_read_configuration_with_stream(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(None)
 }
 
@@ -633,7 +639,10 @@ fn obj_addr(v: &Value) -> u64 {
     }
 }
 
-fn native_jboss_logger_get_attachment(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_attachment(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     if this == 0 || key == 0 {
@@ -666,7 +675,10 @@ fn native_jboss_logger_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }))
 }
 
-fn native_jboss_logger_attach_if_absent(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_attach_if_absent(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = args.first().map(obj_addr).unwrap_or(0);
     let key = args.get(1).map(obj_addr).unwrap_or(0);
     let value = args.get(2).map(obj_addr).unwrap_or(0);
@@ -697,7 +709,9 @@ fn jboss_log_context_singleton() -> &'static Mutex<Option<u64>> {
 
 fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
     {
-        let g = jboss_log_context_singleton().lock().unwrap_or_else(|e| e.into_inner());
+        let g = jboss_log_context_singleton()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(addr) = *g {
             if addr != 0 {
                 return unsafe { object_from_u64(addr) };
@@ -706,7 +720,9 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
     }
     // Synthetic with zero fields — none are read by our overrides.
     let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LogContext", 1);
-    let mut g = jboss_log_context_singleton().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = jboss_log_context_singleton()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *g {
         if addr != 0 {
             return unsafe { object_from_u64(addr) };
@@ -716,15 +732,24 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
     obj
 }
 
-fn native_jboss_logger_get_log_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_log_context(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
 }
 
-fn native_jboss_log_context_get_log_context(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_get_log_context(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ensure_jboss_log_context(ctx)))))
 }
 
-fn native_jboss_log_context_get_logger_if_exists(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_get_logger_if_exists(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Returning null is contractually fine — callers null-check before
     // dereferencing (see JBossLogManagerFacade.getLoggers / updateParents).
     Ok(Some(Value::Object(None)))
@@ -748,7 +773,9 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
         return obj;
     }
     {
-        let reg = jboss_logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let reg = jboss_logger_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
                 return unsafe { object_from_u64(addr) };
@@ -760,7 +787,9 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
-    let mut reg = jboss_logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut reg = jboss_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = reg.get(name) {
         if addr != 0 {
             return unsafe { object_from_u64(addr) };
@@ -770,7 +799,10 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
     obj
 }
 
-fn native_jboss_log_context_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_get_logger(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Mirror `LogManager.getLogger(String)` semantics — return a stable
     // synthetic JBoss Logger keyed by name. Used by JBoss
     // `JBossLogManagerFacade.getJBossLogger(LogContext, name)`. The
@@ -785,7 +817,10 @@ fn native_jboss_log_context_get_logger(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(Some(Value::Object(Some(logger))))
 }
 
-fn native_jboss_log_context_get_level_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_get_level_for_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Round 74 — Keycloak `LoggingPropertyMappers.<clinit>` calls
     // `LogContext.getLogContext().getLevelForName(name.toUpperCase(...))`
     // and then dereferences `.getName()` on the result. Returning null
@@ -849,18 +884,27 @@ fn native_jboss_log_context_get_level_for_name(ctx: &mut dyn NativeContext, args
     Ok(Some(Value::Object(None)))
 }
 
-fn native_jboss_log_context_check_access(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_log_context_check_access(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(None)
 }
 
-fn native_jboss_logger_get_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_level(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Returning null is spec-legal ("inherit from parent"). Both the
     // JDK Logger.isLoggable contract and the JBoss
     // JBossLevelMapping.getPriorityFor(null) chain handle null safely.
     Ok(Some(Value::Object(None)))
 }
 
-fn native_jboss_logger_get_parent(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_parent(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Returning null breaks the parent walk on first hop (the JBoss
     // facade only uses it through Logger.getEffectiveLevel chains;
     // returning the root would loop). The PrivilegedAction in
@@ -868,13 +912,19 @@ fn native_jboss_logger_get_parent(_ctx: &mut dyn NativeContext, _args: &[Value])
     Ok(Some(Value::Object(None)))
 }
 
-fn native_jboss_logger_set_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_set_level(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // No-op — level filtering happens in the process-wide tracing
     // subscriber, not the JBoss logger node graph.
     Ok(None)
 }
 
-fn native_jboss_logger_is_loggable(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_is_loggable(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Match JDK default: every level is loggable. Filtering is owned
     // by the tracing subscriber.
     Ok(Some(Value::Int(1)))
@@ -894,11 +944,17 @@ fn native_jboss_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 
-fn native_jboss_logger_get_use_parent_handlers(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_use_parent_handlers(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Int(1)))
 }
 
-fn native_jboss_logger_get_effective_level(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_get_effective_level(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Return INFO_INT (800) — the JBoss LoggerNode default before any
     // setLevel call. Callers compare against `Level.intValue()`; INFO
     // means INFO+ levels are enabled, FINE/FINER/FINEST are not. This
@@ -983,7 +1039,6 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
-
 /// Surface a throwable that was passed to a logging native. WildFly's
 /// `WFLYSRV0055: Caught exception during boot` is logged with the real
 /// boot exception as the trailing `Throwable` argument — but the previous
@@ -1057,12 +1112,27 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
 /// touching `org.jboss.logmanager.Logger.logRaw` (which our null-safe
 /// stub previously swallowed). By printing here we surface the boot
 /// progress without needing LogRecord field-offset guesses.
-fn native_jboss_logging_logger_do_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logging_logger_do_log(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // Layout: this, level, fqcn, message, params, throwable
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-    let message_obj = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
-    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let message_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let throwable_obj = match args.get(5) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1089,12 +1159,30 @@ fn native_jboss_logging_logger_do_log(ctx: &mut dyn NativeContext, args: &[Value
 /// String format,Object[] params,Throwable)`. Substitutes `%s`/`%%`/`%n`
 /// from the params array so callers like `WFLYCTL0013` show their full
 /// failure description instead of literal `%s`.
-fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-    let format_obj = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
-    let params_obj = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
-    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+fn native_jboss_logging_logger_do_logf(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let format_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let params_obj = match args.get(4) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let throwable_obj = match args.get(5) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1124,9 +1212,11 @@ fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Valu
                     if let Some(s) = ctx.read_string(o) {
                         s
                     } else {
-                        let cn = ctx.class_name_of_id(ctx.class_id_of_object(o))
+                        let cn = ctx
+                            .class_name_of_id(ctx.class_id_of_object(o))
                             .unwrap_or_else(|| "?".to_string());
-                        let ts_result = ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]);
+                        let ts_result =
+                            ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]);
                         match ts_result {
                             Ok(Some(Value::Object(Some(sr)))) => {
                                 ctx.read_string(sr).unwrap_or_else(|| format!("{{{cn}}}"))
@@ -1148,11 +1238,18 @@ fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Valu
                 match chars.peek().copied() {
                     Some('s') | Some('S') => {
                         chars.next();
-                        result.push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
+                        result
+                            .push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
                         param_idx += 1;
                     }
-                    Some('%') => { chars.next(); result.push('%'); }
-                    Some('n') => { chars.next(); result.push('\n'); }
+                    Some('%') => {
+                        chars.next();
+                        result.push('%');
+                    }
+                    Some('n') => {
+                        chars.next();
+                        result.push('\n');
+                    }
                     _ => result.push('%'),
                 }
             } else {
@@ -1185,7 +1282,10 @@ fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Valu
 /// message (best-effort — we don't do printf substitution), emit to
 /// stderr at the named level.
 fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1213,9 +1313,7 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
                 let is_throwable = cn
                     .as_deref()
                     .map(|n| {
-                        n.ends_with("Exception")
-                            || n.ends_with("Error")
-                            || n.ends_with("Throwable")
+                        n.ends_with("Exception") || n.ends_with("Error") || n.ends_with("Throwable")
                     })
                     .unwrap_or(false)
                     || ctx
@@ -1244,7 +1342,10 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
 /// Read the message at args[2] (invoking toString() for non-String objects)
 /// and the throwable at args[3].
 fn jboss_logger_emit_fqcn(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1316,10 +1417,22 @@ fn native_jboss_logger_trace(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
 
 /// Generic `java/util/logging/Logger.log(Level, String)` intercept so
 /// any JUL-direct caller (Hibernate, Mojarra, etc.) also surfaces.
-fn native_jul_logger_log_level_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-    let message_obj = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
+fn native_jul_logger_log_level_msg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let message_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1348,14 +1461,26 @@ fn native_jul_logger_log_level_msg(ctx: &mut dyn NativeContext, args: &[Value]) 
 /// "Bootstrap rc=0, no output" symptom for `Bootstrap version` and
 /// every other JULI-driven Tomcat command.
 fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     // args[2] = source class, args[3] = source method, args[4] = msg.
     // args[5] (if present) = Throwable (5-arg overload). We surface the
     // throwable's class name + message to match Hotspot's
     // SimpleFormatter output shape closely enough for boot-trace.
-    let message_obj = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
-    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+    let message_obj = match args.get(4) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let throwable_obj = match args.get(5) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1378,7 +1503,9 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         "FINE" | "FINER" | "FINEST" => return Ok(None), // suppress noise
         other => other,
     };
-    let message = message_obj.and_then(|o| ctx.read_string(o)).unwrap_or_default();
+    let message = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
     if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
@@ -1387,7 +1514,8 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // a bare class label so the line still emits.
         let cls = {
             let cid = ctx.class_id_of_object(t);
-            ctx.class_name_of_id(cid).unwrap_or_else(|| "Throwable".to_string())
+            ctx.class_name_of_id(cid)
+                .unwrap_or_else(|| "Throwable".to_string())
         };
         let detail = match ctx.get_field_by_name(t, "detailMessage") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -1416,7 +1544,10 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// is INFO, so anything at INFO or higher (INTvalue >= 800) is
 /// loggable, and FINE/FINER/FINEST are not.
 fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     // `Level` exposes an int `value` field (e.g. WARNING=900, INFO=800,
     // CONFIG=700, FINE=500). Compare against the JDK default root level.
     let level_value = level_obj
@@ -1467,8 +1598,14 @@ fn native_jul_logger_fine(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
 }
 
 fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
-    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
-    let message_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let message_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1706,12 +1843,9 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_get_property,
     );
-    registry.register(
-        CLS_JUL_LOG_MANAGER,
-        "checkAccess",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
+    registry.register(CLS_JUL_LOG_MANAGER, "checkAccess", "()V", |_ctx, _args| {
+        Ok(None)
+    });
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "addConfigurationListener",
@@ -1987,15 +2121,33 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
             ("info", "(Ljava/lang/Object;)V"),
             ("info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
             ("infof", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-            ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "infof",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
+            (
+                "infof",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("infof", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-            ("infof", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            (
+                "infof",
+                "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V",
+            ),
             ("infov", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-            ("infov", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "infov",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
+            (
+                "infov",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("infov", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-            ("infov", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            (
+                "infov",
+                "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V",
+            ),
         ] {
             registry.register(jlog, m, sig, native_jboss_logger_info);
         }
@@ -2003,15 +2155,33 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
             ("warn", "(Ljava/lang/Object;)V"),
             ("warn", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
             ("warnf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-            ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "warnf",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
+            (
+                "warnf",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("warnf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-            ("warnf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            (
+                "warnf",
+                "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V",
+            ),
             ("warnv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-            ("warnv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "warnv",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
+            (
+                "warnv",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("warnv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-            ("warnv", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            (
+                "warnv",
+                "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V",
+            ),
         ] {
             registry.register(jlog, m, sig, native_jboss_logger_warn);
         }
@@ -2019,12 +2189,24 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
             ("error", "(Ljava/lang/Object;)V"),
             ("error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
             ("errorf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
-            ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "errorf",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
+            (
+                "errorf",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("errorf", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
-            ("errorf", "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            (
+                "errorf",
+                "(Ljava/lang/Throwable;Ljava/lang/String;[Ljava/lang/Object;)V",
+            ),
             ("errorv", "(Ljava/lang/String;Ljava/lang/Object;)V"),
-            ("errorv", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
+            (
+                "errorv",
+                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
+            ),
             ("errorv", "(Ljava/lang/String;[Ljava/lang/Object;)V"),
         ] {
             registry.register(jlog, m, sig, native_jboss_logger_error);
@@ -2062,12 +2244,42 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         native_jul_logger_log_level_msg,
     );
-    registry.register(CLS_JUL_LOGGER, "info", "(Ljava/lang/String;)V", native_jul_logger_info);
-    registry.register(CLS_JUL_LOGGER, "warning", "(Ljava/lang/String;)V", native_jul_logger_warning);
-    registry.register(CLS_JUL_LOGGER, "severe", "(Ljava/lang/String;)V", native_jul_logger_severe);
-    registry.register(CLS_JUL_LOGGER, "fine", "(Ljava/lang/String;)V", native_jul_logger_fine);
-    registry.register(CLS_JUL_LOGGER, "finer", "(Ljava/lang/String;)V", native_jul_logger_fine);
-    registry.register(CLS_JUL_LOGGER, "finest", "(Ljava/lang/String;)V", native_jul_logger_fine);
+    registry.register(
+        CLS_JUL_LOGGER,
+        "info",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_info,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "warning",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_warning,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "severe",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_severe,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "fine",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_fine,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "finer",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_fine,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "finest",
+        "(Ljava/lang/String;)V",
+        native_jul_logger_fine,
+    );
     // `logp(Level, sourceClass, sourceMethod, msg)` and the 5-arg
     // variant with a trailing Throwable. JULI's DirectJDKLog routes
     // every Tomcat/JULI log call through these instead of the simple
@@ -2200,7 +2412,11 @@ mod tests {
         register_logmanager_natives(&mut r);
 
         assert!(r
-            .find(CLS_JUL_LOG_MANAGER, "getLogManager", "()Ljava/util/logging/LogManager;")
+            .find(
+                CLS_JUL_LOG_MANAGER,
+                "getLogManager",
+                "()Ljava/util/logging/LogManager;"
+            )
             .is_some());
         assert!(r
             .find(
@@ -2241,7 +2457,11 @@ mod tests {
             .find(CLS_LOGGER_ENUMERATION, "hasMoreElements", "()Z")
             .is_some());
         assert!(r
-            .find(CLS_LOGGER_ENUMERATION, "nextElement", "()Ljava/lang/Object;")
+            .find(
+                CLS_LOGGER_ENUMERATION,
+                "nextElement",
+                "()Ljava/lang/Object;"
+            )
             .is_some());
     }
 
@@ -2272,7 +2492,10 @@ mod tests {
             Value::Object(Some(o)) => o,
             other => panic!("expected manager ObjectRef, got {:?}", other),
         };
-        let jboss = match native_get_jboss_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+        let jboss = match native_get_jboss_log_manager(&mut ctx, &[])
+            .unwrap()
+            .unwrap()
+        {
             Value::Object(Some(o)) => o,
             other => panic!("expected manager ObjectRef, got {:?}", other),
         };
@@ -2348,7 +2571,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(second, Value::Int(0), "duplicate addLogger must return false");
+        assert_eq!(
+            second,
+            Value::Int(0),
+            "duplicate addLogger must return false"
+        );
     }
 
     #[test]
@@ -2393,12 +2620,9 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let r = native_add_logger(
-            &mut ctx,
-            &[Value::Object(Some(mgr)), Value::Object(None)],
-        )
-        .unwrap()
-        .unwrap();
+        let r = native_add_logger(&mut ctx, &[Value::Object(Some(mgr)), Value::Object(None)])
+            .unwrap()
+            .unwrap();
         assert_eq!(r, Value::Int(0));
     }
 
@@ -2407,11 +2631,9 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        assert!(
-            native_read_configuration_no_arg(&mut ctx, &[])
-                .unwrap()
-                .is_none()
-        );
+        assert!(native_read_configuration_no_arg(&mut ctx, &[])
+            .unwrap()
+            .is_none());
         assert!(
             native_read_configuration_with_stream(&mut ctx, &[Value::Object(None)])
                 .unwrap()
@@ -2486,21 +2708,15 @@ mod tests {
         };
         let mut observed = Vec::new();
         loop {
-            let has = native_enumeration_has_more(
-                &mut ctx,
-                &[Value::Object(Some(enumeration))],
-            )
-            .unwrap()
-            .unwrap();
+            let has = native_enumeration_has_more(&mut ctx, &[Value::Object(Some(enumeration))])
+                .unwrap()
+                .unwrap();
             if matches!(has, Value::Int(0)) {
                 break;
             }
-            let elem = native_enumeration_next(
-                &mut ctx,
-                &[Value::Object(Some(enumeration))],
-            )
-            .unwrap()
-            .unwrap();
+            let elem = native_enumeration_next(&mut ctx, &[Value::Object(Some(enumeration))])
+                .unwrap()
+                .unwrap();
             match elem {
                 Value::Object(Some(s)) => {
                     observed.push(ctx.read_string(s).unwrap_or_default());
@@ -2573,12 +2789,9 @@ mod tests {
         reset_state_for_tests();
         let mut ctx = mock_ctx();
         let key = ctx.create_string("foo");
-        let v = native_get_property(
-            &mut ctx,
-            &[Value::Object(None), Value::Object(Some(key))],
-        )
-        .unwrap()
-        .unwrap();
+        let v = native_get_property(&mut ctx, &[Value::Object(None), Value::Object(Some(key))])
+            .unwrap()
+            .unwrap();
         assert!(matches!(v, Value::Object(None)));
     }
 
@@ -2743,7 +2956,8 @@ mod tests {
         )
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
-        let recv = alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let recv =
+            alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
         let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
         let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
         let _ = native_jboss_logger_attach(
@@ -2794,7 +3008,8 @@ mod tests {
         )
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
-        let recv = alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let recv =
+            alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
         let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
         let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
         let _ = native_jboss_logger_attach(
@@ -2860,7 +3075,10 @@ mod tests {
         let before = cached_addrs_snapshot();
         gc_update_logmanager_refs(&std::collections::HashMap::new());
         let after = cached_addrs_snapshot();
-        assert_eq!(before, after, "empty pointer map must not mutate any address");
+        assert_eq!(
+            before, after,
+            "empty pointer map must not mutate any address"
+        );
     }
 
     #[test]

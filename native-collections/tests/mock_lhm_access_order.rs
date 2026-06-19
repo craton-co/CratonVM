@@ -24,15 +24,25 @@ const FOR_EACH: &str = "(Ljava/util/function/BiConsumer;)V";
 /// `java.util.function.BiConsumer` placeholder; the mock's
 /// `invoke_virtual` log records each call so we can recover the
 /// iteration order without standing up a real lambda.
-fn iter_keys_via_for_each(reg: &cratonvm_native_api::NativeMethodRegistry,
-                          ctx: &mut MockCtx, lhm: cratonvm_types::ObjectRef) -> Vec<Value> {
+fn iter_keys_via_for_each(
+    reg: &cratonvm_native_api::NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    lhm: cratonvm_types::ObjectRef,
+) -> Vec<Value> {
     let consumer_cid = ctx
         .ensure_class_initialized("java/util/function/BiConsumer")
         .unwrap();
     let consumer = ctx.alloc_object(consumer_cid, 1);
     ctx.clear_invoke_virtual_log();
-    call(reg, ctx, LHM, "forEach", FOR_EACH,
-         &[Value::Object(Some(lhm)), Value::Object(Some(consumer))]).unwrap();
+    call(
+        reg,
+        ctx,
+        LHM,
+        "forEach",
+        FOR_EACH,
+        &[Value::Object(Some(lhm)), Value::Object(Some(consumer))],
+    )
+    .unwrap();
     ctx.invoke_virtual_log()
         .into_iter()
         .filter(|(_, m, _, _)| m == "accept")
@@ -52,19 +62,43 @@ fn access_order_get_moves_entry_to_tail() {
     let k2 = boxed_int(&mut ctx, 2);
     let v2 = boxed_int(&mut ctx, 20);
 
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k1, v1]).unwrap();
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k2, v2]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k1, v1],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k2, v2],
+    )
+    .unwrap();
 
     // Touch k1 → it must move to the tail in access order.
-    let got = call(&reg, &mut ctx, LHM, "get", GET,
-                   &[Value::Object(Some(lhm)), k1]).unwrap();
+    let got = call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "get",
+        GET,
+        &[Value::Object(Some(lhm)), k1],
+    )
+    .unwrap();
     assert_eq!(got, Some(v1));
 
     let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
-    assert_eq!(order, vec![k2, k1],
-               "access-order LHM: after get(k1), iteration should be k2 (LRU), k1 (MRU)");
+    assert_eq!(
+        order,
+        vec![k2, k1],
+        "access-order LHM: after get(k1), iteration should be k2 (LRU), k1 (MRU)"
+    );
 }
 
 #[test]
@@ -80,16 +114,40 @@ fn insertion_order_get_does_not_reorder() {
     let k2 = boxed_int(&mut ctx, 2);
     let v2 = boxed_int(&mut ctx, 20);
 
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k1, v1]).unwrap();
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k2, v2]).unwrap();
-    call(&reg, &mut ctx, LHM, "get", GET,
-         &[Value::Object(Some(lhm)), k1]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k1, v1],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k2, v2],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "get",
+        GET,
+        &[Value::Object(Some(lhm)), k1],
+    )
+    .unwrap();
 
     let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
-    assert_eq!(order, vec![k1, k2],
-               "insertion-order LHM: get(k1) must NOT reorder");
+    assert_eq!(
+        order,
+        vec![k1, k2],
+        "insertion-order LHM: get(k1) must NOT reorder"
+    );
 }
 
 #[test]
@@ -110,14 +168,31 @@ fn insertion_order_beats_bucket_order() {
     let k2 = boxed_int(&mut ctx, 2);
     let v2 = boxed_int(&mut ctx, 20);
 
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k8, v8]).unwrap();
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k2, v2]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k8, v8],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k2, v2],
+    )
+    .unwrap();
 
     let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
-    assert_eq!(order, vec![k8, k2],
-               "default LHM must iterate in insertion order [8,2], not bucket order [2,8]");
+    assert_eq!(
+        order,
+        vec![k8, k2],
+        "default LHM must iterate in insertion order [8,2], not bucket order [2,8]"
+    );
 }
 
 #[test]
@@ -140,18 +215,49 @@ fn access_order_put_of_existing_key_moves_to_tail() {
     let v2 = boxed_int(&mut ctx, 20);
     let v3 = boxed_int(&mut ctx, 30);
 
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k1, v1]).unwrap();
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k2, v2]).unwrap();
-    call(&reg, &mut ctx, LHM, "put", PUT,
-         &[Value::Object(Some(lhm)), k3, v3]).unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k1, v1],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k2, v2],
+    )
+    .unwrap();
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k3, v3],
+    )
+    .unwrap();
 
     // Re-put k1 with a new value → must move k1 to tail.
-    let prev = call(&reg, &mut ctx, LHM, "put", PUT,
-                    &[Value::Object(Some(lhm)), k1, v1b]).unwrap();
-    assert_eq!(prev, Some(v1),
-               "put-of-existing-key returns the previous value");
+    let prev = call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k1, v1b],
+    )
+    .unwrap();
+    assert_eq!(
+        prev,
+        Some(v1),
+        "put-of-existing-key returns the previous value"
+    );
 
     let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
 
@@ -164,7 +270,10 @@ fn access_order_put_of_existing_key_moves_to_tail() {
     // surface the regression. That is the point — behavioural coverage
     // is exactly the mechanism that catches a missing access-order
     // reorder.
-    assert_eq!(order, vec![k2, k3, k1],
-               "access-order LHM put-of-existing-key must move k to tail; \
-                expected [k2, k3, k1], got {order:?}");
+    assert_eq!(
+        order,
+        vec![k2, k3, k1],
+        "access-order LHM put-of-existing-key must move k to tail; \
+                expected [k2, k3, k1], got {order:?}"
+    );
 }

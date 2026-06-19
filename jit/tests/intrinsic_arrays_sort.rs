@@ -152,7 +152,7 @@ fn compile_sort(entry: usize) -> impl Fn(*mut u8) {
                 needs_context: false,
                 num_params: 1,
                 return_type: b'V',
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
@@ -372,12 +372,7 @@ fn arrays_sort_only_registers_integral_single_arg_overloads() {
         );
     }
     // Reference-array sort and the 3-arg range overloads are out of scope.
-    for d in [
-        "([Ljava/lang/Object;)V",
-        "([II I)V",
-        "([III)V",
-        "([JII)V",
-    ] {
+    for d in ["([Ljava/lang/Object;)V", "([II I)V", "([III)V", "([JII)V"] {
         assert!(
             resolve(d).is_none(),
             "Arrays.sort{d} must NOT be intrinsified (out of scope)"
@@ -385,8 +380,7 @@ fn arrays_sort_only_registers_integral_single_arg_overloads() {
     }
     // A non-Arrays class with the same method name must not match.
     assert!(
-        cratonvm_jit::try_resolve_intrinsic("java/util/Collections", "sort", "([I)V")
-            .is_none(),
+        cratonvm_jit::try_resolve_intrinsic("java/util/Collections", "sort", "([I)V").is_none(),
         "only java/util/Arrays.sort is an ARRAYS_SORT intrinsic"
     );
 }

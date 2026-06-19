@@ -41,7 +41,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -69,9 +73,7 @@ fn run_jmx_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("JmxProbe.class").exists() {
-        eprintln!(
-            "[wave1_a_jmx] JmxProbe.class missing — run javac in apps/jmx_probe"
-        );
+        eprintln!("[wave1_a_jmx] JmxProbe.class missing — run javac in apps/jmx_probe");
         return None;
     }
     let mut cmd = Command::new(&bin);
@@ -137,7 +139,9 @@ fn jmx_probe_returns_nonempty_mxbean_lists() {
         rc,
         Some(0),
         "wave1_a_jmx: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     assert!(
         stdout.contains("OK"),
@@ -151,7 +155,8 @@ fn jmx_probe_returns_nonempty_mxbean_lists() {
         pools_n.is_some_and(|n| n >= 1),
         "wave1_a_jmx: getMemoryPoolMXBeans() must return >= 1 pool. \
          Parsed pools={:?}, stdout={:?}",
-        pools_n, stdout
+        pools_n,
+        stdout
     );
 
     let mgrs_n = parse_count(&stdout, "mgrs=");
@@ -159,7 +164,8 @@ fn jmx_probe_returns_nonempty_mxbean_lists() {
         mgrs_n.is_some_and(|n| n >= 1),
         "wave1_a_jmx: getMemoryManagerMXBeans() must return >= 1 manager. \
          Parsed mgrs={:?}, stdout={:?}",
-        mgrs_n, stdout
+        mgrs_n,
+        stdout
     );
 
     let gcs_n = parse_count(&stdout, "gcs=");
@@ -167,7 +173,8 @@ fn jmx_probe_returns_nonempty_mxbean_lists() {
         gcs_n.is_some_and(|n| n >= 1),
         "wave1_a_jmx: getGarbageCollectorMXBeans() must return >= 1 GC \
          bean. Parsed gcs={:?}, stdout={:?}",
-        gcs_n, stdout
+        gcs_n,
+        stdout
     );
 }
 

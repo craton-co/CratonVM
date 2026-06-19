@@ -94,7 +94,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -228,10 +232,7 @@ fn observation_lines(stdout: &str) -> Vec<&str> {
 
 /// Locate the first `r:` observation line on which two runs differ — used to
 /// localise (and name) a synthetic-vs-real divergence in the failure message.
-fn first_observation_diff(
-    syn: &str,
-    real: &str,
-) -> Option<(usize, String, String)> {
+fn first_observation_diff(syn: &str, real: &str) -> Option<(usize, String, String)> {
     let a = observation_lines(syn);
     let b = observation_lines(real);
     for i in 0..a.len().max(b.len()) {
@@ -393,9 +394,7 @@ fn synthetic_vs_real() {
                      SYNTHETIC: {x}\n  REAL     : {y}"
                 )
             })
-            .unwrap_or_else(|| {
-                "(divergence in observation-line count)".to_string()
-            });
+            .unwrap_or_else(|| "(divergence in observation-line count)".to_string());
         panic!(
             "SYNTHETIC DIVERGENCE: a synthetic stub returned a different value \
              than real JDK bytecode.\n{where_}\n\
@@ -554,11 +553,10 @@ fn real_raf_path() {
 /// common pool and verifies the results.
 #[test]
 fn real_fjp_path() {
-    let run =
-        match run_class_env("RealFjp", &[("CRATONVM_REAL_FORKJOINPOOL", "1")]) {
-            Some(r) => r,
-            None => return,
-        };
+    let run = match run_class_env("RealFjp", &[("CRATONVM_REAL_FORKJOINPOOL", "1")]) {
+        Some(r) => r,
+        None => return,
+    };
     assert!(
         run.stdout.contains("REAL_FJP_OK"),
         "RealFjp did not reach the OK marker (exit={:?}).\n\
@@ -588,11 +586,10 @@ fn real_fjp_path() {
 /// client from the same JVM, sends a byte, and verifies the exchange.
 #[test]
 fn real_net_sockets_path() {
-    let run =
-        match run_class_env("RealNetSockets", &[("CRATONVM_REAL_NET_SOCKETS", "1")]) {
-            Some(r) => r,
-            None => return,
-        };
+    let run = match run_class_env("RealNetSockets", &[("CRATONVM_REAL_NET_SOCKETS", "1")]) {
+        Some(r) => r,
+        None => return,
+    };
     assert!(
         run.stdout.contains("REAL_NET_SOCKETS_OK"),
         "RealNetSockets did not reach the OK marker (exit={:?}).\n\

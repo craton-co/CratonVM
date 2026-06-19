@@ -22,7 +22,9 @@
 //!    `*failure_flag` and `ret`-ing.
 
 use crate::analyzer::ParamKind;
-use crate::emitter::{LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind};
+use crate::emitter::{
+    LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind,
+};
 use crate::signature::KernelSignature;
 use cratonvm_reader::method::ClassFileMethod;
 
@@ -49,9 +51,9 @@ pub fn lower_method(
     let kernel_name = mangle(class_name, &method.name, &method.descriptor);
     let params = build_param_list(sig);
 
-    let code = method.code().ok_or_else(|| {
-        LoweringError::UnsupportedNode("method has no Code attribute".into())
-    })?;
+    let code = method
+        .code()
+        .ok_or_else(|| LoweringError::UnsupportedNode("method has no Code attribute".into()))?;
     let bytes = &code.code;
     let shape = detect_loop(bytes)?;
 
@@ -274,25 +276,46 @@ impl<'a> Emitter<'a> {
     pub(crate) fn emit_reg_decls(&self) -> Vec<RegDecl> {
         let mut out = Vec::new();
         if self.regs.u32_count > 0 {
-            out.push(RegDecl { kind: RegKind::U32, count: self.regs.u32_count });
+            out.push(RegDecl {
+                kind: RegKind::U32,
+                count: self.regs.u32_count,
+            });
         }
         if self.regs.u64_count > 0 {
-            out.push(RegDecl { kind: RegKind::U64, count: self.regs.u64_count });
+            out.push(RegDecl {
+                kind: RegKind::U64,
+                count: self.regs.u64_count,
+            });
         }
         if self.regs.s32_count > 0 {
-            out.push(RegDecl { kind: RegKind::S32, count: self.regs.s32_count });
+            out.push(RegDecl {
+                kind: RegKind::S32,
+                count: self.regs.s32_count,
+            });
         }
         if self.regs.s64_count > 0 {
-            out.push(RegDecl { kind: RegKind::S64, count: self.regs.s64_count });
+            out.push(RegDecl {
+                kind: RegKind::S64,
+                count: self.regs.s64_count,
+            });
         }
         if self.regs.f32_count > 0 {
-            out.push(RegDecl { kind: RegKind::F32, count: self.regs.f32_count });
+            out.push(RegDecl {
+                kind: RegKind::F32,
+                count: self.regs.f32_count,
+            });
         }
         if self.regs.f64_count > 0 {
-            out.push(RegDecl { kind: RegKind::F64, count: self.regs.f64_count });
+            out.push(RegDecl {
+                kind: RegKind::F64,
+                count: self.regs.f64_count,
+            });
         }
         if self.regs.pred_count > 0 {
-            out.push(RegDecl { kind: RegKind::Pred, count: self.regs.pred_count });
+            out.push(RegDecl {
+                kind: RegKind::Pred,
+                count: self.regs.pred_count,
+            });
         }
         out
     }
@@ -385,9 +408,18 @@ mod tests {
         let n_int_loads = text.matches("ld.global.s32").count();
         let n_int_stores = text.matches("st.global.s32").count();
         let n_int_adds = text.matches("add.s32").count();
-        assert!(n_int_loads >= 2, "expected ≥2 ld.global.s32, got {n_int_loads}\n{text}");
-        assert!(n_int_stores >= 1, "expected ≥1 st.global.s32, got {n_int_stores}\n{text}");
-        assert!(n_int_adds >= 1, "expected ≥1 add.s32, got {n_int_adds}\n{text}");
+        assert!(
+            n_int_loads >= 2,
+            "expected ≥2 ld.global.s32, got {n_int_loads}\n{text}"
+        );
+        assert!(
+            n_int_stores >= 1,
+            "expected ≥1 st.global.s32, got {n_int_stores}\n{text}"
+        );
+        assert!(
+            n_int_adds >= 1,
+            "expected ≥1 add.s32, got {n_int_adds}\n{text}"
+        );
         // Bounds-fail label is emitted because we use array ops.
         assert!(text.contains("L_bounds_fail:"));
         assert!(text.contains("st.global.u32"));
@@ -471,7 +503,10 @@ mod tests {
     #[ignore = "diagnostic — prints PTX to stdout; run with --nocapture"]
     fn dump_vector_add_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
-        println!("\n----- PTX for EligibleVectorAdd::vectorAdd -----\n{}\n----- end -----", m.render());
+        println!(
+            "\n----- PTX for EligibleVectorAdd::vectorAdd -----\n{}\n----- end -----",
+            m.render()
+        );
     }
 
     /// `ptxas` round-trip — `#[ignore]` by default because most CI
@@ -662,8 +697,8 @@ mod tests {
         // records exit op `if_icmpge` (0xA2) and stride +1.
         let method = load_method("NonCanonicalLoops", "canonical", "([I[I[I)V");
         let code = method.code().expect("canonical has a Code attribute");
-        let shape = super::loop_recog::detect_loop(&code.code)
-            .expect("canonical loop must be recognized");
+        let shape =
+            super::loop_recog::detect_loop(&code.code).expect("canonical loop must be recognized");
         match shape {
             super::loop_recog::LoopShape::Counted(li) => {
                 assert_eq!(li.exit_op, 0xA2, "canonical exit op must be if_icmpge");

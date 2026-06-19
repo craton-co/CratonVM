@@ -273,7 +273,10 @@ fn compute_dominators(blocks: &[Block]) -> Vec<Vec<bool>> {
 /// passes through `a`). Both indices must be in range.
 #[inline]
 fn dominates(dom: &[Vec<bool>], a: usize, b: usize) -> bool {
-    dom.get(b).and_then(|row| row.get(a)).copied().unwrap_or(false)
+    dom.get(b)
+        .and_then(|row| row.get(a))
+        .copied()
+        .unwrap_or(false)
 }
 
 /// Find the home block for a data node such that every one of its already-placed
@@ -603,12 +606,7 @@ mod tests {
     #[test]
     fn test_dominators_diamond() {
         // Diamond CFG:  0 → {1,2} → 3
-        let blocks = vec![
-            blk(0, &[]),
-            blk(1, &[0]),
-            blk(2, &[0]),
-            blk(3, &[1, 2]),
-        ];
+        let blocks = vec![blk(0, &[]), blk(1, &[0]), blk(2, &[0]), blk(3, &[1, 2])];
         let dom = compute_dominators(&blocks);
         // Entry dominates everything.
         for b in 0..4 {
@@ -627,12 +625,7 @@ mod tests {
     #[test]
     fn test_dominators_chain() {
         // Straight-line chain 0 → 1 → 2 → 3: each block dominates all later ones.
-        let blocks = vec![
-            blk(0, &[]),
-            blk(1, &[0]),
-            blk(2, &[1]),
-            blk(3, &[2]),
-        ];
+        let blocks = vec![blk(0, &[]), blk(1, &[0]), blk(2, &[1]), blk(3, &[2])];
         let dom = compute_dominators(&blocks);
         for a in 0..4 {
             for b in a..4 {
@@ -656,7 +649,10 @@ mod tests {
         assert!(dominates(&dom, 0, 1));
         assert!(dominates(&dom, 0, 2));
         assert!(dominates(&dom, 1, 2));
-        assert!(!dominates(&dom, 2, 1), "back-edge target not dominated by body");
+        assert!(
+            !dominates(&dom, 2, 1),
+            "back-edge target not dominated by body"
+        );
     }
 
     #[test]

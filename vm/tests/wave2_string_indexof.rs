@@ -47,7 +47,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -75,7 +79,9 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("SiProbe.class").exists() {
-        eprintln!("[wave2_string_indexof] SiProbe.class missing — run javac in apps/string_indexof_probe");
+        eprintln!(
+            "[wave2_string_indexof] SiProbe.class missing — run javac in apps/string_indexof_probe"
+        );
         return None;
     }
     let mut cmd = Command::new(&bin);
@@ -142,7 +148,9 @@ fn si_probe_index_of_string_and_from_match_hotspot() {
         rc,
         Some(0),
         "wave2_string_indexof: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
-        rc, stdout, stderr
+        rc,
+        stdout,
+        stderr
     );
     assert!(
         stdout.contains("idx=6"),

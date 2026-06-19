@@ -32,16 +32,15 @@
 //! owners from stomping on each other.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ClassId, ObjectRef, Value};
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::lang_class::{
-    annotation_element_to_java, box_value,
-    create_method_object, create_constructor_object, create_field_object,
-    descriptor_to_class_mirror, method_class_name_desc, method_descriptor_for_invoke,
-    mirror_class_id, mirror_class_name, native_method_invoke,
-    parse_descriptor_param_and_return, read_method_descriptor,
-    read_constructor_descriptor, read_field_meta,
+    annotation_element_to_java, box_value, create_constructor_object, create_field_object,
+    create_method_object, descriptor_to_class_mirror, method_class_name_desc,
+    method_descriptor_for_invoke, mirror_class_id, mirror_class_name, native_method_invoke,
+    parse_descriptor_param_and_return, read_constructor_descriptor, read_field_meta,
+    read_method_descriptor,
 };
 use crate::obj_arg;
 
@@ -826,15 +825,33 @@ pub(crate) fn native_method_to_string(
     let mut s = String::new();
     // Build modifier prefix in JLS order. Method.toString uses the
     // method-level mask (no ACC_VARARGS / ACC_BRIDGE / ACC_SYNTHETIC).
-    if (modifiers & 0x0001) != 0 { s.push_str("public "); }
-    if (modifiers & 0x0002) != 0 { s.push_str("private "); }
-    if (modifiers & 0x0004) != 0 { s.push_str("protected "); }
-    if (modifiers & 0x0008) != 0 { s.push_str("static "); }
-    if (modifiers & 0x0010) != 0 { s.push_str("final "); }
-    if (modifiers & 0x0020) != 0 { s.push_str("synchronized "); }
-    if (modifiers & 0x0100) != 0 { s.push_str("native "); }
-    if (modifiers & 0x0400) != 0 { s.push_str("abstract "); }
-    if (modifiers & 0x0800) != 0 { s.push_str("strictfp "); }
+    if (modifiers & 0x0001) != 0 {
+        s.push_str("public ");
+    }
+    if (modifiers & 0x0002) != 0 {
+        s.push_str("private ");
+    }
+    if (modifiers & 0x0004) != 0 {
+        s.push_str("protected ");
+    }
+    if (modifiers & 0x0008) != 0 {
+        s.push_str("static ");
+    }
+    if (modifiers & 0x0010) != 0 {
+        s.push_str("final ");
+    }
+    if (modifiers & 0x0020) != 0 {
+        s.push_str("synchronized ");
+    }
+    if (modifiers & 0x0100) != 0 {
+        s.push_str("native ");
+    }
+    if (modifiers & 0x0400) != 0 {
+        s.push_str("abstract ");
+    }
+    if (modifiers & 0x0800) != 0 {
+        s.push_str("strictfp ");
+    }
 
     // Return type — `getTypeName()` style: dotted class name, primitive
     // bare names ("int"), array suffix `[]`.
@@ -952,7 +969,6 @@ fn class_name_to_type_name(name: &str) -> String {
     name.replace('/', ".")
 }
 
-
 // ---------------------------------------------------------------------------
 // Field.isSynthetic / isEnumConstant
 // ---------------------------------------------------------------------------
@@ -1067,10 +1083,7 @@ thread_local! {
     static INVOKE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-fn native_method_invoke_boxed(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_method_invoke_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Reentrancy / recursion guard — see comment on INVOKE_DEPTH above.
     let prev_depth = INVOKE_DEPTH.with(|d| {
         let v = d.get();
@@ -1088,122 +1101,122 @@ fn native_method_invoke_boxed(
     // inside a closure and capture its Result so we can decrement before
     // propagating.
     let result = (|| -> MethodCallResult {
-    // GC-safety: capture the Method's declared descriptor BEFORE running the
-    // target method. `native_method_invoke` below executes arbitrary Java
-    // that can trigger a GC and MOVE the `Method` mirror. `args` is a
-    // pre-call snapshot of operand-stack `Value`s held on the native's Rust
-    // stack — NOT a GC root — so after the inner invoke `args.first()` is a
-    // stale pointer, and reading fields off it (`method_descriptor_for_invoke`
-    // → `get_field_by_name` → `class_id_of`) dereferences freed/moved memory.
-    // That is the intermittent, load-dependent SIGSEGV seen running JUnit
-    // suites (e.g. TestServerInfo) under CPU contention, where a GC is far
-    // more likely to land inside the inner invoke. The descriptor is
-    // invariant (the method's signature), so capture it now while the mirror
-    // is still valid and reuse it afterwards.
-    let pre_descriptor = match args.first() {
-        Some(Value::Object(Some(o))) => Some(method_descriptor_for_invoke(ctx, *o)),
-        _ => None,
-    };
+        // GC-safety: capture the Method's declared descriptor BEFORE running the
+        // target method. `native_method_invoke` below executes arbitrary Java
+        // that can trigger a GC and MOVE the `Method` mirror. `args` is a
+        // pre-call snapshot of operand-stack `Value`s held on the native's Rust
+        // stack — NOT a GC root — so after the inner invoke `args.first()` is a
+        // stale pointer, and reading fields off it (`method_descriptor_for_invoke`
+        // → `get_field_by_name` → `class_id_of`) dereferences freed/moved memory.
+        // That is the intermittent, load-dependent SIGSEGV seen running JUnit
+        // suites (e.g. TestServerInfo) under CPU contention, where a GC is far
+        // more likely to land inside the inner invoke. The descriptor is
+        // invariant (the method's signature), so capture it now while the mirror
+        // is still valid and reuse it afterwards.
+        let pre_descriptor = match args.first() {
+            Some(Value::Object(Some(o))) => Some(method_descriptor_for_invoke(ctx, *o)),
+            _ => None,
+        };
 
-    // Delegate to the canonical implementation.
-    let raw = native_method_invoke(ctx, args)?;
+        // Delegate to the canonical implementation.
+        let raw = native_method_invoke(ctx, args)?;
 
-    let raw_val = match raw {
-        Some(v) => v,
-        None => return Ok(None),
-    };
+        let raw_val = match raw {
+            Some(v) => v,
+            None => return Ok(None),
+        };
 
-    // Recover the declared return descriptor (captured pre-invoke above) so we
-    // can sanity-check the return shape against what the JDK contract
-    // requires (primitive returns must come back as wrapper objects, never
-    // as raw `Value::Int`/`Value::Long`/etc. and never as a primitive
-    // `Class<int>` mirror).
-    let descriptor = match pre_descriptor {
-        Some(d) => d,
-        None => return Ok(Some(raw_val)),
-    };
-    let (_params, ret_desc) = parse_descriptor_param_and_return(&descriptor);
-    let primitive_ret = matches!(
-        ret_desc.as_str(),
-        "I" | "J" | "Z" | "B" | "S" | "C" | "F" | "D"
-    );
+        // Recover the declared return descriptor (captured pre-invoke above) so we
+        // can sanity-check the return shape against what the JDK contract
+        // requires (primitive returns must come back as wrapper objects, never
+        // as raw `Value::Int`/`Value::Long`/etc. and never as a primitive
+        // `Class<int>` mirror).
+        let descriptor = match pre_descriptor {
+            Some(d) => d,
+            None => return Ok(Some(raw_val)),
+        };
+        let (_params, ret_desc) = parse_descriptor_param_and_return(&descriptor);
+        let primitive_ret = matches!(
+            ret_desc.as_str(),
+            "I" | "J" | "Z" | "B" | "S" | "C" | "F" | "D"
+        );
 
-    // Defensive fallback (G3 / bytebuddy_probe): if the inner returned a
-    // `Class<primitive>` mirror instead of a wrapper instance and the
-    // declared return descriptor is itself a primitive, the inner
-    // dispatch produced a primitive-Class mirror by mistake (e.g. a
-    // mis-wired native handler that conflated the *return type* with the
-    // *return value*). ByteBuddy's `JavaDispatcher` proxy formats that as
-    //   "Cannot assign int to public abstract int ..."
-    // because `value.toString()` for `int.class` is "int". Box the
-    // descriptor-default (0 / false) so the call surfaces a defined value
-    // rather than a Class mirror, and log loud enough that we can spot it
-    // in repro logs.
-    if primitive_ret {
-        if let Value::Object(Some(obj)) = raw_val {
-            let class_id = ctx.class_id_of_object(obj);
-            let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-            if class_name == "java/lang/Class" {
-                let placeholder = match ret_desc.as_str() {
-                    "J" => Value::Long(0),
-                    "F" => Value::Float(0.0),
-                    "D" => Value::Double(0.0),
-                    _ => Value::Int(0),
-                };
-                let recovered = box_value(ctx, placeholder, &ret_desc);
-                tracing::warn!(
-                    "[Method.invoke] inner returned Class mirror for primitive return \
+        // Defensive fallback (G3 / bytebuddy_probe): if the inner returned a
+        // `Class<primitive>` mirror instead of a wrapper instance and the
+        // declared return descriptor is itself a primitive, the inner
+        // dispatch produced a primitive-Class mirror by mistake (e.g. a
+        // mis-wired native handler that conflated the *return type* with the
+        // *return value*). ByteBuddy's `JavaDispatcher` proxy formats that as
+        //   "Cannot assign int to public abstract int ..."
+        // because `value.toString()` for `int.class` is "int". Box the
+        // descriptor-default (0 / false) so the call surfaces a defined value
+        // rather than a Class mirror, and log loud enough that we can spot it
+        // in repro logs.
+        if primitive_ret {
+            if let Value::Object(Some(obj)) = raw_val {
+                let class_id = ctx.class_id_of_object(obj);
+                let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+                if class_name == "java/lang/Class" {
+                    let placeholder = match ret_desc.as_str() {
+                        "J" => Value::Long(0),
+                        "F" => Value::Float(0.0),
+                        "D" => Value::Double(0.0),
+                        _ => Value::Int(0),
+                    };
+                    let recovered = box_value(ctx, placeholder, &ret_desc);
+                    tracing::warn!(
+                        "[Method.invoke] inner returned Class mirror for primitive return \
                      `{}` — recovering with default-boxed value (descriptor={})",
-                    ret_desc,
-                    descriptor,
-                );
-                if dbg_method_invoke_box_enabled() {
-                    eprintln!(
-                        "[Method.invoke] recovered Class<primitive> -> default-boxed; \
-                         ret_desc=`{}`",
                         ret_desc,
+                        descriptor,
                     );
+                    if dbg_method_invoke_box_enabled() {
+                        eprintln!(
+                            "[Method.invoke] recovered Class<primitive> -> default-boxed; \
+                         ret_desc=`{}`",
+                            ret_desc,
+                        );
+                    }
+                    return Ok(Some(recovered));
                 }
-                return Ok(Some(recovered));
+                // Already-boxed Object: pass through.
+                return Ok(Some(raw_val));
             }
-            // Already-boxed Object: pass through.
+        }
+
+        // If the inner already returned a boxed Object (or null) and the return
+        // is a reference type, pass through unchanged.
+        if matches!(raw_val, Value::Object(_)) {
             return Ok(Some(raw_val));
         }
-    }
 
-    // If the inner already returned a boxed Object (or null) and the return
-    // is a reference type, pass through unchanged.
-    if matches!(raw_val, Value::Object(_)) {
-        return Ok(Some(raw_val));
-    }
+        // Otherwise we have a raw primitive `Value`. Box it according to the
+        // Method's declared return type. For non-primitive return descriptors
+        // (somehow paired with a primitive Value) this is a no-op via the
+        // `_ => value` arm of `box_value`.
+        let needs_box = primitive_ret || ret_desc == "V";
+        if !needs_box {
+            return Ok(Some(raw_val));
+        }
 
-    // Otherwise we have a raw primitive `Value`. Box it according to the
-    // Method's declared return type. For non-primitive return descriptors
-    // (somehow paired with a primitive Value) this is a no-op via the
-    // `_ => value` arm of `box_value`.
-    let needs_box = primitive_ret || ret_desc == "V";
-    if !needs_box {
-        return Ok(Some(raw_val));
-    }
-
-    let boxed = box_value(ctx, raw_val, &ret_desc);
-    let boxed_kind: &'static str = match boxed {
-        Value::Object(Some(_)) => "wrapper",
-        Value::Object(None) => "null",
-        _ => "primitive(unchanged)",
-    };
-    tracing::debug!(
-        "[Method.invoke] boxed primitive Value into {} for return descriptor `{}`",
-        boxed_kind,
-        ret_desc
-    );
-    if dbg_method_invoke_box_enabled() {
-        eprintln!(
-            "[Method.invoke] defensive box: ret_desc=`{}` boxed_kind={}",
-            ret_desc, boxed_kind,
+        let boxed = box_value(ctx, raw_val, &ret_desc);
+        let boxed_kind: &'static str = match boxed {
+            Value::Object(Some(_)) => "wrapper",
+            Value::Object(None) => "null",
+            _ => "primitive(unchanged)",
+        };
+        tracing::debug!(
+            "[Method.invoke] boxed primitive Value into {} for return descriptor `{}`",
+            boxed_kind,
+            ret_desc
         );
-    }
-    Ok(Some(boxed))
+        if dbg_method_invoke_box_enabled() {
+            eprintln!(
+                "[Method.invoke] defensive box: ret_desc=`{}` boxed_kind={}",
+                ret_desc, boxed_kind,
+            );
+        }
+        Ok(Some(boxed))
     })();
 
     // Restore depth on every exit path (success or error). Use `set(prev)`
@@ -1693,7 +1706,9 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         field: &str,
     ) -> Value {
         let raw = ctx.get_field_by_name(this, field);
-        let Value::Object(Some(arr)) = raw else { return raw };
+        let Value::Object(Some(arr)) = raw else {
+            return raw;
+        };
         if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
             return raw;
         }
@@ -1898,11 +1913,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         field: &str,
     ) -> Option<cratonvm_types::ObjectRef> {
         let arr = match ctx.get_field_by_name(wildcard, field) {
-            Value::Object(Some(a))
-                if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array =>
-            {
-                a
-            }
+            Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
             _ => return None,
         };
         for i in 0..ctx.array_length(arr) {
@@ -1919,15 +1930,10 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         None
     }
     let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
-    registry.register(
-        tvi_real,
-        "getName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "name")))
-        },
-    );
+    registry.register(tvi_real, "getName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
     let wti_real = "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl";
     registry.register(
         wti_real,

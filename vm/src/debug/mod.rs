@@ -44,19 +44,34 @@ pub enum LocalValue {
 
 impl LocalValue {
     pub fn as_int(&self) -> Option<i32> {
-        match self { LocalValue::Int(v) => Some(*v), _ => None }
+        match self {
+            LocalValue::Int(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_long(&self) -> Option<i64> {
-        match self { LocalValue::Long(v) => Some(*v), _ => None }
+        match self {
+            LocalValue::Long(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_float_bits(&self) -> Option<u32> {
-        match self { LocalValue::Float(v) => Some(v.to_bits()), _ => None }
+        match self {
+            LocalValue::Float(v) => Some(v.to_bits()),
+            _ => None,
+        }
     }
     pub fn as_double_bits(&self) -> Option<u64> {
-        match self { LocalValue::Double(v) => Some(v.to_bits()), _ => None }
+        match self {
+            LocalValue::Double(v) => Some(v.to_bits()),
+            _ => None,
+        }
     }
     pub fn as_object_id(&self) -> Option<u64> {
-        match self { LocalValue::ObjectRef(v) => Some(*v), _ => None }
+        match self {
+            LocalValue::ObjectRef(v) => Some(*v),
+            _ => None,
+        }
     }
 }
 
@@ -212,11 +227,17 @@ pub struct InvokeOutcome {
 
 impl InvokeOutcome {
     pub fn returned(value: DebuggerValue) -> Self {
-        Self { return_value: value, exception: 0 }
+        Self {
+            return_value: value,
+            exception: 0,
+        }
     }
 
     pub fn threw(exception_id: u64) -> Self {
-        Self { return_value: DebuggerValue::null(), exception: exception_id }
+        Self {
+            return_value: DebuggerValue::null(),
+            exception: exception_id,
+        }
     }
 }
 
@@ -277,11 +298,7 @@ pub trait DebuggerVmBridge: Send + Sync {
 
     /// Allocate a new array of the given element type and length.
     /// Returns the wire ID of the newly allocated array.
-    fn new_array(
-        &self,
-        array_type_id: u64,
-        length: i32,
-    ) -> Result<u64, BridgeError>;
+    fn new_array(&self, array_type_id: u64, length: i32) -> Result<u64, BridgeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -481,16 +498,18 @@ impl DebugState {
         location_method_id: u64,
         location_offset: u64,
     ) -> Option<(u32, events::SuspendPolicy, protocol::JdwpPacket)> {
-        let wp = self.field_access_watchpoints.iter().find(|w| {
-            w.class_id == class_id && w.field_id == field_id
-        })?;
+        let wp = self
+            .field_access_watchpoints
+            .iter()
+            .find(|w| w.class_id == class_id && w.field_id == field_id)?;
 
         let req = self.events.get_request(wp.request_id)?;
         let suspend_policy = req.suspend_policy;
         let request_id = wp.request_id;
 
         // Build extra: location(25) + fieldType(1) + fieldClassID(8) + fieldID(8)
-        let mut extra = build_location_extra(location_class_id, location_method_id, location_offset);
+        let mut extra =
+            build_location_extra(location_class_id, location_method_id, location_offset);
         extra.push(1u8); // refTypeTag: CLASS
         extra.extend_from_slice(&class_id.to_be_bytes());
         extra.extend_from_slice(&field_id.to_be_bytes());
@@ -516,16 +535,18 @@ impl DebugState {
         location_method_id: u64,
         location_offset: u64,
     ) -> Option<(u32, events::SuspendPolicy, protocol::JdwpPacket)> {
-        let wp = self.field_modification_watchpoints.iter().find(|w| {
-            w.class_id == class_id && w.field_id == field_id
-        })?;
+        let wp = self
+            .field_modification_watchpoints
+            .iter()
+            .find(|w| w.class_id == class_id && w.field_id == field_id)?;
 
         let req = self.events.get_request(wp.request_id)?;
         let suspend_policy = req.suspend_policy;
         let request_id = wp.request_id;
 
         // Build extra: location(25) + fieldType(1) + fieldClassID(8) + fieldID(8)
-        let mut extra = build_location_extra(location_class_id, location_method_id, location_offset);
+        let mut extra =
+            build_location_extra(location_class_id, location_method_id, location_offset);
         extra.push(1u8); // refTypeTag: CLASS
         extra.extend_from_slice(&class_id.to_be_bytes());
         extra.extend_from_slice(&field_id.to_be_bytes());
@@ -584,7 +605,12 @@ impl DebugState {
 /// This spawns a background listener thread and returns a [`DebugState`]
 /// immediately.  The caller should periodically call
 /// [`handle_debug_commands`] to process incoming JDWP commands.
-pub fn start_debug_server(port: u16) -> std::io::Result<(DebugState, std::sync::mpsc::Receiver<std::io::Result<JdwpConnection>>)> {
+pub fn start_debug_server(
+    port: u16,
+) -> std::io::Result<(
+    DebugState,
+    std::sync::mpsc::Receiver<std::io::Result<JdwpConnection>>,
+)> {
     let rx = transport::JdwpTransport::start_listener(port)?;
     Ok((DebugState::new(), rx))
 }
@@ -693,8 +719,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
         // `ObjectReference.InvokeMethod` and `ArrayType.NewInstance` can
         // forward to the running VM.  The bridge is removed on disconnect.
         if let Some(shared_arc) = shared.self_arc.read().as_ref().and_then(|w| w.upgrade()) {
-            let bridge: Arc<dyn DebuggerVmBridge> =
-                Arc::new(SharedVmBridge::new(shared_arc));
+            let bridge: Arc<dyn DebuggerVmBridge> = Arc::new(SharedVmBridge::new(shared_arc));
             shared.debug_state.lock().vm_bridge = Some(bridge);
         } else {
             tracing::warn!(
@@ -921,7 +946,7 @@ fn send_vm_start_event(stream: &mut std::net::TcpStream, _shared: &crate::vm::Sh
     // Composite event header
     pw.put_u8(0); // suspendPolicy = NONE
     pw.put_u32_be(1); // events count
-    // EventKind = VM_START (90)
+                      // EventKind = VM_START (90)
     pw.put_u8(90);
     pw.put_u32_be(0); // requestID = 0
     pw.put_u64_be(0); // threadID = main thread (0)
@@ -1046,7 +1071,11 @@ impl SharedVmBridge {
             ('D', Value::Double(d)) => DebuggerValue::Double(d.to_bits()),
             ('L', Value::Object(Some(r))) | ('[', Value::Object(Some(r))) => {
                 let id = r.as_ptr() as u64;
-                if tag == '[' { DebuggerValue::Array(id) } else { DebuggerValue::Object(id) }
+                if tag == '[' {
+                    DebuggerValue::Array(id)
+                } else {
+                    DebuggerValue::Object(id)
+                }
             }
             ('L', Value::Object(None)) => DebuggerValue::Object(0),
             ('[', Value::Object(None)) => DebuggerValue::Array(0),
@@ -1101,7 +1130,9 @@ impl DebuggerVmBridge for SharedVmBridge {
         args: &[DebuggerValue],
         return_sig: &str,
     ) -> Result<InvokeOutcome, BridgeError> {
-        let class_name = self.class_name_for(class_id).ok_or(BridgeError::InvalidClass)?;
+        let class_name = self
+            .class_name_for(class_id)
+            .ok_or(BridgeError::InvalidClass)?;
         let (method_name, descriptor) = self
             .method_sig_for(class_id, method_id)
             .ok_or(BridgeError::InvalidClass)?;
@@ -1117,7 +1148,14 @@ impl DebuggerVmBridge for SharedVmBridge {
         }
 
         let vm_args: Vec<_> = args.iter().map(Self::debugger_to_value).collect();
-        Ok(self.run_call(&class_name, &method_name, &descriptor, &vm_args, thread_id, return_sig))
+        Ok(self.run_call(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &vm_args,
+            thread_id,
+            return_sig,
+        ))
     }
 
     fn invoke_instance(
@@ -1130,7 +1168,9 @@ impl DebuggerVmBridge for SharedVmBridge {
         return_sig: &str,
         _non_virtual: bool,
     ) -> Result<InvokeOutcome, BridgeError> {
-        let class_name = self.class_name_for(class_id).ok_or(BridgeError::InvalidClass)?;
+        let class_name = self
+            .class_name_for(class_id)
+            .ok_or(BridgeError::InvalidClass)?;
         let (method_name, descriptor) = self
             .method_sig_for(class_id, method_id)
             .ok_or(BridgeError::InvalidClass)?;
@@ -1207,7 +1247,10 @@ impl DebuggerVmBridge for SharedVmBridge {
             }
         };
 
-        let array_ref = self.shared.heap.alloc_array(class_id, element_type, length as usize);
+        let array_ref = self
+            .shared
+            .heap
+            .alloc_array(class_id, element_type, length as usize);
         let wire_id = array_ref.as_ptr() as u64;
 
         // Register the allocated array in DebugState so subsequent
@@ -1215,10 +1258,8 @@ impl DebuggerVmBridge for SharedVmBridge {
         {
             let mut ds = self.shared.debug_state.lock();
             ds.array_lengths.insert(wire_id, length as usize);
-            ds.array_type_tags.insert(
-                wire_id,
-                element_kind_byte.unwrap_or(b'L'),
-            );
+            ds.array_type_tags
+                .insert(wire_id, element_kind_byte.unwrap_or(b'L'));
         }
         Ok(wire_id)
     }
@@ -1290,7 +1331,7 @@ mod tests {
         let extra = build_location_extra(10, 20, 30);
         assert_eq!(extra.len(), 25);
         assert_eq!(extra[0], 1); // TypeTag = CLASS
-        // class_id = 10 in BE
+                                 // class_id = 10 in BE
         assert_eq!(u64::from_be_bytes(extra[1..9].try_into().unwrap()), 10);
         // method_id = 20 in BE
         assert_eq!(u64::from_be_bytes(extra[9..17].try_into().unwrap()), 20);
@@ -1316,8 +1357,18 @@ mod tests {
         assert!(st.thread_frames.is_empty());
 
         let frames = vec![
-            FrameEntry { frame_id: 0, class_id: 1, method_id: 100, offset: 5 },
-            FrameEntry { frame_id: 1, class_id: 2, method_id: 200, offset: 10 },
+            FrameEntry {
+                frame_id: 0,
+                class_id: 1,
+                method_id: 100,
+                offset: 5,
+            },
+            FrameEntry {
+                frame_id: 1,
+                class_id: 2,
+                method_id: 200,
+                offset: 10,
+            },
         ];
         st.thread_frames.insert(42, frames);
 
@@ -1337,7 +1388,8 @@ mod tests {
             class_id: 10,
             method_id: 20,
             offset: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
         let evt = rx.recv().unwrap();
         assert_eq!(evt.kind, events::EventKind::Breakpoint);
@@ -1356,7 +1408,8 @@ mod tests {
                 class_id: 0,
                 method_id: 0,
                 offset: i as u64,
-            }).unwrap();
+            })
+            .unwrap();
         }
 
         let mut received = 0;
@@ -1379,7 +1432,12 @@ mod tests {
         };
         let pkt = events::compose_event_packet(events::SuspendPolicy::All, &[event]);
         match &pkt {
-            JdwpPacket::Command { command_set, command, data, .. } => {
+            JdwpPacket::Command {
+                command_set,
+                command,
+                data,
+                ..
+            } => {
                 assert_eq!(*command_set, 64);
                 assert_eq!(*command, 100);
                 // suspend_policy(1) + count(4) + kind(1) + req_id(4) + thread_id(8) + location(25) = 43
@@ -1448,11 +1506,29 @@ mod tests {
     #[test]
     fn s39_tr_frame_count_with_frames() {
         let mut st = DebugState::new();
-        st.thread_frames.insert(1, vec![
-            FrameEntry { frame_id: 0, class_id: 10, method_id: 100, offset: 0 },
-            FrameEntry { frame_id: 1, class_id: 20, method_id: 200, offset: 5 },
-            FrameEntry { frame_id: 2, class_id: 30, method_id: 300, offset: 10 },
-        ]);
+        st.thread_frames.insert(
+            1,
+            vec![
+                FrameEntry {
+                    frame_id: 0,
+                    class_id: 10,
+                    method_id: 100,
+                    offset: 0,
+                },
+                FrameEntry {
+                    frame_id: 1,
+                    class_id: 20,
+                    method_id: 200,
+                    offset: 5,
+                },
+                FrameEntry {
+                    frame_id: 2,
+                    class_id: 30,
+                    method_id: 300,
+                    offset: 10,
+                },
+            ],
+        );
         let count = st.thread_frames.get(&1).map_or(0, |f| f.len());
         assert_eq!(count, 3);
     }
@@ -1514,7 +1590,10 @@ mod tests {
         let req_id = st.events.set_event_request(
             events::EventKind::FieldAccess,
             events::SuspendPolicy::All,
-            vec![events::EventModifier::FieldOnly { class_id: 10, field_id: 3 }],
+            vec![events::EventModifier::FieldOnly {
+                class_id: 10,
+                field_id: 3,
+            }],
         );
         st.field_access_watchpoints.push(FieldWatchpoint {
             class_id: 10,
@@ -1529,7 +1608,11 @@ mod tests {
         assert_eq!(sp, events::SuspendPolicy::All);
         // Packet should be a Command (composite event)
         match pkt {
-            protocol::JdwpPacket::Command { command_set, command, .. } => {
+            protocol::JdwpPacket::Command {
+                command_set,
+                command,
+                ..
+            } => {
                 assert_eq!(command_set, 64);
                 assert_eq!(command, 100);
             }
@@ -1543,7 +1626,10 @@ mod tests {
         let req_id = st.events.set_event_request(
             events::EventKind::FieldModification,
             events::SuspendPolicy::EventThread,
-            vec![events::EventModifier::FieldOnly { class_id: 20, field_id: 7 }],
+            vec![events::EventModifier::FieldOnly {
+                class_id: 20,
+                field_id: 7,
+            }],
         );
         st.field_modification_watchpoints.push(FieldWatchpoint {
             class_id: 20,
@@ -1563,7 +1649,10 @@ mod tests {
         let req_id = st.events.set_event_request(
             events::EventKind::FieldAccess,
             events::SuspendPolicy::All,
-            vec![events::EventModifier::FieldOnly { class_id: 10, field_id: 3 }],
+            vec![events::EventModifier::FieldOnly {
+                class_id: 10,
+                field_id: 3,
+            }],
         );
         st.field_access_watchpoints.push(FieldWatchpoint {
             class_id: 10,
@@ -1590,66 +1679,81 @@ mod tests {
     #[test]
     fn t645_hit_count_equal_mode() {
         let mut st = DebugState::new();
-        st.breakpoint_conditions.insert(1, BreakpointCondition {
-            condition: None,
-            hit_count: 0,
-            hit_count_filter: Some(HitCountFilter {
-                mode: HitCountMode::Equal,
-                count: 3,
-            }),
-        });
+        st.breakpoint_conditions.insert(
+            1,
+            BreakpointCondition {
+                condition: None,
+                hit_count: 0,
+                hit_count_filter: Some(HitCountFilter {
+                    mode: HitCountMode::Equal,
+                    count: 3,
+                }),
+            },
+        );
         // Hits 1, 2 should not fire; hit 3 should fire.
         assert!(!st.evaluate_breakpoint_condition(1)); // hit 1
         assert!(!st.evaluate_breakpoint_condition(1)); // hit 2
-        assert!(st.evaluate_breakpoint_condition(1));  // hit 3
+        assert!(st.evaluate_breakpoint_condition(1)); // hit 3
         assert!(!st.evaluate_breakpoint_condition(1)); // hit 4
     }
 
     #[test]
     fn t645_hit_count_greater_or_equal_mode() {
         let mut st = DebugState::new();
-        st.breakpoint_conditions.insert(2, BreakpointCondition {
-            condition: None,
-            hit_count: 0,
-            hit_count_filter: Some(HitCountFilter {
-                mode: HitCountMode::GreaterOrEqual,
-                count: 3,
-            }),
-        });
+        st.breakpoint_conditions.insert(
+            2,
+            BreakpointCondition {
+                condition: None,
+                hit_count: 0,
+                hit_count_filter: Some(HitCountFilter {
+                    mode: HitCountMode::GreaterOrEqual,
+                    count: 3,
+                }),
+            },
+        );
         assert!(!st.evaluate_breakpoint_condition(2)); // hit 1
         assert!(!st.evaluate_breakpoint_condition(2)); // hit 2
-        assert!(st.evaluate_breakpoint_condition(2));  // hit 3 — fires
-        assert!(st.evaluate_breakpoint_condition(2));  // hit 4 — still fires
+        assert!(st.evaluate_breakpoint_condition(2)); // hit 3 — fires
+        assert!(st.evaluate_breakpoint_condition(2)); // hit 4 — still fires
     }
 
     #[test]
     fn t645_hit_count_multiple_mode() {
         let mut st = DebugState::new();
-        st.breakpoint_conditions.insert(3, BreakpointCondition {
-            condition: None,
-            hit_count: 0,
-            hit_count_filter: Some(HitCountFilter {
-                mode: HitCountMode::Multiple,
-                count: 2,
-            }),
-        });
+        st.breakpoint_conditions.insert(
+            3,
+            BreakpointCondition {
+                condition: None,
+                hit_count: 0,
+                hit_count_filter: Some(HitCountFilter {
+                    mode: HitCountMode::Multiple,
+                    count: 2,
+                }),
+            },
+        );
         assert!(!st.evaluate_breakpoint_condition(3)); // hit 1
-        assert!(st.evaluate_breakpoint_condition(3));  // hit 2 (multiple of 2)
+        assert!(st.evaluate_breakpoint_condition(3)); // hit 2 (multiple of 2)
         assert!(!st.evaluate_breakpoint_condition(3)); // hit 3
-        assert!(st.evaluate_breakpoint_condition(3));  // hit 4 (multiple of 2)
+        assert!(st.evaluate_breakpoint_condition(3)); // hit 4 (multiple of 2)
     }
 
     #[test]
     fn t645_condition_expression_stored() {
         let mut st = DebugState::new();
-        st.breakpoint_conditions.insert(5, BreakpointCondition {
-            condition: Some("expr:42".to_string()),
-            hit_count: 0,
-            hit_count_filter: None,
-        });
+        st.breakpoint_conditions.insert(
+            5,
+            BreakpointCondition {
+                condition: Some("expr:42".to_string()),
+                hit_count: 0,
+                hit_count_filter: None,
+            },
+        );
         // With an expression but no hit-count filter, should always pass
         assert!(st.evaluate_breakpoint_condition(5));
         assert_eq!(st.breakpoint_conditions[&5].hit_count, 1);
-        assert_eq!(st.breakpoint_conditions[&5].condition.as_deref(), Some("expr:42"));
+        assert_eq!(
+            st.breakpoint_conditions[&5].condition.as_deref(),
+            Some("expr:42")
+        );
     }
 }

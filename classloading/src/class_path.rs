@@ -6,13 +6,7 @@
 // terminate the entire VM before user code even starts. We gate the
 // lint on `not(test)` so the test module (which legitimately uses
 // `.unwrap()`/`.expect()` for fixture construction) is unaffected.
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-    )
-)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used,))]
 
 use cratonvm_types::error::ClassFileError;
 use parking_lot::Mutex;
@@ -439,22 +433,12 @@ impl std::fmt::Debug for ClassPathEntry {
             ClassPathEntry::JarFile { path, .. } => write!(f, "JarFile({})", path.display()),
             ClassPathEntry::NestedDirectory {
                 parent_jar, prefix, ..
-            } => write!(
-                f,
-                "NestedDirectory({}!/{})",
-                parent_jar.display(),
-                prefix
-            ),
+            } => write!(f, "NestedDirectory({}!/{})", parent_jar.display(), prefix),
             ClassPathEntry::NestedJar {
                 parent_jar,
                 nested_path,
                 ..
-            } => write!(
-                f,
-                "NestedJar({}!/{})",
-                parent_jar.display(),
-                nested_path
-            ),
+            } => write!(f, "NestedJar({}!/{})", parent_jar.display(), nested_path),
             ClassPathEntry::JmodFile { path, .. } => write!(f, "JmodFile({})", path.display()),
             ClassPathEntry::JImageFile { path, .. } => {
                 write!(f, "JImageFile({})", path.display())
@@ -658,9 +642,7 @@ impl ManifestInfo {
                     // directory (absolute roots, `file:/etc`, `..` escapes).
                     // Default-off preserves HotSpot's trusted-manifest
                     // behaviour; see `decode_manifest_classpath_entry`.
-                    if harden_manifest_classpath()
-                        && !path_is_within(&resolved, jar_dir)
-                    {
+                    if harden_manifest_classpath() && !path_is_within(&resolved, jar_dir) {
                         debug!(
                             "manifest Class-Path entry {:?} resolves outside the \
                              JAR directory {:?}; dropped \
@@ -678,9 +660,7 @@ impl ManifestInfo {
 
     /// Returns true if this JAR appears to be a Spring Boot fat JAR.
     pub fn is_spring_boot(&self) -> bool {
-        self.start_class.is_some()
-            || self.boot_classes.is_some()
-            || self.boot_lib.is_some()
+        self.start_class.is_some() || self.boot_classes.is_some() || self.boot_lib.is_some()
     }
 }
 
@@ -1172,7 +1152,11 @@ impl ClassPath {
             return vec![raw.to_string()];
         }
 
-        let dir = PathBuf::from(if dir_part.is_empty() { "." } else { dir_part.as_str() });
+        let dir = PathBuf::from(if dir_part.is_empty() {
+            "."
+        } else {
+            dir_part.as_str()
+        });
         let read = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -1249,8 +1233,8 @@ impl ClassPath {
             Ok(mut archive) => {
                 // Check for MANIFEST.MF to detect Spring Boot fat JAR
                 let manifest = Self::read_manifest(&mut archive);
-                let is_fat_jar = manifest.is_spring_boot()
-                    || Self::probe_fat_jar_structure(&mut archive);
+                let is_fat_jar =
+                    manifest.is_spring_boot() || Self::probe_fat_jar_structure(&mut archive);
 
                 if is_fat_jar {
                     debug!(
@@ -1356,10 +1340,7 @@ impl ClassPath {
             .boot_classes
             .as_deref()
             .unwrap_or("BOOT-INF/classes/");
-        let lib_prefix = manifest
-            .boot_lib
-            .as_deref()
-            .unwrap_or("BOOT-INF/lib/");
+        let lib_prefix = manifest.boot_lib.as_deref().unwrap_or("BOOT-INF/lib/");
 
         // Ensure prefixes end with /
         let classes_prefix = if classes_prefix.ends_with('/') {
@@ -1558,26 +1539,24 @@ impl ClassPath {
                 if pb.exists() {
                     match read_file_for_classpath(&pb) {
                         Ok(data) => {
-                            match Self::build_nested_directory_from_jar(
-                                &pb, data, &prefix,
-                            ) {
+                            match Self::build_nested_directory_from_jar(&pb, data, &prefix) {
                                 Some(entry) => {
                                     debug!(
                                         "Dynamic classpath: adding nested-dir {}!/{}",
-                                        pb.display(), prefix
+                                        pb.display(),
+                                        prefix
                                     );
                                     self.entries.push(entry);
                                 }
                                 None => debug!(
                                     "Dynamic classpath: nested-dir {}!/{} \
                                      yielded no entries (skipping)",
-                                    pb.display(), prefix
+                                    pb.display(),
+                                    prefix
                                 ),
                             }
                         }
-                        Err(e) => debug!(
-                            "Dynamic classpath: failed to read {}: {e}", pb.display()
-                        ),
+                        Err(e) => debug!("Dynamic classpath: failed to read {}: {e}", pb.display()),
                     }
                     continue;
                 }
@@ -1591,9 +1570,10 @@ impl ClassPath {
             if pb.is_dir() {
                 debug!("Dynamic classpath: adding directory {expanded}");
                 self.entries.push(ClassPathEntry::Directory(pb));
-            } else if pb.extension().is_some_and(|e| {
-                e.eq_ignore_ascii_case("jar") || e.eq_ignore_ascii_case("zip")
-            }) && pb.exists()
+            } else if pb
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jar") || e.eq_ignore_ascii_case("zip"))
+                && pb.exists()
             {
                 // Round 7 audit fix (MED #12): mmap large JARs on the
                 // dynamic-add path too (URLClassLoader, agent-injected
@@ -1689,7 +1669,8 @@ impl ClassPath {
             || class_name.contains('\0')
             || class_name.contains(':')       // Windows drive letters (C:)
             || class_name.contains("./")      // current-dir references
-            || class_name.contains(".\\")     // Windows current-dir references
+            || class_name.contains(".\\")
+        // Windows current-dir references
         {
             return Err(ClassFileError::ClassNotFound {
                 class_name: class_name.to_string(),
@@ -1770,13 +1751,20 @@ impl ClassPath {
                         // some generated/proxy class files (Spring AOP,
                         // ByteBuddy, Jackson) exceed the threshold and
                         // benefit from mmap.
-                        return read_file_for_classpath(&full_path).map_err(|e| ClassFileError::IoError {
-                            class_name: class_name.to_string(),
-                            source: e,
+                        return read_file_for_classpath(&full_path).map_err(|e| {
+                            ClassFileError::IoError {
+                                class_name: class_name.to_string(),
+                                source: e,
+                            }
                         });
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    ..
+                } => {
                     for candidate in &archive_candidates {
                         let found = if *multi_release {
                             Self::find_in_multi_release_archive(archive, versions_cache, candidate)
@@ -1795,7 +1783,11 @@ impl ClassPath {
                         return Ok(data.clone());
                     }
                 }
-                ClassPathEntry::NestedJar { archive, nested_path, .. } => {
+                ClassPathEntry::NestedJar {
+                    archive,
+                    nested_path,
+                    ..
+                } => {
                     for candidate in &archive_candidates {
                         if let Some(data) = Self::find_in_archive(archive, candidate) {
                             debug!(
@@ -1806,7 +1798,11 @@ impl ClassPath {
                         }
                     }
                 }
-                ClassPathEntry::JmodFile { path, classes_cache, .. } => {
+                ClassPathEntry::JmodFile {
+                    path,
+                    classes_cache,
+                    ..
+                } => {
                     // Look up in the pre-extracted classes cache — O(1), no decompression
                     if let Some(data) = classes_cache.get(&relative_path) {
                         debug!("Found class {class_name} in JMOD {}", path.display());
@@ -1893,13 +1889,23 @@ impl ClassPath {
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
                         return Some(
-                            dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string() + "/",
+                            dir.to_string_lossy()
+                                .trim_end_matches(['/', '\\'])
+                                .to_string()
+                                + "/",
                         );
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    path,
+                    ..
+                } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
+                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
+                            .is_some()
                     } else {
                         Self::find_in_archive(archive, &relative_path).is_some()
                     };
@@ -1908,14 +1914,19 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::NestedDirectory {
-                    parent_jar, entries_cache, ..
+                    parent_jar,
+                    entries_cache,
+                    ..
                 } => {
                     if entries_cache.contains_key(&relative_path) {
                         return Some(parent_jar.to_string_lossy().into_owned());
                     }
                 }
                 ClassPathEntry::NestedJar {
-                    parent_jar, archive, nested_path, ..
+                    parent_jar,
+                    archive,
+                    nested_path,
+                    ..
                 } => {
                     if Self::find_in_archive(archive, &relative_path).is_some() {
                         // Return "$parent_jar!/$nested_path" style (JAR-in-JAR)
@@ -1929,7 +1940,11 @@ impl ClassPath {
                         return Some(format!("{outer}!/{nested_path}"));
                     }
                 }
-                ClassPathEntry::JmodFile { path, classes_cache, .. } => {
+                ClassPathEntry::JmodFile {
+                    path,
+                    classes_cache,
+                    ..
+                } => {
                     if classes_cache.contains_key(&relative_path) {
                         return Some(path.to_string_lossy().into_owned());
                     }
@@ -1959,10 +1974,7 @@ impl ClassPath {
     ///
     /// Returns `None` if the class isn't on this classpath or lives in a
     /// JMOD/jimage module (JDK internals have no user-visible code source).
-    pub fn find_class_code_source_info(
-        &self,
-        class_name: &str,
-    ) -> Option<(String, Vec<Vec<u8>>)> {
+    pub fn find_class_code_source_info(&self, class_name: &str) -> Option<(String, Vec<Vec<u8>>)> {
         // Audit-fix #6: match `find_class` / `find_class_source_path`'s full
         // validation set (NUL bytes, leading slash, backslash, drive letter,
         // dot-dot, relative-dir prefixes). The previous truncated check let
@@ -1994,9 +2006,16 @@ impl ClassPath {
                         return Some((format!("file:/{p}/"), Vec::new()));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, signer_cache } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    path,
+                    signer_cache,
+                } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
+                        Self::find_in_multi_release_archive(archive, versions_cache, &relative_path)
+                            .is_some()
                     } else {
                         Self::find_in_archive(archive, &relative_path).is_some()
                     };
@@ -2009,8 +2028,8 @@ impl ClassPath {
                         let p = p.trim_start_matches('/').to_string();
                         // Report P1 (perf): verify the signer blocks at most once
                         // per archive, then reuse the cached signing state.
-                        let info = signer_cache
-                            .get_or_init(|| Self::extract_jar_signer_blocks(archive));
+                        let info =
+                            signer_cache.get_or_init(|| Self::extract_jar_signer_blocks(archive));
                         // V3 (unsigned-entry attack): attach the signer chain
                         // ONLY if this exact class entry is committed-to by the
                         // verified manifest and its bytes still match. A class
@@ -2019,18 +2038,20 @@ impl ClassPath {
                         // For multi-release JARs the *served* entry (possibly
                         // `META-INF/versions/<N>/<class>`) is the one that must
                         // be signed, so resolve it before checking.
-                        let mr_cache = if *multi_release { Some(versions_cache) } else { None };
-                        let certs = Self::certs_for_signed_class(
-                            info,
-                            archive,
-                            &relative_path,
-                            mr_cache,
-                        );
+                        let mr_cache = if *multi_release {
+                            Some(versions_cache)
+                        } else {
+                            None
+                        };
+                        let certs =
+                            Self::certs_for_signed_class(info, archive, &relative_path, mr_cache);
                         return Some((format!("file:/{p}"), certs));
                     }
                 }
                 ClassPathEntry::NestedDirectory {
-                    parent_jar, entries_cache, ..
+                    parent_jar,
+                    entries_cache,
+                    ..
                 } => {
                     if entries_cache.contains_key(&relative_path) {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
@@ -2038,23 +2059,24 @@ impl ClassPath {
                         return Some((format!("file:/{p}"), Vec::new()));
                     }
                 }
-                ClassPathEntry::NestedJar { parent_jar, archive, nested_path, signer_cache } => {
+                ClassPathEntry::NestedJar {
+                    parent_jar,
+                    archive,
+                    nested_path,
+                    signer_cache,
+                } => {
                     if Self::find_in_archive(archive, &relative_path).is_some() {
                         let outer = parent_jar.to_string_lossy().replace('\\', "/");
                         let outer = outer.trim_start_matches('/').to_string();
                         // Report P1 (perf): verify the signer blocks at most once
                         // per nested archive, then reuse the cached signing state.
-                        let info = signer_cache
-                            .get_or_init(|| Self::extract_jar_signer_blocks(archive));
+                        let info =
+                            signer_cache.get_or_init(|| Self::extract_jar_signer_blocks(archive));
                         // V3 (unsigned-entry attack): per-class cert attachment —
                         // see the matching `JarFile` arm above. Nested JARs are
                         // not searched multi-release here, so pass `None`.
-                        let certs = Self::certs_for_signed_class(
-                            info,
-                            archive,
-                            &relative_path,
-                            None,
-                        );
+                        let certs =
+                            Self::certs_for_signed_class(info, archive, &relative_path, None);
                         return Some((format!("jar:file:/{outer}!/{nested_path}"), certs));
                     }
                 }
@@ -2098,9 +2120,7 @@ impl ClassPath {
     /// blob, and trust-store chaining, are tracked in
     /// `jar_signer.rs` module docs.  Once `crypto_impl::Rsa::verify_*`
     /// is hoisted out of `cratonvm-native-builtins` we plug it in here.
-    fn extract_jar_signer_blocks(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
-    ) -> JarSignerInfo {
+    fn extract_jar_signer_blocks(archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>) -> JarSignerInfo {
         let mut guard = archive.lock();
         // Collect every safe META-INF entry name once; we need both the
         // `*.SF` companions (to feed into the integrity check) and the
@@ -2186,8 +2206,7 @@ impl ClassPath {
             // unsigned, matching the HotSpot "fails verify" behaviour.
             // On failure we silently drop the block.
             let trust_store = crate::jar_signer::default_trust_store();
-            if let Some(vs) =
-                crate::jar_signer::verify_signer_block(&block, &sf_bytes, trust_store)
+            if let Some(vs) = crate::jar_signer::verify_signer_block(&block, &sf_bytes, trust_store)
             {
                 // V1: the signature/`.SF` check above only binds the `.SF`
                 // to the signer. The full jarsigner trust chain is
@@ -2207,9 +2226,7 @@ impl ClassPath {
                     // V3: record exactly which entries this verified signer
                     // committed to, so cert attachment can be gated per class.
                     for (entry_name, alg, expected) in entries {
-                        signed_entries
-                            .entry(entry_name)
-                            .or_insert((alg, expected));
+                        signed_entries.entry(entry_name).or_insert((alg, expected));
                     }
                 } else {
                     debug!(
@@ -2466,7 +2483,12 @@ impl ClassPath {
                         }
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    ..
+                } => {
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
@@ -2500,13 +2522,22 @@ impl ClassPath {
                         return Some(data.clone());
                     }
                 }
-                ClassPathEntry::NestedJar { archive, nested_path, .. } => {
+                ClassPathEntry::NestedJar {
+                    archive,
+                    nested_path,
+                    ..
+                } => {
                     if let Some(data) = Self::find_in_archive(archive, name) {
                         debug!("Found resource {name} in nested JAR {nested_path}");
                         return Some(data);
                     }
                 }
-                ClassPathEntry::JmodFile { path, classes_cache, archive, .. } => {
+                ClassPathEntry::JmodFile {
+                    path,
+                    classes_cache,
+                    archive,
+                    ..
+                } => {
                     // Try the pre-extracted classes cache first (covers .class + resources under classes/)
                     if let Some(data) = classes_cache.get(name) {
                         debug!("Found resource {name} in JMOD {} (cached)", path.display());
@@ -2529,33 +2560,24 @@ impl ClassPath {
                     // Classes live in `class_to_module`; non-class
                     // resources live in `resource_to_modules`. Try the
                     // appropriate map based on the file extension.
-                    let (full_path_attempts, is_class): (Vec<String>, bool) = if let Some(
-                        class_name,
-                    ) =
-                        name.strip_suffix(".class")
-                    {
-                        if let Some(module) = class_to_module.get(class_name) {
-                            (
-                                vec![format!("/{module}/{class_name}.class")],
-                                true,
-                            )
+                    let (full_path_attempts, is_class): (Vec<String>, bool) =
+                        if let Some(class_name) = name.strip_suffix(".class") {
+                            if let Some(module) = class_to_module.get(class_name) {
+                                (vec![format!("/{module}/{class_name}.class")], true)
+                            } else {
+                                (Vec::new(), true)
+                            }
                         } else {
-                            (Vec::new(), true)
-                        }
-                    } else {
-                        // Non-class resource: try every module that
-                        // contains this path.
-                        match resource_to_modules.get(name) {
-                            Some(modules) => (
-                                modules
-                                    .iter()
-                                    .map(|m| format!("/{m}/{name}"))
-                                    .collect(),
-                                false,
-                            ),
-                            None => (Vec::new(), false),
-                        }
-                    };
+                            // Non-class resource: try every module that
+                            // contains this path.
+                            match resource_to_modules.get(name) {
+                                Some(modules) => (
+                                    modules.iter().map(|m| format!("/{m}/{name}")).collect(),
+                                    false,
+                                ),
+                                None => (Vec::new(), false),
+                            }
+                        };
                     let _ = is_class;
                     for attempt in full_path_attempts {
                         match reader.find_resource(&attempt) {
@@ -2629,7 +2651,12 @@ impl ClassPath {
                         out.push(bytes);
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    ..
+                } => {
                     let bytes = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name)
                     } else {
@@ -2649,7 +2676,11 @@ impl ClassPath {
                         out.push(b);
                     }
                 }
-                ClassPathEntry::JmodFile { classes_cache, archive, .. } => {
+                ClassPathEntry::JmodFile {
+                    classes_cache,
+                    archive,
+                    ..
+                } => {
                     if let Some(b) = classes_cache.get(name) {
                         out.push(b.clone());
                     } else {
@@ -2660,25 +2691,26 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JImageFile {
-                    reader, resource_to_modules, class_to_module, ..
+                    reader,
+                    resource_to_modules,
+                    class_to_module,
+                    ..
                 } => {
-                    let attempts: Vec<String> = if let Some(class_name) =
-                        name.strip_suffix(".class")
-                    {
-                        if let Some(module) = class_to_module.get(class_name) {
-                            vec![format!("/{module}/{class_name}.class")]
+                    let attempts: Vec<String> =
+                        if let Some(class_name) = name.strip_suffix(".class") {
+                            if let Some(module) = class_to_module.get(class_name) {
+                                vec![format!("/{module}/{class_name}.class")]
+                            } else {
+                                Vec::new()
+                            }
                         } else {
-                            Vec::new()
-                        }
-                    } else {
-                        match resource_to_modules.get(name) {
-                            Some(modules) => modules
-                                .iter()
-                                .map(|m| format!("/{m}/{name}"))
-                                .collect(),
-                            None => Vec::new(),
-                        }
-                    };
+                            match resource_to_modules.get(name) {
+                                Some(modules) => {
+                                    modules.iter().map(|m| format!("/{m}/{name}")).collect()
+                                }
+                                None => Vec::new(),
+                            }
+                        };
                     for attempt in attempts {
                         if let Ok(Some(b)) = reader.find_resource(&attempt) {
                             out.push(b);
@@ -2751,7 +2783,13 @@ impl ClassPath {
                         urls.push(format!("file:/{p}"));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    path,
+                    ..
+                } => {
                     let direct = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
                     } else {
@@ -2766,7 +2804,8 @@ impl ClassPath {
                     let with_slash = if !direct && !name.ends_with('/') {
                         let alt = format!("{name}/");
                         if *multi_release {
-                            Self::find_in_multi_release_archive(archive, versions_cache, &alt).is_some()
+                            Self::find_in_multi_release_archive(archive, versions_cache, &alt)
+                                .is_some()
                         } else {
                             Self::find_in_archive(archive, &alt).is_some()
                         }
@@ -2798,21 +2837,35 @@ impl ClassPath {
                         urls.push(format!("jar:file:/{p}!/{suffix}"));
                     }
                 }
-                ClassPathEntry::NestedDirectory { parent_jar, prefix, entries_cache } => {
+                ClassPathEntry::NestedDirectory {
+                    parent_jar,
+                    prefix,
+                    entries_cache,
+                } => {
                     if entries_cache.contains_key(name) {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
                         urls.push(format!("jar:file:/{p}!/{prefix}{name}"));
                     }
                 }
-                ClassPathEntry::NestedJar { parent_jar, archive, nested_path, .. } => {
+                ClassPathEntry::NestedJar {
+                    parent_jar,
+                    archive,
+                    nested_path,
+                    ..
+                } => {
                     if Self::find_in_archive(archive, name).is_some() {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
                         urls.push(format!("jar:file:/{p}!/{nested_path}!/{name}"));
                     }
                 }
-                ClassPathEntry::JmodFile { path, classes_cache, archive, .. } => {
+                ClassPathEntry::JmodFile {
+                    path,
+                    classes_cache,
+                    archive,
+                    ..
+                } => {
                     let found = classes_cache.contains_key(name) || {
                         let jmod_name = format!("classes/{}", name);
                         Self::find_in_archive(archive, &jmod_name).is_some()
@@ -2824,25 +2877,26 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JImageFile {
-                    reader, resource_to_modules, class_to_module, ..
+                    reader,
+                    resource_to_modules,
+                    class_to_module,
+                    ..
                 } => {
-                    let attempts: Vec<String> = if let Some(class_name) =
-                        name.strip_suffix(".class")
-                    {
-                        if let Some(module) = class_to_module.get(class_name) {
-                            vec![format!("/{module}/{class_name}.class")]
+                    let attempts: Vec<String> =
+                        if let Some(class_name) = name.strip_suffix(".class") {
+                            if let Some(module) = class_to_module.get(class_name) {
+                                vec![format!("/{module}/{class_name}.class")]
+                            } else {
+                                Vec::new()
+                            }
                         } else {
-                            Vec::new()
-                        }
-                    } else {
-                        match resource_to_modules.get(name) {
-                            Some(modules) => modules
-                                .iter()
-                                .map(|m| format!("/{m}/{name}"))
-                                .collect(),
-                            None => Vec::new(),
-                        }
-                    };
+                            match resource_to_modules.get(name) {
+                                Some(modules) => {
+                                    modules.iter().map(|m| format!("/{m}/{name}")).collect()
+                                }
+                                None => Vec::new(),
+                            }
+                        };
                     for attempt in attempts {
                         if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
                             // JEP 220 jrt URL scheme: `jrt:/<module>/<resource>`.
@@ -2888,9 +2942,18 @@ impl ClassPath {
                         results.push(data);
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, .. } => {
+                ClassPathEntry::JarFile {
+                    archive,
+                    multi_release,
+                    versions_cache,
+                    ..
+                } => {
                     let found = if *multi_release {
-                        Self::find_in_multi_release_archive(archive, versions_cache, "module-info.class")
+                        Self::find_in_multi_release_archive(
+                            archive,
+                            versions_cache,
+                            "module-info.class",
+                        )
                     } else {
                         Self::find_in_archive(archive, "module-info.class")
                     };
@@ -2905,13 +2968,21 @@ impl ClassPath {
                         results.push(data.clone());
                     }
                 }
-                ClassPathEntry::NestedJar { archive, nested_path, .. } => {
+                ClassPathEntry::NestedJar {
+                    archive,
+                    nested_path,
+                    ..
+                } => {
                     if let Some(data) = Self::find_in_archive(archive, "module-info.class") {
                         debug!("Found module-info.class in nested JAR {nested_path}");
                         results.push(data);
                     }
                 }
-                ClassPathEntry::JmodFile { path, classes_cache, .. } => {
+                ClassPathEntry::JmodFile {
+                    path,
+                    classes_cache,
+                    ..
+                } => {
                     if let Some(data) = classes_cache.get("module-info.class") {
                         debug!("Found module-info.class in JMOD {}", path.display());
                         results.push(data.clone());
@@ -2970,7 +3041,9 @@ impl ClassPath {
                 ClassPathEntry::NestedJar { archive, .. } => {
                     Self::list_archive_classes(archive, &mut names);
                 }
-                ClassPathEntry::JmodFile { all_entry_names, .. } => {
+                ClassPathEntry::JmodFile {
+                    all_entry_names, ..
+                } => {
                     for name in all_entry_names {
                         if let Some(class_path) = name.strip_prefix("classes/") {
                             if let Some(cn) = Self::class_file_to_name(class_path) {
@@ -3012,10 +3085,13 @@ impl ClassPath {
 
     /// Return the total number of classes available in JMOD entries.
     pub fn jmod_class_count(&self) -> usize {
-        self.entries.iter().map(|e| match e {
-            ClassPathEntry::JmodFile { classes_cache, .. } => classes_cache.len(),
-            _ => 0,
-        }).sum()
+        self.entries
+            .iter()
+            .map(|e| match e {
+                ClassPathEntry::JmodFile { classes_cache, .. } => classes_cache.len(),
+                _ => 0,
+            })
+            .sum()
     }
 
     /// Return the number of classes known to the jimage entries on this
@@ -3110,10 +3186,7 @@ impl ClassPath {
                     class_to_module.insert(class_name.to_string(), module);
                 }
             } else {
-                resource_to_modules
-                    .entry(rest)
-                    .or_default()
-                    .push(module);
+                resource_to_modules.entry(rest).or_default().push(module);
             }
         }
 
@@ -3246,14 +3319,12 @@ impl ClassPath {
                 Self::JMOD_MAX_MINOR
             ));
         }
-        debug!(
-            "JMOD {} version {}.{}", path.display(), major, minor
-        );
+        debug!("JMOD {} version {}.{}", path.display(), major, minor);
         // Strip the 4-byte JMOD magic prefix to get standard ZIP data
         let zip_data = data[4..].to_vec();
         let cursor = Cursor::new(zip_data.clone());
-        let mut archive = ZipArchive::new(cursor)
-            .map_err(|e| format!("failed to parse ZIP inside JMOD: {e}"))?;
+        let mut archive =
+            ZipArchive::new(cursor).map_err(|e| format!("failed to parse ZIP inside JMOD: {e}"))?;
 
         let total_entries = archive.len();
 
@@ -3302,8 +3373,6 @@ impl ClassPath {
             archive: Mutex::new(archive2),
         })
     }
-
-
 }
 
 #[cfg(test)]
@@ -3412,7 +3481,9 @@ mod tests {
         fs::write(&resource_path, b"hello world").unwrap();
 
         let cp = ClassPath::new(&[dir.to_string_lossy().into_owned()]);
-        let data = cp.find_resource("hello.txt").expect("resource should be found");
+        let data = cp
+            .find_resource("hello.txt")
+            .expect("resource should be found");
         assert_eq!(data, b"hello world");
 
         assert!(cp.find_resource("missing.txt").is_none());
@@ -3439,7 +3510,9 @@ mod tests {
         assert_eq!(data, b"word1\nword2\nword3");
 
         // Leading slash is stripped
-        let data2 = cp.find_resource("/data/words.txt").expect("leading slash stripped");
+        let data2 = cp
+            .find_resource("/data/words.txt")
+            .expect("leading slash stripped");
         assert_eq!(data2, b"word1\nword2\nword3");
 
         assert!(cp.find_resource("data/missing.txt").is_none());
@@ -3493,12 +3566,8 @@ mod tests {
         {
             let cursor = Cursor::new(&mut dep_jar_buf);
             let mut dep_zip = zip::ZipWriter::new(cursor);
-            dep_zip
-                .start_file("org/dep/Util.class", opts)
-                .unwrap();
-            dep_zip
-                .write_all(b"\xCA\xFE\xBA\xBE_util_class")
-                .unwrap();
+            dep_zip.start_file("org/dep/Util.class", opts).unwrap();
+            dep_zip.write_all(b"\xCA\xFE\xBA\xBE_util_class").unwrap();
             dep_zip
                 .start_file("META-INF/services/org.dep.SPI", opts)
                 .unwrap();
@@ -3509,11 +3578,8 @@ mod tests {
         zip.write_all(&dep_jar_buf).unwrap();
 
         // Launcher class at JAR root
-        zip.start_file(
-            "org/springframework/boot/loader/JarLauncher.class",
-            opts,
-        )
-        .unwrap();
+        zip.start_file("org/springframework/boot/loader/JarLauncher.class", opts)
+            .unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_launcher").unwrap();
 
         zip.finish().unwrap();
@@ -3804,18 +3870,26 @@ mod tests {
     #[test]
     fn load_real_jdk_jmod() {
         // Skip this test if no JDK is available
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let candidate = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if candidate.exists() { Some(candidate.to_string_lossy().into_owned()) } else { None }
-            });
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let candidate = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if candidate.exists() {
+                Some(candidate.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
         let Some(java_home) = java_home else {
             eprintln!("Skipping load_real_jdk_jmod: no JAVA_HOME set");
             return;
         };
-        let jmod_path = PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
+        let jmod_path = PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
         if !jmod_path.exists() {
-            eprintln!("Skipping load_real_jdk_jmod: {} not found", jmod_path.display());
+            eprintln!(
+                "Skipping load_real_jdk_jmod: {} not found",
+                jmod_path.display()
+            );
             return;
         }
 
@@ -3824,7 +3898,11 @@ mod tests {
 
         // Must find java.lang.Object
         let obj_bytes = cp.find_class("java/lang/Object").unwrap();
-        assert_eq!(&obj_bytes[..4], b"\xCA\xFE\xBA\xBE", "Object.class should have class file magic");
+        assert_eq!(
+            &obj_bytes[..4],
+            b"\xCA\xFE\xBA\xBE",
+            "Object.class should have class file magic"
+        );
         assert!(obj_bytes.len() > 100, "Object.class should be non-trivial");
 
         // Must find java.lang.String
@@ -3838,7 +3916,11 @@ mod tests {
 
         // Class listing should have thousands of classes
         let names = cp.list_class_names();
-        assert!(names.len() > 1000, "java.base should have >1000 classes, got {}", names.len());
+        assert!(
+            names.len() > 1000,
+            "java.base should have >1000 classes, got {}",
+            names.len()
+        );
         assert!(names.contains(&"java/lang/Object".to_string()));
         assert!(names.contains(&"java/lang/String".to_string()));
         assert!(names.contains(&"java/util/HashMap".to_string()));
@@ -3847,7 +3929,11 @@ mod tests {
 
         // module-info.class should be found
         let modules = cp.scan_module_infos();
-        assert_eq!(modules.len(), 1, "java.base.jmod should have exactly 1 module-info");
+        assert_eq!(
+            modules.len(),
+            1,
+            "java.base.jmod should have exactly 1 module-info"
+        );
     }
 
     // --- Phase 80.5: Path Traversal Fix Tests ---
@@ -3952,7 +4038,9 @@ mod tests {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("java.home") {
                 if let Some(value) = rest.trim().strip_prefix('=') {
-                    let jmod = PathBuf::from(value.trim()).join("jmods").join("java.base.jmod");
+                    let jmod = PathBuf::from(value.trim())
+                        .join("jmods")
+                        .join("java.base.jmod");
                     if jmod.exists() {
                         return Some(jmod);
                     }
@@ -3966,7 +4054,10 @@ mod tests {
     #[ignore] // requires JDK on host
     fn load_jmod_validates_magic_and_version() {
         let jmod_path = find_java_base_jmod();
-        assert!(jmod_path.is_some(), "No JDK found — cannot test JMOD loading");
+        assert!(
+            jmod_path.is_some(),
+            "No JDK found — cannot test JMOD loading"
+        );
         let jmod_path = jmod_path.unwrap();
 
         // Should load successfully
@@ -3980,7 +4071,11 @@ mod tests {
 
         // Verify it's a JmodFile variant with a populated classes_cache
         match entry.unwrap() {
-            ClassPathEntry::JmodFile { classes_cache, all_entry_names, .. } => {
+            ClassPathEntry::JmodFile {
+                classes_cache,
+                all_entry_names,
+                ..
+            } => {
                 assert!(
                     classes_cache.len() > 100,
                     "java.base should have >100 classes, got {}",
@@ -4083,7 +4178,11 @@ mod tests {
             "Expected at least 10 modules, got {}",
             modules.len()
         );
-        eprintln!("Found {} modules: {:?}", modules.len(), &modules[..5.min(modules.len())]);
+        eprintln!(
+            "Found {} modules: {:?}",
+            modules.len(),
+            &modules[..5.min(modules.len())]
+        );
     }
 
     #[test]
@@ -4097,10 +4196,7 @@ mod tests {
         let result = ClassPath::load_jmod(&path);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("magic"),
-            "Error should mention magic: {err}"
-        );
+        assert!(err.contains("magic"), "Error should mention magic: {err}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4191,7 +4287,10 @@ mod tests {
         let cp = entries.join(" ");
         let raw = format!("Manifest-Version: 1.0\nClass-Path: {cp}\n");
         let info = ManifestInfo::parse(raw.as_bytes());
-        assert!(info.class_path.is_some(), "large Class-Path must be preserved");
+        assert!(
+            info.class_path.is_some(),
+            "large Class-Path must be preserved"
+        );
     }
 
     #[test]
@@ -4211,7 +4310,9 @@ mod tests {
         let cp = info.resolve_class_path(Path::new("C:/tmp/boot/booter.jar"));
         assert_eq!(cp.len(), 2);
         assert!(cp[0].replace('\\', "/").ends_with("/tmp/boot/lib/a.jar"));
-        assert!(cp[1].replace('\\', "/").ends_with("/tmp/boot/../shared/b.jar"));
+        assert!(cp[1]
+            .replace('\\', "/")
+            .ends_with("/tmp/boot/../shared/b.jar"));
     }
 
     #[test]
@@ -4290,7 +4391,8 @@ mod tests {
         zip.write_all(b"\xCA\xFE\xBA\xBE_base").unwrap();
 
         // Versioned class (Java 11)
-        zip.start_file("META-INF/versions/11/com/example/Hello.class", opts).unwrap();
+        zip.start_file("META-INF/versions/11/com/example/Hello.class", opts)
+            .unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_v11").unwrap();
 
         zip.finish().unwrap();
@@ -4322,11 +4424,13 @@ mod tests {
         zip.write_all(b"\xCA\xFE\xBA\xBE_base").unwrap();
 
         // Java 11 version
-        zip.start_file("META-INF/versions/11/com/example/Foo.class", opts).unwrap();
+        zip.start_file("META-INF/versions/11/com/example/Foo.class", opts)
+            .unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_v11").unwrap();
 
         // Java 17 version
-        zip.start_file("META-INF/versions/17/com/example/Foo.class", opts).unwrap();
+        zip.start_file("META-INF/versions/17/com/example/Foo.class", opts)
+            .unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_v17").unwrap();
 
         zip.finish().unwrap();
@@ -4357,7 +4461,8 @@ mod tests {
         zip.start_file("com/example/Hello.class", opts).unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_base").unwrap();
 
-        zip.start_file("META-INF/versions/17/com/example/Hello.class", opts).unwrap();
+        zip.start_file("META-INF/versions/17/com/example/Hello.class", opts)
+            .unwrap();
         zip.write_all(b"\xCA\xFE\xBA\xBE_v17").unwrap();
 
         zip.finish().unwrap();
@@ -4408,15 +4513,22 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         dir.join(format!(
             "{tag}_{}.img",
-            std::process::id().wrapping_mul(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0))
+            std::process::id().wrapping_mul(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0)
+            )
         ))
     }
 
-    fn sample_jimage_resources(
-    ) -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static [u8])> {
+    fn sample_jimage_resources() -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+    )> {
         vec![
             (
                 "java.base",
@@ -4461,9 +4573,7 @@ mod tests {
     /// every class via `find_class`.
     #[test]
     fn jimage_find_class_round_trip() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
         let path = jimage_temp_path("find_class");
         fs::write(&path, &data).unwrap();
 
@@ -4493,11 +4603,8 @@ mod tests {
     /// up a file literally named `modules` without an extension.
     #[test]
     fn jimage_auto_detected_by_filename() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
-        let dir = std::env::temp_dir()
-            .join(format!("cratonvm_jimage_auto_{}", std::process::id()));
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
+        let dir = std::env::temp_dir().join(format!("cratonvm_jimage_auto_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("modules");
         fs::write(&path, &data).unwrap();
@@ -4519,9 +4626,7 @@ mod tests {
     /// distinct module in the jimage.
     #[test]
     fn jimage_scan_module_infos_returns_every_module() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
         let path = jimage_temp_path("scan_module_infos");
         fs::write(&path, &data).unwrap();
 
@@ -4547,9 +4652,7 @@ mod tests {
     /// reflect every `.class` entry in the image (module-infos count).
     #[test]
     fn jimage_class_count_matches_resources() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
         let path = jimage_temp_path("class_count");
         fs::write(&path, &data).unwrap();
 
@@ -4560,7 +4663,10 @@ mod tests {
         // because they're scoped per-module, not global).
         assert_eq!(cp.jimage_class_count(), 3);
         let modules = cp.list_jimage_modules();
-        assert_eq!(modules, vec!["java.base".to_string(), "java.desktop".to_string()]);
+        assert_eq!(
+            modules,
+            vec!["java.base".to_string(), "java.desktop".to_string()]
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -4568,9 +4674,7 @@ mod tests {
     /// `list_class_names` should include every class in the jimage.
     #[test]
     fn jimage_list_class_names_includes_every_entry() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
         let path = jimage_temp_path("list_class_names");
         fs::write(&path, &data).unwrap();
 
@@ -4596,9 +4700,7 @@ mod tests {
     /// ClassNotFound and not leak a panic.
     #[test]
     fn jimage_missing_class_returns_clean_error() {
-        let data = cratonvm_reader::jimage::test_builder::build_simple(
-            &sample_jimage_resources(),
-        );
+        let data = cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
         let path = jimage_temp_path("missing");
         fs::write(&path, &data).unwrap();
 
@@ -4662,21 +4764,56 @@ Specification-Title: Keycloak Common\n\
 Specification-Version: 26.2\n\
 Specification-Vendor: Keycloak\n";
         let info = ManifestInfo::parse(manifest);
-        assert_eq!(info.attributes.get("Implementation-Title").map(String::as_str), Some("keycloak-common"));
-        assert_eq!(info.attributes.get("Implementation-Version").map(String::as_str), Some("26.2.4"));
-        assert_eq!(info.attributes.get("Implementation-Vendor").map(String::as_str), Some("Red Hat, Inc."));
-        assert_eq!(info.attributes.get("Specification-Title").map(String::as_str), Some("Keycloak Common"));
-        assert_eq!(info.attributes.get("Specification-Version").map(String::as_str), Some("26.2"));
-        assert_eq!(info.attributes.get("Specification-Vendor").map(String::as_str), Some("Keycloak"));
+        assert_eq!(
+            info.attributes
+                .get("Implementation-Title")
+                .map(String::as_str),
+            Some("keycloak-common")
+        );
+        assert_eq!(
+            info.attributes
+                .get("Implementation-Version")
+                .map(String::as_str),
+            Some("26.2.4")
+        );
+        assert_eq!(
+            info.attributes
+                .get("Implementation-Vendor")
+                .map(String::as_str),
+            Some("Red Hat, Inc.")
+        );
+        assert_eq!(
+            info.attributes
+                .get("Specification-Title")
+                .map(String::as_str),
+            Some("Keycloak Common")
+        );
+        assert_eq!(
+            info.attributes
+                .get("Specification-Version")
+                .map(String::as_str),
+            Some("26.2")
+        );
+        assert_eq!(
+            info.attributes
+                .get("Specification-Vendor")
+                .map(String::as_str),
+            Some("Keycloak")
+        );
     }
 
     #[test]
     fn t19_h10_manifest_attributes_returns_none_for_missing() {
         let manifest = b"Manifest-Version: 1.0\nMain-Class: foo.Bar\n";
         let info = ManifestInfo::parse(manifest);
-        assert!(info.attributes.get("Implementation-Version").is_none(),
-            "absent attribute must yield None");
-        assert_eq!(info.attributes.get("Manifest-Version").map(String::as_str), Some("1.0"));
+        assert!(
+            info.attributes.get("Implementation-Version").is_none(),
+            "absent attribute must yield None"
+        );
+        assert_eq!(
+            info.attributes.get("Manifest-Version").map(String::as_str),
+            Some("1.0")
+        );
     }
 
     #[test]
@@ -4689,10 +4826,17 @@ Implementation-Version: 1.0\n\
 Name: foo/Bar.class\n\
 Implementation-Version: 999.999\n";
         let info = ManifestInfo::parse(manifest);
-        assert_eq!(info.attributes.get("Implementation-Version").map(String::as_str), Some("1.0"),
-            "main-section attribute wins; per-entry section is ignored");
-        assert!(info.attributes.get("Name").is_none(),
-            "per-entry `Name` header must not leak into main attributes");
+        assert_eq!(
+            info.attributes
+                .get("Implementation-Version")
+                .map(String::as_str),
+            Some("1.0"),
+            "main-section attribute wins; per-entry section is ignored"
+        );
+        assert!(
+            info.attributes.get("Name").is_none(),
+            "per-entry `Name` header must not leak into main attributes"
+        );
     }
 
     #[test]
@@ -4703,10 +4847,15 @@ Implementation-Version: 999.999\n";
         let big = "X".repeat(16 * 1024);
         let raw = format!("Manifest-Version: 1.0\nFoo: {big}\nBar: ok\n");
         let info = ManifestInfo::parse(raw.as_bytes());
-        assert!(info.attributes.get("Foo").is_none(),
-            "oversized value must be dropped");
-        assert_eq!(info.attributes.get("Bar").map(String::as_str), Some("ok"),
-            "subsequent attributes must still be captured");
+        assert!(
+            info.attributes.get("Foo").is_none(),
+            "oversized value must be dropped"
+        );
+        assert_eq!(
+            info.attributes.get("Bar").map(String::as_str),
+            Some("ok"),
+            "subsequent attributes must still be captured"
+        );
     }
 
     // ── Classpath wildcard expansion (Elasticsearch / Cassandra parity) ──
@@ -4919,9 +5068,8 @@ Implementation-Version: 999.999\n";
             20,
             "every explicitly-listed jar must register as a classpath entry"
         );
-        let urls = cp.find_all_resource_urls(
-            "META-INF/services/org.elasticsearch.cli.CliToolProvider",
-        );
+        let urls =
+            cp.find_all_resource_urls("META-INF/services/org.elasticsearch.cli.CliToolProvider");
         assert_eq!(
             urls.len(),
             1,
@@ -5115,7 +5263,11 @@ Implementation-Version: 999.999\n";
         let data = b"Class-Path: ../../shared/b.jar\n";
         let info = ManifestInfo::parse(data);
         let cp = info.resolve_class_path(Path::new("C:/tmp/boot/booter.jar"));
-        assert_eq!(cp.len(), 1, "default policy must keep escaping entries: {cp:?}");
+        assert_eq!(
+            cp.len(),
+            1,
+            "default policy must keep escaping entries: {cp:?}"
+        );
         assert!(cp[0].replace('\\', "/").contains("../../shared/b.jar"));
     }
 }

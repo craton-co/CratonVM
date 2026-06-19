@@ -52,8 +52,8 @@ fn real_forkjoinpool_enabled() -> bool {
 
 use rustc_hash::FxHashMap;
 
-use cratonvm_types::ClassId;
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -147,8 +147,20 @@ fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64)
     // re-seeded copy of the first.
     const ALT_PRIME: u64 = 0x880355f21e6d1965;
     (
-        fmix64(hash_pass(class, method, descriptor, 0xcbf29ce484222325, FNV_PRIME)),
-        fmix64(hash_pass(class, method, descriptor, 0x9e3779b97f4a7c15, ALT_PRIME)),
+        fmix64(hash_pass(
+            class,
+            method,
+            descriptor,
+            0xcbf29ce484222325,
+            FNV_PRIME,
+        )),
+        fmix64(hash_pass(
+            class,
+            method,
+            descriptor,
+            0x9e3779b97f4a7c15,
+            ALT_PRIME,
+        )),
     )
 }
 
@@ -553,7 +565,11 @@ pub trait NativeContext {
     /// request is too large for the heap so a native (e.g. `StringBuilder(int)`)
     /// can raise a catchable `OutOfMemoryError` instead of aborting. Default
     /// delegates to the infallible `new_array`.
-    fn try_new_array(&mut self, element_type: ArrayElementType, length: usize) -> Option<ObjectRef> {
+    fn try_new_array(
+        &mut self,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
         Some(self.new_array(element_type, length))
     }
 
@@ -615,7 +631,10 @@ pub trait NativeContext {
         // while the function reported `true` to the caller. Guard the entry
         // with the same bounds check the VM override performs.
         let dst_len = self.array_length(arr);
-        if dst_off.checked_add(src.len()).map_or(true, |end| end > dst_len) {
+        if dst_off
+            .checked_add(src.len())
+            .map_or(true, |end| end > dst_len)
+        {
             return false;
         }
         for (i, b) in src.iter().enumerate() {
@@ -684,7 +703,10 @@ pub trait NativeContext {
         // CRIT fix: bounds-check the destination before any writes so we
         // never silently overflow past the array end while reporting `true`.
         let dst_len = self.array_length(arr);
-        if dst_off.checked_add(src.len()).map_or(true, |end| end > dst_len) {
+        if dst_off
+            .checked_add(src.len())
+            .map_or(true, |end| end > dst_len)
+        {
             return false;
         }
         for (i, c) in src.iter().enumerate() {
@@ -1068,11 +1090,7 @@ pub trait NativeContext {
     /// Returns `true` if the thread id was found and the mirror was
     /// stored, `false` if the id was unknown. Default impl is a
     /// no-op so mock contexts don't need to model a heap.
-    fn set_native_thread_java_obj(
-        &mut self,
-        _thread_id: u64,
-        _java_thread_obj: ObjectRef,
-    ) -> bool {
+    fn set_native_thread_java_obj(&mut self, _thread_id: u64, _java_thread_obj: ObjectRef) -> bool {
         false
     }
 
@@ -1747,7 +1765,10 @@ pub trait NativeContext {
     fn free_native_memory(&mut self, alloc_id: i64);
 
     /// Load a native library. Returns library index or error.
-    fn load_native_library(&mut self, path: &str) -> Result<i64, cratonvm_types::error::MethodCallFailed>;
+    fn load_native_library(
+        &mut self,
+        path: &str,
+    ) -> Result<i64, cratonvm_types::error::MethodCallFailed>;
 
     /// Find a symbol in a loaded library. Returns the symbol address.
     /// lib_index -1 means search the default/system library.
@@ -1904,11 +1925,7 @@ pub trait NativeContext {
     /// Parses the class bytes, registers the class with the ClassManager under
     /// the application loader, and returns the ClassId of the newly defined class.
     /// Returns `None` if parsing fails.
-    fn define_class_from_bytes(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-    ) -> Option<ClassId>;
+    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId>;
 
     /// NEW-8: Define a hidden class (JEP 371 / JEP 429) from raw bytecode.
     ///
@@ -1991,11 +2008,7 @@ pub trait NativeContext {
     /// returns `Err("class not loaded")`. On success, the JIT cache
     /// for the old class is invalidated and any new method lookups
     /// resolve through the new bytecode.
-    fn redefine_class(
-        &mut self,
-        class_id: ClassId,
-        new_bytes: &[u8],
-    ) -> Result<(), String> {
+    fn redefine_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
         let _ = (class_id, new_bytes);
         Err("redefine_class not implemented".to_string())
     }
@@ -2007,11 +2020,7 @@ pub trait NativeContext {
     /// a second retransform of the same class — e.g. `mockStatic(X)` then
     /// `mock(X)` — double-instruments it. The default delegates to
     /// `redefine_class` (correct for impls that don't cache original bytes).
-    fn retransform_class(
-        &mut self,
-        class_id: ClassId,
-        new_bytes: &[u8],
-    ) -> Result<(), String> {
+    fn retransform_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
         self.redefine_class(class_id, new_bytes)
     }
 
@@ -2555,9 +2564,7 @@ impl NativeMethodRegistry {
         // the call falls through to real bytecode or a clear error instead of a
         // fake. Bridges and intrinsics are always registered. (See the
         // `drop_synthetic_stubs` field doc.)
-        if self.drop_synthetic_stubs
-            && self.current_category == NativeKind::SyntheticStub
-        {
+        if self.drop_synthetic_stubs && self.current_category == NativeKind::SyntheticStub {
             return;
         }
         // NIO-SERVER-SOCKET (route 1): when `CRATONVM_REAL_NET_SOCKETS` is set,
@@ -2681,11 +2688,8 @@ impl NativeMethodRegistry {
         // to back the deferred native-ring name map without a second copy of
         // the parts (see the `name_index` field doc).
         let reg_index = self.registrations.len();
-        self.registrations.push((
-            class_name.into(),
-            method_name.into(),
-            descriptor.into(),
-        ));
+        self.registrations
+            .push((class_name.into(), method_name.into(), descriptor.into()));
         // Tag this registration with the current category (see `with_category`).
         // `insert` (not `or_insert`) so a deliberate re-registration under a new
         // category — e.g. promoting a fixed stub to `Intrinsic` — takes effect.
@@ -2731,7 +2735,9 @@ impl NativeMethodRegistry {
         // eagerly so a dump that races registration still resolves the name. The
         // cheap index is recorded in both cases so a later `flush_*` is complete.
         // First-write-wins to mirror the prior `register_name`/`or_insert_with`.
-        self.name_index.entry(callback as usize).or_insert(reg_index);
+        self.name_index
+            .entry(callback as usize)
+            .or_insert(reg_index);
         if crate::native_ring::is_enabled() {
             let triple = format!("{class_name}.{method_name}{descriptor}");
             crate::native_ring::register_name(callback as usize, &triple);
@@ -2872,7 +2878,11 @@ impl NativeMethodRegistry {
             }
         }
 
-        for slot in variants.iter().take(n_variants).filter_map(|s| s.as_deref()) {
+        for slot in variants
+            .iter()
+            .take(n_variants)
+            .filter_map(|s| s.as_deref())
+        {
             let k = native_method_hash(class_name, method_name, slot);
             if let Some(cb) = self.methods.get(&k).copied() {
                 return Some(cb);
@@ -3047,12 +3057,28 @@ mod tests {
     #[test]
     fn find_distinguishes_by_class() {
         let mut registry = NativeMethodRegistry::new();
-        registry.register("java/lang/Object", "toString", "()Ljava/lang/String;", dummy_native);
-        registry.register("java/lang/String", "toString", "()Ljava/lang/String;", dummy_native_2);
-        assert!(registry.find("java/lang/Object", "toString", "()Ljava/lang/String;").is_some());
-        assert!(registry.find("java/lang/String", "toString", "()Ljava/lang/String;").is_some());
+        registry.register(
+            "java/lang/Object",
+            "toString",
+            "()Ljava/lang/String;",
+            dummy_native,
+        );
+        registry.register(
+            "java/lang/String",
+            "toString",
+            "()Ljava/lang/String;",
+            dummy_native_2,
+        );
+        assert!(registry
+            .find("java/lang/Object", "toString", "()Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find("java/lang/String", "toString", "()Ljava/lang/String;")
+            .is_some());
         // Different class, same method + descriptor
-        assert!(registry.find("java/lang/Integer", "toString", "()Ljava/lang/String;").is_none());
+        assert!(registry
+            .find("java/lang/Integer", "toString", "()Ljava/lang/String;")
+            .is_none());
     }
 
     #[test]
@@ -3138,10 +3164,16 @@ mod tests {
         registry.register("java/sql/PreparedStatement", "execute", "()Z", dummy_native);
         registry.register("java/sql/PreparedStatement", "close", "()V", dummy_native_2);
         registry.alias_class("java/sql/PreparedStatement", "java/sql/CallableStatement");
-        assert!(registry.find("java/sql/CallableStatement", "execute", "()Z").is_some());
-        assert!(registry.find("java/sql/CallableStatement", "close", "()V").is_some());
+        assert!(registry
+            .find("java/sql/CallableStatement", "execute", "()Z")
+            .is_some());
+        assert!(registry
+            .find("java/sql/CallableStatement", "close", "()V")
+            .is_some());
         // Original registrations still present.
-        assert!(registry.find("java/sql/PreparedStatement", "execute", "()Z").is_some());
+        assert!(registry
+            .find("java/sql/PreparedStatement", "execute", "()Z")
+            .is_some());
     }
 
     #[test]
@@ -3196,7 +3228,10 @@ mod tests {
             type_descriptor: "Ljava/lang/Override;".to_string(),
             elements: vec![
                 ("value".to_string(), AnnotationElementValue::Int(42)),
-                ("name".to_string(), AnnotationElementValue::StringVal("test".to_string())),
+                (
+                    "name".to_string(),
+                    AnnotationElementValue::StringVal("test".to_string()),
+                ),
             ],
         };
         let cloned = ann.clone();

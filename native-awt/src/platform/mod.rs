@@ -8,17 +8,17 @@
 
 pub mod backend;
 
+#[cfg(target_os = "macos")]
+pub mod cocoa;
 #[cfg(target_os = "windows")]
 pub mod win32;
 #[cfg(target_os = "linux")]
 pub mod x11;
-#[cfg(target_os = "macos")]
-pub mod cocoa;
 
 // Re-export the platform-specific backend as `DefaultBackend`.
+#[cfg(target_os = "macos")]
+pub use cocoa::CocoaBackend as DefaultBackend;
 #[cfg(target_os = "windows")]
 pub use win32::Win32Backend as DefaultBackend;
 #[cfg(target_os = "linux")]
 pub use x11::X11Backend as DefaultBackend;
-#[cfg(target_os = "macos")]
-pub use cocoa::CocoaBackend as DefaultBackend;

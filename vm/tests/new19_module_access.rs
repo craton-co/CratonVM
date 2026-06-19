@@ -235,8 +235,7 @@ fn new19_direct_classpath_only_mode_allows_everything() {
     let vm = test_vm();
     {
         let mut cm = vm.shared.class_manager.write();
-        cm.load_class("cratonvm/ModuleTarget")
-            .expect("must load");
+        cm.load_class("cratonvm/ModuleTarget").expect("must load");
     }
     let cm = vm.shared.class_manager.read();
     assert!(cm.module_registry.is_empty());

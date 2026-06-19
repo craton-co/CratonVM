@@ -73,25 +73,24 @@ pub fn create_jvmti_env() -> JvmtiEnv {
 
 /// Notify agents that the VM has initialized.
 pub fn notify_vm_init(env: &JvmtiEnv, thread_id: u64) {
-    env.event_manager.fire_event(
-        JvmtiEvent::VMInit,
-        &EventData::VMInit { thread_id },
-    );
+    env.event_manager
+        .fire_event(JvmtiEvent::VMInit, &EventData::VMInit { thread_id });
 }
 
 /// Notify agents that the VM is shutting down.
 pub fn notify_vm_death(env: &JvmtiEnv) {
-    env.event_manager.fire_event(
-        JvmtiEvent::VMDeath,
-        &EventData::VMDeath,
-    );
+    env.event_manager
+        .fire_event(JvmtiEvent::VMDeath, &EventData::VMDeath);
 }
 
 /// Notify agents that a thread has started.
 pub fn notify_thread_start(env: &JvmtiEnv, thread_id: u64, name: &str) {
     env.event_manager.fire_event(
         JvmtiEvent::ThreadStart,
-        &EventData::ThreadStart { thread_id, name: name.to_string() },
+        &EventData::ThreadStart {
+            thread_id,
+            name: name.to_string(),
+        },
     );
 }
 
@@ -99,15 +98,29 @@ pub fn notify_thread_start(env: &JvmtiEnv, thread_id: u64, name: &str) {
 pub fn notify_class_prepare(env: &JvmtiEnv, class_id: u64, name: &str) {
     env.event_manager.fire_event(
         JvmtiEvent::ClassPrepare,
-        &EventData::ClassPrepare { class_id, name: name.to_string() },
+        &EventData::ClassPrepare {
+            class_id,
+            name: name.to_string(),
+        },
     );
 }
 
 /// Notify agents that a breakpoint has been hit.
-pub fn notify_breakpoint(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_id: u64, location: u64) {
+pub fn notify_breakpoint(
+    env: &JvmtiEnv,
+    thread_id: u64,
+    class_id: u64,
+    method_id: u64,
+    location: u64,
+) {
     env.event_manager.fire_event(
         JvmtiEvent::Breakpoint,
-        &EventData::Breakpoint { thread_id, class_id, method_id, location },
+        &EventData::Breakpoint {
+            thread_id,
+            class_id,
+            method_id,
+            location,
+        },
     );
 }
 
@@ -115,7 +128,11 @@ pub fn notify_breakpoint(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_i
 pub fn notify_method_entry(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_id: u64) {
     env.event_manager.fire_event(
         JvmtiEvent::MethodEntry,
-        &EventData::MethodEntry { thread_id, class_id, method_id },
+        &EventData::MethodEntry {
+            thread_id,
+            class_id,
+            method_id,
+        },
     );
 }
 
@@ -137,34 +154,56 @@ pub fn notify_gc_finish(env: &JvmtiEnv) {
 
 /// Notify agents that a thread has ended.
 pub fn notify_thread_end(env: &JvmtiEnv, thread_id: u64) {
-    env.event_manager.fire_event(
-        JvmtiEvent::ThreadEnd,
-        &EventData::ThreadEnd { thread_id },
-    );
+    env.event_manager
+        .fire_event(JvmtiEvent::ThreadEnd, &EventData::ThreadEnd { thread_id });
 }
 
 /// Notify agents that a class has been loaded.
 pub fn notify_class_load(env: &JvmtiEnv, class_id: u64, name: &str) {
     env.event_manager.fire_event(
         JvmtiEvent::ClassLoad,
-        &EventData::ClassLoad { class_id, name: name.to_string() },
+        &EventData::ClassLoad {
+            class_id,
+            name: name.to_string(),
+        },
     );
 }
 
 /// Notify agents that a method has been exited.
-pub fn notify_method_exit(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_id: u64, return_value: Option<i64>) {
+pub fn notify_method_exit(
+    env: &JvmtiEnv,
+    thread_id: u64,
+    class_id: u64,
+    method_id: u64,
+    return_value: Option<i64>,
+) {
     env.event_manager.fire_event(
         JvmtiEvent::MethodExit,
-        &EventData::MethodExit { thread_id, class_id, method_id, return_value },
+        &EventData::MethodExit {
+            thread_id,
+            class_id,
+            method_id,
+            return_value,
+        },
     );
 }
 
 /// Notify agents that an exception was thrown.
-pub fn notify_exception(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_id: u64, location: u64, exception_class: &str) {
+pub fn notify_exception(
+    env: &JvmtiEnv,
+    thread_id: u64,
+    class_id: u64,
+    method_id: u64,
+    location: u64,
+    exception_class: &str,
+) {
     env.event_manager.fire_event(
         JvmtiEvent::Exception,
         &EventData::Exception {
-            thread_id, class_id, method_id, location,
+            thread_id,
+            class_id,
+            method_id,
+            location,
             exception_class: exception_class.to_string(),
         },
     );
@@ -174,7 +213,11 @@ pub fn notify_exception(env: &JvmtiEnv, thread_id: u64, class_id: u64, method_id
 pub fn notify_monitor_wait(env: &JvmtiEnv, thread_id: u64, object_id: u64, timeout: i64) {
     env.event_manager.fire_event(
         JvmtiEvent::MonitorWait,
-        &EventData::MonitorWait { thread_id, object_id, timeout },
+        &EventData::MonitorWait {
+            thread_id,
+            object_id,
+            timeout,
+        },
     );
 }
 
@@ -182,16 +225,17 @@ pub fn notify_monitor_wait(env: &JvmtiEnv, thread_id: u64, object_id: u64, timeo
 pub fn notify_monitor_contended_enter(env: &JvmtiEnv, thread_id: u64, object_id: u64) {
     env.event_manager.fire_event(
         JvmtiEvent::MonitorContendedEnter,
-        &EventData::MonitorContendedEnter { thread_id, object_id },
+        &EventData::MonitorContendedEnter {
+            thread_id,
+            object_id,
+        },
     );
 }
 
 /// Notify agents that a tagged object has been freed.
 pub fn notify_object_free(env: &JvmtiEnv, tag: i64) {
-    env.event_manager.fire_event(
-        JvmtiEvent::ObjectFree,
-        &EventData::ObjectFree { tag },
-    );
+    env.event_manager
+        .fire_event(JvmtiEvent::ObjectFree, &EventData::ObjectFree { tag });
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +250,9 @@ pub struct ObjectTagMap {
 
 impl ObjectTagMap {
     pub fn new() -> Self {
-        Self { tags: RwLock::new(HashMap::new()) }
+        Self {
+            tags: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Set a tag on an object. Tag of 0 removes the tag.
@@ -221,7 +267,12 @@ impl ObjectTagMap {
 
     /// Get the tag for an object. Returns 0 if not tagged.
     pub fn get_tag(&self, obj_addr: usize) -> i64 {
-        self.tags.read().unwrap().get(&obj_addr).copied().unwrap_or(0)
+        self.tags
+            .read()
+            .unwrap()
+            .get(&obj_addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Remove all tags for objects not in the provided live set.
@@ -258,7 +309,12 @@ impl ObjectTagMap {
 
     /// Snapshot of all tags (for iteration).
     pub fn snapshot(&self) -> Vec<(usize, i64)> {
-        self.tags.read().unwrap().iter().map(|(&a, &t)| (a, t)).collect()
+        self.tags
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&a, &t)| (a, t))
+            .collect()
     }
 }
 
@@ -358,7 +414,9 @@ pub fn get_class_methods(
     class_manager: &dyn ClassMethodProvider,
     class_id: u32,
 ) -> Result<Vec<JvmtiMethodInfo>, JvmtiError> {
-    class_manager.get_methods(class_id).ok_or(JvmtiError::NotAvailable)
+    class_manager
+        .get_methods(class_id)
+        .ok_or(JvmtiError::NotAvailable)
 }
 
 /// Trait abstracting class method lookup (for testability).
@@ -400,7 +458,14 @@ pub fn set_local_variable(
 /// Trait abstracting local variable access (for testability).
 pub trait LocalVariableProvider {
     fn get_local(&self, thread_id: u64, frame_depth: usize, slot: usize) -> Option<i64>;
-    fn set_local(&mut self, thread_id: u64, frame_depth: usize, slot: usize, value: i64, type_tag: u8) -> Option<()>;
+    fn set_local(
+        &mut self,
+        thread_id: u64,
+        frame_depth: usize,
+        slot: usize,
+        value: i64,
+        type_tag: u8,
+    ) -> Option<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,16 +482,21 @@ impl<'a> ClassMethodProvider for VmClassMethodProvider<'a> {
     fn get_methods(&self, class_id: u32) -> Option<Vec<JvmtiMethodInfo>> {
         let cm = self.class_manager.read();
         let class = cm.get_class(crate::classloading::ClassId::new(class_id))?;
-        let methods = class.methods.iter().enumerate().map(|(idx, m)| {
-            // Generate stable method_id from class_id + method index
-            let method_id = ((class_id as u64) << 32) | (idx as u64);
-            JvmtiMethodInfo {
-                method_id,
-                name: m.name.to_string(),
-                descriptor: m.descriptor.to_string(),
-                access_flags: m.access_flags.bits(),
-            }
-        }).collect();
+        let methods = class
+            .methods
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| {
+                // Generate stable method_id from class_id + method index
+                let method_id = ((class_id as u64) << 32) | (idx as u64);
+                JvmtiMethodInfo {
+                    method_id,
+                    name: m.name.to_string(),
+                    descriptor: m.descriptor.to_string(),
+                    access_flags: m.access_flags.bits(),
+                }
+            })
+            .collect();
         Some(methods)
     }
 }
@@ -466,7 +536,14 @@ impl<'a> LocalVariableProvider for VmLocalVariableProvider<'a> {
         })
     }
 
-    fn set_local(&mut self, thread_id: u64, frame_depth: usize, slot: usize, value: i64, type_tag: u8) -> Option<()> {
+    fn set_local(
+        &mut self,
+        thread_id: u64,
+        frame_depth: usize,
+        slot: usize,
+        value: i64,
+        type_tag: u8,
+    ) -> Option<()> {
         if thread_id != self.thread_id {
             return None;
         }
@@ -522,7 +599,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::VMInit, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::VMInit, true);
 
         notify_vm_init(&env, 1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -547,7 +625,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::ThreadStart, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::ThreadStart, true);
 
         notify_thread_start(&env, 5, "worker-1");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -559,7 +638,9 @@ mod tests {
         let mut env = create_jvmti_env();
 
         // Load an agent.
-        env.agent_registry.load_agent("myagent.so", "debug=true").unwrap();
+        env.agent_registry
+            .load_agent("myagent.so", "debug=true")
+            .unwrap();
         assert_eq!(env.agent_registry.agents().len(), 1);
 
         // Request capabilities.
@@ -567,7 +648,9 @@ mod tests {
         req.can_generate_breakpoint_events = true;
         req.can_generate_garbage_collection_events = true;
         env.capabilities.add_capabilities(&req).unwrap();
-        assert!(env.capabilities.has_capability("can_generate_breakpoint_events"));
+        assert!(env
+            .capabilities
+            .has_capability("can_generate_breakpoint_events"));
 
         // Enable events and fire.
         let counter = Arc::new(AtomicU32::new(0));
@@ -575,7 +658,8 @@ mod tests {
         env.event_manager.callbacks.on_breakpoint = Some(Box::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::Breakpoint, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::Breakpoint, true);
 
         notify_breakpoint(&env, 1, 10, 3, 42);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -655,7 +739,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::ThreadEnd, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::ThreadEnd, true);
         notify_thread_end(&env, 7);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -672,7 +757,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::ClassLoad, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::ClassLoad, true);
         notify_class_load(&env, 42, "java/lang/String");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -688,7 +774,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::MethodExit, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::MethodExit, true);
         notify_method_exit(&env, 1, 10, 5, Some(99));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -699,12 +786,16 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         env.event_manager.callbacks.on_exception = Some(Box::new(move |data| {
-            if let EventData::Exception { exception_class, .. } = data {
+            if let EventData::Exception {
+                exception_class, ..
+            } = data
+            {
                 assert_eq!(exception_class, "java/lang/NullPointerException");
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::Exception, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::Exception, true);
         notify_exception(&env, 1, 10, 5, 42, "java/lang/NullPointerException");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -720,7 +811,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::MonitorWait, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::MonitorWait, true);
         notify_monitor_wait(&env, 1, 100, 5000);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -736,7 +828,8 @@ mod tests {
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::ObjectFree, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::ObjectFree, true);
         notify_object_free(&env, 77);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -792,9 +885,20 @@ mod tests {
         struct MockLocals;
         impl LocalVariableProvider for MockLocals {
             fn get_local(&self, _thread_id: u64, _frame_depth: usize, slot: usize) -> Option<i64> {
-                if slot == 0 { Some(42) } else { None }
+                if slot == 0 {
+                    Some(42)
+                } else {
+                    None
+                }
             }
-            fn set_local(&mut self, _thread_id: u64, _frame_depth: usize, _slot: usize, _value: i64, _type_tag: u8) -> Option<()> {
+            fn set_local(
+                &mut self,
+                _thread_id: u64,
+                _frame_depth: usize,
+                _slot: usize,
+                _value: i64,
+                _type_tag: u8,
+            ) -> Option<()> {
                 Some(())
             }
         }
@@ -805,9 +909,9 @@ mod tests {
 
     #[test]
     fn test_vm_local_variable_provider() {
-        use crate::threading::jvm_thread::JvmThread;
-        use crate::runtime::frame::Frame;
         use crate::classloading::ClassId;
+        use crate::runtime::frame::Frame;
+        use crate::threading::jvm_thread::JvmThread;
 
         let mut thread = JvmThread::new(crate::threading::jvm_thread::ThreadId(1), "test");
         let frame = Frame::new(
@@ -818,8 +922,8 @@ mod tests {
             None,
             vec![],
             vec![],
-            4,  // max_stack
-            4,  // max_locals
+            4, // max_stack
+            4, // max_locals
             &[crate::types::Value::Int(42), crate::types::Value::Long(100)],
         );
         thread.frames.push(frame);
@@ -841,9 +945,9 @@ mod tests {
 
     #[test]
     fn test_vm_local_variable_provider_set() {
-        use crate::threading::jvm_thread::JvmThread;
-        use crate::runtime::frame::Frame;
         use crate::classloading::ClassId;
+        use crate::runtime::frame::Frame;
+        use crate::threading::jvm_thread::JvmThread;
 
         let mut thread = JvmThread::new(crate::threading::jvm_thread::ThreadId(1), "test");
         let frame = Frame::new(
@@ -895,13 +999,18 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         env.event_manager.callbacks.on_monitor_contended_enter = Some(Box::new(move |data| {
-            if let EventData::MonitorContendedEnter { thread_id, object_id } = data {
+            if let EventData::MonitorContendedEnter {
+                thread_id,
+                object_id,
+            } = data
+            {
                 assert_eq!(*thread_id, 3);
                 assert_eq!(*object_id, 0x5000);
                 c.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        env.event_manager.set_event_notification_mode(JvmtiEvent::MonitorContendedEnter, true);
+        env.event_manager
+            .set_event_notification_mode(JvmtiEvent::MonitorContendedEnter, true);
         notify_monitor_contended_enter(&env, 3, 0x5000);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }

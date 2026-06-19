@@ -52,9 +52,8 @@ fn java_home() -> Option<std::path::PathBuf> {
         }
     }
     // Adoptium 25 default install — matches the worktree environment.
-    let default = std::path::PathBuf::from(
-        "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot",
-    );
+    let default =
+        std::path::PathBuf::from("C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot");
     if default.join("lib").join("modules").exists() {
         return Some(default);
     }

@@ -31,7 +31,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Returns `true` if the point (px, py) lies inside this rectangle.
@@ -90,15 +95,23 @@ impl PartialEq for AffineTransform {
 impl AffineTransform {
     pub fn identity() -> Self {
         Self {
-            m00: 1.0, m01: 0.0, m02: 0.0,
-            m10: 0.0, m11: 1.0, m12: 0.0,
+            m00: 1.0,
+            m01: 0.0,
+            m02: 0.0,
+            m10: 0.0,
+            m11: 1.0,
+            m12: 0.0,
         }
     }
 
     pub fn translate(dx: f64, dy: f64) -> Self {
         Self {
-            m00: 1.0, m01: 0.0, m02: dx,
-            m10: 0.0, m11: 1.0, m12: dy,
+            m00: 1.0,
+            m01: 0.0,
+            m02: dx,
+            m10: 0.0,
+            m11: 1.0,
+            m12: dy,
         }
     }
 
@@ -106,15 +119,23 @@ impl AffineTransform {
         let c = theta.cos();
         let s = theta.sin();
         Self {
-            m00: c, m01: -s, m02: 0.0,
-            m10: s, m11: c,  m12: 0.0,
+            m00: c,
+            m01: -s,
+            m02: 0.0,
+            m10: s,
+            m11: c,
+            m12: 0.0,
         }
     }
 
     pub fn scale(sx: f64, sy: f64) -> Self {
         Self {
-            m00: sx, m01: 0.0, m02: 0.0,
-            m10: 0.0, m11: sy, m12: 0.0,
+            m00: sx,
+            m01: 0.0,
+            m02: 0.0,
+            m10: 0.0,
+            m11: sy,
+            m12: 0.0,
         }
     }
 
@@ -285,9 +306,7 @@ fn composite(src: u32, dst: u32, mode: CompositeMode) -> u32 {
                 return 0;
             }
             let blend_ch = |sc: u8, dc: u8| -> u8 {
-                let val = (sc as u32 * sa * inv_da / 255
-                    + dc as u32 * da * inv_sa / 255)
-                    * 255
+                let val = (sc as u32 * sa * inv_da / 255 + dc as u32 * da * inv_sa / 255) * 255
                     / out_a
                     / 255;
                 val.min(255) as u8
@@ -358,7 +377,9 @@ fn composite_row_src_over_solid(dst: &mut [u32], src_argb: u32) {
     {
         if is_x86_feature_detected!("sse2") {
             // SAFETY: SSE2 confirmed available; helper handles any length.
-            unsafe { composite_row_sse2_solid(dst, src_argb); }
+            unsafe {
+                composite_row_sse2_solid(dst, src_argb);
+            }
             return;
         }
     }
@@ -379,7 +400,9 @@ fn composite_row_src_over(dst: &mut [u32], src: &[u32]) {
         if is_x86_feature_detected!("sse2") {
             // SAFETY: SSE2 confirmed available; lengths checked by debug_assert
             // and the helper itself uses `chunks_exact` + scalar tail.
-            unsafe { composite_row_sse2(dst, src); }
+            unsafe {
+                composite_row_sse2(dst, src);
+            }
             return;
         }
     }
@@ -1031,9 +1054,12 @@ impl SoftwareRenderer {
     /// Draw a parametric arc.  Angles in degrees.
     pub fn draw_arc(
         &mut self,
-        cx: i32, cy: i32,
-        rx: u32, ry: u32,
-        start_angle: f32, arc_angle: f32,
+        cx: i32,
+        cy: i32,
+        rx: u32,
+        ry: u32,
+        start_angle: f32,
+        arc_angle: f32,
     ) {
         let steps = self.arc_steps(rx, ry, arc_angle);
         let start_rad = (start_angle as f64) * PI / 180.0;
@@ -1084,9 +1110,12 @@ impl SoftwareRenderer {
     /// Fill a pie-shaped arc.  Angles in degrees.
     pub fn fill_arc(
         &mut self,
-        cx: i32, cy: i32,
-        rx: u32, ry: u32,
-        start_angle: f32, arc_angle: f32,
+        cx: i32,
+        cy: i32,
+        rx: u32,
+        ry: u32,
+        start_angle: f32,
+        arc_angle: f32,
     ) {
         // Build polygon: center -> arc points -> center
         let steps = self.arc_steps(rx, ry, arc_angle);
@@ -1359,8 +1388,13 @@ impl SoftwareRenderer {
     /// case (e.g. icon sheets, sprite atlases, double-buffered repaints).
     pub fn blit_image_scaled(
         &mut self,
-        src: &[u32], src_w: u32, src_h: u32,
-        dx: i32, dy: i32, dw: u32, dh: u32,
+        src: &[u32],
+        src_w: u32,
+        src_h: u32,
+        dx: i32,
+        dy: i32,
+        dw: u32,
+        dh: u32,
         kind: InterpolationKind,
     ) {
         if dw == 0 || dh == 0 || src_w == 0 || src_h == 0 {
@@ -1384,9 +1418,7 @@ impl SoftwareRenderer {
                     InterpolationKind::Bilinear => {
                         bilinear_sample(src, src_w, src_h, src_xf, src_yf)
                     }
-                    InterpolationKind::Bicubic => {
-                        bicubic_sample(src, src_w, src_h, src_xf, src_yf)
-                    }
+                    InterpolationKind::Bicubic => bicubic_sample(src, src_w, src_h, src_xf, src_yf),
                     InterpolationKind::Nearest => {
                         let sx = src_xf.round() as u32;
                         let sy = src_yf.round() as u32;
@@ -1422,10 +1454,8 @@ impl SoftwareRenderer {
         // out-of-source area; to preserve identical behavior we keep that path
         // available, but the fast path is only used when the *entire* source
         // rect is in-bounds (the common case).
-        let full_src_in_bounds = src_x0 == x
-            && src_y0 == y
-            && src_x1 == x + w as i32
-            && src_y1 == y + h as i32;
+        let full_src_in_bounds =
+            src_x0 == x && src_y0 == y && src_x1 == x + w as i32 && src_y1 == y + h as i32;
 
         if full_src_in_bounds {
             // Compute destination rect (matching the source offset).
@@ -1461,8 +1491,7 @@ impl SoftwareRenderer {
             let s_y_end = s_y + copy_h;
             let d_x_end = d_x + copy_w;
             let d_y_end = d_y + copy_h;
-            let non_overlap = s_x_end <= d_x || d_x_end <= s_x
-                || s_y_end <= d_y || d_y_end <= s_y;
+            let non_overlap = s_x_end <= d_x || d_x_end <= s_x || s_y_end <= d_y || d_y_end <= s_y;
 
             if non_overlap {
                 // True memcpy per row — no aliasing, no temporary buffer.
@@ -1470,7 +1499,8 @@ impl SoftwareRenderer {
                 for r in 0..copy_h {
                     let src_start = (s_y + r) * stride + s_x;
                     let dst_start = (d_y + r) * stride + d_x;
-                    self.pixels.copy_within(src_start..src_start + copy_w, dst_start);
+                    self.pixels
+                        .copy_within(src_start..src_start + copy_w, dst_start);
                 }
                 return;
             }
@@ -1491,7 +1521,8 @@ impl SoftwareRenderer {
             for r in rows_iter {
                 let src_start = (s_y + r) * stride + s_x;
                 let dst_start = (d_y + r) * stride + d_x;
-                self.pixels.copy_within(src_start..src_start + copy_w, dst_start);
+                self.pixels
+                    .copy_within(src_start..src_start + copy_w, dst_start);
             }
             return;
         }
@@ -1511,8 +1542,10 @@ impl SoftwareRenderer {
             for sx in 0..w as i32 {
                 let src_x = x + sx;
                 let src_y = y + sy;
-                if src_x >= 0 && src_y >= 0
-                    && src_x < self.width as i32 && src_y < self.height as i32
+                if src_x >= 0
+                    && src_y >= 0
+                    && src_x < self.width as i32
+                    && src_y < self.height as i32
                 {
                     temp.push(self.pixels[(src_y as u32 * self.width + src_x as u32) as usize]);
                 } else {
@@ -1526,8 +1559,10 @@ impl SoftwareRenderer {
             for sx in 0..w as i32 {
                 let dst_x = x + sx + dx;
                 let dst_y = y + sy + dy;
-                if dst_x >= 0 && dst_y >= 0
-                    && dst_x < self.width as i32 && dst_y < self.height as i32
+                if dst_x >= 0
+                    && dst_y >= 0
+                    && dst_x < self.width as i32
+                    && dst_y < self.height as i32
                 {
                     let idx = (dst_y as u32 * self.width + dst_x as u32) as usize;
                     // Index `temp` in `usize`: `sy * w` can exceed u32 range even
@@ -1768,7 +1803,12 @@ fn bicubic_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
     }
 
     let clamp_u8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-    make_argb(clamp_u8(acc_a), clamp_u8(acc_r), clamp_u8(acc_g), clamp_u8(acc_b))
+    make_argb(
+        clamp_u8(acc_a),
+        clamp_u8(acc_r),
+        clamp_u8(acc_g),
+        clamp_u8(acc_b),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1849,7 +1889,14 @@ mod tests {
         assert!(composed.is_identity());
 
         // Singular matrix
-        let s = AffineTransform { m00: 0.0, m01: 0.0, m02: 0.0, m10: 0.0, m11: 0.0, m12: 0.0 };
+        let s = AffineTransform {
+            m00: 0.0,
+            m01: 0.0,
+            m02: 0.0,
+            m10: 0.0,
+            m11: 0.0,
+            m12: 0.0,
+        };
         assert!(s.invert().is_none());
     }
 
@@ -1966,9 +2013,7 @@ mod tests {
         // L-shaped polygon (concave)
         let mut r = SoftwareRenderer::new(20, 20);
         r.set_color(0xFF_123456);
-        let l_shape = [
-            (2, 2), (10, 2), (10, 10), (6, 10), (6, 6), (2, 6),
-        ];
+        let l_shape = [(2, 2), (10, 2), (10, 10), (6, 10), (6, 6), (2, 6)];
         r.fill_polygon(&l_shape);
         // Inside the L
         assert_ne!(r.pixels()[(4 * 20 + 4) as usize], 0);
@@ -1985,7 +2030,11 @@ mod tests {
         // immediately. (If the clamp regressed, this test would hang the suite.)
         let mut r = SoftwareRenderer::new(16, 16);
         r.set_color(0xFF_FF00FF);
-        let huge = [(i32::MIN, i32::MIN), (i32::MAX, i32::MIN), (i32::MAX, i32::MAX)];
+        let huge = [
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MIN),
+            (i32::MAX, i32::MAX),
+        ];
         r.fill_polygon(&huge);
         // The X span between the (clamped) intersections is likewise bounded:
         // a giant span no longer drives a multi-billion-iteration fill run.
@@ -2097,10 +2146,7 @@ mod tests {
     #[test]
     fn test_blit_image_scaled_bilinear() {
         // 2x2 source: top-left red, top-right green, bottom-left blue, bottom-right white
-        let src = vec![
-            0xFF_FF0000, 0xFF_00FF00,
-            0xFF_0000FF, 0xFF_FFFFFF,
-        ];
+        let src = vec![0xFF_FF0000, 0xFF_00FF00, 0xFF_0000FF, 0xFF_FFFFFF];
         let mut r = SoftwareRenderer::new(10, 10);
         r.blit_image_scaled(&src, 2, 2, 0, 0, 4, 4, InterpolationKind::Bilinear);
 
@@ -2112,7 +2158,7 @@ mod tests {
         let mid = r.pixels()[(1 * 10 + 1) as usize];
         let a = argb_a(mid);
         assert_eq!(a, 255); // fully opaque
-        // The middle should have contributions from all four source pixels
+                            // The middle should have contributions from all four source pixels
     }
 
     #[test]
@@ -2121,10 +2167,7 @@ mod tests {
         // bicubic_sample path (compile-time check via the enum), and
         // (b) produce a fully-opaque blended midpoint when the source
         // is fully opaque (the Catmull-Rom kernel weights sum to ~1).
-        let src = vec![
-            0xFF_FF0000, 0xFF_00FF00,
-            0xFF_0000FF, 0xFF_FFFFFF,
-        ];
+        let src = vec![0xFF_FF0000, 0xFF_00FF00, 0xFF_0000FF, 0xFF_FFFFFF];
         let mut r = SoftwareRenderer::new(10, 10);
         r.blit_image_scaled(&src, 2, 2, 0, 0, 4, 4, InterpolationKind::Bicubic);
         assert_eq!(r.pixels()[0], 0xFF_FF0000);
@@ -2207,11 +2250,17 @@ mod tests {
         // 70000 x 70000 overflows a u32 pixel count. Construction and
         // resize must clamp gracefully rather than panic in the multiply.
         let r = SoftwareRenderer::new(70_000, 70_000);
-        assert_eq!(r.pixels().len(), (r.width() as usize) * (r.height() as usize));
+        assert_eq!(
+            r.pixels().len(),
+            (r.width() as usize) * (r.height() as usize)
+        );
 
         let mut r2 = SoftwareRenderer::new(4, 4);
         r2.resize(0xFFFF_FFFF, 0xFFFF_FFFF);
-        assert_eq!(r2.pixels().len(), (r2.width() as usize) * (r2.height() as usize));
+        assert_eq!(
+            r2.pixels().len(),
+            (r2.width() as usize) * (r2.height() as usize)
+        );
     }
 
     #[test]
@@ -2271,9 +2320,23 @@ mod tests {
         // requested a ~32 GB Vec. Must complete without panic/OOM.
         let mut r = SoftwareRenderer::new(32, 32);
         r.set_color(0xFF_00FF00);
-        r.fill_arc(0, 0, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, 360.0);
+        r.fill_arc(
+            0,
+            0,
+            (i32::MAX / 2) as u32,
+            (i32::MAX / 2) as u32,
+            0.0,
+            360.0,
+        );
         // NaN sweep must also be safe (saturating float cast edge).
-        r.fill_arc(0, 0, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, f32::NAN);
+        r.fill_arc(
+            0,
+            0,
+            (i32::MAX / 2) as u32,
+            (i32::MAX / 2) as u32,
+            0.0,
+            f32::NAN,
+        );
     }
 
     #[test]
@@ -2282,7 +2345,14 @@ mod tests {
         // keeps the loop bounded instead of running ~4e9 iterations.
         let mut r = SoftwareRenderer::new(32, 32);
         r.set_color(0xFF_FF0000);
-        r.draw_arc(16, 16, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, 360.0);
+        r.draw_arc(
+            16,
+            16,
+            (i32::MAX / 2) as u32,
+            (i32::MAX / 2) as u32,
+            0.0,
+            360.0,
+        );
     }
 
     #[test]

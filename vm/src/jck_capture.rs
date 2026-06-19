@@ -88,9 +88,8 @@ impl JckReport {
 
     /// Serialize the report to a pretty-printed JSON string.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
-            format!("{{\"error\": \"serialization failed: {e}\"}}")
-        })
+        serde_json::to_string_pretty(self)
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
     }
 
     /// Write the report to the specified file path as JSON.

@@ -680,9 +680,7 @@ impl CompactAllocator {
         let total_size = CompactHeader::SIZE + num_fields * COMPACT_SLOT_SIZE;
         let aligned = (total_size + 7) & !7; // 8-byte align
 
-        let start = self
-            .offset
-            .fetch_add(aligned, Ordering::Relaxed);
+        let start = self.offset.fetch_add(aligned, Ordering::Relaxed);
         if start + aligned > self.storage.len() {
             // OOM — roll back (best-effort; doesn't handle races perfectly)
             self.offset.fetch_sub(aligned, Ordering::Relaxed);
@@ -696,7 +694,11 @@ impl CompactAllocator {
         unsafe {
             std::ptr::write(ptr as *mut u64, header.raw());
             // Zero field data
-            std::ptr::write_bytes(ptr.add(CompactHeader::SIZE), 0, num_fields * COMPACT_SLOT_SIZE);
+            std::ptr::write_bytes(
+                ptr.add(CompactHeader::SIZE),
+                0,
+                num_fields * COMPACT_SLOT_SIZE,
+            );
         }
 
         self.object_count.fetch_add(1, Ordering::Relaxed);
@@ -1214,7 +1216,10 @@ mod tests {
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 10, &ht, 0x5000);
         assert!(compact.is_array());
-        assert_eq!(compact.element_type(), crate::heap::ArrayElementType::Int as u8);
+        assert_eq!(
+            compact.element_type(),
+            crate::heap::ArrayElementType::Int as u8
+        );
     }
 
     #[test]
@@ -1457,7 +1462,10 @@ mod tests {
 
         let header = alloc.read_header(ptr);
         assert!(header.is_array());
-        assert_eq!(header.element_type(), crate::heap::ArrayElementType::Int as u8);
+        assert_eq!(
+            header.element_type(),
+            crate::heap::ArrayElementType::Int as u8
+        );
 
         let length = alloc.read_array_length(ptr);
         assert_eq!(length, 5);
@@ -1528,7 +1536,9 @@ mod tests {
     fn s54_savings_report_with_objects() {
         let alloc = CompactAllocator::new(1024 * 1024);
         for i in 0..50 {
-            alloc.alloc_object(cratonvm_types::ClassId::new(i), 1).unwrap();
+            alloc
+                .alloc_object(cratonvm_types::ClassId::new(i), 1)
+                .unwrap();
         }
         let report = alloc.savings_report();
         assert_eq!(report.object_count, 50);
@@ -1540,7 +1550,9 @@ mod tests {
     #[test]
     fn s54_savings_report_format() {
         let alloc = CompactAllocator::new(4096);
-        alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
+        alloc
+            .alloc_object(cratonvm_types::ClassId::new(1), 2)
+            .unwrap();
         let report = alloc.savings_report();
         let formatted = report.format();
         assert!(formatted.contains("Compact Object Headers Report"));
@@ -1552,7 +1564,9 @@ mod tests {
     #[test]
     fn s54_savings_report_with_hash_codes() {
         let alloc = CompactAllocator::new(4096);
-        let ptr = alloc.alloc_object(cratonvm_types::ClassId::new(1), 1).unwrap();
+        let ptr = alloc
+            .alloc_object(cratonvm_types::ClassId::new(1), 1)
+            .unwrap();
         alloc.identity_hash_code(ptr as usize);
         let report = alloc.savings_report();
         assert_eq!(report.hash_table_entries, 1);
@@ -1570,7 +1584,10 @@ mod tests {
         assert_eq!(element_byte_size(crate::heap::ArrayElementType::Float), 4);
         assert_eq!(element_byte_size(crate::heap::ArrayElementType::Long), 8);
         assert_eq!(element_byte_size(crate::heap::ArrayElementType::Double), 8);
-        assert_eq!(element_byte_size(crate::heap::ArrayElementType::Reference), 8);
+        assert_eq!(
+            element_byte_size(crate::heap::ArrayElementType::Reference),
+            8
+        );
     }
 
     // -- 54.6: Integration with CompactHeader --
@@ -1672,8 +1689,12 @@ mod tests {
     fn s54_compact_object_layout_size() {
         // Object with 2 fields: 8 (header) + 2*16 (slots) = 40, aligned to 8
         let alloc = CompactAllocator::new(4096);
-        let p1 = alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
-        let p2 = alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
+        let p1 = alloc
+            .alloc_object(cratonvm_types::ClassId::new(1), 2)
+            .unwrap();
+        let p2 = alloc
+            .alloc_object(cratonvm_types::ClassId::new(1), 2)
+            .unwrap();
         let diff = (p2 as usize) - (p1 as usize);
         // 8 + 2*16 = 40, 8-byte aligned
         assert_eq!(diff, 40);
@@ -1683,16 +1704,20 @@ mod tests {
     fn s54_compact_array_layout_size() {
         let alloc = CompactAllocator::new(4096);
         // int[5]: 8 (header) + 8 (length+pad) + 5*4 = 36, aligned to 8 → 40
-        let p1 = alloc.alloc_array(
-            cratonvm_types::ClassId::new(1),
-            crate::heap::ArrayElementType::Int,
-            5,
-        ).unwrap();
-        let p2 = alloc.alloc_array(
-            cratonvm_types::ClassId::new(1),
-            crate::heap::ArrayElementType::Int,
-            5,
-        ).unwrap();
+        let p1 = alloc
+            .alloc_array(
+                cratonvm_types::ClassId::new(1),
+                crate::heap::ArrayElementType::Int,
+                5,
+            )
+            .unwrap();
+        let p2 = alloc
+            .alloc_array(
+                cratonvm_types::ClassId::new(1),
+                crate::heap::ArrayElementType::Int,
+                5,
+            )
+            .unwrap();
         let diff = (p2 as usize) - (p1 as usize);
         // 8 + 8 + ceil(20/8)*8 = 8 + 8 + 24 = 40
         assert_eq!(diff, 40);

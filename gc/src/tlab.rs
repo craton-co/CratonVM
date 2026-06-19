@@ -160,7 +160,9 @@ impl Tlab {
             (raw_end as usize) & 7 == 0,
             "Tlab::new: end pointer must be 8-aligned for tail-filler safety \
              (ptr={:p}, size={}, end={:p})",
-            ptr, size, raw_end
+            ptr,
+            size,
+            raw_end
         );
         // Release-mode safety net: if the caller violates the alignment
         // contract, trim the TLAB by up to 7 bytes so install_tail_filler
@@ -245,7 +247,9 @@ impl Tlab {
     /// the leading null check inside `install_tail_filler`.
     pub fn retire(&mut self) {
         // SAFETY: see method-level note — backing memory valid, single owner.
-        unsafe { self.install_tail_filler(TLAB_FILLER_CLASS_ID); }
+        unsafe {
+            self.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        }
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
@@ -306,11 +310,13 @@ impl Tlab {
         if aligned > cursor_addr {
             let pad = aligned - cursor_addr;
             // SAFETY: cursor..aligned lies within [cursor, end), still owned by this TLAB.
-            unsafe { std::ptr::write_bytes(self.cursor, 0, pad); }
+            unsafe {
+                std::ptr::write_bytes(self.cursor, 0, pad);
+            }
         }
 
         let tail = end_addr - aligned;
-        use crate::heap::{HEADER_SIZE, ArrayElementType, ObjectKind, ObjectHeader};
+        use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
         if tail < HEADER_SIZE {
             // Bug-D fix (2026-06-12): a sub-`HEADER_SIZE` tail cannot hold a
             // walkable `int[]` filler, and ZEROING it (the old behaviour) is
@@ -435,8 +441,7 @@ pub fn max_tlab_size() -> usize {
 /// "synthetic VM" class-id range (the same kind of reserved sentinel as
 /// `AUTOBOX_CLASS_ID`, now `u32::MAX`) so it cannot collide with a
 /// classloader-issued id.
-pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId =
-    cratonvm_types::ClassId::new(0xF111_E700);
+pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0xF111_E700);
 
 /// Bug-D fix (2026-06-12) — synthetic class id stamped into a
 /// **sub-`HEADER_SIZE`** TLAB tail (8/16/24/32 bytes) that is too small to
@@ -453,8 +458,7 @@ pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId =
 /// class id, reads the length, and reclaims the span in O(1) with no
 /// heuristic re-sync. Distinct from `TLAB_FILLER_CLASS_ID` so the two filler
 /// kinds never alias. Sits in the same synthetic high-bit range.
-pub const GAP_FILLER_CLASS_ID: cratonvm_types::ClassId =
-    cratonvm_types::ClassId::new(0xF111_E701);
+pub const GAP_FILLER_CLASS_ID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0xF111_E701);
 
 /// Round-5 #9 / round-7 #9 — class id every TLAB tail filler should use.
 ///
@@ -572,8 +576,7 @@ impl TlabPressureTracker {
             || (alloc_count < FAST_REFILL_ALLOC_COUNT && large_allocs > 0);
 
         // Shrink when: very slow fill OR the TLAB was barely touched.
-        let shrink =
-            elapsed_ms > SLOW_REFILL_THRESHOLD_MS || alloc_count < SLOW_REFILL_ALLOC_COUNT;
+        let shrink = elapsed_ms > SLOW_REFILL_THRESHOLD_MS || alloc_count < SLOW_REFILL_ALLOC_COUNT;
 
         let next = if grow && !shrink {
             current.saturating_mul(2).min(MAX_TLAB_SIZE)
@@ -708,7 +711,7 @@ mod tests {
     fn pressure_tracker_doubles_on_few_large_allocs() {
         let mut t = TlabPressureTracker::new();
         t.begin_refill(64 * 1024); // start at 64 KB
-        // A handful of large allocations → high pressure.
+                                   // A handful of large allocations → high pressure.
         for _ in 0..4 {
             t.record_allocation(512); // > LARGE_ALLOC_THRESHOLD
         }
@@ -869,7 +872,10 @@ mod tests {
             }
         }
         // 256 KB / 24 B = ~10_922 objects with 8-byte alignment.
-        assert!(bumps >= 10_000, "only {bumps} allocations fit in 256 KB TLAB");
+        assert!(
+            bumps >= 10_000,
+            "only {bumps} allocations fit in 256 KB TLAB"
+        );
     }
 
     #[test]
@@ -882,7 +888,10 @@ mod tests {
         t.record_allocation(16);
         std::thread::sleep(std::time::Duration::from_millis(2));
         let next = t.next_refill_size();
-        assert!(next < MAX_TLAB_SIZE, "expected shrink from {MAX_TLAB_SIZE}, got {next}");
+        assert!(
+            next < MAX_TLAB_SIZE,
+            "expected shrink from {MAX_TLAB_SIZE}, got {next}"
+        );
         assert!(next >= MIN_TLAB_SIZE);
     }
 
@@ -932,7 +941,7 @@ mod tests {
 
     #[test]
     fn tlab_filler_consumes_remaining_tail() {
-        use crate::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
         // Use a buffer well above HEADER_SIZE so the filler has room.
         let mut buf = vec![0u8; 4096];
         // Align buffer pointer up to 8.
@@ -978,7 +987,9 @@ mod tests {
         let alloc_size = usable.saturating_sub(8);
         let _ = tlab.alloc(alloc_size, 8).unwrap();
         assert!(tlab.remaining() < crate::heap::HEADER_SIZE);
-        unsafe { tlab.install_tail_filler(TLAB_FILLER_CLASS_ID); }
+        unsafe {
+            tlab.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        }
         assert_eq!(tlab.remaining(), 0);
     }
 
@@ -986,7 +997,9 @@ mod tests {
     fn tlab_filler_noop_on_empty_tlab() {
         let mut tlab = Tlab::empty();
         // Must not panic on null cursor/end.
-        unsafe { tlab.install_tail_filler(TLAB_FILLER_CLASS_ID); }
+        unsafe {
+            tlab.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        }
         assert!(tlab.is_empty());
     }
 

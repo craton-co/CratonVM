@@ -218,7 +218,7 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
                 needs_context: false,
                 num_params: 5,
                 return_type: b'V',
-            guard_class_id: 0,
+                guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
@@ -239,13 +239,9 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
         // the mmap region is executable. The pointer args reference live
         // `FakeArray` storage owned by the caller for the call's duration.
         unsafe {
-            compiled.try_call(&[
-                src,
-                src_pos as i64,
-                dst,
-                dst_pos as i64,
-                len as i64,
-            ]).expect("test JIT call");
+            compiled
+                .try_call(&[src, src_pos as i64, dst, dst_pos as i64, len as i64])
+                .expect("test JIT call");
         }
     }
 }
@@ -267,9 +263,7 @@ fn arraycopy_matcher_registers_only_the_erased_descriptor() {
         cratonvm_jit::try_resolve_intrinsic("java/lang/System", "currentTimeMillis", "()J")
             .is_none()
     );
-    assert!(
-        cratonvm_jit::try_resolve_intrinsic("java/lang/Object", "arraycopy", "()V").is_none()
-    );
+    assert!(cratonvm_jit::try_resolve_intrinsic("java/lang/Object", "arraycopy", "()V").is_none());
 }
 
 #[test]
@@ -409,7 +403,11 @@ fn arraycopy_empty_copy_is_a_noop() {
         "empty copy with valid positions must not deopt"
     );
     for i in 0..4 {
-        assert_eq!(dst.get(i), 0xABCD_0000 + i as u64, "dst[{i}] after empty copy");
+        assert_eq!(
+            dst.get(i),
+            0xABCD_0000 + i as u64,
+            "dst[{i}] after empty copy"
+        );
     }
 }
 

@@ -36,8 +36,11 @@ pub(crate) static ALLOW_THREAD_STOP: AtomicBool = AtomicBool::new(false);
 static THREAD_STOP_REQUESTS: Mutex<Option<std::collections::HashMap<u64, ObjectRef>>> =
     Mutex::new(None);
 
-fn thread_stop_map() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, ObjectRef>>> {
-    THREAD_STOP_REQUESTS.lock().unwrap_or_else(|e| e.into_inner())
+fn thread_stop_map(
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, ObjectRef>>> {
+    THREAD_STOP_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn store_stop_throwable(thread_id: u64, throwable: ObjectRef) {
@@ -54,10 +57,7 @@ pub(crate) fn take_stop_throwable(thread_id: u64) -> Option<ObjectRef> {
 }
 
 /// `Thread.stop0(Object throwable)V` — the HotSpot-internal native.
-fn native_thread_stop0(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_thread_stop0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_STOP.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.stop() is not supported".to_string(),
@@ -73,10 +73,7 @@ fn native_thread_stop0(
 }
 
 /// `Thread.stop()V` — public deprecated wrapper that creates ThreadDeath.
-fn native_thread_stop(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_thread_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_STOP.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.stop() is not supported".to_string(),
@@ -98,17 +95,15 @@ fn native_thread_stop(
 static THREAD_SUSPENDED: Mutex<Option<std::collections::HashMap<u64, AtomicBool>>> =
     Mutex::new(None);
 
-fn suspended_map() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, AtomicBool>>> {
+fn suspended_map(
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, AtomicBool>>> {
     THREAD_SUSPENDED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether deprecated suspend/resume is allowed.  Default: false (JDK 25).
 pub(crate) static ALLOW_THREAD_SUSPEND: AtomicBool = AtomicBool::new(false);
 
-fn native_thread_suspend0(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_thread_suspend0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_SUSPEND.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.suspend() is not supported".to_string(),
@@ -125,10 +120,7 @@ fn native_thread_suspend0(
     Ok(None)
 }
 
-fn native_thread_resume0(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_thread_resume0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_SUSPEND.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.resume() is not supported".to_string(),
@@ -152,10 +144,7 @@ fn native_thread_resume0(
 // T8.1.3 — Thread.destroy()
 // ---------------------------------------------------------------------------
 
-fn native_thread_destroy(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_thread_destroy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Err(MethodCallFailed::InternalError(VmError::Linkage(
         LinkageError::NoSuchMethodError {
             class_name: "java/lang/Thread".to_string(),
@@ -252,7 +241,9 @@ impl FinalizationTracker {
 static FINALIZATION_TRACKER: Mutex<Option<FinalizationTracker>> = Mutex::new(None);
 
 fn finalization_tracker() -> std::sync::MutexGuard<'static, Option<FinalizationTracker>> {
-    FINALIZATION_TRACKER.lock().unwrap_or_else(|e| e.into_inner())
+    FINALIZATION_TRACKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Ensure the global tracker exists and return a lock guard.
@@ -266,10 +257,7 @@ fn with_tracker<R>(f: impl FnOnce(&mut FinalizationTracker) -> R) -> R {
 // T8.1.6 — Runtime.runFinalization() / System.runFinalization()
 // ---------------------------------------------------------------------------
 
-fn native_run_finalization(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_run_finalization(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     with_tracker(|tracker| {
         tracker.run_pending();
     });
@@ -283,10 +271,7 @@ fn native_run_finalization(
 /// Global flag: if true, finalizers run on VM exit.
 pub(crate) static RUN_FINALIZERS_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
-fn native_run_finalizers_on_exit(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_run_finalizers_on_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let flag = match args.first() {
         Some(Value::Int(i)) => *i != 0,
         _ => false,
@@ -340,18 +325,12 @@ fn native_compiler_compile_classes(
     Ok(Some(Value::Int(0)))
 }
 
-fn native_compiler_command(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_compiler_command(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Returns null — the command is a no-op.
     Ok(Some(Value::Object(None)))
 }
 
-fn native_compiler_noop(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_compiler_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
@@ -365,7 +344,12 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
     let thread = "java/lang/Thread";
 
     // T8.1.1 — Thread.stop
-    r.register(thread, "stop0", "(Ljava/lang/Object;)V", native_thread_stop0);
+    r.register(
+        thread,
+        "stop0",
+        "(Ljava/lang/Object;)V",
+        native_thread_stop0,
+    );
     r.register(thread, "stop", "()V", native_thread_stop);
 
     // T8.1.2 — Thread.suspend / resume
@@ -376,11 +360,26 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
     r.register(thread, "destroy", "()V", native_thread_destroy);
 
     // T8.1.4 — Thread.countStackFrames
-    r.register(thread, "countStackFrames", "()I", native_thread_count_stack_frames);
+    r.register(
+        thread,
+        "countStackFrames",
+        "()I",
+        native_thread_count_stack_frames,
+    );
 
     // T8.1.6 — Runtime.runFinalization / System.runFinalization
-    r.register("java/lang/Runtime", "runFinalization", "()V", native_run_finalization);
-    r.register("java/lang/System", "runFinalization", "()V", native_run_finalization);
+    r.register(
+        "java/lang/Runtime",
+        "runFinalization",
+        "()V",
+        native_run_finalization,
+    );
+    r.register(
+        "java/lang/System",
+        "runFinalization",
+        "()V",
+        native_run_finalization,
+    );
 
     // T8.1.7 — System.runFinalizersOnExit
     r.register(
@@ -403,7 +402,12 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
 
     // T8.1.10 — Compiler (removed in JDK 9, legacy stubs)
     let compiler = "java/lang/Compiler";
-    r.register(compiler, "compileClass", "(Ljava/lang/Class;)Z", native_compiler_compile_class);
+    r.register(
+        compiler,
+        "compileClass",
+        "(Ljava/lang/Class;)Z",
+        native_compiler_compile_class,
+    );
     r.register(
         compiler,
         "compileClasses",
@@ -464,14 +468,19 @@ mod tests {
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "stop", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "stop",
+            "()V",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
-        assert!(msg.contains("UnsupportedOperationException") || msg.contains("not supported"),
-            "Expected UnsupportedOperationException, got: {msg}");
+        assert!(
+            msg.contains("UnsupportedOperationException") || msg.contains("not supported"),
+            "Expected UnsupportedOperationException, got: {msg}"
+        );
     }
 
     #[test]
@@ -484,8 +493,11 @@ mod tests {
         let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/ThreadDeath", 0);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "stop0", "(Ljava/lang/Object;)V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "stop0",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(thr)), Value::Object(Some(exc))],
         );
         assert!(res.is_err());
@@ -502,8 +514,11 @@ mod tests {
         let tid = thr.as_ptr() as u64;
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "stop0", "(Ljava/lang/Object;)V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "stop0",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(thr)), Value::Object(Some(exc))],
         );
         assert!(res.is_ok());
@@ -525,8 +540,11 @@ mod tests {
         let tid = thr.as_ptr() as u64;
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "stop", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "stop",
+            "()V",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_ok());
@@ -547,13 +565,19 @@ mod tests {
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "suspend0", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "suspend0",
+            "()V",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
-        assert!(msg.contains("not supported"), "Expected unsupported, got: {msg}");
+        assert!(
+            msg.contains("not supported"),
+            "Expected unsupported, got: {msg}"
+        );
     }
 
     #[test]
@@ -565,8 +589,11 @@ mod tests {
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "resume0", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "resume0",
+            "()V",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_err());
@@ -581,14 +608,19 @@ mod tests {
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "destroy", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "destroy",
+            "()V",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
-        assert!(msg.contains("no such method") || msg.contains("NoSuchMethod"),
-            "Expected NoSuchMethodError, got: {msg}");
+        assert!(
+            msg.contains("no such method") || msg.contains("NoSuchMethod"),
+            "Expected NoSuchMethodError, got: {msg}"
+        );
     }
 
     // ----- T8.1.4 Thread.countStackFrames -----
@@ -600,13 +632,19 @@ mod tests {
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Thread", "countStackFrames", "()I",
+            &reg,
+            &mut ctx,
+            "java/lang/Thread",
+            "countStackFrames",
+            "()I",
             &[Value::Object(Some(thr))],
         );
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
-        assert!(msg.contains("unsupported"), "Expected unsupported, got: {msg}");
+        assert!(
+            msg.contains("unsupported"),
+            "Expected unsupported, got: {msg}"
+        );
     }
 
     // ----- T8.1.5 FinalizationTracker -----
@@ -677,8 +715,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Runtime", "runFinalization", "()V",
+            &reg,
+            &mut ctx,
+            "java/lang/Runtime",
+            "runFinalization",
+            "()V",
             &[],
         );
         assert!(res.is_ok());
@@ -695,7 +736,8 @@ mod tests {
     fn test_system_run_finalization_registered() {
         let reg = make_registry();
         assert!(
-            reg.find("java/lang/System", "runFinalization", "()V").is_some(),
+            reg.find("java/lang/System", "runFinalization", "()V")
+                .is_some(),
             "System.runFinalization should be registered"
         );
     }
@@ -711,8 +753,11 @@ mod tests {
 
         // Set to true
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/System", "runFinalizersOnExit", "(Z)V",
+            &reg,
+            &mut ctx,
+            "java/lang/System",
+            "runFinalizersOnExit",
+            "(Z)V",
             &[Value::Int(1)],
         );
         assert!(res.is_ok());
@@ -720,8 +765,11 @@ mod tests {
 
         // Set to false
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/System", "runFinalizersOnExit", "(Z)V",
+            &reg,
+            &mut ctx,
+            "java/lang/System",
+            "runFinalizersOnExit",
+            "(Z)V",
             &[Value::Int(0)],
         );
         assert!(res.is_ok());
@@ -735,7 +783,12 @@ mod tests {
         let mut reg = NativeMethodRegistry::new();
         crate::security_manager::register_security_manager_natives(&mut reg);
         assert!(
-            reg.find("java/lang/SecurityManager", "checkPermission", "(Ljava/security/Permission;)V").is_some(),
+            reg.find(
+                "java/lang/SecurityManager",
+                "checkPermission",
+                "(Ljava/security/Permission;)V"
+            )
+            .is_some(),
             "SecurityManager.checkPermission must be registered by security_manager.rs"
         );
     }
@@ -751,15 +804,22 @@ mod tests {
         // Pre-arm invoke_virtual to return a class-like object
         let fake_class = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 0);
         unsafe {
-            *ctx.invoke_virtual_result.get() =
-                Some(Ok(Some(Value::Object(Some(fake_class)))));
+            *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(Some(fake_class)))));
         }
 
         let byte_arr = alloc_concurrent_synthetic(&mut ctx, "[B", 0);
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/ClassLoader", "defineClass", "([BII)Ljava/lang/Class;",
-            &[Value::Object(Some(loader)), Value::Object(Some(byte_arr)), Value::Int(0), Value::Int(10)],
+            &reg,
+            &mut ctx,
+            "java/lang/ClassLoader",
+            "defineClass",
+            "([BII)Ljava/lang/Class;",
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(byte_arr)),
+                Value::Int(0),
+                Value::Int(10),
+            ],
         );
         assert!(res.is_ok());
         match res.unwrap() {
@@ -776,8 +836,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Compiler",
+            "compileClass",
+            "(Ljava/lang/Class;)Z",
             &[Value::Object(None)],
         );
         assert!(res.is_ok());
@@ -790,8 +853,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Compiler", "compileClasses", "(Ljava/lang/String;)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Compiler",
+            "compileClasses",
+            "(Ljava/lang/String;)Z",
             &[Value::Object(None)],
         );
         assert!(res.is_ok());
@@ -804,8 +870,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Compiler", "command", "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &reg,
+            &mut ctx,
+            "java/lang/Compiler",
+            "command",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(None)],
         );
         assert!(res.is_ok());
@@ -817,19 +886,11 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
-        let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Compiler", "enable", "()V",
-            &[],
-        );
+        let res = call_native(&reg, &mut ctx, "java/lang/Compiler", "enable", "()V", &[]);
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
 
-        let res = call_native(
-            &reg, &mut ctx,
-            "java/lang/Compiler", "disable", "()V",
-            &[],
-        );
+        let res = call_native(&reg, &mut ctx, "java/lang/Compiler", "disable", "()V", &[]);
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
     }

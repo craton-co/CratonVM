@@ -129,9 +129,17 @@ impl std::fmt::Display for EventLoopError {
         match self {
             Self::InvalidId => write!(f, "event-loop id is invalid (negative or zero)"),
             Self::NotFound => write!(f, "event-loop id not found in registry"),
-            Self::TaskQueueFull => write!(f, "event-loop task queue at capacity {}", MAX_PENDING_TASKS),
-            Self::TimerHeapFull => write!(f, "event-loop timer heap at capacity {}", MAX_SCHEDULED_TIMERS),
-            Self::CapacityExceeded => write!(f, "process event-loop cap {} reached", MAX_EVENT_LOOPS),
+            Self::TaskQueueFull => {
+                write!(f, "event-loop task queue at capacity {}", MAX_PENDING_TASKS)
+            }
+            Self::TimerHeapFull => write!(
+                f,
+                "event-loop timer heap at capacity {}",
+                MAX_SCHEDULED_TIMERS
+            ),
+            Self::CapacityExceeded => {
+                write!(f, "process event-loop cap {} reached", MAX_EVENT_LOOPS)
+            }
             Self::ShuttingDown => write!(f, "event loop is shutting down"),
         }
     }
@@ -376,7 +384,10 @@ impl Default for TimerHeap {
 
 impl TimerHeap {
     pub fn new() -> Self {
-        Self { inner: BinaryHeap::new(), pending_cancelled_count: 0 }
+        Self {
+            inner: BinaryHeap::new(),
+            pending_cancelled_count: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -766,10 +777,7 @@ impl EventLoopManager {
             return Err(EventLoopError::NotFound);
         }
         let loops = self.loops.lock().unwrap_or_else(|e| e.into_inner());
-        loops
-            .get(&id.0)
-            .cloned()
-            .ok_or(EventLoopError::NotFound)
+        loops.get(&id.0).cloned().ok_or(EventLoopError::NotFound)
     }
 
     /// Schedule `task` onto the loop identified by `id`. This is the
@@ -950,7 +958,9 @@ fn fire_expired_timers(el: &EventLoop) {
         };
         // Flush cancelled count from pop_if_expired's lazy drops.
         if pending_n > 0 {
-            el.stats.timers_cancelled.fetch_add(pending_n, Ordering::Relaxed);
+            el.stats
+                .timers_cancelled
+                .fetch_add(pending_n, Ordering::Relaxed);
         }
         match expired {
             Some(mut t) => {
@@ -1122,7 +1132,10 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(2));
             }
-            assert!(flag.load(Ordering::Acquire), "cross-thread wake must fire within 500ms");
+            assert!(
+                flag.load(Ordering::Acquire),
+                "cross-thread wake must fire within 500ms"
+            );
         });
     }
 
@@ -1181,7 +1194,10 @@ mod tests {
             // Wake so the loop reconsiders the (now cancelled) head.
             el.parker.wake();
             thread::sleep(Duration::from_millis(400));
-            assert!(!fired.load(Ordering::Acquire), "cancelled timer must not fire");
+            assert!(
+                !fired.load(Ordering::Acquire),
+                "cancelled timer must not fire"
+            );
             // Stats: cancelled should have been counted.
             assert!(el.stats.timers_cancelled.load(Ordering::Acquire) >= 1);
         });
@@ -1333,7 +1349,7 @@ mod tests {
         wk.wake();
         wk.wake(); // second wake is a dedupe
         wk.wake(); // third too
-        // Now park should observe the wake on the fast path.
+                   // Now park should observe the wake on the fast path.
         let woken = wk.park(Duration::from_millis(50));
         assert!(woken);
         // After consumption, the next park should timeout.

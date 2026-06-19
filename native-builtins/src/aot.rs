@@ -342,7 +342,9 @@ impl AotCache {
             if pos + key_len > data.len() {
                 return None;
             }
-            let key = std::str::from_utf8(&data[pos..pos + key_len]).ok()?.to_string();
+            let key = std::str::from_utf8(&data[pos..pos + key_len])
+                .ok()?
+                .to_string();
             pos += key_len;
             if pos + 8 > data.len() {
                 return None;
@@ -566,8 +568,9 @@ impl PrelinkerCache {
             if pos + name_len > data.len() {
                 return None;
             }
-            let class_name =
-                std::str::from_utf8(&data[pos..pos + name_len]).ok()?.to_string();
+            let class_name = std::str::from_utf8(&data[pos..pos + name_len])
+                .ok()?
+                .to_string();
             pos += name_len;
 
             if pos + 2 > data.len() {
@@ -592,10 +595,18 @@ impl PrelinkerCache {
                 if pos + desc_len > data.len() {
                     return None;
                 }
-                let descriptor =
-                    std::str::from_utf8(&data[pos..pos + desc_len]).ok()?.to_string();
+                let descriptor = std::str::from_utf8(&data[pos..pos + desc_len])
+                    .ok()?
+                    .to_string();
                 pos += desc_len;
-                fields.insert(cp_idx, PrelinkedField { field_offset: offset, descriptor, is_static });
+                fields.insert(
+                    cp_idx,
+                    PrelinkedField {
+                        field_offset: offset,
+                        descriptor,
+                        is_static,
+                    },
+                );
             }
 
             if pos + 2 > data.len() {
@@ -620,13 +631,28 @@ impl PrelinkerCache {
                 if pos + desc_len > data.len() {
                     return None;
                 }
-                let descriptor =
-                    std::str::from_utf8(&data[pos..pos + desc_len]).ok()?.to_string();
+                let descriptor = std::str::from_utf8(&data[pos..pos + desc_len])
+                    .ok()?
+                    .to_string();
                 pos += desc_len;
-                methods.insert(cp_idx, PrelinkedMethod { vtable_slot, descriptor, is_static });
+                methods.insert(
+                    cp_idx,
+                    PrelinkedMethod {
+                        vtable_slot,
+                        descriptor,
+                        is_static,
+                    },
+                );
             }
 
-            classes.insert(class_name.clone(), PrelinkedClass { class_name, fields, methods });
+            classes.insert(
+                class_name.clone(),
+                PrelinkedClass {
+                    class_name,
+                    fields,
+                    methods,
+                },
+            );
         }
         Some(Self { classes })
     }
@@ -709,12 +735,15 @@ impl TrainingRunRecorder {
         receiver_type: Option<&str>,
     ) {
         let key = Self::method_key(class_name, method_name, descriptor);
-        let rec = self.method_records.entry(key).or_insert_with(|| MethodInvocationRecord {
-            class_name: class_name.to_string(),
-            method_name: method_name.to_string(),
-            descriptor: descriptor.to_string(),
-            ..Default::default()
-        });
+        let rec = self
+            .method_records
+            .entry(key)
+            .or_insert_with(|| MethodInvocationRecord {
+                class_name: class_name.to_string(),
+                method_name: method_name.to_string(),
+                descriptor: descriptor.to_string(),
+                ..Default::default()
+            });
         rec.invocation_count += 1;
         if let Some(ty) = receiver_type {
             if let Some(count) = rec.receiver_types.get_mut(ty) {
@@ -734,13 +763,16 @@ impl TrainingRunRecorder {
         taken: bool,
     ) {
         let key = Self::branch_key(class_name, method_name, bytecode_offset);
-        let rec = self.branch_records.entry(key).or_insert_with(|| BranchRecord {
-            class_name: class_name.to_string(),
-            method_name: method_name.to_string(),
-            bytecode_offset,
-            taken_count: 0,
-            not_taken_count: 0,
-        });
+        let rec = self
+            .branch_records
+            .entry(key)
+            .or_insert_with(|| BranchRecord {
+                class_name: class_name.to_string(),
+                method_name: method_name.to_string(),
+                bytecode_offset,
+                taken_count: 0,
+                not_taken_count: 0,
+            });
         if taken {
             rec.taken_count += 1;
         } else {
@@ -791,7 +823,8 @@ impl TrainingRunRecorder {
         for (_, br) in &self.branch_records {
             let mp = profile.method_profile_mut(&br.class_name, &br.method_name, "");
             mp.branch_taken.insert(br.bytecode_offset, br.taken_count);
-            mp.branch_not_taken.insert(br.bytecode_offset, br.not_taken_count);
+            mp.branch_not_taken
+                .insert(br.bytecode_offset, br.not_taken_count);
         }
         profile
     }
@@ -877,19 +910,35 @@ pub fn init_aot_runtime(
 
     if let Some(p) = cache_input {
         let sanitized = sanitize_aot_path(p).unwrap_or_default();
-        *AOT_CACHE_INPUT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() { None } else { Some(sanitized) };
+        *AOT_CACHE_INPUT_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        };
     }
     if let Some(p) = cache_output {
         let sanitized = sanitize_aot_path(p).unwrap_or_default();
-        *AOT_CACHE_OUTPUT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() { None } else { Some(sanitized) };
+        *AOT_CACHE_OUTPUT_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        };
     }
 
     if training {
-        *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(TrainingRunRecorder::new());
+        *AOT_TRAINING_RECORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(TrainingRunRecorder::new());
         *AOT_CACHE_GLOBAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(AotCache::new(
             AotCacheConfig::new().with_training_mode(true),
         ));
-        *AOT_PRELINKER_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PrelinkerCache::new());
+        *AOT_PRELINKER_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PrelinkerCache::new());
     }
 
     if production {
@@ -901,7 +950,9 @@ pub fn init_aot_runtime(
                 }
             }
         }
-        *AOT_PRELINKER_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PrelinkerCache::new());
+        *AOT_PRELINKER_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PrelinkerCache::new());
     }
 }
 
@@ -916,23 +967,24 @@ pub fn aot_record_method_invocation(
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         recorder.record_method_invocation(class_name, method_name, descriptor, receiver_type);
     }
 }
 
 /// Record a branch outcome in the global training recorder.
 /// No-op if not in training mode.
-pub fn aot_record_branch(
-    class_name: &str,
-    method_name: &str,
-    bytecode_offset: u32,
-    taken: bool,
-) {
+pub fn aot_record_branch(class_name: &str, method_name: &str, bytecode_offset: u32, taken: bool) {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         recorder.record_branch(class_name, method_name, bytecode_offset, taken);
     }
 }
@@ -944,7 +996,10 @@ pub fn aot_record_class_loaded(class_name: &str) {
         return;
     }
     // Pre-linker: create an entry placeholder for the loaded class
-    if let Some(ref mut cache) = *AOT_PRELINKER_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref mut cache) = *AOT_PRELINKER_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         if cache.get(class_name).is_none() {
             cache.insert(PrelinkedClass::new(class_name));
         }
@@ -972,7 +1027,10 @@ pub fn aot_flush_training_data() -> usize {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return 0;
     }
-    let output_path = AOT_CACHE_OUTPUT_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let output_path = AOT_CACHE_OUTPUT_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let Some(output_path) = output_path else {
         return 0;
     };
@@ -992,7 +1050,9 @@ pub fn aot_flush_training_data() -> usize {
 
     // Fall back to writing the training profile
     let profile_data = {
-        let guard = AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = AOT_TRAINING_RECORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|r| r.serialize())
     };
     if let Some(data) = profile_data {
@@ -1009,14 +1069,15 @@ pub fn aot_flush_training_data() -> usize {
 ///
 /// Each entry is (class_name, method_name, bytecode_offset, taken_count, not_taken_count).
 /// Called from the VM to bridge JIT ProfileStore → AOT TrainingRunRecorder at shutdown.
-pub fn aot_bulk_import_branches(
-    entries: &[(&str, &str, u32, u32, u32)],
-) -> usize {
+pub fn aot_bulk_import_branches(entries: &[(&str, &str, u32, u32, u32)]) -> usize {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return 0;
     }
     let mut count = 0usize;
-    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         for &(class_name, method_name, offset, taken, not_taken) in entries {
             // Record each branch outcome via the recorder's API.
             for _ in 0..taken {
@@ -1034,18 +1095,24 @@ pub fn aot_bulk_import_branches(
 /// Bulk-import receiver type data into the AOT training recorder.
 ///
 /// Each entry is (class_name, method_name, descriptor, receiver_class_name, count).
-pub fn aot_bulk_import_receivers(
-    entries: &[(&str, &str, &str, &str, u32)],
-) -> usize {
+pub fn aot_bulk_import_receivers(entries: &[(&str, &str, &str, &str, u32)]) -> usize {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return 0;
     }
     let mut count = 0usize;
-    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
         for &(class_name, method_name, descriptor, receiver, n) in entries {
             // Record each receiver observation via the recorder's API.
             for _ in 0..n {
-                recorder.record_method_invocation(class_name, method_name, descriptor, Some(receiver));
+                recorder.record_method_invocation(
+                    class_name,
+                    method_name,
+                    descriptor,
+                    Some(receiver),
+                );
             }
             count += 1;
         }
@@ -1064,14 +1131,24 @@ pub fn aot_record_receiver_type(
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner()) {
-        recorder.record_method_invocation(class_name, method_name, descriptor, Some(receiver_class_name));
+    if let Some(ref mut recorder) = *AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        recorder.record_method_invocation(
+            class_name,
+            method_name,
+            descriptor,
+            Some(receiver_class_name),
+        );
     }
 }
 
 /// Get the current training recorder stats (method count, branch count).
 pub fn aot_training_stats() -> (usize, usize) {
-    let guard = AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = AOT_TRAINING_RECORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
         Some(r) => (r.method_count(), r.branch_count()),
         None => (0, 0),
@@ -1113,7 +1190,10 @@ fn leyden_get_aot_cache_input_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_INPUT_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let path = AOT_CACHE_INPUT_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     match path {
         Some(p) => {
             let s = ctx.create_string(&p);
@@ -1127,7 +1207,10 @@ fn leyden_get_aot_cache_output_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_OUTPUT_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let path = AOT_CACHE_OUTPUT_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     match path {
         Some(p) => {
             let s = ctx.create_string(&p);
@@ -1137,10 +1220,7 @@ fn leyden_get_aot_cache_output_path(
     }
 }
 
-fn leyden_notify_method_invoked(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn leyden_notify_method_invoked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Leyden), args[1] = Method object
     // Extract method info from the Method object if possible
     if let Some(Value::Object(Some(method_obj))) = args.get(1) {
@@ -1155,10 +1235,7 @@ fn leyden_notify_method_invoked(
     Ok(None)
 }
 
-fn leyden_notify_class_loaded(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn leyden_notify_class_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (Leyden), args[1] = Class object
     if let Some(Value::Object(Some(class_obj))) = args.get(1) {
         let class_id = ctx.class_id_of_object(*class_obj);
@@ -1169,23 +1246,41 @@ fn leyden_notify_class_loaded(
     Ok(None)
 }
 
-fn leyden_lookup_aot_method(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn leyden_lookup_aot_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // In production mode, look up pre-compiled method in the AOT cache.
     // args[0] = this (Leyden), args[1] = class name, args[2] = method name, args[3] = descriptor
     if !is_aot_production() {
         return Ok(Some(Value::Object(None)));
     }
-    let class_name = args.get(1)
-        .and_then(|v| if let Value::Object(Some(o)) = v { Some(*o) } else { None })
+    let class_name = args
+        .get(1)
+        .and_then(|v| {
+            if let Value::Object(Some(o)) = v {
+                Some(*o)
+            } else {
+                None
+            }
+        })
         .and_then(|o| ctx.read_string(o));
-    let method_name = args.get(2)
-        .and_then(|v| if let Value::Object(Some(o)) = v { Some(*o) } else { None })
+    let method_name = args
+        .get(2)
+        .and_then(|v| {
+            if let Value::Object(Some(o)) = v {
+                Some(*o)
+            } else {
+                None
+            }
+        })
         .and_then(|o| ctx.read_string(o));
-    let descriptor = args.get(3)
-        .and_then(|v| if let Value::Object(Some(o)) = v { Some(*o) } else { None })
+    let descriptor = args
+        .get(3)
+        .and_then(|v| {
+            if let Value::Object(Some(o)) = v {
+                Some(*o)
+            } else {
+                None
+            }
+        })
         .and_then(|o| ctx.read_string(o));
 
     if let (Some(cn), Some(mn), Some(desc)) = (class_name, method_name, descriptor) {
@@ -1213,7 +1308,9 @@ fn leyden_store_aot_profile(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if let Some(path) = path {
         // Serialize the training recorder and write to the specified path
         let data = {
-            let guard = AOT_TRAINING_RECORDER.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = AOT_TRAINING_RECORDER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|r| r.serialize())
         };
         if let Some(data) = data {
@@ -1317,9 +1414,12 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
     // --- @Stable annotation natives (noops) ---
     let stable = "jdk/internal/vm/annotation/Stable";
     r.register(stable, "<init>", "()V", stable_annotation_noop);
-    r.register(stable, "annotationType", "()Ljava/lang/Class;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        stable,
+        "annotationType",
+        "()Ljava/lang/Class;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // --- java.lang.reflect.Method annotation query ---
     // Real implementation is in lang_class.rs; use it instead of a stub.
@@ -1437,7 +1537,8 @@ mod aot_tests {
     #[test]
     fn test_aot_profile_method_profile_lookup() {
         let mut ap = AotProfile::new();
-        ap.method_profile_mut("Foo", "bar", "()V").record_invocation(None);
+        ap.method_profile_mut("Foo", "bar", "()V")
+            .record_invocation(None);
         let found = ap.method_profile("Foo", "bar", "()V");
         assert!(found.is_some());
         assert_eq!(found.unwrap().invocation_count, 1);
@@ -1539,7 +1640,9 @@ mod aot_tests {
         let blob = cache.serialize();
         let restored = AotCache::deserialize(&blob).expect("deserialization should succeed");
         assert_eq!(restored.entry_count(), 1);
-        let e = restored.lookup("com/example/Foo", "compute", "(I)I").unwrap();
+        let e = restored
+            .lookup("com/example/Foo", "compute", "(I)I")
+            .unwrap();
         assert_eq!(e.bytecode_fingerprint[0], 0xCA);
         assert_eq!(e.bytecode_fingerprint[1], 0xFE);
         assert_eq!(e.compiled_code, vec![0x90, 0x90, 0xC3]);
@@ -1565,7 +1668,14 @@ mod aot_tests {
     #[test]
     fn test_prelinked_class_add_and_get_field() {
         let mut cls = PrelinkedClass::new("java/lang/Object");
-        cls.add_field(5, PrelinkedField { field_offset: 12, descriptor: "I".to_string(), is_static: false });
+        cls.add_field(
+            5,
+            PrelinkedField {
+                field_offset: 12,
+                descriptor: "I".to_string(),
+                is_static: false,
+            },
+        );
         let f = cls.get_field(5).unwrap();
         assert_eq!(f.field_offset, 12);
         assert_eq!(f.descriptor, "I");
@@ -1576,7 +1686,14 @@ mod aot_tests {
     #[test]
     fn test_prelinked_class_add_and_get_method() {
         let mut cls = PrelinkedClass::new("java/lang/Object");
-        cls.add_method(3, PrelinkedMethod { vtable_slot: 7, descriptor: "()V".to_string(), is_static: false });
+        cls.add_method(
+            3,
+            PrelinkedMethod {
+                vtable_slot: 7,
+                descriptor: "()V".to_string(),
+                is_static: false,
+            },
+        );
         let m = cls.get_method(3).unwrap();
         assert_eq!(m.vtable_slot, 7);
         assert_eq!(m.descriptor, "()V");
@@ -1596,8 +1713,22 @@ mod aot_tests {
     fn test_prelinker_cache_serialize_deserialize_roundtrip() {
         let mut cache = PrelinkerCache::new();
         let mut cls = PrelinkedClass::new("com/example/Bar");
-        cls.add_field(1, PrelinkedField { field_offset: 8, descriptor: "J".to_string(), is_static: true });
-        cls.add_method(2, PrelinkedMethod { vtable_slot: 3, descriptor: "(J)V".to_string(), is_static: false });
+        cls.add_field(
+            1,
+            PrelinkedField {
+                field_offset: 8,
+                descriptor: "J".to_string(),
+                is_static: true,
+            },
+        );
+        cls.add_method(
+            2,
+            PrelinkedMethod {
+                vtable_slot: 3,
+                descriptor: "(J)V".to_string(),
+                is_static: false,
+            },
+        );
         cache.insert(cls);
 
         let blob = cache.serialize();
@@ -1744,7 +1875,11 @@ mod aot_tests {
         let mut r = NativeMethodRegistry::new();
         register_aot_natives(&mut r);
         assert!(r
-            .find(LEYDEN, "notifyMethodInvoked", "(Ljava/lang/reflect/Method;)V")
+            .find(
+                LEYDEN,
+                "notifyMethodInvoked",
+                "(Ljava/lang/reflect/Method;)V"
+            )
             .is_some());
         assert!(r
             .find(LEYDEN, "notifyClassLoaded", "(Ljava/lang/Class;)V")
@@ -1987,8 +2122,18 @@ mod aot_tests {
         let _guard = aot_test_lock();
         reset_aot_globals();
         init_aot_runtime(true, false, None, None);
-        aot_record_method_invocation("com/example/Foo", "bar", "(I)V", Some("com/example/FooImpl"));
-        aot_record_method_invocation("com/example/Foo", "bar", "(I)V", Some("com/example/FooImpl"));
+        aot_record_method_invocation(
+            "com/example/Foo",
+            "bar",
+            "(I)V",
+            Some("com/example/FooImpl"),
+        );
+        aot_record_method_invocation(
+            "com/example/Foo",
+            "bar",
+            "(I)V",
+            Some("com/example/FooImpl"),
+        );
         aot_record_method_invocation("com/example/Foo", "bar", "(I)V", Some("com/example/FooSub"));
         let (methods, _) = aot_training_stats();
         assert_eq!(methods, 1);
@@ -2056,10 +2201,8 @@ mod aot_tests {
         let _guard = aot_test_lock();
         reset_aot_globals();
         init_aot_runtime(true, false, None, None);
-        let entries: Vec<(&str, &str, u32, u32, u32)> = vec![
-            ("A", "m1", 5, 10, 3),
-            ("B", "m2", 20, 0, 5),
-        ];
+        let entries: Vec<(&str, &str, u32, u32, u32)> =
+            vec![("A", "m1", 5, 10, 3), ("B", "m2", 20, 0, 5)];
         let count = aot_bulk_import_branches(&entries);
         assert_eq!(count, 2);
         let guard = AOT_TRAINING_RECORDER.lock().unwrap();
@@ -2115,7 +2258,10 @@ mod aot_tests {
         let guard = AOT_PRELINKER_CACHE.lock().unwrap();
         let cache = guard.as_ref().unwrap();
         assert!(cache.get("com/example/MyClass").is_some());
-        assert_eq!(cache.get("com/example/MyClass").unwrap().class_name, "com/example/MyClass");
+        assert_eq!(
+            cache.get("com/example/MyClass").unwrap().class_name,
+            "com/example/MyClass"
+        );
         drop(guard);
         reset_aot_globals();
     }

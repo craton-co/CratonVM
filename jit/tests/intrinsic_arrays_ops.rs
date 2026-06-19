@@ -171,7 +171,7 @@ fn compile_method(
         code_len,
         num_params,
         max_locals,
-        false, // needs_heap — no array opcodes, args are raw pointers
+        false,      // needs_heap — no array opcodes, args are raw pointers
         Vec::new(), // multianewarray_info
         Vec::new(), // field_info
         Vec::new(), // typecheck_info
@@ -180,16 +180,16 @@ fn compile_method(
         Vec::new(), // anewarray_info
         Vec::new(), // invoke_info
         direct_calls,
-        Vec::new(), // mic_slots
-        Vec::new(), // pic_slots
-        Vec::new(), // ldc_info
-        Vec::new(), // ldc2w_info
+        Vec::new(),     // mic_slots
+        Vec::new(),     // pic_slots
+        Vec::new(),     // ldc_info
+        Vec::new(),     // ldc2w_info
         HashMap::new(), // branch_hints
         HashMap::new(), // loop_unroll_hints
         &arrays_helpers(),
         HashSet::new(), // non_escaping_new
         HashMap::new(), // inline_sites
-        None, // string_layout
+        None,           // string_layout
     )
     .expect("JIT compilation failed")
 }
@@ -227,11 +227,7 @@ fn test_arrays_fill_int() {
         2,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(), 2, b'V'),
         )],
     );
     for &len in &[0usize, 1, 5, 17, 64] {
@@ -241,7 +237,11 @@ fn test_arrays_fill_int() {
         }
         let fill_val: i32 = 0x12345678;
         // SAFETY: JIT-compiled code; args are (array_ptr, fill_value).
-        unsafe { compiled.try_call(&[arr.ptr(), fill_val as i64]).expect("test JIT call") };
+        unsafe {
+            compiled
+                .try_call(&[arr.ptr(), fill_val as i64])
+                .expect("test JIT call")
+        };
         for i in 0..len {
             assert_eq!(arr.read_i32(i), fill_val, "int fill len={len} idx={i}");
         }
@@ -258,18 +258,18 @@ fn test_arrays_fill_long() {
         3,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill8.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill8.as_entry(), 2, b'V'),
         )],
     );
     for &len in &[0usize, 1, 3, 9] {
         let mut arr = FakeArray::new(len, 8);
         let fill_val: i64 = -0x0123_4567_89AB_CDEF;
         // SAFETY: JIT-compiled code.
-        unsafe { compiled.try_call(&[arr.ptr(), fill_val]).expect("test JIT call") };
+        unsafe {
+            compiled
+                .try_call(&[arr.ptr(), fill_val])
+                .expect("test JIT call")
+        };
         for i in 0..len {
             assert_eq!(arr.read_i64(i), fill_val, "long fill len={len} idx={i}");
         }
@@ -286,18 +286,18 @@ fn test_arrays_fill_byte() {
         2,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill1.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill1.as_entry(), 2, b'V'),
         )],
     );
     for &len in &[0usize, 1, 7, 33] {
         let mut arr = FakeArray::new(len, 1);
         let fill_val: i8 = -7;
         // SAFETY: JIT-compiled code.
-        unsafe { compiled.try_call(&[arr.ptr(), fill_val as i64]).expect("test JIT call") };
+        unsafe {
+            compiled
+                .try_call(&[arr.ptr(), fill_val as i64])
+                .expect("test JIT call")
+        };
         for i in 0..len {
             assert_eq!(arr.read_i8(i), fill_val, "byte fill len={len} idx={i}");
         }
@@ -314,18 +314,18 @@ fn test_arrays_fill_char_short() {
         2,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill2.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill2.as_entry(), 2, b'V'),
         )],
     );
     for &len in &[0usize, 1, 4, 21] {
         let mut arr = FakeArray::new(len, 2);
         let fill_val: i16 = -12345;
         // SAFETY: JIT-compiled code.
-        unsafe { compiled.try_call(&[arr.ptr(), fill_val as i64]).expect("test JIT call") };
+        unsafe {
+            compiled
+                .try_call(&[arr.ptr(), fill_val as i64])
+                .expect("test JIT call")
+        };
         for i in 0..len {
             assert_eq!(arr.read_i16(i), fill_val, "short fill len={len} idx={i}");
         }
@@ -343,11 +343,7 @@ fn test_arrays_fill_does_not_overrun() {
         2,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(), 2, b'V'),
         )],
     );
     let len = 8usize;
@@ -357,7 +353,11 @@ fn test_arrays_fill_does_not_overrun() {
     arr.write_i32(len, 0x7777_7777);
     arr.write_i32(len + 1, 0x6666_6666);
     // SAFETY: JIT-compiled code.
-    unsafe { compiled.try_call(&[arr.ptr(), 0x1111_1111]).expect("test JIT call") };
+    unsafe {
+        compiled
+            .try_call(&[arr.ptr(), 0x1111_1111])
+            .expect("test JIT call")
+    };
     for i in 0..len {
         assert_eq!(arr.read_i32(i), 0x1111_1111);
     }
@@ -377,15 +377,15 @@ fn test_arrays_fill_null_array_deopts() {
         2,
         vec![(
             2,
-            direct_call(
-                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
-                2,
-                b'V',
-            ),
+            direct_call(cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(), 2, b'V'),
         )],
     );
     // SAFETY: JIT-compiled code; null array argument exercises the NPE stub.
-    let r = unsafe { compiled.try_call(&[0i64, 0x1111_1111]).expect("test JIT call") };
+    let r = unsafe {
+        compiled
+            .try_call(&[0i64, 0x1111_1111])
+            .expect("test JIT call")
+    };
     assert_eq!(
         r,
         i64::MIN,
@@ -428,7 +428,11 @@ fn test_arrays_equals_int() {
             b.write_i32(i, i as i32 * 7 - 3);
         }
         // SAFETY: JIT-compiled code.
-        let r = unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") };
+        let r = unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        };
         assert_eq!(r, 1, "equal int[] len={len} must be true");
     }
 
@@ -442,7 +446,11 @@ fn test_arrays_equals_int() {
         }
         b.write_i32(diff_at, -999);
         // SAFETY: JIT-compiled code.
-        let r = unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") };
+        let r = unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        };
         assert_eq!(r, 0, "int[] differing at idx {diff_at} must be false");
     }
 
@@ -450,7 +458,11 @@ fn test_arrays_equals_int() {
     let a = FakeArray::new(5, 4);
     let b = FakeArray::new(6, 4);
     // SAFETY: JIT-compiled code.
-    let r = unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") };
+    let r = unsafe {
+        compiled
+            .try_call(&[a.ptr(), b.ptr()])
+            .expect("test JIT call")
+    };
     assert_eq!(r, 0, "length-mismatched int[] must be false");
 }
 
@@ -464,10 +476,24 @@ fn test_arrays_equals_long() {
         b.write_i64(i, (i as i64) << 40 | 0xABCD);
     }
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 1);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        1
+    );
     b.write_i64(2, 0);
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 0);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        0
+    );
 }
 
 #[test]
@@ -480,10 +506,24 @@ fn test_arrays_equals_byte() {
         b.write_i8(i, (i as i8).wrapping_mul(13));
     }
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 1);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        1
+    );
     b.write_i8(10, b.read_i8(10).wrapping_add(1));
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 0);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        0
+    );
 }
 
 #[test]
@@ -496,10 +536,24 @@ fn test_arrays_equals_char_short() {
         b.write_i16(i, (i as i16).wrapping_mul(1111));
     }
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 1);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        1
+    );
     b.write_i16(0, b.read_i16(0).wrapping_add(1));
     // SAFETY: JIT-compiled code.
-    assert_eq!(unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") }, 0);
+    assert_eq!(
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
+        0
+    );
 }
 
 #[test]
@@ -510,7 +564,11 @@ fn test_arrays_equals_empty() {
     let b = FakeArray::new(0, 4);
     // SAFETY: JIT-compiled code.
     assert_eq!(
-        unsafe { compiled.try_call(&[a.ptr(), b.ptr()]).expect("test JIT call") },
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), b.ptr()])
+                .expect("test JIT call")
+        },
         1,
         "two empty arrays must compare equal"
     );
@@ -546,7 +604,11 @@ fn test_arrays_equals_null_semantics() {
     // same reference
     // SAFETY: JIT-compiled code.
     assert_eq!(
-        unsafe { compiled.try_call(&[a.ptr(), a.ptr()]).expect("test JIT call") },
+        unsafe {
+            compiled
+                .try_call(&[a.ptr(), a.ptr()])
+                .expect("test JIT call")
+        },
         1,
         "equals(arr, arr) must be true (same reference)"
     );

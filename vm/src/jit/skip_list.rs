@@ -166,9 +166,9 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
         let len = match op {
             // 0..=15 are 1-byte
             0x00..=0x0f => 1,
-            0x10 => 2, // bipush
-            0x11 => 3, // sipush
-            0x12 => 2, // ldc
+            0x10 => 2,        // bipush
+            0x11 => 3,        // sipush
+            0x12 => 2,        // ldc
             0x13 | 0x14 => 3, // ldc_w / ldc2_w
             0x15..=0x19 => 2, // iload..aload
             0x1a..=0x35 => 1, // iload_n..saload
@@ -176,13 +176,13 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
             0x3b..=0x56 => 1, // istore_n..sastore
             0x57..=0x5f => 1, // pop..swap
             0x60..=0x83 => 1, // arithmetic
-            0x84 => 3, // iinc
+            0x84 => 3,        // iinc
             0x85..=0x93 => 1, // conversions
             0x94..=0x98 => 1, // lcmp/fcmpl/fcmpg/dcmpl/dcmpg
             0x99..=0xa6 => 3, // ifeq..if_acmpne
-            0xa7 => 3, // goto
-            0xa8 => 3, // jsr
-            0xa9 => 2, // ret
+            0xa7 => 3,        // goto
+            0xa8 => 3,        // jsr
+            0xa9 => 2,        // ret
             0xaa => {
                 // tableswitch — pad to 4-byte boundary then 12 bytes
                 // header + (high - low + 1) * 4 jumps.
@@ -192,12 +192,16 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
                     return InitComplexity::Complex;
                 }
                 let low = i32::from_be_bytes([
-                    bytecode[table + 4], bytecode[table + 5],
-                    bytecode[table + 6], bytecode[table + 7],
+                    bytecode[table + 4],
+                    bytecode[table + 5],
+                    bytecode[table + 6],
+                    bytecode[table + 7],
                 ]);
                 let high = i32::from_be_bytes([
-                    bytecode[table + 8], bytecode[table + 9],
-                    bytecode[table + 10], bytecode[table + 11],
+                    bytecode[table + 8],
+                    bytecode[table + 9],
+                    bytecode[table + 10],
+                    bytecode[table + 11],
                 ]);
                 let n = (high as i64 - low as i64 + 1).max(0) as usize;
                 1 + pad + 12 + n * 4
@@ -211,19 +215,21 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
                     return InitComplexity::Complex;
                 }
                 let npairs = u32::from_be_bytes([
-                    bytecode[table + 4], bytecode[table + 5],
-                    bytecode[table + 6], bytecode[table + 7],
+                    bytecode[table + 4],
+                    bytecode[table + 5],
+                    bytecode[table + 6],
+                    bytecode[table + 7],
                 ]) as usize;
                 1 + pad + 8 + npairs * 8
             }
             0xac..=0xb1 => 1, // ireturn..return
             0xb2..=0xb6 => 3, // getstatic, putstatic, getfield, putfield, invokevirtual
             0xb7 | 0xb8 => 3, // invokespecial, invokestatic
-            0xb9 => 5, // invokeinterface
+            0xb9 => 5,        // invokeinterface
             // 0xba (invokedynamic) handled above
-            0xbb => 3, // new
-            0xbc => 2, // newarray
-            0xbd => 3, // anewarray
+            0xbb => 3,        // new
+            0xbc => 2,        // newarray
+            0xbd => 3,        // anewarray
             0xbe..=0xbf => 1, // arraylength, athrow
             0xc0..=0xc1 => 3, // checkcast, instanceof
             // 0xc2/0xc3 monitorenter/monitorexit handled above
@@ -241,13 +247,15 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
                     4
                 }
             }
-            0xc5 => 4, // multianewarray
+            0xc5 => 4,        // multianewarray
             0xc6 | 0xc7 => 3, // ifnull, ifnonnull
             0xc8 | 0xc9 => 5, // goto_w, jsr_w
             _ => 1,
         };
         pc += min(len, bytecode.len() - pc);
-        if len == 0 { return InitComplexity::Complex; }
+        if len == 0 {
+            return InitComplexity::Complex;
+        }
     }
     InitComplexity::Trivial
 }
@@ -342,9 +350,8 @@ fn should_skip_jit_internal(
                     s.split(',')
                         .filter_map(|e| {
                             let e = e.trim();
-                            e.rfind('.').map(|i| {
-                                (e[..i].to_string(), e[i + 1..].to_string())
-                            })
+                            e.rfind('.')
+                                .map(|i| (e[..i].to_string(), e[i + 1..].to_string()))
                         })
                         .collect()
                 })
@@ -640,10 +647,7 @@ fn should_skip_jit_internal(
         // broader ban is additive, not replacing those entries. Lifted
         // by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/context/`.
         if class_name.starts_with("org/springframework/boot/context/")
-            && !package_allowed(
-                "org/springframework/boot/context/",
-                allow_packages,
-            )
+            && !package_allowed("org/springframework/boot/context/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -706,9 +710,7 @@ fn should_skip_jit_internal(
         // `MethodMetadata` and `RequestTemplate` objects, each storing
         // `template` / `headers` / `body` slots immediately after `new`.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=feign/`.
-        if class_name.starts_with("feign/")
-            && !package_allowed("feign/", allow_packages)
-        {
+        if class_name.starts_with("feign/") && !package_allowed("feign/", allow_packages) {
             return Some(SkipReason::RustJvmTestFixture);
         }
 
@@ -838,9 +840,7 @@ fn should_skip_jit_internal(
         // covers the full per-class logger wiring path. Lifted by
         // `CRATONVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
         // org/apache/commons/logging/`.
-        if class_name.starts_with("org/slf4j/")
-            && !package_allowed("org/slf4j/", allow_packages)
-        {
+        if class_name.starts_with("org/slf4j/") && !package_allowed("org/slf4j/", allow_packages) {
             return Some(SkipReason::RustJvmTestFixture);
         }
         if class_name.starts_with("ch/qos/logback/")
@@ -1010,8 +1010,7 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-        if class_name.starts_with("java/beans/")
-            && !package_allowed("java/beans/", allow_packages)
+        if class_name.starts_with("java/beans/") && !package_allowed("java/beans/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -1062,10 +1061,7 @@ fn should_skip_jit_internal(
         // fix once the underlying allocate-then-putfield / PIC dispatch
         // miscompile is root-caused.
         if class_name.starts_with("org/junit/platform/console/shadow/picocli/")
-            && !package_allowed(
-                "org/junit/platform/console/shadow/picocli/",
-                allow_packages,
-            )
+            && !package_allowed("org/junit/platform/console/shadow/picocli/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
@@ -2131,12 +2127,24 @@ mod tests {
     fn java_util_targeted_methods_only_skipped_under_conservative() {
         // T1.1.g — HashMap.put is on the targeted list (NEW-1.3).
         assert_eq!(
-            check("java/util/HashMap", "put", false, true, SkipPolicy::Conservative),
+            check(
+                "java/util/HashMap",
+                "put",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             Some(SkipReason::JavaUtilCollection)
         );
         // Aggressive still lifts it.
         assert_eq!(
-            check("java/util/HashMap", "put", false, true, SkipPolicy::Aggressive),
+            check(
+                "java/util/HashMap",
+                "put",
+                false,
+                true,
+                SkipPolicy::Aggressive
+            ),
             None
         );
     }
@@ -2170,7 +2178,13 @@ mod tests {
         }
         // A non-walk WeakHashMap method stays JIT-eligible.
         assert_eq!(
-            check("java/util/WeakHashMap", "size", false, true, SkipPolicy::Conservative),
+            check(
+                "java/util/WeakHashMap",
+                "size",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None
         );
     }
@@ -2180,12 +2194,24 @@ mod tests {
         // T1.1.g — the blanket ban is gone. Unrelated java/util
         // methods are now JIT-eligible even under Conservative.
         assert_eq!(
-            check("java/util/HashMap", "size", false, true, SkipPolicy::Conservative),
+            check(
+                "java/util/HashMap",
+                "size",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None,
             "non-targeted HashMap methods must be JIT-eligible after T1.1.g"
         );
         assert_eq!(
-            check("java/util/ArrayList", "add", false, true, SkipPolicy::Conservative),
+            check(
+                "java/util/ArrayList",
+                "add",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None,
             "non-HashMap java/util classes must be JIT-eligible"
         );
@@ -2230,7 +2256,13 @@ mod tests {
             "unrelated cratonvm/* methods must be JIT-eligible after T1.1.g"
         );
         assert_eq!(
-            check("cratonvm/TckLang", "str_length", false, true, SkipPolicy::Conservative),
+            check(
+                "cratonvm/TckLang",
+                "str_length",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None,
             "non-miscompile TckLang methods must be JIT-eligible"
         );
@@ -2254,11 +2286,23 @@ mod tests {
     #[test]
     fn user_class_never_skipped() {
         assert_eq!(
-            check("com/example/App", "compute", false, true, SkipPolicy::Conservative),
+            check(
+                "com/example/App",
+                "compute",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None
         );
         assert_eq!(
-            check("com/example/App", "compute", false, true, SkipPolicy::Aggressive),
+            check(
+                "com/example/App",
+                "compute",
+                false,
+                true,
+                SkipPolicy::Aggressive
+            ),
             None
         );
     }
@@ -2275,12 +2319,24 @@ mod tests {
     #[test]
     fn java_lang_is_jit_eligible_after_new_1_2() {
         assert_eq!(
-            check("java/lang/String", "indexOf", false, true, SkipPolicy::Conservative),
+            check(
+                "java/lang/String",
+                "indexOf",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None,
             "java/lang/* must be JIT-eligible after NEW-1.2 (instanceof fix)"
         );
         assert_eq!(
-            check("java/lang/Integer", "toString", false, true, SkipPolicy::Conservative),
+            check(
+                "java/lang/Integer",
+                "toString",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None,
             "Integer.toString stays JIT-eligible — only valueOf/<init> are skip-listed"
         );
@@ -2311,7 +2367,13 @@ mod tests {
     #[test]
     fn tck_class_is_jit_eligible_after_new_1_2() {
         assert_eq!(
-            check("cratonvm/TckLang", "test1", false, true, SkipPolicy::Aggressive),
+            check(
+                "cratonvm/TckLang",
+                "test1",
+                false,
+                true,
+                SkipPolicy::Aggressive
+            ),
             None,
             "TCK classes must be JIT-eligible after NEW-1.2 (instanceof fix); \
              package-prefix RustJvmTestFixture ban only applies under Conservative"
@@ -2327,7 +2389,13 @@ mod tests {
             "FinalizerTest must be JIT-eligible after NEW-1.5 (conservative root scan)"
         );
         assert_eq!(
-            check("com/example/MyFinalizerTest", "f", false, true, SkipPolicy::Aggressive),
+            check(
+                "com/example/MyFinalizerTest",
+                "f",
+                false,
+                true,
+                SkipPolicy::Aggressive
+            ),
             None
         );
     }

@@ -140,7 +140,9 @@ pub struct ColoredPointer {
 
 impl ColoredPointer {
     pub fn new(address: u64, colors: u64) -> Self {
-        Self { raw: (address & ZGC_ADDRESS_MASK) | (colors & ZGC_COLOR_MASK) }
+        Self {
+            raw: (address & ZGC_ADDRESS_MASK) | (colors & ZGC_COLOR_MASK),
+        }
     }
 
     pub fn null() -> Self {
@@ -176,17 +178,27 @@ impl ColoredPointer {
 
     /// Return a new pointer with the remapped bit set.
     pub fn set_remapped(&self) -> Self {
-        Self { raw: self.raw | ZGC_COLOR_REMAPPED }
+        Self {
+            raw: self.raw | ZGC_COLOR_REMAPPED,
+        }
     }
 
     /// Return a new pointer with the marked bit for the current cycle set.
     pub fn set_marked(&self, cycle: u32) -> Self {
-        let bit = if cycle % 2 == 0 { ZGC_COLOR_MARKED0 } else { ZGC_COLOR_MARKED1 };
-        Self { raw: self.raw | bit }
+        let bit = if cycle % 2 == 0 {
+            ZGC_COLOR_MARKED0
+        } else {
+            ZGC_COLOR_MARKED1
+        };
+        Self {
+            raw: self.raw | bit,
+        }
     }
 
     pub fn with_colors(&self, new_colors: u64) -> Self {
-        Self { raw: (self.raw & ZGC_ADDRESS_MASK) | (new_colors & ZGC_COLOR_MASK) }
+        Self {
+            raw: (self.raw & ZGC_ADDRESS_MASK) | (new_colors & ZGC_COLOR_MASK),
+        }
     }
 
     pub fn is_null(&self) -> bool {
@@ -228,7 +240,10 @@ pub struct LoadBarrier {
 
 impl LoadBarrier {
     pub fn new() -> Self {
-        Self { good_colors: ZGC_COLOR_REMAPPED, ..Default::default() }
+        Self {
+            good_colors: ZGC_COLOR_REMAPPED,
+            ..Default::default()
+        }
     }
 
     /// Fast-path check: if the pointer already has good colors, pass it through.
@@ -702,7 +717,8 @@ impl ZgcCollector {
         // --- Phase 5: PauseRelocateStart (STW) ---
         let stw_start = std::time::Instant::now();
         self.phase = ZgcPhase::PauseRelocateStart;
-        self.load_barrier.update_good_colors(ZgcPhase::PauseRelocateStart);
+        self.load_barrier
+            .update_good_colors(ZgcPhase::PauseRelocateStart);
         pause_ns += stw_start.elapsed().as_nanos() as u64;
 
         // --- Phase 6: ConcurrentRelocate ---
@@ -761,7 +777,8 @@ impl ZgcCollector {
     /// STW: push simulated root addresses onto the mark stack.
     pub fn pause_mark_start(&mut self) {
         self.phase = ZgcPhase::PauseMarkStart;
-        self.load_barrier.update_good_colors(ZgcPhase::PauseMarkStart);
+        self.load_barrier
+            .update_good_colors(ZgcPhase::PauseMarkStart);
         // Simulate marking all page base addresses as roots.
         let roots: Vec<u64> = self.heap.pages.iter().map(|p| p.virtual_start).collect();
         self.mark_stack.extend(roots);
@@ -1278,10 +1295,7 @@ impl GenerationalZgc {
     ///
     /// Returns the trigger kind alongside the [`ZgcResult`] so callers
     /// can distinguish a "no-op" cycle from a real one.
-    pub fn scheduled_collect(
-        &mut self,
-        roots: &[u64],
-    ) -> (GenerationalTriggerKind, ZgcResult) {
+    pub fn scheduled_collect(&mut self, roots: &[u64]) -> (GenerationalTriggerKind, ZgcResult) {
         let young_occ = self.young_occupancy();
         let old_occ = self.old_occupancy();
         if old_occ > OLD_OCCUPANCY_MAJOR_THRESHOLD {
@@ -1478,8 +1492,8 @@ impl ZgcRealHeap {
                 HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
             }
             ObjectKind::Array => {
-                let data = array_data_size(header.array_length as usize, header.element_type)
-                    .unwrap_or(0);
+                let data =
+                    array_data_size(header.array_length as usize, header.element_type).unwrap_or(0);
                 HEADER_SIZE + data
             }
         }
@@ -1509,9 +1523,8 @@ impl ZgcRealHeap {
                     // element is REF_ELEMENT_SIZE and `i < len`.
                     let data = unsafe { base.add(HEADER_SIZE) };
                     for i in 0..len {
-                        let val = unsafe {
-                            read_prim_element(data, i, ArrayElementType::Reference)
-                        };
+                        let val =
+                            unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
                         if let Value::Object(Some(r)) = val {
                             work.push(r.as_ptr() as usize);
                         }
@@ -1584,8 +1597,7 @@ impl GarbageCollector for ZgcRealHeap {
             length <= ZGC_REAL_MAX_ARRAY_LENGTH,
             "array length {length} exceeds maximum {ZGC_REAL_MAX_ARRAY_LENGTH}"
         );
-        let data_size =
-            array_data_size(length, element_type).expect("array data size overflow");
+        let data_size = array_data_size(length, element_type).expect("array data size overflow");
         let total = HEADER_SIZE
             .checked_add(data_size)
             .expect("array total size overflow");
@@ -1690,12 +1702,7 @@ impl GarbageCollector for ZgcRealHeap {
         Ok(val)
     }
 
-    fn set_array_element(
-        &self,
-        obj: ObjectRef,
-        index: usize,
-        value: Value,
-    ) -> Result<(), i32> {
+    fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
         let header = self.header(obj);
         if header.kind != ObjectKind::Array {
             return Err(index as i32);
@@ -1715,18 +1722,12 @@ impl GarbageCollector for ZgcRealHeap {
                     other => {
                         // Auto-box non-Object values into a 1-field wrapper,
                         // matching `Heap::set_array_element`.
-                        let wrapper =
-                            self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, other);
                         // Re-fetch base: alloc_object cannot move existing
                         // objects (non-moving heap), so `base` is still valid,
                         // but reads are clearer with the explicit comment.
-                        write_prim_element(
-                            base,
-                            index,
-                            element_type,
-                            Value::Object(Some(wrapper)),
-                        );
+                        write_prim_element(base, index, element_type, Value::Object(Some(wrapper)));
                     }
                 }
             } else {
@@ -2125,7 +2126,10 @@ mod tests {
 
     #[test]
     fn test_heap_allocate_oom() {
-        let cfg = ZgcConfig { heap_size: 1024, ..ZgcConfig::default() };
+        let cfg = ZgcConfig {
+            heap_size: 1024,
+            ..ZgcConfig::default()
+        };
         let mut heap = ZgcHeap::new(cfg);
         // Fill beyond capacity.
         let _ = heap.allocate(512);
@@ -2224,7 +2228,9 @@ mod tests {
         c.pause_mark_start();
         c.concurrent_mark();
         c.pause_mark_end();
-        c.relocation_set = c.heap.select_relocation_set(c.heap.config.relocation_threshold);
+        c.relocation_set = c
+            .heap
+            .select_relocation_set(c.heap.config.relocation_threshold);
         for pid in &c.relocation_set.clone() {
             if let Some(p) = c.heap.pages.iter_mut().find(|p| p.id == *pid) {
                 p.is_relocating = true;
@@ -2297,7 +2303,9 @@ mod tests {
     #[test]
     fn test_generational_zgc_old_allocate() {
         let mut gen = GenerationalZgc::new(64 * 1024 * 1024, 192 * 1024 * 1024);
-        gen.old_heap.allocate_medium(1024 * 1024).expect("old alloc");
+        gen.old_heap
+            .allocate_medium(1024 * 1024)
+            .expect("old alloc");
         assert!(gen.old_heap.used_size > 0);
     }
 
@@ -2544,8 +2552,7 @@ mod tests {
     fn generational_scheduled_collect_triggers_minor_on_young_pressure() {
         let mut gen = GenerationalZgc::with_total_size(16 * 1024 * 1024, 0.25);
         // Force young occupancy above the 0.5 threshold.
-        gen.young_heap.used_size =
-            (gen.young_heap.config.heap_size as f64 * 0.6) as usize;
+        gen.young_heap.used_size = (gen.young_heap.config.heap_size as f64 * 0.6) as usize;
         let (kind, _r) = gen.scheduled_collect(&[]);
         assert_eq!(kind, GenerationalTriggerKind::Minor);
         assert_eq!(gen.minor_gc_count, 1);
@@ -2557,8 +2564,7 @@ mod tests {
         // Force old occupancy above the 0.8 threshold; the major branch
         // wins even if young pressure is also high.
         gen.old_heap.used_size = (gen.old_heap.config.heap_size as f64 * 0.9) as usize;
-        gen.young_heap.used_size =
-            (gen.young_heap.config.heap_size as f64 * 0.9) as usize;
+        gen.young_heap.used_size = (gen.young_heap.config.heap_size as f64 * 0.9) as usize;
         let (kind, _r) = gen.scheduled_collect(&[]);
         assert_eq!(kind, GenerationalTriggerKind::Major);
         assert_eq!(gen.major_gc_count, 1);
@@ -2670,7 +2676,8 @@ mod tests {
         let heap = ZgcRealHeap::new();
         let elem = heap.alloc_object(ClassId::new(4), 0);
         let arr = heap.alloc_array(ClassId::new(5), ArrayElementType::Reference, 2);
-        heap.set_array_element(arr, 0, Value::Object(Some(elem))).unwrap();
+        heap.set_array_element(arr, 0, Value::Object(Some(elem)))
+            .unwrap();
 
         let stw = StopTheWorldToken::new();
         let mut roots = [arr];

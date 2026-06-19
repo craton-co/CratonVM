@@ -103,7 +103,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -359,8 +363,7 @@ fn virtual_dispatch_guard() {
         run.stderr,
     );
     assert!(
-        !run.stdout.contains("VIRTUAL_GUARD_FAIL")
-            && !run.stdout.contains("FAIL:"),
+        !run.stdout.contains("VIRTUAL_GUARD_FAIL") && !run.stdout.contains("FAIL:"),
         "virtual-dispatch guard reported an explicit failure line.\n\
          stdout:\n{}",
         run.stdout,
@@ -438,9 +441,7 @@ fn megamorphic_site() {
     if let Some(off) = run_class("IntrinsicMegamorphic", true) {
         let det = |s: &str| -> Vec<String> {
             s.lines()
-                .filter(|l| {
-                    l.starts_with("megamorphic.") && !l.contains("Consistent")
-                })
+                .filter(|l| l.starts_with("megamorphic.") && !l.contains("Consistent"))
                 .map(|l| l.to_string())
                 .collect()
         };

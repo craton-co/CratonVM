@@ -118,14 +118,19 @@ fn read_limbs(
     name: &str,
 ) -> Result<[u64; NUM_LIMBS], cratonvm_types::error::MethodCallFailed> {
     if ctx.array_length(arr) < NUM_LIMBS {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: NUM_LIMBS as i32 }.into());
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: NUM_LIMBS as i32,
+        }
+        .into());
     }
     let mut out = [0u64; NUM_LIMBS];
     for (i, slot) in out.iter_mut().enumerate() {
         match ctx.get_array_element(arr, i) {
             Value::Long(v) => *slot = v as u64,
             // A non-long element means the caller passed the wrong array kind.
-            _ => return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: i as i32 }.into()),
+            _ => {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: i as i32 }.into())
+            }
         }
     }
     Ok(out)
@@ -137,7 +142,10 @@ fn write_limbs(
     limbs: &[i64; NUM_LIMBS],
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if ctx.array_length(arr) < NUM_LIMBS {
-        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: NUM_LIMBS as i32 }.into());
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: NUM_LIMBS as i32,
+        }
+        .into());
     }
     for (i, v) in limbs.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(*v));
@@ -222,7 +230,9 @@ mod tests {
 
     fn u(a: &[i64; 5]) -> [u64; 5] {
         let mut o = [0u64; 5];
-        for i in 0..5 { o[i] = a[i] as u64; }
+        for i in 0..5 {
+            o[i] = a[i] as u64;
+        }
         o
     }
 
@@ -248,7 +258,10 @@ mod tests {
         // emits and downstream ops assume (MAX_ADDS = 0).
         for (a, b, _) in MULT_VECTORS {
             for limb in mont_mult(&u(a), &u(b)) {
-                assert!((0..(1i64 << 52)).contains(&limb), "non-canonical limb {limb:#x}");
+                assert!(
+                    (0..(1i64 << 52)).contains(&limb),
+                    "non-canonical limb {limb:#x}"
+                );
             }
         }
     }

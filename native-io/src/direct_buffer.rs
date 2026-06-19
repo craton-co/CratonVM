@@ -87,11 +87,9 @@ fn bits() -> &'static Bits {
 }
 
 fn oom(message: impl Into<String>) -> MethodCallFailed {
-    MethodCallFailed::InternalError(VmError::Runtime(
-        RuntimeError::OutOfMemoryError {
-            message: message.into(),
-        },
-    ))
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+        message: message.into(),
+    }))
 }
 
 fn try_reserve(size: i64) -> Result<(), MethodCallFailed> {
@@ -107,8 +105,7 @@ fn try_reserve(size: i64) -> Result<(), MethodCallFailed> {
                 "Direct buffer memory: tried {size}, used {cur}, max {max}"
             )));
         }
-        if b
-            .reserved
+        if b.reserved
             .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
@@ -200,8 +197,12 @@ fn pool_take(size: usize) -> Option<(usize, *mut u8)> {
 }
 
 fn pool_put(size: usize, addr: *mut u8) -> bool {
-    let Some(idx) = bucket_for(size) else { return false };
-    let Ok(mut bucket) = pool().buckets[idx].lock() else { return false };
+    let Some(idx) = bucket_for(size) else {
+        return false;
+    };
+    let Ok(mut bucket) = pool().buckets[idx].lock() else {
+        return false;
+    };
     if bucket.len() >= POOL_PER_BUCKET {
         return false;
     }
@@ -474,7 +475,11 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let addr = dbb_allocate(cap)?;
-    let cleaner_id = if cap > 0 { register_cleaner(addr, cap) } else { 0 };
+    let cleaner_id = if cap > 0 {
+        register_cleaner(addr, cap)
+    } else {
+        0
+    };
     let cid = ctx
         .ensure_class_initialized("java/nio/DirectByteBuffer")
         .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
@@ -504,14 +509,14 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Int(c) if c == cap as i32
     );
     if !named_ok {
-        ctx.set_field(buf, 0, Value::Int(0));            // position
-        ctx.set_field(buf, 1, Value::Int(cap as i32));   // limit
-        ctx.set_field(buf, 2, Value::Int(cap as i32));   // capacity
-        ctx.set_field(buf, 3, Value::Int(-1));           // mark
+        ctx.set_field(buf, 0, Value::Int(0)); // position
+        ctx.set_field(buf, 1, Value::Int(cap as i32)); // limit
+        ctx.set_field(buf, 2, Value::Int(cap as i32)); // capacity
+        ctx.set_field(buf, 3, Value::Int(-1)); // mark
         ctx.set_field(buf, 4, Value::Long(addr as i64)); // address
-        ctx.set_field(buf, 5, Value::Long(cap));         // native_size
-        ctx.set_field(buf, 6, Value::Int(cleaner_id));   // cleaner id
-        ctx.set_field(buf, 7, Value::Int(0));            // padding / direct flag
+        ctx.set_field(buf, 5, Value::Long(cap)); // native_size
+        ctx.set_field(buf, 6, Value::Int(cleaner_id)); // cleaner id
+        ctx.set_field(buf, 7, Value::Int(0)); // padding / direct flag
     }
 
     // Round-5 Fix 6 (HIGH): wire a real PhantomReference / Cleaner so the
@@ -547,8 +552,8 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         let cleanable = ctx.alloc_object(cleanable_cid, 3);
         ctx.set_field(cleanable, 0, Value::Object(Some(dealloc))); // action
-        ctx.set_field(cleanable, 1, Value::Int(0));                // cleaned
-        ctx.set_field(cleanable, 2, Value::Int(-1));               // ref id
+        ctx.set_field(cleanable, 1, Value::Int(0)); // cleaned
+        ctx.set_field(cleanable, 2, Value::Int(-1)); // ref id
 
         // ref_type = 3 (Cleaner) — see vm_exec::discover_reference dispatch.
         // The ref processor enqueues `cleanable` into `cleaner_actions` when
@@ -669,7 +674,9 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // consumed finds nothing here, and a free that races in after the
     // address was recycled is rejected by generation mismatch inside
     // `free_checked` — neither can double-`pool_put` the live block.
-    if let Some((size, generation)) = take_unsafe_alloc(addr).or_else(|| take_cleaner_size_for_addr(addr)) {
+    if let Some((size, generation)) =
+        take_unsafe_alloc(addr).or_else(|| take_cleaner_size_for_addr(addr))
+    {
         free_checked(addr, size, generation);
     }
     Ok(None)
@@ -927,14 +934,24 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java.nio.Bits accounting natives.
-    r.register("java/nio/Bits", "reserveMemory", "(JJ)V", bits_reserve_memory);
+    r.register(
+        "java/nio/Bits",
+        "reserveMemory",
+        "(JJ)V",
+        bits_reserve_memory,
+    );
     r.register(
         "java/nio/Bits",
         "reserveMemory",
         "(JI)V",
         bits_reserve_memory,
     );
-    r.register("java/nio/Bits", "unreserveMemory", "(JJ)V", bits_unreserve_memory);
+    r.register(
+        "java/nio/Bits",
+        "unreserveMemory",
+        "(JJ)V",
+        bits_unreserve_memory,
+    );
     r.register(
         "java/nio/Bits",
         "unreserveMemory",
@@ -1153,10 +1170,10 @@ mod tests {
     #[test]
     fn wp35_pool_bucket_classification() {
         assert_eq!(bucket_for(0), None);
-        assert_eq!(bucket_for(1), Some(0));   // round to 64 (2^6) → idx 0
-        assert_eq!(bucket_for(64), Some(0));  // exact bucket-0 fit
-        assert_eq!(bucket_for(4096), Some(6));// 2^12, idx = 12-6 = 6
-        // Beyond 2 MiB falls through to direct system free.
+        assert_eq!(bucket_for(1), Some(0)); // round to 64 (2^6) → idx 0
+        assert_eq!(bucket_for(64), Some(0)); // exact bucket-0 fit
+        assert_eq!(bucket_for(4096), Some(6)); // 2^12, idx = 12-6 = 6
+                                               // Beyond 2 MiB falls through to direct system free.
         assert_eq!(bucket_for(8 * 1024 * 1024), None);
     }
 }

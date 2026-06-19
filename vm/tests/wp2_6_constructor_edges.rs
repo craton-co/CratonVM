@@ -25,8 +25,7 @@
 
 use cratonvm_native_api::NativeMethodRegistry;
 use cratonvm_vm::runtime::lang_reflect_constructor::{
-    ConstructorAccess, CtorTestCase, InstantiationClassification,
-    is_inner_class_ctor_descriptor,
+    is_inner_class_ctor_descriptor, ConstructorAccess, CtorTestCase, InstantiationClassification,
 };
 
 #[test]
@@ -173,10 +172,7 @@ fn case_8_inner_class_descriptor_detection() {
         "com/example/Outer"
     ));
     // Top-level constructor — no outer reference.
-    assert!(!is_inner_class_ctor_descriptor(
-        "(I)V",
-        "com/example/Outer"
-    ));
+    assert!(!is_inner_class_ctor_descriptor("(I)V", "com/example/Outer"));
     assert!(!is_inner_class_ctor_descriptor(
         "(Lcom/example/Other;)V",
         "com/example/Outer"

@@ -43,7 +43,11 @@ fn method_annotations_view_finds_test_on_m() {
         .expect("m() must exist");
     let view = method_annotations(m);
     let visible: Vec<_> = view.runtime_visible().collect();
-    assert_eq!(visible.len(), 1, "@Test is the only runtime-visible annotation on m()");
+    assert_eq!(
+        visible.len(),
+        1,
+        "@Test is the only runtime-visible annotation on m()"
+    );
 
     // `find_by_type_descriptor` returns a reference to the matching annotation.
     let found = view.find_by_type_descriptor("LTest;", |idx| cf.constant_pool.get_utf8(idx));
@@ -63,7 +67,10 @@ fn field_annotations_view_finds_test_on_f() {
         .expect("field f must exist");
     let view = field_annotations(f);
     let visible_count = view.runtime_visible().count();
-    assert_eq!(visible_count, 1, "@Test is the only runtime-visible annotation on f");
+    assert_eq!(
+        visible_count, 1,
+        "@Test is the only runtime-visible annotation on f"
+    );
     let found = view.find_by_type_descriptor("LTest;", |idx| cf.constant_pool.get_utf8(idx));
     assert!(found.is_some(), "LTest; must resolve on f");
 }
@@ -80,9 +87,8 @@ fn view_returns_none_for_missing_descriptor() {
         .find(|m| &*m.name == "m")
         .expect("m() must exist");
     let view = method_annotations(m);
-    let missing = view.find_by_type_descriptor("Ldoes/not/Exist;", |idx| {
-        cf.constant_pool.get_utf8(idx)
-    });
+    let missing =
+        view.find_by_type_descriptor("Ldoes/not/Exist;", |idx| cf.constant_pool.get_utf8(idx));
     assert!(missing.is_none());
 }
 
@@ -98,7 +104,10 @@ fn annotation_type_matches_works_for_class_level() {
             cf.constant_pool.get_utf8(idx).map(|s| s.to_string())
         })
     });
-    assert!(any_test.is_some(), "class-level @Test must match on AnnotationProbe");
+    assert!(
+        any_test.is_some(),
+        "class-level @Test must match on AnnotationProbe"
+    );
 }
 
 #[test]

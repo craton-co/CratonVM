@@ -260,9 +260,7 @@ impl CompressedOops {
                     return CompressedOop::NULL;
                 }
                 match self.mode {
-                    CompressedOopsMode::ZeroBased => {
-                        CompressedOop((addr >> self.shift) as u32)
-                    }
+                    CompressedOopsMode::ZeroBased => CompressedOop((addr >> self.shift) as u32),
                     // HeapBased — `is_encodable` already proved `addr >= base`.
                     _ => CompressedOop(((addr - self.base) >> self.shift) as u32),
                 }
@@ -281,9 +279,7 @@ impl CompressedOops {
         match self.mode {
             CompressedOopsMode::Uncompressed => oop.0 as u64,
             CompressedOopsMode::ZeroBased => (oop.0 as u64) << self.shift,
-            CompressedOopsMode::HeapBased => {
-                self.base + ((oop.0 as u64) << self.shift)
-            }
+            CompressedOopsMode::HeapBased => self.base + ((oop.0 as u64) << self.shift),
         }
     }
 
@@ -399,9 +395,7 @@ pub struct CompressedOopArray {
 impl CompressedOopArray {
     /// Create a new array of the given length, initialized to null.
     pub fn new(len: usize) -> Self {
-        CompressedOopArray {
-            data: vec![0; len],
-        }
+        CompressedOopArray { data: vec![0; len] }
     }
 
     /// Number of elements.

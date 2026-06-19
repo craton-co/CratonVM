@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
@@ -248,10 +248,7 @@ fn extract_string_arg(ctx: &dyn NativeContext, v: Value) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// `JarFile.<init>(File)` — open the jar and stash the handle.
-fn native_jarfile_init_file(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jarfile_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -273,10 +270,7 @@ fn native_jarfile_init_file(
 }
 
 /// `JarFile.<init>(String)` — open the jar by path.
-fn native_jarfile_init_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jarfile_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -397,10 +391,7 @@ fn open_and_register(
 }
 
 /// `JarFile.getEntry(String)` / `ZipFile.getEntry(String)` → `ZipEntry`.
-fn native_jarfile_get_entry(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -466,7 +457,12 @@ fn native_jarfile_get_entry(
     drop(table);
 
     Ok(Some(Value::Object(Some(alloc_zip_entry(
-        ctx, &entry_name, method, size, csize, crc,
+        ctx,
+        &entry_name,
+        method,
+        size,
+        csize,
+        crc,
     )))))
 }
 
@@ -576,8 +572,7 @@ fn native_jarfile_get_input_stream(
             Some(i) => *i,
             None => {
                 // Lazy fill — same O(n) `file_names` path as `getEntry`.
-                let mut idx: HashMap<String, usize> =
-                    HashMap::with_capacity(state.archive.len());
+                let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
                 for (i, n) in state.archive.file_names().enumerate() {
                     idx.insert(n.to_string(), i);
                 }
@@ -591,9 +586,7 @@ fn native_jarfile_get_input_stream(
         };
         let mut zf = state.archive.by_index(idx).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
-                message: format!(
-                    "JarFile.getInputStream({name}): by_index({idx}) failed: {e}"
-                ),
+                message: format!("JarFile.getInputStream({name}): by_index({idx}) failed: {e}"),
             })
         })?;
         // Audit fix: ZIP entries can declare uncompressed sizes >=4 GiB
@@ -654,10 +647,7 @@ fn build_byte_array_input_stream(
 /// `ZipFile.entries()` / `JarFile.entries()` → `Enumeration<ZipEntry>`.
 /// Returns a synthetic `java.util.Enumeration` backed by a Rust Vec
 /// snapshot of the archive's entries.
-fn native_jarfile_entries(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jarfile_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -715,11 +705,11 @@ fn native_jarfile_entries(
     // Build a java.util.ArrayList containing ZipEntry objects, then
     // return `list.elements()` — an Enumeration view.
     let al_class = "java/util/ArrayList";
-    let al_cid = ctx
-        .ensure_class_initialized(al_class)
-        .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
+    let al_cid = ctx.ensure_class_initialized(al_class).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
             message: format!("{al_class}: not loaded"),
-        }))?;
+        })
+    })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
     for (name, method, size, csize, crc) in entries {
@@ -743,10 +733,7 @@ fn native_jarfile_entries(
 
 /// `JarFile.getManifest()` → `java.util.jar.Manifest` loaded from
 /// `META-INF/MANIFEST.MF`, or null if absent.
-fn native_jarfile_get_manifest(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_jarfile_get_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -762,8 +749,7 @@ fn native_jarfile_get_manifest(
         // `file_names()` scan on every call. Build the index once (same as
         // `getEntry`/`getInputStream`), then do a hashed lookup.
         if state.name_index.is_none() {
-            let mut idx: HashMap<String, usize> =
-                HashMap::with_capacity(state.archive.len());
+            let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
             for (i, n) in state.archive.file_names().enumerate() {
                 idx.insert(n.to_string(), i);
             }
@@ -773,16 +759,13 @@ fn native_jarfile_get_manifest(
         // under the canonical "META-INF/MANIFEST.MF". Some archives use a
         // lower/mixed-case path, so retain the case-insensitive fallback
         // (still hashed for the common case) to match prior behavior.
-        let idx_opt = state
-            .name_index
-            .as_ref()
-            .and_then(|m| {
-                m.get("META-INF/MANIFEST.MF").copied().or_else(|| {
-                    m.iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
-                        .map(|(_, i)| *i)
-                })
-            });
+        let idx_opt = state.name_index.as_ref().and_then(|m| {
+            m.get("META-INF/MANIFEST.MF").copied().or_else(|| {
+                m.iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
+                    .map(|(_, i)| *i)
+            })
+        });
         let Some(idx) = idx_opt else {
             return Ok(Some(Value::Object(None)));
         };
@@ -795,11 +778,7 @@ fn native_jarfile_get_manifest(
         // `getInputStream`: reject an oversized or bomb-ratio manifest
         // entry, and bound the eager pre-allocation.
         let raw_size = zf.size();
-        let size = guard_zip_entry_size(
-            "META-INF/MANIFEST.MF",
-            raw_size,
-            zf.compressed_size(),
-        )?;
+        let size = guard_zip_entry_size("META-INF/MANIFEST.MF", raw_size, zf.compressed_size())?;
         let mut buf = Vec::with_capacity(prealloc_hint(size));
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
@@ -908,7 +887,12 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/io/File;Z)V",
             native_jarfile_init_file_verify,
         );
-        r.register(cls, "<init>", "(Ljava/lang/String;)V", native_jarfile_init_string);
+        r.register(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_jarfile_init_string,
+        );
         r.register(
             cls,
             "<init>",
@@ -934,7 +918,12 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
             native_jarfile_entries,
         );
         r.register(cls, "close", "()V", native_jarfile_close);
-        r.register(cls, "getName", "()Ljava/lang/String;", native_jarfile_get_name);
+        r.register(
+            cls,
+            "getName",
+            "()Ljava/lang/String;",
+            native_jarfile_get_name,
+        );
         r.register(cls, "size", "()I", native_jarfile_size);
     }
 
@@ -965,8 +954,8 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let file = tmp.reopen().unwrap();
         let mut zw = zip::ZipWriter::new(file);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
         zw.write_all(b"Manifest-Version: 1.0\r\n\r\n").unwrap();
         zw.start_file("hello.txt", opts).unwrap();

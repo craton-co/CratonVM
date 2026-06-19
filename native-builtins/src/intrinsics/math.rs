@@ -36,8 +36,8 @@
 //! how edge-case coverage is achieved here.
 
 use cratonvm_native_api::NativeContext;
-use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // Operand decoding — identical idiom to `crate::lang_math`.
@@ -145,37 +145,25 @@ fn compute_sqrt(v: f64) -> f64 {
 
 /// Intrinsic for `java/lang/Math.abs (I)I` (static).
 #[inline(always)]
-pub fn intrinsic_math_abs_int(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(compute_abs_int(int_arg(args, 0)))))
 }
 
 /// Intrinsic for `java/lang/Math.abs (J)J` (static).
 #[inline(always)]
-pub fn intrinsic_math_abs_long(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_abs_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(compute_abs_long(long_arg(args, 0)))))
 }
 
 /// Intrinsic for `java/lang/Math.abs (D)D` (static).
 #[inline(always)]
-pub fn intrinsic_math_abs_double(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_abs_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Double(compute_abs_double(double_arg(args, 0)))))
 }
 
 /// Intrinsic for `java/lang/Math.min (II)I` (static).
 #[inline(always)]
-pub fn intrinsic_math_min_int(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(compute_min_int(
         int_arg(args, 0),
         int_arg(args, 1),
@@ -184,10 +172,7 @@ pub fn intrinsic_math_min_int(
 
 /// Intrinsic for `java/lang/Math.max (II)I` (static).
 #[inline(always)]
-pub fn intrinsic_math_max_int(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(compute_max_int(
         int_arg(args, 0),
         int_arg(args, 1),
@@ -196,10 +181,7 @@ pub fn intrinsic_math_max_int(
 
 /// Intrinsic for `java/lang/Math.min (JJ)J` (static).
 #[inline(always)]
-pub fn intrinsic_math_min_long(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_min_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(compute_min_long(
         long_arg(args, 0),
         long_arg(args, 1),
@@ -208,10 +190,7 @@ pub fn intrinsic_math_min_long(
 
 /// Intrinsic for `java/lang/Math.max (JJ)J` (static).
 #[inline(always)]
-pub fn intrinsic_math_max_long(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_max_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Long(compute_max_long(
         long_arg(args, 0),
         long_arg(args, 1),
@@ -220,10 +199,7 @@ pub fn intrinsic_math_max_long(
 
 /// Intrinsic for `java/lang/Math.sqrt (D)D` (static).
 #[inline(always)]
-pub fn intrinsic_math_sqrt(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_math_sqrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Double(compute_sqrt(double_arg(args, 0)))))
 }
 
@@ -378,7 +354,10 @@ mod tests {
         assert_eq!(double_arg(&[], 0), 0.0);
         // second operand index
         assert_eq!(int_arg(&[Value::Int(1), Value::Int(2)], 1), 2);
-        assert_eq!(double_arg(&[Value::Double(1.0), Value::Double(2.0)], 1), 2.0);
+        assert_eq!(
+            double_arg(&[Value::Double(1.0), Value::Double(2.0)], 1),
+            2.0
+        );
     }
 
     // -- handler signatures -------------------------------------------------

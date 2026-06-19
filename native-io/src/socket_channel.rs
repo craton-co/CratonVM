@@ -37,15 +37,15 @@
 //!
 //! All public surface is registered via `register_socket_channel_real`.
 
-use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
@@ -92,14 +92,11 @@ pub(crate) fn tcp_registry() -> &'static RwLock<HashMap<i32, TcpHandle>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-
 /// Try to clone a registered handle out of the tcp_registry. Returns
 /// None if the id is unknown / Closed / Connecting. Used by the selector
 /// to obtain a `SelectableKind` it can poll without taking ownership of
 /// the live JDK-visible handle.
-pub(crate) fn tcp_clone_for_selector(
-    id: i32,
-) -> Option<TcpHandleClone> {
+pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
     let regs = tcp_registry().read();
     match regs.get(&id) {
         Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
@@ -146,7 +143,10 @@ fn tcp_remove(id: i32) {
 // ---------------------------------------------------------------------------
 
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
@@ -386,13 +386,18 @@ pub(crate) fn decode_socket_address(
         Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
-    let host_via_method = match ctx.invoke_virtual(sa, "getHostString", "()Ljava/lang/String;", &[]) {
+    let host_via_method = match ctx.invoke_virtual(sa, "getHostString", "()Ljava/lang/String;", &[])
+    {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
     };
     if let Some(p) = port_via_method {
         let h = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
-        let h = if h.is_empty() { "0.0.0.0".to_string() } else { h };
+        let h = if h.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            h
+        };
         return Ok((h, p));
     }
 
@@ -555,7 +560,11 @@ fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u
             }
             Some(v)
         }
-        BufferAccess::Heap { arr, offset, length } if length > 0 => {
+        BufferAccess::Heap {
+            arr,
+            offset,
+            length,
+        } if length > 0 => {
             // Bulk read via NativeContext intrinsic. The old element-by-element
             // loop clamped `length` to whatever fit before `arr_len`; preserve
             // that by clamping the effective length here.
@@ -589,17 +598,18 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
             }
             n
         }
-        BufferAccess::Heap { arr, offset, length } if length > 0 => {
+        BufferAccess::Heap {
+            arr,
+            offset,
+            length,
+        } if length > 0 => {
             // Bulk write via NativeContext intrinsic. The old loop wrote at
             // most `min(data.len(), length)` bytes, stopping early if it ran
             // past `arr_len`; clamp the effective length the same way.
             let arr_len = ctx.array_length(arr);
             let off = offset as usize;
             let avail = arr_len.saturating_sub(off);
-            let n = (data.len() as i32)
-                .min(length)
-                .max(0)
-                .min(avail as i32);
+            let n = (data.len() as i32).min(length).max(0).min(avail as i32);
             ctx.write_byte_array_from(arr, off, &data[..n as usize]);
             n
         }
@@ -651,7 +661,11 @@ fn sc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
-        Some(o) => Ok(Some(Value::Int(if read_blocking_flag(ctx, o) { 1 } else { 0 }))),
+        Some(o) => Ok(Some(Value::Int(if read_blocking_flag(ctx, o) {
+            1
+        } else {
+            0
+        }))),
         _ => Ok(Some(Value::Int(1))),
     }
 }
@@ -684,7 +698,12 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         None => return Ok(Some(Value::Object(None))),
     };
     let blocking = bool_arg(args, 1);
-    cf_set(ctx, this, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
+    cf_set(
+        ctx,
+        this,
+        F_BLOCKING,
+        Value::Int(if blocking { 1 } else { 0 }),
+    );
     if let Some(id) = read_reg_id(ctx, this) {
         // Apply to the live socket — both stream and listener support it.
         let map = tcp_registry().read();
@@ -907,9 +926,7 @@ fn sc_connect_inner(
         let stream = match crate::outbound_policy::policy_connect(&target) {
             Ok(s) => s,
             Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
-                return Err(ioex(format!(
-                    "connect denied by outbound policy: {reason}"
-                )));
+                return Err(ioex(format!("connect denied by outbound policy: {reason}")));
             }
             Err(crate::outbound_policy::PolicyConnectError::Io(e)) => {
                 return Err(map_err(&target, e));
@@ -932,7 +949,9 @@ fn sc_connect_inner(
         let host_str = ctx.create_string(&host);
         cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-        ipc_dbg(format!("connect success(blocking) id={id} local_port={local_port}"));
+        ipc_dbg(format!(
+            "connect success(blocking) id={id} local_port={local_port}"
+        ));
         return Ok(true);
     }
 
@@ -1082,9 +1101,9 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // background worker / completion channel any more).
     use crate::nb_connect::ConnectPoll;
     enum Verdict {
-        Connected,           // already a Stream
-        Pending,             // still connecting
-        Promote(i32),        // connecting socket completed → local port
+        Connected,    // already a Stream
+        Pending,      // still connecting
+        Promote(i32), // connecting socket completed → local port
         Failed(MethodCallFailed),
         NotConnecting,
     }
@@ -1153,9 +1172,7 @@ fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::i
     match s.read(buf) {
         Ok(0) => Ok(Some(-1)),
         Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-            Ok(None)
-        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
         Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
         Err(e) => Err(e),
     }
@@ -1180,14 +1197,13 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
     };
-    let id = read_reg_id(ctx, this)
-        .ok_or_else(|| ioex("read: channel not connected"))?;
+    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("read: channel not connected"))?;
 
     // Determine the writable region. We materialize into a heap buffer here
     // and copy into the buffer slot afterwards so we don't hold a registry
     // lock across `set_array_element`.
-    let access = buffer_access(ctx, bb)
-        .ok_or_else(|| ioex("read: ByteBuffer has no decodable layout"))?;
+    let access =
+        buffer_access(ctx, bb).ok_or_else(|| ioex("read: ByteBuffer has no decodable layout"))?;
     let len = match access {
         BufferAccess::Direct { length, .. } => length,
         BufferAccess::Heap { length, .. } => length,
@@ -1200,7 +1216,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let n_opt = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => try_read_nb(s, &mut buf).map_err(|e| map_err("read", e))?,
+            Some(TcpHandle::Stream(s)) => {
+                try_read_nb(s, &mut buf).map_err(|e| map_err("read", e))?
+            }
             Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
             _ => return Err(ioex("read: channel not a stream")),
         }
@@ -1227,8 +1245,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("write: null ByteBuffer")),
     };
-    let id = read_reg_id(ctx, this)
-        .ok_or_else(|| ioex("write: channel not connected"))?;
+    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("write: channel not connected"))?;
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
@@ -1236,7 +1253,9 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let n_opt = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => try_write_nb(s, &data).map_err(|e| map_err("write", e))?,
+            Some(TcpHandle::Stream(s)) => {
+                try_write_nb(s, &data).map_err(|e| map_err("write", e))?
+            }
             Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
             _ => return Err(ioex("write: channel not a stream")),
         }
@@ -1301,8 +1320,8 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("write(gathering): null buffer array")),
     };
-    let id = read_reg_id(ctx, this)
-        .ok_or_else(|| ioex("write(gathering): channel not connected"))?;
+    let id =
+        read_reg_id(ctx, this).ok_or_else(|| ioex("write(gathering): channel not connected"))?;
 
     // Collect each buffer's readable region (in order), keeping the buffer ref
     // so we can advance its position by the bytes actually consumed.
@@ -1370,8 +1389,8 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("read(scattering): null buffer array")),
     };
-    let id = read_reg_id(ctx, this)
-        .ok_or_else(|| ioex("read(scattering): channel not connected"))?;
+    let id =
+        read_reg_id(ctx, this).ok_or_else(|| ioex("read(scattering): channel not connected"))?;
 
     // Sum the writable capacity across the buffer slice; remember each target
     // so we can scatter the bytes back afterward (in array order).
@@ -1458,8 +1477,8 @@ pub(crate) fn tcp_stream_available(id: i32) -> Option<i32> {
 fn apply_option(stream: &TcpStream, name: &str, val: i32) -> Result<(), std::io::Error> {
     match name {
         "TCP_NODELAY" => stream.set_nodelay(val != 0),
-        "SO_KEEPALIVE" => Ok(()),     // std::net offers no setter without socket2
-        "SO_REUSEADDR" => Ok(()),     // pre-bind only
+        "SO_KEEPALIVE" => Ok(()), // std::net offers no setter without socket2
+        "SO_REUSEADDR" => Ok(()), // pre-bind only
         "SO_RCVBUF" | "SO_SNDBUF" => Ok(()),
         _ => Ok(()),
     }
@@ -1529,11 +1548,7 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 /// Box a socket-option value as the JDK type the `SocketOption<T>` declares:
 /// `Boolean` for the flag options, otherwise `Integer`.
-fn box_socket_option(
-    ctx: &mut dyn NativeContext,
-    opt_name: &str,
-    raw: i32,
-) -> MethodCallResult {
+fn box_socket_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> MethodCallResult {
     let is_bool = matches!(
         opt_name,
         "TCP_NODELAY"
@@ -1597,7 +1612,10 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         format!("{host}:{port}")
     };
     let listener = TcpListener::bind(&bind_text).map_err(|e| map_err(&bind_text, e))?;
-    let local_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(port as i32);
+    let local_port = listener
+        .local_addr()
+        .map(|a| a.port() as i32)
+        .unwrap_or(port as i32);
     let blocking = read_blocking_flag(ctx, this);
     if !blocking {
         listener
@@ -1617,8 +1635,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("accept: null channel")),
     };
-    let id = read_reg_id(ctx, this)
-        .ok_or_else(|| ioex("accept: server channel not bound"))?;
+    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("accept: server channel not bound"))?;
     let blocking = read_blocking_flag(ctx, this);
 
     // Wave 3 Task C: the selector loop pre-drains pending accepts when
@@ -1631,9 +1648,9 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let listener_clone = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Listener(l)) => l
-                .try_clone()
-                .map_err(|e| map_err("accept clone", e))?,
+            Some(TcpHandle::Listener(l)) => {
+                l.try_clone().map_err(|e| map_err("accept clone", e))?
+            }
             _ => return Err(ioex("accept: id is not a listener")),
         }
     };
@@ -1643,9 +1660,9 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let _ = listener_clone.set_nonblocking(!blocking);
 
     let accepted = if let Some(stream) = preaccepted {
-        let peer = stream.peer_addr().unwrap_or_else(|_| {
-            "0.0.0.0:0".parse().unwrap()
-        });
+        let peer = stream
+            .peer_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
         Some((stream, peer))
     } else {
         match listener_clone.accept() {
@@ -1671,7 +1688,12 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
     init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
-    cf_set(ctx, child, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
+    cf_set(
+        ctx,
+        child,
+        F_BLOCKING,
+        Value::Int(if blocking { 1 } else { 0 }),
+    );
     cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
     cf_set(ctx, child, F_CONNECTED, Value::Int(1));
     cf_set(ctx, child, F_LOCAL_PORT, Value::Int(local_port));
@@ -1767,12 +1789,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         // then cancels keys under keyLock with keyCount==0 — a no-op for us.)
         r.register(c, "implCloseSelectableChannel", "()V", sc_close);
         r.register(c, "implCloseChannel", "()V", sc_close);
-        r.register(
-            c,
-            "connect",
-            "(Ljava/net/SocketAddress;)Z",
-            sc_connect,
-        );
+        r.register(c, "connect", "(Ljava/net/SocketAddress;)Z", sc_connect);
         r.register(
             c,
             "blockingConnect",
@@ -1791,7 +1808,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         // write path flushes header+body via the gathering form (DF03).
         r.register(c, "read", "([Ljava/nio/ByteBuffer;II)J", sc_read_scattering);
         r.register(c, "read", "([Ljava/nio/ByteBuffer;)J", sc_read_scattering);
-        r.register(c, "write", "([Ljava/nio/ByteBuffer;II)J", sc_write_gathering);
+        r.register(
+            c,
+            "write",
+            "([Ljava/nio/ByteBuffer;II)J",
+            sc_write_gathering,
+        );
         r.register(c, "write", "([Ljava/nio/ByteBuffer;)J", sc_write_gathering);
         r.register(
             c,
@@ -1825,7 +1847,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 
     // -- ServerSocketChannel factory + lifecycle --
     for c in [ssc, sscimpl] {
-        r.register(c, "open", "()Ljava/nio/channels/ServerSocketChannel;", ssc_open);
+        r.register(
+            c,
+            "open",
+            "()Ljava/nio/channels/ServerSocketChannel;",
+            ssc_open,
+        );
         r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
@@ -1858,7 +1885,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketAddress;)Ljava/nio/channels/NetworkChannel;",
             ssc_bind,
         );
-        r.register(c, "accept", "()Ljava/nio/channels/SocketChannel;", ssc_accept);
+        r.register(
+            c,
+            "accept",
+            "()Ljava/nio/channels/SocketChannel;",
+            ssc_accept,
+        );
         r.register(
             c,
             "setOption",
@@ -1976,26 +2008,19 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // fix in `native-collections/src/lib.rs`.
 const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
 
-fn ss_back_ref_table()
-    -> &'static RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>
-{
+fn ss_back_ref_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, ObjectRef>> {
     static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
 fn ss_record_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef, ssc: ObjectRef) {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table()
-        .write()
-        .insert(key, ssc);
+    ss_back_ref_table().write().insert(key, ssc);
 }
 
 fn ss_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) -> Option<ObjectRef> {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table()
-        .read()
-        .get(&key)
-        .copied()
+    ss_back_ref_table().read().get(&key).copied()
 }
 
 /// Post-GC hook — remap the SSC `ObjectRef` values that
@@ -2010,9 +2035,7 @@ fn ss_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) -> Option<ObjectRef> 
 /// the previous `from_raw(usize)` resurrection carried — the worst-case
 /// behaviour now is a missed lookup rather than a wild dereference.
 #[allow(dead_code)]
-pub fn ss_back_ref_update_after_gc(
-    pointer_map: &rustc_hash::FxHashMap<usize, usize>,
-) {
+pub fn ss_back_ref_update_after_gc(pointer_map: &rustc_hash::FxHashMap<usize, usize>) {
     if pointer_map.is_empty() {
         return;
     }
@@ -2213,9 +2236,7 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let _ = ssc_close(ctx, &[Value::Object(Some(ssc))])?;
         // C27: remove the identity-hashed key (was raw pointer before).
         let key = ctx.identity_hash_code(this);
-        ss_back_ref_table()
-            .write()
-            .remove(&key);
+        ss_back_ref_table().write().remove(&key);
     }
     Ok(None)
 }

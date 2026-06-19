@@ -128,8 +128,7 @@ fn cratonvm_binary() -> PathBuf {
 /// Returns `Ok(())` on success, or `Err` with a human-readable message on
 /// failure.
 fn try_load_class(classpath: &[&str], class_name: &str) -> Result<(), String> {
-    let config =
-        VmConfig::new().with_classpath(classpath.iter().map(|s| s.to_string()).collect());
+    let config = VmConfig::new().with_classpath(classpath.iter().map(|s| s.to_string()).collect());
     let shared = Arc::new(SharedVm::new(config));
     *shared.self_arc.write() = Some(Arc::downgrade(&shared));
 
@@ -147,13 +146,8 @@ fn try_load_class(classpath: &[&str], class_name: &str) -> Result<(), String> {
 ///
 /// Returns `Ok(())` if invocation completes (even if the Java side throws),
 /// or `Err` with a diagnostic message if something goes wrong at the VM level.
-fn try_invoke_main(
-    classpath: &[&str],
-    class_name: &str,
-    _args: &[&str],
-) -> Result<(), String> {
-    let config =
-        VmConfig::new().with_classpath(classpath.iter().map(|s| s.to_string()).collect());
+fn try_invoke_main(classpath: &[&str], class_name: &str, _args: &[&str]) -> Result<(), String> {
+    let config = VmConfig::new().with_classpath(classpath.iter().map(|s| s.to_string()).collect());
     let mut vm = Vm::new(config);
 
     vm.shared
@@ -217,15 +211,14 @@ fn classpath_from_home_lib(home: &str) -> Vec<String> {
 /// Returns `Err` on connection failure or timeout.
 fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("connection to {addr} failed: {e}"))?;
+    let mut stream =
+        TcpStream::connect(&addr).map_err(|e| format!("connection to {addr} failed: {e}"))?;
     stream
         .set_read_timeout(Some(HTTP_TIMEOUT))
         .map_err(|e| format!("set_read_timeout failed: {e}"))?;
 
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
@@ -276,10 +269,7 @@ fn wait_for_stdout_line<F: Fn(&str) -> bool>(
     predicate: F,
     timeout: Duration,
 ) -> Result<String, String> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("child has no stdout")?;
+    let stdout = child.stdout.take().ok_or("child has no stdout")?;
     let reader = BufReader::new(stdout);
     let deadline = Instant::now() + timeout;
 
@@ -314,10 +304,7 @@ fn t4_9_1_spring_boot_petclinic() {
     let jar = check_prereq_env("PETCLINIC_JAR").unwrap();
 
     // Phase 1: Verify the launcher class is loadable.
-    let result = try_load_class(
-        &[&jar],
-        "org/springframework/boot/loader/JarLauncher",
-    );
+    let result = try_load_class(&[&jar], "org/springframework/boot/loader/JarLauncher");
     assert!(
         result.is_ok(),
         "Petclinic launcher class loading failed: {}",
@@ -325,11 +312,7 @@ fn t4_9_1_spring_boot_petclinic() {
     );
 
     // Phase 2: Attempt to invoke main.
-    let result = try_invoke_main(
-        &[&jar],
-        "org/springframework/boot/loader/JarLauncher",
-        &[],
-    );
+    let result = try_invoke_main(&[&jar], "org/springframework/boot/loader/JarLauncher", &[]);
     assert!(
         result.is_ok(),
         "Petclinic main invocation failed: {}",
@@ -355,7 +338,9 @@ fn t4_9_1_spring_boot_petclinic() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("[T4.9.1] HTTP GET /owners failed: {e} (app may not have fully booted)");
+                    eprintln!(
+                        "[T4.9.1] HTTP GET /owners failed: {e} (app may not have fully booted)"
+                    );
                 }
             }
         } else {
@@ -534,10 +519,7 @@ fn t4_9_4_netty_echo_server() {
 
                 let mut buf = vec![0u8; msg.len()];
                 if stream.read_exact(&mut buf).is_ok() {
-                    assert_eq!(
-                        &buf, msg,
-                        "echo server must return the same data we sent"
-                    );
+                    assert_eq!(&buf, msg, "echo server must return the same data we sent");
                 }
             }
         }
@@ -568,10 +550,7 @@ fn t4_9_5_cassandra_smoke() {
     let cp_refs: Vec<&str> = cp.iter().map(|s| s.as_str()).collect();
 
     // Phase 1: Verify the Cassandra daemon class loads.
-    let result = try_load_class(
-        &cp_refs,
-        "org/apache/cassandra/service/CassandraDaemon",
-    );
+    let result = try_load_class(&cp_refs, "org/apache/cassandra/service/CassandraDaemon");
     assert!(
         result.is_ok(),
         "Cassandra daemon class loading failed: {}",
@@ -579,10 +558,7 @@ fn t4_9_5_cassandra_smoke() {
     );
 
     // Phase 2: Verify the CQL transport class loads.
-    let result = try_load_class(
-        &cp_refs,
-        "org/apache/cassandra/transport/Server",
-    );
+    let result = try_load_class(&cp_refs, "org/apache/cassandra/transport/Server");
     assert!(
         result.is_ok(),
         "Cassandra CQL transport class loading failed: {}",
@@ -661,10 +637,7 @@ fn t4_9_6_elasticsearch_index() {
 
     // Phase 1: Verify the Elasticsearch bootstrap class loads.
     let cp_refs: Vec<&str> = cp.iter().map(|s| s.as_str()).collect();
-    let result = try_load_class(
-        &cp_refs,
-        "org/elasticsearch/bootstrap/Elasticsearch",
-    );
+    let result = try_load_class(&cp_refs, "org/elasticsearch/bootstrap/Elasticsearch");
     assert!(
         result.is_ok(),
         "Elasticsearch bootstrap class loading failed: {}",
@@ -757,10 +730,7 @@ fn t4_9_7_kafka_produce_consume() {
     );
 
     // Phase 2: Verify the KafkaProducer class loads.
-    let result = try_load_class(
-        &cp_refs,
-        "org/apache/kafka/clients/producer/KafkaProducer",
-    );
+    let result = try_load_class(&cp_refs, "org/apache/kafka/clients/producer/KafkaProducer");
     assert!(
         result.is_ok(),
         "KafkaProducer class loading failed: {}",
@@ -775,12 +745,8 @@ fn t4_9_7_kafka_produce_consume() {
             .join("kraft")
             .join("server.properties");
         if config_file.exists() {
-            let mut child = spawn_cratonvm(&[
-                "-cp",
-                &cp_str,
-                "kafka.Kafka",
-                config_file.to_str().unwrap(),
-            ]);
+            let mut child =
+                spawn_cratonvm(&["-cp", &cp_str, "kafka.Kafka", config_file.to_str().unwrap()]);
 
             // Kafka broker listens on 9092.
             let port = 9092u16;
@@ -961,11 +927,8 @@ fn t4_9_10_gradle_build() {
         let tmp_dir = std::env::temp_dir().join("cratonvm_t4_9_10_gradle");
         let _ = std::fs::create_dir_all(&tmp_dir);
 
-        std::fs::write(
-            tmp_dir.join("build.gradle"),
-            "// empty build file\n",
-        )
-        .expect("must write build.gradle");
+        std::fs::write(tmp_dir.join("build.gradle"), "// empty build file\n")
+            .expect("must write build.gradle");
 
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
         let output = Command::new(cratonvm_binary())
@@ -1049,7 +1012,10 @@ fn t4_9_11_intellij_headless() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{stdout}{stderr}");
             // Even a crash with class-loading messages proves we got far.
-            eprintln!("[T4.9.11] IntelliJ headless output length: {} bytes", combined.len());
+            eprintln!(
+                "[T4.9.11] IntelliJ headless output length: {} bytes",
+                combined.len()
+            );
         }
     }
 }
@@ -1205,9 +1171,7 @@ fn t4_9_13_jshell_self_host() {
             let _ = stdin.flush();
         }
 
-        let output = child
-            .wait_with_output()
-            .expect("must wait for jshell");
+        let output = child.wait_with_output().expect("must wait for jshell");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         // JShell should print "3" for the expression 1+2.
@@ -1250,11 +1214,7 @@ fn t4_9_14_openliberty_javaee() {
     );
 
     // Phase 2: Attempt main invocation.
-    let result = try_invoke_main(
-        &cp_refs,
-        "com/ibm/ws/kernel/boot/Launcher",
-        &[],
-    );
+    let result = try_invoke_main(&cp_refs, "com/ibm/ws/kernel/boot/Launcher", &[]);
     assert!(
         result.is_ok(),
         "Open Liberty main invocation failed: {}",
@@ -1276,9 +1236,7 @@ fn t4_9_14_openliberty_javaee() {
         if wait_for_port("127.0.0.1", port, APP_BOOT_TIMEOUT).is_ok() {
             if let Ok(body) = http_get("127.0.0.1", port, "/") {
                 assert!(
-                    body.contains("200")
-                        || body.contains("Liberty")
-                        || body.contains("<html"),
+                    body.contains("200") || body.contains("Liberty") || body.contains("<html"),
                     "Open Liberty response must contain recognizable content"
                 );
             }

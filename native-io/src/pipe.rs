@@ -33,9 +33,9 @@
 //! thread-safe at the kernel level (the kernel serializes per-fd I/O).
 //! The table itself is guarded by a `RwLock`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{OnceLock, RwLock};
-use std::collections::HashMap;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
@@ -343,7 +343,11 @@ fn alloc_channel(
     let obj = ctx.alloc_object(cid, 4);
     ctx.set_field(obj, PIPE_FIELD_ID, Value::Int(id));
     ctx.set_field(obj, PIPE_FIELD_OPEN, Value::Int(1));
-    ctx.set_field(obj, PIPE_FIELD_KIND, Value::Int(if is_sink { 1 } else { 0 }));
+    ctx.set_field(
+        obj,
+        PIPE_FIELD_KIND,
+        Value::Int(if is_sink { 1 } else { 0 }),
+    );
     ctx.set_field(obj, 3, Value::Int(1)); // blocking = true
     obj
 }
@@ -464,13 +468,17 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         return Err(io_error("SinkChannel.write: channel closed"));
     }
     if !end.is_sink {
-        return Err(io_error("SinkChannel.write: wrong end (source registered as sink)"));
+        return Err(io_error(
+            "SinkChannel.write: wrong end (source registered as sink)",
+        ));
     }
     let Some(buf) = arg_obj(args, 1) else {
         return Err(io_error("SinkChannel.write: null buffer"));
     };
     let Some((arr, position, limit)) = buffer_view(ctx, buf) else {
-        return Err(io_error("SinkChannel.write: unrecognised ByteBuffer layout"));
+        return Err(io_error(
+            "SinkChannel.write: unrecognised ByteBuffer layout",
+        ));
     };
     if position >= limit {
         return Ok(Some(Value::Int(0)));
@@ -502,13 +510,17 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Err(io_error("SourceChannel.read: channel closed"));
     }
     if end.is_sink {
-        return Err(io_error("SourceChannel.read: wrong end (sink registered as source)"));
+        return Err(io_error(
+            "SourceChannel.read: wrong end (sink registered as source)",
+        ));
     }
     let Some(buf) = arg_obj(args, 1) else {
         return Err(io_error("SourceChannel.read: null buffer"));
     };
     let Some((arr, position, limit)) = buffer_view(ctx, buf) else {
-        return Err(io_error("SourceChannel.read: unrecognised ByteBuffer layout"));
+        return Err(io_error(
+            "SourceChannel.read: unrecognised ByteBuffer layout",
+        ));
     };
     let space = (limit - position).max(0) as usize;
     if space == 0 {
@@ -639,8 +651,18 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pipe = "java/nio/channels/Pipe";
     r.register(pipe, "open", "()Ljava/nio/channels/Pipe;", pipe_open);
-    r.register(pipe, "source", "()Ljava/nio/channels/Pipe$SourceChannel;", pipe_source);
-    r.register(pipe, "sink", "()Ljava/nio/channels/Pipe$SinkChannel;", pipe_sink);
+    r.register(
+        pipe,
+        "source",
+        "()Ljava/nio/channels/Pipe$SourceChannel;",
+        pipe_source,
+    );
+    r.register(
+        pipe,
+        "sink",
+        "()Ljava/nio/channels/Pipe$SinkChannel;",
+        pipe_sink,
+    );
 
     // SourceChannelImpl
     let source = "sun/nio/ch/SourceChannelImpl";

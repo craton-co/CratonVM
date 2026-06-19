@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -74,7 +74,9 @@ fn cached_outer_jar(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
     }
     let bytes = std::fs::read(path)?;
     let arc = Arc::new(bytes);
-    outer_jar_bytes_cache().lock().insert(path.to_string(), arc.clone());
+    outer_jar_bytes_cache()
+        .lock()
+        .insert(path.to_string(), arc.clone());
     Ok(arc)
 }
 
@@ -90,10 +92,12 @@ fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<
     let cursor = std::io::Cursor::new(outer_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut entry = zip.by_name(inner_entry)
+    let mut entry = zip
+        .by_name(inner_entry)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
     let mut buf = Vec::with_capacity(entry.size().min(1 << 27) as usize);
-    entry.read_to_end(&mut buf)
+    entry
+        .read_to_end(&mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let arc = Arc::new(buf);
     nested_jar_bytes_cache().lock().insert(key, arc.clone());
@@ -111,11 +115,11 @@ fn spring_dbg_enabled() -> bool {
 }
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
 use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layouts used by Phase E.
@@ -148,7 +152,7 @@ const SS_LISTENER_ID: usize = 3;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct SockSide {
-    pub host_id: i32,        // unused (we still keep `SOCK_HOST` in field for getInetAddress)
+    pub host_id: i32, // unused (we still keep `SOCK_HOST` in field for getInetAddress)
     pub port: i32,
     pub local_port: i32,
     pub closed: i32,
@@ -240,12 +244,16 @@ fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
 }
 
 fn ds_get(this: ObjectRef) -> DsSide {
-    ds_side_table().lock().get(&this).copied().unwrap_or(DsSide {
-        port: 0,
-        closed: 0,
-        timeout: 0,
-        fd: -1,
-    })
+    ds_side_table()
+        .lock()
+        .get(&this)
+        .copied()
+        .unwrap_or(DsSide {
+            port: 0,
+            closed: 0,
+            timeout: 0,
+            fd: -1,
+        })
 }
 
 fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
@@ -402,9 +410,7 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     // it stays 0 (the bytes live in the separate `Inet6Address` holder).
     let parsed = ip.parse::<std::net::IpAddr>();
     let (packed, family) = match parsed {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            (i32::from_be_bytes(v4.octets()), IA_FAMILY_V4)
-        }
+        Ok(std::net::IpAddr::V4(v4)) => (i32::from_be_bytes(v4.octets()), IA_FAMILY_V4),
         Ok(std::net::IpAddr::V6(_)) => (0, IA_FAMILY_V6),
         Err(_) => (0, IA_FAMILY_V4),
     };
@@ -421,11 +427,7 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     // socket path — dereferences `holder6`; leaving it null NPEs before bind0
     // is ever reached. Populate it so the real path resolves v6 correctly.
     if let Ok(std::net::IpAddr::V6(v6)) = parsed {
-        let h6 = alloc_concurrent_synthetic(
-            ctx,
-            "java/net/Inet6Address$Inet6AddressHolder",
-            5,
-        );
+        let h6 = alloc_concurrent_synthetic(ctx, "java/net/Inet6Address$Inet6AddressHolder", 5);
         let octets = v6.octets();
         let arr = ctx.new_array(ArrayElementType::Byte, octets.len());
         for (i, b) in octets.iter().enumerate() {
@@ -481,7 +483,10 @@ const HS_PORT: usize = 4;
 // ---------------------------------------------------------------------------
 
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IOException { message: message.into() }.into()
+    RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
 }
 
 /// Throw the concrete `java.net.UnknownHostException` (a subclass of
@@ -489,7 +494,10 @@ fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed 
 /// Tomcat `NetMask`) misses a bare IOException, so host-resolution failures
 /// must use this rather than `ioex("UnknownHostException: ...")`.
 fn uhex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::UnknownHostException { message: message.into() }.into()
+    RuntimeError::UnknownHostException {
+        message: message.into(),
+    }
+    .into()
 }
 /// A missing jar/zip entry must surface as `java.io.FileNotFoundException`
 /// (a subclass of `IOException`), matching the real JDK's
@@ -497,16 +505,25 @@ fn uhex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed 
 /// Config rely on `catch (FileNotFoundException)` to *skip* an absent
 /// profile-specific resource; a plain `IOException` is rethrown and aborts boot.
 fn fnfex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::FileNotFoundException { path: message.into() }.into()
+    RuntimeError::FileNotFoundException {
+        path: message.into(),
+    }
+    .into()
 }
 /// Map a `zip::ZipArchive::by_name` failure to the right Java exception:
 /// `ZipError::FileNotFound` → `FileNotFoundException`, anything else → `IOException`.
-fn zip_entry_err(entry: &str, container: &str, e: zip::result::ZipError) -> cratonvm_types::error::MethodCallFailed {
+fn zip_entry_err(
+    entry: &str,
+    container: &str,
+    e: zip::result::ZipError,
+) -> cratonvm_types::error::MethodCallFailed {
     match e {
-        zip::result::ZipError::FileNotFound => {
-            fnfex(format!("entry {entry} in {container}: specified file not found in archive"))
-        }
-        other => ioex(format!("URL.openStream: entry {entry} in {container}: {other}")),
+        zip::result::ZipError::FileNotFound => fnfex(format!(
+            "entry {entry} in {container}: specified file not found in archive"
+        )),
+        other => ioex(format!(
+            "URL.openStream: entry {entry} in {container}: {other}"
+        )),
     }
 }
 fn npe<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
@@ -516,7 +533,10 @@ fn npe<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     .into()
 }
 fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: message.into() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
 }
 
 fn value_to_string(ctx: &dyn NativeContext, v: Value) -> Option<String> {
@@ -726,7 +746,9 @@ pub(crate) fn read_inet_socket_address(
                         // holder's slot 0 is hostName, slot 1 packs address bytes.
                         if resolved.is_none() {
                             if let Value::Object(Some(inner_holder)) = ctx.get_field(addr_obj, 0) {
-                                if let Value::Object(Some(name_obj)) = ctx.get_field(inner_holder, 0) {
+                                if let Value::Object(Some(name_obj)) =
+                                    ctx.get_field(inner_holder, 0)
+                                {
                                     if let Some(t) = ctx.read_string(name_obj) {
                                         if !t.is_empty() {
                                             resolved = Some(t);
@@ -856,11 +878,7 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
     ia
 }
 
-fn alloc_inet_socket_address(
-    ctx: &mut dyn NativeContext,
-    host: &str,
-    port: i32,
-) -> ObjectRef {
+fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> ObjectRef {
     // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
     //     getfield  holder
     //     invokevirtual InetSocketAddressHolder.getPort()
@@ -873,11 +891,8 @@ fn alloc_inet_socket_address(
     // the synthetic `read_inet_socket_address` reader AND real-JDK
     // bytecode see consistent state.
     let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-    let holder = alloc_concurrent_synthetic(
-        ctx,
-        "java/net/InetSocketAddress$InetSocketAddressHolder",
-        3,
-    );
+    let holder =
+        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
     let h = ctx.create_string(host);
     ctx.set_field(holder, 0, Value::Object(Some(h)));
     ctx.set_field(holder, 1, Value::Object(None));
@@ -898,9 +913,8 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
         return Ok(IpAddr::V6(v6));
     }
     let lookup = format!("{host}:0");
-    let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()).map_err(|e| {
-        uhex(format!("{host}: {e}"))
-    })?;
+    let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str())
+        .map_err(|e| uhex(format!("{host}: {e}")))?;
     match iter.next() {
         Some(sa) => Ok(sa.ip()),
         None => Err(uhex(format!("{host}"))),
@@ -1081,13 +1095,14 @@ fn uri_remove_dot_segments(path: &str) -> String {
     // A path whose final segment is "." or ".." resolves to a directory, so
     // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
     let segs: Vec<&str> = path.split('/').collect();
-    let trailing_slash = path.ends_with('/')
-        || matches!(segs.last(), Some(&".") | Some(&".."));
+    let trailing_slash = path.ends_with('/') || matches!(segs.last(), Some(&".") | Some(&".."));
     let mut out: Vec<&str> = Vec::new();
     for seg in &segs {
         match *seg {
             "" | "." => {}
-            ".." => { out.pop(); }
+            ".." => {
+                out.pop();
+            }
             s => out.push(s),
         }
     }
@@ -1104,7 +1119,15 @@ fn uri_remove_dot_segments(path: &str) -> String {
 
 /// Split a URI string into (scheme, authority, path, query, fragment).
 /// `authority` is `None` when the URI has no `//` authority component.
-fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>, Option<String>) {
+fn uri_split(
+    s: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+) {
     let (without_frag, fragment) = match s.find('#') {
         Some(i) => (&s[..i], Some(s[i + 1..].to_string())),
         None => (s, None),
@@ -1115,11 +1138,21 @@ fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>
     };
     // scheme: leading "alpha *( alpha / digit / + / - / . ) :"
     let (scheme, rest) = match without_query.find(':') {
-        Some(i) if i > 0
-            && without_query[..i].chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
-            && without_query[..i].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        Some(i)
+            if i > 0
+                && without_query[..i]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false)
+                && without_query[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
         {
-            (Some(without_query[..i].to_string()), &without_query[i + 1..])
+            (
+                Some(without_query[..i].to_string()),
+                &without_query[i + 1..],
+            )
         }
         _ => (None, without_query),
     };
@@ -1154,12 +1187,21 @@ pub(crate) fn uri_parse_authority(authority: &str) -> (Option<String>, Option<St
     } else {
         // Reg-name: port (if any) follows the last ':'.
         match hostport.rfind(':') {
-            Some(j) => (hostport[..j].to_string(), Some(hostport[j + 1..].to_string())),
+            Some(j) => (
+                hostport[..j].to_string(),
+                Some(hostport[j + 1..].to_string()),
+            ),
             None => (hostport.to_string(), None),
         }
     };
     let port = port_str
-        .and_then(|p| if p.is_empty() { None } else { p.parse::<i32>().ok() })
+        .and_then(|p| {
+            if p.is_empty() {
+                None
+            } else {
+                p.parse::<i32>().ok()
+            }
+        })
         .unwrap_or(-1);
     let host = if host.is_empty() { None } else { Some(host) };
     (userinfo, host, port)
@@ -1264,9 +1306,15 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
     let (scheme, authority, path, query, fragment) = uri_split(raw);
     let ssp = {
         let mut s = String::new();
-        if let Some(a) = &authority { s.push_str("//"); s.push_str(a); }
+        if let Some(a) = &authority {
+            s.push_str("//");
+            s.push_str(a);
+        }
         s.push_str(&path);
-        if let Some(q) = &query { s.push('?'); s.push_str(q); }
+        if let Some(q) = &query {
+            s.push('?');
+            s.push_str(q);
+        }
         s
     };
     let raw_s = ctx.create_string(raw);
@@ -1291,7 +1339,11 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
     let ssp_s = ctx.create_string(&ssp);
     ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
     let dssp = ctx.create_string(&ssp);
-    ctx.set_field_by_name(uri_obj, "decodedSchemeSpecificPart", Value::Object(Some(dssp)));
+    ctx.set_field_by_name(
+        uri_obj,
+        "decodedSchemeSpecificPart",
+        Value::Object(Some(dssp)),
+    );
     uri_obj
 }
 
@@ -1326,7 +1378,10 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         }
         // Parse from raw string.
         let raw = uri_raw_string(ctx, this);
-        let scheme = raw.find(':').map(|i| raw[..i].to_string()).unwrap_or_default();
+        let scheme = raw
+            .find(':')
+            .map(|i| raw[..i].to_string())
+            .unwrap_or_default();
         if scheme.is_empty() {
             Ok(Some(Value::Object(None)))
         } else {
@@ -1335,28 +1390,38 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     });
 
     // getSchemeSpecificPart() → everything after 'scheme:' (decoded)
-    r.register(uri, "getSchemeSpecificPart", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        let ssp = if let Some(i) = raw.find(':') {
-            raw[i + 1..].to_string()
-        } else {
-            raw.clone()
-        };
-        Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
-    });
+    r.register(
+        uri,
+        "getSchemeSpecificPart",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = uri_raw_string(ctx, this);
+            let ssp = if let Some(i) = raw.find(':') {
+                raw[i + 1..].to_string()
+            } else {
+                raw.clone()
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+        },
+    );
 
     // getRawSchemeSpecificPart() → same (we don't encode/decode)
-    r.register(uri, "getRawSchemeSpecificPart", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        let ssp = if let Some(i) = raw.find(':') {
-            raw[i + 1..].to_string()
-        } else {
-            raw.clone()
-        };
-        Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
-    });
+    r.register(
+        uri,
+        "getRawSchemeSpecificPart",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = uri_raw_string(ctx, this);
+            let ssp = if let Some(i) = raw.find(':') {
+                raw[i + 1..].to_string()
+            } else {
+                raw.clone()
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+        },
+    );
 
     // getPath() → path field (by name) if set, else parse from raw. Unlike
     // getRawPath(), `getPath` returns the DECODED path: java.net.URI stores the
@@ -1535,14 +1600,19 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     });
 
     // getRawFragment() → raw (undecoded) fragment after '#', else null.
-    r.register(uri, "getRawFragment", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        match raw.find('#') {
-            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
-            None => Ok(Some(Value::Object(None))),
-        }
-    });
+    r.register(
+        uri,
+        "getRawFragment",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = uri_raw_string(ctx, this);
+            match raw.find('#') {
+                Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
 
     // getRawQuery() → raw (undecoded) query between '?' and '#', else null.
     // Was unregistered (real bytecode read a mis-populated field → null).
@@ -1559,16 +1629,21 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     });
 
     // getRawUserInfo() → raw (undecoded) userinfo from the authority, else null.
-    r.register(uri, "getRawUserInfo", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        if let (_, Some(auth), _, _, _) = uri_split(&raw) {
-            if let (Some(ui), _, _) = uri_parse_authority(&auth) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&ui)))));
+    r.register(
+        uri,
+        "getRawUserInfo",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = uri_raw_string(ctx, this);
+            if let (_, Some(auth), _, _, _) = uri_split(&raw) {
+                if let (Some(ui), _, _) = uri_parse_authority(&auth) {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&ui)))));
+                }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // isAbsolute() → true if scheme is non-null
     r.register(uri, "isAbsolute", "()Z", |ctx, args| {
@@ -1624,8 +1699,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         // accepting it lets `URI.create("war:file:/...").toURL()` succeed —
         // which `UriUtil.warToJar` (and WebResources) rely on.
         const KNOWN_PROTOCOLS: &[&str] = &[
-            "file", "jar", "http", "https", "ftp", "jrt", "jmod", "mailto",
-            "news", "jndi", "war",
+            "file", "jar", "http", "https", "ftp", "jrt", "jmod", "mailto", "news", "jndi", "war",
         ];
         let proto_lc = proto.to_ascii_lowercase();
         if proto.is_empty() {
@@ -1634,11 +1708,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Err(iae("URI is not absolute"));
         }
         if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str()) {
-            let exc = alloc_concurrent_synthetic(
-                ctx,
-                "java/net/MalformedURLException",
-                4,
-            );
+            let exc = alloc_concurrent_synthetic(ctx, "java/net/MalformedURLException", 4);
             let msg = ctx.create_string(&format!("unknown protocol: {proto_lc}"));
             ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
             return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
@@ -1647,7 +1717,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
         let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
-        let file = if proto.is_empty() { &raw[..] } else { &raw[proto.len() + 1..] };
+        let file = if proto.is_empty() {
+            &raw[..]
+        } else {
+            &raw[proto.len() + 1..]
+        };
         let full_s = ctx.create_string(&raw);
         let proto_s = ctx.create_string(proto);
         let file_s = ctx.create_string(file);
@@ -1682,7 +1756,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let h = raw.bytes().fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
+        let h = raw
+            .bytes()
+            .fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
         Ok(Some(Value::Int(h)))
     });
 
@@ -1697,29 +1773,39 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // for locating ACTIVEMQ_HOME from the launcher jar). Without correct
     // resolution the launcher fell back to a literal `../.` home and could
     // not find lib/*.jar.
-    r.register(uri, "resolve", "(Ljava/net/URI;)Ljava/net/URI;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let base = uri_raw_string(ctx, this);
-        let reference = match args.get(1) {
-            Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
-            _ => return Ok(Some(Value::Object(Some(this)))),
-        };
-        let resolved = uri_resolve_ref(&base, &reference);
-        Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
-    });
+    r.register(
+        uri,
+        "resolve",
+        "(Ljava/net/URI;)Ljava/net/URI;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let base = uri_raw_string(ctx, this);
+            let reference = match args.get(1) {
+                Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let resolved = uri_resolve_ref(&base, &reference);
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+        },
+    );
 
     // resolve(String) → resolve(URI.create(str)). Registered explicitly so
     // the synthetic-URI path does not depend on JDK bytecode chaining.
-    r.register(uri, "resolve", "(Ljava/lang/String;)Ljava/net/URI;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let base = uri_raw_string(ctx, this);
-        let reference = match args.get(1) {
-            Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(Some(this)))),
-        };
-        let resolved = uri_resolve_ref(&base, &reference);
-        Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
-    });
+    r.register(
+        uri,
+        "resolve",
+        "(Ljava/lang/String;)Ljava/net/URI;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let base = uri_raw_string(ctx, this);
+            let reference = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let resolved = uri_resolve_ref(&base, &reference);
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+        },
+    );
 
     // create(String) — static factory.
     //
@@ -1735,14 +1821,19 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // `jar:file:file:/…!/application-<profile>.properties` URL that aborts
     // Keycloak/Quarkus boot with `SRCFG00035`. `make_uri` parses the string
     // and sets all components by name (slot-order safe).
-    r.register(uri, "create", "(Ljava/lang/String;)Ljava/net/URI;", |ctx, args| {
-        let s_obj = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let s = ctx.read_string(s_obj).unwrap_or_default();
-        Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
-    });
+    r.register(
+        uri,
+        "create",
+        "(Ljava/lang/String;)Ljava/net/URI;",
+        |ctx, args| {
+            let s_obj = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let s = ctx.read_string(s_obj).unwrap_or_default();
+            Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
+        },
+    );
 }
 
 // ===========================================================================
@@ -1894,58 +1985,58 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(
-        sock,
-        "<init>",
-        "(Ljava/lang/String;I)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let host_val = args.get(1).copied().unwrap_or(Value::Object(None));
-            let host = value_or_string(ctx, host_val, "");
-            if host.is_empty() {
-                return Err(npe("Socket: null host"));
-            }
-            let port = args
-                .get(2)
-                .and_then(|v| v.as_int())
-                .ok_or_else(|| iae("Socket: missing port"))?;
-            re1_connect_socket(ctx, this, &host, port, 0)
-        },
-    );
-
-    r.register(
-        sock,
-        "<init>",
-        "(Ljava/net/InetAddress;I)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let addr = obj_arg(args, 1)?;
-            let host = inet_addr_field_string_or(ctx, addr, IA_ADDR, "127.0.0.1");
-            let port = args
-                .get(2)
-                .and_then(|v| v.as_int())
-                .ok_or_else(|| iae("Socket: missing port"))?;
-            re1_connect_socket(ctx, this, &host, port, 0)
-        },
-    );
-
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+    r.register(sock, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("Socket.connect: null address"))?;
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
+        let host_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        let host = value_or_string(ctx, host_val, "");
+        if host.is_empty() {
+            return Err(npe("Socket: null host"));
+        }
+        let port = args
+            .get(2)
+            .and_then(|v| v.as_int())
+            .ok_or_else(|| iae("Socket: missing port"))?;
         re1_connect_socket(ctx, this, &host, port, 0)
     });
 
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
+    r.register(sock, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sa = obj_arg(args, 1).map_err(|_| ioex("Socket.connect: null address"))?;
-        let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        if timeout_ms < 0 {
-            return Err(iae(format!("negative timeout {timeout_ms}")));
-        }
-        let (host, port) = read_inet_socket_address(ctx, sa)?;
-        re1_connect_socket(ctx, this, &host, port, timeout_ms)
+        let addr = obj_arg(args, 1)?;
+        let host = inet_addr_field_string_or(ctx, addr, IA_ADDR, "127.0.0.1");
+        let port = args
+            .get(2)
+            .and_then(|v| v.as_int())
+            .ok_or_else(|| iae("Socket: missing port"))?;
+        re1_connect_socket(ctx, this, &host, port, 0)
     });
+
+    r.register(
+        sock,
+        "connect",
+        "(Ljava/net/SocketAddress;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sa = obj_arg(args, 1).map_err(|_| ioex("Socket.connect: null address"))?;
+            let (host, port) = read_inet_socket_address(ctx, sa)?;
+            re1_connect_socket(ctx, this, &host, port, 0)
+        },
+    );
+
+    r.register(
+        sock,
+        "connect",
+        "(Ljava/net/SocketAddress;I)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sa = obj_arg(args, 1).map_err(|_| ioex("Socket.connect: null address"))?;
+            let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            if timeout_ms < 0 {
+                return Err(iae(format!("negative timeout {timeout_ms}")));
+            }
+            let (host, port) = read_inet_socket_address(ctx, sa)?;
+            re1_connect_socket(ctx, this, &host, port, timeout_ms)
+        },
+    );
 
     r.register(sock, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1959,11 +2050,19 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sock, "isConnected", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let s = sock_get(this);
-        Ok(Some(Value::Int(if s.stream_id >= 0 && s.closed == 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if s.stream_id >= 0 && s.closed == 0 {
+            1
+        } else {
+            0
+        })))
     });
     r.register(sock, "isClosed", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if sock_get(this).closed != 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if sock_get(this).closed != 0 {
+            1
+        } else {
+            0
+        })))
     });
 
     r.register(sock, "close", "()V", |_ctx, args| {
@@ -2019,7 +2118,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
-                let d = if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) };
+                let d = if ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(ms as u64))
+                };
                 stream
                     .set_read_timeout(d)
                     .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
@@ -2122,7 +2225,8 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     let sos = "java/net/Socket$SocketOutputStream";
     r.register(sos, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+        let owner =
+            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -2130,7 +2234,8 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(sos, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+        let owner =
+            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) & 0xff;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(one, 0, Value::Int(b as i8 as i32));
@@ -2186,9 +2291,15 @@ fn re2_accept_into(
                 let mut reg = s2_registry().lock();
                 match reg.listeners.get_mut(&listener_id) {
                     Some(listener) => match listener.accept() {
-                        Ok(pair) => { result = Ok(pair); break; }
+                        Ok(pair) => {
+                            result = Ok(pair);
+                            break;
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => { result = Err(e); break; }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
                     },
                     None => {
                         result = Err(std::io::Error::new(
@@ -2219,8 +2330,8 @@ fn re2_accept_into(
             .ok_or_else(|| ioex("ServerSocket: listener fd missing"))?;
         listener.accept()
     };
-    let (stream, peer) = accept_result
-        .map_err(|e| ioex(format!("ServerSocket.accept failed: {e}")))?;
+    let (stream, peer) =
+        accept_result.map_err(|e| ioex(format!("ServerSocket.accept failed: {e}")))?;
     let peer_port = peer.port() as i32;
     let peer_ip = peer.ip().to_string();
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
@@ -2245,9 +2356,12 @@ fn re2_bind_listener(
 ) -> MethodCallResult {
     let ip = resolve_host(host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
-    let listener = TcpListener::bind(addr)
-        .map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
-    let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(port);
+    let listener =
+        TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
+    let actual_port = listener
+        .local_addr()
+        .map(|a| a.port() as i32)
+        .unwrap_or(port);
     let listener_id = s2_alloc_listener(listener);
     ss_set(this, |s| {
         s.port = actual_port;
@@ -2302,7 +2416,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
-            Some(Value::Object(Some(ia))) => inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
+            Some(Value::Object(Some(ia))) => {
+                inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0")
+            }
             _ => "0.0.0.0".to_string(),
         };
         let r = re2_bind_listener(ctx, this, &host, port, backlog);
@@ -2370,7 +2486,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // no-ops: the stub listener does not model SO_REUSEADDR. Default to the
     // common `ServerSocket` value (true) for the getter.
     r.register(ss, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(ss, "getReuseAddress", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(ss, "getReuseAddress", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
 
     r.register(ss, "close", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2434,25 +2552,30 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // back to the wildcard address so the caller gets a usable, non-null
     // InetAddress (matching `new ServerSocket(port).getInetAddress()` == 0.0.0.0
     // on HotSpot) instead of an NPE.
-    r.register(ss, "getInetAddress", "()Ljava/net/InetAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let mut lid = ss_get(this).listener_id;
-        if lid < 0 {
-            lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
-        }
-        let ip = if lid >= 0 {
-            let reg = s2_registry().lock();
-            reg.listeners
-                .get(&lid)
-                .and_then(|l| l.local_addr().ok())
-                .map(|a| a.ip().to_string())
-        } else {
-            None
-        };
-        let ip = ip.unwrap_or_else(|| "0.0.0.0".to_string());
-        let ia = alloc_inet_address(ctx, &ip, &ip);
-        Ok(Some(Value::Object(Some(ia))))
-    });
+    r.register(
+        ss,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mut lid = ss_get(this).listener_id;
+            if lid < 0 {
+                lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+            }
+            let ip = if lid >= 0 {
+                let reg = s2_registry().lock();
+                reg.listeners
+                    .get(&lid)
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.ip().to_string())
+            } else {
+                None
+            };
+            let ip = ip.unwrap_or_else(|| "0.0.0.0".to_string());
+            let ia = alloc_inet_address(ctx, &ip, &ip);
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
 }
 
 fn re2_accept_timeouts() -> &'static Mutex<HashMap<i32, i32>> {
@@ -2492,7 +2615,11 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let ip = resolve_host(&host)?;
-            let name = if host.is_empty() { "localhost".to_string() } else { host };
+            let name = if host.is_empty() {
+                "localhost".to_string()
+            } else {
+                host
+            };
             let obj = alloc_inet_address(ctx, &name, &ip.to_string());
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2527,7 +2654,11 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 return Err(uhex(format!("{host}")));
             }
             let arr = ctx.new_ref_array(ClassId::new(0), addrs.len());
-            let name = if host.is_empty() { "localhost".to_string() } else { host };
+            let name = if host.is_empty() {
+                "localhost".to_string()
+            } else {
+                host
+            };
             for (i, ip) in addrs.iter().enumerate() {
                 let obj = alloc_inet_address(ctx, &name, ip);
                 ctx.set_array_element(arr, i, Value::Object(Some(obj)));
@@ -2568,10 +2699,15 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
     });
-    r.register(ia, "getCanonicalHostName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
-    });
+    r.register(
+        ia,
+        "getCanonicalHostName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+        },
+    );
     r.register(ia, "getAddress", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ip_str = inet_addr_field_string_or(ctx, this, IA_ADDR, "0.0.0.0");
@@ -2649,36 +2785,60 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     register_inet_address_object_methods(r, ia);
 
     for cls in ["java/net/Inet4Address", "java/net/Inet6Address"] {
-        r.register(cls, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
-        });
+        r.register(
+            cls,
+            "getHostAddress",
+            "()Ljava/lang/String;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
+            },
+        );
         r.register(cls, "getHostName", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
         });
-        r.register(cls, "getCanonicalHostName", "()Ljava/lang/String;", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
-        });
+        r.register(
+            cls,
+            "getCanonicalHostName",
+            "()Ljava/lang/String;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
+            },
+        );
         r.register(cls, "getAddress", "()[B", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Object(Some(inet_addr_address_bytes(ctx, this)))))
+            Ok(Some(Value::Object(Some(inet_addr_address_bytes(
+                ctx, this,
+            )))))
         });
         r.register(cls, "isLoopbackAddress", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int(i32::from(inet_addr_predicate(ctx, this, |ip| ip.is_loopback())))))
+            Ok(Some(Value::Int(i32::from(inet_addr_predicate(
+                ctx,
+                this,
+                |ip| ip.is_loopback(),
+            )))))
         });
         r.register(cls, "isAnyLocalAddress", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int(i32::from(inet_addr_predicate(ctx, this, |ip| match ip {
-                IpAddr::V4(v) => v.is_unspecified(),
-                IpAddr::V6(v) => v.is_unspecified(),
-            })))))
+            Ok(Some(Value::Int(i32::from(inet_addr_predicate(
+                ctx,
+                this,
+                |ip| match ip {
+                    IpAddr::V4(v) => v.is_unspecified(),
+                    IpAddr::V6(v) => v.is_unspecified(),
+                },
+            )))))
         });
         r.register(cls, "isMulticastAddress", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int(i32::from(inet_addr_predicate(ctx, this, |ip| ip.is_multicast())))))
+            Ok(Some(Value::Int(i32::from(inet_addr_predicate(
+                ctx,
+                this,
+                |ip| ip.is_multicast(),
+            )))))
         });
         register_inet_address_object_methods(r, cls);
     }
@@ -2752,8 +2912,7 @@ fn register_inet_address_object_methods(r: &mut NativeMethodRegistry, cls: &'sta
         // Real-JDK `InetAddress.equals` compares the address bytes.
         let a = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
         let b = inet_addr_field_string_or(ctx, other, IA_ADDR, "");
-        let eq = !a.is_empty()
-            && a.parse::<IpAddr>().ok() == b.parse::<IpAddr>().ok();
+        let eq = !a.is_empty() && a.parse::<IpAddr>().ok() == b.parse::<IpAddr>().ok();
         Ok(Some(Value::Int(i32::from(eq))))
     });
 }
@@ -2831,8 +2990,9 @@ fn http_perform_request(
                     let next = if loc.starts_with("http") {
                         loc
                     } else {
-                        let (scheme, h, p, _) = http_parse_url(&current_url)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                        let (scheme, h, p, _) = http_parse_url(&current_url).map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+                        })?;
                         format!(
                             "{}://{}:{}{}",
                             if scheme { "https" } else { "http" },
@@ -2919,7 +3079,9 @@ fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
     let sep = all
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header terminator"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no header terminator")
+        })?;
     let header_block = &all[..sep];
     let body_region = &all[sep + 4..];
     let head_str = std::str::from_utf8(header_block)
@@ -2930,9 +3092,9 @@ fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing status"))?;
     let mut parts = status_line.splitn(3, ' ');
     let _ = parts.next();
-    let code_str = parts
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing status code"))?;
+    let code_str = parts.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing status code")
+    })?;
     let status: i32 = code_str
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status code"))?;
@@ -2959,16 +3121,19 @@ fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
     } else {
         body_region.to_vec()
     };
-    Ok(HttpResponse { status, headers, body })
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
     loop {
-        let nl = data
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk header"))?;
+        let nl = data.windows(2).position(|w| w == b"\r\n").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk header")
+        })?;
         let size_str = std::str::from_utf8(&data[..nl])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let size_str = size_str.split(';').next().unwrap_or("0").trim();
@@ -3041,19 +3206,16 @@ fn http_exchange_tls(
     let tcp = TcpStream::connect((host, port))?;
     tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut tls = connector
-        .connect(host, tcp)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}")))?;
+    let mut tls = connector.connect(host, tcp).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}"))
+    })?;
     let req = http_build_request(method, host, port, path, headers, body, 443);
     tls.write_all(&req)?;
     tls.flush()?;
     http_read_response(tls)
 }
 
-fn huc_extract_req_headers(
-    ctx: &dyn NativeContext,
-    hdrs: Value,
-) -> Vec<(String, String)> {
+fn huc_extract_req_headers(ctx: &dyn NativeContext, hdrs: Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Value::Object(Some(a)) = hdrs {
         let len = ctx.array_length(a);
@@ -3235,7 +3397,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw_s = ctx.create_string(&url_str);
         ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-        // Parse scheme.
+                                                           // Parse scheme.
         if let Some(colon) = url_str.find(':') {
             let scheme = &url_str[..colon];
             let scheme_s = ctx.create_string(scheme);
@@ -3328,7 +3490,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let rest = rest.trim_start_matches('/');
             let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
-                None => return Err(ioex(format!("URL.openStream: malformed jar URL: {url_str}"))),
+                None => {
+                    return Err(ioex(format!(
+                        "URL.openStream: malformed jar URL: {url_str}"
+                    )))
+                }
             };
             // Check if the inner_path itself is a nested jar entry (double !/):
             // e.g. "BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories"
@@ -3336,18 +3502,25 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let nested_jar_entry = &inner_path[..second_sep];
                 let resource_entry = &inner_path[second_sep + 2..];
                 use std::io::Read;
-                let nested_jar_bytes = cached_nested_jar(outer_jar, nested_jar_entry)
-                    .map_err(|e| ioex(format!("URL.openStream: nested jar {nested_jar_entry} in {outer_jar}: {e}")))?;
+                let nested_jar_bytes =
+                    cached_nested_jar(outer_jar, nested_jar_entry).map_err(|e| {
+                        ioex(format!(
+                            "URL.openStream: nested jar {nested_jar_entry} in {outer_jar}: {e}"
+                        ))
+                    })?;
                 let inner_cursor = std::io::Cursor::new(nested_jar_bytes.as_slice());
-                let mut inner_zip = zip::ZipArchive::new(inner_cursor)
-                    .map_err(|e| ioex(format!("URL.openStream: open inner jar {nested_jar_entry}: {e}")))?;
+                let mut inner_zip = zip::ZipArchive::new(inner_cursor).map_err(|e| {
+                    ioex(format!(
+                        "URL.openStream: open inner jar {nested_jar_entry}: {e}"
+                    ))
+                })?;
                 let mut entry_file = inner_zip
                     .by_name(resource_entry)
                     .map_err(|e| zip_entry_err(resource_entry, nested_jar_entry, e))?;
                 let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
-                entry_file
-                    .read_to_end(&mut buf)
-                    .map_err(|e| ioex(format!("URL.openStream: read entry {resource_entry}: {e}")))?;
+                entry_file.read_to_end(&mut buf).map_err(|e| {
+                    ioex(format!("URL.openStream: read entry {resource_entry}: {e}"))
+                })?;
                 buf
             } else {
                 // Single-level: jar:file:/path/to.jar!/entry
@@ -3422,8 +3595,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let mut result: Option<Vec<u8>> = None;
             for p in &try_paths {
                 match std::fs::read(p) {
-                    Ok(b) => { result = Some(b); break; }
-                    Err(e) => { if first_err.is_none() { first_err = Some(e); } }
+                    Ok(b) => {
+                        result = Some(b);
+                        break;
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
                 }
             }
             match result {
@@ -3443,8 +3623,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             }
         } else if let Some(name) = url_str.strip_prefix("classpath:") {
             let name = name.trim_start_matches('/');
-            ctx.find_resource(name)
-                .ok_or_else(|| ioex(format!("URL.openStream: classpath resource not found: {name}")))?
+            ctx.find_resource(name).ok_or_else(|| {
+                ioex(format!(
+                    "URL.openStream: classpath resource not found: {name}"
+                ))
+            })?
         } else if let Some(name) = url_str.strip_prefix("resource:") {
             // Synthetic `resource:/<name>` URLs are produced by
             // `Class.getResource(String)` in `lang_class.rs` for resources
@@ -3477,7 +3660,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
             resp.body
         } else {
-            return Err(ioex(format!("URL.openStream: unsupported scheme: {url_str}")));
+            return Err(ioex(format!(
+                "URL.openStream: unsupported scheme: {url_str}"
+            )));
         };
 
         if is_sf && spring_dbg_enabled() {
@@ -3487,9 +3672,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(body) as i32;
         let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
         ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
-        ctx.set_field(stream, 1, Value::Int(0));              // pos
-        ctx.set_field(stream, 2, Value::Int(0));              // mark
-        ctx.set_field(stream, 3, Value::Int(len));            // count
+        ctx.set_field(stream, 1, Value::Int(0)); // pos
+        ctx.set_field(stream, 2, Value::Int(0)); // mark
+        ctx.set_field(stream, 3, Value::Int(len)); // count
         let _ = ctx.invoke(
             "java/io/ByteArrayInputStream",
             "<init>",
@@ -3537,12 +3722,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // which is swallowed and forces a wrong `../.` home fallback.
             let ext = {
                 let s5 = read_field_string_or(ctx, this, 5, "");
-                let s = if s5.contains(':') { s5 } else {
+                let s = if s5.contains(':') {
+                    s5
+                } else {
                     match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {
                         Ok(Some(Value::Object(Some(o)))) => ctx.read_string(o).unwrap_or_default(),
                         _ => {
                             let s0 = read_field_string_or(ctx, this, 0, "");
-                            if s0.contains(':') { s0 } else { String::new() }
+                            if s0.contains(':') {
+                                s0
+                            } else {
+                                String::new()
+                            }
                         }
                     }
                 };
@@ -3593,9 +3784,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // Recover the full `jar:file:…!/…` external form.
             let mut ext = read_field_string_or(ctx, url_obj, 5, "");
             if !ext.starts_with("jar:") {
-                if let Ok(Some(Value::Object(Some(o)))) = ctx.invoke_virtual(
-                    url_obj, "toExternalForm", "()Ljava/lang/String;", &[],
-                ) {
+                if let Ok(Some(Value::Object(Some(o)))) =
+                    ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
+                {
                     ext = ctx.read_string(o).unwrap_or_default();
                 }
             }
@@ -3659,9 +3850,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // Recover the full `jar:file:…!/…` external form.
             let mut ext = read_field_string_or(ctx, url_obj, 5, "");
             if !ext.starts_with("jar:") {
-                if let Ok(Some(Value::Object(Some(o)))) = ctx.invoke_virtual(
-                    url_obj, "toExternalForm", "()Ljava/lang/String;", &[],
-                ) {
+                if let Ok(Some(Value::Object(Some(o)))) =
+                    ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
+                {
                     ext = ctx.read_string(o).unwrap_or_default();
                 }
             }
@@ -3743,7 +3934,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let sz = jar_url_conn_entry_size(ctx, this);
             // URLConnection.getContentLength() narrows to int, -1 when unknown
             // or larger than Integer.MAX_VALUE.
-            let v = if sz < 0 || sz > i32::MAX as i64 { -1 } else { sz as i32 };
+            let v = if sz < 0 || sz > i32::MAX as i64 {
+                -1
+            } else {
+                sz as i32
+            };
             Ok(Some(Value::Int(v)))
         },
     );
@@ -3769,14 +3964,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // to the real-JDK setter, which probes the (uninitialised) connected
     // field and throws IllegalStateException. Make them no-ops on both
     // URLConnection and HttpURLConnection (registered separately).
-    r.register("java/net/URLConnection", "setUseCaches", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(
+        "java/net/URLConnection",
+        "setUseCaches",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
     r.register(
         "java/net/URLConnection",
         "setDefaultUseCaches",
         "(Z)V",
         |_ctx, _args| Ok(None),
     );
-    r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| Ok(None));
+    r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
+        Ok(None)
+    });
     // URLConnection.getInputStream — defer to URL.openStream by reading
     // the URL stored in HUC_URL during openConnection above.
     r.register(
@@ -3791,12 +3993,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     return Err(ioex("URLConnection.getInputStream: no URL"));
                 }
             };
-            ctx.invoke_virtual(
-                url_obj,
-                "openStream",
-                "()Ljava/io/InputStream;",
-                &[],
-            )
+            ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[])
         },
     );
 
@@ -3907,9 +4104,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/data/redis/core/RedisAccessor",
         "afterPropertiesSet",
         "()V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 
     // Same chain: RedisOperationsSessionRepository.setApplicationEventPublisher
@@ -3937,9 +4132,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/data/redis/listener/RedisMessageListenerContainer",
         "setConnectionFactory",
         "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 
     // Same chain: the `enableRedisKeyspaceNotificationsInitializer` bean's
@@ -3982,9 +4175,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/session/data/redis/RedisOperationsSessionRepository",
         "cleanupExpiredSessions",
         "()V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 
     // -----------------------------------------------------------------------
@@ -4050,12 +4241,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // call lets us avoid hard-coding the field index (which depends
             // on the number of fields in the AbstractResource/AbstractFile
             // ResolvingResource superclasses).
-            let url_val = ctx.invoke_virtual(
-                this,
-                "getURL",
-                "()Ljava/net/URL;",
-                &[],
-            )?;
+            let url_val = ctx.invoke_virtual(this, "getURL", "()Ljava/net/URL;", &[])?;
             let url_obj = match url_val {
                 Some(Value::Object(Some(o))) => o,
                 _ => return Err(ioex("UrlResource.getInputStream: getURL() returned null")),
@@ -4080,79 +4266,98 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         huc_perform(ctx, this)?;
         Ok(Some(ctx.get_field(this, HUC_CODE)))
     });
-    r.register(huc, "getInputStream", "()Ljava/io/InputStream;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // S111r22 — For non-HTTP/HTTPS URLs (jar:file:, file:, classpath:, jrt:),
-        // huc_perform would try to make a real HTTP request which fails. Instead,
-        // delegate to URL.openStream() via the stored HUC_URL. This enables
-        // SpringFactoriesLoader to read META-INF/spring.factories from nested JARs
-        // when it goes through url.openConnection().getInputStream().
-        let url_str = huc_url_string(ctx, this);
-        if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
-            // Non-HTTP: delegate to URL.openStream() on the stored URL object.
-            let url_obj = match ctx.get_field(this, HUC_URL) {
-                Value::Object(Some(o)) => o,
-                _ => return Err(ioex("HttpURLConnection.getInputStream: no URL for non-http")),
+    r.register(
+        huc,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // S111r22 — For non-HTTP/HTTPS URLs (jar:file:, file:, classpath:, jrt:),
+            // huc_perform would try to make a real HTTP request which fails. Instead,
+            // delegate to URL.openStream() via the stored HUC_URL. This enables
+            // SpringFactoriesLoader to read META-INF/spring.factories from nested JARs
+            // when it goes through url.openConnection().getInputStream().
+            let url_str = huc_url_string(ctx, this);
+            if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
+                // Non-HTTP: delegate to URL.openStream() on the stored URL object.
+                let url_obj = match ctx.get_field(this, HUC_URL) {
+                    Value::Object(Some(o)) => o,
+                    _ => {
+                        return Err(ioex(
+                            "HttpURLConnection.getInputStream: no URL for non-http",
+                        ))
+                    }
+                };
+                return ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[]);
+            }
+            huc_perform(ctx, this)?;
+            let body = match ctx.get_field(this, HUC_BODY) {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(ArrayElementType::Byte, 0),
             };
-            return ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[]);
-        }
-        huc_perform(ctx, this)?;
-        let body = match ctx.get_field(this, HUC_BODY) {
-            Value::Object(Some(a)) => a,
-            _ => ctx.new_array(ArrayElementType::Byte, 0),
-        };
-        let len = ctx.array_length(body) as i32;
-        let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-        ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
-        ctx.set_field(stream, 1, Value::Int(0));              // pos
-        ctx.set_field(stream, 2, Value::Int(0));              // mark
-        ctx.set_field(stream, 3, Value::Int(len));            // count
-        Ok(Some(Value::Object(Some(stream))))
-    });
-    r.register(huc, "getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        huc_perform(ctx, this)?;
-        let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-        let key = value_or_string(ctx, key_val, "");
-        if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
-            let len = ctx.array_length(arr);
-            for i in 0..len {
-                if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
-                    let line = ctx.read_string(s).unwrap_or_default();
-                    if let Some(colon) = line.find(':') {
-                        if line[..colon].trim().eq_ignore_ascii_case(&key) {
-                            let val = line[colon + 1..].trim().to_string();
-                            let v = ctx.create_string(&val);
-                            return Ok(Some(Value::Object(Some(v))));
+            let len = ctx.array_length(body) as i32;
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
+            ctx.set_field(stream, 1, Value::Int(0)); // pos
+            ctx.set_field(stream, 2, Value::Int(0)); // mark
+            ctx.set_field(stream, 3, Value::Int(len)); // count
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+    r.register(
+        huc,
+        "getHeaderField",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            huc_perform(ctx, this)?;
+            let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+            let key = value_or_string(ctx, key_val, "");
+            if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
+                let len = ctx.array_length(arr);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                        let line = ctx.read_string(s).unwrap_or_default();
+                        if let Some(colon) = line.find(':') {
+                            if line[..colon].trim().eq_ignore_ascii_case(&key) {
+                                let val = line[colon + 1..].trim().to_string();
+                                let v = ctx.create_string(&val);
+                                return Ok(Some(Value::Object(Some(v))));
+                            }
                         }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(huc, "getHeaderField", "(I)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        huc_perform(ctx, this)?;
-        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if idx < 0 {
-            return Ok(Some(Value::Object(None)));
-        }
-        if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
-            let len = ctx.array_length(arr);
-            if (idx as usize) < len {
-                if let Value::Object(Some(s)) = ctx.get_array_element(arr, idx as usize) {
-                    let line = ctx.read_string(s).unwrap_or_default();
-                    if let Some(colon) = line.find(':') {
-                        let v = line[colon + 1..].trim().to_string();
-                        let out = ctx.create_string(&v);
-                        return Ok(Some(Value::Object(Some(out))));
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        huc,
+        "getHeaderField",
+        "(I)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            huc_perform(ctx, this)?;
+            let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            if idx < 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
+                let len = ctx.array_length(arr);
+                if (idx as usize) < len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(arr, idx as usize) {
+                        let line = ctx.read_string(s).unwrap_or_default();
+                        if let Some(colon) = line.find(':') {
+                            let v = line[colon + 1..].trim().to_string();
+                            let out = ctx.create_string(&v);
+                            return Ok(Some(Value::Object(Some(out))));
+                        }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
     r.register(huc, "getContentLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         huc_perform(ctx, this)?;
@@ -4161,14 +4366,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => Ok(Some(Value::Int(-1))),
         }
     });
-    r.register(huc, "setRequestMethod", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let mval = args.get(1).copied().unwrap_or(Value::Object(None));
-        let method = value_or_string(ctx, mval, "GET");
-        let s = ctx.create_string(&method);
-        ctx.set_field(this, HUC_METHOD, Value::Object(Some(s)));
-        Ok(None)
-    });
+    r.register(
+        huc,
+        "setRequestMethod",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mval = args.get(1).copied().unwrap_or(Value::Object(None));
+            let method = value_or_string(ctx, mval, "GET");
+            let s = ctx.create_string(&method);
+            ctx.set_field(this, HUC_METHOD, Value::Object(Some(s)));
+            Ok(None)
+        },
+    );
     r.register(huc, "disconnect", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, HUC_CONNECTED, Value::Int(0));
@@ -4221,9 +4431,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/util/ResourceUtils",
         "useCachesIfNecessary",
         "(Ljava/net/URLConnection;)V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 
     // S111r24 — Some loader paths can hand a null URL into
@@ -4266,10 +4474,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let is_jar = matches!(
-                proto.as_str(),
-                "jar" | "war" | "zip" | "vfszip" | "wsjar"
-            );
+            let is_jar = matches!(proto.as_str(), "jar" | "war" | "zip" | "vfszip" | "wsjar");
             Ok(Some(Value::Int(if is_jar { 1 } else { 0 })))
         },
     );
@@ -4360,10 +4565,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // SB 4.x: context = org/springframework/boot/web/server/servlet/context/ServletWebServerApplicationContext
     //         factory = org/springframework/boot/web/server/servlet/ServletWebServerFactory
     //         impl    = org/springframework/boot/tomcat/servlet/TomcatServletWebServerFactory
-    fn alloc_tomcat_factory(
-        ctx: &mut dyn NativeContext,
-        impl_class: &str,
-    ) -> MethodCallResult {
+    fn alloc_tomcat_factory(ctx: &mut dyn NativeContext, impl_class: &str) -> MethodCallResult {
         let obj_val = match ctx.new_object(impl_class) {
             Ok(Some(v)) => v,
             Ok(None) => return Ok(Some(Value::Object(None))),
@@ -4420,9 +4622,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     //      `serverManager` field stays null; `getWebServer()` will return null
     //      to the caller. This is a deliberate "boot past, don't actually
     //      serve" stance consistent with the Tomcat-side shims below.
-    fn alloc_netty_reactive_factory(
-        ctx: &mut dyn NativeContext,
-    ) -> MethodCallResult {
+    fn alloc_netty_reactive_factory(ctx: &mut dyn NativeContext) -> MethodCallResult {
         let impl_class =
             "org/springframework/boot/web/embedded/netty/NettyReactiveWebServerFactory";
         let obj_val = match ctx.new_object(impl_class) {
@@ -4587,9 +4787,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/core/io/AbstractFileResolvingResource",
         "customizeConnection",
         "(Ljava/net/URLConnection;)V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 
     // AbstractFileResolvingResource.customizeConnection(HttpURLConnection) — no-op
@@ -4597,9 +4795,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/core/io/AbstractFileResolvingResource",
         "customizeConnection",
         "(Ljava/net/HttpURLConnection;)V",
-        |_ctx, _args| {
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
 }
 
@@ -4609,10 +4805,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
 fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let hc = "java/net/http/HttpClient";
-    r.register(hc, "newHttpClient", "()Ljava/net/http/HttpClient;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        hc,
+        "newHttpClient",
+        "()Ljava/net/http/HttpClient;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         hc,
         "newBuilder",
@@ -4624,10 +4825,15 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     );
 
     let bld = "java/net/http/HttpClient$Builder";
-    r.register(bld, "build", "()Ljava/net/http/HttpClient;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        bld,
+        "build",
+        "()Ljava/net/http/HttpClient;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         bld,
         "connectTimeout",
@@ -4802,20 +5008,15 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
-    r.register(
-        bl,
-        "build",
-        "()Ljava/net/http/HttpRequest;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 4);
-            for i in 0..4 {
-                let v = ctx.get_field(this, i);
-                ctx.set_field(req, i, v);
-            }
-            Ok(Some(Value::Object(Some(req))))
-        },
-    );
+    r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 4);
+        for i in 0..4 {
+            let v = ctx.get_field(this, i);
+            ctx.set_field(req, i, v);
+        }
+        Ok(Some(Value::Object(Some(req))))
+    });
 
     let bps = "java/net/http/HttpRequest$BodyPublishers";
     r.register(
@@ -4823,8 +5024,13 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let body = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            ctx.set_field(body, 0, args.first().copied().unwrap_or(Value::Object(None)));
+            let body =
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            ctx.set_field(
+                body,
+                0,
+                args.first().copied().unwrap_or(Value::Object(None)),
+            );
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -4833,7 +5039,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let body = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
+            let body =
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
             let empty = ctx.create_string("");
             ctx.set_field(body, 0, Value::Object(Some(empty)));
             Ok(Some(Value::Object(Some(body))))
@@ -4999,7 +5206,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
     // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
     // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
-    for desc in ["()Ljavax/net/ssl/SSLEngine;", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"] {
+    for desc in [
+        "()Ljavax/net/ssl/SSLEngine;",
+        "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+    ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, _args| {
             let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
             Ok(Some(Value::Object(Some(eng))))
@@ -5021,8 +5231,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     let ssc = "javax/net/ssl/SSLSessionContext";
     r.register(ssc, "setSessionCacheSize", "(I)V", |_ctx, _args| Ok(None));
     r.register(ssc, "setSessionTimeout", "(I)V", |_ctx, _args| Ok(None));
-    r.register(ssc, "getSessionCacheSize", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(ssc, "getSessionTimeout", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(ssc, "getSessionCacheSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssc, "getSessionTimeout", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
 
     let sf = "javax/net/ssl/SSLSocketFactory";
     r.register(
@@ -5053,11 +5267,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(sock))))
         },
     );
-    r.register(sf, "getDefault", "()Ljavax/net/SocketFactory;", |ctx, _args| {
-        let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-        ctx.set_field(f, 0, Value::Object(None));
-        Ok(Some(Value::Object(Some(f))))
-    });
+    r.register(
+        sf,
+        "getDefault",
+        "()Ljavax/net/SocketFactory;",
+        |ctx, _args| {
+            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+            ctx.set_field(f, 0, Value::Object(None));
+            Ok(Some(Value::Object(Some(f))))
+        },
+    );
 }
 
 // ===========================================================================
@@ -5122,7 +5341,9 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let host = match args.get(2) {
-            Some(Value::Object(Some(ia))) => inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
+            Some(Value::Object(Some(ia))) => {
+                inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0")
+            }
             _ => "0.0.0.0".to_string(),
         };
         let fd = ctx
@@ -5172,42 +5393,47 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(ds, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let pkt = obj_arg(args, 1)?;
-        let fd = ds_get(this).fd;
-        if fd < 0 {
-            return Err(ioex("DatagramSocket: closed"));
-        }
-        let data_arr = match ctx.get_field(pkt, DP_DATA) {
-            Value::Object(Some(a)) => a,
-            _ => return Err(ioex("DatagramPacket: null data")),
-        };
-        let cap = ctx.array_length(data_arr);
-        let mut buf = vec![0u8; cap];
-        let timeout_ms = ds_get(this).timeout;
-        let d = if timeout_ms > 0 {
-            Some(Duration::from_millis(timeout_ms as u64))
-        } else {
-            None
-        };
-        ctx.fd_table()
-            .udp_set_read_timeout(fd as u32, d)
-            .map_err(|e| ioex(format!("UDP timeout: {e}")))?;
-        let (n, origin) = ctx
-            .fd_table()
-            .udp_recv(fd as u32, &mut buf)
-            .map_err(|e| ioex(format!("UDP recv: {e}")))?;
-        copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
-        ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
-        if let Some((oh, op)) = origin.rsplit_once(':') {
-            let port = op.parse::<i32>().unwrap_or(0);
-            let ia = alloc_inet_address(ctx, oh, oh);
-            ctx.set_field(pkt, DP_ADDR, Value::Object(Some(ia)));
-            ctx.set_field(pkt, DP_PORT, Value::Int(port));
-        }
-        Ok(None)
-    });
+    r.register(
+        ds,
+        "receive",
+        "(Ljava/net/DatagramPacket;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pkt = obj_arg(args, 1)?;
+            let fd = ds_get(this).fd;
+            if fd < 0 {
+                return Err(ioex("DatagramSocket: closed"));
+            }
+            let data_arr = match ctx.get_field(pkt, DP_DATA) {
+                Value::Object(Some(a)) => a,
+                _ => return Err(ioex("DatagramPacket: null data")),
+            };
+            let cap = ctx.array_length(data_arr);
+            let mut buf = vec![0u8; cap];
+            let timeout_ms = ds_get(this).timeout;
+            let d = if timeout_ms > 0 {
+                Some(Duration::from_millis(timeout_ms as u64))
+            } else {
+                None
+            };
+            ctx.fd_table()
+                .udp_set_read_timeout(fd as u32, d)
+                .map_err(|e| ioex(format!("UDP timeout: {e}")))?;
+            let (n, origin) = ctx
+                .fd_table()
+                .udp_recv(fd as u32, &mut buf)
+                .map_err(|e| ioex(format!("UDP recv: {e}")))?;
+            copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
+            ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
+            if let Some((oh, op)) = origin.rsplit_once(':') {
+                let port = op.parse::<i32>().unwrap_or(0);
+                let ia = alloc_inet_address(ctx, oh, oh);
+                ctx.set_field(pkt, DP_ADDR, Value::Object(Some(ia)));
+                ctx.set_field(pkt, DP_PORT, Value::Int(port));
+            }
+            Ok(None)
+        },
+    );
 
     r.register(ds, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5251,7 +5477,9 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     // `new DatagramSocket(port); setReuseAddress(true)` right after the
     // ServerSocket check.
     r.register(ds, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(ds, "getReuseAddress", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(ds, "getReuseAddress", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
 }
 
 // ===========================================================================
@@ -5325,7 +5553,11 @@ fn re8_build_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
             continue;
         }
         let iface = alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5);
-        let name = ctx.create_string(if matches!(ip, IpAddr::V4(_)) { "eth0" } else { "eth1" });
+        let name = ctx.create_string(if matches!(ip, IpAddr::V4(_)) {
+            "eth0"
+        } else {
+            "eth1"
+        });
         let display = ctx.create_string("Primary Network Interface");
         ctx.set_field(iface, 0, Value::Object(Some(name)));
         ctx.set_field(iface, 1, Value::Object(Some(display)));
@@ -5369,7 +5601,9 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(mac))))
     });
-    r.register(ni, "getMTU", "()I", |_ctx, _args| Ok(Some(Value::Int(1500))));
+    r.register(ni, "getMTU", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(1500)))
+    });
 
     // Low-level "0" suffixed natives used by NetworkInterface (JDK internals).
     // Safe no-op defaults — sufficient for environment probing (e.g., Spring's
@@ -5377,9 +5611,12 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
-    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    r.register(
+        ni,
+        "isLoopback0",
+        "(Ljava/lang/String;I)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
     r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -5569,9 +5806,7 @@ fn register_re9_nio_selector(r: &mut NativeMethodRegistry) {
             let deadline = std::time::Instant::now() + Duration::from_millis(raw as u64);
             let mut total = 0i32;
             while std::time::Instant::now() < deadline {
-                if let Ok(Some(Value::Int(n))) =
-                    ctx.invoke_virtual(this, "selectNow", "()I", &[])
-                {
+                if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(this, "selectNow", "()I", &[]) {
                     if n > 0 {
                         total = n;
                         break;
@@ -6183,10 +6418,7 @@ fn re10_spawn_dispatcher(
 /// inbound request queue and dispatches each request through the real Java
 /// `HttpHandler`, then idles (in a GC-blocked region) until more arrive. Exits
 /// when the server's `running` flag clears.
-fn re10_serve_loop_run(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn re10_serve_loop_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let server_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
     let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
@@ -6370,7 +6602,10 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // Non-blocking so the accept loop polls `running` (and so it can be
             // closed promptly by stop()).
             listener.set_nonblocking(true).ok();
-            let bound_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(port);
+            let bound_port = listener
+                .local_addr()
+                .map(|a| a.port() as i32)
+                .unwrap_or(port);
             let server_id = next_server_id();
             let state = std::sync::Arc::new(ServerState {
                 listener: Mutex::new(Some(listener)),
@@ -6470,19 +6705,24 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     });
     // removeContext(HttpContext ctx) — same, resolving the path from the context's
     // slot 0 (set by createContext).
-    r.register(hs, "removeContext", "(Lcom/sun/net/httpserver/HttpContext;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
-        if let Some(Value::Object(Some(hctx))) = args.get(1).copied() {
-            let path = value_or_string(ctx, ctx.get_field(hctx, 0), "");
-            if id >= 0 {
-                if let Some(state) = server_registry().lock().get(&id) {
-                    state.handlers.lock().retain(|e| e.path_prefix != path);
+    r.register(
+        hs,
+        "removeContext",
+        "(Lcom/sun/net/httpserver/HttpContext;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
+            if let Some(Value::Object(Some(hctx))) = args.get(1).copied() {
+                let path = value_or_string(ctx, ctx.get_field(hctx, 0), "");
+                if id >= 0 {
+                    if let Some(state) = server_registry().lock().get(&id) {
+                        state.handlers.lock().retain(|e| e.path_prefix != path);
+                    }
                 }
             }
-        }
-        Ok(None)
-    });
+            Ok(None)
+        },
+    );
 
     r.register(
         hs,
@@ -6495,10 +6735,15 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
 
     let hex = "com/sun/net/httpserver/HttpExchange";
-    r.register(hex, "getRequestMethod", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    r.register(
+        hex,
+        "getRequestMethod",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
     r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let s = ctx.get_field(this, 1);
@@ -6527,20 +6772,25 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 2)))
         },
     );
-    r.register(hex, "getRequestBody", "()Ljava/io/InputStream;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let body = match ctx.get_field(this, 4) {
-            Value::Object(Some(a)) => a,
-            _ => ctx.new_array(ArrayElementType::Byte, 0),
-        };
-        let len = ctx.array_length(body) as i32;
-        let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-        ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
-        ctx.set_field(stream, 1, Value::Int(0));              // pos
-        ctx.set_field(stream, 2, Value::Int(0));              // mark
-        ctx.set_field(stream, 3, Value::Int(len));            // count
-        Ok(Some(Value::Object(Some(stream))))
-    });
+    r.register(
+        hex,
+        "getRequestBody",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let body = match ctx.get_field(this, 4) {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(ArrayElementType::Byte, 0),
+            };
+            let len = ctx.array_length(body) as i32;
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
+            ctx.set_field(stream, 1, Value::Int(0)); // pos
+            ctx.set_field(stream, 2, Value::Int(0)); // mark
+            ctx.set_field(stream, 3, Value::Int(len)); // count
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
     r.register(hex, "sendResponseHeaders", "(IJ)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let code = args.get(1).and_then(|v| v.as_int()).unwrap_or(200);
@@ -6555,16 +6805,29 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Some(v) => v.as_int().map(|i| i as i64).unwrap_or(0),
             None => 0,
         };
-        ctx.set_field(this, 7, Value::Int(len.clamp(i32::MIN as i64, i32::MAX as i64) as i32));
+        ctx.set_field(
+            this,
+            7,
+            Value::Int(len.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+        );
         Ok(None)
     });
-    r.register(hex, "getResponseBody", "()Ljava/io/OutputStream;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let out = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange$ResponseBody", 2);
-        ctx.set_field(out, 0, Value::Object(Some(this)));
-        ctx.set_field(out, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(out))))
-    });
+    r.register(
+        hex,
+        "getResponseBody",
+        "()Ljava/io/OutputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let out = alloc_concurrent_synthetic(
+                ctx,
+                "com/sun/net/httpserver/HttpExchange$ResponseBody",
+                2,
+            );
+            ctx.set_field(out, 0, Value::Object(Some(this)));
+            ctx.set_field(out, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(out))))
+        },
+    );
     r.register(hex, "close", "()V", |_ctx, _args| Ok(None));
 
     let rb = "com/sun/net/httpserver/HttpExchange$ResponseBody";
@@ -6825,8 +7088,10 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            c.write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc")
-                .unwrap();
+            c.write_all(
+                b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc",
+            )
+            .unwrap();
             let mut resp = Vec::new();
             let _ = c.read_to_end(&mut resp);
             resp

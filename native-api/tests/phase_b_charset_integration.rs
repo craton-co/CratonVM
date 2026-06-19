@@ -15,8 +15,8 @@
 //!   to support (windows-1252, KOI8-R, ISO-8859-15).
 
 use cratonvm_native_api::charset::{
-    average_bytes_per_char, average_chars_per_byte, decode_bytes, decode_bytes_lossy,
-    encode_chars, encode_chars_lossy, max_bytes_per_char, max_chars_per_byte,
+    average_bytes_per_char, average_chars_per_byte, decode_bytes, decode_bytes_lossy, encode_chars,
+    encode_chars_lossy, max_bytes_per_char, max_chars_per_byte,
 };
 
 fn to_u16(s: &str) -> Vec<u16> {

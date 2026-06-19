@@ -273,12 +273,7 @@ fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
             // The host must exist and must explicitly list this class as a
             // member. Otherwise the NestHost claim is unconfirmed (spoofed).
             match store.find_by_name(host) {
-                Some(host_class)
-                    if host_class
-                        .nest_members
-                        .iter()
-                        .any(|m| m == &*class.name) =>
-                {
+                Some(host_class) if host_class.nest_members.iter().any(|m| m == &*class.name) => {
                     // Confirmed: return the claiming class's view of the
                     // host name (byte-identical to the resolved host, and
                     // borrowed from `class` so it satisfies the `'a`
@@ -372,7 +367,8 @@ pub fn check_module_access(
     let target_mod = target.module_name.as_deref().unwrap_or(UNNAMED_MODULE);
 
     // Same module or unnamed module involved в†’ always allowed.
-    if accessor_mod == target_mod || accessor_mod == UNNAMED_MODULE || target_mod == UNNAMED_MODULE {
+    if accessor_mod == target_mod || accessor_mod == UNNAMED_MODULE || target_mod == UNNAMED_MODULE
+    {
         return Ok(());
     }
 
@@ -477,7 +473,8 @@ mod tests {
             name: Arc::from(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Loaded, initializing_thread: None,
+            state: ClassState::Loaded,
+            initializing_thread: None,
             constant_pool: empty_cp(),
             access_flags: flags,
             superclass,
@@ -786,10 +783,14 @@ mod tests {
         // Cross-package protected access through a receiver of the accessor's
         // own type (`child`) is permitted (JVMS В§5.4.4 receiver-subtype clause
         // satisfied). `None` (untracked receiver) is likewise permitted.
-        assert!(
-            check_field_access(child, parent, FieldAccessFlags::PROTECTED, &store, Some(child))
-                .is_ok()
-        );
+        assert!(check_field_access(
+            child,
+            parent,
+            FieldAccessFlags::PROTECTED,
+            &store,
+            Some(child)
+        )
+        .is_ok());
         assert!(
             check_field_access(child, parent, FieldAccessFlags::PROTECTED, &store, None).is_ok()
         );
@@ -892,7 +893,9 @@ mod tests {
         );
 
         let class = store.get(class_id).unwrap();
-        assert!(check_method_access(class, class, MethodAccessFlags::PRIVATE, &store, None).is_ok());
+        assert!(
+            check_method_access(class, class, MethodAccessFlags::PRIVATE, &store, None).is_ok()
+        );
     }
 
     #[test]
@@ -1138,7 +1141,8 @@ mod tests {
             name: Arc::from(name),
             source_file: None,
             version: ClassFileVersion::JAVA_11,
-            state: ClassState::Loaded, initializing_thread: None,
+            state: ClassState::Loaded,
+            initializing_thread: None,
             constant_pool: empty_cp(),
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
             superclass: None,
@@ -1186,7 +1190,9 @@ mod tests {
         // Inner can access Outer's private fields
         assert!(check_field_access(inner, outer, FieldAccessFlags::PRIVATE, &store, None).is_ok());
         // Outer can access Inner's private methods
-        assert!(check_method_access(outer, inner, MethodAccessFlags::PRIVATE, &store, None).is_ok());
+        assert!(
+            check_method_access(outer, inner, MethodAccessFlags::PRIVATE, &store, None).is_ok()
+        );
     }
 
     #[test]

@@ -123,7 +123,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -236,7 +240,10 @@ fn run_fixture(mode: Mode) -> Option<Run> {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[jit_interp_diff] failed to spawn cratonvm ({}): {e}", mode.label());
+            eprintln!(
+                "[jit_interp_diff] failed to spawn cratonvm ({}): {e}",
+                mode.label()
+            );
             return None;
         }
     };

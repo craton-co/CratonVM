@@ -388,10 +388,7 @@ mod tests {
         let err = ClassFileError::ClassNotFound {
             class_name: "java/lang/Object".into(),
         };
-        assert_eq!(
-            format!("{err}"),
-            "class not found: java/lang/Object"
-        );
+        assert_eq!(format!("{err}"), "class not found: java/lang/Object");
     }
 
     #[test]
@@ -412,10 +409,7 @@ mod tests {
             class_name: "Bad".into(),
             message: "bad magic number".into(),
         };
-        assert_eq!(
-            format!("{err}"),
-            "invalid class file Bad: bad magic number"
-        );
+        assert_eq!(format!("{err}"), "invalid class file Bad: bad magic number");
     }
 
     #[test]
@@ -518,10 +512,7 @@ mod tests {
     #[test]
     fn runtime_error_array_index_out_of_bounds() {
         let err = RuntimeError::ArrayIndexOutOfBoundsException { index: -1 };
-        assert_eq!(
-            format!("{err}"),
-            "ArrayIndexOutOfBoundsException: index -1"
-        );
+        assert_eq!(format!("{err}"), "ArrayIndexOutOfBoundsException: index -1");
     }
 
     #[test]
@@ -601,10 +592,7 @@ mod tests {
         let err = RuntimeError::IllegalMonitorStateException {
             message: "not owner".into(),
         };
-        assert_eq!(
-            format!("{err}"),
-            "IllegalMonitorStateException: not owner"
-        );
+        assert_eq!(format!("{err}"), "IllegalMonitorStateException: not owner");
     }
 
     #[test]
@@ -656,10 +644,7 @@ mod tests {
         let err = RuntimeError::UnsupportedOperationException {
             message: "immutable".into(),
         };
-        assert_eq!(
-            format!("{err}"),
-            "UnsupportedOperationException: immutable"
-        );
+        assert_eq!(format!("{err}"), "UnsupportedOperationException: immutable");
     }
 
     #[test]
@@ -696,7 +681,10 @@ mod tests {
         let state = RuntimeError::IllegalStateException {
             message: "denied".into(),
         };
-        assert!(matches!(caller, RuntimeError::IllegalCallerException { .. }));
+        assert!(matches!(
+            caller,
+            RuntimeError::IllegalCallerException { .. }
+        ));
         assert!(matches!(state, RuntimeError::IllegalStateException { .. }));
         // Display strings must not collide.
         assert_ne!(format!("{caller}"), format!("{state}"));

@@ -3,11 +3,11 @@
 
 //! Panama FFI native method registrations.
 
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{obj_arg, alloc_concurrent_synthetic};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 use cratonvm_native_api::ffi::{
     self, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE, LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT,
@@ -113,10 +113,7 @@ where
     }
     if addr % std::mem::align_of::<usize>() != 0 {
         return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "Misaligned function pointer {:#x} in downcall",
-                addr
-            ),
+            message: format!("Misaligned function pointer {:#x} in downcall", addr),
         }
         .into());
     }
@@ -654,7 +651,7 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             };
             let len = ctx.array_length(arr);
             let byte_size = (len * 4) as i64; // int = 4 bytes each
-            // Allocate native memory and copy array contents into it
+                                              // Allocate native memory and copy array contents into it
             let result = ctx.allocate_native_memory(byte_size as usize, 4);
             if let Some((alloc_id, ptr)) = result {
                 // Copy array elements into native memory
@@ -679,7 +676,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             } else {
                 Err(RuntimeError::OutOfMemoryError {
                     message: "Failed to allocate native memory for ofArray".into(),
-                }.into())
+                }
+                .into())
             }
         },
     );
@@ -716,7 +714,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             } else {
                 Err(RuntimeError::OutOfMemoryError {
                     message: "Failed to allocate native memory for ofArray".into(),
-                }.into())
+                }
+                .into())
             }
         },
     );
@@ -753,7 +752,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             } else {
                 Err(RuntimeError::OutOfMemoryError {
                     message: "Failed to allocate native memory for ofArray".into(),
-                }.into())
+                }
+                .into())
             }
         },
     );
@@ -1249,7 +1249,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let n = args.first().and_then(|v| v.as_int()).unwrap_or(0);
             let opt = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2);
-            ctx.set_field(opt, 0, Value::Int(0));        // kind = firstVariadicArg
+            ctx.set_field(opt, 0, Value::Int(0)); // kind = firstVariadicArg
             ctx.set_field(opt, 1, Value::Long(n as i64)); // payload
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1406,8 +1406,8 @@ fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // a prior invocation on this same handle; the Box outlives
         // this call (freed on handle finalization). libffi only
         // reads the Cif during ffi_call.
-        let cif_ref = unsafe { plf::cached_cif_ref(cached_cif_u64) }
-            .expect("non-zero pointer must deref");
+        let cif_ref =
+            unsafe { plf::cached_cif_ref(cached_cif_u64) }.expect("non-zero pointer must deref");
         cif_ref.as_raw_ptr()
     } else {
         // ----- Build libffi types for each parameter -----
@@ -1436,8 +1436,8 @@ fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx.set_field(handle, 3, Value::Long(stash_u64 as i64));
         // SAFETY: stash_u64 was produced above; Box is live for the
         // remainder of this call and beyond.
-        let cif_ref = unsafe { plf::cached_cif_ref(stash_u64) }
-            .expect("just-stashed pointer must deref");
+        let cif_ref =
+            unsafe { plf::cached_cif_ref(stash_u64) }.expect("just-stashed pointer must deref");
         cif_ref.as_raw_ptr()
     };
 
@@ -1712,8 +1712,14 @@ macro_rules! gen_trampolines {
 macro_rules! gen_trampoline {
     ($name:ident, $slot:expr) => {
         unsafe extern "C" fn $name(
-            a0: u64, a1: u64, a2: u64, a3: u64,
-            a4: u64, a5: u64, a6: u64, a7: u64,
+            a0: u64,
+            a1: u64,
+            a2: u64,
+            a3: u64,
+            a4: u64,
+            a5: u64,
+            a6: u64,
+            a7: u64,
         ) -> u64 {
             trampoline_dispatch($slot, &[a0, a1, a2, a3, a4, a5, a6, a7])
         }
@@ -1786,23 +1792,80 @@ gen_trampoline!(_upcall_t62, 62);
 gen_trampoline!(_upcall_t63, 63);
 
 /// Table of trampoline function pointers, indexed by slot.
-static UPCALL_TRAMPOLINE_FNS: [unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64; MAX_UPCALL_TRAMPOLINES] = [
-    _upcall_t00, _upcall_t01, _upcall_t02, _upcall_t03,
-    _upcall_t04, _upcall_t05, _upcall_t06, _upcall_t07,
-    _upcall_t08, _upcall_t09, _upcall_t10, _upcall_t11,
-    _upcall_t12, _upcall_t13, _upcall_t14, _upcall_t15,
-    _upcall_t16, _upcall_t17, _upcall_t18, _upcall_t19,
-    _upcall_t20, _upcall_t21, _upcall_t22, _upcall_t23,
-    _upcall_t24, _upcall_t25, _upcall_t26, _upcall_t27,
-    _upcall_t28, _upcall_t29, _upcall_t30, _upcall_t31,
-    _upcall_t32, _upcall_t33, _upcall_t34, _upcall_t35,
-    _upcall_t36, _upcall_t37, _upcall_t38, _upcall_t39,
-    _upcall_t40, _upcall_t41, _upcall_t42, _upcall_t43,
-    _upcall_t44, _upcall_t45, _upcall_t46, _upcall_t47,
-    _upcall_t48, _upcall_t49, _upcall_t50, _upcall_t51,
-    _upcall_t52, _upcall_t53, _upcall_t54, _upcall_t55,
-    _upcall_t56, _upcall_t57, _upcall_t58, _upcall_t59,
-    _upcall_t60, _upcall_t61, _upcall_t62, _upcall_t63,
+static UPCALL_TRAMPOLINE_FNS: [unsafe extern "C" fn(
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) -> u64; MAX_UPCALL_TRAMPOLINES] = [
+    _upcall_t00,
+    _upcall_t01,
+    _upcall_t02,
+    _upcall_t03,
+    _upcall_t04,
+    _upcall_t05,
+    _upcall_t06,
+    _upcall_t07,
+    _upcall_t08,
+    _upcall_t09,
+    _upcall_t10,
+    _upcall_t11,
+    _upcall_t12,
+    _upcall_t13,
+    _upcall_t14,
+    _upcall_t15,
+    _upcall_t16,
+    _upcall_t17,
+    _upcall_t18,
+    _upcall_t19,
+    _upcall_t20,
+    _upcall_t21,
+    _upcall_t22,
+    _upcall_t23,
+    _upcall_t24,
+    _upcall_t25,
+    _upcall_t26,
+    _upcall_t27,
+    _upcall_t28,
+    _upcall_t29,
+    _upcall_t30,
+    _upcall_t31,
+    _upcall_t32,
+    _upcall_t33,
+    _upcall_t34,
+    _upcall_t35,
+    _upcall_t36,
+    _upcall_t37,
+    _upcall_t38,
+    _upcall_t39,
+    _upcall_t40,
+    _upcall_t41,
+    _upcall_t42,
+    _upcall_t43,
+    _upcall_t44,
+    _upcall_t45,
+    _upcall_t46,
+    _upcall_t47,
+    _upcall_t48,
+    _upcall_t49,
+    _upcall_t50,
+    _upcall_t51,
+    _upcall_t52,
+    _upcall_t53,
+    _upcall_t54,
+    _upcall_t55,
+    _upcall_t56,
+    _upcall_t57,
+    _upcall_t58,
+    _upcall_t59,
+    _upcall_t60,
+    _upcall_t61,
+    _upcall_t62,
+    _upcall_t63,
 ];
 
 // =============================================================================
@@ -1826,7 +1889,7 @@ static UPCALL_TRAMPOLINE_FNS: [unsafe extern "C" fn(u64, u64, u64, u64, u64, u64
 // a) the closure stays alive until the owning arena is closed, and
 // b) the userdata pointer remains stable across the call.
 
-use libffi::middle::{Closure, Cif as MiddleCif, Type as MiddleType};
+use libffi::middle::{Cif as MiddleCif, Closure, Type as MiddleType};
 
 /// Per-upcall state held alive in `UPCALL_REGISTRY`.
 ///
@@ -1855,8 +1918,9 @@ struct UpcallUserdata {
     return_kind: i32,
 }
 
-static UPCALL_REGISTRY: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, UpcallEntry>>> =
-    std::sync::OnceLock::new();
+static UPCALL_REGISTRY: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, UpcallEntry>>,
+> = std::sync::OnceLock::new();
 
 fn upcall_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, UpcallEntry>> {
     UPCALL_REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -1885,29 +1949,17 @@ unsafe extern "C" fn upcall_dispatch(
     for (i, &kind) in userdata.param_kinds.iter().enumerate() {
         let slot = *args.add(i);
         let v = match kind {
-            cratonvm_native_api::ffi::LAYOUT_BYTE
-            | cratonvm_native_api::ffi::LAYOUT_BOOLEAN => {
+            cratonvm_native_api::ffi::LAYOUT_BYTE | cratonvm_native_api::ffi::LAYOUT_BOOLEAN => {
                 Value::Int(*(slot as *const i8) as i32)
             }
-            cratonvm_native_api::ffi::LAYOUT_SHORT
-            | cratonvm_native_api::ffi::LAYOUT_CHAR => {
+            cratonvm_native_api::ffi::LAYOUT_SHORT | cratonvm_native_api::ffi::LAYOUT_CHAR => {
                 Value::Int(*(slot as *const i16) as i32)
             }
-            cratonvm_native_api::ffi::LAYOUT_INT => {
-                Value::Int(*(slot as *const i32))
-            }
-            cratonvm_native_api::ffi::LAYOUT_LONG => {
-                Value::Long(*(slot as *const i64))
-            }
-            cratonvm_native_api::ffi::LAYOUT_FLOAT => {
-                Value::Float(*(slot as *const f32))
-            }
-            cratonvm_native_api::ffi::LAYOUT_DOUBLE => {
-                Value::Double(*(slot as *const f64))
-            }
-            cratonvm_native_api::ffi::LAYOUT_ADDRESS => {
-                Value::Long(*(slot as *const i64))
-            }
+            cratonvm_native_api::ffi::LAYOUT_INT => Value::Int(*(slot as *const i32)),
+            cratonvm_native_api::ffi::LAYOUT_LONG => Value::Long(*(slot as *const i64)),
+            cratonvm_native_api::ffi::LAYOUT_FLOAT => Value::Float(*(slot as *const f32)),
+            cratonvm_native_api::ffi::LAYOUT_DOUBLE => Value::Double(*(slot as *const f64)),
+            cratonvm_native_api::ffi::LAYOUT_ADDRESS => Value::Long(*(slot as *const i64)),
             _ => Value::Long(0),
         };
         java_args.push(v);
@@ -1918,8 +1970,7 @@ unsafe extern "C" fn upcall_dispatch(
         // The Java target is a MethodHandle / functional interface impl.
         // We invoke its `invoke([Object])` method passing our boxed args.
         // Build an Object[] of boxed primitives.
-        let arr =
-            ctx.new_array(cratonvm_types::ArrayElementType::Reference, java_args.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, java_args.len());
         for (i, v) in java_args.iter().enumerate() {
             // Pass primitives through directly; the receiver is
             // expected to pattern-match on Value via lambda dispatch.
@@ -1933,7 +1984,10 @@ unsafe extern "C" fn upcall_dispatch(
             userdata.target,
             "invoke",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(userdata.target)), Value::Object(Some(arr))],
+            &[
+                Value::Object(Some(userdata.target)),
+                Value::Object(Some(arr)),
+            ],
         )
     });
 
@@ -2805,7 +2859,10 @@ mod tests {
             offset < 0 || end > size
         }
         // Zero-size segment, non-zero copy length -> must reject (the bug).
-        assert!(exceeds(0, 64, 0), "zero-size segment must reject non-zero copy");
+        assert!(
+            exceeds(0, 64, 0),
+            "zero-size segment must reject non-zero copy"
+        );
         // Negative offset -> reject.
         assert!(exceeds(-1, 0, 16), "negative offset must reject");
         // Offset+bytes overflowing i64 -> saturates to MAX, exceeds size -> reject.
@@ -2817,7 +2874,10 @@ mod tests {
         // Zero-length copy on a zero-size segment is harmless and the
         // production code only enters the bounds block when bytes > 0, so the
         // predicate for (0,0,0) staying false is the consistent invariant.
-        assert!(!exceeds(0, 0, 0), "zero-length copy is not a bounds violation");
+        assert!(
+            !exceeds(0, 0, 0),
+            "zero-length copy is not a bounds violation"
+        );
     }
 
     #[test]
@@ -2829,7 +2889,7 @@ mod tests {
             arg_sizes: Vec<usize>,
         }
         let desc = FuncDesc {
-            ret_size: 4, // int return
+            ret_size: 4,           // int return
             arg_sizes: vec![8, 8], // two pointer args
         };
         assert_eq!(desc.arg_sizes.len(), 2);
@@ -2984,8 +3044,8 @@ mod tests {
     // Phase 85.1: Arena Lifecycle Tests
     // ===================================================================
 
-    use crate::test_utils::mock_ctx;
     use crate::alloc_concurrent_synthetic;
+    use crate::test_utils::mock_ctx;
 
     /// Helper: create an arena object of the given kind using the actual registration logic.
     fn make_arena(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
@@ -3013,9 +3073,15 @@ mod tests {
         };
 
         // Segment should have valid pointer and size
-        let ptr = match ctx.get_field(seg, 0) { Value::Long(n) => n, _ => 0 };
+        let ptr = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         assert!(ptr != 0, "Segment pointer should be non-null");
-        let size = match ctx.get_field(seg, 1) { Value::Long(n) => n, _ => 0 };
+        let size = match ctx.get_field(seg, 1) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         assert_eq!(size, 64);
 
         // Arena count should be 1
@@ -3082,7 +3148,10 @@ mod tests {
         // Global arena cannot be closed at all
         let global = make_arena(&mut ctx, ffi::ARENA_GLOBAL);
         let close_global = pe_arena_close(&mut ctx, &[Value::Object(Some(global))]);
-        assert!(close_global.is_err(), "Global arena close must return error");
+        assert!(
+            close_global.is_err(),
+            "Global arena close must return error"
+        );
     }
 
     // ===================================================================
@@ -3103,7 +3172,13 @@ mod tests {
 
         let seg = pe_arena_allocate_impl(&mut ctx, arena, 16, 4)
             .unwrap()
-            .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
             .unwrap();
 
         // Write int 42 at offset 0
@@ -3114,7 +3189,14 @@ mod tests {
 
         // Write long at offset 8
         let layout_long = make_layout(&mut ctx, LAYOUT_LONG);
-        pe_segment_set_impl(&mut ctx, seg, layout_long, 8, Value::Long(0x1234_5678_9ABC_DEF0)).unwrap();
+        pe_segment_set_impl(
+            &mut ctx,
+            seg,
+            layout_long,
+            8,
+            Value::Long(0x1234_5678_9ABC_DEF0),
+        )
+        .unwrap();
         let val2 = pe_segment_get_impl(&mut ctx, seg, layout_long, 8).unwrap();
         assert_eq!(val2, Some(Value::Long(0x1234_5678_9ABC_DEF0)));
     }
@@ -3158,7 +3240,9 @@ mod tests {
         let (_, ptr) = result.unwrap();
         for i in 0..len {
             if let Value::Int(v) = ctx.get_array_element(arr, i) {
-                unsafe { *(ptr as *mut i32).add(i) = v; }
+                unsafe {
+                    *(ptr as *mut i32).add(i) = v;
+                }
             }
         }
 
@@ -3177,34 +3261,56 @@ mod tests {
 
         let src = pe_arena_allocate_impl(&mut ctx, arena, 32, 1)
             .unwrap()
-            .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         let dst = pe_arena_allocate_impl(&mut ctx, arena, 32, 1)
             .unwrap()
-            .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
             .unwrap();
 
         // Write pattern to src
-        let src_ptr = match ctx.get_field(src, 0) { Value::Long(n) => n as *mut u8, _ => std::ptr::null_mut() };
+        let src_ptr = match ctx.get_field(src, 0) {
+            Value::Long(n) => n as *mut u8,
+            _ => std::ptr::null_mut(),
+        };
         assert!(!src_ptr.is_null());
         for i in 0..16u8 {
-            unsafe { *src_ptr.add(i as usize) = i + 1; }
+            unsafe {
+                *src_ptr.add(i as usize) = i + 1;
+            }
         }
 
         // Copy 16 bytes from src to dst
         let _copy_args = vec![
             Value::Object(Some(src)),
-            Value::Long(0),   // srcOffset
+            Value::Long(0), // srcOffset
             Value::Object(Some(dst)),
-            Value::Long(0),   // dstOffset
-            Value::Long(16),  // bytes
+            Value::Long(0),  // dstOffset
+            Value::Long(16), // bytes
         ];
 
         // Simulate copy logic
         let src_addr = src_ptr;
-        let dst_ptr = match ctx.get_field(dst, 0) { Value::Long(n) => n as *mut u8, _ => std::ptr::null_mut() };
+        let dst_ptr = match ctx.get_field(dst, 0) {
+            Value::Long(n) => n as *mut u8,
+            _ => std::ptr::null_mut(),
+        };
         assert!(!dst_ptr.is_null());
-        unsafe { std::ptr::copy_nonoverlapping(src_addr, dst_ptr, 16); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_addr, dst_ptr, 16);
+        }
 
         // Verify dst has the pattern
         for i in 0..16u8 {
@@ -3221,7 +3327,13 @@ mod tests {
 
         let seg = pe_arena_allocate_impl(&mut ctx, arena, 64, 1)
             .unwrap()
-            .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
             .unwrap();
 
         // Write a value at offset 16
@@ -3230,7 +3342,10 @@ mod tests {
 
         // Create a slice starting at offset 16, size 32
         let slice = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
-        let base_ptr = match ctx.get_field(seg, 0) { Value::Long(n) => n, _ => 0 };
+        let base_ptr = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         ctx.set_field(slice, 0, Value::Long(base_ptr));
         ctx.set_field(slice, 1, Value::Long(32));
         ctx.set_field(slice, 2, ctx.get_field(seg, 2));
@@ -3251,15 +3366,28 @@ mod tests {
 
         let seg = pe_arena_allocate_impl(&mut ctx, arena, 64, 1)
             .unwrap()
-            .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
             .unwrap();
 
-        let orig_ptr = match ctx.get_field(seg, 0) { Value::Long(n) => n, _ => 0 };
-        let orig_size = match ctx.get_field(seg, 1) { Value::Long(n) => n, _ => 0 };
+        let orig_ptr = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
+        let orig_size = match ctx.get_field(seg, 1) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         assert_eq!(orig_size, 64);
 
         // Reinterpret with new size 128
-        let reinterpreted = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
+        let reinterpreted =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
         ctx.set_field(reinterpreted, 0, Value::Long(orig_ptr));
         ctx.set_field(reinterpreted, 1, Value::Long(128));
         ctx.set_field(reinterpreted, 2, ctx.get_field(seg, 2));
@@ -3268,8 +3396,14 @@ mod tests {
         ctx.set_field(reinterpreted, 5, Value::Long(0));
 
         // Pointer should be the same, size should be different
-        let new_ptr = match ctx.get_field(reinterpreted, 0) { Value::Long(n) => n, _ => 0 };
-        let new_size = match ctx.get_field(reinterpreted, 1) { Value::Long(n) => n, _ => 0 };
+        let new_ptr = match ctx.get_field(reinterpreted, 0) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
+        let new_size = match ctx.get_field(reinterpreted, 1) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         assert_eq!(new_ptr, orig_ptr);
         assert_eq!(new_size, 128);
     }
@@ -3296,7 +3430,9 @@ mod tests {
         // Create a C string in native memory
         let (_, ptr) = ctx.allocate_native_memory(16, 1).unwrap();
         let test_str = b"hello\0";
-        unsafe { std::ptr::copy_nonoverlapping(test_str.as_ptr(), ptr, test_str.len()); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(test_str.as_ptr(), ptr, test_str.len());
+        }
 
         // Build FunctionDescriptor: of(LAYOUT_LONG, ADDRESS)
         let ret_layout = make_layout(&mut ctx, LAYOUT_LONG);
@@ -3304,7 +3440,8 @@ mod tests {
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3318,10 +3455,10 @@ mod tests {
         ctx.set_array_element(call_args, 0, Value::Long(ptr as i64));
 
         // Invoke the downcall
-        let result = pe_downcall_invoke(&mut ctx, &[
-            Value::Object(Some(handle)),
-            Value::Object(Some(call_args)),
-        ]);
+        let result = pe_downcall_invoke(
+            &mut ctx,
+            &[Value::Object(Some(handle)), Value::Object(Some(call_args))],
+        );
 
         assert!(result.is_ok(), "strlen downcall failed: {:?}", result.err());
         let val = result.unwrap();
@@ -3337,7 +3474,9 @@ mod tests {
         let _na = NativeAccessGuard::enable();
 
         let abs_addr = ctx.find_native_symbol(-1, "abs");
-        if abs_addr.is_none() { return; }
+        if abs_addr.is_none() {
+            return;
+        }
         let abs_addr = abs_addr.unwrap() as i64;
 
         // FunctionDescriptor: of(LAYOUT_INT, LAYOUT_INT)
@@ -3346,7 +3485,8 @@ mod tests {
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3357,10 +3497,10 @@ mod tests {
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(-42));
 
-        let result = pe_downcall_invoke(&mut ctx, &[
-            Value::Object(Some(handle)),
-            Value::Object(Some(call_args)),
-        ]);
+        let result = pe_downcall_invoke(
+            &mut ctx,
+            &[Value::Object(Some(handle)), Value::Object(Some(call_args))],
+        );
 
         assert!(result.is_ok(), "abs downcall failed: {:?}", result.err());
         let val = result.unwrap();
@@ -3401,8 +3541,7 @@ mod tests {
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
         // Build a DowncallHandle with 4 fields (the new cache layout).
-        let handle =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
+        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -3445,10 +3584,7 @@ mod tests {
         ctx.set_array_element(call_args2, 0, Value::Int(-11));
         let r2 = pe_downcall_invoke(
             &mut ctx,
-            &[
-                Value::Object(Some(handle)),
-                Value::Object(Some(call_args2)),
-            ],
+            &[Value::Object(Some(handle)), Value::Object(Some(call_args2))],
         )
         .expect("second downcall must succeed");
         assert_eq!(r2, Some(Value::Int(11)));
@@ -3468,8 +3604,7 @@ mod tests {
         // Simpler smoke test: if we don't actually call, field 3 stays 0.
         // Only the invoke path populates the cache slot.
         let mut ctx = mock_ctx();
-        let handle =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
+        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
         ctx.set_field(handle, 3, Value::Long(0));
         match ctx.get_field(handle, 3) {
             Value::Long(0) => {}
@@ -3497,11 +3632,17 @@ mod tests {
             _ => panic!("Expected struct layout object"),
         };
 
-        let total_size = match ctx.get_field(layout, 1) { Value::Long(n) => n, _ => 0 };
+        let total_size = match ctx.get_field(layout, 1) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         // int(4) + padding(4) + long(8) = 16, aligned to 8
         assert_eq!(total_size, 16);
 
-        let alignment = match ctx.get_field(layout, 5) { Value::Long(n) => n, _ => 0 };
+        let alignment = match ctx.get_field(layout, 5) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
         assert_eq!(alignment, 8);
     }
 
@@ -3515,7 +3656,9 @@ mod tests {
 
         // We'll test that a downcall with -1 return kind produces Value::Object(None)
         let abs_addr = ctx.find_native_symbol(-1, "abs");
-        if abs_addr.is_none() { return; }
+        if abs_addr.is_none() {
+            return;
+        }
         let abs_addr = abs_addr.unwrap() as i64;
 
         // FunctionDescriptor: ofVoid(LAYOUT_INT)  — return_layout = None
@@ -3523,7 +3666,8 @@ mod tests {
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3534,10 +3678,10 @@ mod tests {
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(5));
 
-        let result = pe_downcall_invoke(&mut ctx, &[
-            Value::Object(Some(handle)),
-            Value::Object(Some(call_args)),
-        ]);
+        let result = pe_downcall_invoke(
+            &mut ctx,
+            &[Value::Object(Some(handle)), Value::Object(Some(call_args))],
+        );
 
         assert!(result.is_ok());
         // void return should produce Object(None)
@@ -3589,7 +3733,8 @@ mod tests {
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3597,12 +3742,15 @@ mod tests {
         let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
         // Register upcall handle
-        let handle_result = pe_upcall_handle(&mut ctx, &[
-            Value::Object(Some(linker)),
-            Value::Object(Some(target)),
-            Value::Object(Some(descriptor)),
-            Value::Object(Some(arena)),
-        ]);
+        let handle_result = pe_upcall_handle(
+            &mut ctx,
+            &[
+                Value::Object(Some(linker)),
+                Value::Object(Some(target)),
+                Value::Object(Some(descriptor)),
+                Value::Object(Some(arena)),
+            ],
+        );
         assert!(handle_result.is_ok());
         let seg = match handle_result.unwrap() {
             Some(Value::Object(Some(s))) => s,
@@ -3610,7 +3758,10 @@ mod tests {
         };
 
         // The segment's address (field 0) should be a real trampoline function pointer
-        let tramp_addr = match ctx.get_field(seg, 0) { Value::Long(n) => n, _ => -1 };
+        let tramp_addr = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n,
+            _ => -1,
+        };
         assert!(tramp_addr != 0, "Trampoline address should be non-null");
         // Verify it's a real callable function pointer by calling it
         let tramp_fn: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
@@ -3634,10 +3785,10 @@ mod tests {
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(42));
 
-        let result = pe_upcall_invoke(&mut ctx, &[
-            Value::Object(Some(stub)),
-            Value::Object(Some(call_args)),
-        ]);
+        let result = pe_upcall_invoke(
+            &mut ctx,
+            &[Value::Object(Some(stub)), Value::Object(Some(call_args))],
+        );
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val, Some(Value::Int(99)));
@@ -3651,9 +3802,7 @@ mod tests {
         let stub = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2);
         ctx.set_field(stub, 0, Value::Long(999)); // non-existent slot
 
-        let result = pe_upcall_invoke(&mut ctx, &[
-            Value::Object(Some(stub)),
-        ]);
+        let result = pe_upcall_invoke(&mut ctx, &[Value::Object(Some(stub))]);
         assert!(result.is_err(), "Invalid upcall slot must return error");
     }
 
@@ -3678,8 +3827,18 @@ mod tests {
     #[test]
     fn new18_downcall_arity_12_ints() {
         extern "C" fn sum12(
-            a: i32, b: i32, c: i32, d: i32, e: i32, f: i32,
-            g: i32, h: i32, i: i32, j: i32, k: i32, l: i32,
+            a: i32,
+            b: i32,
+            c: i32,
+            d: i32,
+            e: i32,
+            f: i32,
+            g: i32,
+            h: i32,
+            i: i32,
+            j: i32,
+            k: i32,
+            l: i32,
         ) -> i32 {
             a + b + c + d + e + f + g + h + i + j + k + l
         }
@@ -3695,7 +3854,8 @@ mod tests {
             let p = make_layout(&mut ctx, LAYOUT_INT);
             ctx.set_array_element(params_arr, i, Value::Object(Some(p)));
         }
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3733,16 +3893,17 @@ mod tests {
 
         let ret_layout = make_layout(&mut ctx, LAYOUT_DOUBLE);
         let p_int1 = make_layout(&mut ctx, LAYOUT_INT);
-        let p_dbl  = make_layout(&mut ctx, LAYOUT_DOUBLE);
+        let p_dbl = make_layout(&mut ctx, LAYOUT_DOUBLE);
         let p_int2 = make_layout(&mut ctx, LAYOUT_INT);
-        let p_flt  = make_layout(&mut ctx, LAYOUT_FLOAT);
+        let p_flt = make_layout(&mut ctx, LAYOUT_FLOAT);
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p_int1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p_dbl)));
         ctx.set_array_element(params_arr, 2, Value::Object(Some(p_int2)));
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_flt)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3811,7 +3972,8 @@ mod tests {
         ctx.set_array_element(params_arr, 2, Value::Object(Some(p_fmt)));
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_var)));
 
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3835,8 +3997,7 @@ mod tests {
         // snprintf returns the number of chars written excluding NUL.
         assert_eq!(result, Some(Value::Int(2)));
         // And the buffer must contain "42\0".
-        let written =
-            unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, 3) };
+        let written = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, 3) };
         assert_eq!(&written[..2], b"42");
         assert_eq!(written[2], 0);
     }
@@ -3857,7 +4018,8 @@ mod tests {
         let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p2)));
-        let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let descriptor =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -3882,7 +4044,13 @@ mod tests {
             ],
         )
         .expect("upcallHandle must succeed")
-        .and_then(|v| if let Value::Object(Some(s)) = v { Some(s) } else { None })
+        .and_then(|v| {
+            if let Value::Object(Some(s)) = v {
+                Some(s)
+            } else {
+                None
+            }
+        })
         .unwrap();
 
         let tramp_addr = match ctx.get_field(seg, 0) {
@@ -3949,9 +4117,7 @@ mod tests {
                     "message must not duplicate the class name: {message}"
                 );
             }
-            other => panic!(
-                "expected RuntimeError::IllegalCallerException, got {other:?}"
-            ),
+            other => panic!("expected RuntimeError::IllegalCallerException, got {other:?}"),
         }
     }
 
@@ -3971,8 +4137,7 @@ mod tests {
         set_native_access_enabled(true);
 
         // Null function pointer.
-        let null_err =
-            validated_fn_ptr::<extern "C" fn()>(0).expect_err("null must be rejected");
+        let null_err = validated_fn_ptr::<extern "C" fn()>(0).expect_err("null must be rejected");
         // Misaligned function pointer (odd address fails alignment check on
         // every supported platform since `align_of::<usize>() >= 4`).
         let misaligned_err =
@@ -3985,9 +4150,7 @@ mod tests {
                 MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                     RuntimeError::IllegalStateException { .. },
                 )) => { /* expected */ }
-                other => panic!(
-                    "{label}: expected IllegalStateException, got {other:?}"
-                ),
+                other => panic!("{label}: expected IllegalStateException, got {other:?}"),
             }
         }
     }
@@ -4025,12 +4188,7 @@ mod tests {
     /// Helper: build a MemorySegment synthetic backed by a real Rust buffer so
     /// in-bounds accesses are sound while out-of-bounds accesses are caught by
     /// the bounds checks before any dereference.
-    fn make_segment(
-        ctx: &mut dyn NativeContext,
-        ptr: i64,
-        size: i64,
-        base_off: i64,
-    ) -> ObjectRef {
+    fn make_segment(ctx: &mut dyn NativeContext, ptr: i64, size: i64, base_off: i64) -> ObjectRef {
         let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
         ctx.set_field(seg, 0, Value::Long(ptr));
         ctx.set_field(seg, 1, Value::Long(size));
@@ -4073,7 +4231,13 @@ mod tests {
         let seg = make_segment(&mut ctx, buf.as_mut_ptr() as i64, 8, 0);
         let layout = make_layout_kind(&mut ctx, LAYOUT_LONG);
         // offset 4 + width 8 = 12 > size 8 → reject before writing.
-        let r = pe_segment_set_impl(&mut ctx, seg, layout, 4, Value::Long(0x4141414141414141u64 as i64));
+        let r = pe_segment_set_impl(
+            &mut ctx,
+            seg,
+            layout,
+            4,
+            Value::Long(0x4141414141414141u64 as i64),
+        );
         assert!(r.is_err(), "out-of-bounds set must be rejected");
     }
 
@@ -4156,4 +4320,3 @@ mod tests {
         );
     }
 }
-

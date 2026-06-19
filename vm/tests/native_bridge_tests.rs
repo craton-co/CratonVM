@@ -37,17 +37,11 @@ macro_rules! require_class_files {
 
 fn invoke_expect_int(method: &str, expected: i32) {
     let mut vm = test_vm();
-    let result = vm.invoke(
-        "cratonvm/NativeBridgeTest",
-        method,
-        "()I",
-        &[],
-    );
+    let result = vm.invoke("cratonvm/NativeBridgeTest", method, "()I", &[]);
     match result {
-        Ok(Some(Value::Int(v))) => assert_eq!(
-            v, expected,
-            "{method} returned {v}, expected {expected}"
-        ),
+        Ok(Some(Value::Int(v))) => {
+            assert_eq!(v, expected, "{method} returned {v}, expected {expected}")
+        }
         other => panic!("{method} failed: {other:?}"),
     }
 }

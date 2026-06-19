@@ -4,8 +4,8 @@
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 
@@ -73,7 +73,10 @@ pub(crate) fn native_system_current_time_millis(
     Ok(Some(Value::Long(millis)))
 }
 
-pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_arraycopy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args: src (Object), srcPos (int), dest (Object), destPos (int), length (int)
     let src = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -138,18 +141,20 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         || src_end > src_len as i64
         || dest_end > dest_len as i64
     {
-        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-            index: if src_pos < 0 {
-                src_pos
-            } else if dest_pos < 0 {
-                dest_pos
-            } else if src_end > src_len as i64 {
-                src_end as i32
-            } else {
-                dest_end as i32
-            },
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if src_pos < 0 {
+                    src_pos
+                } else if dest_pos < 0 {
+                    dest_pos
+                } else if src_end > src_len as i64 {
+                    src_end as i32
+                } else {
+                    dest_end as i32
+                },
+            }
+            .into(),
+        );
     }
 
     if length == 0 {
@@ -366,7 +371,13 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     // catch). Element types are already verified equal at this point so
     // failure is not expected, but the fallback preserves the original
     // semantics defensively.
-    if ctx.bulk_array_copy(src, src_pos as usize, dest, dest_pos as usize, length as usize) {
+    if ctx.bulk_array_copy(
+        src,
+        src_pos as usize,
+        dest,
+        dest_pos as usize,
+        length as usize,
+    ) {
         return Ok(None);
     }
 
@@ -388,7 +399,10 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     Ok(None)
 }
 
-pub(crate) fn native_thread_current_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_current_thread(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let thread_obj = ctx.current_thread_object();
     Ok(Some(Value::Object(Some(thread_obj))))
 }
@@ -414,16 +428,20 @@ pub(crate) fn native_thread_sleep_millis_nanos(
         _ => 0,
     };
     if millis < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Thread.sleep: timeout value is negative".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Thread.sleep: timeout value is negative".to_string(),
+            }
+            .into(),
+        );
     }
     if !(0..=999_999).contains(&nanos) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Thread.sleep: nanosecond timeout value out of range".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Thread.sleep: nanosecond timeout value out of range".to_string(),
+            }
+            .into(),
+        );
     }
     // RD.9: combine millis + nanos into a single nanosecond value and delegate
     // to `sleepNanos0` so sub-millisecond sleeps honour the requested
@@ -455,7 +473,9 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // Check interrupted before sleeping
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
+                ),
             ));
         }
         // NEW-15.4: virtual-thread aware sleep.
@@ -503,7 +523,9 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // Check interrupted after sleeping (with clear).
         if interrupted || ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
+                ),
             ));
         }
     }
@@ -520,7 +542,10 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// with a spurious `ThreadLeakError`. We compute the state from the
 /// authoritative VM thread registry instead and return the **canonical**
 /// `Thread$State` enum constant (callers compare it with `==`).
-pub(crate) fn native_thread_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_get_state(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -540,7 +565,10 @@ pub(crate) fn native_thread_get_state(ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Object(None)))
 }
 
-pub(crate) fn native_thread_is_alive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_is_alive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -549,7 +577,10 @@ pub(crate) fn native_thread_is_alive(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(alive)))
 }
 
-pub(crate) fn native_thread_start0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_start0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -576,7 +607,10 @@ pub(crate) fn native_thread_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.thread_join(this)
 }
 
-pub(crate) fn native_thread_join_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_join_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -586,10 +620,12 @@ pub(crate) fn native_thread_join_timed(ctx: &mut dyn NativeContext, args: &[Valu
         _ => 0,
     };
     if millis < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Thread.join: timeout value is negative".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Thread.join: timeout value is negative".to_string(),
+            }
+            .into(),
+        );
     }
     if millis == 0 {
         // join(0) means wait forever (same as join())
@@ -639,23 +675,34 @@ pub(crate) fn native_thread_join_millis_nanos(
         _ => 0,
     };
     if millis < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Thread.join: timeout value is negative".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Thread.join: timeout value is negative".to_string(),
+            }
+            .into(),
+        );
     }
     if !(0..=999_999).contains(&nanos) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Thread.join: nanosecond timeout value out of range".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Thread.join: nanosecond timeout value out of range".to_string(),
+            }
+            .into(),
+        );
     }
-    let effective_ms = if nanos > 0 { millis.saturating_add(1) } else { millis };
+    let effective_ms = if nanos > 0 {
+        millis.saturating_add(1)
+    } else {
+        millis
+    };
     let this = args.first().copied().unwrap_or(Value::Object(None));
     native_thread_join_timed(ctx, &[this, Value::Long(effective_ms)])
 }
 
-pub(crate) fn native_thread_interrupt(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_interrupt(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -679,7 +726,10 @@ pub(crate) fn native_thread_interrupt(ctx: &mut dyn NativeContext, args: &[Value
     Ok(None)
 }
 
-pub(crate) fn native_thread_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_get_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -697,7 +747,10 @@ pub(crate) fn native_thread_get_name(ctx: &mut dyn NativeContext, args: &[Value]
     }
 }
 
-pub(crate) fn native_thread_is_interrupted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_is_interrupted(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0] = this, args[1] = boolean clearInterrupted
     let clear = matches!(args.get(1), Some(Value::Int(1)));
     let interrupted = if ctx.is_interrupted(clear) { 1 } else { 0 };
@@ -708,7 +761,10 @@ pub(crate) fn native_thread_is_interrupted(ctx: &mut dyn NativeContext, args: &[
 // Step 4: System properties + utilities
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_system_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_get_property(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let key_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -748,7 +804,10 @@ pub(crate) fn native_system_get_property_default(
     }
 }
 
-pub(crate) fn native_system_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_set_property(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let key_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -768,7 +827,10 @@ pub(crate) fn native_system_set_property(ctx: &mut dyn NativeContext, args: &[Va
     }
 }
 
-pub(crate) fn native_system_nano_time(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_nano_time(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     use std::time::Instant;
     // Use a monotonic clock. We return the elapsed nanos since the first call.
     // Rust's Instant doesn't have a fixed epoch, but nano deltas work.
@@ -852,7 +914,10 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // Phase 13 Step 4: Runtime + System.lineSeparator
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_system_line_separator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_line_separator(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let sep = if cfg!(windows) { "\r\n" } else { "\n" };
     let s = ctx.create_string(sep);
     Ok(Some(Value::Object(Some(s))))
@@ -967,7 +1032,10 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     );
 }
 
-pub(crate) fn native_runtime_get_runtime(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_get_runtime(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
         Err(_) => cratonvm_types::ClassId::new(0),
@@ -986,21 +1054,33 @@ pub(crate) fn native_runtime_available_processors(
     Ok(Some(Value::Int(cpus)))
 }
 
-pub(crate) fn native_runtime_max_memory(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_max_memory(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Long(256 * 1024 * 1024))) // 256 MB
 }
 
-pub(crate) fn native_runtime_total_memory(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_total_memory(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Long(64 * 1024 * 1024))) // 64 MB estimate
 }
 
-pub(crate) fn native_runtime_free_memory(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_free_memory(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
 /// `Runtime.version()` — returns a `java.lang.Runtime$Version` instance.
 /// WildFly / JBoss Modules reads `Runtime.version().feature()` during bootstrap.
-pub(crate) fn native_runtime_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_version(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     let cid = ctx.ensure_class_initialized("java/lang/Runtime$Version")?;
     let mut n = ctx.class_num_total_fields(cid);
     if n == 0 {
@@ -1153,7 +1233,8 @@ fn runtime_spawn_process(
     if cmd.is_empty() {
         return Err(RuntimeError::IllegalStateException {
             message: "Runtime.exec: empty command".to_string(),
-        }.into());
+        }
+        .into());
     }
     let program = &cmd[0];
 
@@ -1201,64 +1282,101 @@ fn runtime_spawn_process(
         }
         Err(e) => Err(RuntimeError::IOException {
             message: format!("Runtime.exec failed: {}", e),
-        }.into()),
+        }
+        .into()),
     }
 }
 
 /// Runtime.exec(String) — parse command line split by whitespace.
-pub(crate) fn native_runtime_exec_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0] = Runtime instance, args[1] = command string
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Err(RuntimeError::IllegalArgumentException {
-            message: "Runtime.exec: null command".to_string(),
-        }.into()),
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Runtime.exec: null command".to_string(),
+            }
+            .into())
+        }
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
     runtime_spawn_process(ctx, &parts, None, None)
 }
 
 /// Runtime.exec(String[])
-pub(crate) fn native_runtime_exec_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let cmd = read_string_array(ctx, &arg_val);
     runtime_spawn_process(ctx, &cmd, None, None)
 }
 
 /// Runtime.exec(String, String[])
-pub(crate) fn native_runtime_exec_string_env(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_string_env(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Err(RuntimeError::IllegalArgumentException {
-            message: "Runtime.exec: null command".to_string(),
-        }.into()),
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Runtime.exec: null command".to_string(),
+            }
+            .into())
+        }
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let env = if matches!(env_val, Value::Object(None)) { None } else { Some(read_string_array(ctx, &env_val)) };
+    let env = if matches!(env_val, Value::Object(None)) {
+        None
+    } else {
+        Some(read_string_array(ctx, &env_val))
+    };
     runtime_spawn_process(ctx, &parts, env.as_deref(), None)
 }
 
 /// Runtime.exec(String[], String[])
-pub(crate) fn native_runtime_exec_array_env(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_array_env(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let cmd = read_string_array(ctx, &arg_val);
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let env = if matches!(env_val, Value::Object(None)) { None } else { Some(read_string_array(ctx, &env_val)) };
+    let env = if matches!(env_val, Value::Object(None)) {
+        None
+    } else {
+        Some(read_string_array(ctx, &env_val))
+    };
     runtime_spawn_process(ctx, &cmd, env.as_deref(), None)
 }
 
 /// Runtime.exec(String, String[], File)
-pub(crate) fn native_runtime_exec_string_env_dir(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_string_env_dir(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Err(RuntimeError::IllegalArgumentException {
-            message: "Runtime.exec: null command".to_string(),
-        }.into()),
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Runtime.exec: null command".to_string(),
+            }
+            .into())
+        }
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let env = if matches!(env_val, Value::Object(None)) { None } else { Some(read_string_array(ctx, &env_val)) };
+    let env = if matches!(env_val, Value::Object(None)) {
+        None
+    } else {
+        Some(read_string_array(ctx, &env_val))
+    };
     let dir = match args.get(3) {
         Some(Value::Object(Some(f))) => match ctx.get_field(*f, 0) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1270,11 +1388,18 @@ pub(crate) fn native_runtime_exec_string_env_dir(ctx: &mut dyn NativeContext, ar
 }
 
 /// Runtime.exec(String[], String[], File)
-pub(crate) fn native_runtime_exec_array_env_dir(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_runtime_exec_array_env_dir(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let cmd = read_string_array(ctx, &arg_val);
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let env = if matches!(env_val, Value::Object(None)) { None } else { Some(read_string_array(ctx, &env_val)) };
+    let env = if matches!(env_val, Value::Object(None)) {
+        None
+    } else {
+        Some(read_string_array(ctx, &env_val))
+    };
     let dir = match args.get(3) {
         Some(Value::Object(Some(f))) => match ctx.get_field(*f, 0) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -1289,7 +1414,10 @@ pub(crate) fn native_runtime_exec_array_env_dir(ctx: &mut dyn NativeContext, arg
 // System.getenv
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_system_getenv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_getenv(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let key_ref = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1304,7 +1432,10 @@ pub(crate) fn native_system_getenv(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 }
 
-pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_getenv_all(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     use cratonvm_types::ClassId;
 
     // Build a HashMap with all environment variables.
@@ -1375,8 +1506,15 @@ pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Val
         Some(n_value),
         Some(n_next),
     ) = (
-        f_table, f_size, f_threshold, f_loadfactor, f_entryset, n_hash, n_key,
-        n_value, n_next,
+        f_table,
+        f_size,
+        f_threshold,
+        f_loadfactor,
+        f_entryset,
+        n_hash,
+        n_key,
+        n_value,
+        n_next,
     ) {
         // Allocate enough slots to cover the real layout.
         let map_n_fields = [f_table, f_size, f_threshold, f_loadfactor, f_entryset]
@@ -1589,7 +1727,10 @@ pub(crate) fn build_stack_trace_element_array(
 /// `Thread.getStackTrace0()` — the live stack of the receiver thread (or, for
 /// another thread, its last-published blocking-deposit snapshot). Returns a
 /// `StackTraceElement[]`. Previously stubbed to an empty array.
-pub(crate) fn native_thread_get_stack_trace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_get_stack_trace(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1608,7 +1749,10 @@ pub(crate) fn native_thread_get_stack_trace(ctx: &mut dyn NativeContext, args: &
 
 /// Maps a library name to a platform-specific filename.
 /// e.g. "foo" → "foo.dll" (Windows), "libfoo.so" (Linux), "libfoo.dylib" (macOS).
-pub(crate) fn native_system_map_library_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_system_map_library_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let name = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -1628,7 +1772,10 @@ pub(crate) fn native_system_map_library_name(ctx: &mut dyn NativeContext, args: 
 // Thread.sleepNanos0(long) — JDK 25 native (replaces sleep(long) internally)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_sleep_nanos(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let nanos = match args.first() {
         Some(Value::Long(n)) => *n,
         _ => 0,
@@ -1637,7 +1784,9 @@ pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Val
         // Check interrupted before sleeping — clear flag and throw
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
+                ),
             ));
         }
         let duration = std::time::Duration::from_nanos(nanos as u64);
@@ -1661,7 +1810,9 @@ pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Val
         // Check interrupted after sleeping — clear flag and throw
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
+                ),
             ));
         }
     }
@@ -1689,7 +1840,10 @@ pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Val
 //     between interrupt-responsiveness and syscall cost.
 //   * The interrupt flag is CLEARED when we throw `InterruptedException`
 //     per JDK spec.
-pub(crate) fn native_thread_sleep0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_thread_sleep0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // WP4.5 — see `native_thread_sleep`: long args from the operand-stack
     // get re-decoded as Doubles by `CompactValue::to_value()`.
     let raw_millis: i64 = match args.first() {
@@ -1697,17 +1851,21 @@ pub(crate) fn native_thread_sleep0(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Double(d)) => d.to_bits() as i64,
         Some(Value::Int(i)) => *i as i64,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "sleep0: missing long millis arg".to_string(),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "sleep0: missing long millis arg".to_string(),
+                }
+                .into(),
+            );
         }
     };
     if raw_millis < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "timeout value is negative".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "timeout value is negative".to_string(),
+            }
+            .into(),
+        );
     }
     let millis = raw_millis as u64;
 
@@ -1885,15 +2043,12 @@ pub(crate) fn native_system_init_phase1(
             ctx.cache_system_stdin(new_in);
             new_in
         };
-        ctx.set_static_field_by_name(
-            "java/lang/System",
-            "in",
-            Value::Object(Some(in_obj)),
-        );
+        ctx.set_static_field_by_name("java/lang/System", "in", Value::Object(Some(in_obj)));
     }
 
     // Step 3: Set System.lineSeparator from the line.separator property
-    let line_sep = ctx.get_system_property("line.separator")
+    let line_sep = ctx
+        .get_system_property("line.separator")
         .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     let line_sep_obj = ctx.create_string(&line_sep);
     ctx.set_static_field_by_name(
@@ -2005,9 +2160,7 @@ pub(crate) fn native_array_new_array(
     let length = match args.get(1) {
         Some(Value::Int(n)) => {
             if *n < 0 {
-                return Err(RuntimeError::NegativeArraySizeException {
-                    size: *n,
-                }.into());
+                return Err(RuntimeError::NegativeArraySizeException { size: *n }.into());
             }
             *n as usize
         }
@@ -2027,22 +2180,23 @@ pub(crate) fn native_array_new_array(
     // `mirror_class_name` first (handles array + ordinary classes), keeping the
     // old readers as a fallback for legacy/unit-test mirrors.
     let comp_name = match args.first() {
-        Some(Value::Object(Some(mirror))) => {
-            crate::lang_class::mirror_class_name(&*ctx, *mirror)
-                .filter(|s| !s.is_empty())
-                .or_else(|| ctx.read_string(*mirror))
-                .or_else(|| match ctx.get_field(*mirror, 1) {
-                    Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
-                    _ => None,
-                })
-                .map(|s| s.replace('.', "/"))
-                .unwrap_or_else(|| "java/lang/Object".to_string())
-        }
+        Some(Value::Object(Some(mirror))) => crate::lang_class::mirror_class_name(&*ctx, *mirror)
+            .filter(|s| !s.is_empty())
+            .or_else(|| ctx.read_string(*mirror))
+            .or_else(|| match ctx.get_field(*mirror, 1) {
+                Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
+                _ => None,
+            })
+            .map(|s| s.replace('.', "/"))
+            .unwrap_or_else(|| "java/lang/Object".to_string()),
         _ => "java/lang/Object".to_string(),
     };
 
     if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
-        eprintln!("[DBG_TOARRAY] newArray comp_name={:?} len={}", comp_name, length);
+        eprintln!(
+            "[DBG_TOARRAY] newArray comp_name={:?} len={}",
+            comp_name, length
+        );
     }
 
     // Map primitive type names to ArrayElementType. Accept both the human name
@@ -2061,7 +2215,8 @@ pub(crate) fn native_array_new_array(
             // Reference array — resolve the component class. `ensure_class_initialized`
             // synthesizes array-descriptor components (`[L...;`) on demand, so a
             // multi-dimensional template yields the correct nested array type.
-            let comp_id = ctx.ensure_class_initialized(&comp_name)
+            let comp_id = ctx
+                .ensure_class_initialized(&comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             ctx.new_ref_array(comp_id, length)
         }
@@ -2109,7 +2264,8 @@ pub(crate) fn native_classloader_define_class1(
     if offset.saturating_add(length) > arr_len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
             index: (offset + length) as i32,
-        }.into());
+        }
+        .into());
     }
 
     let mut bytes = Vec::with_capacity(length);
@@ -2207,7 +2363,8 @@ pub(crate) fn native_classloader_define_class0(
     if offset.saturating_add(length) > arr_len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
             index: (offset + length) as i32,
-        }.into());
+        }
+        .into());
     }
 
     let mut bytes = Vec::with_capacity(length);
@@ -2305,10 +2462,7 @@ pub(crate) fn native_classloader_define_class0(
 // program correctness depends on their values.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn native_perf_attach(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn native_perf_attach(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // attach(String, int) -> ByteBuffer  —  return an empty direct buffer.
     ctx.invoke(
         "java/nio/ByteBuffer",
@@ -2396,50 +2550,36 @@ mod t2_tests {
     #[test]
     fn t2_thread_sleep_millis_nanos_zero_is_noop() {
         let mut ctx = mock_ctx();
-        let r = native_thread_sleep_millis_nanos(
-            &mut ctx,
-            &[Value::Long(0), Value::Int(0)],
-        );
+        let r = native_thread_sleep_millis_nanos(&mut ctx, &[Value::Long(0), Value::Int(0)]);
         assert!(r.is_ok());
     }
 
     #[test]
     fn t2_thread_sleep_rejects_negative_millis() {
         let mut ctx = mock_ctx();
-        let r = native_thread_sleep_millis_nanos(
-            &mut ctx,
-            &[Value::Long(-1), Value::Int(0)],
-        );
+        let r = native_thread_sleep_millis_nanos(&mut ctx, &[Value::Long(-1), Value::Int(0)]);
         assert!(r.is_err(), "negative millis must throw");
     }
 
     #[test]
     fn t2_thread_sleep_rejects_negative_nanos() {
         let mut ctx = mock_ctx();
-        let r = native_thread_sleep_millis_nanos(
-            &mut ctx,
-            &[Value::Long(0), Value::Int(-1)],
-        );
+        let r = native_thread_sleep_millis_nanos(&mut ctx, &[Value::Long(0), Value::Int(-1)]);
         assert!(r.is_err(), "negative nanos must throw");
     }
 
     #[test]
     fn t2_thread_sleep_rejects_oversized_nanos() {
         let mut ctx = mock_ctx();
-        let r = native_thread_sleep_millis_nanos(
-            &mut ctx,
-            &[Value::Long(0), Value::Int(1_000_000)],
-        );
+        let r =
+            native_thread_sleep_millis_nanos(&mut ctx, &[Value::Long(0), Value::Int(1_000_000)]);
         assert!(r.is_err(), "nanos >= 1_000_000 must throw");
     }
 
     #[test]
     fn t2_thread_sleep_accepts_max_nanos() {
         let mut ctx = mock_ctx();
-        let r = native_thread_sleep_millis_nanos(
-            &mut ctx,
-            &[Value::Long(0), Value::Int(999_999)],
-        );
+        let r = native_thread_sleep_millis_nanos(&mut ctx, &[Value::Long(0), Value::Int(999_999)]);
         assert!(r.is_ok(), "nanos = 999_999 must be accepted");
     }
 }
@@ -2710,7 +2850,10 @@ mod t15_tests {
         let mut ctx = mock_ctx();
         let mirror = ctx.create_string("int");
         let r = native_array_new_array(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(-1)]);
-        assert!(r.is_err(), "negative size should throw NegativeArraySizeException");
+        assert!(
+            r.is_err(),
+            "negative size should throw NegativeArraySizeException"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2733,8 +2876,8 @@ mod t15_tests {
                 Value::Object(None), // loader
                 Value::Object(Some(name)),
                 Value::Object(Some(arr)),
-                Value::Int(0), // offset
-                Value::Int(4), // length
+                Value::Int(0),       // offset
+                Value::Int(4),       // length
                 Value::Object(None), // pd
                 Value::Object(None), // source
             ],
@@ -2788,9 +2931,9 @@ mod t15_tests {
 #[cfg(test)]
 mod checkexec_security_tests {
     use super::*;
-    use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
-    use crate::test_utils::mock_ctx;
     use crate::security_manager::set_security_manager_for_test;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 
     /// Helper: assert the failure is a SecurityException (regardless of
     /// the exact message — the wrapping is `MethodCallFailed::InternalError(
@@ -2800,9 +2943,7 @@ mod checkexec_security_tests {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::SecurityException { .. },
             )) => {}
-            other => panic!(
-                "expected RuntimeError::SecurityException, got {other:?}",
-            ),
+            other => panic!("expected RuntimeError::SecurityException, got {other:?}",),
         }
     }
 
@@ -2839,13 +2980,11 @@ mod checkexec_security_tests {
         // Pre-arm the mock so the next invoke_virtual returns a SecurityException.
         // This simulates a SecurityManager whose checkExec(String) denies.
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: "access denied (test policy denies all exec)".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                VmError::Runtime(RuntimeError::SecurityException {
+                    message: "access denied (test policy denies all exec)".to_string(),
+                }),
+            )));
         }
 
         let result = check_exec_or_throw(&mut ctx, "/usr/bin/evil");
@@ -2867,13 +3006,11 @@ mod checkexec_security_tests {
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(Some(sm));
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: "deny".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                VmError::Runtime(RuntimeError::SecurityException {
+                    message: "deny".to_string(),
+                }),
+            )));
         }
 
         // args[0] = Runtime instance (irrelevant here), args[1] = command.
@@ -2881,7 +3018,10 @@ mod checkexec_security_tests {
         let cmd = ctx.create_string("/path/to/definitely-nonexistent-binary-xyz");
         let result = native_runtime_exec_string(
             &mut ctx,
-            &[Value::Object(Some(runtime_instance)), Value::Object(Some(cmd))],
+            &[
+                Value::Object(Some(runtime_instance)),
+                Value::Object(Some(cmd)),
+            ],
         );
 
         let err = result.expect_err("deny-all SM must block Runtime.exec spawn");
@@ -2900,13 +3040,11 @@ mod checkexec_security_tests {
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(Some(sm));
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: "deny".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                VmError::Runtime(RuntimeError::SecurityException {
+                    message: "deny".to_string(),
+                }),
+            )));
         }
 
         // Build a ProcessBuilder synthetic with a 4-slot layout and a
@@ -2944,13 +3082,11 @@ mod checkexec_security_tests {
 
         // First call: simulate a denial for the disallowed binary.
         unsafe {
-            *ctx.invoke_virtual_result.get() = Some(Err(
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::SecurityException {
-                        message: "deny /usr/bin/danger".to_string(),
-                    },
-                )),
-            ));
+            *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
+                VmError::Runtime(RuntimeError::SecurityException {
+                    message: "deny /usr/bin/danger".to_string(),
+                }),
+            )));
         }
         let denied = check_exec_or_throw(&mut ctx, "/usr/bin/danger");
         let err = denied.expect_err("disallowed path must surface SecurityException");

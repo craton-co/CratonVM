@@ -25,6 +25,6 @@ pub mod roots;
 // Top-level re-exports for convenience.
 pub use cratonvm_gc::collector::GarbageCollector;
 pub use cratonvm_gc::gen_heap::GenerationalHeap;
-pub use cratonvm_gc::vm_heap::{GcBackend, VmHeap};
 pub use cratonvm_gc::heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
+pub use cratonvm_gc::vm_heap::{GcBackend, VmHeap};
 pub use cratonvm_gc::MonitorCleanup;

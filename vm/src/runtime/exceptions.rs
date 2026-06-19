@@ -401,7 +401,9 @@ pub mod helpful_npe {
                     stack.pop()?;
                 }
                 for _ in 0..$push {
-                    stack.push(Slot { producer_bci: Some(bci) });
+                    stack.push(Slot {
+                        producer_bci: Some(bci),
+                    });
                 }
             }};
         }
@@ -409,10 +411,10 @@ pub mod helpful_npe {
             // Constants / loads — push 1 (cat-2 longs/doubles also push 1
             // slot here; the analysis only ever inspects reference receivers,
             // and width mismatches just make us bail when popping).
-            AconstNull | IconstM1 | Iconst0 | Iconst1 | Iconst2 | Iconst3 | Iconst4
-            | Iconst5 | Lconst0 | Lconst1 | Fconst0 | Fconst1 | Fconst2 | Dconst0
-            | Dconst1 | Bipush(_) | Sipush(_) | Ldc(_) | LdcW(_) | Ldc2W(_)
-            | Iload(_) | Lload(_) | Fload(_) | Dload(_) | Aload(_) => shape!(0, 1),
+            AconstNull | IconstM1 | Iconst0 | Iconst1 | Iconst2 | Iconst3 | Iconst4 | Iconst5
+            | Lconst0 | Lconst1 | Fconst0 | Fconst1 | Fconst2 | Dconst0 | Dconst1 | Bipush(_)
+            | Sipush(_) | Ldc(_) | LdcW(_) | Ldc2W(_) | Iload(_) | Lload(_) | Fload(_)
+            | Dload(_) | Aload(_) => shape!(0, 1),
             // getstatic pushes 1, putstatic pops 1.
             Getstatic(_) => shape!(0, 1),
             Putstatic(_) => shape!(1, 0),
@@ -648,16 +650,19 @@ pub fn create_exception_object(
             // Young gen full — force a GC cycle and retry.
             thread.tlab.retire();
             super::interpreter::maybe_gc_forced_pub(shared, thread);
-            shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
-                MethodCallFailed::InternalError(VmError::Runtime(
-                    RuntimeError::OutOfMemoryError {
-                        message: format!(
-                            "Java heap space (exception {} with {} fields)",
-                            class_name, num_fields,
-                        ),
-                    },
-                ))
-            })?
+            shared
+                .heap
+                .try_alloc_object(class_id, num_fields)
+                .ok_or_else(|| {
+                    MethodCallFailed::InternalError(VmError::Runtime(
+                        RuntimeError::OutOfMemoryError {
+                            message: format!(
+                                "Java heap space (exception {} with {} fields)",
+                                class_name, num_fields,
+                            ),
+                        },
+                    ))
+                })?
         }
     };
 
@@ -821,10 +826,18 @@ pub fn throw_runtime_error(
     // instead of a syscall + heap alloc.
     if tracing::enabled!(tracing::Level::DEBUG) {
         let frame = thread.frames.last();
-        let method = frame.map(|f| f.method_name().to_string()).unwrap_or_default();
+        let method = frame
+            .map(|f| f.method_name().to_string())
+            .unwrap_or_default();
         let pc = frame.map(|f| f.pc).unwrap_or(0);
         let class_name = frame
-            .and_then(|f| shared.class_manager.read().get_class(f.class_id).map(|c| c.name.clone()))
+            .and_then(|f| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(f.class_id)
+                    .map(|c| c.name.clone())
+            })
             .unwrap_or_default();
         tracing::debug!(
             class = %class_name, method = %method, pc,
@@ -835,7 +848,9 @@ pub fn throw_runtime_error(
             let has_dorun = thread.frames.iter().any(|f| f.method_name() == "doRun");
             if has_dorun {
                 for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
-                    let _cn = shared.class_manager.read()
+                    let _cn = shared
+                        .class_manager
+                        .read()
                         .get_class(f.class_id)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
@@ -846,7 +861,9 @@ pub fn throw_runtime_error(
                 if let RuntimeError::NullPointerException { message: Some(m) } = &error {
                     if m.contains("isInterface") {
                         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
-                            let cn = shared.class_manager.read()
+                            let cn = shared
+                                .class_manager
+                                .read()
                                 .get_class(f.class_id)
                                 .map(|c| c.name.clone())
                                 .unwrap_or_default();
@@ -856,11 +873,18 @@ pub fn throw_runtime_error(
                     if m.contains("Name is null") {
                         eprintln!("SUREFIRE-NPE-TRACE msg={m}");
                         for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                            let cn = shared.class_manager.read()
+                            let cn = shared
+                                .class_manager
+                                .read()
                                 .get_class(f.class_id)
                                 .map(|c| c.name.clone())
                                 .unwrap_or_default();
-                            eprintln!("SUREFIRE-NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                            eprintln!(
+                                "SUREFIRE-NPE-STK[{i}] {}.{} pc={}",
+                                cn,
+                                f.method_name(),
+                                f.pc
+                            );
                         }
                     }
                 }
@@ -872,7 +896,9 @@ pub fn throw_runtime_error(
             // via CRATONVM_DBG_WF_NPE to avoid stderr spam during boot.
             if std::env::var_os("CRATONVM_DBG_WF_NPE").is_some() {
                 let in_log4j_init = thread.frames.iter().any(|f| {
-                    let cn = shared.class_manager.read()
+                    let cn = shared
+                        .class_manager
+                        .read()
                         .get_class(f.class_id)
                         .map(|c| c.name.to_string())
                         .unwrap_or_default();
@@ -882,7 +908,9 @@ pub fn throw_runtime_error(
                 if in_log4j_init {
                     eprintln!("[WF-NPE-TRACE] msg={:?}", error);
                     for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
-                        let cn = shared.class_manager.read()
+                        let cn = shared
+                            .class_manager
+                            .read()
                             .get_class(f.class_id)
                             .map(|c| c.name.to_string())
                             .unwrap_or_default();
@@ -894,7 +922,9 @@ pub fn throw_runtime_error(
             if iae_trace_enabled() {
                 eprintln!("NPE-TRACE msg={:?}", error);
                 for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                    let cn = shared.class_manager.read()
+                    let cn = shared
+                        .class_manager
+                        .read()
                         .get_class(f.class_id)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
@@ -903,12 +933,12 @@ pub fn throw_runtime_error(
             }
         }
         // S111r19+: trace IAE origins for ConfigurationClassParser hunt
-        if matches!(&error, RuntimeError::IllegalArgumentException { .. })
-            && iae_trace_enabled()
-        {
+        if matches!(&error, RuntimeError::IllegalArgumentException { .. }) && iae_trace_enabled() {
             eprintln!("IAE-TRACE error={error:?}");
             for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
-                let cn = shared.class_manager.read()
+                let cn = shared
+                    .class_manager
+                    .read()
                     .get_class(f.class_id)
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
@@ -923,10 +953,9 @@ pub fn throw_runtime_error(
         RuntimeError::ArithmeticException { message } => {
             ("java/lang/ArithmeticException", Some(message.as_str()))
         }
-        RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => (
-            "java/lang/ArrayIndexOutOfBoundsException",
-            None,
-        ),
+        RuntimeError::ArrayIndexOutOfBoundsException { index: _ } => {
+            ("java/lang/ArrayIndexOutOfBoundsException", None)
+        }
         RuntimeError::ClassCastException { message } => {
             ("java/lang/ClassCastException", Some(message.as_str()))
         }
@@ -1058,11 +1087,11 @@ pub fn raise_no_class_def_found(
         Some(class_name),
     ) {
         Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
-        Err(_) => MethodCallFailed::InternalError(VmError::ClassFile(
-            ClassFileError::ClassNotFound {
+        Err(_) => {
+            MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
                 class_name: class_name.to_string(),
-            },
-        )),
+            }))
+        }
     }
 }
 
@@ -1086,7 +1115,10 @@ pub fn convert_class_not_found(
         eprintln!("[NCDFE] class={} err={:?}", class_name, err);
         let cm = shared.class_manager.read();
         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
-            let cn = cm.get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+            let cn = cm
+                .get_class(f.class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
             eprintln!("[NCDFE-STK {}] {}.{} pc={}", i, cn, f.method_name(), f.pc);
         }
     }
@@ -1101,25 +1133,33 @@ pub fn convert_class_not_found(
         // Convert them to throwable Java exceptions so catch(Error) / catch(Throwable)
         // blocks in user/framework code can handle them instead of crashing the VM.
         MethodCallFailed::InternalError(VmError::Linkage(
-            crate::error::LinkageError::NoSuchFieldError { class_name: ref cn, ref field_name },
+            crate::error::LinkageError::NoSuchFieldError {
+                class_name: ref cn,
+                ref field_name,
+            },
         )) => {
             let msg = format!("{}.{}", cn, field_name);
-            match create_exception_object(shared, thread, "java/lang/NoSuchFieldError", Some(&msg)) {
+            match create_exception_object(shared, thread, "java/lang/NoSuchFieldError", Some(&msg))
+            {
                 Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
                 Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
                     crate::error::LinkageError::NoSuchFieldError {
-                        class_name: cn.clone(), field_name: field_name.clone(),
+                        class_name: cn.clone(),
+                        field_name: field_name.clone(),
                     },
                 )),
             }
         }
         MethodCallFailed::InternalError(VmError::Linkage(
             crate::error::LinkageError::NoSuchMethodError {
-                class_name: ref cn, ref method_name, ref method_descriptor,
+                class_name: ref cn,
+                ref method_name,
+                ref method_descriptor,
             },
         )) => {
             let msg = format!("{}.{}{}", cn, method_name, method_descriptor);
-            match create_exception_object(shared, thread, "java/lang/NoSuchMethodError", Some(&msg)) {
+            match create_exception_object(shared, thread, "java/lang/NoSuchMethodError", Some(&msg))
+            {
                 Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
                 Err(_) => MethodCallFailed::InternalError(VmError::Linkage(
                     crate::error::LinkageError::NoSuchMethodError {
@@ -1573,7 +1613,10 @@ mod helpful_npe_tests {
     /// array spelling.
     #[test]
     fn class_external_formats() {
-        assert_eq!(helpful_npe::class_external("java/lang/String"), "java.lang.String");
+        assert_eq!(
+            helpful_npe::class_external("java/lang/String"),
+            "java.lang.String"
+        );
         assert_eq!(helpful_npe::class_external("[I"), "int[]");
         assert_eq!(
             helpful_npe::class_external("[Ljava/lang/Object;"),
@@ -1739,12 +1782,18 @@ mod helpful_npe_tests {
     #[test]
     fn increment2_action_shapes() {
         use helpful_npe::ArrayElemKind;
-        assert_eq!(helpful_npe::action_read_field("x"), "Cannot read field \"x\"");
+        assert_eq!(
+            helpful_npe::action_read_field("x"),
+            "Cannot read field \"x\""
+        );
         assert_eq!(
             helpful_npe::action_assign_field("count"),
             "Cannot assign field \"count\""
         );
-        assert_eq!(helpful_npe::action_array_length(), "Cannot read the array length");
+        assert_eq!(
+            helpful_npe::action_array_length(),
+            "Cannot read the array length"
+        );
         assert_eq!(
             helpful_npe::action_array_load(ArrayElemKind::Int),
             "Cannot load from int array"

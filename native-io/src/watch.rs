@@ -75,9 +75,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -211,9 +211,7 @@ pub fn register_dir(ws_id: i32, dir: &str, kinds_mask: i32) -> Result<i32, Metho
         Ok(p) => p,
         Err(_) => {
             return Err(RuntimeError::IOException {
-                message: format!(
-                    "WatchService.register: path rejected by sandbox: {dir}"
-                ),
+                message: format!("WatchService.register: path rejected by sandbox: {dir}"),
             }
             .into());
         }
@@ -329,11 +327,7 @@ fn drain(state: &mut WatcherState) {
                     };
 
                     // Filter against the registered kinds mask.
-                    let mask = state
-                        .keys
-                        .get(&target)
-                        .map(|k| k.kinds_mask)
-                        .unwrap_or(0);
+                    let mask = state.keys.get(&target).map(|k| k.kinds_mask).unwrap_or(0);
                     if mask & bit == 0 {
                         continue;
                     }
@@ -380,11 +374,7 @@ fn drain(state: &mut WatcherState) {
                         .entry(id)
                         .or_default()
                         .push((KIND_OVERFLOW, String::new()));
-                    let not_enqueued = state
-                        .keys
-                        .get(&id)
-                        .map(|k| !k.enqueued)
-                        .unwrap_or(false);
+                    let not_enqueued = state.keys.get(&id).map(|k| !k.enqueued).unwrap_or(false);
                     if not_enqueued {
                         if let Some(k) = state.keys.get_mut(&id) {
                             k.enqueued = true;
@@ -659,10 +649,7 @@ fn ws_close0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// matching basenames; both are drained in the same call so the indices
 /// line up. We do the drain in `pollEventKinds0` and stash the names on
 /// a per-thread side-table consumed by the next `pollEventNames0`.
-fn ws_poll_event_kinds0_native(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn ws_poll_event_kinds0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
@@ -689,10 +676,7 @@ fn ws_poll_event_kinds0_native(
 /// thread. The pairing is per-thread so concurrent threads don't race;
 /// the data lives in a thread-local side-table and is consumed exactly
 /// once.
-fn ws_poll_event_names0_native(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn ws_poll_event_names0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
@@ -880,7 +864,8 @@ mod tests {
         write_file(&dir.path().join("hello.txt"), b"hi");
 
         let saw = wait_for(id, key, Duration::from_secs(3), |evs| {
-            evs.iter().any(|(k, _)| *k & (KIND_CREATE | KIND_MODIFY) != 0)
+            evs.iter()
+                .any(|(k, _)| *k & (KIND_CREATE | KIND_MODIFY) != 0)
         });
         assert!(saw, "should observe a create or modify event");
         close_watch_service(id);
@@ -893,8 +878,7 @@ mod tests {
         write_file(&path, b"x");
 
         let id = open_watch_service().expect("open");
-        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_DELETE)
-            .expect("register");
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_DELETE).expect("register");
 
         std::fs::remove_file(&path).expect("remove");
 
@@ -912,8 +896,7 @@ mod tests {
         write_file(&path, b"v1");
 
         let id = open_watch_service().expect("open");
-        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_MODIFY)
-            .expect("register");
+        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_MODIFY).expect("register");
 
         // Sleep briefly to let the watcher install before the second write.
         std::thread::sleep(Duration::from_millis(50));
@@ -985,7 +968,8 @@ mod tests {
     fn wp3_8_reset_re_arms_signal_when_more_events_pending() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let id = open_watch_service().unwrap();
-        let key = register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE | KIND_MODIFY).unwrap();
+        let key =
+            register_dir(id, dir.path().to_str().unwrap(), KIND_CREATE | KIND_MODIFY).unwrap();
 
         write_file(&dir.path().join("a.txt"), b"x");
         std::thread::sleep(Duration::from_millis(150));
@@ -1078,7 +1062,10 @@ mod tests {
         crate::set_path_confine_to_cwd(false);
         close_watch_service(id);
 
-        assert!(r.is_err(), "traversal path accepted by WatchService.register");
+        assert!(
+            r.is_err(),
+            "traversal path accepted by WatchService.register"
+        );
         let err = format!("{:?}", r.unwrap_err());
         assert!(
             err.contains("IOException"),

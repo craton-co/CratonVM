@@ -26,8 +26,6 @@ pub fn register_builtins(_registry: &mut cratonvm_native_api::NativeMethodRegist
 }
 
 #[cfg(not(feature = "synthetic-jdk"))]
-pub fn register_synthetic_overrides(
-    _registry: &mut cratonvm_native_api::NativeMethodRegistry,
-) {
+pub fn register_synthetic_overrides(_registry: &mut cratonvm_native_api::NativeMethodRegistry) {
     // No-op shim. See module documentation above.
 }

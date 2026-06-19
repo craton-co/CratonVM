@@ -70,8 +70,7 @@ const COVERAGE_UNBACKED: &str =
 const COVERAGE_SUN: &str =
     "coverage: MessageDigest{MD5,SHA-1,SHA-256,SHA-384,SHA-512,SHA3-256,SHA3-384,SHA3-512}, \
      SecureRandom";
-const COVERAGE_SUN_RSA_SIGN: &str =
-    "coverage: KeyPairGenerator{RSA}, KeyFactory{RSA}, \
+const COVERAGE_SUN_RSA_SIGN: &str = "coverage: KeyPairGenerator{RSA}, KeyFactory{RSA}, \
      Signature{SHA1withRSA,SHA256withRSA,SHA384withRSA,SHA512withRSA}";
 const COVERAGE_SUN_JCE: &str =
     "coverage: Cipher{AES (ECB/CBC/GCM, PKCS5Padding/NoPadding)} via in-tree AES/GCM \
@@ -429,10 +428,7 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// our synthetic slots 0/1 when the receiver is a `make_provider`-style
 /// synthetic.  Returns `None` if the name slot is null/empty (matches
 /// the previous "no-op on bogus arg" behaviour).
-fn read_provider_name_version(
-    ctx: &dyn NativeContext,
-    prov: ObjectRef,
-) -> Option<(String, f64)> {
+fn read_provider_name_version(ctx: &dyn NativeContext, prov: ObjectRef) -> Option<(String, f64)> {
     let name = {
         let by_name = ctx.get_field_by_name(prov, "name");
         let n = match by_name {
@@ -481,7 +477,13 @@ fn security_insert_provider_at(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     let pos = args
         .get(1)
-        .and_then(|v| if let Value::Int(i) = v { Some(*i) } else { None })
+        .and_then(|v| {
+            if let Value::Int(i) = v {
+                Some(*i)
+            } else {
+                None
+            }
+        })
         .unwrap_or(1);
     let (name, ver) = match read_provider_name_version(ctx, prov) {
         Some(pair) => pair,
@@ -858,8 +860,18 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
 fn seed_sunec_services() {
     const P: &str = "SunEC";
     put_service(P, "KeyFactory", "EC", "sun.security.ec.ECKeyFactory");
-    put_service(P, "AlgorithmParameters", "EC", "sun.security.util.ECParameters");
-    put_service(P, "KeyPairGenerator", "EC", "sun.security.ec.ECKeyPairGenerator");
+    put_service(
+        P,
+        "AlgorithmParameters",
+        "EC",
+        "sun.security.util.ECParameters",
+    );
+    put_service(
+        P,
+        "KeyPairGenerator",
+        "EC",
+        "sun.security.ec.ECKeyPairGenerator",
+    );
     // ECDSA Signature family (DER output) + IEEE-P1363 (raw R||S) variants.
     let sigs: &[(&str, &str)] = &[
         ("NONEwithECDSA", "sun.security.ec.ECDSASignature$Raw"),
@@ -868,16 +880,46 @@ fn seed_sunec_services() {
         ("SHA256withECDSA", "sun.security.ec.ECDSASignature$SHA256"),
         ("SHA384withECDSA", "sun.security.ec.ECDSASignature$SHA384"),
         ("SHA512withECDSA", "sun.security.ec.ECDSASignature$SHA512"),
-        ("SHA3-224withECDSA", "sun.security.ec.ECDSASignature$SHA3_224"),
-        ("SHA3-256withECDSA", "sun.security.ec.ECDSASignature$SHA3_256"),
-        ("SHA3-384withECDSA", "sun.security.ec.ECDSASignature$SHA3_384"),
-        ("SHA3-512withECDSA", "sun.security.ec.ECDSASignature$SHA3_512"),
-        ("NONEwithECDSAinP1363Format", "sun.security.ec.ECDSASignature$RawinP1363Format"),
-        ("SHA1withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA1inP1363Format"),
-        ("SHA224withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA224inP1363Format"),
-        ("SHA256withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA256inP1363Format"),
-        ("SHA384withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA384inP1363Format"),
-        ("SHA512withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA512inP1363Format"),
+        (
+            "SHA3-224withECDSA",
+            "sun.security.ec.ECDSASignature$SHA3_224",
+        ),
+        (
+            "SHA3-256withECDSA",
+            "sun.security.ec.ECDSASignature$SHA3_256",
+        ),
+        (
+            "SHA3-384withECDSA",
+            "sun.security.ec.ECDSASignature$SHA3_384",
+        ),
+        (
+            "SHA3-512withECDSA",
+            "sun.security.ec.ECDSASignature$SHA3_512",
+        ),
+        (
+            "NONEwithECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$RawinP1363Format",
+        ),
+        (
+            "SHA1withECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$SHA1inP1363Format",
+        ),
+        (
+            "SHA224withECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$SHA224inP1363Format",
+        ),
+        (
+            "SHA256withECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$SHA256inP1363Format",
+        ),
+        (
+            "SHA384withECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$SHA384inP1363Format",
+        ),
+        (
+            "SHA512withECDSAinP1363Format",
+            "sun.security.ec.ECDSASignature$SHA512inP1363Format",
+        ),
     ];
     for (algo, cls) in sigs {
         put_service(P, "Signature", algo, cls);
@@ -901,33 +943,93 @@ fn seed_sunec_services() {
 fn seed_sunjsse_services() {
     const J: &str = "SunJSSE";
     // KeyManagerFactory
-    put_service(J, "KeyManagerFactory", "SunX509", "sun.security.ssl.KeyManagerFactoryImpl$SunX509");
-    put_service(J, "KeyManagerFactory", "NewSunX509", "sun.security.ssl.KeyManagerFactoryImpl$X509");
+    put_service(
+        J,
+        "KeyManagerFactory",
+        "SunX509",
+        "sun.security.ssl.KeyManagerFactoryImpl$SunX509",
+    );
+    put_service(
+        J,
+        "KeyManagerFactory",
+        "NewSunX509",
+        "sun.security.ssl.KeyManagerFactoryImpl$X509",
+    );
     put_alias(J, "KeyManagerFactory", "PKIX", "NewSunX509");
     // TrustManagerFactory
-    put_service(J, "TrustManagerFactory", "SunX509", "sun.security.ssl.TrustManagerFactoryImpl$SimpleFactory");
-    put_service(J, "TrustManagerFactory", "PKIX", "sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory");
+    put_service(
+        J,
+        "TrustManagerFactory",
+        "SunX509",
+        "sun.security.ssl.TrustManagerFactoryImpl$SimpleFactory",
+    );
+    put_service(
+        J,
+        "TrustManagerFactory",
+        "PKIX",
+        "sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory",
+    );
     put_alias(J, "TrustManagerFactory", "SunPKIX", "PKIX");
     put_alias(J, "TrustManagerFactory", "X509", "PKIX");
     put_alias(J, "TrustManagerFactory", "X.509", "PKIX");
     // SSLContext
-    put_service(J, "SSLContext", "TLS", "sun.security.ssl.SSLContextImpl$TLSContext");
-    put_service(J, "SSLContext", "TLSv1.2", "sun.security.ssl.SSLContextImpl$TLS12Context");
-    put_service(J, "SSLContext", "TLSv1.3", "sun.security.ssl.SSLContextImpl$TLS13Context");
-    put_service(J, "SSLContext", "Default", "sun.security.ssl.SSLContextImpl$DefaultSSLContext");
+    put_service(
+        J,
+        "SSLContext",
+        "TLS",
+        "sun.security.ssl.SSLContextImpl$TLSContext",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1.2",
+        "sun.security.ssl.SSLContextImpl$TLS12Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1.3",
+        "sun.security.ssl.SSLContextImpl$TLS13Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "Default",
+        "sun.security.ssl.SSLContextImpl$DefaultSSLContext",
+    );
     put_alias(J, "SSLContext", "SSL", "TLS");
     // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
     const S: &str = "SUN";
-    put_service(S, "KeyStore", "JKS", "sun.security.provider.JavaKeyStore$JKS");
-    put_service(S, "KeyStore", "CaseExactJKS", "sun.security.provider.JavaKeyStore$CaseExactJKS");
-    put_service(S, "KeyStore", "PKCS12", "sun.security.pkcs12.PKCS12KeyStore");
+    put_service(
+        S,
+        "KeyStore",
+        "JKS",
+        "sun.security.provider.JavaKeyStore$JKS",
+    );
+    put_service(
+        S,
+        "KeyStore",
+        "CaseExactJKS",
+        "sun.security.provider.JavaKeyStore$CaseExactJKS",
+    );
+    put_service(
+        S,
+        "KeyStore",
+        "PKCS12",
+        "sun.security.pkcs12.PKCS12KeyStore",
+    );
     put_alias(S, "KeyStore", "PKCS#12", "PKCS12");
     // CertificateFactory X.509 (SUN provider) — needed by the real
     // X509CertImpl/Validator path: the SunX509 KeyManager + PKIX TrustManager
     // build/validate cert chains via `CertificateFactory.getInstance("X.509")`.
     // Without it `getInstance` fell through to "no CertificateFactory X.509
     // implementation in any provider" and aborted SSLContext setup.
-    put_service(S, "CertificateFactory", "X.509", "sun.security.provider.X509Factory");
+    put_service(
+        S,
+        "CertificateFactory",
+        "X.509",
+        "sun.security.provider.X509Factory",
+    );
     put_alias(S, "CertificateFactory", "X509", "X.509");
     // CertPathValidator / CertPathBuilder PKIX (SUN provider) — needed by the
     // real PKIX TLS trust path and OCSP revocation tests. Without these,
@@ -937,8 +1039,18 @@ fn seed_sunjsse_services() {
     // NOSUMMARY). Both Sun SPI classes have the public no-arg ctor JCA requires,
     // so `build_jca_instance`'s `new_object_initialized(cls,"()V")` runs real
     // provider bytecode (verified against JDK 25).
-    put_service(S, "CertPathValidator", "PKIX", "sun.security.provider.certpath.PKIXCertPathValidator");
-    put_service(S, "CertPathBuilder", "PKIX", "sun.security.provider.certpath.SunCertPathBuilder");
+    put_service(
+        S,
+        "CertPathValidator",
+        "PKIX",
+        "sun.security.provider.certpath.PKIXCertPathValidator",
+    );
+    put_service(
+        S,
+        "CertPathBuilder",
+        "PKIX",
+        "sun.security.provider.certpath.SunCertPathBuilder",
+    );
 }
 
 /// Mirror the JDK's `XMLDSig` provider (`org.jcp.xml.dsig.internal.dom.XMLDSigRI`)
@@ -955,21 +1067,64 @@ fn seed_sunjsse_services() {
 /// `new_object_initialized(cls,"()V")` runs the real DOM SPI bytecode.
 fn seed_xmldsig_services() {
     const X: &str = "XMLDSig";
-    put_service(X, "XMLSignatureFactory", "DOM", "org.jcp.xml.dsig.internal.dom.DOMXMLSignatureFactory");
-    put_service(X, "KeyInfoFactory", "DOM", "org.jcp.xml.dsig.internal.dom.DOMKeyInfoFactory");
+    put_service(
+        X,
+        "XMLSignatureFactory",
+        "DOM",
+        "org.jcp.xml.dsig.internal.dom.DOMXMLSignatureFactory",
+    );
+    put_service(
+        X,
+        "KeyInfoFactory",
+        "DOM",
+        "org.jcp.xml.dsig.internal.dom.DOMKeyInfoFactory",
+    );
     // TransformService entries (algorithm == the C14N/transform URI).
     let ts: &[(&str, &str)] = &[
-        ("http://www.w3.org/TR/2001/REC-xml-c14n-20010315", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod"),
-        ("http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod"),
-        ("http://www.w3.org/2006/12/xml-c14n11", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method"),
-        ("http://www.w3.org/2006/12/xml-c14n11#WithComments", "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method"),
-        ("http://www.w3.org/2001/10/xml-exc-c14n#", "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod"),
-        ("http://www.w3.org/2001/10/xml-exc-c14n#WithComments", "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod"),
-        ("http://www.w3.org/2000/09/xmldsig#base64", "org.jcp.xml.dsig.internal.dom.DOMBase64Transform"),
-        ("http://www.w3.org/2000/09/xmldsig#enveloped-signature", "org.jcp.xml.dsig.internal.dom.DOMEnvelopedTransform"),
-        ("http://www.w3.org/2002/06/xmldsig-filter2", "org.jcp.xml.dsig.internal.dom.DOMXPathFilter2Transform"),
-        ("http://www.w3.org/TR/1999/REC-xpath-19991116", "org.jcp.xml.dsig.internal.dom.DOMXPathTransform"),
-        ("http://www.w3.org/TR/1999/REC-xslt-19991116", "org.jcp.xml.dsig.internal.dom.DOMXSLTTransform"),
+        (
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+            "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod",
+        ),
+        (
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+            "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14NMethod",
+        ),
+        (
+            "http://www.w3.org/2006/12/xml-c14n11",
+            "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method",
+        ),
+        (
+            "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+            "org.jcp.xml.dsig.internal.dom.DOMCanonicalXMLC14N11Method",
+        ),
+        (
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod",
+        ),
+        (
+            "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+            "org.jcp.xml.dsig.internal.dom.DOMExcC14NMethod",
+        ),
+        (
+            "http://www.w3.org/2000/09/xmldsig#base64",
+            "org.jcp.xml.dsig.internal.dom.DOMBase64Transform",
+        ),
+        (
+            "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+            "org.jcp.xml.dsig.internal.dom.DOMEnvelopedTransform",
+        ),
+        (
+            "http://www.w3.org/2002/06/xmldsig-filter2",
+            "org.jcp.xml.dsig.internal.dom.DOMXPathFilter2Transform",
+        ),
+        (
+            "http://www.w3.org/TR/1999/REC-xpath-19991116",
+            "org.jcp.xml.dsig.internal.dom.DOMXPathTransform",
+        ),
+        (
+            "http://www.w3.org/TR/1999/REC-xslt-19991116",
+            "org.jcp.xml.dsig.internal.dom.DOMXSLTTransform",
+        ),
     ];
     for (uri, cls) in ts {
         put_service(X, "TransformService", uri, cls);
@@ -1221,7 +1376,10 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// implementation class name.  Required by the BC fallback path and by
 /// `Cipher.getInstance(algo, providerName)` to render diagnostics when
 /// resolution fails.  Reads slot 3 (populated in `make_service`).
-fn provider_service_get_class_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn provider_service_get_class_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Real-JDK path first.
     let by_name = ctx.get_field_by_name(this, "className");
@@ -1321,10 +1479,7 @@ fn getinstance_get_service_provider(
 /// `sun.security.jca.GetInstance.getService(String type, String algorithm)` —
 /// no-provider form: walk our provider chain in order and return the first
 /// match (mirrors `ProviderList.getService`).
-fn getinstance_get_service_search(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     for (name, _, _) in snapshot() {
@@ -1363,10 +1518,12 @@ fn build_jca_instance(
         let impl_ref = match ctx.new_object_initialized(&internal, "()V", &[])? {
             Some(Value::Object(Some(o))) => o,
             _ => {
-                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                    class_name: entry.class_name.clone(),
-                }
-                .into())
+                return Err(
+                    cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                        class_name: entry.class_name.clone(),
+                    }
+                    .into(),
+                )
             }
         };
         // Pin the SPI across the Provider allocation below (which can GC).
@@ -1385,10 +1542,7 @@ fn build_jca_instance(
     })())
 }
 
-fn getinstance_instance_provider(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (String type, Class clazz, String algorithm, String provider)
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
@@ -1410,9 +1564,9 @@ fn getinstance_instance_provider_obj(
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
     let provider = match args.get(3) {
-        Some(Value::Object(Some(p))) => {
-            read_provider_name_version(ctx, *p).map(|(n, _)| n).unwrap_or_default()
-        }
+        Some(Value::Object(Some(p))) => read_provider_name_version(ctx, *p)
+            .map(|(n, _)| n)
+            .unwrap_or_default(),
         _ => String::new(),
     };
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
@@ -1431,18 +1585,15 @@ fn getinstance_instance_provider_obj(
 /// through `GetInstance.getInstance`; without this the bytecode reaches
 /// `Providers.getProviderList()` (which our shim leaves null) and NPEs on
 /// `list.getServices(...)`.
-fn getinstance_get_services(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn getinstance_get_services(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     let al = "java/util/ArrayList";
-    let al_cid = ctx
-        .ensure_class_initialized(al)
-        .map_err(|_| cratonvm_types::error::RuntimeError::NotImplemented {
+    let al_cid = ctx.ensure_class_initialized(al).map_err(|_| {
+        cratonvm_types::error::RuntimeError::NotImplemented {
             feature: "GetInstance.getServices: ArrayList not loaded".into(),
-        })?;
+        }
+    })?;
     let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al, "<init>", "()V", &[Value::Object(Some(list))])?;
     let pin = ctx.pin_native_root(list);
@@ -1458,15 +1609,17 @@ fn getinstance_get_services(
         }
     }
     list = ctx.read_native_pin(pin, list);
-    let it = ctx.invoke(al, "iterator", "()Ljava/util/Iterator;", &[Value::Object(Some(list))]);
+    let it = ctx.invoke(
+        al,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(list))],
+    );
     ctx.unpin_native_roots(pin);
     it
 }
 
-fn getinstance_instance_search(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (String type, Class clazz, String algorithm) — search the chain.
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
@@ -1485,10 +1638,7 @@ fn getinstance_instance_search(
 /// reflectively instantiate the entry's implementation class (a real BC `*Spi`)
 /// and run its no-arg constructor, so the genuine provider bytecode produces the
 /// SPI object the JDK's `GetInstance.getInstance(Service, clazz)` then wraps.
-fn provider_service_new_instance(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let class_name = {
         // Primary: GC-stable side-table lookup keyed by identity hash (header,
@@ -1525,10 +1675,12 @@ fn provider_service_new_instance(
     // and returns the forwarded reference.
     match ctx.new_object_initialized(&internal, "()V", &[])? {
         Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
-        _ => Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-            class_name: class_name.clone(),
-        }
-        .into()),
+        _ => Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: class_name.clone(),
+            }
+            .into(),
+        ),
     }
 }
 
@@ -1570,7 +1722,12 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     let prov = "java/security/Provider";
     r.register(prov, "getName", "()Ljava/lang/String;", provider_get_name);
     r.register(prov, "getVersion", "()D", provider_get_version);
-    r.register(prov, "getVersionStr", "()Ljava/lang/String;", provider_get_version_str);
+    r.register(
+        prov,
+        "getVersionStr",
+        "()Ljava/lang/String;",
+        provider_get_version_str,
+    );
     r.register(prov, "toString", "()Ljava/lang/String;", provider_to_string);
     r.register(prov, "getInfo", "()Ljava/lang/String;", provider_get_info);
 
@@ -1590,8 +1747,18 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // `knownEngines` static-init chain in.  The constructor shim above
     // makes those chains unnecessary, so no-op them to skip the
     // class-load-time work entirely.
-    r.register("java/security/Provider$ServiceKey", "<clinit>", "()V", clinit_noop);
-    r.register("java/security/Provider$EngineDescription", "<clinit>", "()V", clinit_noop);
+    r.register(
+        "java/security/Provider$ServiceKey",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
+    r.register(
+        "java/security/Provider$EngineDescription",
+        "<clinit>",
+        "()V",
+        clinit_noop,
+    );
 
     // Round 87 (WildFly): skip BouncyCastle's EC asymmetric-provider
     // configuration.  `EC.<clinit>` calls `ECNamedCurveTable.getNames()`,
@@ -1785,21 +1952,36 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     );
 
     let sec = "java/security/Security";
-    r.register(sec, "getProviders", "()[Ljava/security/Provider;", security_get_providers);
+    r.register(
+        sec,
+        "getProviders",
+        "()[Ljava/security/Provider;",
+        security_get_providers,
+    );
     r.register(
         sec,
         "getProvider",
         "(Ljava/lang/String;)Ljava/security/Provider;",
         security_get_provider,
     );
-    r.register(sec, "addProvider", "(Ljava/security/Provider;)I", security_add_provider);
+    r.register(
+        sec,
+        "addProvider",
+        "(Ljava/security/Provider;)I",
+        security_add_provider,
+    );
     r.register(
         sec,
         "insertProviderAt",
         "(Ljava/security/Provider;I)I",
         security_insert_provider_at,
     );
-    r.register(sec, "removeProvider", "(Ljava/lang/String;)V", security_remove_provider);
+    r.register(
+        sec,
+        "removeProvider",
+        "(Ljava/lang/String;)V",
+        security_remove_provider,
+    );
     r.register(
         sec,
         "getProperty",
@@ -1954,15 +2136,14 @@ mod tests {
         // same triple from a sibling call site would otherwise panic on
         // a hash collision check.
         register(&mut r);
-        assert!(
-            r.find(
+        assert!(r
+            .find(
                 "java/security/Provider$Service",
                 "<init>",
                 "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
                  Ljava/lang/String;Ljava/util/List;Ljava/util/Map;)V",
             )
-            .is_some()
-        );
+            .is_some());
     }
 
     #[test]
@@ -2025,12 +2206,12 @@ mod tests {
 
         let args = [
             Value::Object(Some(this)),
-            Value::Object(None),               // null provider
+            Value::Object(None), // null provider
             Value::Object(Some(svc_type)),
             Value::Object(Some(algorithm)),
-            Value::Object(None),               // null className
-            Value::Object(None),               // null aliases
-            Value::Object(None),               // null attributes
+            Value::Object(None), // null className
+            Value::Object(None), // null aliases
+            Value::Object(None), // null attributes
         ];
         let res = provider_service_init(&mut ctx, &args);
         assert!(
@@ -2039,12 +2220,8 @@ mod tests {
         );
 
         // type and algorithm must still land in the synthetic slots.
-        assert!(
-            matches!(ctx.get_field(this, 0), Value::Object(Some(o)) if o == svc_type)
-        );
-        assert!(
-            matches!(ctx.get_field(this, 1), Value::Object(Some(o)) if o == algorithm)
-        );
+        assert!(matches!(ctx.get_field(this, 0), Value::Object(Some(o)) if o == svc_type));
+        assert!(matches!(ctx.get_field(this, 1), Value::Object(Some(o)) if o == algorithm));
         // Provider slot is null — that's OK, the BC chain only consults
         // `getType` / `getAlgorithm` for the cache key.
         assert!(matches!(ctx.get_field(this, 2), Value::Object(None)));
@@ -2058,7 +2235,7 @@ mod tests {
         // bytecode dispatch could hand us a null `this`.
         let mut ctx = MockNativeContext::new();
         let args = [
-            Value::Object(None),        // null this
+            Value::Object(None), // null this
             Value::Object(None),
             Value::Object(None),
             Value::Object(None),
@@ -2083,11 +2260,17 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register(&mut r);
         assert!(
-            r.find("java/security/Provider$ServiceKey", "<clinit>", "()V").is_some(),
+            r.find("java/security/Provider$ServiceKey", "<clinit>", "()V")
+                .is_some(),
             "Provider$ServiceKey.<clinit> must be no-op'd alongside the Service ctor shim"
         );
         assert!(
-            r.find("java/security/Provider$EngineDescription", "<clinit>", "()V").is_some(),
+            r.find(
+                "java/security/Provider$EngineDescription",
+                "<clinit>",
+                "()V"
+            )
+            .is_some(),
             "Provider$EngineDescription.<clinit> must be no-op'd alongside the Service ctor shim"
         );
     }
@@ -2324,7 +2507,10 @@ mod tests {
         };
         assert_eq!(svc_type, "Cipher");
         assert_eq!(svc_algo, "AES/GCM/NoPadding");
-        assert_eq!(svc_class, "org.bouncycastle.jcajce.provider.symmetric.AES$GCM");
+        assert_eq!(
+            svc_class,
+            "org.bouncycastle.jcajce.provider.symmetric.AES$GCM"
+        );
     }
 
     #[test]
@@ -2362,8 +2548,12 @@ mod tests {
             "Provider.getService must be registered for Cipher.getInstance lookups"
         );
         assert!(
-            r.find("java/security/Provider$Service", "getClassName", "()Ljava/lang/String;")
-                .is_some(),
+            r.find(
+                "java/security/Provider$Service",
+                "getClassName",
+                "()Ljava/lang/String;"
+            )
+            .is_some(),
             "Provider$Service.getClassName must be registered for SPI instantiation"
         );
     }

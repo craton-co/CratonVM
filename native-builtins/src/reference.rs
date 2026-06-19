@@ -23,9 +23,9 @@
 //! * `PhantomReference.get()` always returns null per the JDK contract
 //!   (JDK 1.2+). The other ref subclasses return the referent field.
 
-use cratonvm_types::Value;
-use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 use crate::{REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
 
@@ -512,18 +512,41 @@ mod tests {
         register_reference_natives(&mut r);
 
         // A handful of representative entries across the four classes.
-        assert!(r.find("java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;").is_some());
-        assert!(r.find("java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;").is_some());
-        assert!(r.find(
-            "java/lang/ref/PhantomReference",
-            "get",
-            "()Ljava/lang/Object;"
-        )
-        .is_some());
+        assert!(r
+            .find("java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;")
+            .is_some());
+        assert!(r
+            .find("java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;")
+            .is_some());
+        assert!(r
+            .find(
+                "java/lang/ref/PhantomReference",
+                "get",
+                "()Ljava/lang/Object;"
+            )
+            .is_some());
         assert!(r.find("java/lang/ref/Reference", "clear", "()V").is_some());
-        assert!(r.find("java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;").is_some());
-        assert!(r.find("java/lang/ref/ReferenceQueue", "remove", "()Ljava/lang/ref/Reference;").is_some());
-        assert!(r.find("java/lang/ref/ReferenceQueue", "remove", "(J)Ljava/lang/ref/Reference;").is_some());
+        assert!(r
+            .find(
+                "java/lang/ref/ReferenceQueue",
+                "poll",
+                "()Ljava/lang/ref/Reference;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/lang/ref/ReferenceQueue",
+                "remove",
+                "()Ljava/lang/ref/Reference;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/lang/ref/ReferenceQueue",
+                "remove",
+                "(J)Ljava/lang/ref/Reference;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -535,7 +558,15 @@ mod tests {
         // in the vm crate.
         let mut r = NativeMethodRegistry::new();
         register_reference_natives(&mut r);
-        assert!(r.find("java/lang/ref/PhantomReference", "get", "()Ljava/lang/Object;").is_some());
-        assert!(r.find("java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(
+                "java/lang/ref/PhantomReference",
+                "get",
+                "()Ljava/lang/Object;"
+            )
+            .is_some());
+        assert!(r
+            .find("java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;")
+            .is_some());
     }
 }

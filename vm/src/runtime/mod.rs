@@ -9,46 +9,46 @@
 mod call_stack;
 pub mod ec_watch;
 pub mod env_cache;
-pub mod memwatch;
 pub mod exceptions;
 pub mod frame;
 pub mod interpreter;
 pub mod invokedynamic;
+pub mod memwatch;
 pub mod signals;
 pub mod value_stack;
 
+pub mod alloc_fastpath;
+pub mod build_tool_compat;
 pub mod container;
 pub mod crash_handler;
-pub mod stwhang_watch;
 pub mod diagnostics;
-pub mod unified_logging;
+pub mod fx_collections;
 pub mod gc_integration;
 pub mod hprof;
+pub mod jdk_layout;
 pub mod jit_integration;
 pub mod jvmti;
+pub mod lambda_proxy;
+pub mod lock_order;
+pub mod lockfree_resolve;
+pub mod serialization;
 pub mod serviceability;
+pub mod shared_secrets;
 pub mod soak_test;
+pub mod stwhang_watch;
 pub mod tck;
 pub mod threading_integration;
-pub mod jdk_layout;
-pub mod build_tool_compat;
-pub mod vtable;
-pub mod fx_collections;
-pub mod alloc_fastpath;
-pub mod lockfree_resolve;
-pub mod lock_order;
-pub mod serialization;
-pub mod shared_secrets;
+pub mod unified_logging;
 pub mod unsafe_helpers;
 pub mod varhandle;
-pub mod lambda_proxy;
+pub mod vtable;
 // WP2.6 — `lang_reflect_constructor` hosts the spec-classification
 // helpers used by the `Constructor.newInstance` edge-case tests. The
 // native still lives in `native-builtins/src/lang_class.rs`; this
 // module just exposes the classification logic.
-pub mod lang_reflect_constructor;
-pub mod instrument;
 pub mod agent_loader;
+pub mod instrument;
+pub mod lang_reflect_constructor;
 pub mod proxy;
 pub mod stackwalker;
 
@@ -60,7 +60,8 @@ pub mod stackwalker;
 #[cfg(feature = "gpu-offload")]
 pub mod gpu_marshal;
 
-#[cfg(feature = "gpu-offload")] pub mod gpu_residency;
+#[cfg(feature = "gpu-offload")]
+pub mod gpu_residency;
 
 // Part E of the GPU offload plan — analyzer-cache, PTX module store, and
 // dispatcher hook for the interpreter's `execute_invokestatic`. Strictly

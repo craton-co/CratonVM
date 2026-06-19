@@ -222,13 +222,9 @@ fn ref_hash(s: &str) -> i32 {
 /// is `aload_0; invokevirtual <method>; xreturn`. `ret` is the xreturn opcode
 /// (`0xac` ireturn for length/hashCode/isEmpty/charAt — all int-category).
 fn compile_unary(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
-    let entry = try_resolve_string_intrinsic(
-        "java/lang/String",
-        name,
-        descriptor,
-        Some(string_layout()),
-    )?
-    .0;
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", name, descriptor, Some(string_layout()))?
+            .0;
     // aload_0 (2a), invokevirtual (b6 00 01), ireturn (ac)
     let code: Vec<u8> = vec![0x2a, 0xb6, 0x00, 0x01, 0xac, 0, 0];
     let compiled = compile(
@@ -271,14 +267,10 @@ fn compile_unary(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
 /// JIT-compile `int f(String this, int idx)` whose body is
 /// `aload_0; iload_1; invokevirtual charAt; ireturn`.
 fn compile_char_at() -> impl Fn(i64, i32) -> i64 {
-    let entry = try_resolve_string_intrinsic(
-        "java/lang/String",
-        "charAt",
-        "(I)C",
-        Some(string_layout()),
-    )
-    .expect("charAt must register with a layout")
-    .0;
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", "charAt", "(I)C", Some(string_layout()))
+            .expect("charAt must register with a layout")
+            .0;
     // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac)
     let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
     let compiled = compile(
@@ -316,7 +308,11 @@ fn compile_char_at() -> impl Fn(i64, i32) -> i64 {
         Some(string_layout()),
     )
     .expect("charAt wrapper compilation failed");
-    move |this: i64, idx: i32| unsafe { compiled.try_call(&[this, idx as i64]).expect("test JIT call") }
+    move |this: i64, idx: i32| unsafe {
+        compiled
+            .try_call(&[this, idx as i64])
+            .expect("test JIT call")
+    }
 }
 
 // --- matcher integration --------------------------------------------------
@@ -355,8 +351,7 @@ fn string_access_bails_without_a_coder_field() {
     let no_coder = StringFieldLayout::new(0, None, 1, STRING_CLASS_ID);
     assert!(!no_coder.has_coder);
     assert!(
-        try_resolve_string_intrinsic("java/lang/String", "length", "()I", Some(no_coder))
-            .is_none(),
+        try_resolve_string_intrinsic("java/lang/String", "length", "()I", Some(no_coder)).is_none(),
         "length must bail when the layout has no coder field",
     );
 }
@@ -420,7 +415,11 @@ fn string_char_at_latin1() {
     let arr = make_byte_array(&bytes);
     let strobj = make_string(arr.ptr(), coder, 0);
     for i in 0..s.len() {
-        assert_eq!(f(strobj.ptr(), i as i32) as i32, ref_char_at(s, i), "charAt {i}");
+        assert_eq!(
+            f(strobj.ptr(), i as i32) as i32,
+            ref_char_at(s, i),
+            "charAt {i}"
+        );
     }
 }
 
@@ -434,7 +433,11 @@ fn string_char_at_utf16() {
     let strobj = make_string(arr.ptr(), coder, 0);
     let count = s.encode_utf16().count();
     for i in 0..count {
-        assert_eq!(f(strobj.ptr(), i as i32) as i32, ref_char_at(s, i), "charAt {i}");
+        assert_eq!(
+            f(strobj.ptr(), i as i32) as i32,
+            ref_char_at(s, i),
+            "charAt {i}"
+        );
     }
 }
 
@@ -449,7 +452,11 @@ fn string_char_at_out_of_bounds_deopts() {
     for bad in [3i32, -1, 999] {
         let before = TRAP_COUNT.load(Ordering::SeqCst);
         let r = f(strobj.ptr(), bad);
-        assert_eq!(r, i64::MIN, "OOB charAt({bad}) must return the deopt sentinel");
+        assert_eq!(
+            r,
+            i64::MIN,
+            "OOB charAt({bad}) must return the deopt sentinel"
+        );
         assert_eq!(
             TRAP_COUNT.load(Ordering::SeqCst),
             before + 1,
@@ -463,7 +470,14 @@ fn string_char_at_out_of_bounds_deopts() {
 #[test]
 fn string_hash_code_computes_when_cache_zero() {
     let f = compile_unary("hashCode", "()I").expect("hashCode must register");
-    for s in ["", "a", "hello", "The quick brown fox", "caf\u{e9}", "A\u{4e2d}Z"] {
+    for s in [
+        "",
+        "a",
+        "hello",
+        "The quick brown fox",
+        "caf\u{e9}",
+        "A\u{4e2d}Z",
+    ] {
         let (bytes, coder) = encode(s);
         let arr = make_byte_array(&bytes);
         // hash cache = 0 → recompute.
@@ -497,7 +511,11 @@ fn string_length_null_receiver_deopts() {
     let f = compile_unary("length", "()I").expect("length must register");
     let before = TRAP_COUNT.load(Ordering::SeqCst);
     let r = f(0); // null receiver
-    assert_eq!(r, i64::MIN, "null-receiver length must return the deopt sentinel");
+    assert_eq!(
+        r,
+        i64::MIN,
+        "null-receiver length must return the deopt sentinel"
+    );
     assert_eq!(
         TRAP_COUNT.load(Ordering::SeqCst),
         before + 1,
@@ -565,7 +583,9 @@ fn compile_charseq_char_at() -> impl Fn(i64, i32) -> i64 {
     )
     .expect("CharSequence.charAt wrapper compilation failed");
     move |this: i64, idx: i32| unsafe {
-        compiled.try_call(&[this, idx as i64]).expect("test JIT call")
+        compiled
+            .try_call(&[this, idx as i64])
+            .expect("test JIT call")
     }
 }
 

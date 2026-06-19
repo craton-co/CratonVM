@@ -72,27 +72,18 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
     );
 
     // Thread.getPriority() reads `this.holder.priority`.  Return NORM_PRIORITY.
-    registry.register(
-        "java/lang/Thread",
-        "getPriority",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(5))),
-    );
+    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(5)))
+    });
 
     // Thread.isDaemon() reads `this.holder.daemon`.
-    registry.register(
-        "java/lang/Thread",
-        "isDaemon",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
 
-    registry.register(
-        "java/lang/Thread",
-        "setDaemon",
-        "(Z)V",
-        |_ctx, _args| Ok(None),
-    );
+    registry.register("java/lang/Thread", "setDaemon", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
     registry.set_category(__prev_cat);
 }
 
@@ -198,12 +189,8 @@ fn table_filter_prepare_on(
             if i >= size {
                 break;
             }
-            let cond_val = ctx.invoke_virtual(
-                conds,
-                "get",
-                "(I)Ljava/lang/Object;",
-                &[Value::Int(i)],
-            )?;
+            let cond_val =
+                ctx.invoke_virtual(conds, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])?;
             let cond = match cond_val {
                 Some(Value::Object(Some(o))) => o,
                 _ => {
@@ -211,18 +198,12 @@ fn table_filter_prepare_on(
                     continue;
                 }
             };
-            let always_false =
-                ctx.invoke_virtual(cond, "isAlwaysFalse", "()Z", &[])?;
+            let always_false = ctx.invoke_virtual(cond, "isAlwaysFalse", "()Z", &[])?;
             if !matches!(always_false, Some(Value::Int(0))) {
                 i += 1;
                 continue;
             }
-            let col_val = ctx.invoke_virtual(
-                cond,
-                "getColumn",
-                "()Lorg/h2/table/Column;",
-                &[],
-            )?;
+            let col_val = ctx.invoke_virtual(cond, "getColumn", "()Lorg/h2/table/Column;", &[])?;
             let col = match col_val {
                 Some(Value::Object(Some(o))) => o,
                 _ => {
@@ -257,12 +238,7 @@ fn table_filter_prepare_on(
                 }
             }
             if should_remove {
-                ctx.invoke_virtual(
-                    conds,
-                    "remove",
-                    "(I)Ljava/lang/Object;",
-                    &[Value::Int(i)],
-                )?;
+                ctx.invoke_virtual(conds, "remove", "(I)Ljava/lang/Object;", &[Value::Int(i)])?;
                 // stay at same index (size shrank)
                 continue;
             }

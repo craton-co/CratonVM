@@ -136,7 +136,12 @@ pub struct CommandResult {
 
 impl CommandResult {
     pub fn ok(output: String, execution_time_ms: u64) -> Self {
-        Self { success: true, output, error: None, execution_time_ms }
+        Self {
+            success: true,
+            output,
+            error: None,
+            execution_time_ms,
+        }
     }
 
     pub fn err(msg: String, execution_time_ms: u64) -> Self {
@@ -200,7 +205,9 @@ impl JcmdProcessor {
         // Register all standard commands
         Self::register_standard_commands(&mut listener);
 
-        Self { attach_listener: listener }
+        Self {
+            attach_listener: listener,
+        }
     }
 
     /// Create a JcmdProcessor backed by live VM state.
@@ -208,7 +215,9 @@ impl JcmdProcessor {
         let mut listener = AttachListener::new("/tmp/cratonvm_attach");
         listener.start_listening();
         Self::register_live_commands(&mut listener, vm_state);
-        Self { attach_listener: listener }
+        Self {
+            attach_listener: listener,
+        }
     }
 
     fn register_standard_commands(listener: &mut AttachListener) {
@@ -307,10 +316,7 @@ impl JcmdProcessor {
             CommandPermission::ReadOnly,
             vec![],
             Box::new(|_args| {
-                CommandResult::ok(
-                    "CratonVM 1.0.0 (JDK 25 compatible)".to_string(),
-                    0,
-                )
+                CommandResult::ok("CratonVM 1.0.0 (JDK 25 compatible)".to_string(), 0)
             }),
         ));
 
@@ -374,9 +380,7 @@ impl JcmdProcessor {
             CommandImpact::Low,
             CommandPermission::ReadOnly,
             vec![],
-            Box::new(|_args| {
-                CommandResult::ok("VM uptime: 3600.000 seconds".to_string(), 0)
-            }),
+            Box::new(|_args| CommandResult::ok("VM uptime: 3600.000 seconds".to_string(), 0)),
         ));
 
         // 10. VM.info
@@ -411,8 +415,7 @@ impl JcmdProcessor {
             vec![],
             Box::new(|_args| {
                 CommandResult::ok(
-                    "java -Xmx256m -Xms64m -XX:+UseG1GC -cp app.jar com.example.Main"
-                        .to_string(),
+                    "java -Xmx256m -Xms64m -XX:+UseG1GC -cp app.jar com.example.Main".to_string(),
                     0,
                 )
             }),
@@ -432,11 +435,11 @@ impl JcmdProcessor {
                 default_value: Some("thread_dump.txt".to_string()),
             }],
             Box::new(|args| {
-                let path = args.first().map(|s| s.as_str()).unwrap_or("thread_dump.txt");
-                CommandResult::ok(
-                    format!("Thread dump written to {}", path),
-                    0,
-                )
+                let path = args
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("thread_dump.txt");
+                CommandResult::ok(format!("Thread dump written to {}", path), 0)
             }),
         ));
 
@@ -475,10 +478,7 @@ impl JcmdProcessor {
             }],
             Box::new(|args| {
                 let name = args.first().map(|s| s.as_str()).unwrap_or("recording1");
-                CommandResult::ok(
-                    format!("Flight recording started: {}", name),
-                    0,
-                )
+                CommandResult::ok(format!("Flight recording started: {}", name), 0)
             }),
         ));
 
@@ -497,10 +497,7 @@ impl JcmdProcessor {
             }],
             Box::new(|args| {
                 let name = args.first().map(|s| s.as_str()).unwrap_or("recording1");
-                CommandResult::ok(
-                    format!("Flight recording stopped: {}", name),
-                    0,
-                )
+                CommandResult::ok(format!("Flight recording stopped: {}", name), 0)
             }),
         ));
 
@@ -519,10 +516,7 @@ impl JcmdProcessor {
             }],
             Box::new(|args| {
                 let path = args.first().map(|s| s.as_str()).unwrap_or("recording.jfr");
-                CommandResult::ok(
-                    format!("Flight recording dumped to {}", path),
-                    0,
-                )
+                CommandResult::ok(format!("Flight recording dumped to {}", path), 0)
             }),
         ));
     }
@@ -653,7 +647,8 @@ impl JcmdProcessor {
             vec![],
             Box::new(move |_args| {
                 let props = vs.system_properties();
-                let lines: Vec<String> = props.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                let lines: Vec<String> =
+                    props.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
                 CommandResult::ok(lines.join("\n"), 0)
             }),
         ));
@@ -679,9 +674,7 @@ impl JcmdProcessor {
             CommandImpact::Low,
             CommandPermission::ReadOnly,
             vec![],
-            Box::new(move |_args| {
-                CommandResult::ok(vs.command_line(), 0)
-            }),
+            Box::new(move |_args| CommandResult::ok(vs.command_line(), 0)),
         ));
     }
 
@@ -690,10 +683,7 @@ impl JcmdProcessor {
         let parts: Vec<&str> = command_line.trim().splitn(2, ' ').collect();
         let cmd_name = parts[0];
         let args: Vec<String> = if parts.len() > 1 {
-            parts[1]
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect()
+            parts[1].split_whitespace().map(|s| s.to_string()).collect()
         } else {
             vec![]
         };
@@ -824,10 +814,7 @@ impl JstackProcessor {
             ));
 
             // Thread state
-            output.push_str(&format!(
-                "   java.lang.Thread.State: {}\n",
-                thread.state
-            ));
+            output.push_str(&format!("   java.lang.Thread.State: {}\n", thread.state));
 
             // Stack frames
             for frame in &thread.stack_frames {
@@ -910,10 +897,7 @@ impl JstackProcessor {
         }
 
         let mut report = String::new();
-        report.push_str(&format!(
-            "Found {} deadlock(s).\n\n",
-            cycles.len()
-        ));
+        report.push_str(&format!("Found {} deadlock(s).\n\n", cycles.len()));
 
         for (i, cycle) in cycles.iter().enumerate() {
             report.push_str(&format!("Deadlock #{}:\n", i + 1));
@@ -1193,7 +1177,7 @@ impl HprofWriter {
         buf.extend_from_slice(Self::HPROF_MAGIC.as_bytes());
         buf.push(0); // null terminator
         buf.extend_from_slice(&8u32.to_be_bytes()); // identifier size: 8 bytes
-        // Timestamp: milliseconds since epoch, split into high/low 32-bit words
+                                                    // Timestamp: milliseconds since epoch, split into high/low 32-bit words
         let ts_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1222,7 +1206,12 @@ impl HprofWriter {
     }
 
     /// Write a LOAD_CLASS record.
-    pub fn write_load_class(serial: u32, class_obj_id: u64, stack_serial: u32, name_id: u64) -> Vec<u8> {
+    pub fn write_load_class(
+        serial: u32,
+        class_obj_id: u64,
+        stack_serial: u32,
+        name_id: u64,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(Self::HPROF_LOAD_CLASS);
         buf.extend_from_slice(&0u32.to_be_bytes());
@@ -1289,7 +1278,12 @@ impl HprofWriter {
 
     /// Write a GC_ROOT_THREAD_OBJ sub-record.
     /// Format: tag(1) + thread_obj_id(8) + thread_serial(4) + stack_serial(4)
-    pub fn write_gc_root_thread_obj(buf: &mut Vec<u8>, thread_obj_id: u64, thread_serial: u32, stack_serial: u32) {
+    pub fn write_gc_root_thread_obj(
+        buf: &mut Vec<u8>,
+        thread_obj_id: u64,
+        thread_serial: u32,
+        stack_serial: u32,
+    ) {
         buf.push(Self::GC_ROOT_THREAD_OBJ);
         buf.extend_from_slice(&thread_obj_id.to_be_bytes());
         buf.extend_from_slice(&thread_serial.to_be_bytes());
@@ -1323,7 +1317,7 @@ impl HprofWriter {
         let class_obj_id = 0x1000_0000_0000_0000u64 | class_info.class_id as u64;
         buf.extend_from_slice(&class_obj_id.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes()); // stack trace serial = 0
-        // super class object ID
+                                                    // super class object ID
         let super_obj_id = if class_info.super_class_id != 0 {
             0x1000_0000_0000_0000u64 | class_info.super_class_id as u64
         } else {
@@ -1351,9 +1345,15 @@ impl HprofWriter {
             // Static field value: write zeros (we'd need to read from statics table for real values)
             match htype {
                 HprofBasicType::Object => buf.extend_from_slice(&0u64.to_be_bytes()),
-                HprofBasicType::Long | HprofBasicType::Double => buf.extend_from_slice(&0u64.to_be_bytes()),
-                HprofBasicType::Int | HprofBasicType::Float => buf.extend_from_slice(&0u32.to_be_bytes()),
-                HprofBasicType::Short | HprofBasicType::Char => buf.extend_from_slice(&0u16.to_be_bytes()),
+                HprofBasicType::Long | HprofBasicType::Double => {
+                    buf.extend_from_slice(&0u64.to_be_bytes())
+                }
+                HprofBasicType::Int | HprofBasicType::Float => {
+                    buf.extend_from_slice(&0u32.to_be_bytes())
+                }
+                HprofBasicType::Short | HprofBasicType::Char => {
+                    buf.extend_from_slice(&0u16.to_be_bytes())
+                }
                 HprofBasicType::Boolean | HprofBasicType::Byte => buf.push(0),
             }
         }
@@ -1610,23 +1610,23 @@ impl HprofWriter {
         thread_snapshots: &[ThreadSnapshot],
     ) -> Vec<u8> {
         let mut output = Vec::new();
-        let mut string_ids: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut string_ids: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let mut next_string_id: u64 = 1;
-        let class_map: std::collections::HashMap<u32, HprofClassInfo> = classes
-            .iter()
-            .map(|c| (c.class_id, c.clone()))
-            .collect();
+        let class_map: std::collections::HashMap<u32, HprofClassInfo> =
+            classes.iter().map(|c| (c.class_id, c.clone())).collect();
 
         // Helper: intern a string, returning its ID
-        let intern = |s: &str, ids: &mut std::collections::HashMap<String, u64>, nid: &mut u64| -> u64 {
-            if let Some(&id) = ids.get(s) {
-                return id;
-            }
-            let id = *nid;
-            ids.insert(s.to_string(), id);
-            *nid += 1;
-            id
-        };
+        let intern =
+            |s: &str, ids: &mut std::collections::HashMap<String, u64>, nid: &mut u64| -> u64 {
+                if let Some(&id) = ids.get(s) {
+                    return id;
+                }
+                let id = *nid;
+                ids.insert(s.to_string(), id);
+                *nid += 1;
+                id
+            };
 
         // Phase 1: Collect all strings that need UTF-8 records
         // Class names
@@ -1688,19 +1688,28 @@ impl HprofWriter {
                 next_frame_id += 1;
                 let method_name_id = string_ids.get(&frame.method_name).copied().unwrap_or(0);
                 let class_name_id = string_ids.get(&frame.class_name).copied().unwrap_or(0);
-                let source_id = frame.file_name.as_ref()
+                let source_id = frame
+                    .file_name
+                    .as_ref()
                     .and_then(|f| string_ids.get(f))
                     .copied()
                     .unwrap_or(0);
                 output.extend_from_slice(&Self::write_stack_frame(
-                    fid, method_name_id, class_name_id, source_id,
+                    fid,
+                    method_name_id,
+                    class_name_id,
+                    source_id,
                     0, // class serial (could look up but 0 is valid)
                     frame.line_number,
                 ));
                 frame_ids.push(fid);
             }
 
-            output.extend_from_slice(&Self::write_stack_trace(trace_serial, thread_serial, &frame_ids));
+            output.extend_from_slice(&Self::write_stack_trace(
+                trace_serial,
+                thread_serial,
+                &frame_ids,
+            ));
         }
 
         // Phase 6: Write HEAP_DUMP_SEGMENT records
@@ -1711,7 +1720,12 @@ impl HprofWriter {
             let thread_serial = (tidx + 1) as u32;
             // Use thread ID as a synthetic object ID for the thread root
             let thread_obj_id = 0x2000_0000_0000_0000u64 | ts.id;
-            Self::write_gc_root_thread_obj(&mut seg_body, thread_obj_id, thread_serial, thread_serial);
+            Self::write_gc_root_thread_obj(
+                &mut seg_body,
+                thread_obj_id,
+                thread_serial,
+                thread_serial,
+            );
         }
 
         // 6b: CLASS_DUMP sub-records
@@ -1773,15 +1787,13 @@ fn sample_thread_snapshots() -> Vec<ThreadSnapshot> {
             daemon: false,
             priority: 5,
             state: ThreadState::Runnable,
-            stack_frames: vec![
-                FrameInfo {
-                    class_name: "com.example.Main".to_string(),
-                    method_name: "main".to_string(),
-                    file_name: Some("Main.java".to_string()),
-                    line_number: 10,
-                    native_method: false,
-                },
-            ],
+            stack_frames: vec![FrameInfo {
+                class_name: "com.example.Main".to_string(),
+                method_name: "main".to_string(),
+                file_name: Some("Main.java".to_string()),
+                line_number: 10,
+                native_method: false,
+            }],
             lock_info: None,
             blocked_by: None,
             waiting_on: None,
@@ -1792,34 +1804,74 @@ fn sample_thread_snapshots() -> Vec<ThreadSnapshot> {
             daemon: true,
             priority: 8,
             state: ThreadState::Waiting,
-            stack_frames: vec![
-                FrameInfo {
-                    class_name: "java.lang.Object".to_string(),
-                    method_name: "wait".to_string(),
-                    file_name: None,
-                    line_number: -1,
-                    native_method: true,
-                },
-            ],
+            stack_frames: vec![FrameInfo {
+                class_name: "java.lang.Object".to_string(),
+                method_name: "wait".to_string(),
+                file_name: None,
+                line_number: -1,
+                native_method: true,
+            }],
             lock_info: None,
             blocked_by: None,
-            waiting_on: Some("<0x00000000c0000000> (a java.lang.ref.ReferenceQueue$Lock)".to_string()),
+            waiting_on: Some(
+                "<0x00000000c0000000> (a java.lang.ref.ReferenceQueue$Lock)".to_string(),
+            ),
         },
     ]
 }
 
 fn sample_class_histogram() -> Vec<ClassHistogramEntry> {
     vec![
-        ClassHistogramEntry { class_name: "[B".to_string(), instance_count: 50000, total_bytes: 5_000_000 },
-        ClassHistogramEntry { class_name: "java.lang.String".to_string(), instance_count: 40000, total_bytes: 1_600_000 },
-        ClassHistogramEntry { class_name: "java.lang.Object[]".to_string(), instance_count: 20000, total_bytes: 800_000 },
-        ClassHistogramEntry { class_name: "java.util.HashMap$Node".to_string(), instance_count: 15000, total_bytes: 720_000 },
-        ClassHistogramEntry { class_name: "java.lang.Class".to_string(), instance_count: 4200, total_bytes: 672_000 },
-        ClassHistogramEntry { class_name: "java.util.HashMap$Node[]".to_string(), instance_count: 3000, total_bytes: 500_000 },
-        ClassHistogramEntry { class_name: "char[]".to_string(), instance_count: 30000, total_bytes: 480_000 },
-        ClassHistogramEntry { class_name: "java.lang.reflect.Method".to_string(), instance_count: 5000, total_bytes: 400_000 },
-        ClassHistogramEntry { class_name: "java.util.concurrent.ConcurrentHashMap$Node".to_string(), instance_count: 8000, total_bytes: 384_000 },
-        ClassHistogramEntry { class_name: "int[]".to_string(), instance_count: 10000, total_bytes: 360_000 },
+        ClassHistogramEntry {
+            class_name: "[B".to_string(),
+            instance_count: 50000,
+            total_bytes: 5_000_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.lang.String".to_string(),
+            instance_count: 40000,
+            total_bytes: 1_600_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.lang.Object[]".to_string(),
+            instance_count: 20000,
+            total_bytes: 800_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.util.HashMap$Node".to_string(),
+            instance_count: 15000,
+            total_bytes: 720_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.lang.Class".to_string(),
+            instance_count: 4200,
+            total_bytes: 672_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.util.HashMap$Node[]".to_string(),
+            instance_count: 3000,
+            total_bytes: 500_000,
+        },
+        ClassHistogramEntry {
+            class_name: "char[]".to_string(),
+            instance_count: 30000,
+            total_bytes: 480_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.lang.reflect.Method".to_string(),
+            instance_count: 5000,
+            total_bytes: 400_000,
+        },
+        ClassHistogramEntry {
+            class_name: "java.util.concurrent.ConcurrentHashMap$Node".to_string(),
+            instance_count: 8000,
+            total_bytes: 384_000,
+        },
+        ClassHistogramEntry {
+            class_name: "int[]".to_string(),
+            instance_count: 10000,
+            total_bytes: 360_000,
+        },
     ]
 }
 
@@ -1973,8 +2025,8 @@ pub fn hsdb_decode_request_header(bytes: &[u8]) -> Result<(HsdbCommand, u32), St
     if bytes.len() < 5 {
         return Err(format!("short request header: {} < 5", bytes.len()));
     }
-    let cmd =
-        HsdbCommand::from_u8(bytes[0]).ok_or_else(|| format!("unknown command byte {}", bytes[0]))?;
+    let cmd = HsdbCommand::from_u8(bytes[0])
+        .ok_or_else(|| format!("unknown command byte {}", bytes[0]))?;
     let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
     Ok((cmd, len))
 }
@@ -2149,11 +2201,19 @@ mod tests {
     fn test_attach_listener_list_commands() {
         let mut listener = AttachListener::new("/tmp/test");
         listener.register_command(DiagnosticCommand::new(
-            "A.cmd", "d", CommandImpact::Low, CommandPermission::ReadOnly, vec![],
+            "A.cmd",
+            "d",
+            CommandImpact::Low,
+            CommandPermission::ReadOnly,
+            vec![],
             Box::new(|_| CommandResult::ok("ok".to_string(), 0)),
         ));
         listener.register_command(DiagnosticCommand::new(
-            "B.cmd", "d", CommandImpact::Medium, CommandPermission::ManagementAction, vec![],
+            "B.cmd",
+            "d",
+            CommandImpact::Medium,
+            CommandPermission::ManagementAction,
+            vec![],
             Box::new(|_| CommandResult::ok("ok".to_string(), 0)),
         ));
         let names = listener.list_commands();
@@ -2170,9 +2230,7 @@ mod tests {
             CommandImpact::Low,
             CommandPermission::ReadOnly,
             vec![],
-            Box::new(|args| {
-                CommandResult::ok(args.join(", "), 0)
-            }),
+            Box::new(|args| CommandResult::ok(args.join(", "), 0)),
         );
         let result = cmd.execute(&["hello".to_string(), "world".to_string()]);
         assert!(result.success);
@@ -2274,7 +2332,9 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("GC.heap_dump /tmp/dump.hprof");
         assert!(result.success);
-        assert!(result.output.contains("Heap dump written to /tmp/dump.hprof"));
+        assert!(result
+            .output
+            .contains("Heap dump written to /tmp/dump.hprof"));
         assert!(result.output.contains(HprofWriter::HPROF_MAGIC));
     }
 
@@ -2361,7 +2421,9 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("Thread.dump_to_file /tmp/threads.txt");
         assert!(result.success);
-        assert!(result.output.contains("Thread dump written to /tmp/threads.txt"));
+        assert!(result
+            .output
+            .contains("Thread dump written to /tmp/threads.txt"));
     }
 
     #[test]
@@ -2378,7 +2440,9 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("JFR.start myrecording");
         assert!(result.success);
-        assert!(result.output.contains("Flight recording started: myrecording"));
+        assert!(result
+            .output
+            .contains("Flight recording started: myrecording"));
     }
 
     #[test]
@@ -2386,7 +2450,9 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("JFR.stop myrecording");
         assert!(result.success);
-        assert!(result.output.contains("Flight recording stopped: myrecording"));
+        assert!(result
+            .output
+            .contains("Flight recording stopped: myrecording"));
     }
 
     #[test]
@@ -2394,7 +2460,9 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("JFR.dump /tmp/rec.jfr");
         assert!(result.success);
-        assert!(result.output.contains("Flight recording dumped to /tmp/rec.jfr"));
+        assert!(result
+            .output
+            .contains("Flight recording dumped to /tmp/rec.jfr"));
     }
 
     #[test]
@@ -2550,14 +2618,26 @@ mod tests {
     fn test_jstack_deadlock_detection_no_deadlock() {
         let threads = vec![
             ThreadSnapshot {
-                id: 1, name: "t1".to_string(), daemon: false, priority: 5,
-                state: ThreadState::Runnable, stack_frames: vec![],
-                lock_info: None, blocked_by: None, waiting_on: None,
+                id: 1,
+                name: "t1".to_string(),
+                daemon: false,
+                priority: 5,
+                state: ThreadState::Runnable,
+                stack_frames: vec![],
+                lock_info: None,
+                blocked_by: None,
+                waiting_on: None,
             },
             ThreadSnapshot {
-                id: 2, name: "t2".to_string(), daemon: false, priority: 5,
-                state: ThreadState::Runnable, stack_frames: vec![],
-                lock_info: None, blocked_by: None, waiting_on: None,
+                id: 2,
+                name: "t2".to_string(),
+                daemon: false,
+                priority: 5,
+                state: ThreadState::Runnable,
+                stack_frames: vec![],
+                lock_info: None,
+                blocked_by: None,
+                waiting_on: None,
             },
         ];
         assert!(JstackProcessor::generate_deadlock_report(&threads).is_none());
@@ -2567,14 +2647,26 @@ mod tests {
     fn test_jstack_deadlock_detection_cycle() {
         let threads = vec![
             ThreadSnapshot {
-                id: 1, name: "thread-A".to_string(), daemon: false, priority: 5,
-                state: ThreadState::Blocked, stack_frames: vec![],
-                lock_info: None, blocked_by: Some(2), waiting_on: None,
+                id: 1,
+                name: "thread-A".to_string(),
+                daemon: false,
+                priority: 5,
+                state: ThreadState::Blocked,
+                stack_frames: vec![],
+                lock_info: None,
+                blocked_by: Some(2),
+                waiting_on: None,
             },
             ThreadSnapshot {
-                id: 2, name: "thread-B".to_string(), daemon: false, priority: 5,
-                state: ThreadState::Blocked, stack_frames: vec![],
-                lock_info: None, blocked_by: Some(1), waiting_on: None,
+                id: 2,
+                name: "thread-B".to_string(),
+                daemon: false,
+                priority: 5,
+                state: ThreadState::Blocked,
+                stack_frames: vec![],
+                lock_info: None,
+                blocked_by: Some(1),
+                waiting_on: None,
             },
         ];
         let report = JstackProcessor::generate_deadlock_report(&threads);
@@ -2630,8 +2722,16 @@ mod tests {
     #[test]
     fn test_jmap_class_histogram() {
         let entries = vec![
-            ClassHistogramEntry { class_name: "[B".to_string(), instance_count: 1000, total_bytes: 50000 },
-            ClassHistogramEntry { class_name: "java.lang.String".to_string(), instance_count: 500, total_bytes: 20000 },
+            ClassHistogramEntry {
+                class_name: "[B".to_string(),
+                instance_count: 1000,
+                total_bytes: 50000,
+            },
+            ClassHistogramEntry {
+                class_name: "java.lang.String".to_string(),
+                instance_count: 500,
+                total_bytes: 20000,
+            },
         ];
         let output = JmapProcessor::generate_class_histogram(&entries);
         assert!(output.contains("#instances"));
@@ -2732,8 +2832,8 @@ mod tests {
         assert_eq!(body_len, 13);
         // ID = 42
         let id = u64::from_be_bytes([
-            record[9], record[10], record[11], record[12],
-            record[13], record[14], record[15], record[16],
+            record[9], record[10], record[11], record[12], record[13], record[14], record[15],
+            record[16],
         ]);
         assert_eq!(id, 42);
         // String data
@@ -2849,9 +2949,15 @@ mod tests {
                 total_bytes: 4000,
             }]
         }
-        fn trigger_gc(&self) -> bool { true }
-        fn uptime_secs(&self) -> f64 { 42.5 }
-        fn command_line(&self) -> String { "java -jar test.jar".to_string() }
+        fn trigger_gc(&self) -> bool {
+            true
+        }
+        fn uptime_secs(&self) -> f64 {
+            42.5
+        }
+        fn command_line(&self) -> String {
+            "java -jar test.jar".to_string()
+        }
         fn system_properties(&self) -> Vec<(String, String)> {
             vec![("java.version".to_string(), "25".to_string())]
         }
@@ -2901,12 +3007,21 @@ mod tests {
         assert_eq!(HprofBasicType::from_descriptor("J"), HprofBasicType::Long);
         assert_eq!(HprofBasicType::from_descriptor("F"), HprofBasicType::Float);
         assert_eq!(HprofBasicType::from_descriptor("D"), HprofBasicType::Double);
-        assert_eq!(HprofBasicType::from_descriptor("Z"), HprofBasicType::Boolean);
+        assert_eq!(
+            HprofBasicType::from_descriptor("Z"),
+            HprofBasicType::Boolean
+        );
         assert_eq!(HprofBasicType::from_descriptor("B"), HprofBasicType::Byte);
         assert_eq!(HprofBasicType::from_descriptor("C"), HprofBasicType::Char);
         assert_eq!(HprofBasicType::from_descriptor("S"), HprofBasicType::Short);
-        assert_eq!(HprofBasicType::from_descriptor("Ljava/lang/String;"), HprofBasicType::Object);
-        assert_eq!(HprofBasicType::from_descriptor("[I"), HprofBasicType::Object);
+        assert_eq!(
+            HprofBasicType::from_descriptor("Ljava/lang/String;"),
+            HprofBasicType::Object
+        );
+        assert_eq!(
+            HprofBasicType::from_descriptor("[I"),
+            HprofBasicType::Object
+        );
     }
 
     #[test]
@@ -2915,7 +3030,7 @@ mod tests {
         let magic_len = HprofWriter::HPROF_MAGIC.len();
         assert_eq!(&header[..magic_len], HprofWriter::HPROF_MAGIC.as_bytes());
         assert_eq!(header[magic_len], 0); // null terminator
-        // Identifier size = 8
+                                          // Identifier size = 8
         let id_size = u32::from_be_bytes([
             header[magic_len + 1],
             header[magic_len + 2],
@@ -2994,9 +3109,7 @@ mod tests {
                 ("x".to_string(), "I".to_string()),
                 ("y".to_string(), "I".to_string()),
             ],
-            static_fields: vec![
-                ("ORIGIN".to_string(), "LPoint;".to_string()),
-            ],
+            static_fields: vec![("ORIGIN".to_string(), "LPoint;".to_string())],
             source_file: Some("Point.java".to_string()),
             instance_size: 64,
         };
@@ -3021,7 +3134,7 @@ mod tests {
 
     #[test]
     fn test_hprof_gc_prim_array_dump() {
-        use cratonvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
         // Simulate a small int[3] array in memory
         let array_length: u32 = 3;
         let elem_size = 4usize; // int = 4 bytes
@@ -3080,7 +3193,9 @@ mod tests {
 
     #[test]
     fn test_hprof_gc_obj_array_dump() {
-        use cratonvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType, REF_ELEMENT_SIZE};
+        use cratonvm_gc::heap::{
+            ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+        };
         // Simulate an Object[2] array
         let array_length: u32 = 2;
         let data_size = array_length as usize * REF_ELEMENT_SIZE;
@@ -3153,7 +3268,9 @@ mod tests {
         assert_eq!(&dump[..magic_len], HprofWriter::HPROF_MAGIC.as_bytes());
 
         // Should contain HEAP_DUMP_END marker somewhere
-        assert!(dump.windows(1).any(|w| w[0] == HprofWriter::HPROF_HEAP_DUMP_END));
+        assert!(dump
+            .windows(1)
+            .any(|w| w[0] == HprofWriter::HPROF_HEAP_DUMP_END));
 
         // Should be at least header + stack trace + segment + end
         assert!(dump.len() > HprofWriter::header_size() + 20);
@@ -3161,7 +3278,9 @@ mod tests {
 
     #[test]
     fn test_hprof_full_dump_with_class_and_objects() {
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{
+            ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+        };
 
         let classes = vec![HprofClassInfo {
             class_id: 1,
@@ -3290,7 +3409,9 @@ mod tests {
 
     #[test]
     fn test_hprof_full_dump_class_hierarchy() {
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{
+            ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+        };
 
         let classes = vec![
             HprofClassInfo {
@@ -3341,11 +3462,15 @@ mod tests {
         let dump = HprofWriter::write_full_heap_dump(&classes, &objects, &[]);
 
         // Should have two LOAD_CLASS records
-        let _load_class_count = dump.iter().enumerate()
+        let _load_class_count = dump
+            .iter()
+            .enumerate()
             .filter(|(i, &b)| {
-                b == HprofWriter::HPROF_LOAD_CLASS && *i > 0
-                    && dump.get(i.wrapping_sub(4)..=i.wrapping_sub(1))
-                        .map(|s| s == &[0, 0, 0, 0])  // timestamp = 0
+                b == HprofWriter::HPROF_LOAD_CLASS
+                    && *i > 0
+                    && dump
+                        .get(i.wrapping_sub(4)..=i.wrapping_sub(1))
+                        .map(|s| s == &[0, 0, 0, 0]) // timestamp = 0
                         .unwrap_or(false)
             })
             .count();
@@ -3354,9 +3479,16 @@ mod tests {
 
         // Two GC_CLASS_DUMP sub-records should be present in segment body
         // CLASS_DUMP tag is 0x20
-        let class_dump_count = dump.iter().filter(|&&b| b == HprofWriter::GC_CLASS_DUMP).count();
+        let class_dump_count = dump
+            .iter()
+            .filter(|&&b| b == HprofWriter::GC_CLASS_DUMP)
+            .count();
         // Should be >= 2 (Base + Derived)
-        assert!(class_dump_count >= 2, "Expected at least 2 class dumps, got {}", class_dump_count);
+        assert!(
+            class_dump_count >= 2,
+            "Expected at least 2 class dumps, got {}",
+            class_dump_count
+        );
     }
 
     #[test]
@@ -3392,7 +3524,9 @@ mod tests {
 
     #[test]
     fn test_hprof_instance_dump_reads_field_values() {
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{
+            ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+        };
 
         let classes_map: std::collections::HashMap<u32, HprofClassInfo> = [(
             1u32,
@@ -3405,7 +3539,9 @@ mod tests {
                 source_file: None,
                 instance_size: (HEADER_SIZE + SLOT_SIZE) as u32,
             },
-        )].into_iter().collect();
+        )]
+        .into_iter()
+        .collect();
 
         let total_size = HEADER_SIZE + SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
@@ -3444,7 +3580,7 @@ mod tests {
         // data_size at 21..25 (after tag + obj_id(8) + stack_serial(4) + class_obj(8))
         let data_size = u32::from_be_bytes(buf[21..25].try_into().unwrap());
         assert_eq!(data_size, 4); // one int field = 4 bytes
-        // Field value at 25..29 (big-endian)
+                                  // Field value at 25..29 (big-endian)
         let fval = i32::from_be_bytes(buf[25..29].try_into().unwrap());
         assert_eq!(fval, 0x12345678);
     }
@@ -3554,8 +3690,7 @@ mod tests {
     #[test]
     fn hsdb_process_info_includes_pid_and_cmdline() {
         let state = DummyVmState;
-        let (status, payload) =
-            hsdb_handle_request(HsdbCommand::ProcessInfo, &[], Some(&state));
+        let (status, payload) = hsdb_handle_request(HsdbCommand::ProcessInfo, &[], Some(&state));
         assert_eq!(status, HsdbStatus::Ok);
         // pid u64 + len u16 + cmdline bytes
         assert!(payload.len() >= 10);
@@ -3569,8 +3704,7 @@ mod tests {
     #[test]
     fn hsdb_heap_summary_returns_eight_u64() {
         let state = DummyVmState;
-        let (status, payload) =
-            hsdb_handle_request(HsdbCommand::HeapSummary, &[], Some(&state));
+        let (status, payload) = hsdb_handle_request(HsdbCommand::HeapSummary, &[], Some(&state));
         assert_eq!(status, HsdbStatus::Ok);
         assert_eq!(payload.len(), 64);
         let young_used = u64::from_be_bytes(payload[0..8].try_into().unwrap());
@@ -3592,8 +3726,7 @@ mod tests {
     #[test]
     fn hsdb_thread_list_contains_threads() {
         let state = DummyVmState;
-        let (status, payload) =
-            hsdb_handle_request(HsdbCommand::ThreadList, &[], Some(&state));
+        let (status, payload) = hsdb_handle_request(HsdbCommand::ThreadList, &[], Some(&state));
         assert_eq!(status, HsdbStatus::Ok);
         assert!(payload.len() >= 4);
         let count = u32::from_be_bytes(payload[0..4].try_into().unwrap());
@@ -3667,8 +3800,7 @@ mod tests {
         let mut hdr = [0u8; 5];
         stream.read_exact(&mut hdr).unwrap();
         assert_eq!(hdr[0], 0); // OK
-        let plen =
-            u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        let plen = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
         let mut payload = vec![0u8; plen];
         stream.read_exact(&mut payload).unwrap();
         let str_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;

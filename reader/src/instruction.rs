@@ -510,9 +510,7 @@ impl Instruction {
                 if high < low {
                     return Err(
                         crate::class_reader_error::ClassReaderError::InvalidClassData {
-                            message: format!(
-                                "tableswitch high ({high}) < low ({low})"
-                            ),
+                            message: format!("tableswitch high ({high}) < low ({low})"),
                         },
                     );
                 }
@@ -549,9 +547,7 @@ impl Instruction {
                 if npairs_raw < 0 {
                     return Err(
                         crate::class_reader_error::ClassReaderError::InvalidClassData {
-                            message: format!(
-                                "lookupswitch npairs is negative: {npairs_raw}"
-                            ),
+                            message: format!("lookupswitch npairs is negative: {npairs_raw}"),
                         },
                     );
                 }
@@ -900,13 +896,7 @@ mod tests {
     fn decode_invokeinterface() {
         // invokeinterface index=5, count=2, reserved=0
         let (instr, next) = Instruction::decode(&[0xb9, 0x00, 0x05, 0x02, 0x00], 0).unwrap();
-        assert_eq!(
-            instr,
-            Instruction::Invokeinterface {
-                index: 5,
-                count: 2
-            }
-        );
+        assert_eq!(instr, Instruction::Invokeinterface { index: 5, count: 2 });
         assert_eq!(next, 5);
     }
 
@@ -936,8 +926,7 @@ mod tests {
     #[test]
     fn decode_wide_iinc() {
         // wide iinc index=0x0100, constant=0x0200
-        let (instr, next) =
-            Instruction::decode(&[0xc4, 0x84, 0x01, 0x00, 0x02, 0x00], 0).unwrap();
+        let (instr, next) = Instruction::decode(&[0xc4, 0x84, 0x01, 0x00, 0x02, 0x00], 0).unwrap();
         assert_eq!(
             instr,
             Instruction::Iinc {

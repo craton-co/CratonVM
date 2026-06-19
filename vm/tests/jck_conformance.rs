@@ -77,17 +77,37 @@ const CORPUS: &[TckTest] = &[
     // =====================================================================
     // Instructions (JVMS Ch. 6)
     // =====================================================================
-    tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testIntArithmetic"),
-    tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testLongArithmetic"),
-    tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testFloatArithmetic"),
+    tck(
+        INSTRUCTIONS,
+        "cratonvm/TckInstructions",
+        "testIntArithmetic",
+    ),
+    tck(
+        INSTRUCTIONS,
+        "cratonvm/TckInstructions",
+        "testLongArithmetic",
+    ),
+    tck(
+        INSTRUCTIONS,
+        "cratonvm/TckInstructions",
+        "testFloatArithmetic",
+    ),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testComparisons"),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testTableswitch"),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testLookupswitch"),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testFieldOps"),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testArrayOps"),
-    tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testInvokeVirtual"),
+    tck(
+        INSTRUCTIONS,
+        "cratonvm/TckInstructions",
+        "testInvokeVirtual",
+    ),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testInvokeStatic"),
-    tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testExceptionHandling"),
+    tck(
+        INSTRUCTIONS,
+        "cratonvm/TckInstructions",
+        "testExceptionHandling",
+    ),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testCheckcast"),
     tck(INSTRUCTIONS, "cratonvm/TckInstructions", "testInstanceof"),
     // =====================================================================
@@ -434,7 +454,11 @@ const CORPUS: &[TckTest] = &[
     // =====================================================================
     tck(JDBC, "cratonvm/TckJdbc", "open_inmemory_connection"),
     tck(JDBC, "cratonvm/TckJdbc", "statement_ddl_dml_query"),
-    tck(JDBC, "cratonvm/TckJdbc", "prepared_statement_binds_and_executes"),
+    tck(
+        JDBC,
+        "cratonvm/TckJdbc",
+        "prepared_statement_binds_and_executes",
+    ),
     tck(JDBC, "cratonvm/TckJdbc", "rollback_discards_changes"),
     tck(JDBC, "cratonvm/TckJdbc", "savepoint_rollback_and_release"),
     tck(JDBC, "cratonvm/TckJdbc", "blob_round_trip"),
@@ -555,7 +579,11 @@ const CORPUS: &[TckTest] = &[
 ];
 
 const fn tck(category: Category, class: &'static str, method: &'static str) -> TckTest {
-    TckTest { category, class, method }
+    TckTest {
+        category,
+        class,
+        method,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -626,10 +654,7 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
         let outcome = run_one(t);
         tallies.entry(t.category.0).or_default().record(outcome);
         if outcome != Outcome::Pass {
-            eprintln!(
-                "[jck] {:?} {}::{}",
-                outcome, t.class, t.method
-            );
+            eprintln!("[jck] {:?} {}::{}", outcome, t.class, t.method);
         }
     }
     tallies
@@ -647,25 +672,25 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
 const BASELINE_FLOORS: &[(&str, u32)] = &[
     // Updated 2026-04-16 after T4.2-T4.6 corpus expansion.
     // Total corpus: 421 tests, 109 pass on first run.
-    ("ClassFile", 4),     // 4/5 pass
-    ("Concurrent", 8),    // 8/19 — AtomicInteger/Long basic ops pass
-    ("Http", 0),          // 0/10 — java.net.http not yet wired
-    ("Instructions", 9),  // 9/13
-    ("Io", 18),           // 18-20/37 — BAOS, BAIS, File I/O, StringWriter (slight variance)
-    ("Jdbc", 0),          // 0/11 — JDBC wired but not through TCK path
-    ("Lang", 34),         // 34/109 — core types, wrappers, math, system
-    ("Loading", 4),       // 4/5
-    ("Management", 0),    // 0/9 — MXBeans not yet wired
-    ("Math", 3),          // 3/15 — BigInteger basic ops
-    ("Net", 0),           // 0/10 — URL/URI constructors
-    ("Nio", 11),          // 11/25 — ByteBuffer core ops
-    ("Reflect", 5),       // 5/21 — Class metadata basics
-    ("Regex", 0),         // 0/11 — Pattern/Matcher not through TCK path
-    ("Security", 0),      // 0/19 — crypto not through TCK path
-    ("Sql", 8),           // 8/12 — java.sql constants pass
-    ("Text", 0),          // 0/16 — DecimalFormat/MessageFormat
-    ("Time", 0),          // 0/31 — java.time not yet wired
-    ("Util", 3),          // 3/43 — basic collections
+    ("ClassFile", 4),    // 4/5 pass
+    ("Concurrent", 8),   // 8/19 — AtomicInteger/Long basic ops pass
+    ("Http", 0),         // 0/10 — java.net.http not yet wired
+    ("Instructions", 9), // 9/13
+    ("Io", 18),          // 18-20/37 — BAOS, BAIS, File I/O, StringWriter (slight variance)
+    ("Jdbc", 0),         // 0/11 — JDBC wired but not through TCK path
+    ("Lang", 34),        // 34/109 — core types, wrappers, math, system
+    ("Loading", 4),      // 4/5
+    ("Management", 0),   // 0/9 — MXBeans not yet wired
+    ("Math", 3),         // 3/15 — BigInteger basic ops
+    ("Net", 0),          // 0/10 — URL/URI constructors
+    ("Nio", 11),         // 11/25 — ByteBuffer core ops
+    ("Reflect", 5),      // 5/21 — Class metadata basics
+    ("Regex", 0),        // 0/11 — Pattern/Matcher not through TCK path
+    ("Security", 0),     // 0/19 — crypto not through TCK path
+    ("Sql", 8),          // 8/12 — java.sql constants pass
+    ("Text", 0),         // 0/16 — DecimalFormat/MessageFormat
+    ("Time", 0),         // 0/31 — java.time not yet wired
+    ("Util", 3),         // 3/43 — basic collections
 ];
 
 // ---------------------------------------------------------------------------
@@ -687,7 +712,11 @@ fn jck_full_corpus_runs() {
     for (cat, t) in &tallies {
         eprintln!(
             "  {:<14} pass={:>3}  fail={:>3}  error={:>3}  total={:>3}",
-            cat, t.pass, t.fail, t.error, t.total()
+            cat,
+            t.pass,
+            t.fail,
+            t.error,
+            t.total()
         );
         grand.pass += t.pass;
         grand.fail += t.fail;
@@ -695,7 +724,11 @@ fn jck_full_corpus_runs() {
     }
     eprintln!(
         "  {:<14} pass={:>3}  fail={:>3}  error={:>3}  total={:>3}",
-        "TOTAL", grand.pass, grand.fail, grand.error, grand.total()
+        "TOTAL",
+        grand.pass,
+        grand.fail,
+        grand.error,
+        grand.total()
     );
     eprintln!();
 

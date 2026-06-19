@@ -33,8 +33,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -58,7 +58,9 @@ fn class_files_available() -> bool {
 
 fn skip_if_no_classes(tag: &str) -> bool {
     if !class_files_available() {
-        eprintln!("[Phase-I][{tag}] skip: compiled test .class files are absent (no javac on PATH?)");
+        eprintln!(
+            "[Phase-I][{tag}] skip: compiled test .class files are absent (no javac on PATH?)"
+        );
         true
     } else {
         false
@@ -125,9 +127,9 @@ fn ri_1_specjvm_compiler_surrogate() {
     for (method, desc, expected) in cases {
         match vm.invoke("cratonvm/Arithmetic", method, desc, &[]) {
             Ok(Some(Value::Int(v))) if v == *expected => {}
-            other => panic!(
-                "[RI.1] Arithmetic.{method}{desc} => {other:?} (expected Int({expected}))"
-            ),
+            other => {
+                panic!("[RI.1] Arithmetic.{method}{desc} => {other:?} (expected Int({expected}))")
+            }
         }
     }
 }
@@ -156,9 +158,9 @@ fn ri_2_dacapo_avrora_surrogate() {
     for (method, desc, expected) in cases {
         match vm.invoke("cratonvm/ControlFlow", method, desc, &[]) {
             Ok(Some(Value::Int(v))) if v == *expected => {}
-            other => panic!(
-                "[RI.2] ControlFlow.{method}{desc} => {other:?} (expected Int({expected}))"
-            ),
+            other => {
+                panic!("[RI.2] ControlFlow.{method}{desc} => {other:?} (expected Int({expected}))")
+            }
         }
     }
     // Drive switch dispatch explicitly to exercise tableswitch/lookupswitch.
@@ -170,9 +172,7 @@ fn ri_2_dacapo_avrora_surrogate() {
             &[Value::Int(arg)],
         ) {
             Ok(Some(Value::Int(v))) if v == want => {}
-            other => panic!(
-                "[RI.2] ControlFlow.testSwitch({arg}) => {other:?} (expected {want})"
-            ),
+            other => panic!("[RI.2] ControlFlow.testSwitch({arg}) => {other:?} (expected {want})"),
         }
     }
 }
@@ -215,9 +215,9 @@ fn ri_3_dacapo_jython_surrogate() {
         for (cls, method, desc, expected) in seq {
             match vm.invoke(cls, method, desc, &[]) {
                 Ok(Some(Value::Int(v))) if v == *expected => {}
-                other => panic!(
-                    "[RI.3] {cls}.{method}{desc} => {other:?} (expected Int({expected}))"
-                ),
+                other => {
+                    panic!("[RI.3] {cls}.{method}{desc} => {other:?} (expected Int({expected}))")
+                }
             }
         }
     }
@@ -242,7 +242,15 @@ fn ri_4_commons_lang_surrogate() {
     }
     let mut vm = make_vm();
 
-    let cases: &[(i32, i32)] = &[(1, 10), (2, 20), (3, 30), (4, -1), (0, -1), (-5, -1), (999, -1)];
+    let cases: &[(i32, i32)] = &[
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, -1),
+        (0, -1),
+        (-5, -1),
+        (999, -1),
+    ];
     for (arg, want) in cases {
         match vm.invoke(
             "cratonvm/ControlFlow",
@@ -251,9 +259,9 @@ fn ri_4_commons_lang_surrogate() {
             &[Value::Int(*arg)],
         ) {
             Ok(Some(Value::Int(v))) if v == *want => {}
-            other => panic!(
-                "[RI.4] ControlFlow.testSwitch({arg}) => {other:?} (expected Int({want}))"
-            ),
+            other => {
+                panic!("[RI.4] ControlFlow.testSwitch({arg}) => {other:?} (expected Int({want}))")
+            }
         }
     }
 
@@ -261,14 +269,15 @@ fn ri_4_commons_lang_surrogate() {
     // `ArrayUtils.reverse` — mostly about dispatching through many small
     // methods without state leakage.
     for _ in 0..10 {
-        for (method, expected) in
-            [("test", 30i32), ("testMul", 42), ("testDiv", 25), ("testMod", 2)]
-        {
+        for (method, expected) in [
+            ("test", 30i32),
+            ("testMul", 42),
+            ("testDiv", 25),
+            ("testMod", 2),
+        ] {
             match vm.invoke("cratonvm/Arithmetic", method, "()I", &[]) {
                 Ok(Some(Value::Int(v))) if v == expected => {}
-                other => panic!(
-                    "[RI.4] Arithmetic.{method} => {other:?} (expected {expected})"
-                ),
+                other => panic!("[RI.4] Arithmetic.{method} => {other:?} (expected {expected})"),
             }
         }
     }
@@ -316,14 +325,13 @@ fn ri_5_jackson_roundtrip_surrogate() {
     // JSON parse below provides the application-level assertion Jackson
     // databind would make internally.
     let payload = br#"{"k":42}"#;
-    let reparsed = parse_simple_json_int(payload, "k")
-        .expect("[RI.5] JSON parse surrogate failed");
+    let reparsed = parse_simple_json_int(payload, "k").expect("[RI.5] JSON parse surrogate failed");
     assert_eq!(reparsed, 42, "[RI.5] JSON value mismatch after roundtrip");
 
     // Verify the multi-field case: `{"name":"cratonvm","version":42}`.
     let payload = br#"{"name":"cratonvm","version":42}"#;
-    let v = parse_simple_json_int(payload, "version")
-        .expect("[RI.5] JSON parse (multi-field) failed");
+    let v =
+        parse_simple_json_int(payload, "version").expect("[RI.5] JSON parse (multi-field) failed");
     assert_eq!(v, 42, "[RI.5] multi-field JSON value mismatch");
 }
 

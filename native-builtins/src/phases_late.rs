@@ -5,33 +5,35 @@
 
 use std::sync::atomic::{fence, Ordering};
 
-use cratonvm_types::ClassId;
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
-use crate::{FUT_FIELD_RESULT, FUT_FIELD_DONE, BI_FIELD_VALUE, BI_FIELD_SIGNUM};
-use crate::{native_cf_then_apply, native_cf_then_accept};
+use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{native_cf_then_accept, native_cf_then_apply};
+use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, FUT_FIELD_DONE, FUT_FIELD_RESULT};
 
 // Helpers defined in lib.rs that we need
-use crate::normalize_charset_name;
 use crate::bi_alloc;
 use crate::bi_read;
-use crate::{bi_alloc_int, bi_read_int};
-use crate::{
-    bi_add_str, bi_bit_count_str, bi_bit_length_str, bi_bitwise_and, bi_bitwise_or,
-    bi_bitwise_xor, bi_cmp_unsigned, bi_compare, bi_from_byte_array_signed,
-    bi_from_byte_array_with_signum, bi_gcd_str, bi_is_probable_prime_str, bi_mod_inverse_str,
-    bi_mod_pow_str, bi_not_str, bi_parse_sign, bi_shift_left_str, bi_shift_right_str,
-    bi_test_bit_str, bi_to_byte_array_str,
-};
-use crate::{hmac_sha256, hmac_sha384, hmac_sha512, hmac_sha1, hmac_md5};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
+use crate::normalize_charset_name;
+use crate::{
+    bi_add_str, bi_bit_count_str, bi_bit_length_str, bi_bitwise_and, bi_bitwise_or, bi_bitwise_xor,
+    bi_cmp_unsigned, bi_compare, bi_from_byte_array_signed, bi_from_byte_array_with_signum,
+    bi_gcd_str, bi_is_probable_prime_str, bi_mod_inverse_str, bi_mod_pow_str, bi_not_str,
+    bi_parse_sign, bi_shift_left_str, bi_shift_right_str, bi_test_bit_str, bi_to_byte_array_str,
+};
+use crate::{bi_alloc_int, bi_read_int};
+use crate::{hmac_md5, hmac_sha1, hmac_sha256, hmac_sha384, hmac_sha512};
 
 // Re-use register functions from other modules (already pub(crate))
-use crate::lang_invoke::{register_p60_callsite, register_p63_method_handles_lookup, register_p65_method_handles_extra, register_p68_invoke_extras};
+use crate::lang_invoke::{
+    register_p60_callsite, register_p63_method_handles_lookup, register_p65_method_handles_extra,
+    register_p68_invoke_extras,
+};
 use crate::lang_misc::register_p60_record;
 // register_javax_annotation removed (was Spring Boot stub)
 
@@ -61,7 +63,8 @@ const BR_MAX_READERS: usize = 10_000;
 
 fn br_sidetable() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>>> =
+        OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -244,10 +247,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
             // RuntimeError variant in types/src/error.rs.)
             let normalized = normalize_charset_name(&raw_name);
             if normalized.is_empty() {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: raw_name,
-                }
-                .into());
+                return Err(RuntimeError::IllegalArgumentException { message: raw_name }.into());
             }
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
             let canon = ctx.create_string(&normalized);
@@ -415,7 +415,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         if cancelled != 0 {
             return Err(RuntimeError::IllegalStateException {
                 message: "Task was cancelled".into(),
-            }.into());
+            }
+            .into());
         }
         let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
         if done == 0 {
@@ -438,35 +439,45 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(future, "get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let cancelled = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        if cancelled != 0 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Task was cancelled".into(),
-            }.into());
-        }
-        let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if done == 0 {
-            if let Value::Object(Some(task)) = ctx.get_field(this, 3) {
-                let result = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[]);
-                match result {
-                    Ok(val) => ctx.set_field(this, 0, val.unwrap_or(Value::Object(None))),
-                    Err(_) => {
-                        let _ = ctx.invoke_virtual(task, "run", "()V", &[]);
-                        ctx.set_field(this, 0, Value::Object(None));
+    r.register(
+        future,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cancelled = ctx.get_field(this, 2).as_int().unwrap_or(0);
+            if cancelled != 0 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Task was cancelled".into(),
+                }
+                .into());
+            }
+            let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if done == 0 {
+                if let Value::Object(Some(task)) = ctx.get_field(this, 3) {
+                    let result = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[]);
+                    match result {
+                        Ok(val) => ctx.set_field(this, 0, val.unwrap_or(Value::Object(None))),
+                        Err(_) => {
+                            let _ = ctx.invoke_virtual(task, "run", "()V", &[]);
+                            ctx.set_field(this, 0, Value::Object(None));
+                        }
                     }
                 }
+                ctx.set_field(this, 1, Value::Int(1));
             }
-            ctx.set_field(this, 1, Value::Int(1));
-        }
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
     r.register(future, "isDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
         let cancelled = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if done != 0 || cancelled != 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if done != 0 || cancelled != 0 {
+            1
+        } else {
+            0
+        })))
     });
     r.register(future, "isCancelled", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -699,22 +710,31 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
     // completeExceptionally(Throwable) — complete with exception
-    r.register(cf, "completeExceptionally", "(Ljava/lang/Throwable;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if done != 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 1, Value::Int(1));
-        ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-        Ok(Some(Value::Int(1)))
-    });
+    r.register(
+        cf,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if done != 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            ctx.set_field(this, 0, Value::Object(None));
+            ctx.set_field(this, 1, Value::Int(1));
+            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+            Ok(Some(Value::Int(1)))
+        },
+    );
     // isCompletedExceptionally()
     r.register(cf, "isCompletedExceptionally", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let exc = ctx.get_field(this, 2);
-        Ok(Some(Value::Int(if matches!(exc, Value::Object(Some(_))) { 1 } else { 0 })))
+        Ok(Some(Value::Int(if matches!(exc, Value::Object(Some(_))) {
+            1
+        } else {
+            0
+        })))
     });
     // thenCompose — chains a CompletableFuture-returning function
     r.register(
@@ -726,14 +746,20 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let func = obj_arg(args, 1)?;
             // Check if this CF has an exception — propagate it
             if let Value::Object(Some(_)) = ctx.get_field(this, 2) {
-                let new_cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                let new_cf =
+                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
                 ctx.set_field(new_cf, 0, Value::Object(None));
                 ctx.set_field(new_cf, 1, Value::Int(1));
                 ctx.set_field(new_cf, 2, ctx.get_field(this, 2));
                 return Ok(Some(Value::Object(Some(new_cf))));
             }
             let val = ctx.get_field(this, 0);
-            let result = ctx.invoke_virtual(func, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[val])?;
+            let result = ctx.invoke_virtual(
+                func,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[val],
+            )?;
             // The result should be a CompletableFuture — return it directly
             Ok(result)
         },
@@ -748,8 +774,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let func = obj_arg(args, 1)?;
             if let Value::Object(Some(exc)) = ctx.get_field(this, 2) {
                 // Has exception — apply the handler
-                let result = ctx.invoke_virtual(func, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[Value::Object(Some(exc))])?;
-                let new_cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                let result = ctx.invoke_virtual(
+                    func,
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[Value::Object(Some(exc))],
+                )?;
+                let new_cf =
+                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
                 ctx.set_field(new_cf, 0, result.unwrap_or(Value::Object(None)));
                 ctx.set_field(new_cf, 1, Value::Int(1));
                 ctx.set_field(new_cf, 2, Value::Object(None));
@@ -770,8 +802,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let func = obj_arg(args, 1)?;
             let val = ctx.get_field(this, 0);
             let exc = ctx.get_field(this, 2);
-            let result = ctx.invoke_virtual(func, "apply", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", &[val, exc])?;
-            let new_cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let result = ctx.invoke_virtual(
+                func,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[val, exc],
+            )?;
+            let new_cf =
+                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             ctx.set_field(new_cf, 0, result.unwrap_or(Value::Object(None)));
             ctx.set_field(new_cf, 1, Value::Int(1));
             ctx.set_field(new_cf, 2, Value::Object(None));
@@ -784,20 +822,26 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(_)) = ctx.get_field(this, 2) {
             return Err(RuntimeError::IllegalStateException {
                 message: "CompletableFuture completed exceptionally".into(),
-            }.into());
+            }
+            .into());
         }
         Ok(Some(ctx.get_field(this, 0)))
     });
     // getNow(defaultValue) — return result if done, else default
-    r.register(cf, "getNow", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if done != 0 {
-            Ok(Some(ctx.get_field(this, 0)))
-        } else {
-            Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
-        }
-    });
+    r.register(
+        cf,
+        "getNow",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if done != 0 {
+                Ok(Some(ctx.get_field(this, 0)))
+            } else {
+                Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+            }
+        },
+    );
 
     // --- Executors (static factory) ---
     let execs = "java/util/concurrent/Executors";
@@ -894,7 +938,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
                 for i in 0..(task_count as usize) {
                     if let Value::Object(Some(task)) = ctx.get_array_element(queue, i) {
-                        let _: MethodCallResult = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
+                        let _: MethodCallResult = ctx
+                            .invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
                             .or_else(|_| {
                                 ctx.invoke_virtual(task, "run", "()V", &[])?;
                                 Ok(None)
@@ -945,7 +990,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let shutdown = ctx.get_field(this, 0).as_int().unwrap_or(0);
         let tasks = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if shutdown != 0 && tasks == 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if shutdown != 0 && tasks == 0 {
+            1
+        } else {
+            0
+        })))
     });
     r.register(
         es,
@@ -959,7 +1008,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
                     for i in 0..(task_count as usize) {
                         if let Value::Object(Some(task)) = ctx.get_array_element(queue, i) {
-                            let _: Result<Option<Value>, MethodCallFailed> = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
+                            let _: Result<Option<Value>, MethodCallFailed> = ctx
+                                .invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
                                 .or_else(|_| {
                                     ctx.invoke_virtual(task, "run", "()V", &[])?;
                                     Ok(None)
@@ -983,7 +1033,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             if shutdown != 0 {
                 return Err(RuntimeError::IllegalStateException {
                     message: "ExecutorService has been shut down".into(),
-                }.into());
+                }
+                .into());
             }
             // Create a Future with the task stored for lazy execution
             let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
@@ -991,7 +1042,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             ctx.set_field(future, 1, Value::Int(0)); // not done
             ctx.set_field(future, 2, Value::Int(0)); // not cancelled
             ctx.set_field(future, 3, Value::Object(Some(callable))); // store task
-            // Also queue the task in the executor
+                                                                     // Also queue the task in the executor
             let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0) as usize;
             if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
                 let queue_len = ctx.array_length(queue);
@@ -1014,7 +1065,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             if shutdown != 0 {
                 return Err(RuntimeError::IllegalStateException {
                     message: "ExecutorService has been shut down".into(),
-                }.into());
+                }
+                .into());
             }
             let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
             ctx.set_field(future, 0, Value::Object(None));
@@ -1039,7 +1091,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         if shutdown != 0 {
             return Err(RuntimeError::IllegalStateException {
                 message: "ExecutorService has been shut down".into(),
-            }.into());
+            }
+            .into());
         }
         // execute() runs immediately (fire-and-forget)
         let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
@@ -1596,19 +1649,24 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(itr))))
     });
     // BaseStream.iterator() variant (some bytecode resolves against BaseStream)
-    r.register("java/util/stream/BaseStream", "iterator", "()Ljava/util/Iterator;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let arr_val = ctx.get_field(this, 0);
-        let arr = if let Value::Object(Some(a)) = arr_val {
-            a
-        } else {
-            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
-        };
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
-        ctx.set_field(itr, 0, Value::Object(Some(arr)));
-        ctx.set_field(itr, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(itr))))
-    });
+    r.register(
+        "java/util/stream/BaseStream",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr_val = ctx.get_field(this, 0);
+            let arr = if let Value::Object(Some(a)) = arr_val {
+                a
+            } else {
+                ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
+            };
+            let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+            ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            ctx.set_field(itr, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(itr))))
+        },
+    );
 
     // --- Stream.spliterator() → Spliterator (inherited from BaseStream) ---
     // Some Spring code paths call spliterator() directly. We don't have a
@@ -1920,7 +1978,11 @@ pub(crate) fn p56_read_stream_elems(ctx: &mut dyn NativeContext, this: ObjectRef
 }
 
 // --- Helper: build a new Stream from a Vec<Value> ---
-pub(crate) fn p56_build_stream(ctx: &mut dyn NativeContext, elems: Vec<Value>, class: &str) -> ObjectRef {
+pub(crate) fn p56_build_stream(
+    ctx: &mut dyn NativeContext,
+    elems: Vec<Value>,
+    class: &str,
+) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let len = elems.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
@@ -3526,7 +3588,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let first = ctx.get_field(this, 0);
             let second = ctx.get_field(this, 1);
             if let Value::Object(Some(first_ref)) = first {
-                let r1 = ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
+                let r1 =
+                    ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
                 if r1 == Some(Value::Int(0)) {
                     return Ok(Some(Value::Int(0)));
                 }
@@ -3549,7 +3612,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let first = ctx.get_field(this, 0);
             let second = ctx.get_field(this, 1);
             if let Value::Object(Some(first_ref)) = first {
-                let r1 = ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
+                let r1 =
+                    ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
                 if r1 == Some(Value::Int(1)) {
                     return Ok(Some(Value::Int(1)));
                 }
@@ -3571,7 +3635,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let input = args[1];
             let inner = ctx.get_field(this, 0);
             if let Value::Object(Some(inner_ref)) = inner {
-                let r1 = ctx.invoke_virtual(inner_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
+                let r1 =
+                    ctx.invoke_virtual(inner_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
                 let val = match r1 {
                     Some(Value::Int(v)) => v,
                     _ => 0,
@@ -3650,22 +3715,30 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let input = args[1];
-            let first = ctx.get_field(this, 0);   // field 0 = first function
-            let after = ctx.get_field(this, 1);    // field 1 = after function
+            let first = ctx.get_field(this, 0); // field 0 = first function
+            let after = ctx.get_field(this, 1); // field 1 = after function
             let first_ref = match first {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(input)),
             };
             // Use invoke_virtual to support lambda proxy dispatch
-            let mid = ctx.invoke_virtual(first_ref, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[input])?;
+            let mid = ctx.invoke_virtual(
+                first_ref,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[input],
+            )?;
             let mid_val = mid.unwrap_or(Value::Object(None));
             let after_ref = match after {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(mid_val)),
             };
-            ctx.invoke_virtual(after_ref, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[mid_val])
+            ctx.invoke_virtual(
+                after_ref,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[mid_val],
+            )
         },
     );
 
@@ -3677,22 +3750,30 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let input = args[1];
-            let first = ctx.get_field(this, 0);    // field 0 = outer function
-            let before = ctx.get_field(this, 1);   // field 1 = before function
+            let first = ctx.get_field(this, 0); // field 0 = outer function
+            let before = ctx.get_field(this, 1); // field 1 = before function
             let before_ref = match before {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(input)),
             };
             // Use invoke_virtual to support lambda proxy dispatch
-            let mid = ctx.invoke_virtual(before_ref, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[input])?;
+            let mid = ctx.invoke_virtual(
+                before_ref,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[input],
+            )?;
             let mid_val = mid.unwrap_or(Value::Object(None));
             let first_ref = match first {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(mid_val)),
             };
-            ctx.invoke_virtual(first_ref, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[mid_val])
+            ctx.invoke_virtual(
+                first_ref,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[mid_val],
+            )
         },
     );
 
@@ -3701,9 +3782,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "java/util/function/Function$Identity",
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        |_ctx, args| {
-            Ok(Some(args[1]))
-        },
+        |_ctx, args| Ok(Some(args[1])),
     );
 
     // Consumer$AndThen.accept(x) = first.accept(x); after.accept(x);
@@ -3718,12 +3797,10 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let after = ctx.get_field(this, 1);
             // Use invoke_virtual to support lambda proxy dispatch
             if let Value::Object(Some(first_ref)) = first {
-                ctx.invoke_virtual(first_ref, "accept", "(Ljava/lang/Object;)V",
-                    &[input])?;
+                ctx.invoke_virtual(first_ref, "accept", "(Ljava/lang/Object;)V", &[input])?;
             }
             if let Value::Object(Some(after_ref)) = after {
-                ctx.invoke_virtual(after_ref, "accept", "(Ljava/lang/Object;)V",
-                    &[input])?;
+                ctx.invoke_virtual(after_ref, "accept", "(Ljava/lang/Object;)V", &[input])?;
             }
             Ok(None)
         },
@@ -3935,7 +4012,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let norm = p.replace('\\', "/");
-        let abs = if norm.starts_with('/') { norm.clone() } else { format!("/{norm}") };
+        let abs = if norm.starts_with('/') {
+            norm.clone()
+        } else {
+            format!("/{norm}")
+        };
         let uri_str = format!("file://{abs}");
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw = ctx.create_string(&uri_str);
@@ -4017,10 +4098,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // "Malformed zip entry name"). Strip them here, preserving roots
             // ("/", "C:/") and jar: filesystem paths.
             if !acc.starts_with("jar:") && !acc.contains("!/") {
-                while acc.len() > 1
-                    && acc.ends_with('/')
-                    && !acc[..acc.len() - 1].ends_with(':')
-                {
+                while acc.len() > 1 && acc.ends_with('/') && !acc[..acc.len() - 1].ends_with(':') {
                     acc.truncate(acc.len() - 1);
                 }
             }
@@ -4053,12 +4131,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // 1. URI.path by name (real-JDK URIs constructed via real-JDK
             //    URI bytecode populate this; ours don't but cheap to try).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // 2. Synthetic URL_FIELD_PATH (slot 3) where url_parse stores
             //    the post-scheme path for `file:` URIs.
             if let Value::Object(Some(s)) = ctx.get_field(uri, 3) {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // 3. Slot 4 — the `Path.toUri()` natives' synthetic layout
             //    stores the path component there (URIs from
@@ -4068,29 +4150,39 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             //    resolve to real-JDK URI slots (6/18) that are out of
             //    bounds on the 5-slot synthetic, and slots 3/5 are unset.
             if let Value::Object(Some(s)) = ctx.get_field(uri, 4) {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // 4. URI.string by name (full URI text on real-JDK URIs).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // 5. Synthetic URL_FIELD_FULL (slot 5) where url_parse stores
             //    the full URI string. (For our synthetic URIs allocated
             //    with real-JDK layout this slot may have been clobbered
             //    with non-string data, so guarded by Object pattern.)
             if let Value::Object(Some(s)) = ctx.get_field(uri, 5) {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // 6. Slot 0 — the `Path.toUri()` synthetic layout stores the
             //    full `file://...` text there; the scheme-strip loop below
             //    reduces it to the path component.
             if let Value::Object(Some(s)) = ctx.get_field(uri, 0) {
-                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+                if let Some(t) = ctx.read_string(s) {
+                    candidates.push(t);
+                }
             }
             // Pick the first non-empty candidate; strip any `file:` scheme.
             let mut path_str = String::new();
             for c in candidates {
-                if c.is_empty() { continue; }
+                if c.is_empty() {
+                    continue;
+                }
                 let stripped = c
                     .strip_prefix("file://")
                     .or_else(|| c.strip_prefix("file:"))
@@ -4098,7 +4190,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .unwrap_or(c);
                 // Reject candidates that still look like a URI (contain
                 // ':' before the path's drive letter) — those are stale.
-                if stripped.contains("file:") { continue; }
+                if stripped.contains("file:") {
+                    continue;
+                }
                 path_str = stripped;
                 break;
             }
@@ -4122,9 +4216,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/FileSystem;",
         |ctx, args| {
             if let Ok(this) = obj_arg(args, 0) {
-                if let Value::Object(Some(fs)) =
-                    ctx.get_field(this, P57_PATH_FS_FIELD)
-                {
+                if let Value::Object(Some(fs)) = ctx.get_field(this, P57_PATH_FS_FIELD) {
                     return Ok(Some(Value::Object(Some(fs))));
                 }
             }
@@ -4241,22 +4333,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
 
     // --- Path.getParent() → Path (or null) ---
-    r.register(
-        path,
-        "getParent",
-        "()Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, this);
-            let parent = p57_parent_of(&p);
-            if parent.is_empty() {
-                Ok(Some(Value::Object(None)))
-            } else {
-                let result = p57_alloc_path(ctx, &parent);
-                Ok(Some(Value::Object(Some(result))))
-            }
-        },
-    );
+    r.register(path, "getParent", "()Ljava/nio/file/Path;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let p = p57_read_path(ctx, this);
+        let parent = p57_parent_of(&p);
+        if parent.is_empty() {
+            Ok(Some(Value::Object(None)))
+        } else {
+            let result = p57_alloc_path(ctx, &parent);
+            Ok(Some(Value::Object(Some(result))))
+        }
+    });
 
     // --- Path.getRoot() → Path (or null) ---
     r.register(path, "getRoot", "()Ljava/nio/file/Path;", |ctx, args| {
@@ -4327,47 +4414,41 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
 
     // --- Path.toString() → String ---
-    r.register(
-        path,
-        "toString",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, this);
-            let display = match jarfs_decode(&p) {
-                // jar-FS Path.toString() shows the in-jar entry with '/'
-                // (matches the JDK zipfs separator), regardless of host OS.
-                Some((_, e)) => {
-                    if e.starts_with('/') { e } else { format!("/{e}") }
+    r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let p = p57_read_path(ctx, this);
+        let display = match jarfs_decode(&p) {
+            // jar-FS Path.toString() shows the in-jar entry with '/'
+            // (matches the JDK zipfs separator), regardless of host OS.
+            Some((_, e)) => {
+                if e.starts_with('/') {
+                    e
+                } else {
+                    format!("/{e}")
                 }
-                // Host-FS path: render the OS-native separator. CratonVM stores
-                // paths with '/' internally, but HotSpot's WindowsPath.toString()
-                // renders '\'; convert at this display boundary on Windows
-                // (no-op on Unix). Matches `File.getPath()` below.
-                None => file_normalise_path(&p),
-            };
-            let s = ctx.create_string(&display);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+            }
+            // Host-FS path: render the OS-native separator. CratonVM stores
+            // paths with '/' internally, but HotSpot's WindowsPath.toString()
+            // renders '\'; convert at this display boundary on Windows
+            // (no-op on Unix). Matches `File.getPath()` below.
+            None => file_normalise_path(&p),
+        };
+        let s = ctx.create_string(&display);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // --- Path.equals(Object) → boolean ---
-    r.register(
-        path,
-        "equals",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let p1 = p57_read_path(ctx, this);
-            match args.get(1) {
-                Some(Value::Object(Some(other))) => {
-                    let p2 = p57_read_path(ctx, *other);
-                    Ok(Some(Value::Int(if p1 == p2 { 1 } else { 0 })))
-                }
-                _ => Ok(Some(Value::Int(0))),
+    r.register(path, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let p1 = p57_read_path(ctx, this);
+        match args.get(1) {
+            Some(Value::Object(Some(other))) => {
+                let p2 = p57_read_path(ctx, *other);
+                Ok(Some(Value::Int(if p1 == p2 { 1 } else { 0 })))
             }
-        },
-    );
+            _ => Ok(Some(Value::Int(0))),
+        }
+    });
 
     // --- Path.hashCode() → int ---
     r.register(path, "hashCode", "()I", |ctx, args| {
@@ -4396,21 +4477,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- FileSystem methods ---
     let fs_class = "java/nio/file/FileSystem";
 
-    r.register(fs_class, "getSeparator", "()Ljava/lang/String;", |ctx, args| {
-        // A mounted-jar FileSystem renders '/' (matches the JDK zipfs
-        // separator — JUnit5's ClasspathScanner splits scanned entry paths
-        // on this to build package names); the host FS renders the OS
-        // separator.
-        if let Ok(this) = obj_arg(args, 0) {
-            if let Value::Object(Some(_)) = ctx.get_field(this, P57_FS_JAR_FIELD) {
-                let s = ctx.create_string("/");
-                return Ok(Some(Value::Object(Some(s))));
+    r.register(
+        fs_class,
+        "getSeparator",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            // A mounted-jar FileSystem renders '/' (matches the JDK zipfs
+            // separator — JUnit5's ClasspathScanner splits scanned entry paths
+            // on this to build package names); the host FS renders the OS
+            // separator.
+            if let Ok(this) = obj_arg(args, 0) {
+                if let Value::Object(Some(_)) = ctx.get_field(this, P57_FS_JAR_FIELD) {
+                    let s = ctx.create_string("/");
+                    return Ok(Some(Value::Object(Some(s))));
+                }
             }
-        }
-        let sep = if cfg!(windows) { "\\" } else { "/" };
-        let s = ctx.create_string(sep);
-        Ok(Some(Value::Object(Some(s))))
-    });
+            let sep = if cfg!(windows) { "\\" } else { "/" };
+            let s = ctx.create_string(sep);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
 
     r.register(
         fs_class,
@@ -4461,7 +4547,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
         |ctx, _args| {
-            let provider = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            let provider =
+                alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
             let scheme = ctx.create_string("file");
             ctx.set_field(provider, 0, Value::Object(Some(scheme)));
             Ok(Some(Value::Object(Some(provider))))
@@ -4729,11 +4816,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // then re-home them into a DosFileAttributes instance.
             let bfa = p59_files_read_attributes(ctx, &[path_obj])?;
             if let Some(Value::Object(Some(bfa_obj))) = bfa {
-                let dos = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/nio/file/attribute/DosFileAttributes",
-                    5,
-                );
+                let dos =
+                    alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 5);
                 for i in 0..5 {
                     let v = ctx.get_field(bfa_obj, i);
                     ctx.set_field(dos, i, v);
@@ -4778,54 +4862,91 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // DOS-specific flags (all false in this VM).
     {
         let dfa = "java/nio/file/attribute/DosFileAttributes";
-        r.register(dfa, "creationTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
-            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 0)))
-        });
-        r.register(dfa, "lastAccessTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
-            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 1)))
-        });
-        r.register(dfa, "lastModifiedTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
-            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 2)))
-        });
+        r.register(
+            dfa,
+            "creationTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(ctx.get_field(this, 0)))
+            },
+        );
+        r.register(
+            dfa,
+            "lastAccessTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(ctx.get_field(this, 1)))
+            },
+        );
+        r.register(
+            dfa,
+            "lastModifiedTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(ctx.get_field(this, 2)))
+            },
+        );
         r.register(dfa, "isDirectory", "()Z", |ctx, args| {
-            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 3)))
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 3)))
         });
         r.register(dfa, "isRegularFile", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let is_dir = matches!(ctx.get_field(this, 3), Value::Int(1));
             Ok(Some(Value::Int(if is_dir { 0 } else { 1 })))
         });
-        r.register(dfa, "isSymbolicLink", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "isSymbolicLink", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
         r.register(dfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
         r.register(dfa, "size", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 4)))
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 4)))
         });
-        r.register(dfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| Ok(Some(Value::Object(None))));
-        r.register(dfa, "isReadOnly", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-        r.register(dfa, "isHidden", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-        r.register(dfa, "isArchive", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-        r.register(dfa, "isSystem", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
+            Ok(Some(Value::Object(None)))
+        });
+        r.register(dfa, "isReadOnly", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(dfa, "isHidden", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(dfa, "isArchive", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(dfa, "isSystem", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
     }
 
-    r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
-        use cratonvm_types::ArrayElementType;
-        let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
-        let file_s = ctx.create_string("file");
-        ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
-        let jar_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
-        let jar_s = ctx.create_string("jar");
-        ctx.set_field(jar_p, 0, Value::Object(Some(jar_s)));
-        let arr = ctx.new_array(ArrayElementType::Reference, 2);
-        ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
-        ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
-        // Real ArrayList field layout in real-JDK mode:
-        //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
-        ctx.set_field(list, 0, Value::Int(0));
-        ctx.set_field(list, 1, Value::Object(Some(arr)));
-        ctx.set_field(list, 2, Value::Int(2));
-        Ok(Some(Value::Object(Some(list))))
-    });
+    r.register(
+        fsp,
+        "installedProviders",
+        "()Ljava/util/List;",
+        |ctx, _args| {
+            use cratonvm_types::ArrayElementType;
+            let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            let file_s = ctx.create_string("file");
+            ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
+            let jar_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            let jar_s = ctx.create_string("jar");
+            ctx.set_field(jar_p, 0, Value::Object(Some(jar_s)));
+            let arr = ctx.new_array(ArrayElementType::Reference, 2);
+            ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
+            ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
+            // Real ArrayList field layout in real-JDK mode:
+            //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            ctx.set_field(list, 0, Value::Int(0));
+            ctx.set_field(list, 1, Value::Object(Some(arr)));
+            ctx.set_field(list, 2, Value::Int(2));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
 
     r.register(
         fsp,
@@ -5017,7 +5138,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, &name) {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] plain {} -> idx={} val_null={}", name, idx, matches!(v, cratonvm_types::Value::Object(None)));
+                eprintln!(
+                    "[picocli-style] plain {} -> idx={} val_null={}",
+                    name,
+                    idx,
+                    matches!(v, cratonvm_types::Value::Object(None))
+                );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
                 return v;
@@ -5030,7 +5156,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, &prefixed) {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] prefixed {} -> idx={} val_null={}", prefixed, idx, matches!(v, cratonvm_types::Value::Object(None)));
+                eprintln!(
+                    "[picocli-style] prefixed {} -> idx={} val_null={}",
+                    prefixed,
+                    idx,
+                    matches!(v, cratonvm_types::Value::Object(None))
+                );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
                 return v;
@@ -5043,7 +5174,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, "reset") {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] reset fallback idx={} val_null={}", idx, matches!(v, cratonvm_types::Value::Object(None)));
+                eprintln!(
+                    "[picocli-style] reset fallback idx={} val_null={}",
+                    idx,
+                    matches!(v, cratonvm_types::Value::Object(None))
+                );
             }
             return v;
         }
@@ -5151,7 +5286,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
         let size = match jarfs_decode(&p) {
-            Some((jar, entry)) => jarfs_read_entry(&jar, &entry).map(|b| b.len() as u64).unwrap_or(0),
+            Some((jar, entry)) => jarfs_read_entry(&jar, &entry)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0),
             None => std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
         };
         Ok(Some(Value::Long(size as i64)))
@@ -5623,7 +5760,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if !exists {
                 return Err(RuntimeError::IOException {
                     message: format!("NoSuchFileException: {}", p),
-                }.into());
+                }
+                .into());
             }
             Ok(None)
         },
@@ -5694,11 +5832,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         cratonvm_native_collections::make_iterator_from_array(ctx, arr, len)
     });
     r.register(ds, "close", "()V", |_ctx, _args| Ok(None));
-    r.register(ds, "spliterator", "()Ljava/util/Spliterator;", |_ctx, _args| {
-        // Spliterator API is rarely walked for DirectoryStream; return null
-        // so callers that probe it fall back to iterator().
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        ds,
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        |_ctx, _args| {
+            // Spliterator API is rarely walked for DirectoryStream; return null
+            // so callers that probe it fall back to iterator().
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // newFileChannel(Path, Set<? extends OpenOption>, FileAttribute[]) -> FileChannel
     // Real JDK delegates to WindowsFileSystemProvider.newFileChannel which
@@ -5852,7 +5995,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Value::Int(v) if v >= 0 => v as u32,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64));
+            let _ = ctx
+                .fd_table()
+                .rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64));
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -5876,7 +6021,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = match ctx.get_field(this, 0) {
             Value::Int(v) if v >= 0 => v as u32,
-            _ => return Err(RuntimeError::IOException { message: "Channel closed".into() }.into()),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "Channel closed".into(),
+                }
+                .into())
+            }
         };
         let bb = match args.get(1) {
             Some(Value::Object(Some(b))) => *b,
@@ -5894,8 +6044,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 *d = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
             }
         }
-        let n = ctx.fd_table().rw_write(fd_id, &data)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        let n = ctx
+            .fd_table()
+            .rw_write(fd_id, &data)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
         Ok(Some(Value::Int(n as i32)))
     });
@@ -5928,7 +6082,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -6043,18 +6200,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // the side-table is never populated and these shims serve no real-JDK use.
     #[cfg(feature = "synthetic-jdk")]
     {
-    r.register(
-        "java/io/BufferedReader",
-        "read",
-        "([CII)I",
-        |ctx, args| {
+        r.register("java/io/BufferedReader", "read", "([CII)I", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let out_arr = match args.get(1) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let off = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-            let len = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+            let off = match args.get(2) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
+            let len = match args.get(3) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
             if len == 0 {
                 return Ok(Some(Value::Int(0)));
             }
@@ -6070,20 +6229,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match ctx.get_field(this, 0) {
                 Value::Object(Some(inner)) => {
                     let r = ctx.invoke_virtual(
-                        inner, "read", "([CII)I",
-                        &[Value::Object(Some(out_arr)), Value::Int(off as i32), Value::Int(len as i32)],
+                        inner,
+                        "read",
+                        "([CII)I",
+                        &[
+                            Value::Object(Some(out_arr)),
+                            Value::Int(off as i32),
+                            Value::Int(len as i32),
+                        ],
                     )?;
                     Ok(r.or(Some(Value::Int(-1))))
                 }
                 _ => Ok(Some(Value::Int(-1))),
             }
-        },
-    );
-    r.register(
-        "java/io/BufferedReader",
-        "read",
-        "()I",
-        |ctx, args| {
+        });
+        r.register("java/io/BufferedReader", "read", "()I", |ctx, args| {
             let this = obj_arg(args, 0)?;
             if let Some(c) = br_sidetable_read_one(ctx, this) {
                 return Ok(Some(Value::Int(c)));
@@ -6095,8 +6255,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 }
                 _ => Ok(Some(Value::Int(-1))),
             }
-        },
-    );
+        });
     } // end #[cfg(feature = "synthetic-jdk")] BufferedReader.read shims
 
     // Phase B (RB.8): helper — scan an OpenOption[] looking for APPEND.
@@ -6168,17 +6327,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // synthetic with `CRATONVM_SYNTHETIC_BUFFERED_WRITER=1`. See
     // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
     if std::env::var("CRATONVM_SYNTHETIC_BUFFERED_WRITER").as_deref() == Ok("1") {
-    r.register(
-        files,
-        "newBufferedWriter",
-        "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let append = open_options_include_append(ctx, args.get(1));
-            open_buffered_writer(ctx, path_obj, append)
-        },
-    );
-    r.register(
+        r.register(
+            files,
+            "newBufferedWriter",
+            "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
+            |ctx, args| {
+                let path_obj = obj_arg(args, 0)?;
+                let append = open_options_include_append(ctx, args.get(1));
+                open_buffered_writer(ctx, path_obj, append)
+            },
+        );
+        r.register(
         files,
         "newBufferedWriter",
         "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
@@ -6206,35 +6365,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // real BufferedWriter and the native forwards to its wrapped `out`
     // Writer so the genuine OutputStreamWriter/StreamEncoder bytecode runs.
     let bw_class = "java/io/BufferedWriter";
-    r.register(
-        bw_class,
-        "write",
-        "(Ljava/lang/String;II)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if let Some(out) = bw_delegate_out(ctx, this) {
-                let s = args.get(1).cloned().unwrap_or(Value::Object(None));
-                let off = args.get(2).cloned().unwrap_or(Value::Int(0));
-                let len = args.get(3).cloned().unwrap_or(Value::Int(0));
-                let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len]);
-                return Ok(None);
-            }
-            let text = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or_default() as usize;
-            let fd = match ctx.get_field(this, 0) {
-                Value::Int(fd) => fd as u32,
-                _ => return Ok(None),
-            };
-            let end = off.saturating_add(len).min(text.chars().count());
-            let sub: String = text.chars().skip(off).take(end.saturating_sub(off)).collect();
-            let _ = ctx.fd_table().write_string(fd, &sub);
-            Ok(None)
-        },
-    );
+    r.register(bw_class, "write", "(Ljava/lang/String;II)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let s = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let off = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let len = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len]);
+            return Ok(None);
+        }
+        let text = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or_default() as usize;
+        let fd = match ctx.get_field(this, 0) {
+            Value::Int(fd) => fd as u32,
+            _ => return Ok(None),
+        };
+        let end = off.saturating_add(len).min(text.chars().count());
+        let sub: String = text
+            .chars()
+            .skip(off)
+            .take(end.saturating_sub(off))
+            .collect();
+        let _ = ctx.fd_table().write_string(fd, &sub);
+        Ok(None)
+    });
     r.register(bw_class, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(out) = bw_delegate_out(ctx, this) {
@@ -6292,7 +6450,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
         if let Some(out) = bw_delegate_out(ctx, this) {
             let s = ctx.create_string(&sep);
-            let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;)V", &[Value::Object(Some(s))]);
+            let _ = ctx.invoke_virtual(
+                out,
+                "write",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(s))],
+            );
             return Ok(None);
         }
         let fd = match ctx.get_field(this, 0) {
@@ -6356,34 +6519,42 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- Path additional methods ---
     let path = "java/nio/file/Path";
-    r.register(path, "toAbsolutePath", "()Ljava/nio/file/Path;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        // JDK `Path.toAbsolutePath()` does NOT resolve symlinks or require the
-        // file to exist (that is `toRealPath`) — it only makes a *relative*
-        // path absolute. Must NOT `canonicalize()` here: this build runs UNIX-
-        // mode `std::path` on Windows, so `canonicalize` on an existing path
-        // returns a `\\?\C:\…` verbatim path that renders as `//?/C:/…` and
-        // breaks downstream string-based Path ops — e.g. WildFly's
-        // `Environment.validateWildFlyDir` then rejects a valid `jboss.dist`
-        // ("could not find jboss-modules.jar" though it exists). A drive-letter
-        // (`C:`), UNC (`\\`/`//`), or leading-separator path is already absolute
-        // and returned unchanged; a relative path is anchored to the CWD.
-        let b = p.as_bytes();
-        let is_abs = matches!(b.first(), Some(b'/') | Some(b'\\'))
-            || (b.len() >= 2 && b[1] == b':');
-        let abs = if is_abs {
-            p.clone()
-        } else {
-            format!(
-                "{}/{}",
-                std::env::current_dir().unwrap_or_default().to_string_lossy().replace('\\', "/"),
-                p
-            )
-        };
-        let result = p57_alloc_path(ctx, &abs);
-        Ok(Some(Value::Object(Some(result))))
-    });
+    r.register(
+        path,
+        "toAbsolutePath",
+        "()Ljava/nio/file/Path;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, this);
+            // JDK `Path.toAbsolutePath()` does NOT resolve symlinks or require the
+            // file to exist (that is `toRealPath`) — it only makes a *relative*
+            // path absolute. Must NOT `canonicalize()` here: this build runs UNIX-
+            // mode `std::path` on Windows, so `canonicalize` on an existing path
+            // returns a `\\?\C:\…` verbatim path that renders as `//?/C:/…` and
+            // breaks downstream string-based Path ops — e.g. WildFly's
+            // `Environment.validateWildFlyDir` then rejects a valid `jboss.dist`
+            // ("could not find jboss-modules.jar" though it exists). A drive-letter
+            // (`C:`), UNC (`\\`/`//`), or leading-separator path is already absolute
+            // and returned unchanged; a relative path is anchored to the CWD.
+            let b = p.as_bytes();
+            let is_abs =
+                matches!(b.first(), Some(b'/') | Some(b'\\')) || (b.len() >= 2 && b[1] == b':');
+            let abs = if is_abs {
+                p.clone()
+            } else {
+                format!(
+                    "{}/{}",
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    p
+                )
+            };
+            let result = p57_alloc_path(ctx, &abs);
+            Ok(Some(Value::Object(Some(result))))
+        },
+    );
 
     // `Path.toRealPath(LinkOption...)` — resolve to the real, canonical path of
     // an *existing* file. Per the JDK contract this method throws
@@ -6439,7 +6610,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         for part in p.split('/') {
             match part {
                 "." | "" => {}
-                ".." => { parts.pop(); }
+                ".." => {
+                    parts.pop();
+                }
                 other => parts.push(other),
             }
         }
@@ -6482,7 +6655,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(uri))));
         }
         let prefixed;
-        let slash_p: &str = if p.starts_with('/') { &p } else { prefixed = format!("/{}", p); &prefixed };
+        let slash_p: &str = if p.starts_with('/') {
+            &p
+        } else {
+            prefixed = format!("/{}", p);
+            &prefixed
+        };
         let uri_str = format!("file://{}", slash_p);
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
         let s = ctx.create_string(&uri_str);
@@ -6502,7 +6680,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "getName", "(I)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx = match args[1] { Value::Int(i) => i, _ => 0 };
+        let idx = match args[1] {
+            Value::Int(i) => i,
+            _ => 0,
+        };
         let p = p57_read_path(ctx, this);
         let parts: Vec<String> = p57_parse_win_root(&p).1;
         // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
@@ -6517,13 +6698,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(result))))
     });
 
-    r.register(path, "startsWith", "(Ljava/nio/file/Path;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let other = obj_arg(args, 1)?;
-        let p = p57_read_path(ctx, this);
-        let o = p57_read_path(ctx, other);
-        Ok(Some(Value::Int(if p.starts_with(&o) { 1 } else { 0 })))
-    });
+    r.register(
+        path,
+        "startsWith",
+        "(Ljava/nio/file/Path;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, this);
+            let o = p57_read_path(ctx, other);
+            Ok(Some(Value::Int(if p.starts_with(&o) { 1 } else { 0 })))
+        },
+    );
 
     r.register(path, "startsWith", "(Ljava/lang/String;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6574,8 +6760,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     r.register(path, "subpath", "(II)Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let begin = match args[1] { Value::Int(i) => i, _ => 0 };
-        let end = match args[2] { Value::Int(i) => i, _ => 0 };
+        let begin = match args[1] {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        let end = match args[2] {
+            Value::Int(i) => i,
+            _ => 0,
+        };
         let p = p57_read_path(ctx, this);
         let parts: Vec<String> = p57_parse_win_root(&p).1;
         let count = parts.len() as i32;
@@ -6628,10 +6820,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- FileSystem additional methods ---
     let fsys = "java/nio/file/FileSystem";
-    r.register(fsys, "newWatchService", "()Ljava/nio/file/WatchService;", |ctx, _args| {
-        let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 0);
-        Ok(Some(Value::Object(Some(ws))))
-    });
+    r.register(
+        fsys,
+        "newWatchService",
+        "()Ljava/nio/file/WatchService;",
+        |ctx, _args| {
+            let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 0);
+            Ok(Some(Value::Object(Some(ws))))
+        },
+    );
 
     r.register(
         fsys,
@@ -6678,8 +6875,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let mut attrs = 0i32;
                 if let Ok(md) = std::fs::metadata(p) {
                     attrs |= 0x01; // BA_EXISTS
-                    if md.is_file() { attrs |= 0x02; } // BA_REGULAR
-                    if md.is_dir() { attrs |= 0x04; } // BA_DIRECTORY
+                    if md.is_file() {
+                        attrs |= 0x02;
+                    } // BA_REGULAR
+                    if md.is_dir() {
+                        attrs |= 0x04;
+                    } // BA_DIRECTORY
                 }
                 Ok(Some(Value::Int(attrs)))
             },
@@ -6697,26 +6898,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 };
                 let millis = std::fs::metadata(&path_str)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64)
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64
+                    })
                     .unwrap_or(0);
                 Ok(Some(Value::Long(millis)))
             },
         );
 
-        r.register(
-            fs_cls,
-            "getLength",
-            "(Ljava/io/File;)J",
-            |ctx, args| {
-                let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let len = std::fs::metadata(&path_str).map(|m| m.len() as i64).unwrap_or(0);
-                Ok(Some(Value::Long(len)))
-            },
-        );
+        r.register(fs_cls, "getLength", "(Ljava/io/File;)J", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let path_str = match ctx.get_field(file_ref, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let len = std::fs::metadata(&path_str)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            Ok(Some(Value::Long(len)))
+        });
 
         r.register(
             fs_cls,
@@ -6780,22 +6982,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
 
-        r.register(
-            fs_cls,
-            "delete0",
-            "(Ljava/io/File;)Z",
-            |ctx, args| {
-                let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let ok = std::fs::remove_file(&path_str)
-                    .or_else(|_| std::fs::remove_dir(&path_str))
-                    .is_ok();
-                Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-            },
-        );
+        r.register(fs_cls, "delete0", "(Ljava/io/File;)Z", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let path_str = match ctx.get_field(file_ref, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let ok = std::fs::remove_file(&path_str)
+                .or_else(|_| std::fs::remove_dir(&path_str))
+                .is_ok();
+            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        });
 
         r.register(
             fs_cls,
@@ -6807,39 +7004,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
 
-        r.register(
-            fs_cls,
-            "setReadOnly",
-            "(Ljava/io/File;)Z",
-            |_ctx, _args| {
-                Ok(Some(Value::Int(1)))
-            },
-        );
+        r.register(fs_cls, "setReadOnly", "(Ljava/io/File;)Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
 
-        r.register(
-            fs_cls,
-            "getSpace",
-            "(Ljava/io/File;I)J",
-            |_ctx, _args| {
-                // Return a reasonable default: 100GB free
-                Ok(Some(Value::Long(100_000_000_000)))
-            },
-        );
+        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |_ctx, _args| {
+            // Return a reasonable default: 100GB free
+            Ok(Some(Value::Long(100_000_000_000)))
+        });
 
-        r.register(
-            fs_cls,
-            "checkAccess",
-            "(Ljava/io/File;I)Z",
-            |ctx, args| {
-                let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let exists = std::path::Path::new(&path_str).exists();
-                Ok(Some(Value::Int(if exists { 1 } else { 0 })))
-            },
-        );
+        r.register(fs_cls, "checkAccess", "(Ljava/io/File;I)Z", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let path_str = match ctx.get_field(file_ref, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let exists = std::path::Path::new(&path_str).exists();
+            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
+        });
 
         r.register(
             fs_cls,
@@ -6905,13 +7087,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let path_obj = obj_arg(args, 0)?;
         let iterable = obj_arg(args, 1)?;
         let p = p57_read_path(ctx, path_obj);
-        let it_val = ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])
-            .ok().flatten();
+        let it_val = ctx
+            .invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])
+            .ok()
+            .flatten();
         let it = match it_val {
             Some(Value::Object(Some(o))) => o,
-            _ => return Err(RuntimeError::IllegalStateException {
-                message: "Files.write(Iterable): null iterator".to_string(),
-            }.into()),
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Files.write(Iterable): null iterator".to_string(),
+                }
+                .into())
+            }
         };
         let mut out = String::new();
         loop {
@@ -6920,16 +7107,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(1)) => {}
                 _ => break,
             }
-            let nxt = ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
-                .ok().flatten();
+            let nxt = ctx
+                .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten();
             let elem = match nxt {
                 Some(Value::Object(Some(o))) => o,
                 _ => break,
             };
             // CharSequence: try read_string first (Strings), fall back to toString().
             let s = ctx.read_string(elem).unwrap_or_else(|| {
-                let s_val = ctx.invoke_virtual(elem, "toString", "()Ljava/lang/String;", &[])
-                    .ok().flatten();
+                let s_val = ctx
+                    .invoke_virtual(elem, "toString", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten();
                 match s_val {
                     Some(Value::Object(Some(so))) => ctx.read_string(so).unwrap_or_default(),
                     _ => String::new(),
@@ -7010,7 +7201,9 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
     let wb = work.as_bytes();
     if verbatim
         && wb.len() >= 4
-        && work.get(..3).map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
+        && work
+            .get(..3)
+            .map_or(false, |p| p.eq_ignore_ascii_case("UNC"))
         && is_sep(wb[3])
     {
         let after = &work[4..];
@@ -7018,7 +7211,10 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
         let server = it.next().unwrap_or("");
         let share = it.next().unwrap_or("");
         let remainder = it.next().unwrap_or("");
-        return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+        return (
+            Some(format!("\\\\{}\\{}\\", server, share)),
+            split_names(remainder),
+        );
     }
     if wb.len() >= 2 && is_sep(wb[0]) && is_sep(wb[1]) {
         let after = &work[2..];
@@ -7027,7 +7223,10 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
         let share = it.next().unwrap_or("");
         if !server.is_empty() && !share.is_empty() {
             let remainder = it.next().unwrap_or("");
-            return (Some(format!("\\\\{}\\{}\\", server, share)), split_names(remainder));
+            return (
+                Some(format!("\\\\{}\\{}\\", server, share)),
+                split_names(remainder),
+            );
         }
     }
     if wb.len() >= 2 && (wb[0] as char).is_ascii_alphabetic() && wb[1] == b':' {
@@ -7141,10 +7340,7 @@ fn fsp_scan_open_options(
 /// carries the fd. See the registration site (above, near `fsp` block) for
 /// the rationale; this helper does the actual work and is split out so the
 /// closure stays tight enough for the registry macro.
-fn fsp_new_output_stream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg(args, 1)?;
     let p = p57_read_path(ctx, path_obj);
     if p.is_empty() {
@@ -7419,7 +7615,10 @@ fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
 /// callers like SmallRye that `catch (IOException)` can recover, instead of an
 /// uncatchable `IllegalStateException`.
 fn p57_io_error(e: &std::io::Error) -> cratonvm_types::error::MethodCallFailed {
-    RuntimeError::IOException { message: e.to_string() }.into()
+    RuntimeError::IOException {
+        message: e.to_string(),
+    }
+    .into()
 }
 
 /// Read a path (host file or jar-FS entry) into a UTF-8 string.
@@ -7841,24 +8040,19 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     );
 
     // environment() — return a Map of environment variables
-    r.register(
-        pb,
-        "environment",
-        "()Ljava/util/Map;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Check if env map already stored in field 2
-            if let Value::Object(Some(map)) = ctx.get_field(this, 2) {
-                return Ok(Some(Value::Object(Some(map))));
-            }
-            // Create a new HashMap with current process environment
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 4);
-            ctx.set_field(map, 1, Value::Int(0)); // size = 0
-            // Store for future access
-            ctx.set_field(this, 2, Value::Object(Some(map)));
-            Ok(Some(Value::Object(Some(map))))
-        },
-    );
+    r.register(pb, "environment", "()Ljava/util/Map;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Check if env map already stored in field 2
+        if let Value::Object(Some(map)) = ctx.get_field(this, 2) {
+            return Ok(Some(Value::Object(Some(map))));
+        }
+        // Create a new HashMap with current process environment
+        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 4);
+        ctx.set_field(map, 1, Value::Int(0)); // size = 0
+                                              // Store for future access
+        ctx.set_field(this, 2, Value::Object(Some(map)));
+        Ok(Some(Value::Object(Some(map))))
+    });
 
     // redirectInput/Output/Error — store redirect target and return this
     r.register(
@@ -7956,8 +8150,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
             ctx.set_field(bais, 0, Value::Object(Some(arr))); // buf
-            ctx.set_field(bais, 1, Value::Int(0));            // pos
-            ctx.set_field(bais, 2, Value::Int(0));            // mark
+            ctx.set_field(bais, 1, Value::Int(0)); // pos
+            ctx.set_field(bais, 2, Value::Int(0)); // mark
             ctx.set_field(bais, 3, Value::Int(stdout_bytes.len() as i32)); // count
             Ok(Some(Value::Object(Some(bais))))
         },
@@ -7983,8 +8177,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
             ctx.set_field(bais, 0, Value::Object(Some(arr))); // buf
-            ctx.set_field(bais, 1, Value::Int(0));            // pos
-            ctx.set_field(bais, 2, Value::Int(0));            // mark
+            ctx.set_field(bais, 1, Value::Int(0)); // pos
+            ctx.set_field(bais, 2, Value::Int(0)); // mark
             ctx.set_field(bais, 3, Value::Int(stderr_bytes.len() as i32)); // count
             Ok(Some(Value::Object(Some(bais))))
         },
@@ -8070,7 +8264,9 @@ fn df_add_grouping(s: &str) -> String {
             result.push(',');
         }
     }
-    let groups: Vec<&str> = digits[remainder..].as_bytes().chunks(3)
+    let groups: Vec<&str> = digits[remainder..]
+        .as_bytes()
+        .chunks(3)
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
     result.push_str(&groups.join(","));
@@ -8189,79 +8385,107 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     let raf = "java/io/RandomAccessFile";
 
     // <init>(String name, String mode)
-    r.register(raf, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Err(RuntimeError::IllegalArgumentException { message: "null path".into() }.into()),
-        };
-        let mode_str = match args.get(2) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => "r".into(),
-        };
-        let writable = mode_str.contains('w');
-        let create = writable; // create file if mode is "rw"/"rws"/"rwd"
+    r.register(
+        raf,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "null path".into(),
+                    }
+                    .into())
+                }
+            };
+            let mode_str = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => "r".into(),
+            };
+            let writable = mode_str.contains('w');
+            let create = writable; // create file if mode is "rw"/"rws"/"rwd"
 
-        if !writable {
-            // Read-only mode: use open_read
-            let fd_id = ctx.fd_table().open_read_write(&path, false)
-                .or_else(|_| {
-                    // Fallback: try read-only open
-                    ctx.fd_table().open_read(&path).map(|id| id)
-                })
-                .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-            raf_set_fd(ctx, this, fd_id);
-            ctx.set_field(this, 1, Value::Int(0)); // read-only
-        } else {
-            let fd_id = ctx.fd_table().open_read_write(&path, create)
-                .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-            raf_set_fd(ctx, this, fd_id);
-            ctx.set_field(this, 1, Value::Int(1)); // read-write
-        }
-        Ok(None)
-    });
+            if !writable {
+                // Read-only mode: use open_read
+                let fd_id = ctx
+                    .fd_table()
+                    .open_read_write(&path, false)
+                    .or_else(|_| {
+                        // Fallback: try read-only open
+                        ctx.fd_table().open_read(&path).map(|id| id)
+                    })
+                    .map_err(|e| RuntimeError::IOException {
+                        message: format!("Cannot open {}: {}", path, e),
+                    })?;
+                raf_set_fd(ctx, this, fd_id);
+                ctx.set_field(this, 1, Value::Int(0)); // read-only
+            } else {
+                let fd_id = ctx.fd_table().open_read_write(&path, create).map_err(|e| {
+                    RuntimeError::IOException {
+                        message: format!("Cannot open {}: {}", path, e),
+                    }
+                })?;
+                raf_set_fd(ctx, this, fd_id);
+                ctx.set_field(this, 1, Value::Int(1)); // read-write
+            }
+            Ok(None)
+        },
+    );
 
     // <init>(File file, String mode)
-    r.register(raf, "<init>", "(Ljava/io/File;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // File.path / File.holder.path / synthetic slot-0 fallback chain.
-        let path = match args.get(1) {
-            Some(Value::Object(Some(f))) => {
-                // Real-JDK `java.io.File` exposes the absolute path through
-                // the private `path` field (a `String`). Try that first; fall
-                // back to the synthetic slot-0 layout for the legacy probes.
-                let by_name = ctx.get_field_by_name(*f, "path");
-                let p = match by_name {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => match ctx.get_field(*f, 0) {
+    r.register(
+        raf,
+        "<init>",
+        "(Ljava/io/File;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // File.path / File.holder.path / synthetic slot-0 fallback chain.
+            let path = match args.get(1) {
+                Some(Value::Object(Some(f))) => {
+                    // Real-JDK `java.io.File` exposes the absolute path through
+                    // the private `path` field (a `String`). Try that first; fall
+                    // back to the synthetic slot-0 layout for the legacy probes.
+                    let by_name = ctx.get_field_by_name(*f, "path");
+                    let p = match by_name {
                         Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    },
-                };
-                p.unwrap_or_default()
+                        _ => match ctx.get_field(*f, 0) {
+                            Value::Object(Some(s)) => ctx.read_string(s),
+                            _ => None,
+                        },
+                    };
+                    p.unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            if std::env::var_os("CRATONVM_DBG_RAF_INIT").is_some() {
+                eprintln!("[RAF_INIT] file ctor path='{}'", path);
             }
-            _ => String::new(),
-        };
-        if std::env::var_os("CRATONVM_DBG_RAF_INIT").is_some() {
-            eprintln!("[RAF_INIT] file ctor path='{}'", path);
-        }
-        let mode_str = match args.get(2) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => "r".into(),
-        };
-        let writable = mode_str.contains('w');
-        let fd_id = ctx.fd_table().open_read_write(&path, writable)
-            .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-        raf_set_fd(ctx, this, fd_id);
-        ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
-        Ok(None)
-    });
+            let mode_str = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => "r".into(),
+            };
+            let writable = mode_str.contains('w');
+            let fd_id = ctx
+                .fd_table()
+                .open_read_write(&path, writable)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("Cannot open {}: {}", path, e),
+                })?;
+            raf_set_fd(ctx, this, fd_id);
+            ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
+            Ok(None)
+        },
+    );
 
     // read() -> int (single byte, -1 on EOF)
     r.register(raf, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
+        if fd_id < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
         let mut buf = [0u8; 1];
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
@@ -8274,7 +8498,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
+        if fd_id < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(-1))),
@@ -8288,13 +8514,18 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.wrapping_add(len) },
-            }.into());
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into(),
+            );
         }
         let off = off as usize;
         let len = len as usize;
-        if len == 0 { return Ok(Some(Value::Int(0))); }
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let mut buf = vec![0u8; len];
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
@@ -8312,7 +8543,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "read", "([B)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
+        if fd_id < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Int(-1))),
@@ -8337,16 +8570,31 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
-            _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "null buffer".into(),
+                }
+                .into())
+            }
         };
         let len = ctx.array_length(arr);
         let mut buf = vec![0u8; len];
         let mut total = 0;
         while total < len {
             match ctx.fd_table().rw_read(fd_id as u32, &mut buf[total..]) {
-                Ok(0) => return Err(RuntimeError::IOException { message: "Unexpected end of file".into() }.into()),
+                Ok(0) => {
+                    return Err(RuntimeError::IOException {
+                        message: "Unexpected end of file".into(),
+                    }
+                    .into())
+                }
                 Ok(n) => total += n,
-                Err(e) => return Err(RuntimeError::IOException { message: e.to_string() }.into()),
+                Err(e) => {
+                    return Err(RuntimeError::IOException {
+                        message: e.to_string(),
+                    }
+                    .into())
+                }
             }
         }
         for i in 0..len {
@@ -8361,7 +8609,12 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
-            _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "null buffer".into(),
+                }
+                .into())
+            }
         };
         // BUG nb-phases-late(1): same bounds-check as read([BII) — validate
         // signed off/len before casting to usize to avoid a negative-len
@@ -8370,9 +8623,12 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.wrapping_add(len) },
-            }.into());
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into(),
+            );
         }
         let off = off as usize;
         let len = len as usize;
@@ -8380,9 +8636,19 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let mut total = 0;
         while total < len {
             match ctx.fd_table().rw_read(fd_id as u32, &mut buf[total..]) {
-                Ok(0) => return Err(RuntimeError::IOException { message: "Unexpected end of file".into() }.into()),
+                Ok(0) => {
+                    return Err(RuntimeError::IOException {
+                        message: "Unexpected end of file".into(),
+                    }
+                    .into())
+                }
                 Ok(n) => total += n,
-                Err(e) => return Err(RuntimeError::IOException { message: e.to_string() }.into()),
+                Err(e) => {
+                    return Err(RuntimeError::IOException {
+                        message: e.to_string(),
+                    }
+                    .into())
+                }
             }
         }
         for i in 0..len {
@@ -8396,8 +8662,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        ctx.fd_table().rw_write(fd_id as u32, &[b])
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &[b])
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
 
@@ -8415,9 +8684,12 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let arr_len = ctx.array_length(arr) as i64;
         if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
-            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.wrapping_add(len) },
-            }.into());
+            return Err(
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into(),
+            );
         }
         let off = off as usize;
         let len = len as usize;
@@ -8427,8 +8699,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 buf.push(b as u8);
             }
         }
-        ctx.fd_table().rw_write(fd_id as u32, &buf)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &buf)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
 
@@ -8447,8 +8722,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 buf.push(b as u8);
             }
         }
-        ctx.fd_table().rw_write(fd_id as u32, &buf)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &buf)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
 
@@ -8463,8 +8741,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
             _ => 0,
         };
-        ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.fd_table()
+            .rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
 
@@ -8493,8 +8774,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()) as u64,
             _ => 0,
         };
-        ctx.fd_table().rw_set_length(fd_id as u32, new_len)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.fd_table()
+            .rw_set_length(fd_id as u32, new_len)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
 
@@ -8609,14 +8893,20 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if buf[0] == b'\n' { break; }
-                    if buf[0] != b'\r' { line.push(buf[0]); }
+                    if buf[0] == b'\n' {
+                        break;
+                    }
+                    if buf[0] != b'\r' {
+                        line.push(buf[0]);
+                    }
                 }
                 Err(_) => break,
             }
         }
-        if line.is_empty() && ctx.fd_table().rw_position(fd_id as u32).unwrap_or(0)
-            >= ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) {
+        if line.is_empty()
+            && ctx.fd_table().rw_position(fd_id as u32).unwrap_or(0)
+                >= ctx.fd_table().file_size(fd_id as u32).unwrap_or(0)
+        {
             return Ok(Some(Value::Object(None))); // EOF
         }
         let s = String::from_utf8_lossy(&line).to_string();
@@ -8635,7 +8925,10 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     r.register(raf, "writeLong", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        let v = match args.get(1) { Some(Value::Long(l)) => *l, _ => 0 };
+        let v = match args.get(1) {
+            Some(Value::Long(l)) => *l,
+            _ => 0,
+        };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
@@ -8664,20 +8957,28 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &[if v != 0 { 1 } else { 0 }]);
+        let _ = ctx
+            .fd_table()
+            .rw_write(fd_id as u32, &[if v != 0 { 1 } else { 0 }]);
         Ok(None)
     });
     r.register(raf, "writeFloat", "(F)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        let v = match args.get(1) { Some(Value::Float(f)) => *f, _ => 0.0 };
+        let v = match args.get(1) {
+            Some(Value::Float(f)) => *f,
+            _ => 0.0,
+        };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeDouble", "(D)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
-        let v = match args.get(1) { Some(Value::Double(d)) => *d, _ => 0.0 };
+        let v = match args.get(1) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
@@ -8691,7 +8992,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let bytes = s.as_bytes();
         let len = bytes.len().min(65535) as u16;
         let _ = ctx.fd_table().rw_write(fd_id as u32, &len.to_be_bytes());
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &bytes[..len as usize]);
+        let _ = ctx
+            .fd_table()
+            .rw_write(fd_id as u32, &bytes[..len as usize]);
         Ok(None)
     });
     r.register(raf, "writeBytes", "(Ljava/lang/String;)V", |ctx, args| {
@@ -8712,7 +9015,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             _ => String::new(),
         };
         for ch in s.chars() {
-            let _ = ctx.fd_table().rw_write(fd_id as u32, &(ch as u16).to_be_bytes());
+            let _ = ctx
+                .fd_table()
+                .rw_write(fd_id as u32, &(ch as u16).to_be_bytes());
         }
         Ok(None)
     });
@@ -8761,34 +9066,57 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         }
         Ok(Some(Value::Object(Some(fd))))
     });
-    r.register(raf, "getChannel", "()Ljava/nio/channels/FileChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
-        ctx.set_field(fc, 0, ctx.get_field(this, 0));
-        Ok(Some(Value::Object(Some(fc))))
-    });
+    r.register(
+        raf,
+        "getChannel",
+        "()Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
+            ctx.set_field(fc, 0, ctx.get_field(this, 0));
+            Ok(Some(Value::Object(Some(fc))))
+        },
+    );
     r.register(raf, "skipBytes", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if n <= 0 { return Ok(Some(Value::Int(0))); }
+        if n <= 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let pos = ctx.fd_table().rw_position(fd_id as u32).unwrap_or(0);
         let size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0);
         let skip = (n as u64).min(size.saturating_sub(pos));
-        let _ = ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Current(skip as i64));
+        let _ = ctx
+            .fd_table()
+            .rw_seek(fd_id as u32, std::io::SeekFrom::Current(skip as i64));
         Ok(Some(Value::Int(skip as i32)))
     });
     r.set_category(__prev_cat);
 }
 
 /// Read exactly `buf.len()` bytes from a RAF fd, or error.
-fn raf_read_fully(ctx: &mut dyn NativeContext, fd_id: i32, buf: &mut [u8]) -> Result<(), MethodCallFailed> {
+fn raf_read_fully(
+    ctx: &mut dyn NativeContext,
+    fd_id: i32,
+    buf: &mut [u8],
+) -> Result<(), MethodCallFailed> {
     let mut total = 0;
     while total < buf.len() {
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf[total..]) {
-            Ok(0) => return Err(RuntimeError::IOException { message: "Unexpected end of file".into() }.into()),
+            Ok(0) => {
+                return Err(RuntimeError::IOException {
+                    message: "Unexpected end of file".into(),
+                }
+                .into())
+            }
             Ok(n) => total += n,
-            Err(e) => return Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: e.to_string(),
+                }
+                .into())
+            }
         }
     }
     Ok(())
@@ -8814,8 +9142,22 @@ fn encode_file_uri_path(path: &str) -> String {
         b.is_ascii_alphanumeric()
             || matches!(
                 b,
-                b'/' | b'_' | b'-' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-                    | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b','
+                b'/' | b'_'
+                    | b'-'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b':'
+                    | b'@'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'$'
+                    | b','
             )
     }
     let mut out = String::with_capacity(path.len());
@@ -8871,11 +9213,7 @@ fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 fn file_normalise_path(path: &str) -> String {
     let bytes = path.as_bytes();
     // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
-    if bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b':'
-    {
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
         return path[1..].replace('/', "\\");
     }
     // Otherwise normalise forward slashes for consistency with Java's
@@ -9004,46 +9342,56 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
 
     // <init>(String parent, String child)V
-    r.register(file, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let parent = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let child = match args.get(2) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
-        // whose semantics differ from Java and broke `File`-based resource lookup
-        // (the whole catalina.webresources cluster): `push("")` appends a trailing
-        // separator (path no longer denotes the file → exists() false) and
-        // `push("/")` treats the child as absolute and discards the parent. Match
-        // Java: strip leading/trailing separators from the child, a trailing one
-        // from the parent, join with a separator, then normalise (slash
-        // conversion + collapse). Empty child → just the normalised parent.
-        let path = file_join_parent_child(&parent, &child);
-        let s = ctx.create_string(&path);
-        ctx.set_field(this, 0, Value::Object(Some(s)));
-        Ok(None)
-    });
+    r.register(
+        file,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let parent = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let child = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
+            // whose semantics differ from Java and broke `File`-based resource lookup
+            // (the whole catalina.webresources cluster): `push("")` appends a trailing
+            // separator (path no longer denotes the file → exists() false) and
+            // `push("/")` treats the child as absolute and discards the parent. Match
+            // Java: strip leading/trailing separators from the child, a trailing one
+            // from the parent, join with a separator, then normalise (slash
+            // conversion + collapse). Empty child → just the normalised parent.
+            let path = file_join_parent_child(&parent, &child);
+            let s = ctx.create_string(&path);
+            ctx.set_field(this, 0, Value::Object(Some(s)));
+            Ok(None)
+        },
+    );
 
     // <init>(File parent, String child)V
-    r.register(file, "<init>", "(Ljava/io/File;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let parent_path = match args.get(1) {
-            Some(Value::Object(Some(p))) => file_read_path(ctx, *p),
-            _ => String::new(),
-        };
-        let child = match args.get(2) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let path = file_join_parent_child(&parent_path, &child);
-        let s = ctx.create_string(&path);
-        ctx.set_field(this, 0, Value::Object(Some(s)));
-        Ok(None)
-    });
+    r.register(
+        file,
+        "<init>",
+        "(Ljava/io/File;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let parent_path = match args.get(1) {
+                Some(Value::Object(Some(p))) => file_read_path(ctx, *p),
+                _ => String::new(),
+            };
+            let child = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let path = file_join_parent_child(&parent_path, &child);
+            let s = ctx.create_string(&path);
+            ctx.set_field(this, 0, Value::Object(Some(s)));
+            Ok(None)
+        },
+    );
 
     // <init>(URI)V — `new File(file:/path)`.
     //
@@ -9190,20 +9538,25 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Object(None))),
         }
     });
-    r.register(file, "getAbsolutePath", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let p = std::path::Path::new(&path);
-        let abs = if p.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                .unwrap_or(path)
-        };
-        let s = ctx.create_string(&abs);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        file,
+        "getAbsolutePath",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, this);
+            let p = std::path::Path::new(&path);
+            let abs = if p.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            };
+            let s = ctx.create_string(&abs);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.register(file, "getAbsoluteFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
@@ -9222,13 +9575,18 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
     // makes a later `File.toURI()` produce `file://?/C:/...`, an invalid
     // URL that breaks Tomcat's `ClassLoaderFactory.buildClassLoaderUrl`.
-    r.register(file, "getCanonicalPath", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let canonical = file_canonicalize_path(&path);
-        let s = ctx.create_string(&canonical);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        file,
+        "getCanonicalPath",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, this);
+            let canonical = file_canonicalize_path(&path);
+            let s = ctx.create_string(&canonical);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.register(file, "getCanonicalFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
@@ -9255,15 +9613,22 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "isFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let result = std::fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false);
+        let result = std::fs::metadata(&path)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     });
     r.register(file, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let result = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        let result = std::fs::metadata(&path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-            eprintln!("[DBG_SBLOAD] File.isDirectory() path={:?} -> {}", path, result);
+            eprintln!(
+                "[DBG_SBLOAD] File.isDirectory() path={:?} -> {}",
+                path, result
+            );
         }
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     });
@@ -9313,7 +9678,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "length", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+        let size = std::fs::metadata(&path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
         Ok(Some(Value::Long(size)))
     });
     r.register(file, "lastModified", "()J", |ctx, args| {
@@ -9355,10 +9722,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "createNewFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => Ok(Some(Value::Int(1))),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(Value::Int(0))),
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
     r.register(file, "renameTo", "(Ljava/io/File;)Z", |ctx, args| {
@@ -9374,11 +9748,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "setLastModified", "(J)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let millis = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let millis = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         // Use std::fs::File + set_modified (Rust 1.75+)
-        let ok = std::fs::OpenOptions::new().write(true).open(&path)
+        let ok = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .and_then(|f| {
-                let time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis.max(0) as u64);
+                let time =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis.max(0) as u64);
                 f.set_modified(time)
             })
             .is_ok();
@@ -9508,116 +9888,142 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         }
     });
     // listFiles(FileFilter) — invoke filter.accept(File) for each entry
-    r.register(file, "listFiles", "(Ljava/io/FileFilter;)[Ljava/io/File;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let filter = args.get(1).copied().unwrap_or(Value::Object(None));
-        let entries: Vec<String> = match std::fs::read_dir(&path) {
-            Ok(iter) => iter.filter_map(|e| e.ok())
-                .map(|e| e.path().to_string_lossy().into_owned()).collect(),
-            Err(_) => return Ok(Some(Value::Object(None))),
-        };
-        let mut accepted: Vec<ObjectRef> = Vec::new();
-        for entry_path in &entries {
-            let file_obj = file_alloc(ctx, entry_path);
-            let accept = match filter {
-                Value::Object(Some(f)) => {
-                    match ctx.invoke_virtual(f, "accept", "(Ljava/io/File;)Z", &[Value::Object(Some(file_obj))]) {
-                        Ok(Some(Value::Int(v))) => v != 0,
-                        _ => true, // on failure, include
-                    }
-                }
-                _ => true, // null filter accepts everything
+    r.register(
+        file,
+        "listFiles",
+        "(Ljava/io/FileFilter;)[Ljava/io/File;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, this);
+            let filter = args.get(1).copied().unwrap_or(Value::Object(None));
+            let entries: Vec<String> = match std::fs::read_dir(&path) {
+                Ok(iter) => iter
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => return Ok(Some(Value::Object(None))),
             };
-            if accept {
-                accepted.push(file_obj);
+            let mut accepted: Vec<ObjectRef> = Vec::new();
+            for entry_path in &entries {
+                let file_obj = file_alloc(ctx, entry_path);
+                let accept = match filter {
+                    Value::Object(Some(f)) => {
+                        match ctx.invoke_virtual(
+                            f,
+                            "accept",
+                            "(Ljava/io/File;)Z",
+                            &[Value::Object(Some(file_obj))],
+                        ) {
+                            Ok(Some(Value::Int(v))) => v != 0,
+                            _ => true, // on failure, include
+                        }
+                    }
+                    _ => true, // null filter accepts everything
+                };
+                if accept {
+                    accepted.push(file_obj);
+                }
             }
-        }
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
-        for (i, f) in accepted.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*f)));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            for (i, f) in accepted.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Object(Some(*f)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
     // listFiles(FilenameFilter) — invoke filter.accept(File dir, String name)
-    r.register(file, "listFiles", "(Ljava/io/FilenameFilter;)[Ljava/io/File;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let filter = args.get(1).copied().unwrap_or(Value::Object(None));
-        let entries: Vec<(String, String)> = match std::fs::read_dir(&path) {
-            Ok(iter) => iter.filter_map(|e| e.ok())
-                .map(|e| {
-                    let full = e.path().to_string_lossy().into_owned();
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    (full, name)
-                }).collect(),
-            Err(_) => return Ok(Some(Value::Object(None))),
-        };
-        let mut accepted: Vec<ObjectRef> = Vec::new();
-        for (full, name) in &entries {
-            let accept = match filter {
-                Value::Object(Some(f)) => {
-                    let name_str = ctx.create_string(name);
-                    match ctx.invoke_virtual(
-                        f,
-                        "accept",
-                        "(Ljava/io/File;Ljava/lang/String;)Z",
-                        &[Value::Object(Some(this)), Value::Object(Some(name_str))],
-                    ) {
-                        Ok(Some(Value::Int(v))) => v != 0,
-                        _ => true,
-                    }
-                }
-                _ => true,
+    r.register(
+        file,
+        "listFiles",
+        "(Ljava/io/FilenameFilter;)[Ljava/io/File;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, this);
+            let filter = args.get(1).copied().unwrap_or(Value::Object(None));
+            let entries: Vec<(String, String)> = match std::fs::read_dir(&path) {
+                Ok(iter) => iter
+                    .filter_map(|e| e.ok())
+                    .map(|e| {
+                        let full = e.path().to_string_lossy().into_owned();
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        (full, name)
+                    })
+                    .collect(),
+                Err(_) => return Ok(Some(Value::Object(None))),
             };
-            if accept {
-                accepted.push(file_alloc(ctx, full));
+            let mut accepted: Vec<ObjectRef> = Vec::new();
+            for (full, name) in &entries {
+                let accept = match filter {
+                    Value::Object(Some(f)) => {
+                        let name_str = ctx.create_string(name);
+                        match ctx.invoke_virtual(
+                            f,
+                            "accept",
+                            "(Ljava/io/File;Ljava/lang/String;)Z",
+                            &[Value::Object(Some(this)), Value::Object(Some(name_str))],
+                        ) {
+                            Ok(Some(Value::Int(v))) => v != 0,
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                };
+                if accept {
+                    accepted.push(file_alloc(ctx, full));
+                }
             }
-        }
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
-        for (i, f) in accepted.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*f)));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            for (i, f) in accepted.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Object(Some(*f)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
     // list(FilenameFilter) — string array variant
-    r.register(file, "list", "(Ljava/io/FilenameFilter;)[Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let filter = args.get(1).copied().unwrap_or(Value::Object(None));
-        let entries: Vec<String> = match std::fs::read_dir(&path) {
-            Ok(iter) => iter.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
-            Err(_) => return Ok(Some(Value::Object(None))),
-        };
-        let mut accepted: Vec<String> = Vec::new();
-        for name in &entries {
-            let accept = match filter {
-                Value::Object(Some(f)) => {
-                    let name_str = ctx.create_string(name);
-                    match ctx.invoke_virtual(
-                        f,
-                        "accept",
-                        "(Ljava/io/File;Ljava/lang/String;)Z",
-                        &[Value::Object(Some(this)), Value::Object(Some(name_str))],
-                    ) {
-                        Ok(Some(Value::Int(v))) => v != 0,
-                        _ => true,
-                    }
-                }
-                _ => true,
+    r.register(
+        file,
+        "list",
+        "(Ljava/io/FilenameFilter;)[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, this);
+            let filter = args.get(1).copied().unwrap_or(Value::Object(None));
+            let entries: Vec<String> = match std::fs::read_dir(&path) {
+                Ok(iter) => iter
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => return Ok(Some(Value::Object(None))),
             };
-            if accept {
-                accepted.push(name.clone());
+            let mut accepted: Vec<String> = Vec::new();
+            for name in &entries {
+                let accept = match filter {
+                    Value::Object(Some(f)) => {
+                        let name_str = ctx.create_string(name);
+                        match ctx.invoke_virtual(
+                            f,
+                            "accept",
+                            "(Ljava/io/File;Ljava/lang/String;)Z",
+                            &[Value::Object(Some(this)), Value::Object(Some(name_str))],
+                        ) {
+                            Ok(Some(Value::Int(v))) => v != 0,
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                };
+                if accept {
+                    accepted.push(name.clone());
+                }
             }
-        }
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
-        for (i, name) in accepted.iter().enumerate() {
-            let s = ctx.create_string(name);
-            ctx.set_array_element(arr, i, Value::Object(Some(s)));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            for (i, name) in accepted.iter().enumerate() {
+                let s = ctx.create_string(name);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
 
     // --- Disk space (fallback: return i64::MAX when no OS query is available) ---
     r.register(file, "getFreeSpace", "()J", |_ctx, _args| {
@@ -9730,7 +10136,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     out.push(root);
                 }
             }
-            if out.is_empty() { out.push("C:\\".to_string()); }
+            if out.is_empty() {
+                out.push("C:\\".to_string());
+            }
             out
         };
         #[cfg(not(windows))]
@@ -9742,47 +10150,64 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(arr))))
     });
-    r.register(file, "createTempFile", "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/File;", |ctx, args| {
-        let prefix = match args.get(0) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-            _ => "tmp".into(),
-        };
-        let suffix = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| ".tmp".into()),
-            _ => ".tmp".into(),
-        };
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_dir = std::env::temp_dir();
-        let file_name = format!("{}{}{}", prefix, nanos, suffix);
-        let full = tmp_dir.join(&file_name).to_string_lossy().into_owned();
-        let _ = std::fs::File::create(&full);
-        Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
-    });
-    r.register(file, "createTempFile", "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;", |ctx, args| {
-        let prefix = match args.get(0) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-            _ => "tmp".into(),
-        };
-        let suffix = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| ".tmp".into()),
-            _ => ".tmp".into(),
-        };
-        let dir_path = match args.get(2) {
-            Some(Value::Object(Some(f))) => file_read_path(ctx, *f),
-            _ => std::env::temp_dir().to_string_lossy().into_owned(),
-        };
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let file_name = format!("{}{}{}", prefix, nanos, suffix);
-        let full = std::path::PathBuf::from(&dir_path).join(&file_name).to_string_lossy().into_owned();
-        let _ = std::fs::File::create(&full);
-        Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
-    });
+    r.register(
+        file,
+        "createTempFile",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/File;",
+        |ctx, args| {
+            let prefix = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
+                _ => "tmp".into(),
+            };
+            let suffix = match args.get(1) {
+                Some(Value::Object(Some(s))) => {
+                    ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())
+                }
+                _ => ".tmp".into(),
+            };
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_dir = std::env::temp_dir();
+            let file_name = format!("{}{}{}", prefix, nanos, suffix);
+            let full = tmp_dir.join(&file_name).to_string_lossy().into_owned();
+            let _ = std::fs::File::create(&full);
+            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
+        },
+    );
+    r.register(
+        file,
+        "createTempFile",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
+        |ctx, args| {
+            let prefix = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
+                _ => "tmp".into(),
+            };
+            let suffix = match args.get(1) {
+                Some(Value::Object(Some(s))) => {
+                    ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())
+                }
+                _ => ".tmp".into(),
+            };
+            let dir_path = match args.get(2) {
+                Some(Value::Object(Some(f))) => file_read_path(ctx, *f),
+                _ => std::env::temp_dir().to_string_lossy().into_owned(),
+            };
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let file_name = format!("{}{}{}", prefix, nanos, suffix);
+            let full = std::path::PathBuf::from(&dir_path)
+                .join(&file_name)
+                .to_string_lossy()
+                .into_owned();
+            let _ = std::fs::File::create(&full);
+            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
+        },
+    );
     r.register(file, "deleteOnExit", "()V", |_ctx, _args| {
         // Best effort: no actual tracking; caller should delete manually
         Ok(None)
@@ -9827,48 +10252,84 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
-        let pos = ctx.fd_table().rw_position(fd_id as u32)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        let pos =
+            ctx.fd_table()
+                .rw_position(fd_id as u32)
+                .map_err(|e| RuntimeError::IOException {
+                    message: e.to_string(),
+                })?;
         Ok(Some(Value::Long(pos as i64)))
     });
 
     // position(J)FileChannel — returns this
-    r.register(fc, "position", "(J)Ljava/nio/channels/FileChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let pos = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        if fd_id >= 0 {
-            ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
-                .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
-        }
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        fc,
+        "position",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let pos = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            if fd_id >= 0 {
+                ctx.fd_table()
+                    .rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
+                    .map_err(|e| RuntimeError::IOException {
+                        message: e.to_string(),
+                    })?;
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // size()J
     r.register(fc, "size", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
-        let sz = ctx.fd_table().file_size(fd_id as u32)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        let sz = ctx
+            .fd_table()
+            .file_size(fd_id as u32)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(Some(Value::Long(sz as i64)))
     });
 
     // truncate(J)FileChannel
-    r.register(fc, "truncate", "(J)Ljava/nio/channels/FileChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let new_len = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        if fd_id >= 0 {
-            ctx.fd_table().rw_set_length(fd_id as u32, new_len.max(0) as u64)
-                .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
-        }
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        fc,
+        "truncate",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let new_len = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            if fd_id >= 0 {
+                ctx.fd_table()
+                    .rw_set_length(fd_id as u32, new_len.max(0) as u64)
+                    .map_err(|e| RuntimeError::IOException {
+                        message: e.to_string(),
+                    })?;
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // read(ByteBuffer)I
     r.register(fc, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
@@ -9900,7 +10361,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -9909,7 +10373,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
         let bb = match args.get(1) {
             Some(Value::Object(Some(b))) => *b,
@@ -9927,8 +10394,11 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
             }
         }
-        let n = ctx.fd_table().rw_write(fd_id as u32, &data)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        let n = ctx.fd_table().rw_write(fd_id as u32, &data).map_err(|e| {
+            RuntimeError::IOException {
+                message: e.to_string(),
+            }
+        })?;
         ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
         Ok(Some(Value::Int(n as i32)))
     });
@@ -9937,7 +10407,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     r.register(fc, "read", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let position = match args.get(2) { Some(Value::Long(v)) => *v, _ => 0 };
+        let position = match args.get(2) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         if fd_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -9952,7 +10425,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; remaining];
-        match ctx.fd_table().pread_at(fd_id as u32, &mut buf, position.max(0) as u64) {
+        match ctx
+            .fd_table()
+            .pread_at(fd_id as u32, &mut buf, position.max(0) as u64)
+        {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
                 if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
@@ -9963,7 +10439,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -9971,9 +10450,15 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     r.register(fc, "write", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let position = match args.get(2) { Some(Value::Long(v)) => *v, _ => 0 };
+        let position = match args.get(2) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
         let bb = match args.get(1) {
             Some(Value::Object(Some(b))) => *b,
@@ -9991,137 +10476,183 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
             }
         }
-        let n = ctx.fd_table().pwrite_at(fd_id as u32, &data, position.max(0) as u64)
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        let n = ctx
+            .fd_table()
+            .pwrite_at(fd_id as u32, &data, position.max(0) as u64)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
         Ok(Some(Value::Int(n as i32)))
     });
 
     // transferTo(long position, long count, WritableByteChannel target)J
-    r.register(fc, "transferTo", "(JJLjava/nio/channels/WritableByteChannel;)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let position = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        let count = match args.get(2) { Some(Value::Long(v)) => *v, _ => 0 };
-        let target = match args.get(3) {
-            Some(Value::Object(Some(t))) => *t,
-            _ => return Ok(Some(Value::Long(0))),
-        };
-        if fd_id < 0 || count <= 0 {
-            return Ok(Some(Value::Long(0)));
-        }
-        // BUG nb-phases-late(2): a huge `count` (up to Long.MAX_VALUE) was fed
-        // straight into `vec![0u8; count as usize]` → exabyte allocation abort.
-        // The JDK clamps the transfer to the bytes actually available
-        // (file_size - position) and streams through a bounded buffer. Clamp
-        // `count` to what remains in the source file, then loop in chunks so
-        // the per-iteration allocation is bounded regardless of `count`.
-        let position = position.max(0);
-        let file_size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) as i64;
-        let available = (file_size - position).max(0);
-        // Clamp to the bytes available in the source file when we have a real
-        // size; for non-regular/unknown-size fds (file_size==0) fall back to the
-        // caller's `count` and let the chunked read loop stop at EOF — this keeps
-        // the per-iteration allocation bounded either way.
-        let mut to_transfer = if file_size > 0 { count.min(available) } else { count };
-        if to_transfer <= 0 {
-            return Ok(Some(Value::Long(0)));
-        }
-        // Bounded streaming buffer (8 MiB) — matches the JDK's chunked fallback
-        // when a true zero-copy sendfile is unavailable.
-        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
-        let mut total_written: i64 = 0;
-        let mut cur_pos = position;
-        while to_transfer > 0 {
-            let chunk = to_transfer.min(FC_XFER_CHUNK) as usize;
-            let mut buf = vec![0u8; chunk];
-            let n = ctx.fd_table().pread_at(fd_id as u32, &mut buf, cur_pos as u64).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            // Wrap in a ByteBuffer and call target.write(ByteBuffer)
-            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
-            for i in 0..n {
-                ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
-            }
-            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-            ctx.set_field(bb, 1, Value::Int(0));
-            ctx.set_field(bb, 2, Value::Int(n as i32));
-            let written = match ctx.invoke_virtual(target, "write", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-                Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
-                _ => n as i64,
-            };
-            total_written += written;
-            cur_pos += n as i64;
-            to_transfer -= n as i64;
-            // Short write from the target or short read from the source: stop,
-            // mirroring the JDK which returns the bytes transferred so far.
-            if (written as usize) < n || n < chunk {
-                break;
-            }
-        }
-        Ok(Some(Value::Long(total_written)))
-    });
-
-    // transferFrom(ReadableByteChannel src, long position, long count)J
-    r.register(fc, "transferFrom", "(Ljava/nio/channels/ReadableByteChannel;JJ)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        let src = match args.get(1) {
-            Some(Value::Object(Some(s))) => *s,
-            _ => return Ok(Some(Value::Long(0))),
-        };
-        let position = match args.get(2) { Some(Value::Long(v)) => *v, _ => 0 };
-        let count = match args.get(3) { Some(Value::Long(v)) => *v, _ => 0 };
-        if fd_id < 0 || count <= 0 {
-            return Ok(Some(Value::Long(0)));
-        }
-        // BUG nb-phases-late(2): `count` (a long) was used to size the
-        // ByteBuffer via `new_array(count as usize)` (exabyte alloc abort for a
-        // huge/Long.MAX_VALUE count) AND passed to the buffer's limit as
-        // `Int(count as i32)` (silent 64→32 bit truncation). The JDK streams
-        // through a bounded buffer in a loop. Clamp the per-iteration chunk to a
-        // sane ceiling and loop until `count` is satisfied or the source is
-        // exhausted, so the allocation is bounded and the limit never truncates.
-        const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
-        let mut remaining = count;
-        let mut cur_pos = position.max(0);
-        let mut total_written: i64 = 0;
-        while remaining > 0 {
-            let chunk = remaining.min(FC_XFER_CHUNK) as usize;
-            // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
-            let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
-            let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
-            ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
-            ctx.set_field(bb, 1, Value::Int(0));
-            // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
-            ctx.set_field(bb, 2, Value::Int(chunk as i32));
-            let read_n = match ctx.invoke_virtual(src, "read", "(Ljava/nio/ByteBuffer;)I", &[Value::Object(Some(bb))]) {
-                Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+    r.register(
+        fc,
+        "transferTo",
+        "(JJLjava/nio/channels/WritableByteChannel;)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let position = match args.get(1) {
+                Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            if read_n == 0 {
-                break;
+            let count = match args.get(2) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let target = match args.get(3) {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            if fd_id < 0 || count <= 0 {
+                return Ok(Some(Value::Long(0)));
             }
-            // Extract bytes from ByteBuffer (position is now read_n)
-            let mut data = vec![0u8; read_n];
-            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                for i in 0..read_n {
-                    data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+            // BUG nb-phases-late(2): a huge `count` (up to Long.MAX_VALUE) was fed
+            // straight into `vec![0u8; count as usize]` → exabyte allocation abort.
+            // The JDK clamps the transfer to the bytes actually available
+            // (file_size - position) and streams through a bounded buffer. Clamp
+            // `count` to what remains in the source file, then loop in chunks so
+            // the per-iteration allocation is bounded regardless of `count`.
+            let position = position.max(0);
+            let file_size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) as i64;
+            let available = (file_size - position).max(0);
+            // Clamp to the bytes available in the source file when we have a real
+            // size; for non-regular/unknown-size fds (file_size==0) fall back to the
+            // caller's `count` and let the chunked read loop stop at EOF — this keeps
+            // the per-iteration allocation bounded either way.
+            let mut to_transfer = if file_size > 0 {
+                count.min(available)
+            } else {
+                count
+            };
+            if to_transfer <= 0 {
+                return Ok(Some(Value::Long(0)));
+            }
+            // Bounded streaming buffer (8 MiB) — matches the JDK's chunked fallback
+            // when a true zero-copy sendfile is unavailable.
+            const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+            let mut total_written: i64 = 0;
+            let mut cur_pos = position;
+            while to_transfer > 0 {
+                let chunk = to_transfer.min(FC_XFER_CHUNK) as usize;
+                let mut buf = vec![0u8; chunk];
+                let n = ctx
+                    .fd_table()
+                    .pread_at(fd_id as u32, &mut buf, cur_pos as u64)
+                    .unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                // Wrap in a ByteBuffer and call target.write(ByteBuffer)
+                let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
+                for i in 0..n {
+                    ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
+                }
+                let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+                ctx.set_field(bb, 1, Value::Int(0));
+                ctx.set_field(bb, 2, Value::Int(n as i32));
+                let written = match ctx.invoke_virtual(
+                    target,
+                    "write",
+                    "(Ljava/nio/ByteBuffer;)I",
+                    &[Value::Object(Some(bb))],
+                ) {
+                    Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
+                    _ => n as i64,
+                };
+                total_written += written;
+                cur_pos += n as i64;
+                to_transfer -= n as i64;
+                // Short write from the target or short read from the source: stop,
+                // mirroring the JDK which returns the bytes transferred so far.
+                if (written as usize) < n || n < chunk {
+                    break;
                 }
             }
-            let written = ctx.fd_table().pwrite_at(fd_id as u32, &data, cur_pos as u64).unwrap_or(0);
-            total_written += written as i64;
-            cur_pos += written as i64;
-            remaining -= read_n as i64;
-            // Short read from the source means EOF: stop, returning bytes so far.
-            if read_n < chunk {
-                break;
+            Ok(Some(Value::Long(total_written)))
+        },
+    );
+
+    // transferFrom(ReadableByteChannel src, long position, long count)J
+    r.register(
+        fc,
+        "transferFrom",
+        "(Ljava/nio/channels/ReadableByteChannel;JJ)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let src = match args.get(1) {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let position = match args.get(2) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let count = match args.get(3) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            if fd_id < 0 || count <= 0 {
+                return Ok(Some(Value::Long(0)));
             }
-        }
-        Ok(Some(Value::Long(total_written)))
-    });
+            // BUG nb-phases-late(2): `count` (a long) was used to size the
+            // ByteBuffer via `new_array(count as usize)` (exabyte alloc abort for a
+            // huge/Long.MAX_VALUE count) AND passed to the buffer's limit as
+            // `Int(count as i32)` (silent 64→32 bit truncation). The JDK streams
+            // through a bounded buffer in a loop. Clamp the per-iteration chunk to a
+            // sane ceiling and loop until `count` is satisfied or the source is
+            // exhausted, so the allocation is bounded and the limit never truncates.
+            const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+            let mut remaining = count;
+            let mut cur_pos = position.max(0);
+            let mut total_written: i64 = 0;
+            while remaining > 0 {
+                let chunk = remaining.min(FC_XFER_CHUNK) as usize;
+                // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
+                let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
+                let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
+                ctx.set_field(bb, 1, Value::Int(0));
+                // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
+                ctx.set_field(bb, 2, Value::Int(chunk as i32));
+                let read_n = match ctx.invoke_virtual(
+                    src,
+                    "read",
+                    "(Ljava/nio/ByteBuffer;)I",
+                    &[Value::Object(Some(bb))],
+                ) {
+                    Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+                    _ => 0,
+                };
+                if read_n == 0 {
+                    break;
+                }
+                // Extract bytes from ByteBuffer (position is now read_n)
+                let mut data = vec![0u8; read_n];
+                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                    for i in 0..read_n {
+                        data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+                    }
+                }
+                let written = ctx
+                    .fd_table()
+                    .pwrite_at(fd_id as u32, &data, cur_pos as u64)
+                    .unwrap_or(0);
+                total_written += written as i64;
+                cur_pos += written as i64;
+                remaining -= read_n as i64;
+                // Short read from the source means EOF: stop, returning bytes so far.
+                if read_n < chunk {
+                    break;
+                }
+            }
+            Ok(Some(Value::Long(total_written)))
+        },
+    );
 
     // force(boolean metadata)V
     r.register(fc, "force", "(Z)V", |ctx, args| {
@@ -10137,11 +10668,16 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         if fd_id >= 0 {
             let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
             if let Ok(file) = ctx.fd_table().clone_file(fd_id as u32) {
-                let res = if metadata { file.sync_all() } else { file.sync_data() };
+                let res = if metadata {
+                    file.sync_all()
+                } else {
+                    file.sync_data()
+                };
                 if let Err(e) = res {
                     return Err(RuntimeError::IOException {
                         message: format!("FileChannel.force failed: {e}"),
-                    }.into());
+                    }
+                    .into());
                 }
             }
             // Non-file-backed fd (pipe/socket/etc.): nothing to sync — best effort.
@@ -10196,7 +10732,11 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
         let (grouping, max_frac, min_frac) = df_parse_pattern(&pattern);
-        ctx.set_field(this, DF_FIELD_GROUPING, Value::Int(if grouping { 1 } else { 0 }));
+        ctx.set_field(
+            this,
+            DF_FIELD_GROUPING,
+            Value::Int(if grouping { 1 } else { 0 }),
+        );
         ctx.set_field(this, DF_FIELD_MAX_FRAC, Value::Int(max_frac as i32));
         ctx.set_field(this, DF_FIELD_MIN_FRAC, Value::Int(min_frac as i32));
         Ok(None)
@@ -10617,25 +11157,35 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, FUT_FIELD_RESULT)))
     });
-    r.register(cf, "get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, FUT_FIELD_RESULT)))
-    });
+    r.register(
+        cf,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, FUT_FIELD_RESULT)))
+        },
+    );
     // isDone
     r.register(cf, "isDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, FUT_FIELD_DONE)))
     });
     // getNow — return result or default if not done
-    r.register(cf, "getNow", "(Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let done = matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(1));
-        if done {
-            Ok(Some(ctx.get_field(this, FUT_FIELD_RESULT)))
-        } else {
-            Ok(args.get(1).copied())
-        }
-    });
+    r.register(
+        cf,
+        "getNow",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let done = matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(1));
+            if done {
+                Ok(Some(ctx.get_field(this, FUT_FIELD_RESULT)))
+            } else {
+                Ok(args.get(1).copied())
+            }
+        },
+    );
     // complete — set result and mark done
     r.register(cf, "complete", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10650,8 +11200,18 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         }
     });
     // thenApply on CF itself (not just CompletionStage)
-    r.register(cf, "thenApply", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;", native_cf_then_apply);
-    r.register(cf, "thenAccept", "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;", native_cf_then_accept);
+    r.register(
+        cf,
+        "thenApply",
+        "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_apply,
+    );
+    r.register(
+        cf,
+        "thenAccept",
+        "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;",
+        native_cf_then_accept,
+    );
 
     // toCompletableFuture (identity)
     r.register(
@@ -10724,23 +11284,28 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
     // Executor.execute(Runnable) — runs the Runnable; if this is a delayed executor,
     // sleeps first for the delay stored in field 0.
     let executor = "java/util/concurrent/Executor";
-    r.register(executor, "execute", "(Ljava/lang/Runnable;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let runnable = match args.get(1) {
-            Some(Value::Object(Some(r))) => *r,
-            _ => return Ok(None),
-        };
-        // Check if this executor has a delay stored in field 0
-        let delay_ms = match ctx.get_field(this, 0) {
-            Value::Long(ms) if ms > 0 => ms as u64,
-            _ => 0,
-        };
-        if delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        }
-        let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-        Ok(None)
-    });
+    r.register(
+        executor,
+        "execute",
+        "(Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let runnable = match args.get(1) {
+                Some(Value::Object(Some(r))) => *r,
+                _ => return Ok(None),
+            };
+            // Check if this executor has a delay stored in field 0
+            let delay_ms = match ctx.get_field(this, 0) {
+                Value::Long(ms) if ms > 0 => ms as u64,
+                _ => 0,
+            };
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            Ok(None)
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -11029,39 +11594,52 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sc = "java/nio/channels/SocketChannel";
-    r.register(sc, "open", "()Ljava/nio/channels/SocketChannel;", |ctx, _args| {
-        let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
-        ctx.set_field(sc, 0, Value::Int(0));
-        ctx.set_field(sc, 1, Value::Int(1));
-        ctx.set_field(sc, 2, Value::Object(None));
-        ctx.set_field(sc, 3, Value::Int(-1));
-        Ok(Some(Value::Object(Some(sc))))
-    });
-    r.register(sc, "open", "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;", |ctx, args| {
-        let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
-        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        let sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
-        match ctx.fd_table().open_tcp_connect(&addr_str) {
-            Ok(fd) => {
-                ctx.set_field(sc_obj, 0, Value::Int(1));
-                ctx.set_field(sc_obj, 1, Value::Int(1));
-                let s = ctx.create_string(&addr_str);
-                ctx.set_field(sc_obj, 2, Value::Object(Some(s)));
-                ctx.set_field(sc_obj, 3, Value::Int(fd as i32));
+    r.register(
+        sc,
+        "open",
+        "()Ljava/nio/channels/SocketChannel;",
+        |ctx, _args| {
+            let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
+            ctx.set_field(sc, 0, Value::Int(0));
+            ctx.set_field(sc, 1, Value::Int(1));
+            ctx.set_field(sc, 2, Value::Object(None));
+            ctx.set_field(sc, 3, Value::Int(-1));
+            Ok(Some(Value::Object(Some(sc))))
+        },
+    );
+    r.register(
+        sc,
+        "open",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
+        |ctx, args| {
+            let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
+            let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+            let sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
+            match ctx.fd_table().open_tcp_connect(&addr_str) {
+                Ok(fd) => {
+                    ctx.set_field(sc_obj, 0, Value::Int(1));
+                    ctx.set_field(sc_obj, 1, Value::Int(1));
+                    let s = ctx.create_string(&addr_str);
+                    ctx.set_field(sc_obj, 2, Value::Object(Some(s)));
+                    ctx.set_field(sc_obj, 3, Value::Int(fd as i32));
+                }
+                Err(_) => {
+                    ctx.set_field(sc_obj, 0, Value::Int(0));
+                    ctx.set_field(sc_obj, 1, Value::Int(1));
+                    ctx.set_field(sc_obj, 2, Value::Object(None));
+                    ctx.set_field(sc_obj, 3, Value::Int(-1));
+                }
             }
-            Err(_) => {
-                ctx.set_field(sc_obj, 0, Value::Int(0));
-                ctx.set_field(sc_obj, 1, Value::Int(1));
-                ctx.set_field(sc_obj, 2, Value::Object(None));
-                ctx.set_field(sc_obj, 3, Value::Int(-1));
-            }
-        }
-        Ok(Some(Value::Object(Some(sc_obj))))
-    });
+            Ok(Some(Value::Object(Some(sc_obj))))
+        },
+    );
     r.register(sc, "connect", "(Ljava/net/SocketAddress;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.get_field(this, 1).as_int().unwrap_or(0) == 0 {
-            return Err(RuntimeError::IllegalStateException { message: "Channel is closed".into() }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: "Channel is closed".into(),
+            }
+            .into());
         }
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
@@ -11087,7 +11665,9 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd >= 0 { let _ = ctx.fd_table().close(fd as u32); }
+        if fd >= 0 {
+            let _ = ctx.fd_table().close(fd as u32);
+        }
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 3, Value::Int(-1));
@@ -11097,12 +11677,16 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sc, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd < 0 { return Ok(Some(Value::Int(-1))); }
+        if fd < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
         let bb = obj_arg(args, 1)?;
         let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
         let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
         let remaining = if limit > pos { limit - pos } else { 0 };
-        if remaining == 0 { return Ok(Some(Value::Int(0))); }
+        if remaining == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let mut buf = vec![0u8; remaining];
         match ctx.fd_table().tcp_read(fd as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
@@ -11123,16 +11707,22 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sc, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd < 0 { return Ok(Some(Value::Int(0))); }
+        if fd < 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let bb = obj_arg(args, 1)?;
         let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
         let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
         let remaining = if limit > pos { limit - pos } else { 0 };
-        if remaining == 0 { return Ok(Some(Value::Int(0))); }
+        if remaining == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let mut data = vec![0u8; remaining];
         if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
             for i in 0..remaining {
-                if let Value::Int(b) = ctx.get_array_element(arr, pos + i) { data[i] = b as u8; }
+                if let Value::Int(b) = ctx.get_array_element(arr, pos + i) {
+                    data[i] = b as u8;
+                }
             }
         }
         match ctx.fd_table().tcp_write(fd as u32, &data) {
@@ -11144,106 +11734,147 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             Err(_) => Ok(Some(Value::Int(-1))),
         }
     });
-    r.register(sc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd >= 0 { let _ = ctx.fd_table().tcp_set_nonblocking(fd as u32, blocking == 0); }
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        sc,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd >= 0 {
+                let _ = ctx.fd_table().tcp_set_nonblocking(fd as u32, blocking == 0);
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     r.register(sc, "finishConnect", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(sc, "getRemoteAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
-    });
+    r.register(
+        sc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 2)))
+        },
+    );
 
     // ServerSocketChannel = 4-field synthetic (open=0, bound=1, fd_id=2, cached_socket=3)
     let ssc = "java/nio/channels/ServerSocketChannel";
-    r.register(ssc, "open", "()Ljava/nio/channels/ServerSocketChannel;", |ctx, _args| {
-        let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4);
-        ctx.set_field(ssc, 0, Value::Int(1));
-        ctx.set_field(ssc, 1, Value::Int(0));
-        ctx.set_field(ssc, 2, Value::Int(-1));
-        ctx.set_field(ssc, 3, Value::Object(None));
-        Ok(Some(Value::Object(Some(ssc))))
-    });
-    r.register(ssc, "bind", "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
-        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-            eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
-        }
-        match ctx.fd_table().open_tcp_listener(&addr_str) {
-            Ok(fd) => {
-                ctx.set_field(this, 1, Value::Int(1));
-                ctx.set_field(this, 2, Value::Int(fd as i32));
-                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-                    eprintln!("[NIO_BIND] ssc.bind ok fd={fd}");
-                }
-                // If a wrapper ServerSocket has been cached, mirror the actual local port
-                // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
-                if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
-                    if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
-                        let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
-                        ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+    r.register(
+        ssc,
+        "open",
+        "()Ljava/nio/channels/ServerSocketChannel;",
+        |ctx, _args| {
+            let ssc = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4);
+            ctx.set_field(ssc, 0, Value::Int(1));
+            ctx.set_field(ssc, 1, Value::Int(0));
+            ctx.set_field(ssc, 2, Value::Int(-1));
+            ctx.set_field(ssc, 3, Value::Object(None));
+            Ok(Some(Value::Object(Some(ssc))))
+        },
+    );
+    r.register(
+        ssc,
+        "bind",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+            let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+            if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
+            }
+            match ctx.fd_table().open_tcp_listener(&addr_str) {
+                Ok(fd) => {
+                    ctx.set_field(this, 1, Value::Int(1));
+                    ctx.set_field(this, 2, Value::Int(fd as i32));
+                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                        eprintln!("[NIO_BIND] ssc.bind ok fd={fd}");
                     }
+                    // If a wrapper ServerSocket has been cached, mirror the actual local port
+                    // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
+                    if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                        if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                            let port = local
+                                .rsplit(':')
+                                .next()
+                                .and_then(|p| p.parse::<i32>().ok())
+                                .unwrap_or(0);
+                            ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+                        }
+                    }
+                    Ok(Some(Value::Object(Some(this))))
                 }
-                Ok(Some(Value::Object(Some(this))))
+                Err(e) => {
+                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                        eprintln!("[NIO_BIND] ssc.bind FAILED addr='{}' err={}", addr_str, e);
+                    }
+                    Err(RuntimeError::IOException {
+                        message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
+                    }
+                    .into())
+                }
             }
-            Err(e) => {
-                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-                    eprintln!("[NIO_BIND] ssc.bind FAILED addr='{}' err={}", addr_str, e);
-                }
-                Err(RuntimeError::IOException {
-                    message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
-                }
-                .into())
-            }
-        }
-    });
+        },
+    );
     // 2-arg variant: `bind(SocketAddress, int backlog)`. NioEndpoint calls
     // this one with `getAcceptCount()` as backlog. Without an explicit
     // override the JDK default routes through the 1-arg version, but the
     // real ServerSocketChannelImpl has a concrete 2-arg method that bypasses
     // our 1-arg native — so register the same body for both signatures.
-    r.register(ssc, "bind", "(Ljava/net/SocketAddress;I)Ljava/nio/channels/ServerSocketChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
-        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-            let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            eprintln!("[NIO_BIND] ssc.bind 2-arg addr='{}' backlog={}", addr_str, backlog);
-        }
-        match ctx.fd_table().open_tcp_listener(&addr_str) {
-            Ok(fd) => {
-                ctx.set_field(this, 1, Value::Int(1));
-                ctx.set_field(this, 2, Value::Int(fd as i32));
-                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-                    eprintln!("[NIO_BIND] ssc.bind 2-arg ok fd={fd}");
-                }
-                if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
-                    if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
-                        let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
-                        ctx.set_field(s, 0, Value::Int(port));
+    r.register(
+        ssc,
+        "bind",
+        "(Ljava/net/SocketAddress;I)Ljava/nio/channels/ServerSocketChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+            let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+            if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                eprintln!(
+                    "[NIO_BIND] ssc.bind 2-arg addr='{}' backlog={}",
+                    addr_str, backlog
+                );
+            }
+            match ctx.fd_table().open_tcp_listener(&addr_str) {
+                Ok(fd) => {
+                    ctx.set_field(this, 1, Value::Int(1));
+                    ctx.set_field(this, 2, Value::Int(fd as i32));
+                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                        eprintln!("[NIO_BIND] ssc.bind 2-arg ok fd={fd}");
                     }
+                    if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                        if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                            let port = local
+                                .rsplit(':')
+                                .next()
+                                .and_then(|p| p.parse::<i32>().ok())
+                                .unwrap_or(0);
+                            ctx.set_field(s, 0, Value::Int(port));
+                        }
+                    }
+                    Ok(Some(Value::Object(Some(this))))
                 }
-                Ok(Some(Value::Object(Some(this))))
+                Err(e) => {
+                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                        eprintln!(
+                            "[NIO_BIND] ssc.bind 2-arg FAILED addr='{}' err={}",
+                            addr_str, e
+                        );
+                    }
+                    Err(RuntimeError::IOException {
+                        message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
+                    }
+                    .into())
+                }
             }
-            Err(e) => {
-                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
-                    eprintln!("[NIO_BIND] ssc.bind 2-arg FAILED addr='{}' err={}", addr_str, e);
-                }
-                Err(RuntimeError::IOException {
-                    message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
-                }
-                .into())
-            }
-        }
-    });
+        },
+    );
     // ServerSocketChannel.socket() — return a wrapper ServerSocket linked to this channel.
     // Cached on first call. The wrapper's bind/getLocalPort delegate back to the channel.
     r.register(ssc, "socket", "()Ljava/net/ServerSocket;", |ctx, args| {
@@ -11262,7 +11893,11 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
         if fd >= 0 {
             if let Ok(local) = ctx.fd_table().tcp_local_addr(fd as u32) {
-                let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                let port = local
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .unwrap_or(0);
                 ctx.set_field(ss, 0, Value::Int(port));
             }
         }
@@ -11270,42 +11905,56 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ss))))
     });
     // ServerSocketChannel.getLocalAddress() — return InetSocketAddress with local port
-    r.register(ssc, "getLocalAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
-        if fd < 0 { return Ok(Some(Value::Object(None))); }
-        let local = match ctx.fd_table().tcp_local_addr(fd as u32) {
-            Ok(s) => s,
-            Err(_) => return Ok(Some(Value::Object(None))),
-        };
-        let (host, port_s) = match local.rsplit_once(':') {
-            Some((h, p)) => (h, p),
-            None => ("0.0.0.0", "0"),
-        };
-        let port = port_s.parse::<i32>().unwrap_or(0);
-        let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-        let host_str = ctx.create_string(host);
-        ctx.set_field(isa, 0, Value::Object(Some(host_str)));
-        ctx.set_field(isa, 1, Value::Int(port));
-        Ok(Some(Value::Object(Some(isa))))
-    });
-    r.register(ssc, "accept", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
-        if fd < 0 { return Ok(Some(Value::Object(None))); }
-        match ctx.fd_table().tcp_accept(fd as u32) {
-            Ok((stream_fd, addr)) => {
-                let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
-                ctx.set_field(sc, 0, Value::Int(1));
-                ctx.set_field(sc, 1, Value::Int(1));
-                let s = ctx.create_string(&addr);
-                ctx.set_field(sc, 2, Value::Object(Some(s)));
-                ctx.set_field(sc, 3, Value::Int(stream_fd as i32));
-                Ok(Some(Value::Object(Some(sc))))
+    r.register(
+        ssc,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+            if fd < 0 {
+                return Ok(Some(Value::Object(None)));
             }
-            Err(_) => Ok(Some(Value::Object(None))),
-        }
-    });
+            let local = match ctx.fd_table().tcp_local_addr(fd as u32) {
+                Ok(s) => s,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let (host, port_s) = match local.rsplit_once(':') {
+                Some((h, p)) => (h, p),
+                None => ("0.0.0.0", "0"),
+            };
+            let port = port_s.parse::<i32>().unwrap_or(0);
+            let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+            let host_str = ctx.create_string(host);
+            ctx.set_field(isa, 0, Value::Object(Some(host_str)));
+            ctx.set_field(isa, 1, Value::Int(port));
+            Ok(Some(Value::Object(Some(isa))))
+        },
+    );
+    r.register(
+        ssc,
+        "accept",
+        "()Ljava/nio/channels/SocketChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+            if fd < 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            match ctx.fd_table().tcp_accept(fd as u32) {
+                Ok((stream_fd, addr)) => {
+                    let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
+                    ctx.set_field(sc, 0, Value::Int(1));
+                    ctx.set_field(sc, 1, Value::Int(1));
+                    let s = ctx.create_string(&addr);
+                    ctx.set_field(sc, 2, Value::Object(Some(s)));
+                    ctx.set_field(sc, 3, Value::Int(stream_fd as i32));
+                    Ok(Some(Value::Object(Some(sc))))
+                }
+                Err(_) => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
     r.register(ssc, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -11313,33 +11962,47 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(ssc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
-        if fd >= 0 { let _ = ctx.fd_table().close(fd as u32); }
+        if fd >= 0 {
+            let _ = ctx.fd_table().close(fd as u32);
+        }
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(-1));
         Ok(None)
     });
-    r.register(ssc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
-        if fd >= 0 { let _ = ctx.fd_table().tcp_set_nonblocking(fd as u32, blocking == 0); }
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        ssc,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+            let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+            if fd >= 0 {
+                let _ = ctx.fd_table().tcp_set_nonblocking(fd as u32, blocking == 0);
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // Selector = 4-field synthetic (open=0, keys_arr=1, key_count=2, wakeup_flag=3)
     let sel = "java/nio/channels/Selector";
-    r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _args| {
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
-            eprintln!("[SEL/p98] Selector.open()");
-        }
-        let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
-        ctx.set_field(sel, 0, Value::Int(1));
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
-        ctx.set_field(sel, 1, Value::Object(Some(keys)));
-        ctx.set_field(sel, 2, Value::Int(0));
-        ctx.set_field(sel, 3, Value::Int(0)); // wakeup_flag
-        Ok(Some(Value::Object(Some(sel))))
-    });
+    r.register(
+        sel,
+        "open",
+        "()Ljava/nio/channels/Selector;",
+        |ctx, _args| {
+            if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+                eprintln!("[SEL/p98] Selector.open()");
+            }
+            let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
+            ctx.set_field(sel, 0, Value::Int(1));
+            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            ctx.set_field(sel, 1, Value::Object(Some(keys)));
+            ctx.set_field(sel, 2, Value::Int(0));
+            ctx.set_field(sel, 3, Value::Int(0)); // wakeup_flag
+            Ok(Some(Value::Object(Some(sel))))
+        },
+    );
     // select() — blocks until at least one channel is ready or wakeup is called (max 30s)
     r.register(sel, "select", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -11348,8 +12011,15 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     // select(long timeout) — blocks up to timeout_ms (0 means infinite → cap at 30s)
     r.register(sel, "select", "(J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let timeout_ms = match args.get(1) { Some(Value::Long(t)) => *t, _ => 0 };
-        let effective = if timeout_ms <= 0 { 30_000i64 } else { timeout_ms };
+        let timeout_ms = match args.get(1) {
+            Some(Value::Long(t)) => *t,
+            _ => 0,
+        };
+        let effective = if timeout_ms <= 0 {
+            30_000i64
+        } else {
+            timeout_ms
+        };
         p98_blocking_select(ctx, this, effective)
     });
     // selectNow() — single non-blocking poll
@@ -11361,7 +12031,9 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(ka)) = ctx.get_field(this, 1) {
             for i in 0..key_count {
                 if let Value::Object(Some(k)) = ctx.get_array_element(ka, i) {
-                    if ctx.get_field(k, 3).as_int().unwrap_or(0) != 0 { ready.push(k); }
+                    if ctx.get_field(k, 3).as_int().unwrap_or(0) != 0 {
+                        ready.push(k);
+                    }
                 }
             }
         }
@@ -11380,17 +12052,24 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, kc);
         if let Value::Object(Some(ka)) = ctx.get_field(this, 1) {
-            for i in 0..kc { ctx.set_array_element(arr, i, ctx.get_array_element(ka, i)); }
+            for i in 0..kc {
+                ctx.set_array_element(arr, i, ctx.get_array_element(ka, i));
+            }
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(kc as i32));
         Ok(Some(Value::Object(Some(set))))
     });
-    r.register(sel, "wakeup", "()Ljava/nio/channels/Selector;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 3, Value::Int(1)); // set wakeup flag
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        sel,
+        "wakeup",
+        "()Ljava/nio/channels/Selector;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 3, Value::Int(1)); // set wakeup flag
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     r.register(sel, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -11403,14 +12082,24 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
 
     // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
     let sk = "java/nio/channels/SelectionKey";
-    r.register(sk, "channel", "()Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(sk, "selector", "()Ljava/nio/channels/Selector;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        sk,
+        "channel",
+        "()Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        sk,
+        "selector",
+        "()Ljava/nio/channels/Selector;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
     r.register(sk, "interestOps", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 2)))
@@ -11439,27 +12128,35 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sk, "OP_ACCEPT", "I", |_ctx, _args| Ok(Some(Value::Int(16))));
 
     let sac = "java/nio/channels/SelectableChannel";
-    r.register(sac, "register", "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;", |ctx, args| {
-        let channel = obj_arg(args, 0)?;
-        let selector = obj_arg(args, 1)?;
-        let ops = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
-        ctx.set_field(key, 0, Value::Object(Some(channel)));
-        ctx.set_field(key, 1, Value::Object(Some(selector)));
-        ctx.set_field(key, 2, Value::Int(ops));
-        ctx.set_field(key, 3, Value::Int(0));
-        let kc = ctx.get_field(selector, 2).as_int().unwrap_or(0) as usize;
-        if let Value::Object(Some(ka)) = ctx.get_field(selector, 1) {
-            if kc < ctx.array_length(ka) {
-                ctx.set_array_element(ka, kc, Value::Object(Some(key)));
-                ctx.set_field(selector, 2, Value::Int((kc + 1) as i32));
+    r.register(
+        sac,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+        |ctx, args| {
+            let channel = obj_arg(args, 0)?;
+            let selector = obj_arg(args, 1)?;
+            let ops = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
+            ctx.set_field(key, 0, Value::Object(Some(channel)));
+            ctx.set_field(key, 1, Value::Object(Some(selector)));
+            ctx.set_field(key, 2, Value::Int(ops));
+            ctx.set_field(key, 3, Value::Int(0));
+            let kc = ctx.get_field(selector, 2).as_int().unwrap_or(0) as usize;
+            if let Value::Object(Some(ka)) = ctx.get_field(selector, 1) {
+                if kc < ctx.array_length(ka) {
+                    ctx.set_array_element(ka, kc, Value::Object(Some(key)));
+                    ctx.set_field(selector, 2, Value::Int((kc + 1) as i32));
+                }
             }
-        }
-        Ok(Some(Value::Object(Some(key))))
-    });
-    r.register(sac, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
+            Ok(Some(Value::Object(Some(key))))
+        },
+    );
+    r.register(
+        sac,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
     r.set_category(__prev_cat);
 }
 
@@ -11506,7 +12203,9 @@ fn p98_extract_socket_addr(ctx: &mut dyn NativeContext, addr: Value) -> String {
                 // InetAddress.holder.hostName / InetAddress.holder.address fallback.
                 match ctx.get_field_by_name(ia, "holder") {
                     Value::Object(Some(iah)) => match ctx.get_field_by_name(iah, "hostName") {
-                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
+                        Value::Object(Some(s)) => {
+                            ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into())
+                        }
                         _ => "0.0.0.0".into(),
                     },
                     _ => "0.0.0.0".into(),
@@ -11574,17 +12273,33 @@ fn p98_do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> MethodCall
                 let interest = ctx.get_field(key, 2).as_int().unwrap_or(0);
                 let fd = if let Value::Object(Some(ch)) = ctx.get_field(key, 0) {
                     let fd3 = ctx.get_field(ch, 3).as_int().unwrap_or(-1);
-                    if fd3 >= 0 { fd3 } else { ctx.get_field(ch, 2).as_int().unwrap_or(-1) }
-                } else { -1 };
+                    if fd3 >= 0 {
+                        fd3
+                    } else {
+                        ctx.get_field(ch, 2).as_int().unwrap_or(-1)
+                    }
+                } else {
+                    -1
+                };
                 if fd >= 0 {
                     let (readable, writable) = ctx.fd_table().poll_ready(fd as u32);
                     let mut ready = 0;
-                    if readable && (interest & 1 != 0) { ready |= 1; }   // OP_READ
-                    if writable && (interest & 4 != 0) { ready |= 4; }   // OP_WRITE
-                    if writable && (interest & 8 != 0) { ready |= 8; }   // OP_CONNECT
-                    if readable && (interest & 16 != 0) { ready |= 16; } // OP_ACCEPT
+                    if readable && (interest & 1 != 0) {
+                        ready |= 1;
+                    } // OP_READ
+                    if writable && (interest & 4 != 0) {
+                        ready |= 4;
+                    } // OP_WRITE
+                    if writable && (interest & 8 != 0) {
+                        ready |= 8;
+                    } // OP_CONNECT
+                    if readable && (interest & 16 != 0) {
+                        ready |= 16;
+                    } // OP_ACCEPT
                     ctx.set_field(key, 3, Value::Int(ready));
-                    if ready != 0 { ready_count += 1; }
+                    if ready != 0 {
+                        ready_count += 1;
+                    }
                 }
             }
         }
@@ -11615,7 +12330,7 @@ const GZIP_DEFAULT_MAX_INFLATED: u64 = 256 * 1024 * 1024;
 fn gzip_max_inflated_bytes() -> Option<u64> {
     match std::env::var("CRATONVM_MAX_INFLATED_BYTES") {
         Ok(s) => match s.trim().parse::<u64>() {
-            Ok(0) => None,             // explicitly disabled
+            Ok(0) => None, // explicitly disabled
             Ok(n) => Some(n),
             Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
         },
@@ -11682,7 +12397,11 @@ fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Ve
             is_ref,
             "read",
             "([BII)I",
-            &[Value::Object(Some(buf)), Value::Int(0), Value::Int(CHUNK as i32)],
+            &[
+                Value::Object(Some(buf)),
+                Value::Int(0),
+                Value::Int(CHUNK as i32),
+            ],
         );
         match res {
             Ok(Some(Value::Int(n))) if n > 0 => {
@@ -11808,13 +12527,15 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                                          — possible compression bomb",
                                         cap.unwrap_or(0)
                                     ),
-                                }.into());
+                                }
+                                .into());
                             }
                         };
                         if let Some(rem) = remaining.as_mut() {
                             *rem = rem.saturating_sub(entry_bytes.len() as u64);
                         }
-                        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
+                        let byte_arr = ctx
+                            .new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
                         // PERF: bulk memcpy the inflated entry instead of a
                         // per-element set_array_element loop.
                         ctx.write_byte_array_from(byte_arr, 0, &entry_bytes);
@@ -11856,9 +12577,11 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             let name_val = ctx.get_array_element(names_arr, idx as usize);
             let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 2);
             ctx.set_field(ze, 0, name_val); // name
-            // Set size from data array
+                                            // Set size from data array
             if let Value::Object(Some(data_arr)) = ctx.get_field(this, 2) {
-                if let Value::Object(Some(entry_data)) = ctx.get_array_element(data_arr, idx as usize) {
+                if let Value::Object(Some(entry_data)) =
+                    ctx.get_array_element(data_arr, idx as usize)
+                {
                     let size = ctx.array_length(entry_data);
                     ctx.set_field(ze, 1, Value::Int(size as i32));
                 }
@@ -11874,7 +12597,9 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zi, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if idx < 0 { return Ok(Some(Value::Int(-1))); }
+        if idx < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
 
         let data_arr = match ctx.get_field(this, 2) {
             Value::Object(Some(a)) => a,
@@ -11886,7 +12611,9 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         };
         let entry_len = ctx.array_length(entry_data);
         let pos = ctx.get_field(this, 4).as_int().unwrap_or(0) as usize;
-        if pos >= entry_len { return Ok(Some(Value::Int(-1))); }
+        if pos >= entry_len {
+            return Ok(Some(Value::Int(-1)));
+        }
 
         let dst = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
@@ -12114,13 +12841,15 @@ fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let cap = gzip_max_inflated_bytes();
         match inflate_bounded(decoder, cap) {
             Ok(buf) => buf,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData
-                && e.to_string().contains("compression bomb") =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::InvalidData
+                    && e.to_string().contains("compression bomb") =>
             {
                 // Cap exceeded: fail loud rather than OOM.
                 return Err(RuntimeError::IOException {
                     message: format!("GZIPInputStream: {e}"),
-                }.into());
+                }
+                .into());
             }
             // Genuinely-not-gzip input keeps the lenient raw-passthrough behavior.
             Err(_) => compressed,
@@ -12185,7 +12914,11 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
     if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
         let len = ctx.array_length(data);
-        Ok(Some(Value::Int(if len > pos { (len - pos) as i32 } else { 0 })))
+        Ok(Some(Value::Int(if len > pos {
+            (len - pos) as i32
+        } else {
+            0
+        })))
     } else {
         Ok(Some(Value::Int(0)))
     }
@@ -12261,7 +12994,8 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
 use std::collections::HashMap as ZoHashMap;
 use std::sync::Mutex as StdMutex;
 
-static ZO_ENTRY_BUFS: std::sync::OnceLock<StdMutex<ZoHashMap<u64, Vec<u8>>>> = std::sync::OnceLock::new();
+static ZO_ENTRY_BUFS: std::sync::OnceLock<StdMutex<ZoHashMap<u64, Vec<u8>>>> =
+    std::sync::OnceLock::new();
 
 fn zo_bufs() -> &'static StdMutex<ZoHashMap<u64, Vec<u8>>> {
     ZO_ENTRY_BUFS.get_or_init(|| StdMutex::new(ZoHashMap::new()))
@@ -12353,13 +13087,17 @@ fn zo_write_zip(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), Meth
                 _ => Vec::new(),
             };
 
-            writer.start_file(&name, options).map_err(|e| RuntimeError::IOException {
-                message: format!("ZIP write error: {}", e),
-            })?;
+            writer
+                .start_file(&name, options)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("ZIP write error: {}", e),
+                })?;
             use std::io::Write;
-            writer.write_all(&data).map_err(|e| RuntimeError::IOException {
-                message: format!("ZIP write error: {}", e),
-            })?;
+            writer
+                .write_all(&data)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("ZIP write error: {}", e),
+                })?;
         }
         writer.finish().map_err(|e| RuntimeError::IOException {
             message: format!("ZIP finish error: {}", e),
@@ -12399,9 +13137,11 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     use flate2::Compression;
     use std::io::Write;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&data).map_err(|e| RuntimeError::IOException {
-        message: format!("GZIP compression failed: {}", e),
-    })?;
+    encoder
+        .write_all(&data)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("GZIP compression failed: {}", e),
+        })?;
     let compressed = encoder.finish().map_err(|e| RuntimeError::IOException {
         message: format!("GZIP finish failed: {}", e),
     })?;
@@ -12858,8 +13598,7 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // canonical "descriptor" extra slot — fall back to ()V on miss.
         if let Value::Object(Some(s)) = ctx.get_field_by_name(*mt, "descriptor") {
             if let Some(desc) = ctx.read_string(s) {
-                let (params, _ret) =
-                    crate::lang_class::parse_descriptor_param_and_return(&desc);
+                let (params, _ret) = crate::lang_class::parse_descriptor_param_and_return(&desc);
                 if !params.is_empty() {
                     arity = params.len();
                 }
@@ -13039,7 +13778,12 @@ fn p58_sq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         // No consumer: enqueue self as a waiting producer.
         let ticket = sq_next_ticket();
-        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+        entry.producers.push(SqWaiter {
+            ticket,
+            thread: me,
+            item: Some(item),
+            fulfilled: false,
+        });
         drop(t);
         // Park until a taker fulfils us. park() may return spuriously, so loop.
         loop {
@@ -13114,9 +13858,15 @@ fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Int(1)));
         }
         ticket = sq_next_ticket();
-        entry.producers.push(SqWaiter { ticket, thread: me, item: Some(item), fulfilled: false });
+        entry.producers.push(SqWaiter {
+            ticket,
+            thread: me,
+            item: Some(item),
+            fulfilled: false,
+        });
     }
-    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    let deadline =
+        timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
     // Helper closure result type: a removal returning whether we were consumed.
     let give_up = |key: i32, ticket: u64| -> i32 {
         let mut t = sq_table().lock();
@@ -13124,7 +13874,9 @@ fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
                 let consumed = entry.producers[pos].fulfilled;
                 entry.producers.remove(pos);
-                if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                if entry.producers.is_empty() && entry.consumers.is_empty() {
+                    t.remove(&key);
+                }
                 return if consumed { 1 } else { 0 };
             }
         }
@@ -13150,7 +13902,9 @@ fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             if let Some(pos) = entry.producers.iter().position(|w| w.ticket == ticket) {
                 if entry.producers[pos].fulfilled {
                     entry.producers.remove(pos);
-                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    if entry.producers.is_empty() && entry.consumers.is_empty() {
+                        t.remove(&key);
+                    }
                     return Ok(Some(Value::Int(1)));
                 }
                 // Spurious wake — loop and re-check deadline.
@@ -13183,7 +13937,12 @@ fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         }
         // No producer: enqueue self as a waiting consumer.
         let ticket = sq_next_ticket();
-        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+        entry.consumers.push(SqWaiter {
+            ticket,
+            thread: me,
+            item: None,
+            fulfilled: false,
+        });
         drop(t);
         loop {
             ctx.park(None);
@@ -13191,7 +13950,10 @@ fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             if let Some(entry) = t.get_mut(&key) {
                 if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
                     if entry.consumers[pos].fulfilled {
-                        let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                        let item = entry.consumers[pos]
+                            .item
+                            .take()
+                            .unwrap_or(Value::Object(None));
                         entry.consumers.remove(pos);
                         if entry.producers.is_empty() && entry.consumers.is_empty() {
                             t.remove(&key);
@@ -13251,9 +14013,15 @@ fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Ok(Some(item));
         }
         ticket = sq_next_ticket();
-        entry.consumers.push(SqWaiter { ticket, thread: me, item: None, fulfilled: false });
+        entry.consumers.push(SqWaiter {
+            ticket,
+            thread: me,
+            item: None,
+            fulfilled: false,
+        });
     }
-    let deadline = timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
+    let deadline =
+        timeout_nanos.map(|n| std::time::Instant::now() + std::time::Duration::from_nanos(n));
     loop {
         let park_dur = match deadline {
             Some(d) => {
@@ -13264,12 +14032,17 @@ fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                     if let Some(entry) = t.get_mut(&key) {
                         if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
                             let item = if entry.consumers[pos].fulfilled {
-                                entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                                entry.consumers[pos]
+                                    .item
+                                    .take()
+                                    .unwrap_or(Value::Object(None))
                             } else {
                                 Value::Object(None)
                             };
                             entry.consumers.remove(pos);
-                            if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                            if entry.producers.is_empty() && entry.consumers.is_empty() {
+                                t.remove(&key);
+                            }
                             return Ok(Some(item));
                         }
                     }
@@ -13283,12 +14056,17 @@ fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 if let Some(entry) = t.get_mut(&key) {
                     if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
                         let item = if entry.consumers[pos].fulfilled {
-                            entry.consumers[pos].item.take().unwrap_or(Value::Object(None))
+                            entry.consumers[pos]
+                                .item
+                                .take()
+                                .unwrap_or(Value::Object(None))
                         } else {
                             Value::Object(None)
                         };
                         entry.consumers.remove(pos);
-                        if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                        if entry.producers.is_empty() && entry.consumers.is_empty() {
+                            t.remove(&key);
+                        }
                         return Ok(Some(item));
                     }
                 }
@@ -13300,9 +14078,14 @@ fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if let Some(entry) = t.get_mut(&key) {
             if let Some(pos) = entry.consumers.iter().position(|w| w.ticket == ticket) {
                 if entry.consumers[pos].fulfilled {
-                    let item = entry.consumers[pos].item.take().unwrap_or(Value::Object(None));
+                    let item = entry.consumers[pos]
+                        .item
+                        .take()
+                        .unwrap_or(Value::Object(None));
                     entry.consumers.remove(pos);
-                    if entry.producers.is_empty() && entry.consumers.is_empty() { t.remove(&key); }
+                    if entry.producers.is_empty() && entry.consumers.is_empty() {
+                        t.remove(&key);
+                    }
                     return Ok(Some(item));
                 }
                 continue; // spurious wake — loop and re-check deadline
@@ -13496,12 +14279,18 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     // ES-FAIL-05 — `HotThreads.initializeRuntimeMonitoring()` (ESTestCase.<clinit>)
     // calls isThreadContentionMonitoringSupported(); unregistered → AbstractMethodError
     // blocking ~every server test. Report false (HotThreads then no-ops).
-    r.register(tmx, "isThreadContentionMonitoringSupported", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(tmx, "isThreadContentionMonitoringEnabled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    r.register(
+        tmx,
+        "isThreadContentionMonitoringSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        tmx,
+        "isThreadContentionMonitoringEnabled",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
 
     // RuntimeMXBean = 0-field synthetic — wire to real uptime
     let rmx = "java/lang/management/RuntimeMXBean";
@@ -13651,7 +14440,11 @@ fn p59_heap_usage(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
     let used = ctx.heap_allocated_bytes() as i64;
     let rss = get_process_rss_bytes();
-    let committed = if rss > 0 { rss } else { used + (4 * 1024 * 1024) };
+    let committed = if rss > 0 {
+        rss
+    } else {
+        used + (4 * 1024 * 1024)
+    };
     let max = committed * 2; // max = 2x committed
     ctx.set_field(mu, 0, Value::Long(used.min(committed))); // init = first seen used
     ctx.set_field(mu, 1, Value::Long(used.max(1024))); // used
@@ -13665,7 +14458,11 @@ fn p59_nonheap_usage(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
     // Non-heap: metaspace/code cache estimate
     let rss = get_process_rss_bytes();
     let heap_used = ctx.heap_allocated_bytes() as i64;
-    let nonheap_used = if rss > heap_used { (rss - heap_used).max(512 * 1024) } else { 512 * 1024 };
+    let nonheap_used = if rss > heap_used {
+        (rss - heap_used).max(512 * 1024)
+    } else {
+        512 * 1024
+    };
     ctx.set_field(mu, 0, Value::Long(256 * 1024)); // initial
     ctx.set_field(mu, 1, Value::Long(nonheap_used));
     ctx.set_field(mu, 2, Value::Long(nonheap_used + 1024 * 1024));
@@ -14249,12 +15046,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             sb2_launcher_get_main_class,
         );
-        r.register(
-            cls,
-            "isExploded",
-            "()Z",
-            |_ctx, _args| Ok(Some(Value::Int(0))),
-        );
+        r.register(cls, "isExploded", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
         r.register(
             cls,
             "isPostProcessingClassPathArchives",
@@ -14350,64 +15144,96 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     //
     // This native is registered on BOTH the SB2 and SB3 launcher class names
     // and for both the one-arg and two-arg overloads.
-    r.register(luc, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", |ctx, args| {
-        let name_obj = match args.get(1) {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("LaunchedURLClassLoader.loadClass: null name".to_string()),
-            }.into()),
-        };
-        let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        let internal = dotted.replace('.', "/");
-        match ctx.ensure_class_initialized(&internal) {
-            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-        }
-    });
-    r.register(luc, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", |ctx, args| {
-        let name_obj = match args.get(1) {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("LaunchedURLClassLoader.loadClass(Z): null name".to_string()),
-            }.into()),
-        };
-        let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        let internal = dotted.replace('.', "/");
-        match ctx.ensure_class_initialized(&internal) {
-            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-        }
-    });
+    r.register(
+        luc,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("LaunchedURLClassLoader.loadClass: null name".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let dotted = ctx.read_string(name_obj).unwrap_or_default();
+            let internal = dotted.replace('.', "/");
+            match ctx.ensure_class_initialized(&internal) {
+                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+            }
+        },
+    );
+    r.register(
+        luc,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("LaunchedURLClassLoader.loadClass(Z): null name".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let dotted = ctx.read_string(name_obj).unwrap_or_default();
+            let internal = dotted.replace('.', "/");
+            match ctx.ensure_class_initialized(&internal) {
+                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+            }
+        },
+    );
     // Also register for the SB3 repackaged launcher
     let luc3 = "org/springframework/boot/loader/launch/LaunchedClassLoader";
-    r.register(luc3, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", |ctx, args| {
-        let name_obj = match args.get(1) {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("LaunchedClassLoader.loadClass: null name".to_string()),
-            }.into()),
-        };
-        let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        let internal = dotted.replace('.', "/");
-        match ctx.ensure_class_initialized(&internal) {
-            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-        }
-    });
-    r.register(luc3, "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", |ctx, args| {
-        let name_obj = match args.get(1) {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Err(RuntimeError::NullPointerException {
-                message: Some("LaunchedClassLoader.loadClass(Z): null name".to_string()),
-            }.into()),
-        };
-        let dotted = ctx.read_string(name_obj).unwrap_or_default();
-        let internal = dotted.replace('.', "/");
-        match ctx.ensure_class_initialized(&internal) {
-            Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-            Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-        }
-    });
+    r.register(
+        luc3,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("LaunchedClassLoader.loadClass: null name".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let dotted = ctx.read_string(name_obj).unwrap_or_default();
+            let internal = dotted.replace('.', "/");
+            match ctx.ensure_class_initialized(&internal) {
+                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+            }
+        },
+    );
+    r.register(
+        luc3,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
+        |ctx, args| {
+            let name_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("LaunchedClassLoader.loadClass(Z): null name".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let dotted = ctx.read_string(name_obj).unwrap_or_default();
+            let internal = dotted.replace('.', "/");
+            match ctx.ensure_class_initialized(&internal) {
+                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
+                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
+            }
+        },
+    );
 
     // ---------------------------------------------------------------------------
     // S111r21 — Spring's ClassUtils.forName(String, ClassLoader) native override.
@@ -14438,11 +15264,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // deliberately ignored (we use CratonVM's unified classpath scanner).
     // ---------------------------------------------------------------------------
     let cu = "org/springframework/util/ClassUtils";
-    r.register(cu, "forName", "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
-        spring_class_utils_for_name_impl);
+    r.register(
+        cu,
+        "forName",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
+        spring_class_utils_for_name_impl,
+    );
     // Some Spring Boot 3 / Spring Framework 6 code paths use a 1-arg overload.
-    r.register(cu, "forName", "(Ljava/lang/String;)Ljava/lang/Class;",
-        spring_class_utils_for_name_impl);
+    r.register(
+        cu,
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        spring_class_utils_for_name_impl,
+    );
 
     // S111r27 — intercept DefaultApplicationContextFactory.create to diagnose
     // what exception is thrown and provide a direct bypass if needed.
@@ -14479,26 +15313,32 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
 ///  1. Try the direct binary name via ensure_class_initialized (fast path)
 ///  2. Try inner-class substitution (replace last '.' with '$') if step 1 fails
 ///  3. Throw ClassNotFoundException if both fail (propagated as Java-level CNFE)
-fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn spring_class_utils_for_name_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Err(RuntimeError::NullPointerException {
-            message: Some("ClassUtils.forName: null name".to_string()),
-        }.into()),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("ClassUtils.forName: null name".to_string()),
+            }
+            .into())
+        }
     };
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
 
     // Handle primitive language names (Spring converts these to wrapper classes)
     let prim_class_id: Option<&str> = match dotted.as_str() {
         "boolean" => Some("java/lang/Boolean"),
-        "byte"    => Some("java/lang/Byte"),
-        "char"    => Some("java/lang/Character"),
-        "short"   => Some("java/lang/Short"),
-        "int"     => Some("java/lang/Integer"),
-        "long"    => Some("java/lang/Long"),
-        "float"   => Some("java/lang/Float"),
-        "double"  => Some("java/lang/Double"),
-        "void"    => Some("java/lang/Void"),
+        "byte" => Some("java/lang/Byte"),
+        "char" => Some("java/lang/Character"),
+        "short" => Some("java/lang/Short"),
+        "int" => Some("java/lang/Integer"),
+        "long" => Some("java/lang/Long"),
+        "float" => Some("java/lang/Float"),
+        "double" => Some("java/lang/Double"),
+        "void" => Some("java/lang/Void"),
         _ => None,
     };
     if let Some(prim) = prim_class_id {
@@ -14526,7 +15366,11 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
     // Inner-class retry: replace last '/' with '$'
     // "a/b/Outer/Inner" → "a/b/Outer$Inner"
     if let Some(last_slash) = internal.rfind('/') {
-        let inner = format!("{}${}", &internal[..last_slash], &internal[last_slash + 1..]);
+        let inner = format!(
+            "{}${}",
+            &internal[..last_slash],
+            &internal[last_slash + 1..]
+        );
         if let Ok(cid) = ctx.ensure_class_initialized(&inner) {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
@@ -14543,7 +15387,10 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
 // ConcurrentReferenceHashMap cache miss), this native provides a direct bypass:
 // it creates AnnotationConfigServletWebServerApplicationContext directly for
 // SERVLET type applications.
-fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn spring_default_app_ctx_factory_create(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[1] = WebApplicationType enum instance
     let web_type_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let is_servlet = match web_type_val {
@@ -14583,12 +15430,8 @@ fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Va
     // Step 2: run the no-arg constructor explicitly via invoke_special
     // invoke_special args[0] = this
     match ctx.invoke_special(ctx_class, "<init>", "()V", &[obj_val]) {
-        Ok(_) => {
-            Ok(Some(obj_val))
-        }
-        Err(e) => {
-            Err(e)
-        }
+        Ok(_) => Ok(Some(obj_val)),
+        Err(e) => Err(e),
     }
 }
 
@@ -14707,7 +15550,11 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let elems = p59_jar_collect_entries(ctx, &path);
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] JarFile.stream() path={:?} entries={}", path, elems.len());
+        eprintln!(
+            "[DBG_SBLOAD] JarFile.stream() path={:?} entries={}",
+            path,
+            elems.len()
+        );
     }
     Ok(Some(Value::Object(Some(p56_build_stream(
         ctx,
@@ -14718,7 +15565,10 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s
 /// (SB3 `JarFileArchive` / launcher classpath scan).
-fn p59_fat_jar_boot_inf_nested_url_values(ctx: &mut dyn NativeContext, jar_path: &str) -> Vec<Value> {
+fn p59_fat_jar_boot_inf_nested_url_values(
+    ctx: &mut dyn NativeContext,
+    jar_path: &str,
+) -> Vec<Value> {
     let mut urls: Vec<Value> = Vec::new();
     let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
     let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
@@ -14772,13 +15622,19 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         _ => String::new(),
     };
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}", jar_path);
+        eprintln!(
+            "[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}",
+            jar_path
+        );
     }
 
     let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
 
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls", urls.len());
+        eprintln!(
+            "[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls",
+            urls.len()
+        );
     }
 
     // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
@@ -14819,7 +15675,10 @@ fn sb3_executable_archive_launcher_create_class_loader_collection(
         );
     }
     let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
-    let url_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, url_values.len());
+    let url_arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        url_values.len(),
+    );
     for (i, v) in url_values.iter().enumerate() {
         ctx.set_array_element(url_arr, i, *v);
     }
@@ -14876,14 +15735,14 @@ fn sb2_read_start_class(jar_path: &str) -> Option<String> {
 /// bypassing the null `this.archive` field. Matches the SB2 launcher's
 /// own contract: throws IllegalStateException when no Start-Class is
 /// declared.
-fn sb2_launcher_get_main_class(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn sb2_launcher_get_main_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let jar_path = sb2_launcher_jar_path(ctx, this).unwrap_or_default();
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}", jar_path);
+        eprintln!(
+            "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}",
+            jar_path
+        );
     }
     let start_class = sb2_read_start_class(&jar_path);
     match start_class {
@@ -14892,10 +15751,7 @@ fn sb2_launcher_get_main_class(
             // Spec-correct behaviour: throw IllegalStateException so callers
             // see the same surface as a real JDK + valid SB2 launcher.
             Err(RuntimeError::IllegalStateException {
-                message: format!(
-                    "No 'Start-Class' manifest entry specified in {}",
-                    jar_path
-                ),
+                message: format!("No 'Start-Class' manifest entry specified in {}", jar_path),
             }
             .into())
         }
@@ -14908,10 +15764,7 @@ fn sb2_launcher_get_main_class(
 /// We allocate `JarFileArchive` instances and pre-populate slot 1 (the `url`
 /// field per SB2's instance layout) so the launcher's
 /// `createClassLoader(List)` loop receives valid URLs.
-fn sb2_launcher_build_archive_list(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-) -> Vec<Value> {
+fn sb2_launcher_build_archive_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut archives: Vec<Value> = Vec::new();
     let jar_path = match sb2_launcher_jar_path(ctx, this) {
         Some(p) => p,
@@ -14946,7 +15799,10 @@ fn sb2_launcher_build_archive_list(
         }
     }
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries", archives.len());
+        eprintln!(
+            "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries",
+            archives.len()
+        );
     }
     archives
 }
@@ -14998,7 +15854,10 @@ fn sb2_launcher_get_class_path_archives_iterator(
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries", archives.len());
+        eprintln!(
+            "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries",
+            archives.len()
+        );
     }
     Ok(Some(Value::Object(Some(itr))))
 }
@@ -15060,13 +15919,13 @@ fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
     let full_s = ctx.create_string(full);
     let host_s = ctx.create_string("");
     ctx.set_field(url, 0, Value::Object(Some(proto_s))); // protocol
-    ctx.set_field(url, 1, Value::Object(Some(host_s)));  // host
-    ctx.set_field(url, 2, Value::Int(-1));                // port
-    ctx.set_field(url, 3, Value::Object(Some(file_s)));  // file
-    ctx.set_field(url, 4, Value::Object(None));           // query
-    // Slot 5 = authority — leave null to satisfy our URL.toString fallback.
-    ctx.set_field(url, 5, Value::Object(Some(full_s)));  // authority/full
-    ctx.set_field(url, 6, Value::Object(Some(file_s)));  // path
+    ctx.set_field(url, 1, Value::Object(Some(host_s))); // host
+    ctx.set_field(url, 2, Value::Int(-1)); // port
+    ctx.set_field(url, 3, Value::Object(Some(file_s))); // file
+    ctx.set_field(url, 4, Value::Object(None)); // query
+                                                // Slot 5 = authority — leave null to satisfy our URL.toString fallback.
+    ctx.set_field(url, 5, Value::Object(Some(full_s))); // authority/full
+    ctx.set_field(url, 6, Value::Object(Some(file_s))); // path
     url
 }
 
@@ -15316,24 +16175,24 @@ fn p59_read_input_stream_fully(
             Some(Value::Int(v)) => out.push((v & 0xff) as u8),
             None | Some(Value::Object(None)) => break,
             Some(other) => {
-                return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                    RuntimeError::IOException {
+                return Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
                         message: format!(
                             "Manifest(InputStream): unexpected read() return {:?}",
                             other
                         ),
-                    },
-                )));
+                    }),
+                ));
             }
         }
         // Guard against runaway streams (e.g., buggy read() that never
         // returns -1). Manifest files are tiny — 1 MB is plenty of headroom.
         if out.len() > 1024 * 1024 {
-            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                RuntimeError::IOException {
+            return Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
                     message: "Manifest(InputStream): stream exceeds 1 MB limit".to_string(),
-                },
-            )));
+                }),
+            ));
         }
     }
     Ok(out)
@@ -15416,7 +16275,11 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
             // Spec: the colon is followed by a space; be lenient and accept
             // "key:value" too.
             let rest = &line[colon + 1..];
-            let value = rest.strip_prefix(' ').unwrap_or(rest).trim_end().to_string();
+            let value = rest
+                .strip_prefix(' ')
+                .unwrap_or(rest)
+                .trim_end()
+                .to_string();
             if key.is_empty() {
                 return Err(format!("empty manifest key in line: {}", line));
             }
@@ -15465,11 +16328,11 @@ pub(crate) fn p59_manifest_init_from_input_stream(
     let stream = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
         _ => {
-            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                RuntimeError::NullPointerException {
+            return Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException {
                     message: Some("Manifest(InputStream): stream is null".to_string()),
-                },
-            )));
+                }),
+            ));
         }
     };
     // Pin the Manifest across the whole parse: reading the stream may invoke
@@ -15765,10 +16628,7 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Snapshot the keys via the synthetic HashMap layout and hand back a
 /// synthetic `(data, cursor)` Spliterator that the rest of the
 /// `Spliterator.*` and `StreamSupport.stream(...)` natives understand.
-fn p59_hashset_spliterator(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn p59_hashset_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Walk the synthetic HashSet to collect keys. Two layouts in use:
     //   * Wrapped-HashMap layout: slot 0 = HashMap (`HS_FIELD_MAP`), the
@@ -15829,7 +16689,11 @@ const VH_KIND_ARRAY: i32 = 2;
 
 /// Resolve the field index for a named field in a class (instance fields only).
 /// Walks the inheritance chain. Returns `None` if not found.
-fn vh_find_instance_field(ctx: &dyn NativeContext, class_id: ClassId, name: &str) -> Option<(ClassId, usize)> {
+fn vh_find_instance_field(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<(ClassId, usize)> {
     let mut current = class_id;
     loop {
         let fields = ctx.declared_fields(current);
@@ -15859,7 +16723,11 @@ fn vh_get(ctx: &dyn NativeContext, vh: ObjectRef, target: Option<ObjectRef>) -> 
         ctx.get_static_field(ClassId::new(class_id_raw), field_idx)
     } else {
         let obj = match target.or_else(|| {
-            if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) { o } else { None }
+            if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+                o
+            } else {
+                None
+            }
         }) {
             Some(o) => o,
             None => return Value::Object(None),
@@ -15881,7 +16749,11 @@ fn vh_set(ctx: &mut dyn NativeContext, vh: ObjectRef, target: Option<ObjectRef>,
         let class_id_raw = ctx.get_field(vh, VH_CLASS_OR_TARGET).as_int().unwrap_or(0) as u32;
         ctx.set_static_field(ClassId::new(class_id_raw), field_idx, value);
     } else if let Some(obj) = target.or_else(|| {
-        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) { o } else { None }
+        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+            o
+        } else {
+            None
+        }
     }) {
         ctx.set_field(obj, field_idx, value);
     }
@@ -15899,7 +16771,11 @@ fn vh_get_volatile(ctx: &dyn NativeContext, vh: ObjectRef, target: Option<Object
         ctx.get_static_field(ClassId::new(class_id_raw), field_idx)
     } else {
         let obj = match target.or_else(|| {
-            if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) { o } else { None }
+            if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+                o
+            } else {
+                None
+            }
         }) {
             Some(o) => o,
             None => return Value::Object(None),
@@ -15909,7 +16785,12 @@ fn vh_get_volatile(ctx: &dyn NativeContext, vh: ObjectRef, target: Option<Object
 }
 
 /// Write the value a VarHandle points to using volatile (atomic) access for instance fields.
-fn vh_set_volatile(ctx: &mut dyn NativeContext, vh: ObjectRef, target: Option<ObjectRef>, value: Value) {
+fn vh_set_volatile(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+    target: Option<ObjectRef>,
+    value: Value,
+) {
     if ctx.object_num_fields(vh) < VH_NUM_FIELDS {
         ctx.set_array_element(vh, 0, value);
         return;
@@ -15920,7 +16801,11 @@ fn vh_set_volatile(ctx: &mut dyn NativeContext, vh: ObjectRef, target: Option<Ob
         let class_id_raw = ctx.get_field(vh, VH_CLASS_OR_TARGET).as_int().unwrap_or(0) as u32;
         ctx.set_static_field(ClassId::new(class_id_raw), field_idx, value);
     } else if let Some(obj) = target.or_else(|| {
-        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) { o } else { None }
+        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+            o
+        } else {
+            None
+        }
     }) {
         ctx.set_field_volatile(obj, field_idx, value);
     }
@@ -15961,7 +16846,10 @@ fn vh_array_get(ctx: &dyn NativeContext, args: &[Value]) -> Value {
 /// `args = [vh, array, idx, value]` — `value_arg_index` is `3`.
 fn vh_array_set(ctx: &mut dyn NativeContext, args: &[Value], value_arg_index: usize) {
     if let Some((arr, idx)) = vh_array_target(args) {
-        let val = args.get(value_arg_index).copied().unwrap_or(Value::Object(None));
+        let val = args
+            .get(value_arg_index)
+            .copied()
+            .unwrap_or(Value::Object(None));
         ctx.set_array_element(arr, idx, val);
     }
 }
@@ -16071,11 +16959,36 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         Ok(Some(vh_auto_box(ctx, val)))
     };
 
-    r.register(vh, "get",         "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_plain_impl);
-    r.register(vh, "getPlain",    "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_plain_impl);
-    r.register(vh, "getOpaque",   "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_plain_impl);
-    r.register(vh, "getVolatile", "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_volatile_impl);
-    r.register(vh, "getAcquire",  "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_acquire_impl);
+    r.register(
+        vh,
+        "get",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_plain_impl,
+    );
+    r.register(
+        vh,
+        "getPlain",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_plain_impl,
+    );
+    r.register(
+        vh,
+        "getOpaque",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_plain_impl,
+    );
+    r.register(
+        vh,
+        "getVolatile",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_volatile_impl,
+    );
+    r.register(
+        vh,
+        "getAcquire",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_acquire_impl,
+    );
 
     // set / setPlain / setOpaque — plain (relaxed) access
     let vh_set_plain_impl = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -16159,11 +17072,21 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         Ok(None)
     };
 
-    r.register(vh, "set",         "([Ljava/lang/Object;)V", vh_set_plain_impl);
-    r.register(vh, "setPlain",    "([Ljava/lang/Object;)V", vh_set_plain_impl);
-    r.register(vh, "setOpaque",   "([Ljava/lang/Object;)V", vh_set_plain_impl);
-    r.register(vh, "setVolatile", "([Ljava/lang/Object;)V", vh_set_volatile_impl);
-    r.register(vh, "setRelease",  "([Ljava/lang/Object;)V", vh_set_release_impl);
+    r.register(vh, "set", "([Ljava/lang/Object;)V", vh_set_plain_impl);
+    r.register(vh, "setPlain", "([Ljava/lang/Object;)V", vh_set_plain_impl);
+    r.register(vh, "setOpaque", "([Ljava/lang/Object;)V", vh_set_plain_impl);
+    r.register(
+        vh,
+        "setVolatile",
+        "([Ljava/lang/Object;)V",
+        vh_set_volatile_impl,
+    );
+    r.register(
+        vh,
+        "setRelease",
+        "([Ljava/lang/Object;)V",
+        vh_set_release_impl,
+    );
 
     // compareAndSet(target?, expected, new) → boolean
     // compareAndExchangeAcquire / compareAndExchangeRelease / compareAndExchange → old value
@@ -16175,7 +17098,9 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let expected = args.get(1).copied().unwrap_or(Value::Object(None));
             let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
             let success = values_equal(&current, &expected);
-            if success { ctx.set_array_element(this, 0, new_val); }
+            if success {
+                ctx.set_array_element(this, 0, new_val);
+            }
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
@@ -16188,19 +17113,28 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
             let current = ctx.get_array_element(arr, idx);
             let success = values_equal(&current, &expected);
-            if success { ctx.set_array_element(arr, idx, new_val); }
+            if success {
+                ctx.set_array_element(arr, idx, new_val);
+            }
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
         let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
         let (target, expected, new_val) = if is_static {
-            (None,
-             args.get(1).copied().unwrap_or(Value::Object(None)),
-             args.get(2).copied().unwrap_or(Value::Object(None)))
+            (
+                None,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            )
         } else {
-            let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-            (tgt,
-             args.get(2).copied().unwrap_or(Value::Object(None)),
-             args.get(3).copied().unwrap_or(Value::Object(None)))
+            let tgt = match args.get(1) {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            (
+                tgt,
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+                args.get(3).copied().unwrap_or(Value::Object(None)),
+            )
         };
         let current = vh_get(ctx, this, target);
         let success = values_equal(&current, &expected);
@@ -16209,11 +17143,31 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(if success { 1 } else { 0 })))
     };
-    r.register(vh, "compareAndSet",           "([Ljava/lang/Object;)Z", vh_cas_impl);
-    r.register(vh, "weakCompareAndSet",        "([Ljava/lang/Object;)Z", vh_cas_impl);
-    r.register(vh, "weakCompareAndSetPlain",   "([Ljava/lang/Object;)Z", vh_cas_impl);
-    r.register(vh, "weakCompareAndSetAcquire", "([Ljava/lang/Object;)Z", vh_cas_impl);
-    r.register(vh, "weakCompareAndSetRelease", "([Ljava/lang/Object;)Z", vh_cas_impl);
+    r.register(vh, "compareAndSet", "([Ljava/lang/Object;)Z", vh_cas_impl);
+    r.register(
+        vh,
+        "weakCompareAndSet",
+        "([Ljava/lang/Object;)Z",
+        vh_cas_impl,
+    );
+    r.register(
+        vh,
+        "weakCompareAndSetPlain",
+        "([Ljava/lang/Object;)Z",
+        vh_cas_impl,
+    );
+    r.register(
+        vh,
+        "weakCompareAndSetAcquire",
+        "([Ljava/lang/Object;)Z",
+        vh_cas_impl,
+    );
+    r.register(
+        vh,
+        "weakCompareAndSetRelease",
+        "([Ljava/lang/Object;)Z",
+        vh_cas_impl,
+    );
 
     // compareAndExchange — returns old value instead of boolean
     let vh_cae_impl = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -16222,7 +17176,9 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let current = ctx.get_array_element(this, 0);
             let expected = args.get(1).copied().unwrap_or(Value::Object(None));
             let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-            if values_equal(&current, &expected) { ctx.set_array_element(this, 0, new_val); }
+            if values_equal(&current, &expected) {
+                ctx.set_array_element(this, 0, new_val);
+            }
             return Ok(Some(current));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
@@ -16233,19 +17189,28 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let expected = args.get(3).copied().unwrap_or(Value::Object(None));
             let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
             let current = ctx.get_array_element(arr, idx);
-            if values_equal(&current, &expected) { ctx.set_array_element(arr, idx, new_val); }
+            if values_equal(&current, &expected) {
+                ctx.set_array_element(arr, idx, new_val);
+            }
             return Ok(Some(current));
         }
         let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
         let (target, expected, new_val) = if is_static {
-            (None,
-             args.get(1).copied().unwrap_or(Value::Object(None)),
-             args.get(2).copied().unwrap_or(Value::Object(None)))
+            (
+                None,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            )
         } else {
-            let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-            (tgt,
-             args.get(2).copied().unwrap_or(Value::Object(None)),
-             args.get(3).copied().unwrap_or(Value::Object(None)))
+            let tgt = match args.get(1) {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            (
+                tgt,
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+                args.get(3).copied().unwrap_or(Value::Object(None)),
+            )
         };
         let current = vh_get(ctx, this, target);
         if values_equal(&current, &expected) {
@@ -16253,9 +17218,24 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(current))
     };
-    r.register(vh, "compareAndExchange",          "([Ljava/lang/Object;)Ljava/lang/Object;", vh_cae_impl);
-    r.register(vh, "compareAndExchangeAcquire",   "([Ljava/lang/Object;)Ljava/lang/Object;", vh_cae_impl);
-    r.register(vh, "compareAndExchangeRelease",   "([Ljava/lang/Object;)Ljava/lang/Object;", vh_cae_impl);
+    r.register(
+        vh,
+        "compareAndExchange",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_cae_impl,
+    );
+    r.register(
+        vh,
+        "compareAndExchangeAcquire",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_cae_impl,
+    );
+    r.register(
+        vh,
+        "compareAndExchangeRelease",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_cae_impl,
+    );
 
     // getAndSet — atomically swap, return old value
     let vh_get_and_set_impl = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -16274,16 +17254,34 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         let (target, new_val) = if is_static {
             (None, args.get(1).copied().unwrap_or(Value::Object(None)))
         } else {
-            let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+            let tgt = match args.get(1) {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
             (tgt, args.get(2).copied().unwrap_or(Value::Object(None)))
         };
         let old = vh_get(ctx, this, target);
         vh_set(ctx, this, target, new_val);
         Ok(Some(old))
     };
-    r.register(vh, "getAndSet",        "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_and_set_impl);
-    r.register(vh, "getAndSetAcquire", "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_and_set_impl);
-    r.register(vh, "getAndSetRelease", "([Ljava/lang/Object;)Ljava/lang/Object;", vh_get_and_set_impl);
+    r.register(
+        vh,
+        "getAndSet",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_and_set_impl,
+    );
+    r.register(
+        vh,
+        "getAndSetAcquire",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_and_set_impl,
+    );
+    r.register(
+        vh,
+        "getAndSetRelease",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        vh_get_and_set_impl,
+    );
 
     // getAndAdd — atomically add int/long, return old value
     r.register(
@@ -16296,7 +17294,10 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let (target, delta) = if is_static {
                 (None, args.get(1).copied().unwrap_or(Value::Int(0)))
             } else {
-                let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+                let tgt = match args.get(1) {
+                    Some(Value::Object(o)) => *o,
+                    _ => None,
+                };
                 (tgt, args.get(2).copied().unwrap_or(Value::Int(0)))
             };
             let old = vh_get(ctx, this, target);
@@ -16309,42 +17310,58 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             Ok(Some(old))
         },
     );
-    r.register(vh, "getAndAddAcquire", "([Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
-        let (target, delta) = if is_static {
-            (None, args.get(1).copied().unwrap_or(Value::Int(0)))
-        } else {
-            let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-            (tgt, args.get(2).copied().unwrap_or(Value::Int(0)))
-        };
-        let old = vh_get(ctx, this, target);
-        let new_val = match (&old, &delta) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.wrapping_add(*b)),
-            (Value::Long(a), Value::Long(b)) => Value::Long(a.wrapping_add(*b)),
-            _ => old,
-        };
-        vh_set(ctx, this, target, new_val);
-        Ok(Some(old))
-    });
-    r.register(vh, "getAndAddRelease", "([Ljava/lang/Object;)Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
-        let (target, delta) = if is_static {
-            (None, args.get(1).copied().unwrap_or(Value::Int(0)))
-        } else {
-            let tgt = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
-            (tgt, args.get(2).copied().unwrap_or(Value::Int(0)))
-        };
-        let old = vh_get(ctx, this, target);
-        let new_val = match (&old, &delta) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.wrapping_add(*b)),
-            (Value::Long(a), Value::Long(b)) => Value::Long(a.wrapping_add(*b)),
-            _ => old,
-        };
-        vh_set(ctx, this, target, new_val);
-        Ok(Some(old))
-    });
+    r.register(
+        vh,
+        "getAndAddAcquire",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
+            let (target, delta) = if is_static {
+                (None, args.get(1).copied().unwrap_or(Value::Int(0)))
+            } else {
+                let tgt = match args.get(1) {
+                    Some(Value::Object(o)) => *o,
+                    _ => None,
+                };
+                (tgt, args.get(2).copied().unwrap_or(Value::Int(0)))
+            };
+            let old = vh_get(ctx, this, target);
+            let new_val = match (&old, &delta) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a.wrapping_add(*b)),
+                (Value::Long(a), Value::Long(b)) => Value::Long(a.wrapping_add(*b)),
+                _ => old,
+            };
+            vh_set(ctx, this, target, new_val);
+            Ok(Some(old))
+        },
+    );
+    r.register(
+        vh,
+        "getAndAddRelease",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
+            let (target, delta) = if is_static {
+                (None, args.get(1).copied().unwrap_or(Value::Int(0)))
+            } else {
+                let tgt = match args.get(1) {
+                    Some(Value::Object(o)) => *o,
+                    _ => None,
+                };
+                (tgt, args.get(2).copied().unwrap_or(Value::Int(0)))
+            };
+            let old = vh_get(ctx, this, target);
+            let new_val = match (&old, &delta) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a.wrapping_add(*b)),
+                (Value::Long(a), Value::Long(b)) => Value::Long(a.wrapping_add(*b)),
+                _ => old,
+            };
+            vh_set(ctx, this, target, new_val);
+            Ok(Some(old))
+        },
+    );
 
     // MethodHandles VarHandle factory methods
     let mhs = "java/lang/invoke/MethodHandles";
@@ -16353,7 +17370,8 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         "arrayElementVarHandle",
         "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         |ctx, _args| {
-            let vh_obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
             ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Object(None));
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(0));
             // Mark this VarHandle as array-element kind so the get/set/cas
@@ -16370,7 +17388,8 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         "findVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         |ctx, args| {
-            let vh_obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
             // args[1] = class mirror (JClass), args[2] = field name String, args[3] = field type
             let field_name = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -16383,7 +17402,11 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let field_idx = vh_find_instance_field(ctx, class_id, &field_name)
                 .map(|(_, i)| i as i32)
                 .unwrap_or(0);
-            ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Int(class_id.as_u32() as i32));
+            ctx.set_field(
+                vh_obj,
+                VH_CLASS_OR_TARGET,
+                Value::Int(class_id.as_u32() as i32),
+            );
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(field_idx));
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(0));
             Ok(Some(Value::Object(Some(vh_obj))))
@@ -16394,7 +17417,8 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         "findStaticVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         |ctx, args| {
-            let vh_obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
             let class_id = match args.get(1) {
                 Some(Value::Object(Some(mirror))) => ctx.class_id_of_object(*mirror),
                 _ => ClassId::new(0),
@@ -16404,8 +17428,15 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let fields = ctx.declared_fields(class_id);
-            let field_idx = fields.iter().position(|f| f.name == field_name).unwrap_or(0) as i32;
-            ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Int(class_id.as_u32() as i32));
+            let field_idx = fields
+                .iter()
+                .position(|f| f.name == field_name)
+                .unwrap_or(0) as i32;
+            ctx.set_field(
+                vh_obj,
+                VH_CLASS_OR_TARGET,
+                Value::Int(class_id.as_u32() as i32),
+            );
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(field_idx));
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(1));
             Ok(Some(Value::Object(Some(vh_obj))))
@@ -16729,7 +17760,12 @@ fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.invoke_virtual(function, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[Value::Object(Some(stream))])
+    ctx.invoke_virtual(
+        function,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(stream))],
+    )
 }
 
 fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16889,7 +17925,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_str = extract_path_string(ctx, args.first());
             let millis = if let Ok(meta) = std::fs::metadata(&path_str) {
-                meta.modified().ok()
+                meta.modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0)
@@ -16955,12 +17992,10 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
 /// Extract path string from a Path argument (field 0 = String)
 fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
     match arg {
-        Some(Value::Object(Some(path_obj))) => {
-            match ctx.get_field(*path_obj, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            }
-        }
+        Some(Value::Object(Some(path_obj))) => match ctx.get_field(*path_obj, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
         _ => String::new(),
     }
 }
@@ -16991,7 +18026,9 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (
                 0,
-                jarfs_read_entry(&jar, &entry).map(|b| b.len() as i64).unwrap_or(0),
+                jarfs_read_entry(&jar, &entry)
+                    .map(|b| b.len() as i64)
+                    .unwrap_or(0),
             ),
             JarFsKind::Absent => {
                 // Real readAttributes throws NoSuchFileException (an
@@ -17010,7 +18047,10 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
     // Check if NOFOLLOW_LINKS is specified (would use symlink_metadata)
     let meta_result = if path_str.is_empty() {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "empty path"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "empty path",
+        ))
     } else {
         std::fs::metadata(&path_str)
     };
@@ -17199,10 +18239,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         let module_name = read_module_name(ctx, this);
         let packages = ctx.module_packages(&module_name);
         // Convert slash-format packages to dot-format for Java API.
-        let dot_packages: Vec<String> = packages
-            .into_iter()
-            .map(|p| p.replace('/', "."))
-            .collect();
+        let dot_packages: Vec<String> = packages.into_iter().map(|p| p.replace('/', ".")).collect();
         let set = build_string_set(ctx, dot_packages);
         Ok(Some(Value::Object(Some(set))))
     });
@@ -18516,14 +19553,23 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v as f64,
             _ => 0.0,
         };
-        let count = match ctx.get_field(this, 2) { Value::Int(n) => n as usize, _ => 0 };
+        let count = match ctx.get_field(this, 2) {
+            Value::Int(n) => n as usize,
+            _ => 0,
+        };
         let limits_arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
-            _ => { let s = ctx.create_string(&format!("{d}")); return Ok(Some(Value::Object(Some(s)))); }
+            _ => {
+                let s = ctx.create_string(&format!("{d}"));
+                return Ok(Some(Value::Object(Some(s))));
+            }
         };
         let formats_arr = match ctx.get_field(this, 1) {
             Value::Object(Some(a)) => a,
-            _ => { let s = ctx.create_string(&format!("{d}")); return Ok(Some(Value::Object(Some(s)))); }
+            _ => {
+                let s = ctx.create_string(&format!("{d}"));
+                return Ok(Some(Value::Object(Some(s))));
+            }
         };
         // Find the largest limit <= d
         let mut chosen = 0;
@@ -18568,10 +19614,10 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let normalized = match form_ordinal {
-                0 => input.nfc().collect::<String>(),   // NFC
-                1 => input.nfd().collect::<String>(),   // NFD
-                2 => input.nfkc().collect::<String>(),  // NFKC
-                3 => input.nfkd().collect::<String>(),  // NFKD
+                0 => input.nfc().collect::<String>(),  // NFC
+                1 => input.nfd().collect::<String>(),  // NFD
+                2 => input.nfkc().collect::<String>(), // NFKC
+                3 => input.nfkd().collect::<String>(), // NFKD
                 _ => input,
             };
             let s = ctx.create_string(&normalized);
@@ -18584,8 +19630,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Z",
         |ctx, args| {
             use unicode_normalization::{
-                is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick,
-                IsNormalized,
+                is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -18657,10 +19702,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
         "Friday",
         "Saturday",
     ];
-    let wd_arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        weekdays.len(),
-    );
+    let wd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, weekdays.len());
     for (i, &w) in weekdays.iter().enumerate() {
         let s = ctx.create_string(w);
         ctx.set_array_element(wd_arr, i, Value::Object(Some(s)));
@@ -18693,10 +19735,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
         "December",
         "",
     ];
-    let m_arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        months.len(),
-    );
+    let m_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, months.len());
     for (i, &m) in months.iter().enumerate() {
         let s = ctx.create_string(m);
         ctx.set_array_element(m_arr, i, Value::Object(Some(s)));
@@ -18824,10 +19863,17 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // Extract level name and message from LogRecord via invoke_virtual
             let level_str = if let Some(Value::Object(Some(record))) = args.get(1) {
                 // getLevel() -> Level, then Level.getName() -> String
-                let level = match ctx.invoke_virtual(*record, "getLevel", "()Ljava/util/logging/Level;", &[]) {
+                let level = match ctx.invoke_virtual(
+                    *record,
+                    "getLevel",
+                    "()Ljava/util/logging/Level;",
+                    &[],
+                ) {
                     Ok(Some(Value::Object(Some(l)))) => {
                         match ctx.invoke_virtual(l, "getName", "()Ljava/lang/String;", &[]) {
-                            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
                             _ => "INFO".to_string(),
                         }
                     }
@@ -18888,7 +19934,9 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             // Check if closed
             let closed = ctx.get_field(this, 2).as_int().unwrap_or(0);
-            if closed != 0 { return Ok(None); }
+            if closed != 0 {
+                return Ok(None);
+            }
 
             // Get filename
             let filename = match ctx.get_field(this, 0) {
@@ -18898,19 +19946,27 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
 
             // Extract level and message
             let (level_str, message) = if let Some(Value::Object(Some(record))) = args.get(1) {
-                let level = match ctx.invoke_virtual(*record, "getLevel", "()Ljava/util/logging/Level;", &[]) {
+                let level = match ctx.invoke_virtual(
+                    *record,
+                    "getLevel",
+                    "()Ljava/util/logging/Level;",
+                    &[],
+                ) {
                     Ok(Some(Value::Object(Some(l)))) => {
                         match ctx.invoke_virtual(l, "getName", "()Ljava/lang/String;", &[]) {
-                            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                            Ok(Some(Value::Object(Some(s)))) => {
+                                ctx.read_string(s).unwrap_or_default()
+                            }
                             _ => "INFO".to_string(),
                         }
                     }
                     _ => "INFO".to_string(),
                 };
-                let msg = match ctx.invoke_virtual(*record, "getMessage", "()Ljava/lang/String;", &[]) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
+                let msg =
+                    match ctx.invoke_virtual(*record, "getMessage", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
                 (level, msg)
             } else {
                 ("INFO".to_string(), String::new())
@@ -18919,7 +19975,11 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // Append to file
             let formatted = format!("[{}] {}\n", level_str, message);
             use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&filename) {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&filename)
+            {
                 let _ = file.write_all(formatted.as_bytes());
             }
             Ok(None)
@@ -19131,8 +20191,11 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
-                    let e =
-                        alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+                    let e = alloc_concurrent_synthetic(
+                        ctx,
+                        "java/util/Collections$EmptyEnumeration",
+                        0,
+                    );
                     return Ok(Some(Value::Object(Some(e))));
                 }
             };
@@ -19541,8 +20604,12 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Long(0))),
             };
             let size = match jarfs_decode(&path_str) {
-                Some((jar, e)) => jarfs_read_entry(&jar, &e).map(|b| b.len() as i64).unwrap_or(0),
-                None => std::fs::metadata(&path_str).map(|m| m.len() as i64).unwrap_or(0),
+                Some((jar, e)) => jarfs_read_entry(&jar, &e)
+                    .map(|b| b.len() as i64)
+                    .unwrap_or(0),
+                None => std::fs::metadata(&path_str)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0),
             };
             Ok(Some(Value::Long(size)))
         } else {
@@ -19740,9 +20807,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Int(0))),
         };
-        let entry = jarfs_decode(&path_str)
-            .map(|(_, e)| e)
-            .unwrap_or(path_str);
+        let entry = jarfs_decode(&path_str).map(|(_, e)| e).unwrap_or(path_str);
         // keycloak-15: count name elements after the (explicitly parsed) Windows
         // drive/UNC root, not std::path components (which mis-count `C:` as a name).
         let count = p57_parse_win_root(&entry).1.len() as i32;
@@ -19767,43 +20832,53 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     // NetworkInterface objects here breaks downstream `getInetAddresses()`
     // because the real JDK reads field slots we don't populate.
 
-    r.register(ni, "getByName", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", |ctx, args| {
-        let name_ref = obj_arg(args, 1)?;
-        let name = ctx.read_string(name_ref).unwrap_or_default();
-        let interfaces = p61_build_network_interfaces(ctx);
-        for iface in &interfaces {
-            if let Value::Object(Some(s)) = ctx.get_field(*iface, 0) {
-                if ctx.read_string(s).as_deref() == Some(&name) {
-                    return Ok(Some(Value::Object(Some(*iface))));
+    r.register(
+        ni,
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/NetworkInterface;",
+        |ctx, args| {
+            let name_ref = obj_arg(args, 1)?;
+            let name = ctx.read_string(name_ref).unwrap_or_default();
+            let interfaces = p61_build_network_interfaces(ctx);
+            for iface in &interfaces {
+                if let Value::Object(Some(s)) = ctx.get_field(*iface, 0) {
+                    if ctx.read_string(s).as_deref() == Some(&name) {
+                        return Ok(Some(Value::Object(Some(*iface))));
+                    }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
-    r.register(ni, "getByInetAddress", "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;", |ctx, args| {
-        let addr_ref = obj_arg(args, 1)?;
-        let addr_str = match ctx.get_field(addr_ref, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let interfaces = p61_build_network_interfaces(ctx);
-        for iface in &interfaces {
-            if let Value::Object(Some(addrs)) = ctx.get_field(*iface, 2) {
-                let len = ctx.array_length(addrs);
-                for i in 0..len {
-                    if let Value::Object(Some(ia)) = ctx.get_array_element(addrs, i) {
-                        if let Value::Object(Some(s)) = ctx.get_field(ia, 1) {
-                            if ctx.read_string(s).as_deref() == Some(&addr_str) {
-                                return Ok(Some(Value::Object(Some(*iface))));
+    r.register(
+        ni,
+        "getByInetAddress",
+        "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
+        |ctx, args| {
+            let addr_ref = obj_arg(args, 1)?;
+            let addr_str = match ctx.get_field(addr_ref, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let interfaces = p61_build_network_interfaces(ctx);
+            for iface in &interfaces {
+                if let Value::Object(Some(addrs)) = ctx.get_field(*iface, 2) {
+                    let len = ctx.array_length(addrs);
+                    for i in 0..len {
+                        if let Value::Object(Some(ia)) = ctx.get_array_element(addrs, i) {
+                            if let Value::Object(Some(s)) = ctx.get_field(ia, 1) {
+                                if ctx.read_string(s).as_deref() == Some(&addr_str) {
+                                    return Ok(Some(Value::Object(Some(*iface))));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     r.register(ni, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -19813,24 +20888,29 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(ni, "getInetAddresses", "()Ljava/util/Enumeration;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let addrs = ctx.get_field(this, 2);
-        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-        match addrs {
-            Value::Object(Some(a)) => {
-                ctx.set_field(enum_obj, 0, Value::Object(Some(a)));
-                ctx.set_field(enum_obj, 1, Value::Int(0));
+    r.register(
+        ni,
+        "getInetAddresses",
+        "()Ljava/util/Enumeration;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addrs = ctx.get_field(this, 2);
+            // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+            let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            match addrs {
+                Value::Object(Some(a)) => {
+                    ctx.set_field(enum_obj, 0, Value::Object(Some(a)));
+                    ctx.set_field(enum_obj, 1, Value::Int(0));
+                }
+                _ => {
+                    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                    ctx.set_field(enum_obj, 0, Value::Object(Some(empty)));
+                    ctx.set_field(enum_obj, 1, Value::Int(0));
+                }
             }
-            _ => {
-                let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                ctx.set_field(enum_obj, 0, Value::Object(Some(empty)));
-                ctx.set_field(enum_obj, 1, Value::Int(0));
-            }
-        }
-        Ok(Some(Value::Object(Some(enum_obj))))
-    });
+            Ok(Some(Value::Object(Some(enum_obj))))
+        },
+    );
     r.register(ni, "getIndex", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
@@ -19859,23 +20939,33 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
         // Return a dummy MAC address (00:00:00:00:00:00) — real MAC requires platform APIs
         let mac = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 6);
-        for i in 0..6 { ctx.set_array_element(mac, i, Value::Int(0)); }
+        for i in 0..6 {
+            ctx.set_array_element(mac, i, Value::Int(0));
+        }
         Ok(Some(Value::Object(Some(mac))))
     });
     r.register(ni, "getMTU", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1500))) // standard ethernet MTU
     });
-    r.register(ni, "getSubInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
-        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-        ctx.set_field(enum_obj, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(enum_obj))))
-    });
-    r.register(ni, "getParent", "()Ljava/net/NetworkInterface;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        ni,
+        "getSubInterfaces",
+        "()Ljava/util/Enumeration;",
+        |ctx, _args| {
+            // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+            let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
+            ctx.set_field(enum_obj, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(enum_obj))))
+        },
+    );
+    r.register(
+        ni,
+        "getParent",
+        "()Ljava/net/NetworkInterface;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
     r.register(ni, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let other = obj_arg(args, 1)?;
@@ -19930,8 +21020,7 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
     // `holder` reference field, never a bare String). This is the object
     // Hazelcast's `DefaultAddressPicker` enumerates via
     // `NetworkInterface.getInetAddresses()` then calls `.getHostName()` on.
-    let lo_addr =
-        crate::net_phase_e::alloc_inet_address_external(ctx, "localhost", "127.0.0.1");
+    let lo_addr = crate::net_phase_e::alloc_inet_address_external(ctx, "localhost", "127.0.0.1");
     let lo_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(lo_addrs, 0, Value::Object(Some(lo_addr)));
     ctx.set_field(lo, 2, Value::Object(Some(lo_addrs)));
@@ -19952,8 +21041,7 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
         let eth_display = ctx.create_string("Primary Network Interface");
         ctx.set_field(eth, 0, Value::Object(Some(eth_name)));
         ctx.set_field(eth, 1, Value::Object(Some(eth_display)));
-        let eth_addr =
-            crate::net_phase_e::alloc_inet_address_external(ctx, &hostname, &primary_ip);
+        let eth_addr = crate::net_phase_e::alloc_inet_address_external(ctx, &hostname, &primary_ip);
         let eth_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(eth_addrs, 0, Value::Object(Some(eth_addr)));
         ctx.set_field(eth, 2, Value::Object(Some(eth_addrs)));
@@ -20110,7 +21198,11 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     // `IllegalStateException("CharBuffer has no backing array")`.
     r.register(cb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if cb_read_hb(ctx, this).is_some() { 1 } else { 0 })))
+        Ok(Some(Value::Int(if cb_read_hb(ctx, this).is_some() {
+            1
+        } else {
+            0
+        })))
     });
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -20181,7 +21273,12 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         "java/nio/HeapCharBufferR",
         "java/nio/StringCharBuffer",
     ] {
-        r.register(subclass, "toString", "(II)Ljava/lang/String;", cb_to_string_range);
+        r.register(
+            subclass,
+            "toString",
+            "(II)Ljava/lang/String;",
+            cb_to_string_range,
+        );
     }
     r.register(cb, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
@@ -20274,8 +21371,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if pos >= lim {
-            return Err(RuntimeError::BufferUnderflowException
-            .into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
@@ -20329,8 +21425,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if pos >= lim {
-            return Err(RuntimeError::BufferOverflowException
-            .into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
@@ -21616,8 +22711,14 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
     // tryConvertToWriteLock(stamp) — upgrade read lock to write lock if possible
     r.register(sl, "tryConvertToWriteLock", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stamp = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-        let state = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
+        let stamp = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
+        let state = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
         let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
         // Can upgrade if: stamp is valid, not already write-locked, read count is exactly 1
         if stamp == state && wl == 0 && state == 1 {
@@ -21635,7 +22736,10 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
     // tryConvertToReadLock(stamp) — downgrade write lock to read lock
     r.register(sl, "tryConvertToReadLock", "(J)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stamp = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let stamp = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
         if stamp < 0 && wl != 0 {
             // Downgrade: release write, acquire read
@@ -21653,65 +22757,103 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
     // unlock(stamp) — release whatever lock the stamp represents
     r.register(sl, "unlock", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stamp = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let stamp = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         if stamp < 0 {
             // Write lock
             ctx.set_field(this, 0, Value::Long(0));
             ctx.set_field(this, 1, Value::Int(0));
         } else if stamp > 0 {
             // Read lock
-            let state = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
+            let state = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
             ctx.set_field(this, 0, Value::Long((state - 1).max(0)));
         }
         Ok(None)
     });
     // tryReadLock with timeout
-    r.register(sl, "tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if wl != 0 {
-            // Try waiting briefly
-            let delay = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-            if delay > 0 {
-                let ms = delay.min(100); // cap at 100ms
-                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    r.register(
+        sl,
+        "tryReadLock",
+        "(JLjava/util/concurrent/TimeUnit;)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if wl != 0 {
+                // Try waiting briefly
+                let delay = match args.get(1) {
+                    Some(Value::Long(v)) => *v,
+                    _ => 0,
+                };
+                if delay > 0 {
+                    let ms = delay.min(100); // cap at 100ms
+                    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                }
+                let wl2 = ctx.get_field(this, 1).as_int().unwrap_or(0);
+                if wl2 != 0 {
+                    return Ok(Some(Value::Long(0)));
+                }
             }
-            let wl2 = ctx.get_field(this, 1).as_int().unwrap_or(0);
-            if wl2 != 0 {
-                return Ok(Some(Value::Long(0)));
-            }
-        }
-        let state = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
-        let stamp = state + 1;
-        ctx.set_field(this, 0, Value::Long(stamp));
-        Ok(Some(Value::Long(stamp)))
-    });
+            let state = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let stamp = state + 1;
+            ctx.set_field(this, 0, Value::Long(stamp));
+            Ok(Some(Value::Long(stamp)))
+        },
+    );
     // tryWriteLock with timeout
-    r.register(sl, "tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let state = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
-        if state != 0 {
-            let delay = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
-            if delay > 0 {
-                let ms = delay.min(100);
-                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    r.register(
+        sl,
+        "tryWriteLock",
+        "(JLjava/util/concurrent/TimeUnit;)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let state = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            if state != 0 {
+                let delay = match args.get(1) {
+                    Some(Value::Long(v)) => *v,
+                    _ => 0,
+                };
+                if delay > 0 {
+                    let ms = delay.min(100);
+                    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                }
+                let state2 = match ctx.get_field(this, 0) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                if state2 != 0 {
+                    return Ok(Some(Value::Long(0)));
+                }
             }
-            let state2 = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
-            if state2 != 0 {
-                return Ok(Some(Value::Long(0)));
-            }
-        }
-        let stamp = -(std::process::id() as i64);
-        ctx.set_field(this, 0, Value::Long(stamp));
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(Some(Value::Long(stamp)))
-    });
+            let stamp = -(std::process::id() as i64);
+            ctx.set_field(this, 0, Value::Long(stamp));
+            ctx.set_field(this, 1, Value::Int(1));
+            Ok(Some(Value::Long(stamp)))
+        },
+    );
     // getReadLockCount
     r.register(sl, "getReadLockCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let state = match ctx.get_field(this, 0) { Value::Long(v) => v, _ => 0 };
+        let state = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
         let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if wl == 0 && state > 0 { state as i32 } else { 0 })))
+        Ok(Some(Value::Int(if wl == 0 && state > 0 {
+            state as i32
+        } else {
+            0
+        })))
     });
     r.set_category(__prev_cat);
 }
@@ -21973,7 +23115,8 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             cratonvm_native_collections::native_map_get_pub(
-                ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
+                ctx,
+                &[Value::Object(Some(map)), Value::Object(Some(key))],
             )
         },
     );
@@ -21992,7 +23135,8 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             cratonvm_native_collections::native_map_get_pub(
-                ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
+                ctx,
+                &[Value::Object(Some(map)), Value::Object(Some(key))],
             )
         },
     );
@@ -22007,7 +23151,8 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         cratonvm_native_collections::native_map_contains_key_pub(
-            ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
+            ctx,
+            &[Value::Object(Some(map)), Value::Object(Some(key))],
         )
     });
     r.register(rb, "getLocale", "()Ljava/util/Locale;", |_ctx, _args| {
@@ -22038,12 +23183,7 @@ fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
 }
 
 /// Put a String[] under a key into a HashMap.
-fn put_arr(
-    ctx: &mut dyn NativeContext,
-    map: ObjectRef,
-    key: &str,
-    items: &[&str],
-) {
+fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str]) {
     let k = ctx.create_string(key);
     let arr = make_string_array(ctx, items);
     cratonvm_native_collections::native_map_put_pub(
@@ -22058,12 +23198,7 @@ fn put_arr(
 }
 
 /// Put a String value under a key into a HashMap.
-fn put_str(
-    ctx: &mut dyn NativeContext,
-    map: ObjectRef,
-    key: &str,
-    value: &str,
-) {
+fn put_str(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, value: &str) {
     let k = ctx.create_string(key);
     let v = ctx.create_string(value);
     cratonvm_native_collections::native_map_put_pub(
@@ -22085,8 +23220,19 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "MonthNames",
         &[
-            "January", "February", "March", "April", "May", "June", "July",
-            "August", "September", "October", "November", "December", "",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+            "",
         ],
     );
     put_arr(
@@ -22094,23 +23240,35 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "MonthAbbreviations",
         &[
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-            "Oct", "Nov", "Dec", "",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
         ],
     );
     put_arr(
         ctx,
         map,
         "MonthNarrows",
-        &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", ""],
+        &[
+            "J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", "",
+        ],
     );
     put_arr(
         ctx,
         map,
         "standalone.MonthNames",
         &[
-            "January", "February", "March", "April", "May", "June", "July",
-            "August", "September", "October", "November", "December", "",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+            "",
         ],
     );
     put_arr(
@@ -22118,15 +23276,16 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "standalone.MonthAbbreviations",
         &[
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-            "Oct", "Nov", "Dec", "",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
         ],
     );
     put_arr(
         ctx,
         map,
         "standalone.MonthNarrows",
-        &["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", ""],
+        &[
+            "J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D", "",
+        ],
     );
     // 8 slots: index 0 unused, 1=Sunday..7=Saturday.
     put_arr(
@@ -22134,8 +23293,14 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "DayNames",
         &[
-            "", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
-            "Friday", "Saturday",
+            "",
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
         ],
     );
     put_arr(
@@ -22155,8 +23320,14 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map,
         "standalone.DayNames",
         &[
-            "", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
-            "Friday", "Saturday",
+            "",
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
         ],
     );
     put_arr(
@@ -22176,11 +23347,26 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     put_arr(ctx, map, "Eras", &["BC", "AD"]);
     put_arr(ctx, map, "short.Eras", &["BC", "AD"]);
     put_arr(ctx, map, "narrow.Eras", &["B", "A"]);
-    put_arr(ctx, map, "QuarterNames", &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"]);
+    put_arr(
+        ctx,
+        map,
+        "QuarterNames",
+        &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
+    );
     put_arr(ctx, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
     put_arr(ctx, map, "QuarterNarrows", &["1", "2", "3", "4"]);
-    put_arr(ctx, map, "standalone.QuarterNames", &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"]);
-    put_arr(ctx, map, "standalone.QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
+    put_arr(
+        ctx,
+        map,
+        "standalone.QuarterNames",
+        &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
+    );
+    put_arr(
+        ctx,
+        map,
+        "standalone.QuarterAbbreviations",
+        &["Q1", "Q2", "Q3", "Q4"],
+    );
     put_arr(ctx, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
     // Standard 9-element layout used by SimpleDateFormat:
     // 4 time patterns (FULL/LONG/MEDIUM/SHORT), 4 date patterns, 1 date-time combiner.
@@ -22217,19 +23403,31 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
             "{1} {0}",
         ],
     );
-    put_arr(ctx, map, "DateTimePatternChars", &["GyMdkHmsSEDFwWahKzZYuXL"]);
+    put_arr(
+        ctx,
+        map,
+        "DateTimePatternChars",
+        &["GyMdkHmsSEDFwWahKzZYuXL"],
+    );
     // Number format patterns: number / currency / percent / scientific.
     put_arr(
         ctx,
         map,
         "NumberPatterns",
-        &["#,##0.###", "\u{00A4}#,##0.00;(\u{00A4}#,##0.00)", "#,##0%", "#E0"],
+        &[
+            "#,##0.###",
+            "\u{00A4}#,##0.00;(\u{00A4}#,##0.00)",
+            "#,##0%",
+            "#E0",
+        ],
     );
     put_arr(
         ctx,
         map,
         "NumberElements",
-        &[".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN"],
+        &[
+            ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
+        ],
     );
     put_str(ctx, map, "TimePatternChars", "hHmsSaEcLkKzZ");
 }
@@ -22240,19 +23438,41 @@ fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // missing key callers fall back to the locale code via getDisplayName
     // overrides we register elsewhere.
     let langs: &[(&str, &str)] = &[
-        ("en", "English"), ("fr", "French"), ("de", "German"),
-        ("es", "Spanish"), ("it", "Italian"), ("ja", "Japanese"),
-        ("ko", "Korean"), ("zh", "Chinese"), ("ru", "Russian"),
-        ("pt", "Portuguese"), ("nl", "Dutch"), ("sv", "Swedish"),
-        ("ar", "Arabic"), ("hi", "Hindi"), ("tr", "Turkish"),
+        ("en", "English"),
+        ("fr", "French"),
+        ("de", "German"),
+        ("es", "Spanish"),
+        ("it", "Italian"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("zh", "Chinese"),
+        ("ru", "Russian"),
+        ("pt", "Portuguese"),
+        ("nl", "Dutch"),
+        ("sv", "Swedish"),
+        ("ar", "Arabic"),
+        ("hi", "Hindi"),
+        ("tr", "Turkish"),
     ];
     let countries: &[(&str, &str)] = &[
-        ("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"),
-        ("FR", "France"), ("DE", "Germany"), ("ES", "Spain"),
-        ("IT", "Italy"), ("JP", "Japan"), ("CN", "China"),
-        ("KR", "South Korea"), ("RU", "Russia"), ("BR", "Brazil"),
-        ("AU", "Australia"), ("NL", "Netherlands"), ("SE", "Sweden"),
-        ("MX", "Mexico"), ("IN", "India"), ("ZA", "South Africa"),
+        ("US", "United States"),
+        ("GB", "United Kingdom"),
+        ("CA", "Canada"),
+        ("FR", "France"),
+        ("DE", "Germany"),
+        ("ES", "Spain"),
+        ("IT", "Italy"),
+        ("JP", "Japan"),
+        ("CN", "China"),
+        ("KR", "South Korea"),
+        ("RU", "Russia"),
+        ("BR", "Brazil"),
+        ("AU", "Australia"),
+        ("NL", "Netherlands"),
+        ("SE", "Sweden"),
+        ("MX", "Mexico"),
+        ("IN", "India"),
+        ("ZA", "South Africa"),
     ];
     for (k, v) in langs {
         put_str(ctx, map, k, v);
@@ -22314,8 +23534,14 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     let k = ctx.create_string(key);
                     let v = ctx.create_string(value);
                     cratonvm_native_collections::native_map_put_pub(
-                        ctx, &[Value::Object(Some(map)), Value::Object(Some(k)), Value::Object(Some(v))]
-                    ).ok();
+                        ctx,
+                        &[
+                            Value::Object(Some(map)),
+                            Value::Object(Some(k)),
+                            Value::Object(Some(v)),
+                        ],
+                    )
+                    .ok();
                     populated_from_props = true;
                 }
             }
@@ -22361,18 +23587,37 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 /// Static registry of known service provider implementations.
 /// Maps service interface name → list of implementation class names.
-fn service_provider_registry() -> &'static std::collections::HashMap<&'static str, &'static [&'static str]> {
+fn service_provider_registry(
+) -> &'static std::collections::HashMap<&'static str, &'static [&'static str]> {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<std::collections::HashMap<&str, &[&str]>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut m = std::collections::HashMap::new();
-        m.insert("java.nio.charset.spi.CharsetProvider", &["sun.nio.cs.StandardCharsets"][..]);
+        m.insert(
+            "java.nio.charset.spi.CharsetProvider",
+            &["sun.nio.cs.StandardCharsets"][..],
+        );
         m.insert("java.util.spi.ToolProvider", &[][..]);
-        m.insert("java.util.logging.LogManager", &["java.util.logging.LogManager"][..]);
-        m.insert("javax.xml.parsers.DocumentBuilderFactory", &["javax.xml.parsers.DocumentBuilderFactory"][..]);
-        m.insert("javax.xml.parsers.SAXParserFactory", &["javax.xml.parsers.SAXParserFactory"][..]);
-        m.insert("javax.xml.transform.TransformerFactory", &["javax.xml.transform.TransformerFactory"][..]);
-        m.insert("java.security.Provider", &["SUN", "SunJCE", "SunRsaSign", "SunEC", "SunJSSE"][..]);
+        m.insert(
+            "java.util.logging.LogManager",
+            &["java.util.logging.LogManager"][..],
+        );
+        m.insert(
+            "javax.xml.parsers.DocumentBuilderFactory",
+            &["javax.xml.parsers.DocumentBuilderFactory"][..],
+        );
+        m.insert(
+            "javax.xml.parsers.SAXParserFactory",
+            &["javax.xml.parsers.SAXParserFactory"][..],
+        );
+        m.insert(
+            "javax.xml.transform.TransformerFactory",
+            &["javax.xml.transform.TransformerFactory"][..],
+        );
+        m.insert(
+            "java.security.Provider",
+            &["SUN", "SunJCE", "SunRsaSign", "SunEC", "SunJSSE"][..],
+        );
         m
     })
 }
@@ -22403,7 +23648,10 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .copied()
                 .unwrap_or(&[]);
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, providers.len().max(1));
+            let arr = ctx.new_array(
+                cratonvm_types::ArrayElementType::Reference,
+                providers.len().max(1),
+            );
             for (i, &pname) in providers.iter().enumerate() {
                 let s = ctx.create_string(pname);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -22436,7 +23684,10 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .copied()
                 .unwrap_or(&[]);
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, providers.len().max(1));
+            let arr = ctx.new_array(
+                cratonvm_types::ArrayElementType::Reference,
+                providers.len().max(1),
+            );
             for (i, &pname) in providers.iter().enumerate() {
                 let s = ctx.create_string(pname);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -22526,7 +23777,11 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
 
 /// Convert a time value + TimeUnit argument to milliseconds.
 /// TimeUnit ordinals: 0=NANOSECONDS, 1=MICROSECONDS, 2=MILLISECONDS, 3=SECONDS, 4=MINUTES, 5=HOURS, 6=DAYS
-fn scheduled_convert_to_millis(ctx: &mut dyn NativeContext, value: i64, unit_arg: Option<&Value>) -> i64 {
+fn scheduled_convert_to_millis(
+    ctx: &mut dyn NativeContext,
+    value: i64,
+    unit_arg: Option<&Value>,
+) -> i64 {
     let ordinal = match unit_arg {
         Some(Value::Object(Some(unit_obj))) => {
             // TimeUnit stores ordinal in field 0
@@ -22535,13 +23790,13 @@ fn scheduled_convert_to_millis(ctx: &mut dyn NativeContext, value: i64, unit_arg
         _ => 2, // MILLISECONDS
     };
     match ordinal {
-        0 => value / 1_000_000,            // NANOSECONDS
-        1 => value / 1_000,               // MICROSECONDS
-        2 => value,                        // MILLISECONDS
-        3 => value * 1_000,               // SECONDS
-        4 => value * 60_000,              // MINUTES
-        5 => value * 3_600_000,           // HOURS
-        6 => value * 86_400_000,          // DAYS
+        0 => value / 1_000_000,  // NANOSECONDS
+        1 => value / 1_000,      // MICROSECONDS
+        2 => value,              // MILLISECONDS
+        3 => value * 1_000,      // SECONDS
+        4 => value * 60_000,     // MINUTES
+        5 => value * 3_600_000,  // HOURS
+        6 => value * 86_400_000, // DAYS
         _ => value,
     }
 }
@@ -22550,13 +23805,18 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     fn stpe_ensure_work_queue(ctx: &mut dyn NativeContext, this: ObjectRef) {
-        let has_queue = matches!(ctx.get_field_by_name(this, "workQueue"), Value::Object(Some(_)));
+        let has_queue = matches!(
+            ctx.get_field_by_name(this, "workQueue"),
+            Value::Object(Some(_))
+        );
         if has_queue {
             return;
         }
         // Real JDK STPE expects a non-null workQueue before delayedExecute().
         // Prefer DelayedWorkQueue; fall back to PriorityBlockingQueue.
-        let queue = match ctx.new_object("java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue") {
+        let queue = match ctx
+            .new_object("java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue")
+        {
             Ok(Some(Value::Object(Some(q)))) => {
                 let _ = ctx.invoke_special(
                     "java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue",
@@ -22643,7 +23903,10 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     // can look the task up and flip the cancelled flag. Field 0 used to
     // carry the result reference for `Future.get()` — we keep that
     // surface by routing `get()` through the pump's done-tracking.
-    fn build_sf(ctx: &mut dyn cratonvm_native_api::NativeContext, id: u64) -> cratonvm_types::ObjectRef {
+    fn build_sf(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        id: u64,
+    ) -> cratonvm_types::ObjectRef {
         let sf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
         ctx.set_field(sf, 0, Value::Long(id as i64));
         ctx.set_field(sf, 1, Value::Int(0));
@@ -22725,42 +23988,61 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     // registered against the synthetic ScheduledFuture class so the
     // probe's `sf.cancel(false)` resolves here regardless of which
     // scheduling overload built the future.
-    r.register("java/util/concurrent/ScheduledFuture", "cancel", "(Z)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let id = match ctx.get_field(this, 0) {
-            Value::Long(v) => v as u64,
-            Value::Int(v) => v as u64,
-            _ => 0,
-        };
-        if id == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let cancelled = match crate::scheduled_pump::registry().find(id) {
-            Some(t) => t.cancel(),
-            None => false,
-        };
-        if cancelled {
-            ctx.set_field(this, 1, Value::Int(1));
-        }
-        Ok(Some(Value::Int(if cancelled { 1 } else { 0 })))
-    });
-    r.register("java/util/concurrent/ScheduledFuture", "isCancelled", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let id = match ctx.get_field(this, 0) {
-            Value::Long(v) => v as u64,
-            Value::Int(v) => v as u64,
-            _ => 0,
-        };
-        if id == 0 { return Ok(Some(Value::Int(0))); }
-        Ok(Some(Value::Int(match crate::scheduled_pump::registry().find(id) {
-            Some(t) if t.is_cancelled() => 1,
-            _ => 0,
-        })))
-    });
-    r.register("java/util/concurrent/ScheduledFuture", "isDone", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        "java/util/concurrent/ScheduledFuture",
+        "cancel",
+        "(Z)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u64,
+                _ => 0,
+            };
+            if id == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            let cancelled = match crate::scheduled_pump::registry().find(id) {
+                Some(t) => t.cancel(),
+                None => false,
+            };
+            if cancelled {
+                ctx.set_field(this, 1, Value::Int(1));
+            }
+            Ok(Some(Value::Int(if cancelled { 1 } else { 0 })))
+        },
+    );
+    r.register(
+        "java/util/concurrent/ScheduledFuture",
+        "isCancelled",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u64,
+                _ => 0,
+            };
+            if id == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
+            Ok(Some(Value::Int(
+                match crate::scheduled_pump::registry().find(id) {
+                    Some(t) if t.is_cancelled() => 1,
+                    _ => 0,
+                },
+            )))
+        },
+    );
+    r.register(
+        "java/util/concurrent/ScheduledFuture",
+        "isDone",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
     r.register(stpe, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 1, Value::Int(1));
@@ -22837,8 +24119,13 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let obj = stpe_new_executor(ctx, cores)
-                .unwrap_or_else(|| alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledThreadPoolExecutor", 2));
+            let obj = stpe_new_executor(ctx, cores).unwrap_or_else(|| {
+                alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/concurrent/ScheduledThreadPoolExecutor",
+                    2,
+                )
+            });
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -22847,8 +24134,13 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         "newSingleThreadScheduledExecutor",
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
-            let obj = stpe_new_executor(ctx, 1)
-                .unwrap_or_else(|| alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledThreadPoolExecutor", 2));
+            let obj = stpe_new_executor(ctx, 1).unwrap_or_else(|| {
+                alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/concurrent/ScheduledThreadPoolExecutor",
+                    2,
+                )
+            });
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -23017,12 +24309,7 @@ pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let elem = args.get(1).copied().unwrap_or(Value::Object(None));
         // Try add(Object) which appends
-        let _ = ctx.invoke_virtual(
-            this,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[elem],
-        );
+        let _ = ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]);
         Ok(None)
     });
     r.register(
@@ -23256,10 +24543,7 @@ fn native_p64_ll_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     // Build new ArrayList with reversed elements
     let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let new_arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        elements.len(),
-    );
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elements.len());
     for (i, elem) in elements.iter().enumerate() {
         ctx.set_array_element(new_arr, i, *elem);
     }
@@ -23450,10 +24734,7 @@ fn native_p64_lhm_seq_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         cur = ctx.get_field(node, 5);
     }
     let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        entries.len(),
-    );
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, entries.len());
     for (i, e) in entries.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*e)));
     }
@@ -24040,10 +25321,7 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
             }
             results.push(this_str[last..].to_string());
 
-            let arr = ctx.new_array(
-                cratonvm_types::ArrayElementType::Reference,
-                results.len(),
-            );
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, results.len());
             for (i, part) in results.iter().enumerate() {
                 let s = ctx.create_string(part);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -24700,8 +25978,7 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => {
                     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-                    let buckets =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+                    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                     ctx.set_field(map, 0, Value::Object(Some(buckets)));
                     ctx.set_field(map, 1, Value::Int(0));
                     ctx.set_field(map, 2, Value::Int(16));
@@ -24779,10 +26056,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                     Err(_) => input.split(&pat_str).collect(),
                 }
             };
-            let arr = ctx.new_array(
-                cratonvm_types::ArrayElementType::Reference,
-                parts.len(),
-            );
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, parts.len());
             for (i, part) in parts.iter().enumerate() {
                 let s = ctx.create_string(part);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -25081,14 +26355,14 @@ fn collator_normalize(s: &str, strength: i32) -> String {
 /// Strip accent from a character (common Latin characters)
 fn strip_accent(c: char) -> char {
     match c {
-        'À'|'Á'|'Â'|'Ã'|'Ä'|'Å'|'à'|'á'|'â'|'ã'|'ä'|'å' => 'a',
-        'È'|'É'|'Ê'|'Ë'|'è'|'é'|'ê'|'ë' => 'e',
-        'Ì'|'Í'|'Î'|'Ï'|'ì'|'í'|'î'|'ï' => 'i',
-        'Ò'|'Ó'|'Ô'|'Õ'|'Ö'|'ò'|'ó'|'ô'|'õ'|'ö' => 'o',
-        'Ù'|'Ú'|'Û'|'Ü'|'ù'|'ú'|'û'|'ü' => 'u',
-        'Ñ'|'ñ' => 'n',
-        'Ç'|'ç' => 'c',
-        'Ý'|'ý'|'ÿ' => 'y',
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'È' | 'É' | 'Ê' | 'Ë' | 'è' | 'é' | 'ê' | 'ë' => 'e',
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'ì' | 'í' | 'î' | 'ï' => 'i',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'Ñ' | 'ñ' => 'n',
+        'Ç' | 'ç' => 'c',
+        'Ý' | 'ý' | 'ÿ' => 'y',
         _ => c,
     }
 }
@@ -25163,7 +26437,13 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
                 _ => String::new(),
             };
-            Ok(Some(Value::Int(if collator_compare(&s1, &s2, strength) == 0 { 1 } else { 0 })))
+            Ok(Some(Value::Int(
+                if collator_compare(&s1, &s2, strength) == 0 {
+                    1
+                } else {
+                    0
+                },
+            )))
         },
     );
     r.register(c, "getStrength", "()I", |ctx, args| {
@@ -25199,23 +26479,33 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
     );
     // CollationKey methods
     let ck_cls = "java/text/CollationKey";
-    r.register(ck_cls, "getSourceString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(ck_cls, "compareTo", "(Ljava/text/CollationKey;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let other = obj_arg(args, 1)?;
-        let k1 = match ctx.get_field(this, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let k2 = match ctx.get_field(other, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        Ok(Some(Value::Int(k1.cmp(&k2) as i32)))
-    });
+    r.register(
+        ck_cls,
+        "getSourceString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        ck_cls,
+        "compareTo",
+        "(Ljava/text/CollationKey;)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = obj_arg(args, 1)?;
+            let k1 = match ctx.get_field(this, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let k2 = match ctx.get_field(other, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(Value::Int(k1.cmp(&k2) as i32)))
+        },
+    );
     r.register(ck_cls, "toByteArray", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let key = match ctx.get_field(this, 1) {
@@ -25258,19 +26548,26 @@ fn bi_alloc_kind(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
 
 /// Find the next break boundary after `pos` in `text` for the given iterator kind.
 fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
-    if pos >= text.len() { return None; }
+    if pos >= text.len() {
+        return None;
+    }
     let bytes = text.as_bytes();
     match kind {
         BI_WORD => {
             // Word boundary: transition between word chars and non-word chars
-            let at_word = pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_');
+            let at_word =
+                pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_');
             let mut i = pos;
             if at_word {
                 // Skip word chars to find end of word
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
             } else {
                 // Skip non-word chars to find start of next word
-                while i < bytes.len() && !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+                while i < bytes.len() && !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
             }
             Some(i)
         }
@@ -25281,7 +26578,9 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
                 if bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?' {
                     i += 1;
                     // Skip trailing whitespace
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
                     return Some(i);
                 }
                 i += 1;
@@ -25310,18 +26609,26 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
 
 /// Find the previous break boundary before `pos`.
 fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
-    if pos == 0 { return None; }
+    if pos == 0 {
+        return None;
+    }
     let bytes = text.as_bytes();
     match kind {
         BI_WORD => {
             let mut i = pos;
             // Move back one step
-            if i > 0 { i -= 1; }
+            if i > 0 {
+                i -= 1;
+            }
             let at_word = i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_');
             if at_word {
-                while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') { i -= 1; }
+                while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                    i -= 1;
+                }
             } else {
-                while i > 0 && !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') { i -= 1; }
+                while i > 0 && !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                    i -= 1;
+                }
             }
             Some(i)
         }
@@ -25341,7 +26648,9 @@ fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
             let mut i = pos;
             if i > 0 {
                 i -= 1;
-                while i > 0 && !text.is_char_boundary(i) { i -= 1; }
+                while i > 0 && !text.is_char_boundary(i) {
+                    i -= 1;
+                }
             }
             Some(i)
         }
@@ -25363,30 +26672,54 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bi = "java/text/BreakIterator";
-    r.register(bi, "getWordInstance", "()Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)))))
-    });
-    r.register(bi, "getWordInstance", "(Ljava/util/Locale;)Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)))))
-    });
-    r.register(bi, "getSentenceInstance", "()Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)))))
-    });
-    r.register(bi, "getSentenceInstance", "(Ljava/util/Locale;)Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)))))
-    });
-    r.register(bi, "getCharacterInstance", "()Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)))))
-    });
-    r.register(bi, "getCharacterInstance", "(Ljava/util/Locale;)Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)))))
-    });
-    r.register(bi, "getLineInstance", "()Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)))))
-    });
-    r.register(bi, "getLineInstance", "(Ljava/util/Locale;)Ljava/text/BreakIterator;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)))))
-    });
+    r.register(
+        bi,
+        "getWordInstance",
+        "()Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+    );
+    r.register(
+        bi,
+        "getWordInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+    );
+    r.register(
+        bi,
+        "getSentenceInstance",
+        "()Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+    );
+    r.register(
+        bi,
+        "getSentenceInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+    );
+    r.register(
+        bi,
+        "getCharacterInstance",
+        "()Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+    );
+    r.register(
+        bi,
+        "getCharacterInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+    );
+    r.register(
+        bi,
+        "getLineInstance",
+        "()Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+    );
+    r.register(
+        bi,
+        "getLineInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+    );
     r.register(bi, "setText", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
@@ -25475,14 +26808,19 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(bi, "getText", "()Ljava/text/CharacterIterator;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Return a StringCharacterIterator wrapping the text
-        let ci = alloc_concurrent_synthetic(ctx, "java/text/StringCharacterIterator", 2);
-        ctx.set_field(ci, 0, ctx.get_field(this, 0));
-        ctx.set_field(ci, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(ci))))
-    });
+    r.register(
+        bi,
+        "getText",
+        "()Ljava/text/CharacterIterator;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Return a StringCharacterIterator wrapping the text
+            let ci = alloc_concurrent_synthetic(ctx, "java/text/StringCharacterIterator", 2);
+            ctx.set_field(ci, 0, ctx.get_field(this, 0));
+            ctx.set_field(ci, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(ci))))
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -25583,10 +26921,14 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
 
 fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_val = args.first().copied().unwrap_or(Value::Object(None));
-    let visitor = if let Some(Value::Object(Some(v))) = args.get(1) { *v } else {
+    let visitor = if let Some(Value::Object(Some(v))) = args.get(1) {
+        *v
+    } else {
         return Ok(Some(path_val));
     };
-    let path_obj = if let Value::Object(Some(p)) = path_val { p } else {
+    let path_obj = if let Value::Object(Some(p)) = path_val {
+        p
+    } else {
         return Ok(Some(path_val));
     };
     let root_str = match ctx.get_field(path_obj, 0) {
@@ -25610,8 +26952,12 @@ fn p98_walk_dir(
         &[Value::Object(Some(dir_path_obj)), Value::Object(Some(attrs))])?;
     if let Some(Value::Object(Some(r))) = pre {
         let ord = ctx.get_field(r, 1).as_int().unwrap_or(0);
-        if ord == 1 { return Ok(false); } // TERMINATE
-        if ord == 2 { return Ok(true); }  // SKIP_SUBTREE
+        if ord == 1 {
+            return Ok(false);
+        } // TERMINATE
+        if ord == 2 {
+            return Ok(true);
+        } // SKIP_SUBTREE
     }
     if let Some((jar, entry)) = jarfs_decode(dir) {
         // jar-FS directory — children come from the archive listing, not the
@@ -25624,14 +26970,22 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? { return Ok(false); }
+                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                    return Ok(false);
+                }
             } else {
-                let fa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+                let fa = alloc_concurrent_synthetic(
+                    ctx,
+                    "java/nio/file/attribute/BasicFileAttributes",
+                    0,
+                );
                 let vr = ctx.invoke_virtual(visitor, "visitFile",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
                 if let Some(Value::Object(Some(r))) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 { return Ok(false); }
+                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -25643,23 +26997,36 @@ fn p98_walk_dir(
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo)? { return Ok(false); }
+                if !p98_walk_dir(ctx, &es, visitor, epo)? {
+                    return Ok(false);
+                }
             } else {
-                let fa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+                let fa = alloc_concurrent_synthetic(
+                    ctx,
+                    "java/nio/file/attribute/BasicFileAttributes",
+                    0,
+                );
                 let vr = ctx.invoke_virtual(visitor, "visitFile",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
                 if let Some(Value::Object(Some(r))) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 { return Ok(false); }
+                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                        return Ok(false);
+                    }
                 }
             }
         }
     }
-    let post = ctx.invoke_virtual(visitor, "postVisitDirectory",
+    let post = ctx.invoke_virtual(
+        visitor,
+        "postVisitDirectory",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        &[Value::Object(Some(dir_path_obj)), Value::Object(None)])?;
+        &[Value::Object(Some(dir_path_obj)), Value::Object(None)],
+    )?;
     if let Some(Value::Object(Some(r))) = post {
-        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 { return Ok(false); }
+        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -26141,7 +27508,11 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             if matches!(name_val, Value::Object(Some(_))) {
                 ctx.set_field(thr, 0, name_val);
             } else {
-                let name = ctx.create_string(if is_virtual { "virtual-factory-thread" } else { "platform-factory-thread" });
+                let name = ctx.create_string(if is_virtual {
+                    "virtual-factory-thread"
+                } else {
+                    "platform-factory-thread"
+                });
                 ctx.set_field(thr, 0, Value::Object(Some(name)));
             }
             ctx.set_field(thr, 1, Value::Int(5));
@@ -26787,11 +28158,7 @@ fn j25_sts_init_named_sof(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(None)
 }
 
-fn j25_sts_fork_impl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    policy: i32,
-) -> MethodCallResult {
+fn j25_sts_fork_impl(ctx: &mut dyn NativeContext, args: &[Value], policy: i32) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let subtask_cls = "java/util/concurrent/StructuredTaskScope$Subtask";
     let state = j25_sts_state(ctx, this);
@@ -26874,7 +28241,11 @@ fn j25_sts_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 fn j25_sts_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let state = j25_sts_state(ctx, this);
-    Ok(Some(Value::Int(if state != J25_STS_STATE_OPEN { 1 } else { 0 })))
+    Ok(Some(Value::Int(if state != J25_STS_STATE_OPEN {
+        1
+    } else {
+        0
+    })))
 }
 
 /// Register core `fork/join/joinUntil/shutdown/close/isShutdown` methods
@@ -27437,9 +28808,14 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                             Ok(0) => -1i32, // EOF
                             Ok(n) => {
                                 // Store bytes into the ByteBuffer backing array
-                                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) { // BB_ARRAY
+                                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                                    // BB_ARRAY
                                     for i in 0..n {
-                                        ctx.set_array_element(arr, bb_pos + i, Value::Int(tmp[i] as i8 as i32));
+                                        ctx.set_array_element(
+                                            arr,
+                                            bb_pos + i,
+                                            Value::Int(tmp[i] as i8 as i32),
+                                        );
                                     }
                                 }
                                 // Advance ByteBuffer position
@@ -27469,7 +28845,10 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let _bb = args.get(1); // ByteBuffer (simplified: extract from position/limit)
-            let position = match args.get(2) { Some(Value::Long(p)) => *p, _ => 0 };
+            let position = match args.get(2) {
+                Some(Value::Long(p)) => *p,
+                _ => 0,
+            };
 
             // Read path from field 0
             let path = match ctx.get_field(this, 0) {
@@ -27483,8 +28862,14 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                     // Read backing array from ByteBuffer field 0
                     match ctx.get_field(*bb, 0) {
                         Value::Object(Some(arr)) => {
-                            let bb_pos = match ctx.get_field(*bb, 1) { Value::Int(p) => p as usize, _ => 0 };
-                            let bb_lim = match ctx.get_field(*bb, 2) { Value::Int(l) => l as usize, _ => ctx.array_length(arr) };
+                            let bb_pos = match ctx.get_field(*bb, 1) {
+                                Value::Int(p) => p as usize,
+                                _ => 0,
+                            };
+                            let bb_lim = match ctx.get_field(*bb, 2) {
+                                Value::Int(l) => l as usize,
+                                _ => ctx.array_length(arr),
+                            };
                             let len = bb_lim.saturating_sub(bb_pos);
                             let mut buf = vec![0u8; len];
                             for i in 0..len {
@@ -27500,15 +28885,23 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                     Vec::new()
                 };
                 use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create(true).open(&path) {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&path)
+                {
                     use std::io::Seek;
                     let _ = file.seek(std::io::SeekFrom::Start(position as u64));
                     match file.write_all(&bb_data) {
                         Ok(()) => bb_data.len() as i32,
                         Err(_) => 0i32,
                     }
-                } else { 0i32 }
-            } else { 0i32 };
+                } else {
+                    0i32
+                }
+            } else {
+                0i32
+            };
 
             let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2);
             ctx.set_field(future, 0, Value::Int(bytes_written));
@@ -27522,7 +28915,9 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Long(0))),
         };
-        let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+        let size = std::fs::metadata(&path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
         Ok(Some(Value::Long(size)))
     });
     r.register(
@@ -27580,8 +28975,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let ch =
                 alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousSocketChannel", 4);
-            ctx.set_field(ch, 0, Value::Int(0));  // not connected
-            ctx.set_field(ch, 1, Value::Int(1));  // open
+            ctx.set_field(ch, 0, Value::Int(0)); // not connected
+            ctx.set_field(ch, 1, Value::Int(1)); // open
             ctx.set_field(ch, 2, Value::Int(-1)); // no fd
             ctx.set_field(ch, 3, Value::Object(None)); // remote addr
             Ok(Some(Value::Object(Some(ch))))
@@ -27620,9 +29015,11 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             };
             // Blocking TCP connect
             let fd_id = ctx.fd_table().open_tcp_connect(&addr_str).map_err(|e| {
-                RuntimeError::IOException { message: format!("connect failed: {}", e) }
+                RuntimeError::IOException {
+                    message: format!("connect failed: {}", e),
+                }
             })?;
-            ctx.set_field(this, 0, Value::Int(1));  // connected
+            ctx.set_field(this, 0, Value::Int(1)); // connected
             ctx.set_field(this, 2, Value::Int(fd_id as i32));
             ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
             // DF07: completed Future<Void> via real CompletableFuture (see helper).
@@ -27707,10 +29104,15 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(asc, "getRemoteAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
-    });
+    r.register(
+        asc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 3)))
+        },
+    );
 
     // AsynchronousServerSocketChannel
     let assc = "java/nio/channels/AsynchronousServerSocketChannel";
@@ -27842,14 +29244,24 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         ctx.set_field(p, 1, Value::Object(Some(sink)));
         Ok(Some(Value::Object(Some(p))))
     });
-    r.register(pipe, "source", "()Ljava/nio/channels/Pipe$SourceChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(pipe, "sink", "()Ljava/nio/channels/Pipe$SinkChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        pipe,
+        "source",
+        "()Ljava/nio/channels/Pipe$SourceChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        pipe,
+        "sink",
+        "()Ljava/nio/channels/Pipe$SinkChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
 
     // SourceChannel.read(ByteBuffer)
     let src_ch = "java/nio/channels/Pipe$SourceChannel";
@@ -27857,7 +29269,10 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 1).as_int().unwrap_or(-1);
         if fd_id < 0 || ctx.get_field(this, 0).as_int().unwrap_or(0) == 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
         let bb = obj_arg(args, 1)?;
         let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
@@ -27867,8 +29282,12 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut tmp = vec![0u8; remaining];
-        let n = ctx.fd_table().pipe_read(fd_id as u32, &mut tmp)
-            .map_err(|e| RuntimeError::IOException { message: format!("pipe read: {}", e) })?;
+        let n = ctx
+            .fd_table()
+            .pipe_read(fd_id as u32, &mut tmp)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("pipe read: {}", e),
+            })?;
         if n == 0 {
             return Ok(Some(Value::Int(-1))); // EOF
         }
@@ -27893,9 +29312,12 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(src_ch, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
+    r.register(
+        src_ch,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
 
     // SinkChannel.write(ByteBuffer)
     let sink_ch = "java/nio/channels/Pipe$SinkChannel";
@@ -27903,7 +29325,10 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 1).as_int().unwrap_or(-1);
         if fd_id < 0 || ctx.get_field(this, 0).as_int().unwrap_or(0) == 0 {
-            return Err(RuntimeError::IOException { message: "Channel closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into());
         }
         let bb = obj_arg(args, 1)?;
         let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
@@ -27918,8 +29343,12 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
             }
         }
-        let n = ctx.fd_table().pipe_write(fd_id as u32, &data)
-            .map_err(|e| RuntimeError::IOException { message: format!("pipe write: {}", e) })?;
+        let n = ctx
+            .fd_table()
+            .pipe_write(fd_id as u32, &data)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("pipe write: {}", e),
+            })?;
         ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
         Ok(Some(Value::Int(n as i32)))
     });
@@ -27936,28 +29365,44 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(sink_ch, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
+    r.register(
+        sink_ch,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
 
     // =========================================================================
     // UnixDomainSocketAddress — throws UnsupportedOperationException on Windows
     // =========================================================================
     let udsa = "java/net/UnixDomainSocketAddress";
-    r.register(udsa, "of", "(Ljava/lang/String;)Ljava/net/UnixDomainSocketAddress;", |_ctx, _args| {
-        Err(RuntimeError::UnsupportedOperationException {
-            message: "Unix domain sockets are not supported on this platform".into(),
-        }.into())
-    });
-    r.register(udsa, "of", "(Ljava/nio/file/Path;)Ljava/net/UnixDomainSocketAddress;", |_ctx, _args| {
-        Err(RuntimeError::UnsupportedOperationException {
-            message: "Unix domain sockets are not supported on this platform".into(),
-        }.into())
-    });
+    r.register(
+        udsa,
+        "of",
+        "(Ljava/lang/String;)Ljava/net/UnixDomainSocketAddress;",
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "Unix domain sockets are not supported on this platform".into(),
+            }
+            .into())
+        },
+    );
+    r.register(
+        udsa,
+        "of",
+        "(Ljava/nio/file/Path;)Ljava/net/UnixDomainSocketAddress;",
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "Unix domain sockets are not supported on this platform".into(),
+            }
+            .into())
+        },
+    );
     r.register(udsa, "getPath", "()Ljava/nio/file/Path;", |_ctx, _args| {
         Err(RuntimeError::UnsupportedOperationException {
             message: "Unix domain sockets are not supported on this platform".into(),
-        }.into())
+        }
+        .into())
     });
     r.set_category(__prev_cat);
 }
@@ -28859,12 +30304,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
 
 /// NEW-13: copy a single byte from `src[idx]` into `dst[idx]`, preserving
 /// the signed-byte encoding used by Java's byte[] element storage.
-fn out_copy_byte(
-    ctx: &mut dyn NativeContext,
-    src: ObjectRef,
-    dst: ObjectRef,
-    idx: usize,
-) {
+fn out_copy_byte(ctx: &mut dyn NativeContext, src: ObjectRef, dst: ObjectRef, idx: usize) {
     let v = match ctx.get_array_element(src, idx) {
         Value::Int(v) => v,
         _ => 0,
@@ -28916,7 +30356,6 @@ fn mac_extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec
         _ => Vec::new(),
     }
 }
-
 
 /// Off-object state for the synthetic `javax.crypto.Mac` (bug-26 L3). Storing the
 /// algorithm / key / accumulated data / init-flag in raw slots of a REAL
@@ -28977,10 +30416,7 @@ fn mac_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32,
 /// just before inserting a fresh entry. `keep` is the id we are about to insert,
 /// which is never evicted. Best-effort eviction (lowest ids first) — these are
 /// abandoned Mac handles whose Java objects are unreachable.
-fn mac_state_evict_if_needed(
-    t: &mut std::collections::HashMap<i32, MacState>,
-    keep: i32,
-) {
+fn mac_state_evict_if_needed(t: &mut std::collections::HashMap<i32, MacState>, keep: i32) {
     if t.len() < MAC_STATE_MAX_ENTRIES {
         return;
     }
@@ -29021,7 +30457,12 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             mac_state_evict_if_needed(&mut t, id);
             t.insert(
                 id,
-                MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
+                MacState {
+                    algo,
+                    key: Vec::new(),
+                    data: Vec::new(),
+                    initialized: false,
+                },
             );
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -29049,7 +30490,12 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             mac_state_evict_if_needed(&mut t, id);
             t.insert(
                 id,
-                MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
+                MacState {
+                    algo,
+                    key: Vec::new(),
+                    data: Vec::new(),
+                    initialized: false,
+                },
             );
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -29078,7 +30524,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             let bytes = mac_read_byte_array(ctx, *arr);
             let id = ctx.identity_hash_code(this);
-            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
+            mac_state_table()
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_default()
+                .data
+                .extend_from_slice(&bytes);
         }
         Ok(None)
     });
@@ -29095,7 +30547,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 }
             }
             let id = ctx.identity_hash_code(this);
-            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
+            mac_state_table()
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_default()
+                .data
+                .extend_from_slice(&bytes);
         }
         Ok(None)
     });
@@ -29104,7 +30562,13 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         let id = ctx.identity_hash_code(this);
-        mac_state_table().lock().unwrap().entry(id).or_default().data.push(b);
+        mac_state_table()
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .data
+            .push(b);
         Ok(None)
     });
     // doFinal()[B — compute HMAC, return result, reset accumulator
@@ -29313,14 +30777,14 @@ fn new13_build_connector() -> Result<native_tls::TlsConnector, String> {
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
 fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
-    let session = alloc_concurrent_synthetic(
-        ctx,
-        "javax/net/ssl/SSLSession",
-        NEW13_SSL_SESS_FIELDS,
-    );
+    let session =
+        alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS);
     let (proto, cipher) = match crate::servlet::s2_tls_session_info(tls_id) {
         Some((p, c, _, _)) => (p, c),
-        None => (String::from("TLSv1.3"), String::from("TLS_AES_128_GCM_SHA256")),
+        None => (
+            String::from("TLSv1.3"),
+            String::from("TLS_AES_128_GCM_SHA256"),
+        ),
     };
     let proto_str = ctx.create_string(&proto);
     let cipher_str = ctx.create_string(&cipher);
@@ -29331,21 +30795,16 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
 }
 
 /// NEW-13: common body for the two `SSLSocketFactory.createSocket` overloads.
-fn new13_do_create_socket(
-    ctx: &mut dyn NativeContext,
-    host: &str,
-    port: u16,
-) -> MethodCallResult {
-    let connector = new13_build_connector()
-        .map_err(|msg| RuntimeError::IOException { message: msg })?;
-    let tls_id = crate::servlet::s2_tls_connect(&connector, host, port)
-        .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+fn new13_do_create_socket(ctx: &mut dyn NativeContext, host: &str, port: u16) -> MethodCallResult {
+    let connector =
+        new13_build_connector().map_err(|msg| RuntimeError::IOException { message: msg })?;
+    let tls_id = crate::servlet::s2_tls_connect(&connector, host, port).map_err(|e| {
+        RuntimeError::IOException {
+            message: e.to_string(),
+        }
+    })?;
 
-    let sock = alloc_concurrent_synthetic(
-        ctx,
-        "javax/net/ssl/SSLSocket",
-        NEW13_SSL_SOCK_FIELDS,
-    );
+    let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
     let host_obj = ctx.create_string(host);
     ctx.set_field(sock, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(sock, NEW13_SOCK_PORT, Value::Int(port as i32));
@@ -29374,7 +30833,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: "SSLContext.getInstance: protocol is null".into(),
-                    }.into());
+                    }
+                    .into());
                 }
             };
             let proto_name = ctx.read_string(proto_ref).unwrap_or_default();
@@ -29383,14 +30843,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 other => {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: format!("No such algorithm: {}", other),
-                    }.into());
+                    }
+                    .into());
                 }
             }
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLContext",
-                NEW13_SSL_CTX_FIELDS,
-            );
+            let obj =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS);
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto_ref)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(0));
             ctx.set_field(obj, NEW13_CTX_KM, Value::Object(None));
@@ -29406,11 +30864,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // A "Default" context is pre-initialised: it uses the platform
             // trust store and an implementation-defined `SecureRandom`.
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLContext",
-                NEW13_SSL_CTX_FIELDS,
-            );
+            let obj =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS);
             let proto = ctx.create_string("TLSv1.3");
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(1));
@@ -29458,7 +30913,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if let Err(msg) = new13_build_connector() {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
-                }.into());
+                }
+                .into());
             }
 
             ctx.set_field(this, NEW13_CTX_KM, km_arg);
@@ -29587,20 +31043,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 _ => {
                     return Err(RuntimeError::NullPointerException {
                         message: Some("SSLSocketFactory.createSocket: host is null".into()),
-                    }.into());
+                    }
+                    .into());
                 }
             };
             let host = ctx.read_string(host_ref).unwrap_or_default();
             if host.is_empty() {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "SSLSocketFactory.createSocket: host is empty".into(),
-                }.into());
+                }
+                .into());
             }
             let port_i = args.get(2).and_then(|v| v.as_int()).unwrap_or(443);
             if !(0..=65535).contains(&port_i) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: format!("port out of range: {}", port_i),
-                }.into());
+                }
+                .into());
             }
             new13_do_create_socket(ctx, &host, port_i as u16)
         },
@@ -29616,14 +31075,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
                 return Err(RuntimeError::NullPointerException {
                     message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
-                }.into());
+                }
+                .into());
             }
             let host_ref = match args.get(2) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
                     return Err(RuntimeError::NullPointerException {
                         message: Some("SSLSocketFactory.createSocket: host is null".into()),
-                    }.into());
+                    }
+                    .into());
                 }
             };
             let host = ctx.read_string(host_ref).unwrap_or_default();
@@ -29631,7 +31092,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if !(0..=65535).contains(&port_i) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: format!("port out of range: {}", port_i),
-                }.into());
+                }
+                .into());
             }
             new13_do_create_socket(ctx, &host, port_i as u16)
         },
@@ -29726,7 +31188,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         match crate::servlet::s2_tls_read(tls_id, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
     r.register(ssl_is, "read", "([BII)I", |ctx, args| {
@@ -29740,7 +31205,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             _ => {
                 return Err(RuntimeError::NullPointerException {
                     message: Some("SSLSocketInputStream.read: buffer is null".into()),
-                }.into());
+                }
+                .into());
             }
         };
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
@@ -29751,7 +31217,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if off.saturating_add(len) > arr_len {
             return Err(RuntimeError::ArrayIndexOutOfBoundsException {
                 index: off.saturating_add(len) as i32,
-            }.into());
+            }
+            .into());
         }
         if len == 0 {
             return Ok(Some(Value::Int(0)));
@@ -29765,7 +31232,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
     r.register(ssl_is, "available", "()I", |_ctx, _args| {
@@ -29784,11 +31254,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
-            }.into());
+            }
+            .into());
         }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        crate::servlet::s2_tls_write(tls_id, &[b])
-            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        crate::servlet::s2_tls_write(tls_id, &[b]).map_err(|e| RuntimeError::IOException {
+            message: e.to_string(),
+        })?;
         Ok(None)
     });
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
@@ -29797,14 +31269,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
-            }.into());
+            }
+            .into());
         }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => {
                 return Err(RuntimeError::NullPointerException {
                     message: Some("SSLSocketOutputStream.write: buffer is null".into()),
-                }.into());
+                }
+                .into());
             }
         };
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
@@ -29813,7 +31287,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if off.saturating_add(len) > arr_len {
             return Err(RuntimeError::ArrayIndexOutOfBoundsException {
                 index: off.saturating_add(len) as i32,
-            }.into());
+            }
+            .into());
         }
         if len == 0 {
             return Ok(None);
@@ -29833,11 +31308,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Ok(0) => {
                     return Err(RuntimeError::IOException {
                         message: "SSLSocketOutputStream.write: peer closed".into(),
-                    }.into());
+                    }
+                    .into());
                 }
                 Ok(n) => written += n,
                 Err(e) => {
-                    return Err(RuntimeError::IOException { message: e.to_string() }.into());
+                    return Err(RuntimeError::IOException {
+                        message: e.to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -29861,7 +31340,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
                 ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-            } else { -1 };
+            } else {
+                -1
+            };
             if tls_id >= 0 {
                 if let Some((p, _, _, _)) = crate::servlet::s2_tls_session_info(tls_id) {
                     let s = ctx.create_string(&p);
@@ -29879,7 +31360,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
                 ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-            } else { -1 };
+            } else {
+                -1
+            };
             if tls_id >= 0 {
                 if let Some((_, c, _, _)) = crate::servlet::s2_tls_session_info(tls_id) {
                     let s = ctx.create_string(&c);
@@ -29893,7 +31376,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
             ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-        } else { -1 };
+        } else {
+            -1
+        };
         // A session is "valid" while the backing TLS stream is still alive
         // in the registry. Closed sockets invalidate their own session.
         let alive = tls_id >= 0 && crate::servlet::s2_tls_session_info(tls_id).is_some();
@@ -29906,7 +31391,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // the same bytes, per SSLSession.getId() contract.
         let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
             ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-        } else { -1 };
+        } else {
+            -1
+        };
         let mut seed: u64 = (tls_id as i64 as u64).wrapping_mul(0x9E3779B97F4A7C15);
         if let Some((p, c, _, _)) = crate::servlet::s2_tls_session_info(tls_id) {
             for b in p.as_bytes().iter().chain(c.as_bytes()) {
@@ -29916,7 +31403,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         let mut rng = seed | 1;
         for i in 0..32 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ctx.set_array_element(arr, i, Value::Int(((rng >> 33) & 0xFF) as i32));
         }
         Ok(Some(Value::Object(Some(arr))))
@@ -29934,7 +31423,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
                 ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
-            } else { -1 };
+            } else {
+                -1
+            };
             let chain = if tls_id >= 0 {
                 crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
             } else {
@@ -29943,18 +31434,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if chain.is_empty() {
                 return Err(RuntimeError::IllegalStateException {
                     message: "peer not authenticated (no certificate in session)".into(),
-                }.into());
+                }
+                .into());
             }
             let arr = ctx.new_ref_array(ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
                 // Allocate a 4-field X509Certificate: the extra field 3
                 // carries the raw DER bytes so `Certificate.getEncoded()`
                 // can return them without relying on legacy-synthetic-crypto.
-                let cert = alloc_concurrent_synthetic(
-                    ctx,
-                    "java/security/cert/X509Certificate",
-                    4,
-                );
+                let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
                 let (subject, issuer) = basic_der_extract_names(der)
                     .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
                 let sub_str = ctx.create_string(&subject);
@@ -29963,10 +31451,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
                 ctx.set_field(cert, 2, Value::Long(0));
                 // Copy DER bytes into a Java byte[] stored at field 3.
-                let der_arr = ctx.new_array(
-                    cratonvm_types::ArrayElementType::Byte,
-                    der.len(),
-                );
+                let der_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
                 for (j, &b) in der.iter().enumerate() {
                     ctx.set_array_element(der_arr, j, Value::Int(b as i8 as i32));
                 }
@@ -29976,30 +31461,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
-    r.register(
-        ssl_session,
-        "getCreationTime",
-        "()J",
-        |_ctx, _args| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            Ok(Some(Value::Long(now)))
-        },
-    );
-    r.register(
-        ssl_session,
-        "getLastAccessedTime",
-        "()J",
-        |_ctx, _args| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            Ok(Some(Value::Long(now)))
-        },
-    );
+    r.register(ssl_session, "getCreationTime", "()J", |_ctx, _args| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        Ok(Some(Value::Long(now)))
+    });
+    r.register(ssl_session, "getLastAccessedTime", "()J", |_ctx, _args| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        Ok(Some(Value::Long(now)))
+    });
 
     // TrustManagerFactory = 2-field (algorithm=0, keystore=1)
     //
@@ -30049,13 +31524,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(tmf, "init", "(Ljavax/net/ssl/ManagerFactoryParameters;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 1 {
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
-        Ok(None)
-    });
+    r.register(
+        tmf,
+        "init",
+        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) > 1 {
+                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            }
+            Ok(None)
+        },
+    );
     r.register(
         tmf,
         "getTrustManagers",
@@ -30123,13 +31603,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(kmf, "init", "(Ljavax/net/ssl/ManagerFactoryParameters;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 1 {
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
-        Ok(None)
-    });
+    r.register(
+        kmf,
+        "init",
+        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) > 1 {
+                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            }
+            Ok(None)
+        },
+    );
     r.register(
         kmf,
         "getKeyManagers",
@@ -30264,7 +31749,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 _ => "NOT_HANDSHAKING",
             };
             // Return an enum synthetic
-            let e = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
+            let e =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -30309,10 +31795,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Read src position / limit to figure out how many bytes to wrap.
             let src_pos = ctx.get_field(src, 1).as_int().unwrap_or(0) as usize;
             let src_lim = ctx.get_field(src, 2).as_int().unwrap_or(0) as usize;
-            let remaining = if src_lim > src_pos { src_lim - src_pos } else { 0 };
+            let remaining = if src_lim > src_pos {
+                src_lim - src_pos
+            } else {
+                0
+            };
             let dst_pos = ctx.get_field(dst, 1).as_int().unwrap_or(0) as usize;
             let dst_lim = ctx.get_field(dst, 2).as_int().unwrap_or(0) as usize;
-            let dst_rem = if dst_lim > dst_pos { dst_lim - dst_pos } else { 0 };
+            let dst_rem = if dst_lim > dst_pos {
+                dst_lim - dst_pos
+            } else {
+                0
+            };
 
             let bytes_produced;
             let bytes_consumed;
@@ -30362,11 +31856,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(this, 5, Value::Int(new_hs));
 
-            let result = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult",
-                4,
-            );
+            let result = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
             // Fields: 0=status ordinal (OK=0), 1=handshakeStatus ordinal,
             //         2=bytesConsumed, 3=bytesProduced
             ctx.set_field(result, 0, Value::Int(0)); // OK
@@ -30406,10 +31896,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let hs = ctx.get_field(this, 5).as_int().unwrap_or(0);
             let src_pos = ctx.get_field(src, 1).as_int().unwrap_or(0) as usize;
             let src_lim = ctx.get_field(src, 2).as_int().unwrap_or(0) as usize;
-            let remaining = if src_lim > src_pos { src_lim - src_pos } else { 0 };
+            let remaining = if src_lim > src_pos {
+                src_lim - src_pos
+            } else {
+                0
+            };
             let dst_pos = ctx.get_field(dst, 1).as_int().unwrap_or(0) as usize;
             let dst_lim = ctx.get_field(dst, 2).as_int().unwrap_or(0) as usize;
-            let dst_rem = if dst_lim > dst_pos { dst_lim - dst_pos } else { 0 };
+            let dst_rem = if dst_lim > dst_pos {
+                dst_lim - dst_pos
+            } else {
+                0
+            };
 
             let bytes_produced;
             let bytes_consumed;
@@ -30450,11 +31948,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(this, 5, Value::Int(new_hs));
 
-            let result = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult",
-                4,
-            );
+            let result = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
             ctx.set_field(result, 0, Value::Int(0)); // OK
             ctx.set_field(result, 1, Value::Int(new_hs));
             ctx.set_field(result, 2, Value::Int(bytes_consumed as i32));
@@ -30479,11 +31973,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 3 => "CLOSED",
                 _ => "OK",
             };
-            let e = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$Status",
-                2,
-            );
+            let e = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 2);
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -30505,11 +31995,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 4 => "FINISHED",
                 _ => "NOT_HANDSHAKING",
             };
-            let e = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
-                2,
-            );
+            let e =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -30610,7 +32097,11 @@ fn der_read_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     if data.len() < header_len + length {
         return None;
     }
-    Some((tag, &data[header_len..header_len + length], &data[header_len + length..]))
+    Some((
+        tag,
+        &data[header_len..header_len + length],
+        &data[header_len + length..],
+    ))
 }
 
 /// Extract CommonName (OID 2.5.4.3) from a DER-encoded Name (SEQUENCE of RDNs).
@@ -30636,7 +32127,9 @@ fn der_extract_cn(name_data: &[u8]) -> String {
                         x if x == &[0x55, 0x04, 0x0b] => "OU",
                         _ => "",
                     };
-                    if !oid_name.is_empty() && (val_tag == 0x0c || val_tag == 0x13 || val_tag == 0x16) {
+                    if !oid_name.is_empty()
+                        && (val_tag == 0x0c || val_tag == 0x13 || val_tag == 0x16)
+                    {
                         if let Ok(s) = std::str::from_utf8(val_bytes) {
                             parts.push(format!("{}={}", oid_name, s));
                         }
@@ -30658,11 +32151,15 @@ fn der_extract_cn(name_data: &[u8]) -> String {
 pub(crate) fn basic_der_extract_names(data: &[u8]) -> Option<(String, String)> {
     // Certificate = SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
     let (tag, cert_content, _) = der_read_tlv(data)?;
-    if tag != 0x30 { return None; } // must be SEQUENCE
+    if tag != 0x30 {
+        return None;
+    } // must be SEQUENCE
 
     // tbsCertificate = SEQUENCE { version, serialNumber, signature, issuer, validity, subject, ... }
     let (tag, tbs_content, _) = der_read_tlv(cert_content)?;
-    if tag != 0x30 { return None; }
+    if tag != 0x30 {
+        return None;
+    }
 
     let mut pos = tbs_content;
 
@@ -30672,24 +32169,34 @@ pub(crate) fn basic_der_extract_names(data: &[u8]) -> Option<(String, String)> {
     }
 
     // serialNumber: INTEGER
-    let (0x02, _, rest) = der_read_tlv(pos)? else { return None; };
+    let (0x02, _, rest) = der_read_tlv(pos)? else {
+        return None;
+    };
     pos = rest;
 
     // signature: AlgorithmIdentifier (SEQUENCE)
-    let (0x30, _, rest) = der_read_tlv(pos)? else { return None; };
+    let (0x30, _, rest) = der_read_tlv(pos)? else {
+        return None;
+    };
     pos = rest;
 
     // issuer: Name (SEQUENCE)
-    let (0x30, issuer_content, rest) = der_read_tlv(pos)? else { return None; };
+    let (0x30, issuer_content, rest) = der_read_tlv(pos)? else {
+        return None;
+    };
     let issuer = der_extract_cn(issuer_content);
     pos = rest;
 
     // validity: SEQUENCE { notBefore, notAfter }
-    let (0x30, _, rest) = der_read_tlv(pos)? else { return None; };
+    let (0x30, _, rest) = der_read_tlv(pos)? else {
+        return None;
+    };
     pos = rest;
 
     // subject: Name (SEQUENCE)
-    let (0x30, subject_content, _) = der_read_tlv(pos)? else { return None; };
+    let (0x30, subject_content, _) = der_read_tlv(pos)? else {
+        return None;
+    };
     let subject = der_extract_cn(subject_content);
 
     Some((subject, issuer))
@@ -30736,9 +32243,15 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                             data.push(b);
                         }
                         Some(data)
-                    } else { None }
-                } else { None }
-            } else { None };
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Try legacy-synthetic-crypto parser first (full featured)
             #[cfg(feature = "legacy-synthetic-crypto")]
@@ -30791,7 +32304,11 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
                     let len = ctx.array_length(buf_ref);
                     if len > 0 {
-                        let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
+                        let cert = alloc_concurrent_synthetic(
+                            ctx,
+                            "java/security/cert/X509Certificate",
+                            3,
+                        );
                         let mut data = Vec::with_capacity(len);
                         for i in 0..len {
                             let b = match ctx.get_array_element(buf_ref, i) {
@@ -30835,10 +32352,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(der_arr)) = ctx.get_field(*this, 3) {
                     let len = ctx.array_length(der_arr);
                     if len > 0 {
-                        let out = ctx.new_array(
-                            cratonvm_types::ArrayElementType::Byte,
-                            len,
-                        );
+                        let out = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
                         for i in 0..len {
                             out_copy_byte(ctx, der_arr, out, i);
                         }
@@ -30849,9 +32363,13 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         }
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
+                let arr =
+                    ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
                 for (i, &b) in parsed.encoded.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -30870,11 +32388,16 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let _ = (&ctx, &args); // used only under legacy-synthetic-crypto feature
             #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
-                let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                     let pk = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4);
                     let alg_idx = match parsed.public_key_algorithm.as_str() {
-                        "RSA" => 6, "EC" => 7, _ => 0,
+                        "RSA" => 6,
+                        "EC" => 7,
+                        _ => 0,
                     };
                     ctx.set_field(pk, 0, Value::Int(alg_idx));
                     ctx.set_field(pk, 1, Value::Int(256));
@@ -30886,20 +32409,28 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
-    r.register(cert, "verify", "(Ljava/security/PublicKey;)V", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
-            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                if !parsed.verify_signature(&parsed.public_key_bytes) {
-                    // For non-self-signed certs, verification with own key is expected to fail
-                    // We don't throw here as this is best-effort
+    r.register(
+        cert,
+        "verify",
+        "(Ljava/security/PublicKey;)V",
+        |ctx, args| {
+            #[cfg(feature = "legacy-synthetic-crypto")]
+            if let Some(Value::Object(Some(this))) = args.get(0) {
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
+                if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                    if !parsed.verify_signature(&parsed.public_key_bytes) {
+                        // For non-self-signed certs, verification with own key is expected to fail
+                        // We don't throw here as this is best-effort
+                    }
                 }
             }
-        }
-        let _ = (ctx, args);
-        Ok(None)
-    });
+            let _ = (ctx, args);
+            Ok(None)
+        },
+    );
 
     // X509Certificate = 3-field (subject_str=0, issuer_str=1, cert_id=2)
     let x509 = "java/security/cert/X509Certificate";
@@ -30912,7 +32443,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let sub = ctx.get_field(this, 0);
             if matches!(sub, Value::Object(Some(_))) {
                 // Wrap string in a Principal-like synthetic
-                let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                let princ =
+                    alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
                 ctx.set_field(princ, 0, sub);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -30927,7 +32459,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let iss = ctx.get_field(this, 1);
             if matches!(iss, Value::Object(Some(_))) {
-                let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                let princ =
+                    alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
                 ctx.set_field(princ, 0, iss);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -30941,7 +32474,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let sub = ctx.get_field(this, 0);
-            let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let princ =
+                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
             ctx.set_field(princ, 0, sub);
             Ok(Some(Value::Object(Some(princ))))
         },
@@ -30953,7 +32487,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let iss = ctx.get_field(this, 1);
-            let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let princ =
+                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
             ctx.set_field(princ, 0, iss);
             Ok(Some(Value::Object(Some(princ))))
         },
@@ -30961,7 +32496,10 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getNotBefore", "()Ljava/util/Date;", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                 let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
                 ctx.set_field(date, 0, Value::Long(parsed.not_before * 1000)); // millis
@@ -30974,7 +32512,10 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getNotAfter", "()Ljava/util/Date;", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                 let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
                 ctx.set_field(date, 0, Value::Long(parsed.not_after * 1000));
@@ -30991,12 +32532,18 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
-                let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                     // Create BigInteger with value from serial number bytes
                     // Convert serial number bytes to decimal string
-                    let serial_hex: String = parsed.serial_number.iter()
-                        .map(|b| format!("{:02x}", b)).collect();
+                    let serial_hex: String = parsed
+                        .serial_number
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
                     let serial_dec = u128::from_str_radix(&serial_hex, 16)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|_| "0".to_string());
@@ -31015,7 +32562,10 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
-                let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                     let s = ctx.create_string(&parsed.sig_algorithm);
                     return Ok(Some(Value::Object(Some(s))));
@@ -31029,7 +32579,10 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getVersion", "()I", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                 return Ok(Some(Value::Int(parsed.version as i32)));
             }
@@ -31044,9 +32597,13 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getEncoded", "()[B", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
+                let arr =
+                    ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
                 for (i, &b) in parsed.encoded.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -31064,11 +32621,16 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
-                let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                     let pk = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4);
                     let alg_idx = match parsed.public_key_algorithm.as_str() {
-                        "RSA" => 6, "EC" => 7, _ => 0,
+                        "RSA" => 6,
+                        "EC" => 7,
+                        _ => 0,
                     };
                     ctx.set_field(pk, 0, Value::Int(alg_idx));
                     ctx.set_field(pk, 1, Value::Int(256));
@@ -31081,22 +32643,33 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
-    r.register(x509, "verify", "(Ljava/security/PublicKey;)V", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
-            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                // Best-effort verification — doesn't throw on failure for now
-                let _ = parsed.verify_signature(&parsed.public_key_bytes);
+    r.register(
+        x509,
+        "verify",
+        "(Ljava/security/PublicKey;)V",
+        |ctx, args| {
+            #[cfg(feature = "legacy-synthetic-crypto")]
+            if let Some(Value::Object(Some(this))) = args.get(0) {
+                let cert_id = match ctx.get_field(*this, 2) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
+                if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                    // Best-effort verification — doesn't throw on failure for now
+                    let _ = parsed.verify_signature(&parsed.public_key_bytes);
+                }
             }
-        }
-        let _ = (ctx, args);
-        Ok(None)
-    });
+            let _ = (ctx, args);
+            Ok(None)
+        },
+    );
     r.register(x509, "checkValidity", "()V", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -31105,7 +32678,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 if !parsed.is_valid_at(now) {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: "Certificate not valid at current time".into(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -31115,16 +32689,25 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "checkValidity", "(Ljava/util/Date;)V", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
                 // Extract time from Date object (field 0 = millis)
                 let millis = if let Some(Value::Object(Some(date))) = args.get(1) {
-                    match ctx.get_field(*date, 0) { Value::Long(ms) => ms / 1000, _ => 0 }
-                } else { 0 };
+                    match ctx.get_field(*date, 0) {
+                        Value::Long(ms) => ms / 1000,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
                 if millis > 0 && !parsed.is_valid_at(millis) {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: "Certificate not valid at specified time".into(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -31136,9 +32719,15 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getSignature", "()[B", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.signature_bytes.len());
+                let arr = ctx.new_array(
+                    cratonvm_types::ArrayElementType::Byte,
+                    parsed.signature_bytes.len(),
+                );
                 for (i, &b) in parsed.signature_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -31154,9 +32743,15 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     r.register(x509, "getTBSCertificate", "()[B", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
+            let cert_id = match ctx.get_field(*this, 2) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.tbs_bytes.len());
+                let arr = ctx.new_array(
+                    cratonvm_types::ArrayElementType::Byte,
+                    parsed.tbs_bytes.len(),
+                );
                 for (i, &b) in parsed.tbs_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -31231,16 +32826,18 @@ mod jdbc_registry {
     }
 
     fn registry() -> &'static parking_lot::Mutex<JdbcRegistry> {
-        REGISTRY.get_or_init(|| parking_lot::Mutex::new(JdbcRegistry {
-            next_id: 1,
-            connections: HashMap::new(),
-            conn_closed: HashMap::new(),
-            results: HashMap::new(),
-            next_stmt_id: 1,
-            prepared: HashMap::new(),
-            next_ps_id: 1,
-            last_was_null: HashMap::new(),
-        }))
+        REGISTRY.get_or_init(|| {
+            parking_lot::Mutex::new(JdbcRegistry {
+                next_id: 1,
+                connections: HashMap::new(),
+                conn_closed: HashMap::new(),
+                results: HashMap::new(),
+                next_stmt_id: 1,
+                prepared: HashMap::new(),
+                next_ps_id: 1,
+                last_was_null: HashMap::new(),
+            })
+        })
     }
 
     /// Record whether the most recent get* call on this ResultSet returned a NULL value.
@@ -31250,7 +32847,12 @@ mod jdbc_registry {
 
     /// Return true if the most recent get* call returned NULL. Defaults to false.
     pub fn was_null(stmt_id: i64) -> bool {
-        registry().lock().last_was_null.get(&stmt_id).copied().unwrap_or(false)
+        registry()
+            .lock()
+            .last_was_null
+            .get(&stmt_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn next_id(current: &mut i64) -> i64 {
@@ -31274,7 +32876,10 @@ mod jdbc_registry {
         }
         // Reject absolute paths outside current directory on Unix-like systems
         if path.starts_with('/') && !path.starts_with("/tmp/") {
-            return Err(format!("JDBC path rejected: absolute path '{}' not allowed", path));
+            return Err(format!(
+                "JDBC path rejected: absolute path '{}' not allowed",
+                path
+            ));
         }
         Ok(())
     }
@@ -31303,8 +32908,7 @@ mod jdbc_registry {
 
         validate_path(path)?;
 
-        let conn = rusqlite::Connection::open(path)
-            .map_err(|e| sanitize_error(&e))?;
+        let conn = rusqlite::Connection::open(path).map_err(|e| sanitize_error(&e))?;
         let mut reg = registry().lock();
         let id = next_id(&mut reg.next_id);
         reg.connections.insert(id, conn);
@@ -31329,7 +32933,9 @@ mod jdbc_registry {
     /// When turning ON, commits any pending transaction.
     pub fn set_auto_commit(id: i64, auto_commit: bool) -> Result<(), String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&id)
+        let conn = reg
+            .connections
+            .get(&id)
             .ok_or_else(|| "Connection not found".to_string())?;
         if auto_commit {
             // Turning auto-commit ON: commit any pending transaction
@@ -31345,7 +32951,9 @@ mod jdbc_registry {
     /// Commit the current transaction and start a new one.
     pub fn commit(id: i64) -> Result<(), String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&id)
+        let conn = reg
+            .connections
+            .get(&id)
             .ok_or_else(|| "Connection not found".to_string())?;
         conn.execute_batch("COMMIT; BEGIN DEFERRED")
             .map_err(|e| format!("Commit failed: {}", e))
@@ -31354,7 +32962,9 @@ mod jdbc_registry {
     /// Roll back the current transaction and start a new one.
     pub fn rollback(id: i64) -> Result<(), String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&id)
+        let conn = reg
+            .connections
+            .get(&id)
             .ok_or_else(|| "Connection not found".to_string())?;
         conn.execute_batch("ROLLBACK; BEGIN DEFERRED")
             .map_err(|e| format!("Rollback failed: {}", e))
@@ -31364,7 +32974,9 @@ mod jdbc_registry {
     /// and READ_UNCOMMITTED (via pragma).
     pub fn set_isolation(id: i64, level: i32) -> Result<(), String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&id)
+        let conn = reg
+            .connections
+            .get(&id)
             .ok_or_else(|| "Connection not found".to_string())?;
         // Java isolation levels: 1=READ_UNCOMMITTED, 2=READ_COMMITTED,
         // 4=REPEATABLE_READ, 8=SERIALIZABLE
@@ -31382,11 +32994,12 @@ mod jdbc_registry {
         let mut reg = registry().lock();
 
         let (rows, column_names, column_types) = {
-            let conn = reg.connections.get(&conn_id)
+            let conn = reg
+                .connections
+                .get(&conn_id)
                 .ok_or_else(|| "Connection not found".to_string())?;
 
-            let mut stmt = conn.prepare(sql)
-                .map_err(|e| sanitize_error(&e))?;
+            let mut stmt = conn.prepare(sql).map_err(|e| sanitize_error(&e))?;
 
             let column_count = stmt.column_count();
             let col_names: Vec<String> = (0..column_count)
@@ -31395,13 +33008,10 @@ mod jdbc_registry {
 
             // Column types — rusqlite doesn't expose decl_type easily before execution.
             // Default all to TEXT; actual type detection happens at row-read time.
-            let col_types: Vec<String> = (0..column_count)
-                .map(|_| "TEXT".to_string())
-                .collect();
+            let col_types: Vec<String> = (0..column_count).map(|_| "TEXT".to_string()).collect();
 
             let mut result_rows: Vec<Vec<String>> = Vec::new();
-            let mut rows_iter = stmt.query([])
-                .map_err(|e| sanitize_error(&e))?;
+            let mut rows_iter = stmt.query([]).map_err(|e| sanitize_error(&e))?;
 
             while let Some(row) = rows_iter.next().map_err(|e| sanitize_error(&e))? {
                 if result_rows.len() >= MAX_RESULT_ROWS {
@@ -31409,7 +33019,8 @@ mod jdbc_registry {
                 }
                 let mut vals = Vec::with_capacity(column_count);
                 for i in 0..column_count {
-                    let val: String = row.get::<_, String>(i)
+                    let val: String = row
+                        .get::<_, String>(i)
                         .or_else(|_| row.get::<_, i64>(i).map(|v| v.to_string()))
                         .or_else(|_| row.get::<_, f64>(i).map(|v| v.to_string()))
                         .unwrap_or_else(|_| "NULL".to_string());
@@ -31431,14 +33042,23 @@ mod jdbc_registry {
             }
         }
 
-        reg.results.insert(stmt_id, CachedResult { rows, column_names, column_types });
+        reg.results.insert(
+            stmt_id,
+            CachedResult {
+                rows,
+                column_names,
+                column_types,
+            },
+        );
         Ok((stmt_id, row_count))
     }
 
     /// Execute an update (INSERT/UPDATE/DELETE). Returns rows affected.
     pub fn execute_update(conn_id: i64, sql: &str) -> Result<i32, String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&conn_id)
+        let conn = reg
+            .connections
+            .get(&conn_id)
             .ok_or_else(|| "Connection not found".to_string())?;
         conn.execute(sql, [])
             .map(|n| n as i32)
@@ -31451,12 +33071,15 @@ mod jdbc_registry {
     pub fn prepare(conn_id: i64, sql: &str) -> i64 {
         let mut reg = registry().lock();
         let id = next_id(&mut reg.next_ps_id);
-        reg.prepared.insert(id, PreparedState {
-            conn_id,
-            sql: sql.to_string(),
-            params: HashMap::new(),
-            batch: Vec::new(),
-        });
+        reg.prepared.insert(
+            id,
+            PreparedState {
+                conn_id,
+                sql: sql.to_string(),
+                params: HashMap::new(),
+                batch: Vec::new(),
+            },
+        );
         id
     }
 
@@ -31503,26 +33126,41 @@ mod jdbc_registry {
     pub fn execute_prepared_query(ps_id: i64) -> Result<(i64, usize), String> {
         let mut reg = registry().lock();
         let (conn_id, sql, params) = {
-            let ps = reg.prepared.get(&ps_id)
+            let ps = reg
+                .prepared
+                .get(&ps_id)
                 .ok_or_else(|| "PreparedStatement not found".to_string())?;
             (ps.conn_id, ps.sql.clone(), ps.params.clone())
         };
 
         let (rows, column_names, column_types) = {
-            let conn = reg.connections.get(&conn_id)
+            let conn = reg
+                .connections
+                .get(&conn_id)
                 .ok_or_else(|| "Connection not found".to_string())?;
-            let mut stmt = conn.prepare(&sql)
-                .map_err(|e| sanitize_error(&e))?;
+            let mut stmt = conn.prepare(&sql).map_err(|e| sanitize_error(&e))?;
 
             // Bind parameters
             for (&idx, val) in &params {
                 match val {
-                    ParamValue::Text(s) => { let _ = stmt.raw_bind_parameter(idx, s.as_str()); }
-                    ParamValue::Int(v) => { let _ = stmt.raw_bind_parameter(idx, *v); }
-                    ParamValue::Real(v) => { let _ = stmt.raw_bind_parameter(idx, *v); }
-                    ParamValue::Bool(v) => { let _ = stmt.raw_bind_parameter(idx, *v as i32); }
-                    ParamValue::Null => { let _ = stmt.raw_bind_parameter(idx, rusqlite::types::Null); }
-                    ParamValue::Blob(b) => { let _ = stmt.raw_bind_parameter(idx, b.as_slice()); }
+                    ParamValue::Text(s) => {
+                        let _ = stmt.raw_bind_parameter(idx, s.as_str());
+                    }
+                    ParamValue::Int(v) => {
+                        let _ = stmt.raw_bind_parameter(idx, *v);
+                    }
+                    ParamValue::Real(v) => {
+                        let _ = stmt.raw_bind_parameter(idx, *v);
+                    }
+                    ParamValue::Bool(v) => {
+                        let _ = stmt.raw_bind_parameter(idx, *v as i32);
+                    }
+                    ParamValue::Null => {
+                        let _ = stmt.raw_bind_parameter(idx, rusqlite::types::Null);
+                    }
+                    ParamValue::Blob(b) => {
+                        let _ = stmt.raw_bind_parameter(idx, b.as_slice());
+                    }
                 }
             }
 
@@ -31530,17 +33168,18 @@ mod jdbc_registry {
             let col_names: Vec<String> = (0..column_count)
                 .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
                 .collect();
-            let col_types: Vec<String> = (0..column_count)
-                .map(|_i| "TEXT".to_string())
-                .collect();
+            let col_types: Vec<String> = (0..column_count).map(|_i| "TEXT".to_string()).collect();
 
             let mut result_rows: Vec<Vec<String>> = Vec::new();
             let mut rows_iter = stmt.raw_query();
             while let Some(row) = rows_iter.next().map_err(|e| sanitize_error(&e))? {
-                if result_rows.len() >= MAX_RESULT_ROWS { break; }
+                if result_rows.len() >= MAX_RESULT_ROWS {
+                    break;
+                }
                 let mut vals = Vec::with_capacity(column_count);
                 for i in 0..column_count {
-                    let val: String = row.get::<_, String>(i)
+                    let val: String = row
+                        .get::<_, String>(i)
                         .or_else(|_| row.get::<_, i64>(i).map(|v| v.to_string()))
                         .or_else(|_| row.get::<_, f64>(i).map(|v| v.to_string()))
                         .unwrap_or_else(|_| "NULL".to_string());
@@ -31559,7 +33198,14 @@ mod jdbc_registry {
                 reg.results.remove(&oldest_key);
             }
         }
-        reg.results.insert(stmt_id, CachedResult { rows, column_names, column_types });
+        reg.results.insert(
+            stmt_id,
+            CachedResult {
+                rows,
+                column_names,
+                column_types,
+            },
+        );
         Ok((stmt_id, row_count))
     }
 
@@ -31567,22 +33213,37 @@ mod jdbc_registry {
     pub fn execute_prepared_update(ps_id: i64) -> Result<i32, String> {
         let reg = registry().lock();
         let (conn_id, sql, params) = {
-            let ps = reg.prepared.get(&ps_id)
+            let ps = reg
+                .prepared
+                .get(&ps_id)
                 .ok_or_else(|| "PreparedStatement not found".to_string())?;
             (ps.conn_id, ps.sql.clone(), ps.params.clone())
         };
-        let conn = reg.connections.get(&conn_id)
+        let conn = reg
+            .connections
+            .get(&conn_id)
             .ok_or_else(|| "Connection not found".to_string())?;
-        let mut stmt = conn.prepare(&sql)
-            .map_err(|e| sanitize_error(&e))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| sanitize_error(&e))?;
         for (&idx, val) in &params {
             match val {
-                ParamValue::Text(s) => { let _ = stmt.raw_bind_parameter(idx, s.as_str()); }
-                ParamValue::Int(v) => { let _ = stmt.raw_bind_parameter(idx, *v); }
-                ParamValue::Real(v) => { let _ = stmt.raw_bind_parameter(idx, *v); }
-                ParamValue::Bool(v) => { let _ = stmt.raw_bind_parameter(idx, *v as i32); }
-                ParamValue::Null => { let _ = stmt.raw_bind_parameter(idx, rusqlite::types::Null); }
-                ParamValue::Blob(b) => { let _ = stmt.raw_bind_parameter(idx, b.as_slice()); }
+                ParamValue::Text(s) => {
+                    let _ = stmt.raw_bind_parameter(idx, s.as_str());
+                }
+                ParamValue::Int(v) => {
+                    let _ = stmt.raw_bind_parameter(idx, *v);
+                }
+                ParamValue::Real(v) => {
+                    let _ = stmt.raw_bind_parameter(idx, *v);
+                }
+                ParamValue::Bool(v) => {
+                    let _ = stmt.raw_bind_parameter(idx, *v as i32);
+                }
+                ParamValue::Null => {
+                    let _ = stmt.raw_bind_parameter(idx, rusqlite::types::Null);
+                }
+                ParamValue::Blob(b) => {
+                    let _ = stmt.raw_bind_parameter(idx, b.as_slice());
+                }
             }
         }
         stmt.raw_execute()
@@ -31608,31 +33269,49 @@ mod jdbc_registry {
     /// Returns a Vec of update counts (one per batch entry).
     pub fn execute_batch(ps_id: i64) -> Result<Vec<i32>, String> {
         let mut reg = registry().lock();
-        let ps = reg.prepared.get_mut(&ps_id)
+        let ps = reg
+            .prepared
+            .get_mut(&ps_id)
             .ok_or_else(|| "PreparedStatement not found".to_string())?;
         let conn_id = ps.conn_id;
         let sql = ps.sql.clone();
         let batches = std::mem::take(&mut ps.batch);
 
-        let conn = reg.connections.get(&conn_id)
+        let conn = reg
+            .connections
+            .get(&conn_id)
             .ok_or_else(|| "Connection not found".to_string())?;
 
         let mut counts = Vec::with_capacity(batches.len());
         for params in &batches {
-            let mut stmt = conn.prepare(&sql)
+            let mut stmt = conn
+                .prepare(&sql)
                 .map_err(|e| format!("Batch prepare failed: {}", e))?;
             for (idx, pv) in params {
                 match pv {
-                    ParamValue::Text(s) => { let _ = stmt.raw_bind_parameter(*idx, s.as_str()); }
-                    ParamValue::Int(v) => { let _ = stmt.raw_bind_parameter(*idx, *v); }
-                    ParamValue::Real(v) => { let _ = stmt.raw_bind_parameter(*idx, *v); }
-                    ParamValue::Bool(v) => { let _ = stmt.raw_bind_parameter(*idx, *v as i32); }
-                    ParamValue::Null => { let _ = stmt.raw_bind_parameter(*idx, rusqlite::types::Null); }
-                    ParamValue::Blob(v) => { let _ = stmt.raw_bind_parameter(*idx, v.as_slice()); }
+                    ParamValue::Text(s) => {
+                        let _ = stmt.raw_bind_parameter(*idx, s.as_str());
+                    }
+                    ParamValue::Int(v) => {
+                        let _ = stmt.raw_bind_parameter(*idx, *v);
+                    }
+                    ParamValue::Real(v) => {
+                        let _ = stmt.raw_bind_parameter(*idx, *v);
+                    }
+                    ParamValue::Bool(v) => {
+                        let _ = stmt.raw_bind_parameter(*idx, *v as i32);
+                    }
+                    ParamValue::Null => {
+                        let _ = stmt.raw_bind_parameter(*idx, rusqlite::types::Null);
+                    }
+                    ParamValue::Blob(v) => {
+                        let _ = stmt.raw_bind_parameter(*idx, v.as_slice());
+                    }
                 }
             }
-            let changed = stmt.raw_execute()
-                .map_err(|e| format!("Batch execute failed: {}", e))? as i32;
+            let changed =
+                stmt.raw_execute()
+                    .map_err(|e| format!("Batch execute failed: {}", e))? as i32;
             counts.push(changed);
         }
         Ok(counts)
@@ -31641,11 +33320,14 @@ mod jdbc_registry {
     /// Execute a batch of SQL strings (for Statement.addBatch/executeBatch).
     pub fn execute_sql_batch(conn_id: i64, sqls: &[String]) -> Result<Vec<i32>, String> {
         let reg = registry().lock();
-        let conn = reg.connections.get(&conn_id)
+        let conn = reg
+            .connections
+            .get(&conn_id)
             .ok_or_else(|| "Connection not found".to_string())?;
         let mut counts = Vec::with_capacity(sqls.len());
         for sql in sqls {
-            let changed = conn.execute(sql, [])
+            let changed = conn
+                .execute(sql, [])
                 .map_err(|e| format!("Batch SQL failed: {}", e))? as i32;
             counts.push(changed);
         }
@@ -31656,7 +33338,8 @@ mod jdbc_registry {
 
     pub fn get_result(stmt_id: i64, row: usize, col: usize) -> Option<String> {
         let reg = registry().lock();
-        reg.results.get(&stmt_id)
+        reg.results
+            .get(&stmt_id)
             .and_then(|r| r.rows.get(row))
             .and_then(|r| r.get(col))
             .cloned()
@@ -31664,14 +33347,16 @@ mod jdbc_registry {
 
     pub fn get_column_count(stmt_id: i64) -> usize {
         let reg = registry().lock();
-        reg.results.get(&stmt_id)
+        reg.results
+            .get(&stmt_id)
             .map(|r| r.column_names.len())
             .unwrap_or(0)
     }
 
     pub fn get_column_name(stmt_id: i64, col: usize) -> String {
         let reg = registry().lock();
-        reg.results.get(&stmt_id)
+        reg.results
+            .get(&stmt_id)
             .and_then(|r| r.column_names.get(col))
             .cloned()
             .unwrap_or_else(|| "?".to_string())
@@ -31680,7 +33365,8 @@ mod jdbc_registry {
     /// Get the declared column type name (e.g. "INTEGER", "TEXT", "REAL").
     pub fn get_column_type_name(stmt_id: i64, col: usize) -> String {
         let reg = registry().lock();
-        reg.results.get(&stmt_id)
+        reg.results
+            .get(&stmt_id)
             .and_then(|r| r.column_types.get(col))
             .cloned()
             .unwrap_or_else(|| "TEXT".to_string())
@@ -31690,19 +33376,17 @@ mod jdbc_registry {
     pub fn get_column_type_code(stmt_id: i64, col: usize) -> i32 {
         let type_name = get_column_type_name(stmt_id, col);
         match type_name.to_uppercase().as_str() {
-            "INTEGER" | "INT" | "BIGINT" => 4,    // Types.INTEGER
-            "REAL" | "DOUBLE" | "FLOAT" => 8,      // Types.DOUBLE
-            "BLOB" => 2004,                        // Types.BLOB
-            "BOOLEAN" | "BOOL" => 16,              // Types.BOOLEAN
-            _ => 12,                                // Types.VARCHAR
+            "INTEGER" | "INT" | "BIGINT" => 4, // Types.INTEGER
+            "REAL" | "DOUBLE" | "FLOAT" => 8,  // Types.DOUBLE
+            "BLOB" => 2004,                    // Types.BLOB
+            "BOOLEAN" | "BOOL" => 16,          // Types.BOOLEAN
+            _ => 12,                           // Types.VARCHAR
         }
     }
 
     pub fn get_row_count(stmt_id: i64) -> usize {
         let reg = registry().lock();
-        reg.results.get(&stmt_id)
-            .map(|r| r.rows.len())
-            .unwrap_or(0)
+        reg.results.get(&stmt_id).map(|r| r.rows.len()).unwrap_or(0)
     }
 
     /// Free cached results for a result set.
@@ -31743,14 +33427,16 @@ mod jdbc_registry {
     }
 
     fn new14() -> &'static parking_lot::Mutex<New14Registry> {
-        NEW14.get_or_init(|| parking_lot::Mutex::new(New14Registry {
-            blobs: HashMap::new(),
-            clobs: HashMap::new(),
-            next_lob_id: 1,
-            savepoints: HashMap::new(),
-            next_savepoint_id: 1,
-            registered_drivers: Vec::new(),
-        }))
+        NEW14.get_or_init(|| {
+            parking_lot::Mutex::new(New14Registry {
+                blobs: HashMap::new(),
+                clobs: HashMap::new(),
+                next_lob_id: 1,
+                savepoints: HashMap::new(),
+                next_savepoint_id: 1,
+                registered_drivers: Vec::new(),
+            })
+        })
     }
 
     // ----- Blob -------------------------------------------------------
@@ -31871,10 +33557,7 @@ mod jdbc_registry {
             return String::new();
         }
         let start_char = (pos - 1) as usize;
-        s.chars()
-            .skip(start_char)
-            .take(length as usize)
-            .collect()
+        s.chars().skip(start_char).take(length as usize).collect()
     }
 
     /// Overwrite chars starting at 1-based `pos`. Extends the clob if
@@ -31926,10 +33609,7 @@ mod jdbc_registry {
 
     /// Create a new savepoint on `conn_id`. Returns the savepoint's
     /// opaque id and its effective name.
-    pub fn savepoint_create(
-        conn_id: i64,
-        name: Option<String>,
-    ) -> Result<(i64, String), String> {
+    pub fn savepoint_create(conn_id: i64, name: Option<String>) -> Result<(i64, String), String> {
         let reg = registry().lock();
         let conn = reg
             .connections
@@ -31943,9 +33623,7 @@ mod jdbc_registry {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
-            return Err(
-                "Savepoint name must be ASCII alphanumeric or underscore".to_string()
-            );
+            return Err("Savepoint name must be ASCII alphanumeric or underscore".to_string());
         }
         let sql = format!("SAVEPOINT {effective}");
         conn.execute_batch(&sql).map_err(|e| sanitize_error(&e))?;
@@ -32069,9 +33747,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                     ctx.set_field(conn, 3, Value::Int(8)); // SERIALIZABLE
                     Ok(Some(Value::Object(Some(conn))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: e,
-                }.into()),
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
             }
         },
     );
@@ -32124,7 +33800,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "()Ljava/sql/Statement;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+            let conn_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
             // Statement = 2-field (conn_id=0, closed=1)
             let stmt = alloc_concurrent_synthetic(ctx, "java/sql/Statement", 2);
             ctx.set_field(stmt, 0, Value::Long(conn_id)); // pass conn_id through
@@ -32138,7 +33818,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/sql/PreparedStatement;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+            let conn_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
             let sql = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -32172,17 +33856,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let sql = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).unwrap_or_default()
-                }
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
             let ps_id = jdbc_registry::prepare(conn_id, &sql);
-            let stmt = alloc_concurrent_synthetic(
-                ctx,
-                "java/sql/CallableStatement",
-                3,
-            );
+            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/CallableStatement", 3);
             ctx.set_field(stmt, 0, Value::Long(ps_id));
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id));
@@ -32191,7 +33869,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     );
     r.register(conn, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::close_connection(conn_id);
         ctx.set_field(this, 1, Value::Int(1));
         Ok(None)
@@ -32203,7 +33885,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.register(conn, "setAutoCommit", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let auto = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::set_auto_commit(conn_id, auto)
             .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         ctx.set_field(this, 2, Value::Int(if auto { 1 } else { 0 }));
@@ -32215,14 +33901,22 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(conn, "commit", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::commit(conn_id)
             .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
     });
     r.register(conn, "rollback", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::rollback(conn_id)
             .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
@@ -32242,7 +33936,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.register(conn, "setTransactionIsolation", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let level = args.get(1).and_then(|v| v.as_int()).unwrap_or(8);
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::set_isolation(conn_id, level)
             .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         ctx.set_field(this, 3, Value::Int(level));
@@ -32255,9 +33953,19 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.register(conn, "isValid", "(I)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let closed = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        if closed != 0 { return Ok(Some(Value::Int(0))); }
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        Ok(Some(Value::Int(if jdbc_registry::is_valid(conn_id) { 1 } else { 0 })))
+        if closed != 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if jdbc_registry::is_valid(conn_id) {
+            1
+        } else {
+            0
+        })))
     });
 
     // Statement = 2-field (conn_id=0, closed=1)
@@ -32268,7 +33976,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/sql/ResultSet;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+            let conn_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
             let sql = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -32292,7 +34004,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)I",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+            let conn_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
             let sql = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -32305,7 +34021,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     );
     r.register(stmt, "execute", "(Ljava/lang/String;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let sql = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
@@ -32349,8 +34069,12 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let timeout = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         ctx.set_field(this, 3, Value::Int(timeout)); // store in field 3
-        // Apply busy_timeout to SQLite connection
-        let conn_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+                                                     // Apply busy_timeout to SQLite connection
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         if timeout > 0 {
             let timeout_ms = (timeout * 1000).to_string();
             let pragma = format!("PRAGMA busy_timeout = {}", timeout_ms);
@@ -32368,7 +34092,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     let pstmt = "java/sql/PreparedStatement";
     r.register(pstmt, "setString", "(ILjava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         let val = match args.get(2) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -32379,7 +34107,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "setInt", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         let val = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i64;
         jdbc_registry::bind_int(ps_id, idx, val);
@@ -32387,31 +34119,59 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "setLong", "(IJ)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
-        let val = match args.get(2) { Some(Value::Long(v)) => *v, Some(Value::Int(v)) => *v as i64, _ => 0 };
+        let val = match args.get(2) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
         jdbc_registry::bind_int(ps_id, idx, val);
         Ok(None)
     });
     r.register(pstmt, "setDouble", "(ID)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
-        let val = match args.get(2) { Some(Value::Double(v)) => *v, Some(Value::Float(v)) => *v as f64, _ => 0.0 };
+        let val = match args.get(2) {
+            Some(Value::Double(v)) => *v,
+            Some(Value::Float(v)) => *v as f64,
+            _ => 0.0,
+        };
         jdbc_registry::bind_double(ps_id, idx, val);
         Ok(None)
     });
     r.register(pstmt, "setFloat", "(IF)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
-        let val = match args.get(2) { Some(Value::Float(v)) => *v as f64, Some(Value::Double(v)) => *v, _ => 0.0 };
+        let val = match args.get(2) {
+            Some(Value::Float(v)) => *v as f64,
+            Some(Value::Double(v)) => *v,
+            _ => 0.0,
+        };
         jdbc_registry::bind_double(ps_id, idx, val);
         Ok(None)
     });
     r.register(pstmt, "setBoolean", "(IZ)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         let val = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) != 0;
         jdbc_registry::bind_bool(ps_id, idx, val);
@@ -32419,14 +34179,22 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "setNull", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         jdbc_registry::bind_null(ps_id, idx);
         Ok(None)
     });
     r.register(pstmt, "setObject", "(ILjava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         match args.get(2) {
             Some(Value::Object(Some(s))) => {
@@ -32443,12 +34211,21 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "setBytes", "(I[B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) as usize;
         let bytes = match args.get(2) {
             Some(Value::Object(Some(arr))) => {
                 let len = ctx.array_length(*arr);
-                (0..len).map(|i| match ctx.get_array_element(*arr, i) { Value::Int(b) => b as u8, _ => 0 }).collect()
+                (0..len)
+                    .map(|i| match ctx.get_array_element(*arr, i) {
+                        Value::Int(b) => b as u8,
+                        _ => 0,
+                    })
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -32461,7 +34238,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "()Ljava/sql/ResultSet;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
             match jdbc_registry::execute_prepared_query(ps_id) {
                 Ok((stmt_id, row_count)) => {
                     let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
@@ -32476,7 +34257,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     );
     r.register(pstmt, "executeUpdate", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         match jdbc_registry::execute_prepared_update(ps_id) {
             Ok(n) => Ok(Some(Value::Int(n))),
             Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
@@ -32484,7 +34269,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "execute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         match jdbc_registry::execute_prepared_update(ps_id) {
             Ok(_) => Ok(Some(Value::Int(1))),
             Err(_) => Ok(Some(Value::Int(0))),
@@ -32492,20 +34281,32 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::free_prepared(ps_id);
         ctx.set_field(this, 1, Value::Int(1));
         Ok(None)
     });
     r.register(pstmt, "addBatch", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::add_batch(ps_id);
         Ok(None)
     });
     r.register(pstmt, "executeBatch", "()[I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         match jdbc_registry::execute_batch(ps_id) {
             Ok(counts) => {
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, counts.len());
@@ -32519,14 +34320,22 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(pstmt, "clearBatch", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         // Clear batch by re-preparing (simple approach)
         let _ = (ctx, ps_id);
         Ok(None)
     });
     r.register(pstmt, "clearParameters", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::clear_params(ps_id);
         Ok(None)
     });
@@ -32548,30 +34357,16 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // ResultSet getters — read from cached SQLite query results
     r.register(rs, "getString", "(I)Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
-        match jdbc_registry::get_result(stmt_id, cursor, col) {
-            Some(s) if s != "NULL" => {
-                jdbc_registry::set_was_null(stmt_id, false);
-                Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-            }
-            _ => {
-                jdbc_registry::set_was_null(stmt_id, true);
-                Ok(Some(Value::Object(None)))
-            }
-        }
-    });
-    r.register(rs, "getString", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
         };
-        let col_count = jdbc_registry::get_column_count(stmt_id);
-        let col = (0..col_count).find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name).unwrap_or(0);
+        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         match jdbc_registry::get_result(stmt_id, cursor, col) {
             Some(s) if s != "NULL" => {
                 jdbc_registry::set_was_null(stmt_id, false);
@@ -32583,11 +34378,50 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             }
         }
     });
+    r.register(
+        rs,
+        "getString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stmt_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+            let col_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let col_count = jdbc_registry::get_column_count(stmt_id);
+            let col = (0..col_count)
+                .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+                .unwrap_or(0);
+            match jdbc_registry::get_result(stmt_id, cursor, col) {
+                Some(s) if s != "NULL" => {
+                    jdbc_registry::set_was_null(stmt_id, false);
+                    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+                }
+                _ => {
+                    jdbc_registry::set_was_null(stmt_id, true);
+                    Ok(Some(Value::Object(None)))
+                }
+            }
+        },
+    );
     r.register(rs, "getInt", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32596,14 +34430,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getInt", "(Ljava/lang/String;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let col_name = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
         let col_count = jdbc_registry::get_column_count(stmt_id);
-        let col = (0..col_count).find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name).unwrap_or(0);
+        let col = (0..col_count)
+            .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+            .unwrap_or(0);
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32612,9 +34452,16 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getLong", "(I)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32623,14 +34470,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getLong", "(Ljava/lang/String;)J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let col_name = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
         let col_count = jdbc_registry::get_column_count(stmt_id);
-        let col = (0..col_count).find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name).unwrap_or(0);
+        let col = (0..col_count)
+            .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+            .unwrap_or(0);
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32639,9 +34492,16 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getDouble", "(I)D", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32650,14 +34510,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getDouble", "(Ljava/lang/String;)D", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let col_name = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
         let col_count = jdbc_registry::get_column_count(stmt_id);
-        let col = (0..col_count).find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name).unwrap_or(0);
+        let col = (0..col_count)
+            .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+            .unwrap_or(0);
         let raw = jdbc_registry::get_result(stmt_id, cursor, col);
         let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
         jdbc_registry::set_was_null(stmt_id, is_null);
@@ -32666,18 +34532,33 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getFloat", "(I)F", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         let val = jdbc_registry::get_result(stmt_id, cursor, col)
-            .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
         Ok(Some(Value::Float(val)))
     });
     r.register(rs, "getBoolean", "(I)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         let val = jdbc_registry::get_result(stmt_id, cursor, col)
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -32685,14 +34566,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getBoolean", "(Ljava/lang/String;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
         let col_name = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
         let col_count = jdbc_registry::get_column_count(stmt_id);
-        let col = (0..col_count).find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name).unwrap_or(0);
+        let col = (0..col_count)
+            .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+            .unwrap_or(0);
         let val = jdbc_registry::get_result(stmt_id, cursor, col)
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -32700,9 +34587,16 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "getObject", "(I)Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
         match jdbc_registry::get_result(stmt_id, cursor, col) {
             Some(s) if s != "NULL" => Ok(Some(Value::Object(Some(ctx.create_string(&s))))),
             _ => Ok(Some(Value::Object(None))),
@@ -32720,12 +34614,24 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(rs, "wasNull", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        Ok(Some(Value::Int(if jdbc_registry::was_null(stmt_id) { 1 } else { 0 })))
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if jdbc_registry::was_null(stmt_id) {
+            1
+        } else {
+            0
+        })))
     });
     r.register(rs, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
         jdbc_registry::free_results(stmt_id);
         Ok(None)
     });
@@ -32770,8 +34676,14 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     let rsmd = "java/sql/ResultSetMetaData";
     r.register(rsmd, "getColumnCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        Ok(Some(Value::Int(jdbc_registry::get_column_count(stmt_id) as i32)))
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(
+            jdbc_registry::get_column_count(stmt_id) as i32
+        )))
     });
     r.register(
         rsmd,
@@ -32779,17 +34691,33 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-            let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+            let stmt_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let col = match args.get(1) {
+                Some(Value::Int(c)) => (*c - 1) as usize,
+                _ => 0,
+            };
             let name = jdbc_registry::get_column_name(stmt_id, col);
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
     );
     r.register(rsmd, "getColumnType", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-        let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
-        Ok(Some(Value::Int(jdbc_registry::get_column_type_code(stmt_id, col))))
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::get_column_type_code(
+            stmt_id, col,
+        ))))
     });
     r.register(
         rsmd,
@@ -32797,8 +34725,15 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let stmt_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
-            let col = match args.get(1) { Some(Value::Int(c)) => (*c - 1) as usize, _ => 0 };
+            let stmt_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let col = match args.get(1) {
+                Some(Value::Int(c)) => (*c - 1) as usize,
+                _ => 0,
+            };
             let type_name = jdbc_registry::get_column_type_name(stmt_id, col);
             Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
         },
@@ -32842,22 +34777,42 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // underlying registry and returns a real string — no more hardcoded
     // empty values.
     let dbmd = "java/sql/DatabaseMetaData";
-    r.register(dbmd, "getDatabaseProductName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(jdbc_registry::database_product_name());
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(dbmd, "getDatabaseProductVersion", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(&jdbc_registry::database_product_version());
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(dbmd, "getDriverName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(jdbc_registry::driver_name());
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(dbmd, "getDriverVersion", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(jdbc_registry::driver_version());
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        dbmd,
+        "getDatabaseProductName",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string(jdbc_registry::database_product_name());
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        dbmd,
+        "getDatabaseProductVersion",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string(&jdbc_registry::database_product_version());
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        dbmd,
+        "getDriverName",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string(jdbc_registry::driver_name());
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        dbmd,
+        "getDriverVersion",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string(jdbc_registry::driver_version());
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.register(dbmd, "getDriverMajorVersion", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -32874,7 +34829,9 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("");
         Ok(Some(Value::Object(Some(s))))
     });
-    r.register(dbmd, "isReadOnly", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(dbmd, "isReadOnly", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     r.register(dbmd, "supportsTransactions", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -32914,34 +34871,43 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         jdbc_registry::register_driver(&name);
         Ok(None)
     });
-    r.register(dm, "deregisterDriver", "(Ljava/sql/Driver;)V", |ctx, args| {
-        let name = match args.first() {
-            Some(Value::Object(Some(obj))) => {
-                let cid = ctx.class_id_of_object(*obj);
-                ctx.class_name_of_id(cid).unwrap_or_default()
+    r.register(
+        dm,
+        "deregisterDriver",
+        "(Ljava/sql/Driver;)V",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(obj))) => {
+                    let cid = ctx.class_id_of_object(*obj);
+                    ctx.class_name_of_id(cid).unwrap_or_default()
+                }
+                _ => return Ok(None),
+            };
+            jdbc_registry::deregister_driver(&name);
+            Ok(None)
+        },
+    );
+    r.register(
+        dm,
+        "getDrivers",
+        "()Ljava/util/Enumeration;",
+        |ctx, _args| {
+            // Return an Enumeration over the registered driver names. The
+            // Enumeration synthetic has 2 fields (array=0, pos=1) matching
+            // the shape used by other enumerator sites in native-builtins.
+            let drivers = jdbc_registry::list_drivers();
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, drivers.len());
+            for (i, name) in drivers.iter().enumerate() {
+                let s = ctx.create_string(name);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            _ => return Ok(None),
-        };
-        jdbc_registry::deregister_driver(&name);
-        Ok(None)
-    });
-    r.register(dm, "getDrivers", "()Ljava/util/Enumeration;", |ctx, _args| {
-        // Return an Enumeration over the registered driver names. The
-        // Enumeration synthetic has 2 fields (array=0, pos=1) matching
-        // the shape used by other enumerator sites in native-builtins.
-        let drivers = jdbc_registry::list_drivers();
-        let arr =
-            ctx.new_array(cratonvm_types::ArrayElementType::Reference, drivers.len());
-        for (i, name) in drivers.iter().enumerate() {
-            let s = ctx.create_string(name);
-            ctx.set_array_element(arr, i, Value::Object(Some(s)));
-        }
-        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-        let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-        ctx.set_field(en, 0, Value::Object(Some(arr)));
-        ctx.set_field(en, 1, Value::Int(0));
-        Ok(Some(Value::Object(Some(en))))
-    });
+            // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+            let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(en))))
+        },
+    );
 
     // =========================================================================
     // NEW-14.N2 — java.sql.Blob real implementation
@@ -32974,8 +34940,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         };
         let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let bytes = jdbc_registry::blob_get_bytes(id, pos, length);
-        let arr =
-            ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
@@ -33054,23 +35019,28 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Long(jdbc_registry::clob_length(id))))
     });
-    r.register(clob, "getSubString", "(JI)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let id = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            Value::Int(v) => v as i64,
-            _ => 0,
-        };
-        let pos = match args.get(1) {
-            Some(Value::Long(v)) => *v,
-            Some(Value::Int(v)) => *v as i64,
-            _ => 1,
-        };
-        let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let s = jdbc_registry::clob_get_substring(id, pos, length);
-        let out = ctx.create_string(&s);
-        Ok(Some(Value::Object(Some(out))))
-    });
+    r.register(
+        clob,
+        "getSubString",
+        "(JI)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let pos = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
+                _ => 1,
+            };
+            let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let s = jdbc_registry::clob_get_substring(id, pos, length);
+            let out = ctx.create_string(&s);
+            Ok(Some(Value::Object(Some(out))))
+        },
+    );
     r.register(clob, "setString", "(JLjava/lang/String;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = match ctx.get_field(this, 0) {
@@ -33136,10 +35106,15 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(id)))
     });
-    r.register(sp, "getSavepointName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        sp,
+        "getSavepointName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
 
     // =========================================================================
     // NEW-14.N6 — Connection factories for Blob/Clob/Savepoint
@@ -33158,25 +35133,29 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         ctx.set_field(obj, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
     });
-    r.register(conn, "setSavepoint", "()Ljava/sql/Savepoint;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            Value::Int(v) => v as i64,
-            _ => 0,
-        };
-        match jdbc_registry::savepoint_create(conn_id, None) {
-            Ok((id, name)) => {
-                let sp_obj =
-                    alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
-                ctx.set_field(sp_obj, 0, Value::Long(id));
-                let name_ref = ctx.create_string(&name);
-                ctx.set_field(sp_obj, 1, Value::Object(Some(name_ref)));
-                Ok(Some(Value::Object(Some(sp_obj))))
+    r.register(
+        conn,
+        "setSavepoint",
+        "()Ljava/sql/Savepoint;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let conn_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            match jdbc_registry::savepoint_create(conn_id, None) {
+                Ok((id, name)) => {
+                    let sp_obj = alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
+                    ctx.set_field(sp_obj, 0, Value::Long(id));
+                    let name_ref = ctx.create_string(&name);
+                    ctx.set_field(sp_obj, 1, Value::Object(Some(name_ref)));
+                    Ok(Some(Value::Object(Some(sp_obj))))
+                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
             }
-            Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
-        }
-    });
+        },
+    );
     r.register(
         conn,
         "setSavepoint",
@@ -33194,16 +35173,13 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::savepoint_create(conn_id, name) {
                 Ok((id, effective)) => {
-                    let sp_obj =
-                        alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
+                    let sp_obj = alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
                     ctx.set_field(sp_obj, 0, Value::Long(id));
                     let name_ref = ctx.create_string(&effective);
                     ctx.set_field(sp_obj, 1, Value::Object(Some(name_ref)));
                     Ok(Some(Value::Object(Some(sp_obj))))
                 }
-                Err(e) => {
-                    Err(RuntimeError::IllegalStateException { message: e }.into())
-                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
             }
         },
     );
@@ -33258,10 +35234,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // a single call at the end of registration so the full PreparedStatement
     // table is already populated before we copy it.
     // =========================================================================
-    r.alias_class(
-        "java/sql/PreparedStatement",
-        "java/sql/CallableStatement",
-    );
+    r.alias_class("java/sql/PreparedStatement", "java/sql/CallableStatement");
     // Statement is the superinterface of PreparedStatement / CallableStatement
     // too, so close/isClosed/execute(String) etc. must reach both subclasses.
     r.alias_class("java/sql/Statement", "java/sql/PreparedStatement");
@@ -33280,8 +35253,12 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // PreparedStatement implementation which returns the corresponding
     // ResultSet column value.
     let cstmt = "java/sql/CallableStatement";
-    r.register(cstmt, "registerOutParameter", "(II)V", |_ctx, _args| Ok(None));
-    r.register(cstmt, "registerOutParameter", "(III)V", |_ctx, _args| Ok(None));
+    r.register(cstmt, "registerOutParameter", "(II)V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(cstmt, "registerOutParameter", "(III)V", |_ctx, _args| {
+        Ok(None)
+    });
     r.register(
         cstmt,
         "registerOutParameter",
@@ -33324,7 +35301,10 @@ fn xml_parse(input: &str) -> Option<XmlNode> {
     if trimmed.is_empty() {
         return None;
     }
-    let mut parser = XmlParser { input: trimmed, pos: 0 };
+    let mut parser = XmlParser {
+        input: trimmed,
+        pos: 0,
+    };
     // Skip XML declaration and DOCTYPE
     parser.skip_prolog();
     parser.parse_node()
@@ -33373,8 +35353,12 @@ impl<'a> XmlParser<'a> {
                 // DOCTYPE — skip to >
                 let mut depth = 0;
                 for (i, b) in rem.bytes().enumerate() {
-                    if b == b'[' { depth += 1; }
-                    if b == b']' { depth -= 1; }
+                    if b == b'[' {
+                        depth += 1;
+                    }
+                    if b == b']' {
+                        depth -= 1;
+                    }
                     if b == b'>' && depth <= 0 {
                         self.pos += i + 1;
                         break;
@@ -33459,7 +35443,11 @@ impl<'a> XmlParser<'a> {
             let rem = self.remaining();
             if rem.starts_with("/>") {
                 self.pos += 2;
-                return Some(XmlNode::Element { tag, attributes, children: Vec::new() });
+                return Some(XmlNode::Element {
+                    tag,
+                    attributes,
+                    children: Vec::new(),
+                });
             }
             if rem.starts_with('>') {
                 self.pos += 1;
@@ -33499,7 +35487,9 @@ impl<'a> XmlParser<'a> {
                     let val_start = self.pos;
                     while self.pos < self.input.len() {
                         let b = self.input.as_bytes()[self.pos];
-                        if b.is_ascii_whitespace() || b == b'>' || b == b'/' { break; }
+                        if b.is_ascii_whitespace() || b == b'>' || b == b'/' {
+                            break;
+                        }
                         self.pos += 1;
                     }
                     let attr_val = self.input[val_start..self.pos].to_string();
@@ -33535,7 +35525,11 @@ impl<'a> XmlParser<'a> {
             }
         }
 
-        Some(XmlNode::Element { tag, attributes, children })
+        Some(XmlNode::Element {
+            tag,
+            attributes,
+            children,
+        })
     }
 }
 
@@ -33550,13 +35544,20 @@ fn xml_unescape(s: &str) -> String {
 /// Build a DOM tree of synthetic objects from a parsed XML tree
 fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
     match node {
-        XmlNode::Element { tag, attributes, children } => {
+        XmlNode::Element {
+            tag,
+            attributes,
+            children,
+        } => {
             let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
             let tag_s = ctx.create_string(tag);
             ctx.set_field(elem, 0, Value::Object(Some(tag_s))); // tag_name
 
             // Build attributes array
-            let attrs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, attributes.len());
+            let attrs_arr = ctx.new_array(
+                cratonvm_types::ArrayElementType::Reference,
+                attributes.len(),
+            );
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 2);
                 let n = ctx.create_string(name);
@@ -33568,7 +35569,8 @@ fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
             ctx.set_field(elem, 1, Value::Object(Some(attrs_arr))); // attributes
 
             // Build children array
-            let children_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, children.len());
+            let children_arr =
+                ctx.new_array(cratonvm_types::ArrayElementType::Reference, children.len());
             for (i, child) in children.iter().enumerate() {
                 let child_obj = xml_build_dom(ctx, child);
                 ctx.set_array_element(children_arr, i, Value::Object(Some(child_obj)));
@@ -33623,14 +35625,22 @@ fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> ObjectR
 /// Walk a DOM tree for SAX callbacks
 fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
     match node {
-        XmlNode::Element { tag, attributes, children } => {
+        XmlNode::Element {
+            tag,
+            attributes,
+            children,
+        } => {
             // Build Attributes object for startElement
             let uri = ctx.create_string("");
             let tag_s = ctx.create_string(tag);
             let qname = ctx.create_string(tag);
             // SAX Attributes = synthetic with attr data
-            let sax_attrs = alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1);
-            let attrs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, attributes.len() * 2);
+            let sax_attrs =
+                alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1);
+            let attrs_arr = ctx.new_array(
+                cratonvm_types::ArrayElementType::Reference,
+                attributes.len() * 2,
+            );
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let n = ctx.create_string(name);
                 let v = ctx.create_string(value);
@@ -33640,9 +35650,15 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
             ctx.set_field(sax_attrs, 0, Value::Object(Some(attrs_arr)));
 
             let _ = ctx.invoke_virtual(
-                handler, "startElement",
+                handler,
+                "startElement",
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Lorg/xml/sax/Attributes;)V",
-                &[Value::Object(Some(uri)), Value::Object(Some(tag_s)), Value::Object(Some(qname)), Value::Object(Some(sax_attrs))],
+                &[
+                    Value::Object(Some(uri)),
+                    Value::Object(Some(tag_s)),
+                    Value::Object(Some(qname)),
+                    Value::Object(Some(sax_attrs)),
+                ],
             );
 
             for child in children {
@@ -33653,9 +35669,14 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
             let tag_s2 = ctx.create_string(tag);
             let qname2 = ctx.create_string(tag);
             let _ = ctx.invoke_virtual(
-                handler, "endElement",
+                handler,
+                "endElement",
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                &[Value::Object(Some(uri2)), Value::Object(Some(tag_s2)), Value::Object(Some(qname2))],
+                &[
+                    Value::Object(Some(uri2)),
+                    Value::Object(Some(tag_s2)),
+                    Value::Object(Some(qname2)),
+                ],
             );
         }
         XmlNode::Text(text) | XmlNode::CData(text) => {
@@ -33667,9 +35688,14 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
                 }
             }
             let _ = ctx.invoke_virtual(
-                handler, "characters",
+                handler,
+                "characters",
                 "([CII)V",
-                &[Value::Object(Some(char_arr)), Value::Int(0), Value::Int(text.len() as i32)],
+                &[
+                    Value::Object(Some(char_arr)),
+                    Value::Int(0),
+                    Value::Int(text.len() as i32),
+                ],
             );
         }
         XmlNode::Comment(_) => {} // SAX doesn't have a default comment handler
@@ -33677,7 +35703,11 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
 }
 
 /// Recursively collect elements matching a tag name
-fn dom_get_elements_by_tag(ctx: &mut dyn NativeContext, elem: ObjectRef, tag_name: &str) -> MethodCallResult {
+fn dom_get_elements_by_tag(
+    ctx: &mut dyn NativeContext,
+    elem: ObjectRef,
+    tag_name: &str,
+) -> MethodCallResult {
     let mut results = Vec::new();
     dom_collect_by_tag(ctx, elem, tag_name, &mut results);
     let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
@@ -33690,7 +35720,12 @@ fn dom_get_elements_by_tag(ctx: &mut dyn NativeContext, elem: ObjectRef, tag_nam
     Ok(Some(Value::Object(Some(nl))))
 }
 
-fn dom_collect_by_tag(ctx: &mut dyn NativeContext, elem: ObjectRef, tag_name: &str, results: &mut Vec<ObjectRef>) {
+fn dom_collect_by_tag(
+    ctx: &mut dyn NativeContext,
+    elem: ObjectRef,
+    tag_name: &str,
+    results: &mut Vec<ObjectRef>,
+) {
     // Check if this element matches
     if let Value::Object(Some(name_s)) = ctx.get_field(elem, 0) {
         if let Some(name) = ctx.read_string(name_s) {
@@ -33751,11 +35786,13 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/parsers/DocumentBuilderFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilderFactory", 3);
+            let obj =
+                alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilderFactory", 3);
             ctx.set_field(obj, 0, Value::Int(0)); // namespaceAware
             ctx.set_field(obj, 1, Value::Int(0)); // validating
             let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))])
+                .ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -33801,7 +35838,11 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
-                    &[Value::Object(Some(features)), key, Value::Object(Some(bool_obj))],
+                    &[
+                        Value::Object(Some(features)),
+                        key,
+                        Value::Object(Some(bool_obj)),
+                    ],
                 )?;
             }
         }
@@ -33912,7 +35953,8 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Int(0));
             ctx.set_field(obj, 1, Value::Int(0));
             let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))])
+                .ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -33957,7 +35999,11 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
-                    &[Value::Object(Some(features)), key, Value::Object(Some(bool_obj))],
+                    &[
+                        Value::Object(Some(features)),
+                        key,
+                        Value::Object(Some(bool_obj)),
+                    ],
                 )?;
             }
         }
@@ -34045,184 +36091,286 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
 
     // Document
     let doc_cls = "org/w3c/dom/Document";
-    r.register(doc_cls, "getDocumentElement", "()Lorg/w3c/dom/Element;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+    r.register(
+        doc_cls,
+        "getDocumentElement",
+        "()Lorg/w3c/dom/Element;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        doc_cls,
+        "createElement",
+        "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
+        |ctx, args| {
+            let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
+            ctx.set_field(elem, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let attrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(elem, 1, Value::Object(Some(attrs)));
+            ctx.set_field(elem, 2, Value::Object(Some(children)));
+            ctx.set_field(elem, 3, Value::Int(0));
+            Ok(Some(Value::Object(Some(elem))))
+        },
+    );
+    r.register(
+        doc_cls,
+        "createTextNode",
+        "(Ljava/lang/String;)Lorg/w3c/dom/Text;",
+        |ctx, args| {
+            let t = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2);
+            ctx.set_field(t, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field(t, 1, Value::Object(None));
+            Ok(Some(Value::Object(Some(t))))
+        },
+    );
+    r.register(doc_cls, "getNodeType", "()S", |_ctx, _args| {
+        Ok(Some(Value::Int(NODE_DOCUMENT)))
     });
-    r.register(doc_cls, "createElement", "(Ljava/lang/String;)Lorg/w3c/dom/Element;", |ctx, args| {
-        let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
-        ctx.set_field(elem, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        let attrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(elem, 1, Value::Object(Some(attrs)));
-        ctx.set_field(elem, 2, Value::Object(Some(children)));
-        ctx.set_field(elem, 3, Value::Int(0));
-        Ok(Some(Value::Object(Some(elem))))
-    });
-    r.register(doc_cls, "createTextNode", "(Ljava/lang/String;)Lorg/w3c/dom/Text;", |ctx, args| {
-        let t = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2);
-        ctx.set_field(t, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(t, 1, Value::Object(None));
-        Ok(Some(Value::Object(Some(t))))
-    });
-    r.register(doc_cls, "getNodeType", "()S", |_ctx, _args| Ok(Some(Value::Int(NODE_DOCUMENT))));
-    r.register(doc_cls, "getNodeName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("#document");
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(doc_cls, "getElementById", "(Ljava/lang/String;)Lorg/w3c/dom/Element;", |_ctx, _args| {
-        Ok(Some(Value::Object(None))) // simplified
-    });
-    r.register(doc_cls, "getElementsByTagName", "(Ljava/lang/String;)Lorg/w3c/dom/NodeList;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let tag_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let root = match ctx.get_field(this, 0) {
-            Value::Object(Some(r)) => r,
-            _ => {
-                let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                ctx.set_field(nl, 0, Value::Object(Some(arr)));
-                ctx.set_field(nl, 1, Value::Int(0));
-                return Ok(Some(Value::Object(Some(nl))));
-            }
-        };
-        dom_get_elements_by_tag(ctx, root, &tag_name)
-    });
+    r.register(
+        doc_cls,
+        "getNodeName",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("#document");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        doc_cls,
+        "getElementById",
+        "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
+        |_ctx, _args| {
+            Ok(Some(Value::Object(None))) // simplified
+        },
+    );
+    r.register(
+        doc_cls,
+        "getElementsByTagName",
+        "(Ljava/lang/String;)Lorg/w3c/dom/NodeList;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let tag_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let root = match ctx.get_field(this, 0) {
+                Value::Object(Some(r)) => r,
+                _ => {
+                    let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                    ctx.set_field(nl, 0, Value::Object(Some(arr)));
+                    ctx.set_field(nl, 1, Value::Int(0));
+                    return Ok(Some(Value::Object(Some(nl))));
+                }
+            };
+            dom_get_elements_by_tag(ctx, root, &tag_name)
+        },
+    );
 
     // Element
     let elem_cls = "org/w3c/dom/Element";
-    r.register(elem_cls, "getTagName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+    r.register(
+        elem_cls,
+        "getTagName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        elem_cls,
+        "getNodeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(elem_cls, "getNodeType", "()S", |_ctx, _args| {
+        Ok(Some(Value::Int(NODE_ELEMENT)))
     });
-    r.register(elem_cls, "getNodeName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(elem_cls, "getNodeType", "()S", |_ctx, _args| Ok(Some(Value::Int(NODE_ELEMENT))));
-    r.register(elem_cls, "getAttribute", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let attr_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        if let Value::Object(Some(attrs_arr)) = ctx.get_field(this, 1) {
-            let len = ctx.array_length(attrs_arr);
-            for i in 0..len {
-                if let Value::Object(Some(attr)) = ctx.get_array_element(attrs_arr, i) {
-                    if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
-                        if ctx.read_string(n).as_deref() == Some(&attr_name) {
-                            if let Value::Object(Some(v)) = ctx.get_field(attr, 1) {
-                                return Ok(Some(Value::Object(Some(v))));
+    r.register(
+        elem_cls,
+        "getAttribute",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let attr_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(attrs_arr)) = ctx.get_field(this, 1) {
+                let len = ctx.array_length(attrs_arr);
+                for i in 0..len {
+                    if let Value::Object(Some(attr)) = ctx.get_array_element(attrs_arr, i) {
+                        if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
+                            if ctx.read_string(n).as_deref() == Some(&attr_name) {
+                                if let Value::Object(Some(v)) = ctx.get_field(attr, 1) {
+                                    return Ok(Some(Value::Object(Some(v))));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        let empty = ctx.create_string("");
-        Ok(Some(Value::Object(Some(empty))))
-    });
-    r.register(elem_cls, "hasAttribute", "(Ljava/lang/String;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let attr_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        if let Value::Object(Some(attrs_arr)) = ctx.get_field(this, 1) {
-            let len = ctx.array_length(attrs_arr);
-            for i in 0..len {
-                if let Value::Object(Some(attr)) = ctx.get_array_element(attrs_arr, i) {
-                    if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
-                        if ctx.read_string(n).as_deref() == Some(&attr_name) {
-                            return Ok(Some(Value::Int(1)));
+            let empty = ctx.create_string("");
+            Ok(Some(Value::Object(Some(empty))))
+        },
+    );
+    r.register(
+        elem_cls,
+        "hasAttribute",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let attr_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if let Value::Object(Some(attrs_arr)) = ctx.get_field(this, 1) {
+                let len = ctx.array_length(attrs_arr);
+                for i in 0..len {
+                    if let Value::Object(Some(attr)) = ctx.get_array_element(attrs_arr, i) {
+                        if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
+                            if ctx.read_string(n).as_deref() == Some(&attr_name) {
+                                return Ok(Some(Value::Int(1)));
+                            }
                         }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(elem_cls, "setAttribute", "(Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        // Simplified: attributes are immutable after parse for now
-        let _ = (ctx, args);
-        Ok(None)
-    });
-    r.register(elem_cls, "getChildNodes", "()Lorg/w3c/dom/NodeList;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
-        ctx.set_field(nl, 0, ctx.get_field(this, 2)); // children array
-        ctx.set_field(nl, 1, ctx.get_field(this, 3)); // child count
-        Ok(Some(Value::Object(Some(nl))))
-    });
-    r.register(elem_cls, "getElementsByTagName", "(Ljava/lang/String;)Lorg/w3c/dom/NodeList;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let tag_name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        dom_get_elements_by_tag(ctx, this, &tag_name)
-    });
-    r.register(elem_cls, "getFirstChild", "()Lorg/w3c/dom/Node;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        if count > 0 {
-            if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
-                return Ok(Some(ctx.get_array_element(arr, 0)));
+            Ok(Some(Value::Int(0)))
+        },
+    );
+    r.register(
+        elem_cls,
+        "setAttribute",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            // Simplified: attributes are immutable after parse for now
+            let _ = (ctx, args);
+            Ok(None)
+        },
+    );
+    r.register(
+        elem_cls,
+        "getChildNodes",
+        "()Lorg/w3c/dom/NodeList;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
+            ctx.set_field(nl, 0, ctx.get_field(this, 2)); // children array
+            ctx.set_field(nl, 1, ctx.get_field(this, 3)); // child count
+            Ok(Some(Value::Object(Some(nl))))
+        },
+    );
+    r.register(
+        elem_cls,
+        "getElementsByTagName",
+        "(Ljava/lang/String;)Lorg/w3c/dom/NodeList;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let tag_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            dom_get_elements_by_tag(ctx, this, &tag_name)
+        },
+    );
+    r.register(
+        elem_cls,
+        "getFirstChild",
+        "()Lorg/w3c/dom/Node;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
+            if count > 0 {
+                if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
+                    return Ok(Some(ctx.get_array_element(arr, 0)));
+                }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(elem_cls, "getLastChild", "()Lorg/w3c/dom/Node;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        if count > 0 {
-            if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
-                return Ok(Some(ctx.get_array_element(arr, count as usize - 1)));
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        elem_cls,
+        "getLastChild",
+        "()Lorg/w3c/dom/Node;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
+            if count > 0 {
+                if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
+                    return Ok(Some(ctx.get_array_element(arr, count as usize - 1)));
+                }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
     r.register(elem_cls, "hasChildNodes", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let count = ctx.get_field(this, 3).as_int().unwrap_or(0);
         Ok(Some(Value::Int(if count > 0 { 1 } else { 0 })))
     });
-    r.register(elem_cls, "getAttributes", "()Lorg/w3c/dom/NamedNodeMap;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let nm = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NamedNodeMap", 2);
-        let attrs = ctx.get_field(this, 1);
-        let len = match attrs {
-            Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
-            _ => 0,
-        };
-        ctx.set_field(nm, 0, attrs);
-        ctx.set_field(nm, 1, Value::Int(len));
-        Ok(Some(Value::Object(Some(nm))))
-    });
-    r.register(elem_cls, "getTextContent", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let text = dom_get_text_content(ctx, this);
-        let s = ctx.create_string(&text);
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(elem_cls, "getNodeValue", "()Ljava/lang/String;", |_ctx, _args| {
-        Ok(Some(Value::Object(None))) // Element nodes have null nodeValue
-    });
-    r.register(elem_cls, "getParentNode", "()Lorg/w3c/dom/Node;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
-    });
+    r.register(
+        elem_cls,
+        "getAttributes",
+        "()Lorg/w3c/dom/NamedNodeMap;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let nm = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NamedNodeMap", 2);
+            let attrs = ctx.get_field(this, 1);
+            let len = match attrs {
+                Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
+                _ => 0,
+            };
+            ctx.set_field(nm, 0, attrs);
+            ctx.set_field(nm, 1, Value::Int(len));
+            Ok(Some(Value::Object(Some(nm))))
+        },
+    );
+    r.register(
+        elem_cls,
+        "getTextContent",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let text = dom_get_text_content(ctx, this);
+            let s = ctx.create_string(&text);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        elem_cls,
+        "getNodeValue",
+        "()Ljava/lang/String;",
+        |_ctx, _args| {
+            Ok(Some(Value::Object(None))) // Element nodes have null nodeValue
+        },
+    );
+    r.register(
+        elem_cls,
+        "getParentNode",
+        "()Lorg/w3c/dom/Node;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 4)))
+        },
+    );
 
     // Node interface (registered on both Element and generic Node)
     for cls in ["org/w3c/dom/Node", "org/w3c/dom/Element"] {
-        r.register(cls, "getNamespaceURI", "()Ljava/lang/String;", |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        });
+        r.register(
+            cls,
+            "getNamespaceURI",
+            "()Ljava/lang/String;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
         r.register(cls, "getLocalName", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
@@ -34234,19 +36382,36 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
 
     // Text/CharacterData
     let text_cls = "org/w3c/dom/Text";
-    r.register(text_cls, "getNodeType", "()S", |_ctx, _args| Ok(Some(Value::Int(NODE_TEXT))));
-    r.register(text_cls, "getNodeName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("#text");
-        Ok(Some(Value::Object(Some(s))))
+    r.register(text_cls, "getNodeType", "()S", |_ctx, _args| {
+        Ok(Some(Value::Int(NODE_TEXT)))
     });
-    r.register(text_cls, "getNodeValue", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(text_cls, "getTextContent", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    r.register(
+        text_cls,
+        "getNodeName",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("#text");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+    r.register(
+        text_cls,
+        "getNodeValue",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        text_cls,
+        "getTextContent",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
     r.register(text_cls, "getData", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -34266,7 +36431,12 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     });
 
     // Comment
-    r.register("org/w3c/dom/Comment", "getNodeType", "()S", |_ctx, _args| Ok(Some(Value::Int(NODE_COMMENT))));
+    r.register(
+        "org/w3c/dom/Comment",
+        "getNodeType",
+        "()S",
+        |_ctx, _args| Ok(Some(Value::Int(NODE_COMMENT))),
+    );
 
     // Attr
     let attr_cls = "org/w3c/dom/Attr";
@@ -34278,15 +36448,27 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(attr_cls, "getNodeType", "()S", |_ctx, _args| Ok(Some(Value::Int(NODE_ATTRIBUTE))));
-    r.register(attr_cls, "getNodeName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+    r.register(attr_cls, "getNodeType", "()S", |_ctx, _args| {
+        Ok(Some(Value::Int(NODE_ATTRIBUTE)))
     });
-    r.register(attr_cls, "getNodeValue", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(
+        attr_cls,
+        "getNodeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        attr_cls,
+        "getNodeValue",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
 
     // NodeList
     let nl_cls = "org/w3c/dom/NodeList";
@@ -34324,26 +36506,31 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(nm_cls, "getNamedItem", "(Ljava/lang/String;)Lorg/w3c/dom/Node;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let len = ctx.array_length(arr);
-            for i in 0..len {
-                if let Value::Object(Some(attr)) = ctx.get_array_element(arr, i) {
-                    if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
-                        if ctx.read_string(n).as_deref() == Some(&name) {
-                            return Ok(Some(Value::Object(Some(attr))));
+    r.register(
+        nm_cls,
+        "getNamedItem",
+        "(Ljava/lang/String;)Lorg/w3c/dom/Node;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+                let len = ctx.array_length(arr);
+                for i in 0..len {
+                    if let Value::Object(Some(attr)) = ctx.get_array_element(arr, i) {
+                        if let Value::Object(Some(n)) = ctx.get_field(attr, 0) {
+                            if ctx.read_string(n).as_deref() == Some(&name) {
+                                return Ok(Some(Value::Object(Some(attr))));
+                            }
                         }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // TransformerFactory
     let tf = "javax/xml/transform/TransformerFactory";
@@ -34416,7 +36603,6 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
 }
-
 
 // =============================================================================
 // Phase 69: Cleaner, Spliterator/StreamSupport, WebSocket stubs,
@@ -34677,22 +36863,12 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             let mut collected: Vec<Value> = Vec::new();
             const SAFETY_CAP: usize = 1_000_000;
             loop {
-                let has_next = ctx.invoke_virtual(
-                    iter,
-                    "hasNext",
-                    "()Z",
-                    &[],
-                );
+                let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[]);
                 let proceed = matches!(has_next, Ok(Some(Value::Int(1))));
                 if !proceed {
                     break;
                 }
-                let next = ctx.invoke_virtual(
-                    iter,
-                    "next",
-                    "()Ljava/lang/Object;",
-                    &[],
-                );
+                let next = ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]);
                 let val = match next {
                     Ok(Some(v)) => v,
                     _ => break,
@@ -34753,10 +36929,17 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     Value::Long(l) => format!("Long({})", l),
                     _ => "other".to_string(),
                 };
-                eprintln!("[STREAMSUPP-DBG] spliterator class={} field0={}", cn, f0_kind);
+                eprintln!(
+                    "[STREAMSUPP-DBG] spliterator class={} field0={}",
+                    cn, f0_kind
+                );
             }
             let arr = match field0 {
-                Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
+                Value::Object(Some(a))
+                    if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array =>
+                {
+                    a
+                }
                 _ => {
                     // Real Spliterator subclass — drain via a collecting
                     // consumer.
@@ -35420,11 +37603,15 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
     // WebSocket.request(long n) — add to demand counter for backpressure
     r.register(ws, "request", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let n = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let n = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         if n < 0 {
             return Err(RuntimeError::IllegalArgumentException {
                 message: "request count must be non-negative".into(),
-            }.into());
+            }
+            .into());
         }
         if ctx.object_num_fields(this) > P69_WS_DEMAND {
             let current = match ctx.get_field(this, P69_WS_DEMAND) {
@@ -35437,15 +37624,10 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(
-        ws,
-        "getSubprotocol",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, P69_WS_SUBPROTO)))
-        },
-    );
+    r.register(ws, "getSubprotocol", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, P69_WS_SUBPROTO)))
+    });
     r.register(ws, "isOutputClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, P69_WS_OUT_CLOSED)))
@@ -35470,12 +37652,17 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
     // WebSocket.Listener — default methods
     // Per JDK spec, Listener.onOpen default calls webSocket.request(1L) to start receiving.
     let wsl = "java/net/http/WebSocket$Listener";
-    r.register(wsl, "onOpen", "(Ljava/net/http/WebSocket;)V", |ctx, args| {
-        if let Some(Value::Object(Some(ws))) = args.get(1) {
-            let _ = ctx.invoke_virtual(*ws, "request", "(J)V", &[Value::Long(1)]);
-        }
-        Ok(None)
-    });
+    r.register(
+        wsl,
+        "onOpen",
+        "(Ljava/net/http/WebSocket;)V",
+        |ctx, args| {
+            if let Some(Value::Object(Some(ws))) = args.get(1) {
+                let _ = ctx.invoke_virtual(*ws, "request", "(J)V", &[Value::Long(1)]);
+            }
+            Ok(None)
+        },
+    );
     r.register(wsl, "onText", "(Ljava/net/http/WebSocket;Ljava/lang/CharSequence;Z)Ljava/util/concurrent/CompletionStage;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -35563,7 +37750,9 @@ fn ws_generate_key() -> String {
     let mut rng = seed;
     let mut key_bytes = [0u8; 16];
     for b in key_bytes.iter_mut() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (rng >> 33) as u8;
     }
     ws_base64_encode(&key_bytes)
@@ -35630,7 +37819,8 @@ fn ws_send_frame(
     if fd_id == 0 {
         return Err(RuntimeError::IOException {
             message: "WebSocket not connected".into(),
-        }.into());
+        }
+        .into());
     }
 
     let mut frame = Vec::with_capacity(14 + payload.len());
@@ -35658,7 +37848,9 @@ fn ws_send_frame(
     let mut rng = seed;
     let mut mask = [0u8; 4];
     for m in mask.iter_mut() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *m = (rng >> 33) as u8;
     }
     frame.extend_from_slice(&mask);
@@ -35674,7 +37866,9 @@ fn ws_send_frame(
     } else {
         ctx.fd_table().tcp_write(fd_id, &frame)
     };
-    write_result.map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+    write_result.map_err(|e| RuntimeError::IOException {
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 
@@ -36325,9 +38519,15 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     // (PosixFilePermission stub_clinit / real enum), so a HashSet of them works
     // with Set.contains(OWNER_READ) downstream.
     const PFP_NAMES: [&str; 9] = [
-        "OWNER_READ", "OWNER_WRITE", "OWNER_EXECUTE",
-        "GROUP_READ", "GROUP_WRITE", "GROUP_EXECUTE",
-        "OTHERS_READ", "OTHERS_WRITE", "OTHERS_EXECUTE",
+        "OWNER_READ",
+        "OWNER_WRITE",
+        "OWNER_EXECUTE",
+        "GROUP_READ",
+        "GROUP_WRITE",
+        "GROUP_EXECUTE",
+        "OTHERS_READ",
+        "OTHERS_WRITE",
+        "OTHERS_EXECUTE",
     ];
     const PFP_PAT: [char; 9] = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
     r.register(
@@ -36351,7 +38551,12 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                         Some(slot) => {
                             let constant = ctx.get_static_field(c, slot);
                             matches!(
-                                ctx.invoke_virtual(set, "contains", "(Ljava/lang/Object;)Z", &[constant]),
+                                ctx.invoke_virtual(
+                                    set,
+                                    "contains",
+                                    "(Ljava/lang/Object;)Z",
+                                    &[constant]
+                                ),
                                 Ok(Some(Value::Int(1)))
                             )
                         }
@@ -36381,7 +38586,12 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Object(Some(o)))) => o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let _ = ctx.invoke("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+            let _ = ctx.invoke(
+                "java/util/HashSet",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(set))],
+            );
             let chars: Vec<char> = perms.chars().collect();
             let pfp = "java/nio/file/attribute/PosixFilePermission";
             let _ = ctx.ensure_class_initialized(pfp);
@@ -36451,7 +38661,9 @@ fn ois_read_n(ctx: &mut dyn NativeContext, stream: ObjectRef, n: usize) -> Vec<u
     let mut result = Vec::with_capacity(n);
     for _ in 0..n {
         let b = ois_read_byte(ctx, stream);
-        if b < 0 { break; }
+        if b < 0 {
+            break;
+        }
         result.push(b as u8);
     }
     result
@@ -36507,7 +38719,10 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(oos, "writeLong", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Long(v)) => *v, _ => 0 };
+        let val = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             oos_write_bytes(ctx, stream, &val.to_be_bytes());
         }
@@ -36536,7 +38751,10 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(oos, "writeDouble", "(D)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Double(v)) => *v, _ => 0.0 };
+        let val = match args.get(1) {
+            Some(Value::Double(v)) => *v,
+            _ => 0.0,
+        };
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             oos_write_bytes(ctx, stream, &val.to_be_bytes());
         }
@@ -36544,7 +38762,10 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
     });
     r.register(oos, "writeFloat", "(F)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let val = match args.get(1) { Some(Value::Float(v)) => *v, _ => 0.0 };
+        let val = match args.get(1) {
+            Some(Value::Float(v)) => *v,
+            _ => 0.0,
+        };
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             oos_write_bytes(ctx, stream, &val.to_be_bytes());
         }
@@ -36657,7 +38878,9 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             let bytes = ois_read_n(ctx, stream, 4);
             if bytes.len() == 4 {
-                Ok(Some(Value::Int(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))))
+                Ok(Some(Value::Int(i32::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                ]))))
             } else {
                 Ok(Some(Value::Int(0)))
             }
@@ -36671,8 +38894,7 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
             let bytes = ois_read_n(ctx, stream, 8);
             if bytes.len() == 8 {
                 Ok(Some(Value::Long(i64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]))))
             } else {
                 Ok(Some(Value::Long(0)))
@@ -36715,8 +38937,7 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
             let bytes = ois_read_n(ctx, stream, 8);
             if bytes.len() == 8 {
                 Ok(Some(Value::Double(f64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]))))
             } else {
                 Ok(Some(Value::Double(0.0)))
@@ -36730,7 +38951,9 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             let bytes = ois_read_n(ctx, stream, 4);
             if bytes.len() == 4 {
-                Ok(Some(Value::Float(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))))
+                Ok(Some(Value::Float(f32::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                ]))))
             } else {
                 Ok(Some(Value::Float(0.0)))
             }
@@ -36752,7 +38975,9 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             let bytes = ois_read_n(ctx, stream, 2);
             if bytes.len() == 2 {
-                Ok(Some(Value::Int(u16::from_be_bytes([bytes[0], bytes[1]]) as i32)))
+                Ok(Some(Value::Int(
+                    u16::from_be_bytes([bytes[0], bytes[1]]) as i32
+                )))
             } else {
                 Ok(Some(Value::Int(0)))
             }
@@ -36765,7 +38990,9 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             let bytes = ois_read_n(ctx, stream, 2);
             if bytes.len() == 2 {
-                Ok(Some(Value::Int(i16::from_be_bytes([bytes[0], bytes[1]]) as i32)))
+                Ok(Some(Value::Int(
+                    i16::from_be_bytes([bytes[0], bytes[1]]) as i32
+                )))
             } else {
                 Ok(Some(Value::Int(0)))
             }
@@ -37016,7 +39243,12 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
         };
         // Try to invoke the operator; fallback to addition
         let result = if let Value::Object(Some(op)) = ctx.get_field(this, 2) {
-            match ctx.invoke_virtual(op, "applyAsLong", "(JJ)J", &[Value::Long(cur), Value::Long(x)]) {
+            match ctx.invoke_virtual(
+                op,
+                "applyAsLong",
+                "(JJ)J",
+                &[Value::Long(cur), Value::Long(x)],
+            ) {
                 Ok(Some(Value::Long(r))) => r,
                 _ => cur + x, // fallback
             }
@@ -37101,7 +39333,12 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
             _ => 0.0,
         };
         let result = if let Value::Object(Some(op)) = ctx.get_field(this, 2) {
-            match ctx.invoke_virtual(op, "applyAsDouble", "(DD)D", &[Value::Double(cur), Value::Double(x)]) {
+            match ctx.invoke_virtual(
+                op,
+                "applyAsDouble",
+                "(DD)D",
+                &[Value::Double(cur), Value::Double(x)],
+            ) {
                 Ok(Some(Value::Double(r))) => r,
                 _ => cur + x,
             }
@@ -37718,17 +39955,13 @@ fn bc_has_any_small_factors(mag: &[u32], negative: bool) -> bool {
 /// product equals the class's hex literal; 2 is excluded because the candidate
 /// is forced odd first). Used by [`register_bc_util_small_factors`].
 const BC_ODD_SMALL_PRIMES: [u32; 131] = [
-    3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41,
-    43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
-    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
-    163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227,
-    229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
-    293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367,
-    373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439,
-    443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509,
-    521, 523, 541, 547, 557, 563, 569, 571, 577, 587, 593, 599,
-    601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
-    673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743,
+    3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+    197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
+    311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421,
+    431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+    557, 563, 569, 571, 577, 587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659,
+    661, 673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743,
 ];
 
 /// `x mod p` for a single 32-bit prime `p`, via Horner over little-endian
@@ -37751,7 +39984,9 @@ fn bc_util_has_any_small_factors(mag: &[u32]) -> bool {
     if mag.first().copied().unwrap_or(0) & 1 == 0 {
         return true;
     }
-    BC_ODD_SMALL_PRIMES.iter().any(|&p| mag_mod_u32(mag, p) == 0)
+    BC_ODD_SMALL_PRIMES
+        .iter()
+        .any(|&p| mag_mod_u32(mag, p) == 0)
 }
 
 pub(crate) fn register_bc_primes_small_factors(r: &mut NativeMethodRegistry) {
@@ -37962,7 +40197,10 @@ pub(crate) fn register_bc_chacha(r: &mut NativeMethodRegistry) {
     }
 
     fn iae(msg: &str) -> MethodCallFailed {
-        RuntimeError::IllegalArgumentException { message: msg.into() }.into()
+        RuntimeError::IllegalArgumentException {
+            message: msg.into(),
+        }
+        .into()
     }
 
     // ChaChaEngine.chachaCore: x[i] = permute(input)_i + input[i]. `input` and
@@ -38255,7 +40493,8 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             };
             let cipher = obj_field("cipher").ok_or_else(|| ise("SIC: null cipher"))?;
             let counter_arr = obj_field("counter").ok_or_else(|| ise("SIC: null counter"))?;
-            let counter_out_arr = obj_field("counterOut").ok_or_else(|| ise("SIC: null counterOut"))?;
+            let counter_out_arr =
+                obj_field("counterOut").ok_or_else(|| ise("SIC: null counterOut"))?;
             let iv_arr = obj_field("IV").ok_or_else(|| ise("SIC: null IV"))?;
             let mut byte_count = match ctx.get_field_by_name(this, "byteCount") {
                 Value::Int(v) => v,
@@ -38380,33 +40619,45 @@ pub(crate) fn register_bc_strings_utf8(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let s = "org/bouncycastle/util/Strings";
 
-    r.register(s, "fromUTF8ByteArray", "([B)Ljava/lang/String;", |ctx, args| {
-        let arr = obj_arg(args, 0)?;
-        let len = ctx.array_length(arr);
-        let mut buf = vec![0u8; len];
-        ctx.read_byte_array_into(arr, 0, &mut buf);
-        match std::str::from_utf8(&buf) {
-            // BC's `new String(chars, 0, len)` is a fresh, DISTINCT, un-interned
-            // object — must NOT go through the pooling `create_string`, which
-            // would (a) leak every dynamically-decoded string into the intern
-            // pool (testCounter decodes 255k unique growing strings → heap
-            // exhaustion) and (b) give wrong `==` identity semantics.
-            Ok(text) => Ok(Some(Value::Object(Some(ctx.create_string_uninterned(text))))),
-            Err(_) => Err(RuntimeError::IllegalArgumentException {
-                message: "Invalid UTF-8 input".into(),
+    r.register(
+        s,
+        "fromUTF8ByteArray",
+        "([B)Ljava/lang/String;",
+        |ctx, args| {
+            let arr = obj_arg(args, 0)?;
+            let len = ctx.array_length(arr);
+            let mut buf = vec![0u8; len];
+            ctx.read_byte_array_into(arr, 0, &mut buf);
+            match std::str::from_utf8(&buf) {
+                // BC's `new String(chars, 0, len)` is a fresh, DISTINCT, un-interned
+                // object — must NOT go through the pooling `create_string`, which
+                // would (a) leak every dynamically-decoded string into the intern
+                // pool (testCounter decodes 255k unique growing strings → heap
+                // exhaustion) and (b) give wrong `==` identity semantics.
+                Ok(text) => Ok(Some(Value::Object(Some(
+                    ctx.create_string_uninterned(text),
+                )))),
+                Err(_) => Err(RuntimeError::IllegalArgumentException {
+                    message: "Invalid UTF-8 input".into(),
+                }
+                .into()),
             }
-            .into()),
-        }
-    });
+        },
+    );
 
-    r.register(s, "toUTF8ByteArray", "(Ljava/lang/String;)[B", |ctx, args| {
-        let str_obj = obj_arg(args, 0)?;
-        let text = ctx.read_string(str_obj).unwrap_or_default();
-        let bytes = text.as_bytes();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-        ctx.write_byte_array_from(arr, 0, bytes);
-        Ok(Some(Value::Object(Some(arr))))
-    });
+    r.register(
+        s,
+        "toUTF8ByteArray",
+        "(Ljava/lang/String;)[B",
+        |ctx, args| {
+            let str_obj = obj_arg(args, 0)?;
+            let text = ctx.read_string(str_obj).unwrap_or_default();
+            let bytes = text.as_bytes();
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, bytes);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
 
     r.set_category(__prev_cat);
 }
@@ -38442,7 +40693,11 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let res = if n >= 0 { v.shl(n as u32) } else { v.shr(n.unsigned_abs()) };
+        let res = if n >= 0 {
+            v.shl(n as u32)
+        } else {
+            v.shr(n.unsigned_abs())
+        };
         Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
     });
     r.register(
@@ -38455,7 +40710,11 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
-            let res = if n >= 0 { v.shr(n as u32) } else { v.shl(n.unsigned_abs()) };
+            let res = if n >= 0 {
+                v.shr(n as u32)
+            } else {
+                v.shl(n.unsigned_abs())
+            };
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
         },
     );
@@ -38465,21 +40724,36 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     // hits"); BigInt::{and,or,xor,not} are exact for both signs (validated by
     // bigint::tests::bit_ops_correct against algebraic identities + the decimal
     // reference for non-negatives).
-    r.register(bi, "and", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
-    });
-    r.register(bi, "or", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
-    });
-    r.register(bi, "xor", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
-    });
+    r.register(
+        bi,
+        "and",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "or",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "xor",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
+        },
+    );
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
         let a = bi_read_int(ctx, obj_arg(args, 0)?);
         Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())))))
@@ -38685,54 +40959,84 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     // .hasAnySmallFactors), so this is the dominant createRandomPrime /
     // crypto-suite cost. Validated against the decimal reference in
     // bigint::tests; matches HotSpot's intrinsic approach (not a stub).
-    r.register(bi, "multiply", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))))))
-    });
-    r.register(bi, "add", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))))))
-    });
-    r.register(bi, "subtract", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))))))
-    });
-    r.register(bi, "mod", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let m = bi_read_int(ctx, obj_arg(args, 1)?);
-        if m.is_zero() || m.is_neg() {
-            return Err(RuntimeError::ArithmeticException {
-                message: "BigInteger: modulus not positive".into(),
+    r.register(
+        bi,
+        "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "mod",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let m = bi_read_int(ctx, obj_arg(args, 1)?);
+            if m.is_zero() || m.is_neg() {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger: modulus not positive".into(),
+                }
+                .into());
             }
-            .into());
-        }
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))))))
-    });
-    r.register(bi, "remainder", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        if b.is_zero() {
-            return Err(RuntimeError::ArithmeticException {
-                message: "BigInteger divide by zero".into(),
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))))))
+        },
+    );
+    r.register(
+        bi,
+        "remainder",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            if b.is_zero() {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger divide by zero".into(),
+                }
+                .into());
             }
-            .into());
-        }
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))))))
-    });
-    r.register(bi, "divide", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        let b = bi_read_int(ctx, obj_arg(args, 1)?);
-        if b.is_zero() {
-            return Err(RuntimeError::ArithmeticException {
-                message: "BigInteger divide by zero".into(),
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))))))
+        },
+    );
+    r.register(
+        bi,
+        "divide",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+        |ctx, args| {
+            let a = bi_read_int(ctx, obj_arg(args, 0)?);
+            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            if b.is_zero() {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "BigInteger divide by zero".into(),
+                }
+                .into());
             }
-            .into());
-        }
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))))))
-    });
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))))))
+        },
+    );
 
     r.register(bi, "intValueExact", "()I", |ctx, args| {
         let v = bi_read(ctx, obj_arg(args, 0)?);
@@ -38825,7 +41129,8 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException reading {}: {}", p, e),
-                }.into()),
+                }
+                .into()),
             }
         },
     );
@@ -38838,8 +41143,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, obj_arg(args, 0)?);
             match std::fs::read(&p) {
                 Ok(bytes) => {
-                    let arr =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, &b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -39129,21 +41433,37 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         let header = format!("java.lang.ThreadGroup[name={},maxpri={}]\n", name, max_prio);
         let header_s = ctx.create_string(&header);
         // Get System.out and print
-        if let Ok(Some(sys_out)) = ctx.invoke_virtual(this, "getSystemOut", "()Ljava/io/PrintStream;", &[]) {
+        if let Ok(Some(sys_out)) =
+            ctx.invoke_virtual(this, "getSystemOut", "()Ljava/io/PrintStream;", &[])
+        {
             if let Value::Object(Some(out)) = sys_out {
-                let _ = ctx.invoke_virtual(out, "print", "(Ljava/lang/String;)V", &[Value::Object(Some(header_s))]);
+                let _ = ctx.invoke_virtual(
+                    out,
+                    "print",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(header_s))],
+                );
             }
         }
         // Iterate threads
         let threads = ctx.enumerate_threads(usize::MAX);
         for thread_obj in threads {
-            if let Ok(Some(Value::Object(Some(name_obj)))) = ctx.invoke_virtual(thread_obj, "getName", "()Ljava/lang/String;", &[]) {
+            if let Ok(Some(Value::Object(Some(name_obj)))) =
+                ctx.invoke_virtual(thread_obj, "getName", "()Ljava/lang/String;", &[])
+            {
                 let tname = ctx.read_string(name_obj).unwrap_or_default();
                 let line = format!("    Thread[{}]\n", tname);
                 let line_s = ctx.create_string(&line);
-                if let Ok(Some(sys_out)) = ctx.invoke_virtual(this, "getSystemOut", "()Ljava/io/PrintStream;", &[]) {
+                if let Ok(Some(sys_out)) =
+                    ctx.invoke_virtual(this, "getSystemOut", "()Ljava/io/PrintStream;", &[])
+                {
                     if let Value::Object(Some(out)) = sys_out {
-                        let _ = ctx.invoke_virtual(out, "print", "(Ljava/lang/String;)V", &[Value::Object(Some(line_s))]);
+                        let _ = ctx.invoke_virtual(
+                            out,
+                            "print",
+                            "(Ljava/lang/String;)V",
+                            &[Value::Object(Some(line_s))],
+                        );
                     }
                 }
             }
@@ -39524,21 +41844,11 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         let len_val = args.get(3).copied().unwrap_or(Value::Int(0));
         // Write to underlying stream
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(
-                stream,
-                "write",
-                "([BII)V",
-                &[arr_val, off_val, len_val],
-            );
+            let _ = ctx.invoke_virtual(stream, "write", "([BII)V", &[arr_val, off_val, len_val]);
         }
         // Update checksum with byte range
         if let Value::Object(Some(cs)) = ctx.get_field(this, 1) {
-            let _ = ctx.invoke_virtual(
-                cs,
-                "update",
-                "([BII)V",
-                &[arr_val, off_val, len_val],
-            );
+            let _ = ctx.invoke_virtual(cs, "update", "([BII)V", &[arr_val, off_val, len_val]);
         }
         Ok(None)
     });
@@ -39608,38 +41918,53 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
 
     // LogRecord = 7-field (level=0, message=1, loggerName=2, thrown=3, parameters=4, millis=5 Long, sequence=6 Long)
     let lr = "java/util/logging/LogRecord";
-    r.register(lr, "<init>", "(Ljava/util/logging/Level;Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 2, Value::Object(None));
-            ctx.set_field(this, 3, Value::Object(None));
-            ctx.set_field(this, 4, Value::Object(None));
-            let millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            ctx.set_field(this, 5, Value::Long(millis));
-            ctx.set_field(this, 6, Value::Long(0));
-        }
-        Ok(None)
-    });
-    r.register(lr, "getLevel", "()Ljava/util/logging/Level;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 0)))
-        } else {
-            Ok(Some(Value::Object(None)))
-        }
-    });
-    r.register(lr, "setLevel", "(Ljava/util/logging/Level;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
-        Ok(None)
-    });
+    r.register(
+        lr,
+        "<init>",
+        "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+                ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+                ctx.set_field(this, 2, Value::Object(None));
+                ctx.set_field(this, 3, Value::Object(None));
+                ctx.set_field(this, 4, Value::Object(None));
+                let millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                ctx.set_field(this, 5, Value::Long(millis));
+                ctx.set_field(this, 6, Value::Long(0));
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        lr,
+        "getLevel",
+        "()Ljava/util/logging/Level;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) >= 7 {
+                Ok(Some(ctx.get_field(this, 0)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
+    );
+    r.register(
+        lr,
+        "setLevel",
+        "(Ljava/util/logging/Level;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            }
+            Ok(None)
+        },
+    );
     r.register(lr, "getMessage", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) >= 7 {
@@ -39697,13 +42022,18 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
-    r.register(lr, "setParameters", "([Ljava/lang/Object;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 4, args.get(1).copied().unwrap_or(Value::Object(None)));
-        }
-        Ok(None)
-    });
+    r.register(
+        lr,
+        "setParameters",
+        "([Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 4, args.get(1).copied().unwrap_or(Value::Object(None)));
+            }
+            Ok(None)
+        },
+    );
     r.register(lr, "getMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) >= 7 {
@@ -40165,13 +42495,11 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
         _ => return,
     };
     // Get listener count
-    let size = match cratonvm_native_collections::native_al_size(
-        ctx,
-        &[Value::Object(Some(listeners))],
-    ) {
-        Ok(Some(Value::Int(n))) => n,
-        _ => 0,
-    };
+    let size =
+        match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(listeners))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
     for i in 0..size {
         let listener_val = match cratonvm_native_collections::native_al_get(
             ctx,
@@ -40607,20 +42935,28 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 
     // BeanInfo = 2-field (propertyDescriptors=0 PD[], beanDescriptor=1)
     let bi = "java/beans/BeanInfo";
-    r.register(bi, "getPropertyDescriptors", "()[Ljava/beans/PropertyDescriptor;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let pd = ctx.get_field(this, 0);
-        match pd {
-            Value::Object(Some(_)) => Ok(Some(pd)),
-            _ => {
-                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-                Ok(Some(Value::Object(Some(arr))))
+    r.register(
+        bi,
+        "getPropertyDescriptors",
+        "()[Ljava/beans/PropertyDescriptor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pd = ctx.get_field(this, 0);
+            match pd {
+                Value::Object(Some(_)) => Ok(Some(pd)),
+                _ => {
+                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                    Ok(Some(Value::Object(Some(arr))))
+                }
             }
-        }
-    });
-    r.register(bi, "getBeanDescriptor", "()Ljava/beans/BeanDescriptor;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+        },
+    );
+    r.register(
+        bi,
+        "getBeanDescriptor",
+        "()Ljava/beans/BeanDescriptor;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
     // SPB.11: Spring's ExtendedBeanInfo constructor calls
     // `delegate.getMethodDescriptors()` and then `findCandidateWriteMethods`
     // (looking for set*-prefixed candidates) → `handleCandidateWriteMethod`
@@ -40635,34 +42971,49 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // a 1-slot synthetic with the underlying `java.lang.reflect.Method` at
     // slot 0; the matching `MethodDescriptor.getMethod()` native is
     // registered below.
-    r.register(bi, "getMethodDescriptors", "()[Ljava/beans/MethodDescriptor;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let mds = ctx.get_field(this, 1);
-        match mds {
-            Value::Object(Some(_)) => Ok(Some(mds)),
-            _ => {
-                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-                Ok(Some(Value::Object(Some(arr))))
+    r.register(
+        bi,
+        "getMethodDescriptors",
+        "()[Ljava/beans/MethodDescriptor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mds = ctx.get_field(this, 1);
+            match mds {
+                Value::Object(Some(_)) => Ok(Some(mds)),
+                _ => {
+                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                    Ok(Some(Value::Object(Some(arr))))
+                }
             }
-        }
-    });
+        },
+    );
     // MethodDescriptor.getMethod() — synthetic overlay: the wrapped
     // java.lang.reflect.Method lives at slot 0 of our 1-field synthetic.
-    r.register("java/beans/MethodDescriptor", "getMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Real-JDK MD has a `method` field; our synthetic stub stores the
-        // Method at slot 0. Try by name first; fall through to slot 0 when
-        // the by-name lookup misses (synthetic-stub case).
-        let by_name = ctx.get_field_by_name(this, "method");
-        if matches!(by_name, Value::Object(Some(_))) {
-            return Ok(Some(by_name));
-        }
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(bi, "getEventSetDescriptors", "()[Ljava/beans/EventSetDescriptor;", |ctx, _args| {
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-        Ok(Some(Value::Object(Some(arr))))
-    });
+    r.register(
+        "java/beans/MethodDescriptor",
+        "getMethod",
+        "()Ljava/lang/reflect/Method;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Real-JDK MD has a `method` field; our synthetic stub stores the
+            // Method at slot 0. Try by name first; fall through to slot 0 when
+            // the by-name lookup misses (synthetic-stub case).
+            let by_name = ctx.get_field_by_name(this, "method");
+            if matches!(by_name, Value::Object(Some(_))) {
+                return Ok(Some(by_name));
+            }
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        bi,
+        "getEventSetDescriptors",
+        "()[Ljava/beans/EventSetDescriptor;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
 
     // FeatureDescriptor.getName(): JDK declares `private String name` on
     // FeatureDescriptor. Our synthetic PropertyDescriptors are allocated with
@@ -40722,10 +43073,15 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // PropertyDescriptor (the typical invokevirtual call-site class). The
     // VM's hierarchy-walk doesn't always reach our parent-class native, so
     // duplicate the registration on the subclass call-site for safety.
-    r.register("java/beans/FeatureDescriptor", "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_by_name(this, "name")))
-    });
+    r.register(
+        "java/beans/FeatureDescriptor",
+        "getName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "name")))
+        },
+    );
 
     // PropertyDescriptor = 4-field
     //   field 0: name (String)
@@ -40763,52 +43119,77 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // `BeanWrapperImpl.isWritableProperty("metadataReaderFactory")` returns
     // false on Spring Boot demo and surfaces as `NotWritablePropertyException`.
     let gtapd = "org/springframework/beans/GenericTypeAwarePropertyDescriptor";
-    r.register(gtapd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_by_name(this, "readMethod")))
-    });
-    r.register(gtapd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_by_name(this, "writeMethod")))
-    });
-    r.register(gtapd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let pt = ctx.get_field_by_name(this, "propertyType");
-        if matches!(pt, Value::Object(Some(_))) {
-            return Ok(Some(pt));
-        }
-        // Fallback: derive from write method's parameter type, then read
-        // method's return type (matches JDK findPropertyType behaviour).
-        let wm = ctx.get_field_by_name(this, "writeMethod");
-        if let Value::Object(Some(m)) = wm {
-            // We can't easily call Method.getParameterTypes() here without
-            // recursion machinery, so leave null — the read path below will
-            // catch the common cases.
-            let _ = m;
-        }
-        Ok(Some(pt))
-    });
-    r.register(pd, "getReadMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let cid = ctx.class_id_of_object(this);
-        let base = ctx.class_num_total_fields(cid);
-        Ok(Some(ctx.get_field(this, base + 1)))
-    });
-    r.register(pd, "getWriteMethod", "()Ljava/lang/reflect/Method;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // SPB.11: For subclasses (GTAPD etc.) prefer their own `writeMethod`
-        // instance field (resolved via dynamic-hierarchy lookup, which
-        // agrees with the slot the subclass ctor's putfield wrote to). For
-        // our synthetic PDs the by-name lookup misses → fall back to the
-        // overlay slot at `base + 2` populated in `introspector_get_bean_info`.
-        let by_name = ctx.get_field_by_name(this, "writeMethod");
-        if matches!(by_name, Value::Object(Some(_))) {
-            return Ok(Some(by_name));
-        }
-        let cid = ctx.class_id_of_object(this);
-        let base = ctx.class_num_total_fields(cid);
-        Ok(Some(ctx.get_field(this, base + 2)))
-    });
+    r.register(
+        gtapd,
+        "getReadMethod",
+        "()Ljava/lang/reflect/Method;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "readMethod")))
+        },
+    );
+    r.register(
+        gtapd,
+        "getWriteMethod",
+        "()Ljava/lang/reflect/Method;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "writeMethod")))
+        },
+    );
+    r.register(
+        gtapd,
+        "getPropertyType",
+        "()Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pt = ctx.get_field_by_name(this, "propertyType");
+            if matches!(pt, Value::Object(Some(_))) {
+                return Ok(Some(pt));
+            }
+            // Fallback: derive from write method's parameter type, then read
+            // method's return type (matches JDK findPropertyType behaviour).
+            let wm = ctx.get_field_by_name(this, "writeMethod");
+            if let Value::Object(Some(m)) = wm {
+                // We can't easily call Method.getParameterTypes() here without
+                // recursion machinery, so leave null — the read path below will
+                // catch the common cases.
+                let _ = m;
+            }
+            Ok(Some(pt))
+        },
+    );
+    r.register(
+        pd,
+        "getReadMethod",
+        "()Ljava/lang/reflect/Method;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cid = ctx.class_id_of_object(this);
+            let base = ctx.class_num_total_fields(cid);
+            Ok(Some(ctx.get_field(this, base + 1)))
+        },
+    );
+    r.register(
+        pd,
+        "getWriteMethod",
+        "()Ljava/lang/reflect/Method;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // SPB.11: For subclasses (GTAPD etc.) prefer their own `writeMethod`
+            // instance field (resolved via dynamic-hierarchy lookup, which
+            // agrees with the slot the subclass ctor's putfield wrote to). For
+            // our synthetic PDs the by-name lookup misses → fall back to the
+            // overlay slot at `base + 2` populated in `introspector_get_bean_info`.
+            let by_name = ctx.get_field_by_name(this, "writeMethod");
+            if matches!(by_name, Value::Object(Some(_))) {
+                return Ok(Some(by_name));
+            }
+            let cid = ctx.class_id_of_object(this);
+            let base = ctx.class_num_total_fields(cid);
+            Ok(Some(ctx.get_field(this, base + 2)))
+        },
+    );
     r.register(pd, "getPropertyType", "()Ljava/lang/Class;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cid = ctx.class_id_of_object(this);
@@ -40831,7 +43212,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         other => {
-            if trace { eprintln!("BI-TRACE: arg0 unexpected: {:?}", other); }
+            if trace {
+                eprintln!("BI-TRACE: arg0 unexpected: {:?}", other);
+            }
             return Ok(Some(Value::Object(None)));
         }
     };
@@ -40842,7 +43225,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let class_id = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
         Some(c) => c,
         None => {
-            if trace { eprintln!("BI-TRACE: mirror_class_id returned None"); }
+            if trace {
+                eprintln!("BI-TRACE: mirror_class_id returned None");
+            }
             // Empty BeanInfo is safer than null (matches JDK behaviour for
             // classes with no introspectable bean properties).
             let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
@@ -40954,13 +43339,19 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             }
 
             // getter: getXxx() -> T (T != void) or isXxx() -> boolean.
-            let is_get = name.starts_with("get") && name.len() > 3 && desc.starts_with("()")
+            let is_get = name.starts_with("get")
+                && name.len() > 3
+                && desc.starts_with("()")
                 && !desc.ends_with(")V");
             let is_is = name.starts_with("is") && name.len() > 2 && desc == "()Z";
             if is_get || is_is {
                 let prop_start = if is_get { 3 } else { 2 };
                 let prop_name = decapitalize(&name[prop_start..]);
-                let ret_desc = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
+                let ret_desc = desc
+                    .split(')')
+                    .nth(1)
+                    .unwrap_or("Ljava/lang/Object;")
+                    .to_string();
                 let ret_mirror =
                     crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &ret_desc);
                 let ret_cid = crate::lang_class::mirror_class_id(ctx, ret_mirror);
@@ -41005,8 +43396,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
             // setter: setXxx(T) -> void with exactly one parameter.
             if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
-                let (params, _ret) =
-                    crate::jmx_openmbean::parse_method_descriptor_pub(desc);
+                let (params, _ret) = crate::jmx_openmbean::parse_method_descriptor_pub(desc);
                 if params.len() != 1 {
                     continue;
                 }
@@ -41045,8 +43435,12 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
     // Resolve each accumulated property into the (name, readMethod, writeMethod,
     // propertyType) tuple the PropertyDescriptor builder below expects.
-    let mut properties: Vec<(String, Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>)> =
-        Vec::with_capacity(props.len());
+    let mut properties: Vec<(
+        String,
+        Option<ObjectRef>,
+        Option<ObjectRef>,
+        Option<ObjectRef>,
+    )> = Vec::with_capacity(props.len());
     for p in &mut props {
         let mut write_method: Option<ObjectRef> = None;
         let mut write_param_mirror: Option<ObjectRef> = None;
@@ -41099,7 +43493,12 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             "()Ljava/lang/Class;",
             0x0001, /* ACC_PUBLIC */
         );
-        properties.push(("class".to_string(), Some(getter), None, Some(class_class_mirror)));
+        properties.push((
+            "class".to_string(),
+            Some(getter),
+            None,
+            Some(class_class_mirror),
+        ));
     }
 
     // Build PropertyDescriptor array.
@@ -41327,14 +43726,18 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
                 // Get the value under old name
                 let val = cratonvm_native_collections::native_map_get_pub(
-                    ctx, &[Value::Object(Some(bindings)), old_name],
-                )?.unwrap_or(Value::Object(None));
+                    ctx,
+                    &[Value::Object(Some(bindings)), old_name],
+                )?
+                .unwrap_or(Value::Object(None));
                 // Remove old, put new
                 cratonvm_native_collections::native_map_remove_pub(
-                    ctx, &[Value::Object(Some(bindings)), old_name],
+                    ctx,
+                    &[Value::Object(Some(bindings)), old_name],
                 )?;
                 cratonvm_native_collections::native_map_put_pub(
-                    ctx, &[Value::Object(Some(bindings)), new_name, val],
+                    ctx,
+                    &[Value::Object(Some(bindings)), new_name, val],
                 )?;
             }
             Ok(None)
@@ -41362,7 +43765,8 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
                 cratonvm_native_collections::native_map_remove_pub(
-                    ctx, &[Value::Object(Some(bindings)), key],
+                    ctx,
+                    &[Value::Object(Some(bindings)), key],
                 )?;
             }
             Ok(None)
@@ -41418,10 +43822,15 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
     );
     // Note: Context is an interface — these are fallback defaults. Real implementations
     // are on javax/naming/InitialContext which will be dispatched via virtual lookup first.
-    r.register(ctx_iface, "unbind", "(Ljava/lang/String;)V", |_ctx, _args| {
-        // Default interface implementation — concrete classes override.
-        Ok(None)
-    });
+    r.register(
+        ctx_iface,
+        "unbind",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| {
+            // Default interface implementation — concrete classes override.
+            Ok(None)
+        },
+    );
     r.register(ctx_iface, "close", "()V", |_ctx, _args| {
         // Default interface implementation — concrete classes override.
         Ok(None)
@@ -41539,7 +43948,9 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         match ctx.fd_table().open_udp(Some("0.0.0.0:0")) {
             Ok(fd_id) => {
-                let actual_port = ctx.fd_table().udp_local_addr(fd_id)
+                let actual_port = ctx
+                    .fd_table()
+                    .udp_local_addr(fd_id)
                     .ok()
                     .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                     .unwrap_or(0);
@@ -41553,18 +43964,26 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, 1, Value::Int(0));
                 ctx.set_field(this, 2, Value::Int(0));
                 ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException { message: format!("DatagramSocket: {e}") }.into());
+                return Err(RuntimeError::IOException {
+                    message: format!("DatagramSocket: {e}"),
+                }
+                .into());
             }
         }
         Ok(None)
     });
     r.register(ds, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let port = match args.get(1) { Some(Value::Int(i)) => *i, _ => 0 };
+        let port = match args.get(1) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
         let bind_addr = format!("0.0.0.0:{port}");
         match ctx.fd_table().open_udp(Some(&bind_addr)) {
             Ok(fd_id) => {
-                let actual_port = ctx.fd_table().udp_local_addr(fd_id)
+                let actual_port = ctx
+                    .fd_table()
+                    .udp_local_addr(fd_id)
                     .ok()
                     .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                     .unwrap_or(port);
@@ -41575,27 +43994,33 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             }
             Err(e) => {
                 ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException { message: format!("DatagramSocket bind :{port}: {e}") }.into());
+                return Err(RuntimeError::IOException {
+                    message: format!("DatagramSocket bind :{port}: {e}"),
+                }
+                .into());
             }
         }
         Ok(None)
     });
     r.register(ds, "<init>", "(ILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let port = match args.get(1) { Some(Value::Int(i)) => *i, _ => 0 };
+        let port = match args.get(1) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
         let host = match args.get(2) {
-            Some(Value::Object(Some(ia))) => {
-                match ctx.get_field(*ia, 1) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
-                    _ => "0.0.0.0".into(),
-                }
-            }
+            Some(Value::Object(Some(ia))) => match ctx.get_field(*ia, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
+                _ => "0.0.0.0".into(),
+            },
             _ => "0.0.0.0".into(),
         };
         let bind_addr = format!("{host}:{port}");
         match ctx.fd_table().open_udp(Some(&bind_addr)) {
             Ok(fd_id) => {
-                let actual_port = ctx.fd_table().udp_local_addr(fd_id)
+                let actual_port = ctx
+                    .fd_table()
+                    .udp_local_addr(fd_id)
                     .ok()
                     .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                     .unwrap_or(port);
@@ -41606,7 +44031,10 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             }
             Err(e) => {
                 ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException { message: format!("DatagramSocket bind {host}:{port}: {e}") }.into());
+                return Err(RuntimeError::IOException {
+                    message: format!("DatagramSocket bind {host}:{port}: {e}"),
+                }
+                .into());
             }
         }
         Ok(None)
@@ -41617,14 +44045,22 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         let packet = obj_arg(args, 1)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "DatagramSocket not bound".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "DatagramSocket not bound".into(),
+            }
+            .into());
         }
         let dest_addr = match ctx.get_field(packet, 2) {
             Value::Object(Some(ia)) => match ctx.get_field(ia, 1) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
                 _ => "127.0.0.1".into(),
             },
-            _ => return Err(RuntimeError::IOException { message: "DatagramPacket has no destination address".into() }.into()),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramPacket has no destination address".into(),
+                }
+                .into())
+            }
         };
         let dest_port = ctx.get_field(packet, 3).as_int().unwrap_or(0);
         let data_arr = match ctx.get_field(packet, 0) {
@@ -41640,62 +44076,84 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         }
         let target = format!("{dest_addr}:{dest_port}");
         if let Err(e) = ctx.fd_table().udp_send(fd_id as u32, &buf, &target) {
-            return Err(RuntimeError::IOException { message: format!("send: {e}") }.into());
+            return Err(RuntimeError::IOException {
+                message: format!("send: {e}"),
+            }
+            .into());
         }
         Ok(None)
     });
     // receive(DatagramPacket) — real UDP receive via fd_table
-    r.register(ds, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let packet = obj_arg(args, 1)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "DatagramSocket not bound".into() }.into());
-        }
-        let timeout_ms = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        if timeout_ms > 0 {
-            let _ = ctx.fd_table().udp_set_read_timeout(
-                fd_id as u32,
-                Some(std::time::Duration::from_millis(timeout_ms as u64)),
-            );
-        } else {
-            let _ = ctx.fd_table().udp_set_read_timeout(fd_id as u32, None);
-        }
-        let mut buf = vec![0u8; 65536];
-        match ctx.fd_table().udp_recv(fd_id as u32, &mut buf) {
-            Ok((n, src_addr_str)) => {
-                let data_arr = match ctx.get_field(packet, 0) {
-                    Value::Object(Some(a)) => a,
-                    _ => {
-                        let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
-                        ctx.set_field(packet, 0, Value::Object(Some(a)));
-                        a
+    r.register(
+        ds,
+        "receive",
+        "(Ljava/net/DatagramPacket;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let packet = obj_arg(args, 1)?;
+            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd_id < 0 {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramSocket not bound".into(),
+                }
+                .into());
+            }
+            let timeout_ms = ctx.get_field(this, 2).as_int().unwrap_or(0);
+            if timeout_ms > 0 {
+                let _ = ctx.fd_table().udp_set_read_timeout(
+                    fd_id as u32,
+                    Some(std::time::Duration::from_millis(timeout_ms as u64)),
+                );
+            } else {
+                let _ = ctx.fd_table().udp_set_read_timeout(fd_id as u32, None);
+            }
+            let mut buf = vec![0u8; 65536];
+            match ctx.fd_table().udp_recv(fd_id as u32, &mut buf) {
+                Ok((n, src_addr_str)) => {
+                    let data_arr = match ctx.get_field(packet, 0) {
+                        Value::Object(Some(a)) => a,
+                        _ => {
+                            let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
+                            ctx.set_field(packet, 0, Value::Object(Some(a)));
+                            a
+                        }
+                    };
+                    let copy_len = n.min(ctx.array_length(data_arr));
+                    for i in 0..copy_len {
+                        ctx.set_array_element(data_arr, i, Value::Int(buf[i] as i8 as i32));
                     }
-                };
-                let copy_len = n.min(ctx.array_length(data_arr));
-                for i in 0..copy_len {
-                    ctx.set_array_element(data_arr, i, Value::Int(buf[i] as i8 as i32));
+                    ctx.set_field(packet, 1, Value::Int(copy_len as i32));
+                    // Parse source address "ip:port"
+                    let (src_ip, src_port) = if let Some(colon) = src_addr_str.rfind(':') {
+                        (
+                            &src_addr_str[..colon],
+                            src_addr_str[colon + 1..].parse::<i32>().unwrap_or(0),
+                        )
+                    } else {
+                        (src_addr_str.as_str(), 0)
+                    };
+                    let ia = crate::net_phase_e::alloc_inet_address_external(ctx, src_ip, src_ip);
+                    ctx.set_field(packet, 2, Value::Object(Some(ia)));
+                    ctx.set_field(packet, 3, Value::Int(src_port));
                 }
-                ctx.set_field(packet, 1, Value::Int(copy_len as i32));
-                // Parse source address "ip:port"
-                let (src_ip, src_port) = if let Some(colon) = src_addr_str.rfind(':') {
-                    (&src_addr_str[..colon], src_addr_str[colon + 1..].parse::<i32>().unwrap_or(0))
-                } else {
-                    (src_addr_str.as_str(), 0)
-                };
-                let ia = crate::net_phase_e::alloc_inet_address_external(ctx, src_ip, src_ip);
-                ctx.set_field(packet, 2, Value::Object(Some(ia)));
-                ctx.set_field(packet, 3, Value::Int(src_port));
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
-                    return Err(RuntimeError::IOException { message: "Receive timed out".into() }.into());
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock
+                    {
+                        return Err(RuntimeError::IOException {
+                            message: "Receive timed out".into(),
+                        }
+                        .into());
+                    }
+                    return Err(RuntimeError::IOException {
+                        message: format!("receive: {e}"),
+                    }
+                    .into());
                 }
-                return Err(RuntimeError::IOException { message: format!("receive: {e}") }.into());
             }
-        }
-        Ok(None)
-    });
+            Ok(None)
+        },
+    );
     r.register(ds, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
@@ -41716,22 +44174,27 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     r.register(ds, "getLocalPort", "()I", |ctx, args| {
         Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
     });
-    r.register(ds, "getLocalAddress", "()Ljava/net/InetAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            if let Ok(addr_str) = ctx.fd_table().udp_local_addr(fd_id as u32) {
-                let (ip, _port) = if let Some(colon) = addr_str.rfind(':') {
-                    (&addr_str[..colon], &addr_str[colon + 1..])
-                } else {
-                    (addr_str.as_str(), "0")
-                };
-                let ia = crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip);
-                return Ok(Some(Value::Object(Some(ia))));
+    r.register(
+        ds,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd_id >= 0 {
+                if let Ok(addr_str) = ctx.fd_table().udp_local_addr(fd_id as u32) {
+                    let (ip, _port) = if let Some(colon) = addr_str.rfind(':') {
+                        (&addr_str[..colon], &addr_str[colon + 1..])
+                    } else {
+                        (addr_str.as_str(), "0")
+                    };
+                    let ia = crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip);
+                    return Ok(Some(Value::Object(Some(ia))));
+                }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
     r.register(ds, "getSoTimeout", "()I", |ctx, args| {
         Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
     });
@@ -41760,7 +44223,9 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         if fd_id >= 0 {
             let host = match args.get(1) {
                 Some(Value::Object(Some(ia))) => match ctx.get_field(*ia, 1) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
+                    Value::Object(Some(s)) => {
+                        ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into())
+                    }
                     _ => "127.0.0.1".into(),
                 },
                 _ => "127.0.0.1".into(),
@@ -41794,9 +44259,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     let ms = "java/net/MulticastSocket";
     r.register(ms, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.fd_table().open_udp(Some("0.0.0.0:0")).map_err(|e| {
-            RuntimeError::IOException { message: format!("MulticastSocket bind failed: {}", e) }
-        })?;
+        let fd_id =
+            ctx.fd_table()
+                .open_udp(Some("0.0.0.0:0"))
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("MulticastSocket bind failed: {}", e),
+                })?;
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -41811,9 +44279,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let bind_addr = format!("0.0.0.0:{}", port);
-        let fd_id = ctx.fd_table().open_udp(Some(&bind_addr)).map_err(|e| {
-            RuntimeError::IOException { message: format!("MulticastSocket bind failed: {}", e) }
-        })?;
+        let fd_id =
+            ctx.fd_table()
+                .open_udp(Some(&bind_addr))
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("MulticastSocket bind failed: {}", e),
+                })?;
         ctx.set_field(this, 0, Value::Int(port));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -41825,44 +44296,73 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
         if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Socket closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Socket closed".into(),
+            }
+            .into());
         }
         let addr_ref = obj_arg(args, 1)?;
         let addr_str = match crate::net_phase_e::inet_addr_get(addr_ref) {
             Some((_, ip)) if !ip.is_empty() => ip,
             _ => match ctx.get_field(addr_ref, 1) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Err(RuntimeError::IOException { message: "Invalid multicast address".into() }.into()),
+                _ => {
+                    return Err(RuntimeError::IOException {
+                        message: "Invalid multicast address".into(),
+                    }
+                    .into())
+                }
             },
         };
-        let mcast_ip: std::net::Ipv4Addr = addr_str.parse().map_err(|_| {
-            RuntimeError::IOException { message: format!("Invalid multicast address: {}", addr_str) }
-        })?;
-        ctx.fd_table().udp_join_multicast_v4(fd_id as u32, &mcast_ip, &std::net::Ipv4Addr::UNSPECIFIED)
-            .map_err(|e| RuntimeError::IOException { message: format!("joinGroup failed: {}", e) })?;
+        let mcast_ip: std::net::Ipv4Addr =
+            addr_str.parse().map_err(|_| RuntimeError::IOException {
+                message: format!("Invalid multicast address: {}", addr_str),
+            })?;
+        ctx.fd_table()
+            .udp_join_multicast_v4(fd_id as u32, &mcast_ip, &std::net::Ipv4Addr::UNSPECIFIED)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("joinGroup failed: {}", e),
+            })?;
         Ok(None)
     });
-    r.register(ms, "leaveGroup", "(Ljava/net/InetAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException { message: "Socket closed".into() }.into());
-        }
-        let addr_ref = obj_arg(args, 1)?;
-        let addr_str = match crate::net_phase_e::inet_addr_get(addr_ref) {
-            Some((_, ip)) if !ip.is_empty() => ip,
-            _ => match ctx.get_field(addr_ref, 1) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Err(RuntimeError::IOException { message: "Invalid multicast address".into() }.into()),
-            },
-        };
-        let mcast_ip: std::net::Ipv4Addr = addr_str.parse().map_err(|_| {
-            RuntimeError::IOException { message: format!("Invalid multicast address: {}", addr_str) }
-        })?;
-        ctx.fd_table().udp_leave_multicast_v4(fd_id as u32, &mcast_ip, &std::net::Ipv4Addr::UNSPECIFIED)
-            .map_err(|e| RuntimeError::IOException { message: format!("leaveGroup failed: {}", e) })?;
-        Ok(None)
-    });
+    r.register(
+        ms,
+        "leaveGroup",
+        "(Ljava/net/InetAddress;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd_id < 0 {
+                return Err(RuntimeError::IOException {
+                    message: "Socket closed".into(),
+                }
+                .into());
+            }
+            let addr_ref = obj_arg(args, 1)?;
+            let addr_str = match crate::net_phase_e::inet_addr_get(addr_ref) {
+                Some((_, ip)) if !ip.is_empty() => ip,
+                _ => match ctx.get_field(addr_ref, 1) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => {
+                        return Err(RuntimeError::IOException {
+                            message: "Invalid multicast address".into(),
+                        }
+                        .into())
+                    }
+                },
+            };
+            let mcast_ip: std::net::Ipv4Addr =
+                addr_str.parse().map_err(|_| RuntimeError::IOException {
+                    message: format!("Invalid multicast address: {}", addr_str),
+                })?;
+            ctx.fd_table()
+                .udp_leave_multicast_v4(fd_id as u32, &mcast_ip, &std::net::Ipv4Addr::UNSPECIFIED)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("leaveGroup failed: {}", e),
+                })?;
+            Ok(None)
+        },
+    );
     r.register(ms, "setTimeToLive", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ttl = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
@@ -41881,24 +44381,37 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
         if fd_id < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IOException { message: "Socket closed".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "Socket closed".into(),
+            }
+            .into());
         }
         let pkt = obj_arg(args, 1)?;
         let data_arr = match ctx.get_field(pkt, 0) {
             Value::Object(Some(a)) => a,
-            _ => return Err(RuntimeError::IOException { message: "No packet data".into() }.into()),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "No packet data".into(),
+                }
+                .into())
+            }
         };
         let length = ctx.get_field(pkt, 1).as_int().unwrap_or(0) as usize;
         let offset = ctx.get_field(pkt, 2).as_int().unwrap_or(0) as usize;
         let mut buf = vec![0u8; length];
         for i in 0..length {
-            buf[i] = ctx.get_array_element(data_arr, offset + i).as_int().unwrap_or(0) as u8;
+            buf[i] = ctx
+                .get_array_element(data_arr, offset + i)
+                .as_int()
+                .unwrap_or(0) as u8;
         }
         // Extract target address from packet
         let addr_str = match ctx.get_field(pkt, 3) {
             Value::Object(Some(addr)) => {
                 let host = match ctx.get_field(addr, 1) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
+                    Value::Object(Some(s)) => {
+                        ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into())
+                    }
                     _ => "127.0.0.1".into(),
                 };
                 host
@@ -41907,49 +44420,72 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         };
         let port = ctx.get_field(pkt, 4).as_int().unwrap_or(0);
         let target = format!("{}:{}", addr_str, port);
-        ctx.fd_table().udp_send(fd_id as u32, &buf, &target)
-            .map_err(|e| RuntimeError::IOException { message: format!("send failed: {}", e) })?;
+        ctx.fd_table()
+            .udp_send(fd_id as u32, &buf, &target)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("send failed: {}", e),
+            })?;
         Ok(None)
     });
-    r.register(ms, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
-            return Err(RuntimeError::IOException { message: "Socket closed".into() }.into());
-        }
-        let timeout = ctx.get_field(this, 2).as_int().unwrap_or(0);
-        if timeout > 0 {
-            let _ = ctx.fd_table().udp_set_read_timeout(
-                fd_id as u32,
-                Some(std::time::Duration::from_millis(timeout as u64)),
-            );
-        }
-        let pkt = obj_arg(args, 1)?;
-        let data_arr = match ctx.get_field(pkt, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Err(RuntimeError::IOException { message: "No packet buffer".into() }.into()),
-        };
-        let buf_len = ctx.array_length(data_arr);
-        let mut buf = vec![0u8; buf_len];
-        let (n, src_str) = ctx.fd_table().udp_recv(fd_id as u32, &mut buf)
-            .map_err(|e| RuntimeError::IOException { message: format!("receive failed: {}", e) })?;
-        for i in 0..n {
-            ctx.set_array_element(data_arr, i, Value::Int(buf[i] as i8 as i32));
-        }
-        ctx.set_field(pkt, 1, Value::Int(n as i32)); // length
-        ctx.set_field(pkt, 2, Value::Int(0));         // offset
-        // Parse source address "ip:port"
-        let (src_ip_str, src_port) = if let Some(colon) = src_str.rfind(':') {
-            (&src_str[..colon], src_str[colon + 1..].parse::<i32>().unwrap_or(0))
-        } else {
-            (src_str.as_str(), 0)
-        };
-        let src_addr =
-            crate::net_phase_e::alloc_inet_address_external(ctx, src_ip_str, src_ip_str);
-        ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
-        ctx.set_field(pkt, 4, Value::Int(src_port));
-        Ok(None)
-    });
+    r.register(
+        ms,
+        "receive",
+        "(Ljava/net/DatagramPacket;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            if fd_id < 0 || ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+                return Err(RuntimeError::IOException {
+                    message: "Socket closed".into(),
+                }
+                .into());
+            }
+            let timeout = ctx.get_field(this, 2).as_int().unwrap_or(0);
+            if timeout > 0 {
+                let _ = ctx.fd_table().udp_set_read_timeout(
+                    fd_id as u32,
+                    Some(std::time::Duration::from_millis(timeout as u64)),
+                );
+            }
+            let pkt = obj_arg(args, 1)?;
+            let data_arr = match ctx.get_field(pkt, 0) {
+                Value::Object(Some(a)) => a,
+                _ => {
+                    return Err(RuntimeError::IOException {
+                        message: "No packet buffer".into(),
+                    }
+                    .into())
+                }
+            };
+            let buf_len = ctx.array_length(data_arr);
+            let mut buf = vec![0u8; buf_len];
+            let (n, src_str) = ctx
+                .fd_table()
+                .udp_recv(fd_id as u32, &mut buf)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("receive failed: {}", e),
+                })?;
+            for i in 0..n {
+                ctx.set_array_element(data_arr, i, Value::Int(buf[i] as i8 as i32));
+            }
+            ctx.set_field(pkt, 1, Value::Int(n as i32)); // length
+            ctx.set_field(pkt, 2, Value::Int(0)); // offset
+                                                  // Parse source address "ip:port"
+            let (src_ip_str, src_port) = if let Some(colon) = src_str.rfind(':') {
+                (
+                    &src_str[..colon],
+                    src_str[colon + 1..].parse::<i32>().unwrap_or(0),
+                )
+            } else {
+                (src_str.as_str(), 0)
+            };
+            let src_addr =
+                crate::net_phase_e::alloc_inet_address_external(ctx, src_ip_str, src_ip_str);
+            ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
+            ctx.set_field(pkt, 4, Value::Int(src_port));
+            Ok(None)
+        },
+    );
     r.register(ms, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
@@ -41993,9 +44529,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
 pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    use crate::servlet::{
-        s2_alloc_dgram, s2_register_channel, SocketRegistry,
-    };
+    use crate::servlet::{s2_alloc_dgram, s2_register_channel, SocketRegistry};
     let dc = "java/nio/channels/DatagramChannel";
 
     // DatagramChannel field layout (5 fields, NEW-3):
@@ -42008,19 +44542,29 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // The sock_id was added by NEW-3 so that send/receive/read/write
     // share one persistent UDP socket and the Selector can poll its fd.
 
-    r.register(dc, "open", "()Ljava/nio/channels/DatagramChannel;", |ctx, _args| {
-        let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/DatagramChannel", 5);
-        ctx.set_field(ch, 0, Value::Int(0));   // port
-        ctx.set_field(ch, 1, Value::Int(1));   // open
-        ctx.set_field(ch, 2, Value::Int(0));   // not connected
-        ctx.set_field(ch, 3, Value::Int(1));   // blocking mode (default)
-        ctx.set_field(ch, 4, Value::Int(-1));  // sock_id (not yet bound)
-        Ok(Some(Value::Object(Some(ch))))
-    });
+    r.register(
+        dc,
+        "open",
+        "()Ljava/nio/channels/DatagramChannel;",
+        |ctx, _args| {
+            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/DatagramChannel", 5);
+            ctx.set_field(ch, 0, Value::Int(0)); // port
+            ctx.set_field(ch, 1, Value::Int(1)); // open
+            ctx.set_field(ch, 2, Value::Int(0)); // not connected
+            ctx.set_field(ch, 3, Value::Int(1)); // blocking mode (default)
+            ctx.set_field(ch, 4, Value::Int(-1)); // sock_id (not yet bound)
+            Ok(Some(Value::Object(Some(ch))))
+        },
+    );
 
     // Helper: lazily bind a 0.0.0.0:<port> UdpSocket for this channel if
     // no persistent socket has been allocated yet. Returns the sock_id.
-    fn ensure_bound(ctx: &mut dyn NativeContext, this: ObjectRef, host: &str, port: i32) -> Option<i32> {
+    fn ensure_bound(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        host: &str,
+        port: i32,
+    ) -> Option<i32> {
         let existing = ctx.get_field(this, 4).as_int().unwrap_or(-1);
         if existing >= 0 {
             return Some(existing);
@@ -42043,98 +44587,115 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         Some(id)
     }
 
-    r.register(dc, "bind", "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let h = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_else(|| "0.0.0.0".into()),
-                    _ => "0.0.0.0".into(),
-                };
-                let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (h, p)
-            }
-            _ => ("0.0.0.0".into(), 0),
-        };
-        // If a previous send/receive auto-bound this channel, rebind by
-        // dropping the old socket first so the user-requested address
-        // wins. This is the correct JDK semantics for bind after send.
-        {
-            let mut reg = crate::servlet::s2_registry().lock();
-            let old = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-            if old >= 0 {
-                reg.dgrams.remove(&old);
-                ctx.set_field(this, 4, Value::Int(-1));
-            }
-        }
-        match ensure_bound(ctx, this, &host, port) {
-            Some(_) => Ok(Some(Value::Object(Some(this)))),
-            None => Err(RuntimeError::IOException {
-                message: format!("DatagramChannel.bind({host}:{port}) failed"),
-            }
-            .into()),
-        }
-    });
-
-    r.register(dc, "connect", "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let h = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (h, p)
-            }
-            _ => (String::new(), 0),
-        };
-        // Auto-bind if not yet bound.
-        if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
-            return Err(RuntimeError::IOException {
-                message: "DatagramChannel.connect: auto-bind failed".into(),
-            }
-            .into());
-        }
-        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-        if sid < 0 {
-            return Err(RuntimeError::IOException {
-                message: "DatagramChannel.connect: socket missing".into(),
-            }
-            .into());
-        }
-        let target = format!("{host}:{port}");
-        {
-            let reg = crate::servlet::s2_registry().lock();
-            if let Some(sock) = reg.dgrams.get(&sid) {
-                if sock.connect(&target).is_err() {
-                    return Err(RuntimeError::IOException {
-                        message: format!("DatagramChannel.connect({target}) failed"),
-                    }
-                    .into());
+    r.register(
+        dc,
+        "bind",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (host, port) = match args.get(1) {
+                Some(Value::Object(Some(sa))) => {
+                    let h = match ctx.get_field(*sa, 0) {
+                        Value::Object(Some(h)) => {
+                            ctx.read_string(h).unwrap_or_else(|| "0.0.0.0".into())
+                        }
+                        _ => "0.0.0.0".into(),
+                    };
+                    let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                    (h, p)
+                }
+                _ => ("0.0.0.0".into(), 0),
+            };
+            // If a previous send/receive auto-bound this channel, rebind by
+            // dropping the old socket first so the user-requested address
+            // wins. This is the correct JDK semantics for bind after send.
+            {
+                let mut reg = crate::servlet::s2_registry().lock();
+                let old = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+                if old >= 0 {
+                    reg.dgrams.remove(&old);
+                    ctx.set_field(this, 4, Value::Int(-1));
                 }
             }
-        }
-        ctx.set_field(this, 2, Value::Int(1));
-        Ok(Some(Value::Object(Some(this))))
-    });
-
-    r.register(dc, "disconnect", "()Ljava/nio/channels/DatagramChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-        if sid >= 0 {
-            let reg = crate::servlet::s2_registry().lock();
-            if let Some(sock) = reg.dgrams.get(&sid) {
-                // Reset to unspecified address per POSIX semantics by
-                // connecting to (AF_UNSPEC, 0, 0). Rust's std::net doesn't
-                // expose this directly; as a portable proxy, the socket
-                // remains bound but the `connected` flag is cleared.
-                let _ = sock;
+            match ensure_bound(ctx, this, &host, port) {
+                Some(_) => Ok(Some(Value::Object(Some(this)))),
+                None => Err(RuntimeError::IOException {
+                    message: format!("DatagramChannel.bind({host}:{port}) failed"),
+                }
+                .into()),
             }
-        }
-        ctx.set_field(this, 2, Value::Int(0));
-        Ok(Some(Value::Object(Some(this))))
-    });
+        },
+    );
+
+    r.register(
+        dc,
+        "connect",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (host, port) = match args.get(1) {
+                Some(Value::Object(Some(sa))) => {
+                    let h = match ctx.get_field(*sa, 0) {
+                        Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                    (h, p)
+                }
+                _ => (String::new(), 0),
+            };
+            // Auto-bind if not yet bound.
+            if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramChannel.connect: auto-bind failed".into(),
+                }
+                .into());
+            }
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid < 0 {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramChannel.connect: socket missing".into(),
+                }
+                .into());
+            }
+            let target = format!("{host}:{port}");
+            {
+                let reg = crate::servlet::s2_registry().lock();
+                if let Some(sock) = reg.dgrams.get(&sid) {
+                    if sock.connect(&target).is_err() {
+                        return Err(RuntimeError::IOException {
+                            message: format!("DatagramChannel.connect({target}) failed"),
+                        }
+                        .into());
+                    }
+                }
+            }
+            ctx.set_field(this, 2, Value::Int(1));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+
+    r.register(
+        dc,
+        "disconnect",
+        "()Ljava/nio/channels/DatagramChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid >= 0 {
+                let reg = crate::servlet::s2_registry().lock();
+                if let Some(sock) = reg.dgrams.get(&sid) {
+                    // Reset to unspecified address per POSIX semantics by
+                    // connecting to (AF_UNSPEC, 0, 0). Rust's std::net doesn't
+                    // expose this directly; as a portable proxy, the socket
+                    // remains bound but the `connected` flag is cleared.
+                    let _ = sock;
+                }
+            }
+            ctx.set_field(this, 2, Value::Int(0));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     r.register(dc, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -42157,156 +44718,171 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(dc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        ctx.set_field(this, 3, Value::Int(blocking));
-        // Apply the mode to the underlying socket if one exists.
-        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-        if sid >= 0 {
-            let reg = crate::servlet::s2_registry().lock();
-            if let Some(sock) = reg.dgrams.get(&sid) {
-                let _ = sock.set_nonblocking(blocking == 0);
-            }
-        }
-        Ok(Some(Value::Object(Some(this))))
-    });
-
-    r.register(dc, "send", "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Auto-bind to 0.0.0.0:0 on first send — matches JDK behavior.
-        if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
-            return Err(RuntimeError::IOException {
-                message: "DatagramChannel.send: auto-bind failed".into(),
-            }
-            .into());
-        }
-        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-        if sid < 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-
-        // Destination from SocketAddress.
-        let (dest_host, dest_port) = match args.get(2) {
-            Some(Value::Object(Some(sa))) => {
-                let h = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(h)) => {
-                        ctx.read_string(h).unwrap_or_else(|| "127.0.0.1".into())
-                    }
-                    _ => "127.0.0.1".into(),
-                };
-                let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (h, p)
-            }
-            _ => ("127.0.0.1".into(), 0),
-        };
-
-        // Read the ByteBuffer's remaining bytes.
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(bb))) => *bb,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let remaining = limit.saturating_sub(pos);
-        if remaining == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let arr = match ctx.get_field(bb, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let mut buf = vec![0u8; remaining];
-        for i in 0..remaining {
-            if let Value::Int(b) = ctx.get_array_element(arr, pos + i) {
-                buf[i] = b as u8;
-            }
-        }
-
-        let dest = format!("{dest_host}:{dest_port}");
-        let sent = {
-            let reg = crate::servlet::s2_registry().lock();
-            match reg.dgrams.get(&sid) {
-                Some(sock) => match sock.send_to(&buf, &dest) {
-                    Ok(n) => n as i32,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                    Err(_) => -1,
-                },
-                None => -1,
-            }
-        };
-        if sent < 0 {
-            return Err(RuntimeError::IOException {
-                message: format!("DatagramChannel.send({dest}) failed"),
-            }
-            .into());
-        }
-        ctx.set_field(bb, 1, Value::Int((pos + sent as usize) as i32));
-        Ok(Some(Value::Int(sent)))
-    });
-
-    r.register(dc, "receive", "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
-            return Err(RuntimeError::IOException {
-                message: "DatagramChannel.receive: auto-bind failed".into(),
-            }
-            .into());
-        }
-        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
-        if sid < 0 {
-            return Ok(Some(Value::Object(None)));
-        }
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(bb))) => *bb,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        // Receive into a scratch buffer sized to the ByteBuffer's
-        // remaining bytes. Datagram receive truncates if the buffer is
-        // too small — we mirror that behavior by passing a slice of the
-        // correct length.
-        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let capacity = limit.saturating_sub(pos).min(65_536);
-        let mut buf = vec![0u8; capacity.max(1)];
-
-        let result = {
-            let reg = crate::servlet::s2_registry().lock();
-            match reg.dgrams.get(&sid) {
-                Some(sock) => sock.recv_from(&mut buf),
-                None => return Ok(Some(Value::Object(None))),
-            }
-        };
-        match result {
-            Ok((n, src_addr)) => {
-                let arr = match ctx.get_field(bb, 0) {
-                    Value::Object(Some(a)) => a,
-                    _ => return Ok(Some(Value::Object(None))),
-                };
-                let arr_len = ctx.array_length(arr);
-                let copy_len = n.min(arr_len.saturating_sub(pos));
-                for i in 0..copy_len {
-                    ctx.set_array_element(arr, pos + i, Value::Int(buf[i] as i8 as i32));
+    r.register(
+        dc,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+            ctx.set_field(this, 3, Value::Int(blocking));
+            // Apply the mode to the underlying socket if one exists.
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid >= 0 {
+                let reg = crate::servlet::s2_registry().lock();
+                if let Some(sock) = reg.dgrams.get(&sid) {
+                    let _ = sock.set_nonblocking(blocking == 0);
                 }
-                ctx.set_field(bb, 1, Value::Int((pos + copy_len) as i32));
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
-                let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-                let host_str = ctx.create_string(&src_addr.ip().to_string());
-                ctx.set_field(sa, 0, Value::Object(Some(host_str)));
-                ctx.set_field(sa, 1, Value::Int(src_addr.port() as i32));
-                Ok(Some(Value::Object(Some(sa))))
+    r.register(
+        dc,
+        "send",
+        "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Auto-bind to 0.0.0.0:0 on first send — matches JDK behavior.
+            if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramChannel.send: auto-bind failed".into(),
+                }
+                .into());
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Non-blocking datagram with no pending packet: per JDK
-                // DatagramChannel.receive, return null.
-                Ok(Some(Value::Object(None)))
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid < 0 {
+                return Ok(Some(Value::Int(0)));
             }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("DatagramChannel.receive failed: {e}"),
+
+            // Destination from SocketAddress.
+            let (dest_host, dest_port) = match args.get(2) {
+                Some(Value::Object(Some(sa))) => {
+                    let h = match ctx.get_field(*sa, 0) {
+                        Value::Object(Some(h)) => {
+                            ctx.read_string(h).unwrap_or_else(|| "127.0.0.1".into())
+                        }
+                        _ => "127.0.0.1".into(),
+                    };
+                    let p = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                    (h, p)
+                }
+                _ => ("127.0.0.1".into(), 0),
+            };
+
+            // Read the ByteBuffer's remaining bytes.
+            let bb = match args.get(1) {
+                Some(Value::Object(Some(bb))) => *bb,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+            let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+            let remaining = limit.saturating_sub(pos);
+            if remaining == 0 {
+                return Ok(Some(Value::Int(0)));
             }
-            .into()),
-        }
-    });
+            let arr = match ctx.get_field(bb, 0) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let mut buf = vec![0u8; remaining];
+            for i in 0..remaining {
+                if let Value::Int(b) = ctx.get_array_element(arr, pos + i) {
+                    buf[i] = b as u8;
+                }
+            }
+
+            let dest = format!("{dest_host}:{dest_port}");
+            let sent = {
+                let reg = crate::servlet::s2_registry().lock();
+                match reg.dgrams.get(&sid) {
+                    Some(sock) => match sock.send_to(&buf, &dest) {
+                        Ok(n) => n as i32,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(_) => -1,
+                    },
+                    None => -1,
+                }
+            };
+            if sent < 0 {
+                return Err(RuntimeError::IOException {
+                    message: format!("DatagramChannel.send({dest}) failed"),
+                }
+                .into());
+            }
+            ctx.set_field(bb, 1, Value::Int((pos + sent as usize) as i32));
+            Ok(Some(Value::Int(sent)))
+        },
+    );
+
+    r.register(
+        dc,
+        "receive",
+        "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ensure_bound(ctx, this, "0.0.0.0", 0).is_none() {
+                return Err(RuntimeError::IOException {
+                    message: "DatagramChannel.receive: auto-bind failed".into(),
+                }
+                .into());
+            }
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid < 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let bb = match args.get(1) {
+                Some(Value::Object(Some(bb))) => *bb,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Receive into a scratch buffer sized to the ByteBuffer's
+            // remaining bytes. Datagram receive truncates if the buffer is
+            // too small — we mirror that behavior by passing a slice of the
+            // correct length.
+            let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+            let limit = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+            let capacity = limit.saturating_sub(pos).min(65_536);
+            let mut buf = vec![0u8; capacity.max(1)];
+
+            let result = {
+                let reg = crate::servlet::s2_registry().lock();
+                match reg.dgrams.get(&sid) {
+                    Some(sock) => sock.recv_from(&mut buf),
+                    None => return Ok(Some(Value::Object(None))),
+                }
+            };
+            match result {
+                Ok((n, src_addr)) => {
+                    let arr = match ctx.get_field(bb, 0) {
+                        Value::Object(Some(a)) => a,
+                        _ => return Ok(Some(Value::Object(None))),
+                    };
+                    let arr_len = ctx.array_length(arr);
+                    let copy_len = n.min(arr_len.saturating_sub(pos));
+                    for i in 0..copy_len {
+                        ctx.set_array_element(arr, pos + i, Value::Int(buf[i] as i8 as i32));
+                    }
+                    ctx.set_field(bb, 1, Value::Int((pos + copy_len) as i32));
+
+                    let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+                    let host_str = ctx.create_string(&src_addr.ip().to_string());
+                    ctx.set_field(sa, 0, Value::Object(Some(host_str)));
+                    ctx.set_field(sa, 1, Value::Int(src_addr.port() as i32));
+                    Ok(Some(Value::Object(Some(sa))))
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking datagram with no pending packet: per JDK
+                    // DatagramChannel.receive, return null.
+                    Ok(Some(Value::Object(None)))
+                }
+                Err(e) => Err(RuntimeError::IOException {
+                    message: format!("DatagramChannel.receive failed: {e}"),
+                }
+                .into()),
+            }
+        },
+    );
 
     // read(ByteBuffer) — connected-mode receive. Semantics: return the
     // number of bytes placed into the buffer, or -1 on EOF, or 0 if
@@ -42353,9 +44929,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int((pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(Some(Value::Int(0)))
-            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
             Err(_) => Ok(Some(Value::Int(-1))),
         }
     });
@@ -42404,9 +44978,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int((pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(Some(Value::Int(0)))
-            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
             Err(e) => Err(RuntimeError::IOException {
                 message: format!("DatagramChannel.write failed: {e}"),
             }
@@ -42438,7 +45010,10 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // socket() -> DatagramSocket
     r.register(dc, "socket", "()Ljava/net/DatagramSocket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let port = match ctx.get_field(this, 0) { Value::Int(p) => p, _ => 0 };
+        let port = match ctx.get_field(this, 0) {
+            Value::Int(p) => p,
+            _ => 0,
+        };
         let ds = alloc_concurrent_synthetic(ctx, "java/net/DatagramSocket", 3);
         ctx.set_field(ds, 0, Value::Int(port));
         ctx.set_field(ds, 1, Value::Int(0)); // not closed
@@ -42447,33 +45022,48 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     });
 
     // getLocalAddress() -> SocketAddress
-    r.register(dc, "getLocalAddress", "()Ljava/net/SocketAddress;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let port = match ctx.get_field(this, 0) { Value::Int(p) => p, _ => 0 };
-        let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-        let host = ctx.create_string("0.0.0.0");
-        ctx.set_field(sa, 0, Value::Object(Some(host)));
-        ctx.set_field(sa, 1, Value::Int(port));
-        Ok(Some(Value::Object(Some(sa))))
-    });
+    r.register(
+        dc,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let port = match ctx.get_field(this, 0) {
+                Value::Int(p) => p,
+                _ => 0,
+            };
+            let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+            let host = ctx.create_string("0.0.0.0");
+            ctx.set_field(sa, 0, Value::Object(Some(host)));
+            ctx.set_field(sa, 1, Value::Int(port));
+            Ok(Some(Value::Object(Some(sa))))
+        },
+    );
 
     // getRemoteAddress() -> SocketAddress
-    r.register(dc, "getRemoteAddress", "()Ljava/net/SocketAddress;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        dc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // setOption / getOption stubs
-    r.register(dc, "setOption", "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;", |_ctx, args| {
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
-    r.register(dc, "getOption", "(Ljava/net/SocketOption;)Ljava/lang/Object;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    r.register(
+        dc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        dc,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // validOps() -> int (SelectionKey.OP_READ | OP_WRITE = 1|4 = 5)
-    r.register(dc, "validOps", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(5)))
-    });
+    r.register(dc, "validOps", "()I", |_ctx, _args| Ok(Some(Value::Int(5))));
 
     // isBlocking() -> boolean
     r.register(dc, "isBlocking", "()Z", |ctx, args| {
@@ -42574,7 +45164,12 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(cls, "removeContext", "(Ljava/lang/String;)V", |_ctx, _args| Ok(None));
+        r.register(
+            cls,
+            "removeContext",
+            "(Ljava/lang/String;)V",
+            |_ctx, _args| Ok(None),
+        );
         r.register(
             cls,
             "removeContext",
@@ -42752,7 +45347,9 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                     Ok(fd) => {
                         ctx.set_field(ssc, 1, Value::Int(1));
                         ctx.set_field(ssc, 2, Value::Int(fd as i32));
-                        let port = ctx.fd_table().tcp_local_addr(fd)
+                        let port = ctx
+                            .fd_table()
+                            .tcp_local_addr(fd)
                             .ok()
                             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                             .unwrap_or(0);
@@ -42762,7 +45359,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                     Err(e) => {
                         return Err(RuntimeError::IOException {
                             message: format!("bind {addr_str}: {e}"),
-                        }.into());
+                        }
+                        .into());
                     }
                 }
             }
@@ -42782,7 +45380,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             Err(e) => {
                 return Err(RuntimeError::IOException {
                     message: format!("bind {addr_str}: {e}"),
-                }.into());
+                }
+                .into());
             }
         }
         Ok(None)
@@ -42800,7 +45399,9 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
                     ctx.set_field(ssc, 1, Value::Int(1));
                     ctx.set_field(ssc, 2, Value::Int(fd as i32));
-                    let port = ctx.fd_table().tcp_local_addr(fd)
+                    let port = ctx
+                        .fd_table()
+                        .tcp_local_addr(fd)
                         .ok()
                         .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                         .unwrap_or(0);
@@ -42818,7 +45419,9 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
                 let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
                 if fd >= 0 {
-                    let port = ctx.fd_table().tcp_local_addr(fd as u32)
+                    let port = ctx
+                        .fd_table()
+                        .tcp_local_addr(fd as u32)
                         .ok()
                         .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
                         .unwrap_or(0);
@@ -42853,14 +45456,16 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         // Accept a connection on the underlying TcpListener and populate the given
         // Socket object's stream_id field. This is the JDK-internal hook called by
         // ServerSocket.accept() to delegate the actual blocking accept.
-        use crate::servlet::{s2_registry, s2_alloc_stream};
+        use crate::servlet::{s2_alloc_stream, s2_registry};
         let this = obj_arg(args, 0)?;
         let target_socket = match args.get(1) {
             Some(Value::Object(Some(s))) => *s,
-            _ => return Err(RuntimeError::IOException {
-                message: "implAccept: null socket".into(),
+            _ => {
+                return Err(RuntimeError::IOException {
+                    message: "implAccept: null socket".into(),
+                }
+                .into())
             }
-            .into()),
         };
         let listener_id = ctx.get_field(this, 3).as_int().unwrap_or(-1); // SS_LISTENER_ID
         if listener_id < 0 {
@@ -42872,17 +45477,20 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         // Block-accept via the s2_registry. Take the listener out, accept on it, put it back.
         let stream = {
             let mut reg = s2_registry().lock();
-            let listener = reg.listeners.get(&listener_id).ok_or_else(|| {
-                RuntimeError::IOException {
-                    message: "Listener not found".into(),
-                }
-            })?;
+            let listener =
+                reg.listeners
+                    .get(&listener_id)
+                    .ok_or_else(|| RuntimeError::IOException {
+                        message: "Listener not found".into(),
+                    })?;
             match listener.accept() {
                 Ok((stream, _addr)) => stream,
-                Err(e) => return Err(RuntimeError::IOException {
-                    message: format!("accept failed: {}", e),
+                Err(e) => {
+                    return Err(RuntimeError::IOException {
+                        message: format!("accept failed: {}", e),
+                    }
+                    .into())
                 }
-                .into()),
             }
         };
         let stream_id = s2_alloc_stream(stream);
@@ -42918,89 +45526,114 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     // Socket.connect(SocketAddress) — extract host/port, connect via std::net::TcpStream.
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (host, port)
+    r.register(
+        sock,
+        "connect",
+        "(Ljava/net/SocketAddress;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (host, port) = match args.get(1) {
+                Some(Value::Object(Some(sa))) => {
+                    let host = match ctx.get_field(*sa, 0) {
+                        Value::Object(Some(s)) => {
+                            ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into())
+                        }
+                        _ => "127.0.0.1".into(),
+                    };
+                    let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                    (host, port)
+                }
+                _ => {
+                    return Err(RuntimeError::IOException {
+                        message: "Socket.connect: null address".into(),
+                    }
+                    .into())
+                }
+            };
+            // Connect and register in s2_registry
+            use crate::servlet::{s2_alloc_stream, s2_registry};
+            let addr = format!("{}:{}", host, port);
+            match std::net::TcpStream::connect(&addr) {
+                Ok(stream) => {
+                    let stream_id = s2_alloc_stream(stream);
+                    // Store host, port, stream_id in Socket fields
+                    let host_s = ctx.create_string(&host);
+                    ctx.set_field(this, 0, Value::Object(Some(host_s)));
+                    ctx.set_field(this, 1, Value::Int(port));
+                    ctx.set_field(this, 3, Value::Int(0)); // not closed
+                    ctx.set_field(this, 4, Value::Int(stream_id));
+                    Ok(None)
+                }
+                Err(e) => Err(RuntimeError::IOException {
+                    message: format!("Socket.connect failed: {}", e),
+                }
+                .into()),
             }
-            _ => return Err(RuntimeError::IOException {
-                message: "Socket.connect: null address".into(),
-            }.into()),
-        };
-        // Connect and register in s2_registry
-        use crate::servlet::{s2_registry, s2_alloc_stream};
-        let addr = format!("{}:{}", host, port);
-        match std::net::TcpStream::connect(&addr) {
-            Ok(stream) => {
-                let stream_id = s2_alloc_stream(stream);
-                // Store host, port, stream_id in Socket fields
-                let host_s = ctx.create_string(&host);
-                ctx.set_field(this, 0, Value::Object(Some(host_s)));
-                ctx.set_field(this, 1, Value::Int(port));
-                ctx.set_field(this, 3, Value::Int(0)); // not closed
-                ctx.set_field(this, 4, Value::Int(stream_id));
-                Ok(None)
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("Socket.connect failed: {}", e),
-            }.into()),
-        }
-    });
+        },
+    );
     // Socket.connect(SocketAddress, int timeout)
-    r.register(sock, "connect", "(Ljava/net/SocketAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let (host, port) = match args.get(1) {
-            Some(Value::Object(Some(sa))) => {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
-                (host, port)
+    r.register(
+        sock,
+        "connect",
+        "(Ljava/net/SocketAddress;I)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (host, port) = match args.get(1) {
+                Some(Value::Object(Some(sa))) => {
+                    let host = match ctx.get_field(*sa, 0) {
+                        Value::Object(Some(s)) => {
+                            ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into())
+                        }
+                        _ => "127.0.0.1".into(),
+                    };
+                    let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                    (host, port)
+                }
+                _ => {
+                    return Err(RuntimeError::IOException {
+                        message: "Socket.connect: null address".into(),
+                    }
+                    .into())
+                }
+            };
+            let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            use crate::servlet::{s2_alloc_stream, s2_registry};
+            let addr = format!("{}:{}", host, port);
+            let result = if timeout_ms > 0 {
+                // Resolve address and use connect_timeout
+                match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
+                    Ok(mut iter) => match iter.next() {
+                        Some(sock_addr) => std::net::TcpStream::connect_timeout(
+                            &sock_addr,
+                            std::time::Duration::from_millis(timeout_ms.max(0) as u64),
+                        ),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            "no address",
+                        )),
+                    },
+                    Err(e) => Err(e),
+                }
+            } else {
+                std::net::TcpStream::connect(&addr)
+            };
+            match result {
+                Ok(stream) => {
+                    let stream_id = s2_alloc_stream(stream);
+                    let host_s = ctx.create_string(&host);
+                    ctx.set_field(this, 0, Value::Object(Some(host_s)));
+                    ctx.set_field(this, 1, Value::Int(port));
+                    ctx.set_field(this, 3, Value::Int(0));
+                    ctx.set_field(this, 4, Value::Int(stream_id));
+                    Ok(None)
+                }
+                Err(e) => Err(RuntimeError::IOException {
+                    message: format!("Socket.connect failed: {}", e),
+                }
+                .into()),
             }
-            _ => return Err(RuntimeError::IOException {
-                message: "Socket.connect: null address".into(),
-            }.into()),
-        };
-        let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        use crate::servlet::{s2_registry, s2_alloc_stream};
-        let addr = format!("{}:{}", host, port);
-        let result = if timeout_ms > 0 {
-            // Resolve address and use connect_timeout
-            match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
-                Ok(mut iter) => match iter.next() {
-                    Some(sock_addr) => std::net::TcpStream::connect_timeout(
-                        &sock_addr,
-                        std::time::Duration::from_millis(timeout_ms.max(0) as u64),
-                    ),
-                    None => Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")),
-                },
-                Err(e) => Err(e),
-            }
-        } else {
-            std::net::TcpStream::connect(&addr)
-        };
-        match result {
-            Ok(stream) => {
-                let stream_id = s2_alloc_stream(stream);
-                let host_s = ctx.create_string(&host);
-                ctx.set_field(this, 0, Value::Object(Some(host_s)));
-                ctx.set_field(this, 1, Value::Int(port));
-                ctx.set_field(this, 3, Value::Int(0));
-                ctx.set_field(this, 4, Value::Int(stream_id));
-                Ok(None)
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: format!("Socket.connect failed: {}", e),
-            }.into()),
-        }
-    });
+        },
+    );
     r.register(
         sock,
         "getLocalAddress",
@@ -43098,18 +45731,24 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Some(stream) = reg.streams.get(&stream_id) {
                 // socket2 doesn't expose send_oob; use regular write as best effort.
                 use std::io::Write;
-                let mut stream_clone = stream.try_clone().map_err(|e| {
-                    RuntimeError::IOException { message: e.to_string() }
-                })?;
+                let mut stream_clone =
+                    stream.try_clone().map_err(|e| RuntimeError::IOException {
+                        message: e.to_string(),
+                    })?;
                 let _ = stream_clone.write_all(&[byte]);
             }
         }
         Ok(None)
     });
-    r.register(sock, "setPerformancePreferences", "(III)V", |_ctx, _args| {
-        // Performance hints are advisory — accept and ignore.
-        Ok(None)
-    });
+    r.register(
+        sock,
+        "setPerformancePreferences",
+        "(III)V",
+        |_ctx, _args| {
+            // Performance hints are advisory — accept and ignore.
+            Ok(None)
+        },
+    );
     r.register(sock, "setTrafficClass", "(I)V", |ctx, args| {
         use crate::servlet::s2_registry;
         let this = obj_arg(args, 0)?;
@@ -43165,10 +45804,16 @@ fn field_has_json_ignore(ctx: &mut dyn NativeContext, class_id: ClassId, field_n
 }
 
 /// Get the @JsonProperty / @SerializedName override for a field, if any.
-fn field_json_name(ctx: &mut dyn NativeContext, class_id: ClassId, field_name: &str) -> Option<String> {
+fn field_json_name(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    field_name: &str,
+) -> Option<String> {
     let annotations = ctx.field_annotations(class_id, field_name);
     for ann in &annotations {
-        if ann.type_descriptor.contains("JsonProperty") || ann.type_descriptor.contains("SerializedName") {
+        if ann.type_descriptor.contains("JsonProperty")
+            || ann.type_descriptor.contains("SerializedName")
+        {
             // Try to extract annotation "value" element
             for (name, elem) in &ann.elements {
                 if name == "value" {
@@ -43186,10 +45831,7 @@ fn field_json_name(ctx: &mut dyn NativeContext, class_id: ClassId, field_name: &
 
 /// Serialize a Java object to a JSON string using reflection.
 /// Walks declared fields, reads each value, and builds a JSON object string.
-fn reflection_serialize_to_json(
-    ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
-) -> String {
+fn reflection_serialize_to_json(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
     reflection_serialize_to_json_depth(ctx, obj, 0)
 }
 
@@ -43225,8 +45867,8 @@ fn reflection_serialize_to_json_depth(
         let val = ctx.get_field(obj, meta.slot_index);
         let json_val = value_to_json_depth(ctx, &val, &meta.descriptor, depth + 1);
         // Use @JsonProperty/@SerializedName name if present
-        let output_name = field_json_name(ctx, class_id, &meta.name)
-            .unwrap_or_else(|| meta.name.clone());
+        let output_name =
+            field_json_name(ctx, class_id, &meta.name).unwrap_or_else(|| meta.name.clone());
         entries.push(format!("\"{}\":{}", json_escape(&output_name), json_val));
     }
     format!("{{{}}}", entries.join(","))
@@ -43237,31 +45879,48 @@ fn value_to_json(ctx: &mut dyn NativeContext, val: &Value, descriptor: &str) -> 
     value_to_json_depth(ctx, val, descriptor, 0)
 }
 
-fn value_to_json_depth(ctx: &mut dyn NativeContext, val: &Value, descriptor: &str, depth: usize) -> String {
+fn value_to_json_depth(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    descriptor: &str,
+    depth: usize,
+) -> String {
     if depth > JSON_MAX_DEPTH {
         return "null".to_string();
     }
     match val {
-        Value::Int(n) => {
-            match descriptor {
-                "Z" => if *n != 0 { "true".to_string() } else { "false".to_string() },
-                "C" => {
-                    let ch = char::from_u32(*n as u32).unwrap_or('?');
-                    format!("\"{}\"", json_escape(&ch.to_string()))
+        Value::Int(n) => match descriptor {
+            "Z" => {
+                if *n != 0 {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
                 }
-                _ => n.to_string(),
             }
-        }
+            "C" => {
+                let ch = char::from_u32(*n as u32).unwrap_or('?');
+                format!("\"{}\"", json_escape(&ch.to_string()))
+            }
+            _ => n.to_string(),
+        },
         Value::Long(n) => n.to_string(),
         Value::Float(f) => {
-            if f.is_nan() { "null".to_string() }
-            else if f.is_infinite() { "null".to_string() }
-            else { format!("{}", f) }
+            if f.is_nan() {
+                "null".to_string()
+            } else if f.is_infinite() {
+                "null".to_string()
+            } else {
+                format!("{}", f)
+            }
         }
         Value::Double(d) => {
-            if d.is_nan() { "null".to_string() }
-            else if d.is_infinite() { "null".to_string() }
-            else { format!("{}", d) }
+            if d.is_nan() {
+                "null".to_string()
+            } else if d.is_infinite() {
+                "null".to_string()
+            } else {
+                format!("{}", d)
+            }
         }
         Value::Object(None) => "null".to_string(),
         Value::Object(Some(obj_ref)) => {
@@ -43274,14 +45933,20 @@ fn value_to_json_depth(ctx: &mut dyn NativeContext, val: &Value, descriptor: &st
                 // Array — serialize elements
                 let len = ctx.array_length(*obj_ref);
                 let mut elems = Vec::new();
-                let elem_desc = if descriptor.len() > 1 { &descriptor[1..] } else { "I" };
+                let elem_desc = if descriptor.len() > 1 {
+                    &descriptor[1..]
+                } else {
+                    "I"
+                };
                 for i in 0..len {
                     let elem = ctx.get_array_element(*obj_ref, i);
                     elems.push(value_to_json_depth(ctx, &elem, elem_desc, depth + 1));
                 }
                 format!("[{}]", elems.join(","))
-            } else if cname == "java/lang/Integer" || cname == "java/lang/Byte"
-                || cname == "java/lang/Short" {
+            } else if cname == "java/lang/Integer"
+                || cname == "java/lang/Byte"
+                || cname == "java/lang/Short"
+            {
                 let inner = ctx.get_field(*obj_ref, 0);
                 value_to_json_depth(ctx, &inner, "I", depth + 1)
             } else if cname == "java/lang/Long" {
@@ -43402,7 +46067,10 @@ fn json_unescape(s: &str) -> String {
                         None => out.push('\u{FFFD}'),
                     }
                 }
-                Some(other) => { out.push('\\'); out.push(other); }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
                 None => out.push('\\'),
             }
         } else {
@@ -43460,13 +46128,23 @@ fn parse_json_object(json: &str) -> Vec<(String, String)> {
     let bytes = inner.as_bytes();
     while i < bytes.len() {
         // Skip whitespace and commas
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b',' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') {
+        while i < bytes.len()
+            && (bytes[i] == b' '
+                || bytes[i] == b','
+                || bytes[i] == b'\n'
+                || bytes[i] == b'\r'
+                || bytes[i] == b'\t')
+        {
             i += 1;
         }
-        if i >= bytes.len() { break; }
+        if i >= bytes.len() {
+            break;
+        }
 
         // Expect key string
-        if bytes[i] != b'"' { break; }
+        if bytes[i] != b'"' {
+            break;
+        }
         i += 1;
         let key_start = i;
         while i < bytes.len() {
@@ -43480,13 +46158,17 @@ fn parse_json_object(json: &str) -> Vec<(String, String)> {
                 i += json_utf8_char_len(bytes, i);
             }
         }
-        if i >= bytes.len() { break; } // unterminated string
+        if i >= bytes.len() {
+            break;
+        } // unterminated string
         let raw_key = &inner[key_start..i.min(inner.len())];
         let key = json_unescape(raw_key);
         i += 1; // skip closing quote
 
         // Skip colon and whitespace
-        while i < bytes.len() && (bytes[i] == b':' || bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+        while i < bytes.len() && (bytes[i] == b':' || bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
 
         // Read value
         let val = read_json_value(inner, &mut i);
@@ -43520,18 +46202,24 @@ fn json_pretty_print(json: &str) -> String {
                 out.push(b as char);
                 indent += 2;
                 out.push('\n');
-                for _ in 0..indent { out.push(' '); }
+                for _ in 0..indent {
+                    out.push(' ');
+                }
             }
             b'}' | b']' => {
                 indent = indent.saturating_sub(2);
                 out.push('\n');
-                for _ in 0..indent { out.push(' '); }
+                for _ in 0..indent {
+                    out.push(' ');
+                }
                 out.push(b as char);
             }
             b',' => {
                 out.push(',');
                 out.push('\n');
-                for _ in 0..indent { out.push(' '); }
+                for _ in 0..indent {
+                    out.push(' ');
+                }
             }
             b':' => {
                 out.push_str(" : ");
@@ -43548,7 +46236,9 @@ fn json_pretty_print(json: &str) -> String {
 /// Handles strings with escaped quotes, nested objects/arrays with string awareness.
 fn read_json_value(s: &str, i: &mut usize) -> String {
     let bytes = s.as_bytes();
-    if *i >= bytes.len() { return String::new(); }
+    if *i >= bytes.len() {
+        return String::new();
+    }
 
     match bytes[*i] {
         b'"' => {
@@ -43566,7 +46256,9 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
                 }
             }
             let val = json_unescape(&s[start..(*i).min(bytes.len())]);
-            if *i < bytes.len() { *i += 1; } // skip closing quote
+            if *i < bytes.len() {
+                *i += 1;
+            } // skip closing quote
             val
         }
         b'{' => {
@@ -43576,13 +46268,24 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             while *i < bytes.len() {
                 if in_string {
                     // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
-                    if bytes[*i] == b'"' { in_string = false; }
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() {
+                        *i += 1 + json_utf8_char_len(bytes, *i + 1);
+                        continue;
+                    }
+                    if bytes[*i] == b'"' {
+                        in_string = false;
+                    }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'{' => depth += 1,
-                        b'}' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                *i += 1;
+                                return s[start..(*i).min(bytes.len())].to_string();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -43597,13 +46300,24 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
             while *i < bytes.len() {
                 if in_string {
                     // UTF-8-width-aware escape skip keeps `*i` on a char boundary (finding 1).
-                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() { *i += 1 + json_utf8_char_len(bytes, *i + 1); continue; }
-                    if bytes[*i] == b'"' { in_string = false; }
+                    if bytes[*i] == b'\\' && *i + 1 < bytes.len() {
+                        *i += 1 + json_utf8_char_len(bytes, *i + 1);
+                        continue;
+                    }
+                    if bytes[*i] == b'"' {
+                        in_string = false;
+                    }
                 } else {
                     match bytes[*i] {
                         b'"' => in_string = true,
                         b'[' => depth += 1,
-                        b']' => { depth -= 1; if depth == 0 { *i += 1; return s[start..(*i).min(bytes.len())].to_string(); } }
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                *i += 1;
+                                return s[start..(*i).min(bytes.len())].to_string();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -43614,8 +46328,15 @@ fn read_json_value(s: &str, i: &mut usize) -> String {
         _ => {
             // Number, boolean, null
             let start = *i;
-            while *i < bytes.len() && bytes[*i] != b',' && bytes[*i] != b'}' && bytes[*i] != b']'
-                && bytes[*i] != b' ' && bytes[*i] != b'\n' && bytes[*i] != b'\r' && bytes[*i] != b'\t' {
+            while *i < bytes.len()
+                && bytes[*i] != b','
+                && bytes[*i] != b'}'
+                && bytes[*i] != b']'
+                && bytes[*i] != b' '
+                && bytes[*i] != b'\n'
+                && bytes[*i] != b'\r'
+                && bytes[*i] != b'\t'
+            {
                 *i += 1;
             }
             s[start..*i].to_string()
@@ -43649,7 +46370,9 @@ fn reflection_deserialize_from_json_depth(
     for (key, val_str) in &pairs {
         // Match by field name or by @JsonProperty/@SerializedName alias
         let meta = instance_fields.iter().find(|f| {
-            if f.name == *key { return true; }
+            if f.name == *key {
+                return true;
+            }
             if let Some(alias) = field_json_name(ctx, class_id, &f.name) {
                 return alias == *key;
             }
@@ -43671,7 +46394,12 @@ fn json_str_to_value(ctx: &mut dyn NativeContext, val_str: &str, descriptor: &st
     json_str_to_value_depth(ctx, val_str, descriptor, 0)
 }
 
-fn json_str_to_value_depth(ctx: &mut dyn NativeContext, val_str: &str, descriptor: &str, depth: usize) -> Value {
+fn json_str_to_value_depth(
+    ctx: &mut dyn NativeContext,
+    val_str: &str,
+    descriptor: &str,
+    depth: usize,
+) -> Value {
     if depth > JSON_MAX_DEPTH {
         return Value::Object(None);
     }
@@ -43758,9 +46486,13 @@ fn json_str_to_value_depth(ctx: &mut dyn NativeContext, val_str: &str, descripto
                             break;
                         }
                     }
-                    if i >= inner.len() { break; }
+                    if i >= inner.len() {
+                        break;
+                    }
                     let val = read_json_value(inner, &mut i);
-                    if val.is_empty() && i >= inner.len() { break; }
+                    if val.is_empty() && i >= inner.len() {
+                        break;
+                    }
                     elements.push(val);
                 }
                 let arr_type = match elem_desc {
@@ -43798,10 +46530,10 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     //   bit 2: WRITE_DATES_AS_TIMESTAMPS (default: 1 = enabled)
     //   bit 3: FAIL_ON_NULL_FOR_PRIMITIVES (default: 0 = disabled)
     //   bit 4: SERIALIZE_NULLS (default: 0 = disabled; for Gson compat)
-    const OM_CFG_FAIL_UNKNOWN: i32     = 1 << 0;
-    const OM_CFG_INDENT: i32           = 1 << 1;
+    const OM_CFG_FAIL_UNKNOWN: i32 = 1 << 0;
+    const OM_CFG_INDENT: i32 = 1 << 1;
     const OM_CFG_DATES_TIMESTAMPS: i32 = 1 << 2;
-    const OM_CFG_FAIL_NULL_PRIM: i32   = 1 << 3;
+    const OM_CFG_FAIL_NULL_PRIM: i32 = 1 << 3;
     const OM_CFG_FIELD: usize = 0;
 
     // Default config: FAIL_ON_UNKNOWN_PROPERTIES | WRITE_DATES_AS_TIMESTAMPS
@@ -43820,10 +46552,13 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
         "writeValueAsString",
         "(Ljava/lang/Object;)Ljava/lang/String;",
         |ctx, args| {
-            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => {
-                let null_str = ctx.create_string("null");
-                return Ok(Some(Value::Object(Some(null_str))));
-            }};
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    let null_str = ctx.create_string("null");
+                    return Ok(Some(Value::Object(Some(null_str))));
+                }
+            };
             let obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -43831,10 +46566,17 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(null_str))));
                 }
             };
-            let cfg = match ctx.get_field(this, OM_CFG_FIELD) { Value::Int(v) => v, _ => OM_DEFAULT_CFG };
+            let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
+                Value::Int(v) => v,
+                _ => OM_DEFAULT_CFG,
+            };
             let indent = (cfg & OM_CFG_INDENT) != 0;
             let json = reflection_serialize_to_json(ctx, obj);
-            let output = if indent { json_pretty_print(&json) } else { json };
+            let output = if indent {
+                json_pretty_print(&json)
+            } else {
+                json
+            };
             let result = ctx.create_string(&output);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -43913,15 +46655,23 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     }
 
     // configure(Feature, boolean) — set or clear a config bit
-    r.register(om, "configure",
+    r.register(
+        om,
+        "configure",
         "(Ljava/lang/Enum;Z)Lcom/fasterxml/jackson/databind/ObjectMapper;",
         |ctx, args| {
-            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
             let enabled = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
                     if let Some(bit) = om_feature_bit(&name) {
-                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) { Value::Int(v) => v, _ => OM_DEFAULT_CFG };
+                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
+                            Value::Int(v) => v,
+                            _ => OM_DEFAULT_CFG,
+                        };
                         let new_cfg = if enabled { cfg | bit } else { cfg & !bit };
                         ctx.set_field(this, OM_CFG_FIELD, Value::Int(new_cfg));
                     }
@@ -43932,14 +46682,22 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     );
 
     // enable(Feature) — set a config bit
-    r.register(om, "enable",
+    r.register(
+        om,
+        "enable",
         "(Ljava/lang/Enum;)Lcom/fasterxml/jackson/databind/ObjectMapper;",
         |ctx, args| {
-            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
                     if let Some(bit) = om_feature_bit(&name) {
-                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) { Value::Int(v) => v, _ => OM_DEFAULT_CFG };
+                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
+                            Value::Int(v) => v,
+                            _ => OM_DEFAULT_CFG,
+                        };
                         ctx.set_field(this, OM_CFG_FIELD, Value::Int(cfg | bit));
                     }
                 }
@@ -43949,14 +46707,22 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     );
 
     // disable(Feature) — clear a config bit
-    r.register(om, "disable",
+    r.register(
+        om,
+        "disable",
         "(Ljava/lang/Enum;)Lcom/fasterxml/jackson/databind/ObjectMapper;",
         |ctx, args| {
-            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
                     if let Some(bit) = om_feature_bit(&name) {
-                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) { Value::Int(v) => v, _ => OM_DEFAULT_CFG };
+                        let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
+                            Value::Int(v) => v,
+                            _ => OM_DEFAULT_CFG,
+                        };
                         ctx.set_field(this, OM_CFG_FIELD, Value::Int(cfg & !bit));
                     }
                 }
@@ -43966,19 +46732,19 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     );
 
     // setSerializationInclusion — return this (no direct config bit)
-    r.register(om, "setSerializationInclusion",
+    r.register(
+        om,
+        "setSerializationInclusion",
         "(Ljava/lang/Enum;)Lcom/fasterxml/jackson/databind/ObjectMapper;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
     // registerModule — return this (modules not supported but don't crash)
-    r.register(om, "registerModule",
+    r.register(
+        om,
+        "registerModule",
         "(Lcom/fasterxml/jackson/databind/Module;)Lcom/fasterxml/jackson/databind/ObjectMapper;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
     // -----------------------------------------------------------------------
@@ -44008,10 +46774,13 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
         "toJson",
         "(Ljava/lang/Object;)Ljava/lang/String;",
         |ctx, args| {
-            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => {
-                let null_str = ctx.create_string("null");
-                return Ok(Some(Value::Object(Some(null_str))));
-            }};
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    let null_str = ctx.create_string("null");
+                    return Ok(Some(Value::Object(Some(null_str))));
+                }
+            };
             let obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -44019,9 +46788,16 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(null_str))));
                 }
             };
-            let cfg = match ctx.get_field(this, GSON_CFG_FIELD) { Value::Int(v) => v, _ => 0 };
+            let cfg = match ctx.get_field(this, GSON_CFG_FIELD) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
             let json = reflection_serialize_to_json(ctx, obj);
-            let output = if (cfg & GSON_CFG_PRETTY) != 0 { json_pretty_print(&json) } else { json };
+            let output = if (cfg & GSON_CFG_PRETTY) != 0 {
+                json_pretty_print(&json)
+            } else {
+                json
+            };
             let result = ctx.create_string(&output);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -44065,37 +46841,81 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(gsb, "create", "()Lcom/google/gson/Gson;", |ctx, args| {
-        let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => {
-            let g = alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1);
-            return Ok(Some(Value::Object(Some(g))));
-        }};
-        let cfg = match ctx.get_field(this, 0) { Value::Int(v) => v, _ => 0 };
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                let g = alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1);
+                return Ok(Some(Value::Object(Some(g))));
+            }
+        };
+        let cfg = match ctx.get_field(this, 0) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         let g = alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1);
         ctx.set_field(g, GSON_CFG_FIELD, Value::Int(cfg));
         Ok(Some(Value::Object(Some(g))))
     });
-    r.register(gsb, "setPrettyPrinting", "()Lcom/google/gson/GsonBuilder;", |ctx, args| {
-        let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
-        let cfg = match ctx.get_field(this, 0) { Value::Int(v) => v, _ => 0 };
-        ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_PRETTY));
-        Ok(Some(Value::Object(Some(this))))
-    });
-    r.register(gsb, "serializeNulls", "()Lcom/google/gson/GsonBuilder;", |ctx, args| {
-        let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
-        let cfg = match ctx.get_field(this, 0) { Value::Int(v) => v, _ => 0 };
-        ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_SERIALIZE_NULLS));
-        Ok(Some(Value::Object(Some(this))))
-    });
-    r.register(gsb, "disableHtmlEscaping", "()Lcom/google/gson/GsonBuilder;", |ctx, args| {
-        let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Object(None))) };
-        let cfg = match ctx.get_field(this, 0) { Value::Int(v) => v, _ => 0 };
-        ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_NO_HTML_ESCAPE));
-        Ok(Some(Value::Object(Some(this))))
-    });
-    r.register(gsb, "setDateFormat", "(Ljava/lang/String;)Lcom/google/gson/GsonBuilder;", |_ctx, args| {
-        // Date format not yet supported, but store for future use
-        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-    });
+    r.register(
+        gsb,
+        "setPrettyPrinting",
+        "()Lcom/google/gson/GsonBuilder;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let cfg = match ctx.get_field(this, 0) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_PRETTY));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        gsb,
+        "serializeNulls",
+        "()Lcom/google/gson/GsonBuilder;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let cfg = match ctx.get_field(this, 0) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_SERIALIZE_NULLS));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        gsb,
+        "disableHtmlEscaping",
+        "()Lcom/google/gson/GsonBuilder;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let cfg = match ctx.get_field(this, 0) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(this, 0, Value::Int(cfg | GSON_CFG_NO_HTML_ESCAPE));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        gsb,
+        "setDateFormat",
+        "(Ljava/lang/String;)Lcom/google/gson/GsonBuilder;",
+        |_ctx, args| {
+            // Date format not yet supported, but store for future use
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        },
+    );
 
     // -----------------------------------------------------------------------
     // ObjectMapper.readTree(String) -> JsonNode
@@ -44143,20 +46963,32 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 
     r.register(JN, "asText", "()Ljava/lang/String;", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
-        if ntype == 3 { // string node
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if ntype == 3 {
+            // string node
             Ok(Some(ctx.get_field(this, JN_TEXT)))
-        } else if ntype == 4 { // number node
+        } else if ntype == 4 {
+            // number node
             let text_val = ctx.get_field(this, JN_TEXT);
             if let Value::Object(Some(_)) = text_val {
                 Ok(Some(text_val))
             } else {
-                let n = match ctx.get_field(this, JN_NUM) { Value::Long(v) => v, _ => 0 };
+                let n = match ctx.get_field(this, JN_NUM) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
                 let s = ctx.create_string(&n.to_string());
                 Ok(Some(Value::Object(Some(s))))
             }
-        } else if ntype == 5 { // boolean
-            let b = match ctx.get_field(this, JN_BOOL) { Value::Int(v) => v, _ => 0 };
+        } else if ntype == 5 {
+            // boolean
+            let b = match ctx.get_field(this, JN_BOOL) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
             let s = ctx.create_string(if b != 0 { "true" } else { "false" });
             Ok(Some(Value::Object(Some(s))))
         } else {
@@ -44167,7 +46999,10 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 
     r.register(JN, "asInt", "()I", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let n = match ctx.get_field(this, JN_NUM) { Value::Long(v) => v as i32, _ => 0 };
+        let n = match ctx.get_field(this, JN_NUM) {
+            Value::Long(v) => v as i32,
+            _ => 0,
+        };
         Ok(Some(Value::Int(n)))
     });
 
@@ -44181,7 +47016,10 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
         // Use the dedicated double field for full precision; fall back to long
         let d = match ctx.get_field(this, JN_DBL) {
             Value::Double(v) if v != 0.0 => v,
-            _ => match ctx.get_field(this, JN_NUM) { Value::Long(v) => v as f64, _ => 0.0 },
+            _ => match ctx.get_field(this, JN_NUM) {
+                Value::Long(v) => v as f64,
+                _ => 0.0,
+            },
         };
         Ok(Some(Value::Double(d)))
     });
@@ -44193,43 +47031,64 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 
     r.register(JN, "isNull", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 0 { 1 } else { 0 })))
     });
 
     r.register(JN, "isMissingNode", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => -1 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => -1,
+        };
         Ok(Some(Value::Int(if ntype == -1 { 1 } else { 0 })))
     });
 
     r.register(JN, "isTextual", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 3 { 1 } else { 0 })))
     });
 
     r.register(JN, "isNumber", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 4 { 1 } else { 0 })))
     });
 
     r.register(JN, "isBoolean", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 5 { 1 } else { 0 })))
     });
 
     r.register(JN, "isObject", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 1 { 1 } else { 0 })))
     });
 
     r.register(JN, "isArray", "()Z", |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
-        let ntype = match ctx.get_field(this, JN_TYPE) { Value::Int(v) => v, _ => 0 };
+        let ntype = match ctx.get_field(this, JN_TYPE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         Ok(Some(Value::Int(if ntype == 2 { 1 } else { 0 })))
     });
 
@@ -44239,77 +47098,104 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     });
 
     // get(String fieldName) -> JsonNode — for object nodes
-    r.register(JN, "get", "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;", |ctx, args| {
-        let this = crate::obj_arg(args, 0)?;
-        let name_ref = match args.get(1) {
-            Some(Value::Object(Some(s))) => *s,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let name = ctx.read_string(name_ref).unwrap_or_default();
-        let count = match ctx.get_field(this, JN_COUNT) { Value::Int(v) => v as usize, _ => 0 };
-        let keys_arr = match ctx.get_field(this, JN_KEYS) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let children_arr = match ctx.get_field(this, JN_CHILDREN) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        for i in 0..count {
-            if let Value::Object(Some(key_ref)) = ctx.get_array_element(keys_arr, i) {
-                if let Some(key_str) = ctx.read_string(key_ref) {
-                    if key_str == name {
-                        return Ok(Some(ctx.get_array_element(children_arr, i)));
+    r.register(
+        JN,
+        "get",
+        "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
+        |ctx, args| {
+            let this = crate::obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = ctx.read_string(name_ref).unwrap_or_default();
+            let count = match ctx.get_field(this, JN_COUNT) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            let keys_arr = match ctx.get_field(this, JN_KEYS) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let children_arr = match ctx.get_field(this, JN_CHILDREN) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            for i in 0..count {
+                if let Value::Object(Some(key_ref)) = ctx.get_array_element(keys_arr, i) {
+                    if let Some(key_str) = ctx.read_string(key_ref) {
+                        if key_str == name {
+                            return Ok(Some(ctx.get_array_element(children_arr, i)));
+                        }
                     }
                 }
             }
-        }
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // get(int index) -> JsonNode — for array nodes
-    r.register(JN, "get", "(I)Lcom/fasterxml/jackson/databind/JsonNode;", |ctx, args| {
-        let this = crate::obj_arg(args, 0)?;
-        let idx = match args.get(1) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-        let count = match ctx.get_field(this, JN_COUNT) { Value::Int(v) => v as usize, _ => 0 };
-        if idx >= count {
-            return Ok(Some(Value::Object(None)));
-        }
-        let children_arr = match ctx.get_field(this, JN_CHILDREN) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        Ok(Some(ctx.get_array_element(children_arr, idx)))
-    });
+    r.register(
+        JN,
+        "get",
+        "(I)Lcom/fasterxml/jackson/databind/JsonNode;",
+        |ctx, args| {
+            let this = crate::obj_arg(args, 0)?;
+            let idx = match args.get(1) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
+            let count = match ctx.get_field(this, JN_COUNT) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            if idx >= count {
+                return Ok(Some(Value::Object(None)));
+            }
+            let children_arr = match ctx.get_field(this, JN_CHILDREN) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(ctx.get_array_element(children_arr, idx)))
+        },
+    );
 
     // path(String) -> JsonNode (returns MissingNode instead of null)
-    r.register(JN, "path", "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;", |ctx, args| {
-        let this = crate::obj_arg(args, 0)?;
-        let name_ref = match args.get(1) {
-            Some(Value::Object(Some(s))) => *s,
-            _ => {
-                let missing = alloc_json_node(ctx, -1); // missing node type
-                return Ok(Some(Value::Object(Some(missing))));
-            }
-        };
-        let name = ctx.read_string(name_ref).unwrap_or_default();
-        let count = match ctx.get_field(this, JN_COUNT) { Value::Int(v) => v as usize, _ => 0 };
-        if let Value::Object(Some(keys_arr)) = ctx.get_field(this, JN_KEYS) {
-            if let Value::Object(Some(children_arr)) = ctx.get_field(this, JN_CHILDREN) {
-                for i in 0..count {
-                    if let Value::Object(Some(key_ref)) = ctx.get_array_element(keys_arr, i) {
-                        if let Some(key_str) = ctx.read_string(key_ref) {
-                            if key_str == name {
-                                return Ok(Some(ctx.get_array_element(children_arr, i)));
+    r.register(
+        JN,
+        "path",
+        "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
+        |ctx, args| {
+            let this = crate::obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(Some(s))) => *s,
+                _ => {
+                    let missing = alloc_json_node(ctx, -1); // missing node type
+                    return Ok(Some(Value::Object(Some(missing))));
+                }
+            };
+            let name = ctx.read_string(name_ref).unwrap_or_default();
+            let count = match ctx.get_field(this, JN_COUNT) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
+            if let Value::Object(Some(keys_arr)) = ctx.get_field(this, JN_KEYS) {
+                if let Value::Object(Some(children_arr)) = ctx.get_field(this, JN_CHILDREN) {
+                    for i in 0..count {
+                        if let Value::Object(Some(key_ref)) = ctx.get_array_element(keys_arr, i) {
+                            if let Some(key_str) = ctx.read_string(key_ref) {
+                                if key_str == name {
+                                    return Ok(Some(ctx.get_array_element(children_arr, i)));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        let missing = alloc_json_node(ctx, -1);
-        Ok(Some(Value::Object(Some(missing))))
-    });
+            let missing = alloc_json_node(ctx, -1);
+            Ok(Some(Value::Object(Some(missing))))
+        },
+    );
 
     // has(String) -> boolean
     r.register(JN, "has", "(Ljava/lang/String;)Z", |ctx, args| {
@@ -44319,7 +47205,10 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let name = ctx.read_string(name_ref).unwrap_or_default();
-        let count = match ctx.get_field(this, JN_COUNT) { Value::Int(v) => v as usize, _ => 0 };
+        let count = match ctx.get_field(this, JN_COUNT) {
+            Value::Int(v) => v as usize,
+            _ => 0,
+        };
         if let Value::Object(Some(keys_arr)) = ctx.get_field(this, JN_KEYS) {
             for i in 0..count {
                 if let Value::Object(Some(key_ref)) = ctx.get_array_element(keys_arr, i) {
@@ -44386,8 +47275,11 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
             ctx.set_array_element(keys, i, Value::Object(Some(key_obj)));
             let child_json = if val_str.starts_with('{') || val_str.starts_with('[') {
                 val_str.clone()
-            } else if val_str == "true" || val_str == "false" || val_str == "null"
-                || val_str.parse::<f64>().is_ok() {
+            } else if val_str == "true"
+                || val_str == "false"
+                || val_str == "null"
+                || val_str.parse::<f64>().is_ok()
+            {
                 val_str.clone()
             } else {
                 format!("\"{}\"", json_escape(val_str))
@@ -44406,12 +47298,22 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
         let mut i = 0;
         while i < inner.len() {
             // skip whitespace/commas
-            while i < inner.len() && (inner.as_bytes()[i] == b' ' || inner.as_bytes()[i] == b',' || inner.as_bytes()[i] == b'\n' || inner.as_bytes()[i] == b'\r' || inner.as_bytes()[i] == b'\t') {
+            while i < inner.len()
+                && (inner.as_bytes()[i] == b' '
+                    || inner.as_bytes()[i] == b','
+                    || inner.as_bytes()[i] == b'\n'
+                    || inner.as_bytes()[i] == b'\r'
+                    || inner.as_bytes()[i] == b'\t')
+            {
                 i += 1;
             }
-            if i >= inner.len() { break; }
+            if i >= inner.len() {
+                break;
+            }
             let val = read_json_value(inner, &mut i);
-            if val.is_empty() && i >= inner.len() { break; }
+            if val.is_empty() && i >= inner.len() {
+                break;
+            }
             elements.push(val);
         }
         let count = elements.len();
@@ -44420,8 +47322,11 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
         for (idx, elem) in elements.iter().enumerate() {
             let child_json = if elem.starts_with('{') || elem.starts_with('[') {
                 elem.clone()
-            } else if *elem == "true" || *elem == "false" || *elem == "null"
-                || elem.parse::<f64>().is_ok() {
+            } else if *elem == "true"
+                || *elem == "false"
+                || *elem == "null"
+                || elem.parse::<f64>().is_ok()
+            {
                 elem.clone()
             } else {
                 format!("\"{}\"", json_escape(elem))
@@ -44453,7 +47358,7 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
     } else if let Ok(f) = trimmed.parse::<f64>() {
         let node = alloc_json_node(ctx, 4);
         ctx.set_field(node, 2, Value::Long(f as i64)); // truncated for asInt()/asLong()
-        ctx.set_field(node, 7, Value::Double(f));       // full precision for asDouble()
+        ctx.set_field(node, 7, Value::Double(f)); // full precision for asDouble()
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
         node
@@ -44468,11 +47373,18 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
 
 /// Convert a JsonNode back to a JSON string.
 fn json_node_to_string(ctx: &mut dyn NativeContext, node: ObjectRef) -> String {
-    let ntype = match ctx.get_field(node, 0) { Value::Int(v) => v, _ => 0 };
+    let ntype = match ctx.get_field(node, 0) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     match ntype {
         0 => "null".to_string(),
-        1 => { // object
-            let count = match ctx.get_field(node, 6) { Value::Int(v) => v as usize, _ => 0 };
+        1 => {
+            // object
+            let count = match ctx.get_field(node, 6) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
             let mut entries = Vec::new();
             if let (Value::Object(Some(keys)), Value::Object(Some(children))) =
                 (ctx.get_field(node, 5), ctx.get_field(node, 4))
@@ -44480,17 +47392,26 @@ fn json_node_to_string(ctx: &mut dyn NativeContext, node: ObjectRef) -> String {
                 for i in 0..count {
                     let key_str = if let Value::Object(Some(kr)) = ctx.get_array_element(keys, i) {
                         ctx.read_string(kr).unwrap_or_default()
-                    } else { String::new() };
-                    let child_str = if let Value::Object(Some(cr)) = ctx.get_array_element(children, i) {
-                        json_node_to_string(ctx, cr)
-                    } else { "null".to_string() };
+                    } else {
+                        String::new()
+                    };
+                    let child_str =
+                        if let Value::Object(Some(cr)) = ctx.get_array_element(children, i) {
+                            json_node_to_string(ctx, cr)
+                        } else {
+                            "null".to_string()
+                        };
                     entries.push(format!("\"{}\":{}", json_escape(&key_str), child_str));
                 }
             }
             format!("{{{}}}", entries.join(","))
         }
-        2 => { // array
-            let count = match ctx.get_field(node, 6) { Value::Int(v) => v as usize, _ => 0 };
+        2 => {
+            // array
+            let count = match ctx.get_field(node, 6) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            };
             let mut elems = Vec::new();
             if let Value::Object(Some(children)) = ctx.get_field(node, 4) {
                 for i in 0..count {
@@ -44503,22 +47424,37 @@ fn json_node_to_string(ctx: &mut dyn NativeContext, node: ObjectRef) -> String {
             }
             format!("[{}]", elems.join(","))
         }
-        3 => { // string
+        3 => {
+            // string
             if let Value::Object(Some(sr)) = ctx.get_field(node, 1) {
                 let s = ctx.read_string(sr).unwrap_or_default();
                 format!("\"{}\"", json_escape(&s))
-            } else { "\"\"".to_string() }
+            } else {
+                "\"\"".to_string()
+            }
         }
-        4 => { // number
+        4 => {
+            // number
             if let Value::Object(Some(sr)) = ctx.get_field(node, 1) {
                 ctx.read_string(sr).unwrap_or_else(|| "0".to_string())
             } else {
-                match ctx.get_field(node, 2) { Value::Long(v) => v.to_string(), _ => "0".to_string() }
+                match ctx.get_field(node, 2) {
+                    Value::Long(v) => v.to_string(),
+                    _ => "0".to_string(),
+                }
             }
         }
-        5 => { // boolean
-            let b = match ctx.get_field(node, 3) { Value::Int(v) => v, _ => 0 };
-            if b != 0 { "true".to_string() } else { "false".to_string() }
+        5 => {
+            // boolean
+            let b = match ctx.get_field(node, 3) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            if b != 0 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
         }
         _ => "null".to_string(), // missing node
     }
@@ -44715,8 +47651,7 @@ mod new14_jdbc_tests {
     /// non-zero id that the subsequent lookups recognize.
     #[test]
     fn new14_open_inmemory_connection() {
-        let id = jdbc_registry::open_connection(":memory:")
-            .expect("open :memory: connection");
+        let id = jdbc_registry::open_connection(":memory:").expect("open :memory: connection");
         assert!(id > 0);
         assert!(jdbc_registry::is_valid(id));
         jdbc_registry::close_connection(id);
@@ -44758,11 +47693,9 @@ mod new14_jdbc_tests {
         assert_eq!(n3, 1);
 
         // Query all rows via executeQuery.
-        let (stmt_id, row_count) = jdbc_registry::execute_query(
-            conn,
-            "SELECT id, name, price FROM widgets ORDER BY id",
-        )
-        .unwrap();
+        let (stmt_id, row_count) =
+            jdbc_registry::execute_query(conn, "SELECT id, name, price FROM widgets ORDER BY id")
+                .unwrap();
         assert_eq!(row_count, 3);
         assert_eq!(jdbc_registry::get_column_count(stmt_id), 3);
         assert_eq!(jdbc_registry::get_column_name(stmt_id, 0), "id");
@@ -44798,10 +47731,7 @@ mod new14_jdbc_tests {
         )
         .unwrap();
 
-        let ps = jdbc_registry::prepare(
-            conn,
-            "INSERT INTO users (id, name, age) VALUES (?, ?, ?)",
-        );
+        let ps = jdbc_registry::prepare(conn, "INSERT INTO users (id, name, age) VALUES (?, ?, ?)");
         jdbc_registry::bind_int(ps, 1, 1);
         jdbc_registry::bind_string(ps, 2, "Alice".to_string());
         jdbc_registry::bind_int(ps, 3, 30);
@@ -44816,14 +47746,18 @@ mod new14_jdbc_tests {
         assert_eq!(jdbc_registry::execute_prepared_update(ps).unwrap(), 1);
 
         // Verify both rows via a plain query.
-        let (stmt_id, row_count) = jdbc_registry::execute_query(
-            conn,
-            "SELECT id, name, age FROM users ORDER BY id",
-        )
-        .unwrap();
+        let (stmt_id, row_count) =
+            jdbc_registry::execute_query(conn, "SELECT id, name, age FROM users ORDER BY id")
+                .unwrap();
         assert_eq!(row_count, 2);
-        assert_eq!(jdbc_registry::get_result(stmt_id, 0, 1).as_deref(), Some("Alice"));
-        assert_eq!(jdbc_registry::get_result(stmt_id, 1, 1).as_deref(), Some("Bob"));
+        assert_eq!(
+            jdbc_registry::get_result(stmt_id, 0, 1).as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            jdbc_registry::get_result(stmt_id, 1, 1).as_deref(),
+            Some("Bob")
+        );
 
         jdbc_registry::free_results(stmt_id);
         jdbc_registry::free_prepared(ps);
@@ -44843,23 +47777,19 @@ mod new14_jdbc_tests {
         jdbc_registry::execute_update(conn, "INSERT INTO t VALUES (2)").unwrap();
         jdbc_registry::rollback(conn).unwrap();
 
-        let (stmt_id, count) = jdbc_registry::execute_query(
-            conn,
-            "SELECT COUNT(*) FROM t",
-        )
-        .unwrap();
+        let (stmt_id, count) =
+            jdbc_registry::execute_query(conn, "SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count, 1); // COUNT(*) always yields one row
-        assert_eq!(jdbc_registry::get_result(stmt_id, 0, 0).as_deref(), Some("0"));
+        assert_eq!(
+            jdbc_registry::get_result(stmt_id, 0, 0).as_deref(),
+            Some("0")
+        );
         jdbc_registry::free_results(stmt_id);
 
         // Commit path.
         jdbc_registry::execute_update(conn, "INSERT INTO t VALUES (3)").unwrap();
         jdbc_registry::commit(conn).unwrap();
-        let (stmt2, _) = jdbc_registry::execute_query(
-            conn,
-            "SELECT COUNT(*) FROM t",
-        )
-        .unwrap();
+        let (stmt2, _) = jdbc_registry::execute_query(conn, "SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(jdbc_registry::get_result(stmt2, 0, 0).as_deref(), Some("1"));
         jdbc_registry::free_results(stmt2);
         jdbc_registry::close_connection(conn);
@@ -44943,9 +47873,11 @@ mod new14_jdbc_tests {
         // Now commit and verify only the pre-savepoint row survived.
         jdbc_registry::savepoint_release(sp_id).unwrap();
         jdbc_registry::commit(conn).unwrap();
-        let (stmt_id, _) =
-            jdbc_registry::execute_query(conn, "SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(jdbc_registry::get_result(stmt_id, 0, 0).as_deref(), Some("1"));
+        let (stmt_id, _) = jdbc_registry::execute_query(conn, "SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(
+            jdbc_registry::get_result(stmt_id, 0, 0).as_deref(),
+            Some("1")
+        );
         jdbc_registry::free_results(stmt_id);
         jdbc_registry::close_connection(conn);
     }
@@ -44954,10 +47886,7 @@ mod new14_jdbc_tests {
     fn new14_savepoint_rejects_injected_name() {
         let conn = jdbc_registry::open_connection(":memory:").unwrap();
         jdbc_registry::set_auto_commit(conn, false).unwrap();
-        let bad = jdbc_registry::savepoint_create(
-            conn,
-            Some("sp; DROP TABLE t; --".to_string()),
-        );
+        let bad = jdbc_registry::savepoint_create(conn, Some("sp; DROP TABLE t; --".to_string()));
         assert!(bad.is_err());
         let msg = bad.err().unwrap();
         assert!(msg.contains("alphanumeric"));
@@ -44996,7 +47925,11 @@ mod new14_jdbc_tests {
         let version = jdbc_registry::database_product_version();
         // rusqlite's `version()` returns a dotted string like "3.46.0".
         assert!(
-            version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false),
+            version
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false),
             "version must start with a digit: {version:?}"
         );
         assert_eq!(jdbc_registry::driver_name(), "CratonVM JDBC");
@@ -45149,12 +48082,9 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
     r.register(vt, "notifyJvmtiEnd", "()V", |_ctx, _args| Ok(None));
     r.register(vt, "notifyJvmtiMount", "(Z)V", |_ctx, _args| Ok(None));
     r.register(vt, "notifyJvmtiUnmount", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(
-        vt,
-        "notifyJvmtiDisableSuspend",
-        "(Z)V",
-        |_ctx, _args| Ok(None),
-    );
+    r.register(vt, "notifyJvmtiDisableSuspend", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // postPinnedEvent(String) — JFR pinned-event reporter. Funnel into the
     // existing cratonvm JFR pinned-thread emitter so pin reports surface
@@ -45173,10 +48103,9 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
             // fall back to a generic literal rather than allocating an
             // `Arc<str>` per pinning event.
             let reason_str: String = match args.first() {
-                Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s)
-                        .unwrap_or_else(|| "VirtualThread pinned (no reason)".to_string())
-                }
+                Some(Value::Object(Some(s))) => ctx
+                    .read_string(*s)
+                    .unwrap_or_else(|| "VirtualThread pinned (no reason)".to_string()),
                 _ => "VirtualThread pinned (no reason)".to_string(),
             };
             let reason_static: &'static str = match reason_str.as_str() {
@@ -45576,8 +48505,7 @@ fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> String {
     if is_safe_factory_class_name(&sf) {
         sf.replace('.', "/")
     } else {
-        "java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory"
-            .to_string()
+        "java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory".to_string()
     }
 }
 
@@ -45603,10 +48531,7 @@ fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRe
 /// T19_K3 — Populate the `factory` instance field of a real-loaded
 /// `ForkJoinPool` synthetic with a non-null factory.  No-op if the
 /// loaded class shape lacks that field (legacy synthetic mode).
-fn populate_common_factory(
-    ctx: &mut dyn NativeContext,
-    pool: cratonvm_types::ObjectRef,
-) {
+fn populate_common_factory(ctx: &mut dyn NativeContext, pool: cratonvm_types::ObjectRef) {
     let factory = alloc_common_factory(ctx);
     // Set by name so we work whether the class is the real JDK shape
     // (with `factory` at some non-zero index) or a synthetic placeholder
@@ -45802,7 +48727,11 @@ mod ra1_char_buffer_roundtrip_tests {
 
         // allocate(10) — mirrors `CharBuffer.allocate(10)`.
         let allocate = reg
-            .find("java/nio/CharBuffer", "allocate", "(I)Ljava/nio/CharBuffer;")
+            .find(
+                "java/nio/CharBuffer",
+                "allocate",
+                "(I)Ljava/nio/CharBuffer;",
+            )
             .expect("CharBuffer.allocate(I) must be registered");
         let buf = match allocate(&mut ctx, &[Value::Int(10)]).expect("allocate ok") {
             Some(Value::Object(Some(b))) => b,
@@ -45821,8 +48750,7 @@ mod ra1_char_buffer_roundtrip_tests {
             .find("java/nio/CharBuffer", "put", "(C)Ljava/nio/CharBuffer;")
             .expect("CharBuffer.put(C) must be registered");
         for ch in b'A'..=b'E' {
-            put(&mut ctx, &[Value::Object(Some(buf)), Value::Int(ch as i32)])
-                .expect("put ok");
+            put(&mut ctx, &[Value::Object(Some(buf)), Value::Int(ch as i32)]).expect("put ok");
         }
         assert_eq!(ctx.get_field(buf, CB_FIELD_POS), Value::Int(5));
 
@@ -45905,11 +48833,8 @@ mod t10_manifest_input_stream_tests {
                 "(Ljava/io/InputStream;)V",
             )
             .expect("Manifest.<init>(InputStream) must be registered");
-        init(
-            ctx,
-            &[Value::Object(Some(mf)), Value::Object(Some(bais))],
-        )
-        .expect("Manifest.<init>(InputStream) ok");
+        init(ctx, &[Value::Object(Some(mf)), Value::Object(Some(bais))])
+            .expect("Manifest.<init>(InputStream) ok");
         mf
     }
 
@@ -45928,8 +48853,8 @@ mod t10_manifest_input_stream_tests {
             )
             .expect("Attributes.getValue must be registered");
         let k = ctx.create_string(key);
-        let out = get(ctx, &[Value::Object(Some(attrs)), Value::Object(Some(k))])
-            .expect("getValue ok");
+        let out =
+            get(ctx, &[Value::Object(Some(attrs)), Value::Object(Some(k))]).expect("getValue ok");
         match out {
             Some(Value::Object(Some(s))) => ctx.read_string(s),
             _ => None,
@@ -45950,7 +48875,8 @@ mod t10_manifest_input_stream_tests {
 
         // Manifest with three main attributes (CRLF line endings, as real
         // MANIFEST.MF files use), no per-entry sections.
-        let mf_bytes = b"Manifest-Version: 1.0\r\nMain-Class: com.example.Foo\r\nCreated-By: cratonvm\r\n\r\n";
+        let mf_bytes =
+            b"Manifest-Version: 1.0\r\nMain-Class: com.example.Foo\r\nCreated-By: cratonvm\r\n\r\n";
         let mf = call_manifest_init(&reg, &mut ctx, mf_bytes);
 
         // Drive getMainAttributes() to retrieve the Attributes object.
@@ -46016,9 +48942,7 @@ mod t10_manifest_input_stream_tests {
             Value::Object(Some(a)) => a,
             other => panic!("expected Object, got {other:?}"),
         };
-        let size = reg
-            .find("java/util/jar/Attributes", "size", "()I")
-            .unwrap();
+        let size = reg.find("java/util/jar/Attributes", "size", "()I").unwrap();
         let n = match size(&mut ctx, &[Value::Object(Some(attrs))])
             .unwrap()
             .unwrap()
@@ -46230,8 +49154,8 @@ mod zip_2x_api_tests {
         }
 
         let inner = buf.into_inner();
-        let mut archive = zip::ZipArchive::new(Cursor::new(inner))
-            .expect("re-open round-tripped zip");
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(inner)).expect("re-open round-tripped zip");
         assert_eq!(archive.len(), 2, "expected two entries");
 
         let mut s = String::new();
@@ -46268,15 +49192,14 @@ mod zip_2x_api_tests {
             let mut buf = Cursor::new(Vec::<u8>::new());
             {
                 let mut zw = zip::ZipWriter::new(&mut buf);
-                let opts = zip::write::SimpleFileOptions::default()
-                    .compression_method(*method);
+                let opts = zip::write::SimpleFileOptions::default().compression_method(*method);
                 zw.start_file(format!("{label}.dat"), opts).unwrap();
                 zw.write_all(label.as_bytes()).unwrap();
                 zw.finish().unwrap();
             }
             let bytes = buf.into_inner();
-            let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-                .expect("re-open per-method zip");
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(bytes)).expect("re-open per-method zip");
             let entry = archive
                 .by_name(&format!("{label}.dat"))
                 .expect("named entry present");
@@ -46292,7 +49215,6 @@ mod zip_2x_api_tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod bc_small_factors_tests {
@@ -46312,7 +49234,10 @@ mod bc_small_factors_tests {
         // Each group's modulus must equal the Java `int m` (positive, no overflow).
         for g in BC_SMALL_FACTOR_GROUPS {
             let m: u64 = g.iter().map(|&p| p as u64).product();
-            assert!(m < (1u64 << 31), "group product {m} must fit a positive i32");
+            assert!(
+                m < (1u64 << 31),
+                "group product {m} must fit a positive i32"
+            );
         }
     }
 
@@ -46361,7 +49286,10 @@ mod bc_small_factors_tests {
                 }
             }
         });
-        (3..=n).filter(|&i| s[i] && i % 2 == 1).map(|i| i as u32).collect()
+        (3..=n)
+            .filter(|&i| s[i] && i % 2 == 1)
+            .map(|i| i as u32)
+            .collect()
     }
 
     #[test]
@@ -46432,15 +49360,19 @@ mod nb_core_stubs_fix_tests {
         ctx.set_field(publisher, 1, Value::Int(0));
 
         let count = r
-            .find("java/util/concurrent/SubmissionPublisher", "getNumberOfSubscribers", "()I")
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "getNumberOfSubscribers",
+                "()I",
+            )
             .unwrap();
-        let n0 = count(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap();
+        let n0 = count(&mut ctx, &[Value::Object(Some(publisher))])
+            .unwrap()
+            .unwrap();
         assert_eq!(n0, Value::Int(0), "fresh publisher has 0 subscribers");
 
         // Register two distinct subscribers.
-        let sub_cid = ctx
-            .ensure_class_initialized("FlowSubscriberImpl")
-            .unwrap();
+        let sub_cid = ctx.ensure_class_initialized("FlowSubscriberImpl").unwrap();
         let s1 = ctx.alloc_object(sub_cid, 1);
         let s2 = ctx.alloc_object(sub_cid, 1);
         let subscribe = r
@@ -46450,17 +49382,33 @@ mod nb_core_stubs_fix_tests {
                 "(Ljava/util/concurrent/Flow$Subscriber;)V",
             )
             .unwrap();
-        subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(Some(s1))]).unwrap();
-        subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(Some(s2))]).unwrap();
+        subscribe(
+            &mut ctx,
+            &[Value::Object(Some(publisher)), Value::Object(Some(s1))],
+        )
+        .unwrap();
+        subscribe(
+            &mut ctx,
+            &[Value::Object(Some(publisher)), Value::Object(Some(s2))],
+        )
+        .unwrap();
 
-        let n2 = count(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap();
+        let n2 = count(&mut ctx, &[Value::Object(Some(publisher))])
+            .unwrap()
+            .unwrap();
         assert_eq!(n2, Value::Int(2), "two subscribers registered");
 
         let has = r
-            .find("java/util/concurrent/SubmissionPublisher", "hasSubscribers", "()Z")
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "hasSubscribers",
+                "()Z",
+            )
             .unwrap();
         assert_eq!(
-            has(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap(),
+            has(&mut ctx, &[Value::Object(Some(publisher))])
+                .unwrap()
+                .unwrap(),
             Value::Int(1),
             "hasSubscribers true once registered"
         );
@@ -46471,7 +49419,11 @@ mod nb_core_stubs_fix_tests {
             Value::Object(Some(w)) => w,
             other => panic!("subscribers field should be a wrapper object, got {other:?}"),
         };
-        assert_eq!(ctx.get_field(wrapper, 1), Value::Int(2), "wrapper count is 2");
+        assert_eq!(
+            ctx.get_field(wrapper, 1),
+            Value::Int(2),
+            "wrapper count is 2"
+        );
         if let Value::Object(Some(arr)) = ctx.get_field(wrapper, 0) {
             assert!(ctx.array_length(arr) >= 2);
             assert_eq!(ctx.get_array_element(arr, 0), Value::Object(Some(s1)));
@@ -46496,8 +49448,14 @@ mod nb_core_stubs_fix_tests {
                 "(Ljava/util/concurrent/Flow$Subscriber;)V",
             )
             .unwrap();
-        let res = subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(None)]);
-        assert!(res.is_err(), "null subscriber must throw, not silently no-op");
+        let res = subscribe(
+            &mut ctx,
+            &[Value::Object(Some(publisher)), Value::Object(None)],
+        );
+        assert!(
+            res.is_err(),
+            "null subscriber must throw, not silently no-op"
+        );
     }
 
     #[test]
@@ -46511,14 +49469,21 @@ mod nb_core_stubs_fix_tests {
         ctx.set_field(publisher, 0, Value::Object(None));
         ctx.set_field(publisher, 1, Value::Int(1)); // closed
         let submit = r
-            .find("java/util/concurrent/SubmissionPublisher", "submit", "(Ljava/lang/Object;)I")
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "submit",
+                "(Ljava/lang/Object;)I",
+            )
             .unwrap();
         let item = ctx.create_string("x");
         let res = submit(
             &mut ctx,
             &[Value::Object(Some(publisher)), Value::Object(Some(item))],
         );
-        assert!(res.is_err(), "submit on a closed publisher must throw, not return a fake lag");
+        assert!(
+            res.is_err(),
+            "submit on a closed publisher must throw, not return a fake lag"
+        );
     }
 
     #[test]
@@ -46532,7 +49497,11 @@ mod nb_core_stubs_fix_tests {
         ctx.set_field(publisher, 0, Value::Object(None));
         ctx.set_field(publisher, 1, Value::Int(0));
         let submit = r
-            .find("java/util/concurrent/SubmissionPublisher", "submit", "(Ljava/lang/Object;)I")
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "submit",
+                "(Ljava/lang/Object;)I",
+            )
             .unwrap();
         let item = ctx.create_string("x");
         // No subscribers -> 0 delivered (the old code returned a hardcoded 1).
@@ -46542,7 +49511,11 @@ mod nb_core_stubs_fix_tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(lag, Value::Int(0), "no subscribers => estimated lag 0, not a fake 1");
+        assert_eq!(
+            lag,
+            Value::Int(0),
+            "no subscribers => estimated lag 0, not a fake 1"
+        );
     }
 
     fn charset_registry() -> NativeMethodRegistry {
@@ -46634,7 +49607,15 @@ mod nb_phases_late_security_fix_tests {
         for i in 0..(MAC_STATE_MAX_ENTRIES as i32 + 1) {
             // NB: list all fields explicitly — MacState impls Drop (key-zeroing),
             // so the `..Default::default()` functional-update form is rejected (E0509).
-            t.insert(i, MacState { algo: String::new(), key: vec![0u8; 4], data: Vec::new(), initialized: false });
+            t.insert(
+                i,
+                MacState {
+                    algo: String::new(),
+                    key: vec![0u8; 4],
+                    data: Vec::new(),
+                    initialized: false,
+                },
+            );
         }
         let keep = MAC_STATE_MAX_ENTRIES as i32; // the "about to insert" id
         mac_state_evict_if_needed(&mut t, keep);
@@ -46676,10 +49657,18 @@ mod nb_phases_late_security_fix_tests {
         assert!(r.find(sq, "take", "()Ljava/lang/Object;").is_some());
         assert!(r.find(sq, "offer", "(Ljava/lang/Object;)Z").is_some());
         assert!(r
-            .find(sq, "offer", "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z")
+            .find(
+                sq,
+                "offer",
+                "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z"
+            )
             .is_some());
         assert!(r
-            .find(sq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
+            .find(
+                sq,
+                "poll",
+                "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"
+            )
             .is_some());
     }
 }
@@ -46694,7 +49683,10 @@ mod nb_phases_late_robustness_fix_tests {
     fn json_unescape_decodes_astral_surrogate_pair() {
         // U+1F600 GRINNING FACE encoded as a UTF-16 surrogate pair.
         let s = json_unescape("\\uD83D\\uDE00");
-        assert_eq!(s, "\u{1F600}", "surrogate pair must combine into one astral char");
+        assert_eq!(
+            s, "\u{1F600}",
+            "surrogate pair must combine into one astral char"
+        );
     }
 
     #[test]
@@ -46725,7 +49717,7 @@ mod nb_phases_late_robustness_fix_tests {
         assert_eq!(json_utf8_char_len("é".as_bytes(), 0), 2); // 0xC3 0xA9
         assert_eq!(json_utf8_char_len("€".as_bytes(), 0), 3); // 3-byte
         assert_eq!(json_utf8_char_len("😀".as_bytes(), 0), 4); // 4-byte
-        // Out-of-range index returns 0.
+                                                               // Out-of-range index returns 0.
         assert_eq!(json_utf8_char_len("a".as_bytes(), 5), 0);
     }
 
@@ -46737,7 +49729,10 @@ mod nb_phases_late_robustness_fix_tests {
         let mut i = 0usize;
         let v = read_json_value(s, &mut i);
         // The unescaped value keeps the backslash-prefixed unknown escape as `\é`.
-        assert!(v.contains('é'), "value should retain the multi-byte char, got {v:?}");
+        assert!(
+            v.contains('é'),
+            "value should retain the multi-byte char, got {v:?}"
+        );
     }
 
     #[test]

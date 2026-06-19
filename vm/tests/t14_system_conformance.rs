@@ -21,8 +21,7 @@ fn workspace_root() -> PathBuf {
 /// Read a workspace-relative source file.
 fn read_ws(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 // ===========================================================================
@@ -168,10 +167,7 @@ fn t14_vm_get_saved_property_not_stub() {
     // Find the getSavedProperty registration line
     let line = lib
         .lines()
-        .find(|l| {
-            l.contains("\"jdk/internal/misc/VM\"")
-                && l.contains("\"getSavedProperty\"")
-        })
+        .find(|l| l.contains("\"jdk/internal/misc/VM\"") && l.contains("\"getSavedProperty\""))
         .expect("getSavedProperty registration not found");
 
     // Must NOT be an inline closure returning null
@@ -199,10 +195,7 @@ fn t14_vm_get_runtime_arguments_not_stub() {
 
     let line = lib
         .lines()
-        .find(|l| {
-            l.contains("\"jdk/internal/misc/VM\"")
-                && l.contains("\"getRuntimeArguments\"")
-        })
+        .find(|l| l.contains("\"jdk/internal/misc/VM\"") && l.contains("\"getRuntimeArguments\""))
         .expect("getRuntimeArguments registration not found");
 
     // Must NOT return null

@@ -52,8 +52,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{
     native_unsafe_cas_int, native_unsafe_cas_long, native_unsafe_cas_object,
-    native_unsafe_get_int_volatile, native_unsafe_put_int_volatile,
-    unsafe_obj, unsafe_offset,
+    native_unsafe_get_int_volatile, native_unsafe_put_int_volatile, unsafe_obj, unsafe_offset,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,10 +150,7 @@ fn cache_lookup(addr: i64, width: usize) -> Option<(i64, usize)> {
 fn refresh_arena_cache(addr: i64, width: usize) {
     ARENA_CACHE.with(|c| {
         let new_entry = match c.get() {
-            Some((base, size))
-                if addr >= base
-                    && (addr - base) as u64 <= size as u64 =>
-            {
+            Some((base, size)) if addr >= base && (addr - base) as u64 <= size as u64 => {
                 // Access starts inside or exactly at the end of the
                 // cached window — extend forward to cover it.
                 let new_end = addr.saturating_add(width as i64);
@@ -277,10 +273,7 @@ fn native_unsafe_park_with_blocker(
 // `Cleaner.clean()`. For correctness in our arena-backed model, we
 // evict the address slot on first call.
 
-fn native_unsafe_invoke_cleaner(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_invoke_cleaner(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [this, ByteBuffer]
     let buf = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
@@ -586,10 +579,7 @@ fn native_unsafe_put_long_at_address(
 // 5. freeMemory(long) — release arena. (Real impl, not no-op.)
 // ---------------------------------------------------------------------------
 
-fn native_unsafe_free_memory(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match args.get(1) {
         Some(Value::Long(a)) => *a,
         _ => return Ok(None),
@@ -733,17 +723,15 @@ fn native_unsafe_set_memory_consolidated(
         Some(obj_ref) => {
             let off = offset as usize;
             if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array
-                && ctx.heap_element_type_of(obj_ref)
-                    != cratonvm_types::ArrayElementType::Reference
+                && ctx.heap_element_type_of(obj_ref) != cratonvm_types::ArrayElementType::Reference
             {
                 let fill = vec![value; bytes];
                 if crate::unsafe_array_write_bytes(ctx, obj_ref, off, &fill) {
                     return Ok(None);
                 }
-                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                    index: off as i32,
-                }
-                .into());
+                return Err(
+                    RuntimeError::ArrayIndexOutOfBoundsException { index: off as i32 }.into(),
+                );
             }
             // Object-field (non-array) target. `bytes` is treated as a slot
             // count in this slot-based model, so it MUST be bounded by the
@@ -757,9 +745,7 @@ fn native_unsafe_set_memory_consolidated(
                 Some(e) => e,
                 None => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!(
-                            "Unsafe.setMemory: offset {off} + size {bytes} overflows"
-                        ),
+                        message: format!("Unsafe.setMemory: offset {off} + size {bytes} overflows"),
                     }
                     .into());
                 }
@@ -945,25 +931,85 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
     let u2 = "jdk/internal/misc/Unsafe";
 
     // allocate / reallocate / free — sun.misc + jdk.internal.misc (0-suffix).
-    registry.register(u, "allocateMemory", "(J)J", native_unsafe_allocate_memory_consolidated);
-    registry.register(u, "reallocateMemory", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(
+        u,
+        "allocateMemory",
+        "(J)J",
+        native_unsafe_allocate_memory_consolidated,
+    );
+    registry.register(
+        u,
+        "reallocateMemory",
+        "(JJ)J",
+        native_unsafe_reallocate_memory_consolidated,
+    );
     registry.register(u, "freeMemory", "(J)V", native_unsafe_free_memory);
-    registry.register(u2, "allocateMemory0", "(J)J", native_unsafe_allocate_memory_consolidated);
-    registry.register(u2, "reallocateMemory0", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(
+        u2,
+        "allocateMemory0",
+        "(J)J",
+        native_unsafe_allocate_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "reallocateMemory0",
+        "(JJ)J",
+        native_unsafe_reallocate_memory_consolidated,
+    );
     registry.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory);
     // Some JDK builds expose the unsuffixed forms on jdk.internal.misc.Unsafe.
-    registry.register(u2, "allocateMemory", "(J)J", native_unsafe_allocate_memory_consolidated);
-    registry.register(u2, "reallocateMemory", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(
+        u2,
+        "allocateMemory",
+        "(J)J",
+        native_unsafe_allocate_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "reallocateMemory",
+        "(JJ)J",
+        native_unsafe_reallocate_memory_consolidated,
+    );
     registry.register(u2, "freeMemory", "(J)V", native_unsafe_free_memory);
 
     // setMemory / copyMemory — off-heap form routed to the arena, on-heap
     // form delegated to the bounds-checked lib.rs handlers.
-    registry.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
-    registry.register(u2, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
-    registry.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
-    registry.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
-    registry.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
-    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
+    registry.register(
+        u,
+        "setMemory",
+        "(Ljava/lang/Object;JJB)V",
+        native_unsafe_set_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "setMemory",
+        "(Ljava/lang/Object;JJB)V",
+        native_unsafe_set_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "setMemory0",
+        "(Ljava/lang/Object;JJB)V",
+        native_unsafe_set_memory_consolidated,
+    );
+    registry.register(
+        u,
+        "copyMemory",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+        native_unsafe_copy_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "copyMemory",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+        native_unsafe_copy_memory_consolidated,
+    );
+    registry.register(
+        u2,
+        "copyMemory0",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+        native_unsafe_copy_memory_consolidated,
+    );
     registry.set_category(__prev_cat);
 }
 
@@ -986,10 +1032,7 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
 // tracked to honour a user-provided loader once multi-loader
 // namespaces are ready for production traffic.
 
-fn native_unsafe_define_class(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [this, name(String|null), bytes(byte[]), off(int), len(int),
     //        loader(ClassLoader|null), pd(ProtectionDomain|null)]
     //
@@ -1006,7 +1049,11 @@ fn native_unsafe_define_class(
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
             return Err(LinkageError::ClassFormatError {
-                class_name: if name.is_empty() { "<anonymous>".into() } else { name },
+                class_name: if name.is_empty() {
+                    "<anonymous>".into()
+                } else {
+                    name
+                },
                 message: "defineClass: byte[] is null".into(),
             }
             .into())
@@ -1100,7 +1147,11 @@ fn native_unsafe_define_class(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => Err(LinkageError::ClassFormatError {
-            class_name: if slashed_name.is_empty() { "<anonymous>".into() } else { slashed_name },
+            class_name: if slashed_name.is_empty() {
+                "<anonymous>".into()
+            } else {
+                slashed_name
+            },
             message: msg,
         }
         .into()),
@@ -1177,11 +1228,9 @@ fn native_unsafe_define_anonymous_class(
     // 3. Mint a unique hidden-class name. We reuse `HIDDEN_CLASS_COUNTER`
     //    from classloader.rs so anonymous + Lookup-defined hidden classes
     //    share a single monotonic id space (no collisions).
-    let host_prefix = host_internal_name
-        .as_deref()
-        .unwrap_or("anonymous");
-    let id = crate::classloader::HIDDEN_CLASS_COUNTER
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let host_prefix = host_internal_name.as_deref().unwrap_or("anonymous");
+    let id =
+        crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hidden_name = format!("{host_prefix}/0x{id:x}");
 
     // 4. Define under the same loader as the host class. We currently
@@ -1286,10 +1335,7 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
 // average is not an OS concept; return 0 (matches real HotSpot on
 // Windows). `nelems` is clamped to 3; the JDK spec caps at 3.
 
-fn native_unsafe_get_load_average(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_get_load_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [this, double[] dest, int nelems]
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
@@ -1372,18 +1418,12 @@ fn native_unsafe_static_field_base(
 // 9. Release/Acquire fences — per JMM.
 // ---------------------------------------------------------------------------
 
-fn native_unsafe_acquire_fence(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_acquire_fence(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     Ok(None)
 }
 
-fn native_unsafe_release_fence(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_unsafe_release_fence(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     Ok(None)
 }
@@ -1616,10 +1656,25 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     for class in &[u, u2] {
         registry.register(class, "getByte", "(J)B", native_unsafe_get_byte_at_address);
         registry.register(class, "putByte", "(JB)V", native_unsafe_put_byte_at_address);
-        registry.register(class, "getShort", "(J)S", native_unsafe_get_short_at_address);
-        registry.register(class, "putShort", "(JS)V", native_unsafe_put_short_at_address);
+        registry.register(
+            class,
+            "getShort",
+            "(J)S",
+            native_unsafe_get_short_at_address,
+        );
+        registry.register(
+            class,
+            "putShort",
+            "(JS)V",
+            native_unsafe_put_short_at_address,
+        );
         registry.register(class, "getChar", "(J)C", native_unsafe_get_short_at_address);
-        registry.register(class, "putChar", "(JC)V", native_unsafe_put_short_at_address);
+        registry.register(
+            class,
+            "putChar",
+            "(JC)V",
+            native_unsafe_put_short_at_address,
+        );
         registry.register(class, "getInt", "(J)I", native_unsafe_get_int_at_address);
         registry.register(class, "putInt", "(JI)V", native_unsafe_put_int_at_address);
         registry.register(class, "getLong", "(J)J", native_unsafe_get_long_at_address);
@@ -1644,7 +1699,9 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 None => {
                     invalidate_arena_cache();
                     Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsafe.getFloat: address 0x{addr:x} is not in any live arena"),
+                        message: format!(
+                            "Unsafe.getFloat: address 0x{addr:x} is not in any live arena"
+                        ),
                     }
                     .into())
                 }
@@ -1684,7 +1741,9 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 None => {
                     invalidate_arena_cache();
                     Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsafe.getDouble: address 0x{addr:x} is not in any live arena"),
+                        message: format!(
+                            "Unsafe.getDouble: address 0x{addr:x} is not in any live arena"
+                        ),
                     }
                     .into())
                 }
@@ -1709,8 +1768,18 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
             .into())
         });
         // getAddress / putAddress use native pointer width (8 on our 64-bit VM).
-        registry.register(class, "getAddress", "(J)J", native_unsafe_get_long_at_address);
-        registry.register(class, "putAddress", "(JJ)V", native_unsafe_put_long_at_address);
+        registry.register(
+            class,
+            "getAddress",
+            "(J)J",
+            native_unsafe_get_long_at_address,
+        );
+        registry.register(
+            class,
+            "putAddress",
+            "(JJ)V",
+            native_unsafe_put_long_at_address,
+        );
     }
 
     // 5. Real freeMemory. Overrides the no-op in lib.rs.
@@ -1742,8 +1811,18 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     );
 
     // 7. getLoadAverage0.
-    registry.register(u2, "getLoadAverage0", "([DI)I", native_unsafe_get_load_average);
-    registry.register(u, "getLoadAverage", "([DI)I", native_unsafe_get_load_average);
+    registry.register(
+        u2,
+        "getLoadAverage0",
+        "([DI)I",
+        native_unsafe_get_load_average,
+    );
+    registry.register(
+        u,
+        "getLoadAverage",
+        "([DI)I",
+        native_unsafe_get_load_average,
+    );
 
     // 8. staticFieldBase — real impl (returns declaring-class mirror).
     registry.register(
@@ -1790,8 +1869,18 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     // 11. getAndAddByte / getAndAddShort — uncommon but present in JDK 25
     // for VarHandle arithmetic on sub-int widths. Implement via strong CAS
     // loop in a slot.
-    registry.register(u2, "getAndAddByte", "(Ljava/lang/Object;JB)B", native_unsafe_get_and_add_int_from_unsafe);
-    registry.register(u2, "getAndAddShort", "(Ljava/lang/Object;JS)S", native_unsafe_get_and_add_int_from_unsafe);
+    registry.register(
+        u2,
+        "getAndAddByte",
+        "(Ljava/lang/Object;JB)B",
+        native_unsafe_get_and_add_int_from_unsafe,
+    );
+    registry.register(
+        u2,
+        "getAndAddShort",
+        "(Ljava/lang/Object;JS)S",
+        native_unsafe_get_and_add_int_from_unsafe,
+    );
 
     // 12. compareAndExchange* family (JDK 9+). Strong CAS that returns the
     // value SEEN (== expected on success, != expected on failure). All
@@ -1930,11 +2019,8 @@ mod tests {
             &[dummy_this(), Value::Long(addr), Value::Int(0x1234_5678)],
         )
         .unwrap();
-        let got = native_unsafe_get_int_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
+        let got =
+            native_unsafe_get_int_at_address(&mut ctx, &[dummy_this(), Value::Long(addr)]).unwrap();
         assert_eq!(got, Some(Value::Int(0x1234_5678)));
         crate::unsafe_arena_free(addr);
     }
@@ -1948,11 +2034,8 @@ mod tests {
             &[dummy_this(), Value::Long(addr), Value::Long(i64::MIN)],
         )
         .unwrap();
-        let got = native_unsafe_get_long_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
+        let got = native_unsafe_get_long_at_address(&mut ctx, &[dummy_this(), Value::Long(addr)])
+            .unwrap();
         assert_eq!(got, Some(Value::Long(i64::MIN)));
         crate::unsafe_arena_free(addr);
     }
@@ -1960,14 +2043,14 @@ mod tests {
     #[test]
     fn free_memory_evicts_arena() {
         let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
-        // FIX: this test previously asserted that a getInt after freeMemory
-        // returned Some(Int(0)) — the obsolete "free is a no-op, reads return
-        // 0" contract. Under the consolidated bounds-checked arena (SECURITY
-        // FIX V5/V9), freeMemory EVICTS the block: a subsequent access is a
-        // use-after-free and must be rejected ("not in any live arena"). The
-        // old assertion's .unwrap() panicked on that (correct) Err. Rewritten
-        // to exercise the live consolidated arena path and to genuinely prove
-        // eviction: writes/reads succeed while live, then error after free.
+                                                    // FIX: this test previously asserted that a getInt after freeMemory
+                                                    // returned Some(Int(0)) — the obsolete "free is a no-op, reads return
+                                                    // 0" contract. Under the consolidated bounds-checked arena (SECURITY
+                                                    // FIX V5/V9), freeMemory EVICTS the block: a subsequent access is a
+                                                    // use-after-free and must be rejected ("not in any live arena"). The
+                                                    // old assertion's .unwrap() panicked on that (correct) Err. Rewritten
+                                                    // to exercise the live consolidated arena path and to genuinely prove
+                                                    // eviction: writes/reads succeed while live, then error after free.
         let mut ctx = MockNativeContext::new();
         // Allocate through the consolidated arena allocator — the same path
         // `register_consolidated_off_heap_store` wires `allocateMemory` to via
@@ -1980,26 +2063,21 @@ mod tests {
             &[dummy_this(), Value::Long(addr), Value::Int(42)],
         )
         .unwrap();
-        let live = native_unsafe_get_int_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
-        assert_eq!(live, Some(Value::Int(42)), "read must succeed while arena is live");
+        let live =
+            native_unsafe_get_int_at_address(&mut ctx, &[dummy_this(), Value::Long(addr)]).unwrap();
+        assert_eq!(
+            live,
+            Some(Value::Int(42)),
+            "read must succeed while arena is live"
+        );
 
         // Free evicts the arena block.
-        native_unsafe_free_memory(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
+        native_unsafe_free_memory(&mut ctx, &[dummy_this(), Value::Long(addr)]).unwrap();
 
         // After free, the address is no longer in any live arena: getInt must
         // error (use-after-free rejected) rather than silently returning 0.
-        let after_free = native_unsafe_get_int_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        );
+        let after_free =
+            native_unsafe_get_int_at_address(&mut ctx, &[dummy_this(), Value::Long(addr)]);
         assert!(
             after_free.is_err(),
             "getInt after free must be rejected (arena evicted), got {after_free:?}",
@@ -2085,23 +2163,21 @@ mod tests {
                 Value::Object(None),
             ],
         );
-        assert!(result.is_err(), "expected ClassFormatError, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected ClassFormatError, got {:?}",
+            result
+        );
     }
 
     #[test]
     fn invoke_cleaner_idempotent_on_double_call() {
         let mut ctx = MockNativeContext::new();
         let buf = ctx.alloc_object(ClassId::new(1), 1);
-        let r1 = native_unsafe_invoke_cleaner(
-            &mut ctx,
-            &[dummy_this(), Value::Object(Some(buf))],
-        )
-        .unwrap();
-        let r2 = native_unsafe_invoke_cleaner(
-            &mut ctx,
-            &[dummy_this(), Value::Object(Some(buf))],
-        )
-        .unwrap();
+        let r1 = native_unsafe_invoke_cleaner(&mut ctx, &[dummy_this(), Value::Object(Some(buf))])
+            .unwrap();
+        let r2 = native_unsafe_invoke_cleaner(&mut ctx, &[dummy_this(), Value::Object(Some(buf))])
+            .unwrap();
         assert_eq!(r1, None);
         assert_eq!(r2, None);
     }
@@ -2109,10 +2185,7 @@ mod tests {
     #[test]
     fn invoke_cleaner_null_buffer_throws_illegal_arg() {
         let mut ctx = MockNativeContext::new();
-        let r = native_unsafe_invoke_cleaner(
-            &mut ctx,
-            &[dummy_this(), Value::Object(None)],
-        );
+        let r = native_unsafe_invoke_cleaner(&mut ctx, &[dummy_this(), Value::Object(None)]);
         assert!(r.is_err());
     }
 
@@ -2191,11 +2264,7 @@ mod tests {
         )
         .unwrap();
         assert!(cache_lookup(addr, 4).is_some());
-        native_unsafe_free_memory(
-            &mut ctx,
-            &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
+        native_unsafe_free_memory(&mut ctx, &[dummy_this(), Value::Long(addr)]).unwrap();
         assert!(
             cache_lookup(addr, 4).is_none(),
             "cache must be invalidated after freeMemory"
@@ -2208,17 +2277,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let a = crate::unsafe_arena_allocate(16);
         let b = crate::unsafe_arena_allocate(16);
-        native_unsafe_put_int_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(a), Value::Int(1)],
-        )
-        .unwrap();
+        native_unsafe_put_int_at_address(&mut ctx, &[dummy_this(), Value::Long(a), Value::Int(1)])
+            .unwrap();
         assert!(cache_lookup(a, 4).is_some());
-        native_unsafe_put_int_at_address(
-            &mut ctx,
-            &[dummy_this(), Value::Long(b), Value::Int(2)],
-        )
-        .unwrap();
+        native_unsafe_put_int_at_address(&mut ctx, &[dummy_this(), Value::Long(b), Value::Int(2)])
+            .unwrap();
         // Cache now points at b's window; a is no longer in range
         // (assuming the two arenas don't accidentally span each other).
         assert!(cache_lookup(b, 4).is_some());

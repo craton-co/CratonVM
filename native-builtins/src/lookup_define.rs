@@ -48,8 +48,8 @@
 use std::sync::atomic::Ordering;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::obj_arg;
 
@@ -110,8 +110,7 @@ fn decode_byte_array(
 /// unset.
 fn lookup_class_name(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) -> Option<String> {
     if let Value::Object(Some(mirror)) = ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
-        crate::lang_class::mirror_class_id(ctx, mirror)
-            .and_then(|cid| ctx.class_name_of_id(cid))
+        crate::lang_class::mirror_class_id(ctx, mirror).and_then(|cid| ctx.class_name_of_id(cid))
     } else {
         None
     }
@@ -194,7 +193,11 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
     let raw = ctx.loader_id_of_class(cid);
     // Negative or 0/1/2 → Application namespace (== backend loader_id 0).
     // 3+ → UserDefined(raw) (== backend loader_id raw).
-    if raw < 3 { 0 } else { raw as u32 }
+    if raw < 3 {
+        0
+    } else {
+        raw as u32
+    }
 }
 
 /// Allocate a fresh Lookup synthetic with full-power modes pointing at
@@ -275,10 +278,7 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // The hidden class is named "<original>/0x<id>" so multiple defines
 // from the same template get distinct synthetic names.
 
-fn lk_define_hidden_class_full(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this_lookup = obj_arg(args, 0)?;
     let class_bytes = decode_byte_array(ctx, args.get(1), "defineHiddenClass")?;
     let initialize = matches!(args.get(2), Some(Value::Int(n)) if *n != 0);
@@ -491,9 +491,7 @@ fn lk_define_hidden_class_with_class_data(
         Err(msg) => {
             if msg.contains("initialize after define failed") {
                 return Err(RuntimeError::IllegalStateException {
-                    message: format!(
-                        "ExceptionInInitializerError for {hidden_name}: {msg}"
-                    ),
+                    message: format!("ExceptionInInitializerError for {hidden_name}: {msg}"),
                 }
                 .into());
             }
@@ -533,12 +531,11 @@ fn lk_define_hidden_class_with_class_data(
 // `parking_lot::Mutex` — removes poison handling and yields a smaller, faster
 // lock. The map is keyed by `ClassId` (a `u32`), which is GC-stable, so no
 // further key change is required.
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 fn class_data_store() -> &'static Mutex<HashMap<u32, ObjectRef>> {
-    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, ObjectRef>>> =
-        std::sync::OnceLock::new();
+    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, ObjectRef>>> = std::sync::OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -552,10 +549,7 @@ fn store_class_data(cid: cratonvm_types::ClassId, data: ObjectRef) {
 /// `Object` reference for the given hidden class, or `None` if no
 /// `defineHiddenClassWithClassData` ever attached one.
 pub fn get_class_data(cid: cratonvm_types::ClassId) -> Option<ObjectRef> {
-    class_data_store()
-        .lock()
-        .get(&cid.as_u32())
-        .copied()
+    class_data_store().lock().get(&cid.as_u32()).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +567,12 @@ pub fn register_lookup_define_class(r: &mut NativeMethodRegistry) {
     let lk = LK_CLASS;
 
     // Lookup.defineClass([B)Ljava/lang/Class;
-    r.register(lk, "defineClass", "([B)Ljava/lang/Class;", lk_define_class_b);
+    r.register(
+        lk,
+        "defineClass",
+        "([B)Ljava/lang/Class;",
+        lk_define_class_b,
+    );
 
     // Lookup.defineHiddenClass([B,Z,[L...$ClassOption;)Lookup;
     r.register(
@@ -612,16 +611,16 @@ mod tests {
     /// linking / verification is skipped because of `skip_verification`.
     fn cafebabe_minimal() -> Vec<u8> {
         let mut b = vec![0xCA, 0xFE, 0xBA, 0xBE]; // magic
-        b.extend_from_slice(&[0x00, 0x00]);       // minor 0
-        b.extend_from_slice(&[0x00, 0x41]);       // major 65 (JDK 21)
-        b.extend_from_slice(&[0x00, 0x01]);       // cp_count = 1 (no entries)
-        b.extend_from_slice(&[0x00, 0x21]);       // access_flags = ACC_PUBLIC|ACC_SUPER
-        b.extend_from_slice(&[0x00, 0x00]);       // this_class
-        b.extend_from_slice(&[0x00, 0x00]);       // super_class
-        b.extend_from_slice(&[0x00, 0x00]);       // interfaces_count
-        b.extend_from_slice(&[0x00, 0x00]);       // fields_count
-        b.extend_from_slice(&[0x00, 0x00]);       // methods_count
-        b.extend_from_slice(&[0x00, 0x00]);       // attributes_count
+        b.extend_from_slice(&[0x00, 0x00]); // minor 0
+        b.extend_from_slice(&[0x00, 0x41]); // major 65 (JDK 21)
+        b.extend_from_slice(&[0x00, 0x01]); // cp_count = 1 (no entries)
+        b.extend_from_slice(&[0x00, 0x21]); // access_flags = ACC_PUBLIC|ACC_SUPER
+        b.extend_from_slice(&[0x00, 0x00]); // this_class
+        b.extend_from_slice(&[0x00, 0x00]); // super_class
+        b.extend_from_slice(&[0x00, 0x00]); // interfaces_count
+        b.extend_from_slice(&[0x00, 0x00]); // fields_count
+        b.extend_from_slice(&[0x00, 0x00]); // methods_count
+        b.extend_from_slice(&[0x00, 0x00]); // attributes_count
         b
     }
 
@@ -647,10 +646,7 @@ mod tests {
         }
         let r = lk_define_class_b(
             &mut ctx,
-            &[
-                Value::Object(Some(lookup)),
-                Value::Object(Some(bytes)),
-            ],
+            &[Value::Object(Some(lookup)), Value::Object(Some(bytes))],
         );
         assert!(r.is_err(), "expected IAE on bad magic");
     }
@@ -660,19 +656,13 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         let class_bytes = cafebabe_minimal();
-        let bytes = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*b as i32));
         }
         let r = lk_define_class_b(
             &mut ctx,
-            &[
-                Value::Object(Some(lookup)),
-                Value::Object(Some(bytes)),
-            ],
+            &[Value::Object(Some(lookup)), Value::Object(Some(bytes))],
         )
         .unwrap();
         // Result is the new Class mirror.
@@ -684,10 +674,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         let class_bytes = cafebabe_minimal();
-        let bytes = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*b as i32));
         }
@@ -710,10 +697,7 @@ mod tests {
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         let payload = ctx.alloc_object(ClassId::new(1), 1);
         let class_bytes = cafebabe_minimal();
-        let bytes = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*b as i32));
         }
@@ -731,10 +715,7 @@ mod tests {
         // The class data store should now hold *something* — we can't
         // easily recover the exact ClassId synthesized by the mock, but
         // we can assert at least one entry exists.
-        let any_entry = class_data_store()
-            .lock()
-            .values()
-            .any(|v| *v == payload);
+        let any_entry = class_data_store().lock().values().any(|v| *v == payload);
         assert!(any_entry, "expected payload to be stored");
     }
 
@@ -742,10 +723,9 @@ mod tests {
     fn registration_wires_all_three_natives() {
         let mut r = NativeMethodRegistry::new();
         register_lookup_define_class(&mut r);
-        assert!(
-            r.find(LK_CLASS, "defineClass", "([B)Ljava/lang/Class;")
-                .is_some()
-        );
+        assert!(r
+            .find(LK_CLASS, "defineClass", "([B)Ljava/lang/Class;")
+            .is_some());
         assert!(
             r.find(
                 LK_CLASS,
@@ -787,10 +767,9 @@ mod tests {
     /// STRONG = 1). Mirrors the convention used by
     /// `classloader.rs::lk_define_hidden_class`.
     fn make_class_option(ctx: &mut MockNativeContext, ordinal: i32) -> ObjectRef {
-        let opt_cid = ctx.ensure_class_initialized(
-            "java/lang/invoke/MethodHandles$Lookup$ClassOption",
-        )
-        .expect("alloc class option cid");
+        let opt_cid = ctx
+            .ensure_class_initialized("java/lang/invoke/MethodHandles$Lookup$ClassOption")
+            .expect("alloc class option cid");
         let opt = ctx.alloc_object(opt_cid, 4);
         ctx.set_field(opt, 0, Value::Int(ordinal));
         opt
@@ -833,10 +812,7 @@ mod tests {
         }
 
         let class_bytes = cafebabe_minimal();
-        let bytes_arr = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
@@ -954,10 +930,7 @@ mod tests {
         ctx.set_nest_host_override(lookup_cid, "weld/cdi/BeanManagerImpl");
 
         let class_bytes = cafebabe_minimal();
-        let bytes_arr = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
@@ -1027,19 +1000,13 @@ mod tests {
         ctx.set_loader_id_override(lookup_cid, 7);
 
         let class_bytes = cafebabe_minimal();
-        let bytes_arr = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
         let r = lk_define_class_b(
             &mut ctx,
-            &[
-                Value::Object(Some(lookup)),
-                Value::Object(Some(bytes_arr)),
-            ],
+            &[Value::Object(Some(lookup)), Value::Object(Some(bytes_arr))],
         );
         assert!(r.is_ok(), "defineClass must succeed: {:?}", r.err());
         assert_eq!(
@@ -1061,19 +1028,14 @@ mod tests {
             ctx.set_loader_id_override(lookup_cid, raw);
 
             let class_bytes = cafebabe_minimal();
-            let bytes_arr = ctx.new_array(
-                cratonvm_types::ArrayElementType::Byte,
-                class_bytes.len(),
-            );
+            let bytes_arr =
+                ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
             for (i, b) in class_bytes.iter().enumerate() {
                 ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
             }
             let r = lk_define_class_b(
                 &mut ctx,
-                &[
-                    Value::Object(Some(lookup)),
-                    Value::Object(Some(bytes_arr)),
-                ],
+                &[Value::Object(Some(lookup)), Value::Object(Some(bytes_arr))],
             );
             assert!(r.is_ok(), "defineClass must succeed for raw={raw}");
             assert_eq!(
@@ -1094,10 +1056,7 @@ mod tests {
         ctx.set_loader_id_override(lookup_cid, 11);
 
         let class_bytes = cafebabe_minimal();
-        let bytes_arr = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
@@ -1130,10 +1089,7 @@ mod tests {
         let payload = ctx.alloc_object(ClassId::new(1), 1);
 
         let class_bytes = cafebabe_minimal();
-        let bytes_arr = ctx.new_array(
-            cratonvm_types::ArrayElementType::Byte,
-            class_bytes.len(),
-        );
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }

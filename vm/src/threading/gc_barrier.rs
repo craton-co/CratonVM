@@ -119,9 +119,7 @@ impl GcBarrier {
         //    and then vanished into a block.
         let blocked = self.threads_blocked.load(Ordering::Acquire);
         let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
-        inner.expected = alive_count
-            .saturating_sub(1)
-            .saturating_sub(blocked_u32);
+        inner.expected = alive_count.saturating_sub(1).saturating_sub(blocked_u32);
         inner.arrived = 0;
         inner.pointer_map.clear();
         self.stw_requested.store(true, Ordering::Release);
@@ -266,11 +264,7 @@ impl GcBarrier {
     /// `participating` selects whether this caller counts toward the
     /// barrier's `arrived` quota. Non-participating (excluded) callers only
     /// wait for GC to complete and never signal `all_arrived`.
-    fn arrive_and_wait_inner(
-        &self,
-        tid: ThreadId,
-        participating: bool,
-    ) -> HashMap<usize, usize> {
+    fn arrive_and_wait_inner(&self, tid: ThreadId, participating: bool) -> HashMap<usize, usize> {
         let mut inner = self.inner.lock();
         // If this is the initiator or STW is not active, return immediately
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
@@ -353,9 +347,7 @@ impl Drop for BlockedGuard<'_> {
         while self.barrier.stw_requested.load(Ordering::Acquire) {
             self.barrier.gc_complete.wait(&mut inner);
         }
-        self.barrier
-            .threads_blocked
-            .fetch_sub(1, Ordering::AcqRel);
+        self.barrier.threads_blocked.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

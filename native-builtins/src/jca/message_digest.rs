@@ -76,18 +76,13 @@ const FIELD_ALGO: usize = 0;
 
 fn accumulators() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, Vec<u8>>> {
     use std::sync::OnceLock;
-    static ACC: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, Vec<u8>>>> =
-        OnceLock::new();
+    static ACC: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, Vec<u8>>>> = OnceLock::new();
     ACC.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 fn read_accumulator(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
     let key = ctx.identity_hash_code(this);
-    accumulators()
-        .lock()
-        .get(&key)
-        .cloned()
-        .unwrap_or_default()
+    accumulators().lock().get(&key).cloned().unwrap_or_default()
 }
 
 fn write_accumulator(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
@@ -282,7 +277,12 @@ fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, rem);
     // Bulk get reads `rem` bytes and advances position → limit (consumes input).
-    ctx.invoke_virtual(buf, "get", "([B)Ljava/nio/ByteBuffer;", &[Value::Object(Some(tmp))])?;
+    ctx.invoke_virtual(
+        buf,
+        "get",
+        "([B)Ljava/nio/ByteBuffer;",
+        &[Value::Object(Some(tmp))],
+    )?;
     let mut bytes = Vec::with_capacity(rem);
     for i in 0..rem {
         if let Value::Int(b) = ctx.get_array_element(tmp, i) {
@@ -429,13 +429,23 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register(md, "update", "([B)V", md_update_bytes);
     r.register(md, "update", "(B)V", md_update_byte);
     r.register(md, "update", "([BII)V", md_update_bytes_off);
-    r.register(md, "update", "(Ljava/nio/ByteBuffer;)V", md_update_bytebuffer);
+    r.register(
+        md,
+        "update",
+        "(Ljava/nio/ByteBuffer;)V",
+        md_update_bytebuffer,
+    );
     r.register(md, "digest", "()[B", md_digest);
     r.register(md, "digest", "([B)[B", md_digest_input);
     r.register(md, "reset", "()V", md_reset);
     r.register(md, "getAlgorithm", "()Ljava/lang/String;", md_get_algorithm);
     r.register(md, "getDigestLength", "()I", md_get_digest_length);
-    r.register(md, "getProvider", "()Ljava/security/Provider;", md_get_provider);
+    r.register(
+        md,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        md_get_provider,
+    );
     r.register(md, "clone", "()Ljava/lang/Object;", md_clone);
 }
 
@@ -498,7 +508,8 @@ mod tests {
         let hash = compute_digest("SHA-256", b"hello world");
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            hex,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
     }
 

@@ -1856,9 +1856,17 @@ mod tests {
         // Crucially the unscaled form must NOT set the writeback/index bit
         // (bit 10) — that bit being 1 would mutate the base register.
         let inst = last_inst(&e);
-        assert_eq!((inst >> 10) & 0x3, 0b00, "LDUR/STUR must be unscaled (bits 11:10 == 00)");
+        assert_eq!(
+            (inst >> 10) & 0x3,
+            0b00,
+            "LDUR/STUR must be unscaled (bits 11:10 == 00)"
+        );
         // And it is distinct from the unsigned-offset form (bits 24 == 0).
-        assert_eq!((inst >> 24) & 1, 0, "LDUR/STUR is not the scaled unsigned-offset form");
+        assert_eq!(
+            (inst >> 24) & 1,
+            0,
+            "LDUR/STUR is not the scaled unsigned-offset form"
+        );
     }
 
     #[test]

@@ -59,8 +59,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::Value;
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
 use crate::jboss_msc::ServiceName;
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // DeploymentUnit — the per-archive unit of work.
@@ -176,8 +176,7 @@ impl DeploymentUnit {
         value: AttachmentValue,
     ) -> AttachmentValue {
         let mut map = self.attachments.lock().unwrap_or_else(|e| e.into_inner());
-        map
-            .insert(AttachmentKeyIdentity(key.clone()), value)
+        map.insert(AttachmentKeyIdentity(key.clone()), value)
             .unwrap_or(AttachmentValue::None)
     }
 
@@ -185,8 +184,7 @@ impl DeploymentUnit {
     /// key was absent).
     pub fn remove_attachment(&self, key: &Arc<AttachmentKey>) -> AttachmentValue {
         let mut map = self.attachments.lock().unwrap_or_else(|e| e.into_inner());
-        map
-            .remove(&AttachmentKeyIdentity(key.clone()))
+        map.remove(&AttachmentKeyIdentity(key.clone()))
             .unwrap_or(AttachmentValue::None)
     }
 
@@ -934,10 +932,7 @@ fn native_deployment_unit_get_service_name(
     }
 }
 
-fn native_log_manager_get_logger(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_log_manager_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
@@ -951,13 +946,13 @@ fn native_log_manager_get_logger(
 
 /// `Logger.log(Level, String)` — honours the credential-redaction
 /// pass and routes through `tracing`.
-fn native_logger_log(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if args.len() < 3 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
-            message: format!("Logger.log: expected 3 args (this, level, msg), got {}", args.len()),
+            message: format!(
+                "Logger.log: expected 3 args (this, level, msg), got {}",
+                args.len()
+            ),
         }));
     }
     let this = obj_arg(args, 0)?;
@@ -1014,10 +1009,7 @@ fn native_logger_level_helper(
     Ok(None)
 }
 
-fn native_level_get(
-    ctx: &mut dyn NativeContext,
-    level: JulLevel,
-) -> MethodCallResult {
+fn native_level_get(ctx: &mut dyn NativeContext, level: JulLevel) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Level", LVL_NUM_FIELDS);
     let name = ctx.create_string(level.name());
     ctx.set_field(obj, LVL_FIELD_NAME, Value::Object(Some(name)));
@@ -1161,10 +1153,7 @@ fn native_process_state_noop_void(
     Ok(None)
 }
 
-fn native_exec_builder_build(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_exec_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Signature: Builder.build() -> EnhancedQueueExecutor. `this` carries
     // the configured name / sizes in its mirror fields.  Missing values
     // fall back to defaults.
@@ -1309,10 +1298,7 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
     let _ = iterations;
 }
 
-fn native_exec_execute(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if args.len() < 2 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
             message: format!("execute: expected (this, runnable), got {}", args.len()),
@@ -1349,7 +1335,9 @@ fn native_exec_execute(
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        map.entry(this).or_insert_with(VecDeque::new).push_back(runnable_ref);
+        map.entry(this)
+            .or_insert_with(VecDeque::new)
+            .push_back(runnable_ref);
         if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
             eprintln!("[eqe] enqueue pool={} pending_keys={}", name, map.len());
         }
@@ -1386,10 +1374,7 @@ fn native_exec_execute(
 /// the result with `pop`. WildFly's `BootstrapImpl.startup()` is NOT on
 /// the active boot path (Main calls `bootstrap().get()` directly, never
 /// `startup()`).
-fn native_async_future_task_await(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Round 89: drain any pending Runnables enqueued via EQE.execute first.
     // This is the natural "I am about to wait" point — running queued work
@@ -1552,7 +1537,12 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
 
     // --- DeploymentUnit ---
     let du = "org/jboss/as/server/deployment/DeploymentUnit";
-    r.register(du, "getName", "()Ljava/lang/String;", native_deployment_unit_get_name);
+    r.register(
+        du,
+        "getName",
+        "()Ljava/lang/String;",
+        native_deployment_unit_get_name,
+    );
     r.register(
         du,
         "getServiceName",
@@ -1584,17 +1574,52 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         native_logger_log,
     );
     r.register(logger, "info", "(Ljava/lang/String;)V", native_logger_info);
-    r.register(logger, "warning", "(Ljava/lang/String;)V", native_logger_warning);
-    r.register(logger, "severe", "(Ljava/lang/String;)V", native_logger_severe);
+    r.register(
+        logger,
+        "warning",
+        "(Ljava/lang/String;)V",
+        native_logger_warning,
+    );
+    r.register(
+        logger,
+        "severe",
+        "(Ljava/lang/String;)V",
+        native_logger_severe,
+    );
     r.register(logger, "fine", "(Ljava/lang/String;)V", native_logger_fine);
 
     // --- Level ---
     let level = "org/jboss/logmanager/Level";
-    r.register(level, "INFO", "()Lorg/jboss/logmanager/Level;", native_level_info);
-    r.register(level, "WARNING", "()Lorg/jboss/logmanager/Level;", native_level_warning);
-    r.register(level, "SEVERE", "()Lorg/jboss/logmanager/Level;", native_level_severe);
-    r.register(level, "FINE", "()Lorg/jboss/logmanager/Level;", native_level_fine);
-    r.register(level, "ALL", "()Lorg/jboss/logmanager/Level;", native_level_all);
+    r.register(
+        level,
+        "INFO",
+        "()Lorg/jboss/logmanager/Level;",
+        native_level_info,
+    );
+    r.register(
+        level,
+        "WARNING",
+        "()Lorg/jboss/logmanager/Level;",
+        native_level_warning,
+    );
+    r.register(
+        level,
+        "SEVERE",
+        "()Lorg/jboss/logmanager/Level;",
+        native_level_severe,
+    );
+    r.register(
+        level,
+        "FINE",
+        "()Lorg/jboss/logmanager/Level;",
+        native_level_fine,
+    );
+    r.register(
+        level,
+        "ALL",
+        "()Lorg/jboss/logmanager/Level;",
+        native_level_all,
+    );
 
     // --- ControlledProcessState / ModelController ---
     r.register(
@@ -1720,8 +1745,12 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         let eqe = "org/jboss/threads/EnhancedQueueExecutor";
         r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
         r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
-        r.register(eqe, "isShutdown", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-        r.register(eqe, "isTerminated", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(eqe, "isShutdown", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
+        r.register(eqe, "isTerminated", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
         r.register(
             eqe,
             "awaitTermination",
@@ -1873,7 +1902,9 @@ mod tests {
 
     #[test]
     fn t19_2_a_enhanced_queue_executor_submit_runs_runnable() {
-        let cfg = QueueExecutorConfig::new("t19_2_a_submit").with_max_size(4).with_core_size(0);
+        let cfg = QueueExecutorConfig::new("t19_2_a_submit")
+            .with_max_size(4)
+            .with_core_size(0);
         let exec = EnhancedQueueExecutor::new(cfg);
         let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let c2 = counter.clone();
@@ -1936,14 +1967,8 @@ mod tests {
         assert!(!redacted.contains("hunter2"), "password must be stripped");
         assert!(redacted.contains("password=<redacted>"));
         // Also: secret, token get redacted.
-        assert_eq!(
-            redact_credentials("secret=abc"),
-            "secret=<redacted>"
-        );
-        assert_eq!(
-            redact_credentials("token=xyz"),
-            "token=<redacted>"
-        );
+        assert_eq!(redact_credentials("secret=abc"), "secret=<redacted>");
+        assert_eq!(redact_credentials("token=xyz"), "token=<redacted>");
         // But non-credential substrings like `passwordLength=12` are untouched.
         let safe = redact_credentials("passwordLength=12");
         assert_eq!(safe, "passwordLength=12");
@@ -2085,12 +2110,12 @@ mod tests {
 
     #[test]
     fn t19_2_a_panic_in_task_does_not_crash_worker() {
-        let cfg = QueueExecutorConfig::new("t19_2_a_panic").with_max_size(4).with_core_size(0);
+        let cfg = QueueExecutorConfig::new("t19_2_a_panic")
+            .with_max_size(4)
+            .with_core_size(0);
         let exec = EnhancedQueueExecutor::new(cfg);
-        exec.submit(|| panic!("boom in task"))
-            .expect("submit");
-        exec.submit(|| {})
-            .expect("submit again");
+        exec.submit(|| panic!("boom in task")).expect("submit");
+        exec.submit(|| {}).expect("submit again");
         exec.drain_locally();
         // Both tasks counted — panic didn't prevent completion accounting.
         assert_eq!(exec.completed_count(), 2);
@@ -2137,10 +2162,7 @@ mod tests {
 
     #[test]
     fn t19_2_a_redact_credentials_handles_various_cases() {
-        assert_eq!(
-            redact_credentials("Password=xyz"),
-            "Password=<redacted>"
-        );
+        assert_eq!(redact_credentials("Password=xyz"), "Password=<redacted>");
         // Case-insensitive matches still pick the canonical lower/upper name.
         let redacted = redact_credentials("Authorization: Bearer tok123");
         assert!(!redacted.contains("tok123"));

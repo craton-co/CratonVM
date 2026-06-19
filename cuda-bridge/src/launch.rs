@@ -193,9 +193,7 @@ impl DeviceModule {
         let kernel_done = Arc::new(Event::new(ctx)?);
         stream.record_event(&kernel_done)?;
         for slot in &last_write_slots {
-            *slot
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(kernel_done.clone());
         }
         Ok(())
     }
@@ -235,9 +233,11 @@ mod tests {
         // The op log must contain a Launch op with the right kernel
         // name. Other ops (kernel_done EventRecord) may surround it.
         let found = ops.iter().any(|op| match op {
-            StreamOp::Launch { kernel, grid, block } => {
-                kernel == "my_kernel" && *grid == cfg.grid && *block == cfg.block
-            }
+            StreamOp::Launch {
+                kernel,
+                grid,
+                block,
+            } => kernel == "my_kernel" && *grid == cfg.grid && *block == cfg.block,
             _ => false,
         });
         assert!(found, "expected Launch op in {:?}", ops);
@@ -303,9 +303,8 @@ mod tests {
         //       explicitly and assert the launch / download paths
         //       wait on it.
         let buf: DeviceBuffer<f32> = DeviceBuffer::for_test();
-        let upload_event = std::sync::Arc::new(
-            crate::Event::new(&ctx).expect("Event::new in stub mode"),
-        );
+        let upload_event =
+            std::sync::Arc::new(crate::Event::new(&ctx).expect("Event::new in stub mode"));
         stream
             .record_event(&upload_event)
             .expect("record upload event");
@@ -340,9 +339,9 @@ mod tests {
 
         // (a) Between UploadAsync (op #1 in our setup) and Launch
         // there must be an EventWait whose id matches upload_event_id.
-        let kernel_waits_on_upload = ops[..launch_pos]
-            .iter()
-            .any(|op| matches!(op, StreamOp::EventWait { event_id } if *event_id == upload_event_id));
+        let kernel_waits_on_upload = ops[..launch_pos].iter().any(
+            |op| matches!(op, StreamOp::EventWait { event_id } if *event_id == upload_event_id),
+        );
         assert!(
             kernel_waits_on_upload,
             "kernel must wait on upload's last_write event before launching; got {:?}",
@@ -369,9 +368,9 @@ mod tests {
             .iter()
             .position(|op| matches!(op, StreamOp::DownloadAsync { .. }))
             .expect("must contain DownloadAsync");
-        let d2h_waits_on_kernel = ops[launch_pos + 1..download_pos]
-            .iter()
-            .any(|op| matches!(op, StreamOp::EventWait { event_id } if *event_id == kernel_event_id));
+        let d2h_waits_on_kernel = ops[launch_pos + 1..download_pos].iter().any(
+            |op| matches!(op, StreamOp::EventWait { event_id } if *event_id == kernel_event_id),
+        );
         assert!(
             d2h_waits_on_kernel,
             "D→H must wait on kernel_done event before downloading; got {:?}",

@@ -48,7 +48,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -88,12 +92,7 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     // The path-separator (`;` on Windows, `:` elsewhere) is what the
     // ClassLoaders.<clinit> URLClassPath walker tokenises.
     let sep = if cfg!(windows) { ";" } else { ":" };
-    let cp = format!(
-        "{}{}{}",
-        probe.display(),
-        sep,
-        bb_jar.display()
-    );
+    let cp = format!("{}{}{}", probe.display(), sep, bb_jar.display());
     let mut cmd = Command::new(&bin);
     if let Some(home) = java_home() {
         cmd.arg("--java-home").arg(&home);
@@ -116,7 +115,10 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("[wave2-bytebuddy] ByteBuddyProbe timed out after {:?}", timeout);
+                    panic!(
+                        "[wave2-bytebuddy] ByteBuddyProbe timed out after {:?}",
+                        timeout
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -176,10 +178,9 @@ fn bytebuddy_probe_classloaders_clinit_no_swallow() {
         }
     };
     let combined = format!("{stdout}\n{stderr}");
-    let saw_classloaders_swallow = combined
-        .lines()
-        .any(|l| l.contains("class=jdk/internal/loader/ClassLoaders")
-            && l.contains("StringIndexOutOfBounds"));
+    let saw_classloaders_swallow = combined.lines().any(|l| {
+        l.contains("class=jdk/internal/loader/ClassLoaders") && l.contains("StringIndexOutOfBounds")
+    });
     assert!(
         !saw_classloaders_swallow,
         "wave2-bytebuddy: jdk/internal/loader/ClassLoaders.<clinit> still swallows \
@@ -210,8 +211,7 @@ fn bytebuddy_probe_console_charset_no_swallow() {
     let combined = format!("{stdout}\n{stderr}");
     let saw_charset_swallow = combined
         .lines()
-        .any(|l| l.contains("class=java/io/Console")
-            && l.contains("Null charset name"));
+        .any(|l| l.contains("class=java/io/Console") && l.contains("Null charset name"));
     assert!(
         !saw_charset_swallow,
         "wave2-bytebuddy: java/io/Console.<clinit> still swallows \

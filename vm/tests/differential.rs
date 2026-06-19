@@ -38,7 +38,11 @@ pub struct Outcome {
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stdout={:?}, return={:?}", self.stdout, self.return_value)
+        write!(
+            f,
+            "stdout={:?}, return={:?}",
+            self.stdout, self.return_value
+        )
     }
 }
 
@@ -93,7 +97,10 @@ fn run_cratonvm(class: &str, method: &str, descriptor: &str) -> Outcome {
         Ok(Some(value)) => {
             let stdout = vm.main_thread.printed_lines.join("\n");
             let return_value = format_value(&value);
-            Outcome { stdout, return_value }
+            Outcome {
+                stdout,
+                return_value,
+            }
         }
         Ok(None) => {
             let stdout = vm.main_thread.printed_lines.join("\n");
@@ -189,8 +196,7 @@ fn run_hotspot(class: &str, method: &str, descriptor: &str) -> Outcome {
     std::fs::create_dir_all(&temp_dir).ok();
 
     let wrapper_java = temp_dir.join("DiffWrapper__.java");
-    std::fs::write(&wrapper_java, &wrapper_src)
-        .expect("Failed to write wrapper Java file");
+    std::fs::write(&wrapper_java, &wrapper_src).expect("Failed to write wrapper Java file");
 
     // Compile the wrapper.
     let compile = Command::new(javac_executable())
@@ -265,12 +271,20 @@ fn test_resources_dir() -> String {
 
 /// Return the `java` executable name.
 fn java_executable() -> &'static str {
-    if cfg!(windows) { "java.exe" } else { "java" }
+    if cfg!(windows) {
+        "java.exe"
+    } else {
+        "java"
+    }
 }
 
 /// Return the `javac` executable name.
 fn javac_executable() -> &'static str {
-    if cfg!(windows) { "javac.exe" } else { "javac" }
+    if cfg!(windows) {
+        "javac.exe"
+    } else {
+        "javac"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +344,10 @@ impl DivergenceReport {
             .join("differential-divergences.json");
         let json = serde_json::to_string_pretty(self).expect("failed to serialize report");
         std::fs::write(&path, json).unwrap_or_else(|e| {
-            eprintln!("Warning: could not write divergence report to {}: {e}", path.display());
+            eprintln!(
+                "Warning: could not write divergence report to {}: {e}",
+                path.display()
+            );
         });
     }
 }
@@ -372,17 +389,12 @@ fn diff_basic_arithmetic() {
             result.matches,
             "Arithmetic divergence in DiffArithmetic.{method}!\n  \
              CratonVM: {}\n  HotSpot: {}",
-            result.cratonvm_outcome,
-            result.hotspot_outcome
+            result.cratonvm_outcome, result.hotspot_outcome
         );
     }
 
     // Also test the main method which prints all results to stdout.
-    let main_result = differential_run(
-        "cratonvm/DiffArithmetic",
-        "main",
-        "([Ljava/lang/String;)V",
-    );
+    let main_result = differential_run("cratonvm/DiffArithmetic", "main", "([Ljava/lang/String;)V");
     eprintln!(
         "diff_basic_arithmetic: DiffArithmetic.main\n  \
          CratonVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
@@ -445,18 +457,13 @@ fn diff_string_operations() {
             eprintln!(
                 "  WARNING: String divergence in DiffString.{method}!\n    \
                  CratonVM: {}\n    HotSpot: {}",
-                result.cratonvm_outcome,
-                result.hotspot_outcome
+                result.cratonvm_outcome, result.hotspot_outcome
             );
         }
     }
 
     // Also test main which prints all results to stdout.
-    let main_result = differential_run(
-        "cratonvm/DiffString",
-        "main",
-        "([Ljava/lang/String;)V",
-    );
+    let main_result = differential_run("cratonvm/DiffString", "main", "([Ljava/lang/String;)V");
     eprintln!(
         "diff_string_operations: DiffString.main\n  \
          CratonVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
@@ -494,8 +501,7 @@ fn diff_string_operations() {
                 "  NOTE: Integer String method DiffString.{m} diverged \
                  (expected once String natives are complete):\n    \
                  CratonVM: {}\n    HotSpot: {}",
-                r.cratonvm_outcome,
-                r.hotspot_outcome
+                r.cratonvm_outcome, r.hotspot_outcome
             );
         }
     }
@@ -606,7 +612,10 @@ mod unit_tests {
 
     #[test]
     fn parse_return_type_object() {
-        assert_eq!(parse_return_type("()Ljava/lang/String;"), "Ljava/lang/String;");
+        assert_eq!(
+            parse_return_type("()Ljava/lang/String;"),
+            "Ljava/lang/String;"
+        );
     }
 
     #[test]

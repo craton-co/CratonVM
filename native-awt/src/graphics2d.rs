@@ -247,8 +247,7 @@ impl Graphics2DState {
                 self.renderer.set_antialias(on);
             }
             RenderingHintKey::TextAntialiasing => {
-                self.rendering_hints.text_antialias =
-                    matches!(value, RenderingHintValue::On);
+                self.rendering_hints.text_antialias = matches!(value, RenderingHintValue::On);
             }
             RenderingHintKey::Interpolation => {
                 self.rendering_hints.interpolation = match value {
@@ -339,14 +338,16 @@ impl Graphics2DState {
                 self.renderer.fill_rect(x, y, w as u32, h as u32);
             }
             Paint::LinearGradient {
-                x1: gx1, y1: gy1,
-                x2: gx2, y2: gy2,
-                color1, color2, cyclic,
+                x1: gx1,
+                y1: gy1,
+                x2: gx2,
+                y2: gy2,
+                color1,
+                color2,
+                cyclic,
             } => {
                 self.fill_rect_gradient(
-                    x, y, w as u32, h as u32,
-                    *gx1, *gy1, *gx2, *gy2,
-                    *color1, *color2, *cyclic,
+                    x, y, w as u32, h as u32, *gx1, *gy1, *gx2, *gy2, *color1, *color2, *cyclic,
                 );
             }
         }
@@ -374,11 +375,7 @@ impl Graphics2DState {
         self.renderer.fill_ellipse(cx, cy, rx, ry);
     }
 
-    pub fn draw_arc(
-        &mut self,
-        x: i32, y: i32, w: i32, h: i32,
-        start: i32, extent: i32,
-    ) {
+    pub fn draw_arc(&mut self, x: i32, y: i32, w: i32, h: i32, start: i32, extent: i32) {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
@@ -386,14 +383,11 @@ impl Graphics2DState {
         let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
-        self.renderer.draw_arc(cx, cy, rx, ry, start as f32, extent as f32);
+        self.renderer
+            .draw_arc(cx, cy, rx, ry, start as f32, extent as f32);
     }
 
-    pub fn fill_arc(
-        &mut self,
-        x: i32, y: i32, w: i32, h: i32,
-        start: i32, extent: i32,
-    ) {
+    pub fn fill_arc(&mut self, x: i32, y: i32, w: i32, h: i32, start: i32, extent: i32) {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
@@ -401,7 +395,8 @@ impl Graphics2DState {
         let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
-        self.renderer.fill_arc(cx, cy, rx, ry, start as f32, extent as f32);
+        self.renderer
+            .fill_arc(cx, cy, rx, ry, start as f32, extent as f32);
     }
 
     pub fn draw_polygon(&mut self, xs: &[i32], ys: &[i32]) {
@@ -451,12 +446,8 @@ impl Graphics2DState {
         // avoid per-character rounding drift accumulating across a long string.
         let mut pen = x as f64;
         for ch in text.chars() {
-            let advance = crate::font::glyph_advance(
-                &self.font.family,
-                self.font.style,
-                self.font.size,
-                ch,
-            );
+            let advance =
+                crate::font::glyph_advance(&self.font.family, self.font.style, self.font.size, ch);
             let cx = pen.floor() as i32;
             if ch != ' ' {
                 // Draw the visible mark within the glyph's advance box. Width
@@ -464,13 +455,16 @@ impl Graphics2DState {
                 let mark_w = (advance.floor() as i32 - 1).max(1);
                 if mark_w >= 3 && glyph_h >= 3 {
                     if ch.is_uppercase() || ch.is_ascii_digit() {
-                        self.renderer.draw_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
+                        self.renderer
+                            .draw_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
                     } else {
                         let half = glyph_h / 2;
-                        self.renderer.fill_rect(cx, y - half + 1, mark_w as u32, half as u32);
+                        self.renderer
+                            .fill_rect(cx, y - half + 1, mark_w as u32, half as u32);
                     }
                 } else {
-                    self.renderer.fill_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
+                    self.renderer
+                        .fill_rect(cx, y - glyph_h + 1, mark_w as u32, glyph_h as u32);
                 }
             }
             pen += advance;
@@ -489,14 +483,20 @@ impl Graphics2DState {
 
     pub fn draw_image_scaled(
         &mut self,
-        pixels: &[u32], w: u32, h: u32,
-        x: i32, y: i32, dw: u32, dh: u32,
+        pixels: &[u32],
+        w: u32,
+        h: u32,
+        x: i32,
+        y: i32,
+        dw: u32,
+        dh: u32,
     ) {
         if self.disposed {
             return;
         }
         let kind = self.rendering_hints.interpolation.to_kind();
-        self.renderer.blit_image_scaled(pixels, w, h, x, y, dw, dh, kind);
+        self.renderer
+            .blit_image_scaled(pixels, w, h, x, y, dw, dh, kind);
     }
 
     // ── Clear / copy ──────────────────────────────────────────────
@@ -589,8 +589,13 @@ impl Graphics2DState {
     /// of a line and set it as the renderer colour.
     fn sync_paint_color_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32) {
         if let Paint::LinearGradient {
-            x1: gx1, y1: gy1, x2: gx2, y2: gy2,
-            color1, color2, cyclic,
+            x1: gx1,
+            y1: gy1,
+            x2: gx2,
+            y2: gy2,
+            color1,
+            color2,
+            cyclic,
         } = &self.paint
         {
             // Widen to i64 before summing so extreme coordinates cannot
@@ -598,9 +603,7 @@ impl Graphics2DState {
             let mid_x = (x1 as i64 + x2 as i64) as f64 / 2.0;
             let mid_y = (y1 as i64 + y2 as i64) as f64 / 2.0;
             let c = gradient_color_at(
-                *gx1, *gy1, *gx2, *gy2,
-                *color1, *color2, *cyclic,
-                mid_x, mid_y,
+                *gx1, *gy1, *gx2, *gy2, *color1, *color2, *cyclic, mid_x, mid_y,
             );
             self.renderer.set_color(c);
         }
@@ -617,9 +620,17 @@ impl Graphics2DState {
     /// dominates per-pixel set_color overhead now.
     fn fill_rect_gradient(
         &mut self,
-        x: i32, y: i32, w: u32, h: u32,
-        gx1: f64, gy1: f64, gx2: f64, gy2: f64,
-        color1: u32, color2: u32, cyclic: bool,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        gx1: f64,
+        gy1: f64,
+        gx2: f64,
+        gy2: f64,
+        color1: u32,
+        color2: u32,
+        cyclic: bool,
     ) {
         let buf_w = self.renderer.width() as i32;
         let buf_h = self.renderer.height() as i32;
@@ -656,8 +667,7 @@ impl Graphics2DState {
         if vertical_only {
             for py in y0..y1 {
                 let c = gradient_color_at(
-                    gx1, gy1, gx2, gy2, color1, color2, cyclic,
-                    x0 as f64, py as f64,
+                    gx1, gy1, gx2, gy2, color1, color2, cyclic, x0 as f64, py as f64,
                 );
                 let start = py as usize * buf_w_usize + x0 as usize;
                 pixels[start..start + row_w].fill(c);
@@ -712,9 +722,15 @@ impl Graphics2DState {
 /// Compute the ARGB colour at point (px, py) for a linear gradient defined
 /// from (gx1, gy1) to (gx2, gy2) between color1 and color2.
 fn gradient_color_at(
-    gx1: f64, gy1: f64, gx2: f64, gy2: f64,
-    color1: u32, color2: u32, cyclic: bool,
-    px: f64, py: f64,
+    gx1: f64,
+    gy1: f64,
+    gx2: f64,
+    gy2: f64,
+    color1: u32,
+    color2: u32,
+    cyclic: bool,
+    px: f64,
+    py: f64,
 ) -> u32 {
     let dx = gx2 - gx1;
     let dy = gy2 - gy1;
@@ -936,8 +952,16 @@ mod tests {
         let last = g.pixels()[9];
         let first_r = (first >> 16) & 0xFF;
         let last_r = (last >> 16) & 0xFF;
-        assert!(first_r < 30, "first pixel red should be near 0, got {}", first_r);
-        assert!(last_r > 225, "last pixel red should be near 255, got {}", last_r);
+        assert!(
+            first_r < 30,
+            "first pixel red should be near 0, got {}",
+            first_r
+        );
+        assert!(
+            last_r > 225,
+            "last pixel red should be near 255, got {}",
+            last_r
+        );
     }
 
     #[test]
@@ -1036,10 +1060,7 @@ mod tests {
             RenderingHintKey::Interpolation,
             RenderingHintValue::BilinearInterpolation,
         );
-        let src = vec![
-            0xFF_FF0000, 0xFF_00FF00,
-            0xFF_0000FF, 0xFF_FFFFFF,
-        ];
+        let src = vec![0xFF_FF0000, 0xFF_00FF00, 0xFF_0000FF, 0xFF_FFFFFF];
         g.draw_image_scaled(&src, 2, 2, 0, 0, 4, 4);
 
         assert_eq!(g.pixels()[0], 0xFF_FF0000);
@@ -1048,7 +1069,11 @@ mod tests {
         let a = (mid >> 24) & 0xFF;
         assert_eq!(a, 255);
         let r = (mid >> 16) & 0xFF;
-        assert!(r < 255 && r > 0, "midpoint red should be blended, got {}", r);
+        assert!(
+            r < 255 && r > 0,
+            "midpoint red should be blended, got {}",
+            r
+        );
     }
 
     #[test]
@@ -1062,10 +1087,7 @@ mod tests {
             RenderingHintKey::Interpolation,
             RenderingHintValue::BicubicInterpolation,
         );
-        let src = vec![
-            0xFF_FF0000, 0xFF_00FF00,
-            0xFF_0000FF, 0xFF_FFFFFF,
-        ];
+        let src = vec![0xFF_FF0000, 0xFF_00FF00, 0xFF_0000FF, 0xFF_FFFFFF];
         g.draw_image_scaled(&src, 2, 2, 0, 0, 4, 4);
 
         assert_eq!(g.pixels()[0], 0xFF_FF0000);
@@ -1075,7 +1097,11 @@ mod tests {
         // fully-opaque output after clamping.
         assert_eq!(a, 255);
         let r = (mid >> 16) & 0xFF;
-        assert!(r < 255 && r > 0, "midpoint red should be blended, got {}", r);
+        assert!(
+            r < 255 && r > 0,
+            "midpoint red should be blended, got {}",
+            r
+        );
     }
 
     #[test]
@@ -1120,6 +1146,10 @@ mod tests {
         let combined = t.concatenate(&s);
         let inv = combined.invert().unwrap();
         let id = combined.concatenate(&inv);
-        assert!(id.is_identity(), "T * T^-1 should be identity, got {:?}", id);
+        assert!(
+            id.is_identity(),
+            "T * T^-1 should be identity, got {:?}",
+            id
+        );
     }
 }

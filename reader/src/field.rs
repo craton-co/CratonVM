@@ -40,10 +40,14 @@ impl ClassFileField {
     pub fn constant_value_index(&self) -> Option<u16> {
         // Only returns a value when the attribute has already been decoded.
         // Lazy attributes must be force-decoded by the caller first.
-        self.attributes.iter().find_map(|attr| match attr.as_decoded() {
-            Some(Attribute::ConstantValue { constant_value_index }) => Some(*constant_value_index),
-            _ => None,
-        })
+        self.attributes
+            .iter()
+            .find_map(|attr| match attr.as_decoded() {
+                Some(Attribute::ConstantValue {
+                    constant_value_index,
+                }) => Some(*constant_value_index),
+                _ => None,
+            })
     }
 }
 
@@ -111,9 +115,7 @@ mod tests {
     #[test]
     fn combined_flags() {
         let f = make_field(
-            FieldAccessFlags::PUBLIC
-                | FieldAccessFlags::STATIC
-                | FieldAccessFlags::FINAL,
+            FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
         );
         assert!(f.is_static());
         assert!(f.is_final());

@@ -52,8 +52,8 @@ use crate::alloc_concurrent_synthetic;
 
 // Synthetic field layouts ---------------------------------------------------
 
-const PROXY_TYPE: usize = 0;     // 0=DIRECT, 1=HTTP, 2=SOCKS
-const PROXY_ADDRESS: usize = 1;  // ObjectRef to InetSocketAddress
+const PROXY_TYPE: usize = 0; // 0=DIRECT, 1=HTTP, 2=SOCKS
+const PROXY_ADDRESS: usize = 1; // ObjectRef to InetSocketAddress
 
 const ISA_HOST: usize = 0;
 const ISA_PORT: usize = 1;
@@ -67,7 +67,10 @@ const PROXY_TYPE_SOCKS: i32 = 2;
 // ---------------------------------------------------------------------------
 
 fn iae<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: msg.into() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -91,17 +94,23 @@ fn read_settings(ctx: &dyn NativeContext) -> ProxySettings {
     let mut s = ProxySettings::default();
 
     // ---- JVM system properties ----
-    let http_host = ctx.get_system_property("http.proxyHost").filter(|s| !s.is_empty());
+    let http_host = ctx
+        .get_system_property("http.proxyHost")
+        .filter(|s| !s.is_empty());
     let http_port = ctx.get_system_property("http.proxyPort");
     if let Some(h) = http_host {
         s.http = Some((h, parse_port(http_port, 80)));
     }
-    let https_host = ctx.get_system_property("https.proxyHost").filter(|s| !s.is_empty());
+    let https_host = ctx
+        .get_system_property("https.proxyHost")
+        .filter(|s| !s.is_empty());
     let https_port = ctx.get_system_property("https.proxyPort");
     if let Some(h) = https_host {
         s.https = Some((h, parse_port(https_port, 443)));
     }
-    let socks_host = ctx.get_system_property("socksProxyHost").filter(|s| !s.is_empty());
+    let socks_host = ctx
+        .get_system_property("socksProxyHost")
+        .filter(|s| !s.is_empty());
     let socks_port = ctx.get_system_property("socksProxyPort");
     if let Some(h) = socks_host {
         s.socks = Some((h, parse_port(socks_port, 1080)));
@@ -367,7 +376,10 @@ fn parse_uri_min(uri: &str) -> Option<UriBits> {
     } else if let Some(idx) = authority.rfind(':') {
         let h = authority[..idx].to_string();
         let port_str = &authority[idx + 1..];
-        let p = port_str.parse::<u16>().ok().unwrap_or(default_port_for(&scheme));
+        let p = port_str
+            .parse::<u16>()
+            .ok()
+            .unwrap_or(default_port_for(&scheme));
         (h, p)
     } else {
         (authority.to_string(), default_port_for(&scheme))
@@ -401,11 +413,8 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16)
     // and trip `java/lang/String.getPort()` NoSuchMethodError. See the
     // matching helper in `net_phase_e.rs`.
     let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
-    let holder = alloc_concurrent_synthetic(
-        ctx,
-        "java/net/InetSocketAddress$InetSocketAddressHolder",
-        3,
-    );
+    let holder =
+        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
     let h = ctx.create_string(host);
     ctx.set_field(holder, 0, Value::Object(Some(h)));
     ctx.set_field(holder, 1, Value::Object(None));
@@ -500,9 +509,18 @@ fn select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
 
     let chosen: Option<(String, u16, i32)> = match uri_bits.scheme.as_str() {
-        "http" => settings.http.as_ref().map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
-        "https" => settings.https.as_ref().map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
-        "ftp" => settings.http.as_ref().map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
+        "http" => settings
+            .http
+            .as_ref()
+            .map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
+        "https" => settings
+            .https
+            .as_ref()
+            .map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
+        "ftp" => settings
+            .http
+            .as_ref()
+            .map(|(h, p)| (h.clone(), *p, PROXY_TYPE_HTTP)),
         "socket" | "ws" | "wss" | "socks" => settings
             .socks
             .as_ref()
@@ -635,7 +653,9 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
         connect_failed,
     );
     // The package-private internal init stub real-JDK runs at <clinit>.
-    r.register(DEFAULT_PROXY_SELECTOR, "init", "()V", |_ctx, _args| Ok(None));
+    r.register(DEFAULT_PROXY_SELECTOR, "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // Public ProxySelector — `getDefault` allocates a DefaultProxySelector
     // and `setDefault` stashes it. We provide a stable singleton here.
@@ -778,10 +798,26 @@ mod tests {
 
     #[test]
     fn cidr_v4_basic_arithmetic() {
-        assert!(v4_cidr(Ipv4Addr::new(10, 0, 0, 0), 8, Ipv4Addr::new(10, 1, 2, 3)));
-        assert!(!v4_cidr(Ipv4Addr::new(10, 0, 0, 0), 8, Ipv4Addr::new(11, 1, 2, 3)));
-        assert!(v4_cidr(Ipv4Addr::new(192, 168, 1, 0), 24, Ipv4Addr::new(192, 168, 1, 5)));
-        assert!(!v4_cidr(Ipv4Addr::new(192, 168, 1, 0), 24, Ipv4Addr::new(192, 168, 2, 5)));
+        assert!(v4_cidr(
+            Ipv4Addr::new(10, 0, 0, 0),
+            8,
+            Ipv4Addr::new(10, 1, 2, 3)
+        ));
+        assert!(!v4_cidr(
+            Ipv4Addr::new(10, 0, 0, 0),
+            8,
+            Ipv4Addr::new(11, 1, 2, 3)
+        ));
+        assert!(v4_cidr(
+            Ipv4Addr::new(192, 168, 1, 0),
+            24,
+            Ipv4Addr::new(192, 168, 1, 5)
+        ));
+        assert!(!v4_cidr(
+            Ipv4Addr::new(192, 168, 1, 0),
+            24,
+            Ipv4Addr::new(192, 168, 2, 5)
+        ));
         assert!(v4_cidr(Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::new(1, 2, 3, 4)));
     }
 

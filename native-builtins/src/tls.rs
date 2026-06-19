@@ -14,13 +14,13 @@
 #[path = "tls_impl.rs"]
 pub mod tls_impl;
 
-use cratonvm_types::ClassId;
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ObjectRef, Value};
-use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
+use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::ClassId;
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Cipher and protocol constants
@@ -119,7 +119,7 @@ fn alloc_ssl_engine(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn alloc_ssl_session(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6);
     ctx.set_field(obj, SES_CIPHER_SUITE, Value::Int(0)); // TLS_AES_256_GCM_SHA384
-    ctx.set_field(obj, SES_PROTOCOL, Value::Int(0));     // TLSv1.3
+    ctx.set_field(obj, SES_PROTOCOL, Value::Int(0)); // TLSv1.3
     ctx.set_field(obj, SES_VALID, Value::Int(1));
     ctx.set_field(obj, SES_PEER_HOST, Value::Int(0));
     ctx.set_field(obj, SES_PEER_PORT, Value::Int(-1));
@@ -173,15 +173,13 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
             let protocol_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("TLS")    => 0,
-                        Some("TLSv1.2") => 1,
-                        Some("TLSv1.3") => 2,
-                        Some("SSL")    => 3,
-                        _              => 0,
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("TLS") => 0,
+                    Some("TLSv1.2") => 1,
+                    Some("TLSv1.3") => 2,
+                    Some("SSL") => 3,
+                    _ => 0,
+                },
                 _ => 0,
             };
             let obj = alloc_ssl_context(ctx, protocol_idx);
@@ -302,26 +300,21 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
     );
 
     // getProtocol() -> String
-    r.register(
-        cls,
-        "getProtocol",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let idx = match ctx.get_field(this, CTX_PROTOCOL_IDX) {
-                Value::Int(i) => i,
-                _ => 0,
-            };
-            let proto = match idx {
-                1 => "TLSv1.2",
-                2 => "TLSv1.3",
-                3 => "SSL",
-                _ => "TLS",
-            };
-            let s = ctx.create_string(proto);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = match ctx.get_field(this, CTX_PROTOCOL_IDX) {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
+        let s = ctx.create_string(proto);
+        Ok(Some(Value::Object(Some(s))))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -390,7 +383,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             };
             let next_hs = match hs_status {
                 HS_NEED_UNWRAP => HS_NEED_WRAP, // After receiving, need to send next message
-                HS_NEED_TASK => HS_FINISHED,     // After delegated task, handshake finishes
+                HS_NEED_TASK => HS_FINISHED,    // After delegated task, handshake finishes
                 _ => HS_NOT_HANDSHAKING,
             };
             // If handshake just finished, mark it complete
@@ -414,7 +407,11 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v,
             _ => 1,
         };
-        let initial_hs = if client_mode != 0 { HS_NEED_WRAP } else { HS_NEED_UNWRAP };
+        let initial_hs = if client_mode != 0 {
+            HS_NEED_WRAP
+        } else {
+            HS_NEED_UNWRAP
+        };
         ctx.set_field(this, ENG_HANDSHAKE_STATUS, Value::Int(initial_hs));
         // Reset inbound/outbound done flags for new handshake
         ctx.set_field(this, ENG_INBOUND_DONE, Value::Int(0));
@@ -431,11 +428,8 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             // Return the enum as a synthetic object carrying the int status
             let hs_val = ctx.get_field(this, ENG_HANDSHAKE_STATUS);
-            let hs_obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
-                1,
-            );
+            let hs_obj =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1);
             ctx.set_field(hs_obj, 0, hs_val);
             Ok(Some(Value::Object(Some(hs_obj))))
         },
@@ -505,11 +499,21 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     // Shadowed by phases_late.rs::register_p68_ssl (Phase L) which provides the
     // real implementation that stores the protocol list on the engine. This
     // registration runs first; the phases_late.rs version overrides it.
-    r.register(cls, "setEnabledProtocols", "([Ljava/lang/String;)V", native_noop_with_this);
+    r.register(
+        cls,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
 
     // setEnabledCipherSuites(String[]) -> void
     // Shadowed by phases_late.rs::register_p68_ssl (Phase L) — see note above.
-    r.register(cls, "setEnabledCipherSuites", "([Ljava/lang/String;)V", native_noop_with_this);
+    r.register(
+        cls,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        native_noop_with_this,
+    );
 
     // getApplicationProtocol() -> String
     r.register(
@@ -536,7 +540,12 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     // Shadowed by phases_late.rs::register_p68_ssl (Phase L) which copies the
     // parameter fields onto the engine. This stub is kept so the tls.rs module
     // remains self-contained when the experimental-tls feature is built alone.
-    r.register(cls, "setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V", native_noop_with_this);
+    r.register(
+        cls,
+        "setSSLParameters",
+        "(Ljavax/net/ssl/SSLParameters;)V",
+        native_noop_with_this,
+    );
 
     // getSSLParameters() -> SSLParameters
     r.register(
@@ -592,21 +601,16 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     );
 
     // getProtocol() -> String
-    r.register(
-        cls,
-        "getProtocol",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let idx = match ctx.get_field(this, SES_PROTOCOL) {
-                Value::Int(i) => i,
-                _ => 0,
-            };
-            let proto = if idx == 0 { "TLSv1.3" } else { "TLSv1.2" };
-            let s = ctx.create_string(proto);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = match ctx.get_field(this, SES_PROTOCOL) {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        let proto = if idx == 0 { "TLSv1.3" } else { "TLSv1.2" };
+        let s = ctx.create_string(proto);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // isValid() -> boolean
     r.register(cls, "isValid", "()Z", |ctx, args| {
@@ -635,19 +639,14 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     });
 
     // getPeerHost() -> String
-    r.register(
-        cls,
-        "getPeerHost",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let field = ctx.get_field(this, SES_PEER_HOST);
-            match field {
-                Value::Object(_) => Ok(Some(field)),
-                _ => Ok(Some(Value::Object(None))),
-            }
-        },
-    );
+    r.register(cls, "getPeerHost", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let field = ctx.get_field(this, SES_PEER_HOST);
+        match field {
+            Value::Object(_) => Ok(Some(field)),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
 
     // getPeerPort() -> int
     r.register(cls, "getPeerPort", "()I", |ctx, args| {
@@ -691,31 +690,31 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getProtocols() -> String[]
-    r.register(
-        cls,
-        "getProtocols",
-        "()[Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let set = match ctx.get_field(this, 0) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            if set != 0 {
-                let arr = build_string_array(ctx, SUPPORTED_PROTOCOLS);
-                Ok(Some(Value::Object(Some(arr))))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
-        },
-    );
+    r.register(cls, "getProtocols", "()[Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let set = match ctx.get_field(this, 0) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if set != 0 {
+            let arr = build_string_array(ctx, SUPPORTED_PROTOCOLS);
+            Ok(Some(Value::Object(Some(arr))))
+        } else {
+            Ok(Some(Value::Object(None)))
+        }
+    });
 
     // setProtocols(String[]) -> void
-    r.register(cls, "setProtocols", "([Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(1));
-        Ok(None)
-    });
+    r.register(
+        cls,
+        "setProtocols",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 0, Value::Int(1));
+            Ok(None)
+        },
+    );
 
     // getCipherSuites() -> String[]
     r.register(
@@ -738,11 +737,16 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     );
 
     // setCipherSuites(String[]) -> void
-    r.register(cls, "setCipherSuites", "([Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(None)
-    });
+    r.register(
+        cls,
+        "setCipherSuites",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 1, Value::Int(1));
+            Ok(None)
+        },
+    );
 
     // getApplicationProtocols() -> String[]
     r.register(
@@ -796,13 +800,11 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = match args.get(1) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("HTTPS") => 1,
-                        Some("LDAPS") => 2,
-                        _             => 0,
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("HTTPS") => 1,
+                    Some("LDAPS") => 2,
+                    _ => 0,
+                },
                 _ => 0,
             };
             ctx.set_field(this, 2, Value::Int(idx));
@@ -903,13 +905,11 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
         |ctx, args| {
             let alg_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("PKIX")    => 0,
-                        Some("SunX509") => 1,
-                        _              => 0,
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("PKIX") => 0,
+                    Some("SunX509") => 1,
+                    _ => 0,
+                },
                 _ => 0,
             };
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 3);
@@ -940,23 +940,18 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
     // (slot 2). A null KeyStore means "use the default trust store" — real-JDK
     // loads the platform cacerts; we record id 0, which
     // build_trust_manager_state(0) resolves to system roots only.
-    r.register(
-        cls,
-        "init",
-        "(Ljava/security/KeyStore;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let ks_id = match args.get(1) {
-                Some(Value::Object(Some(ks_obj))) => read_keystore_registry_id(ctx, *ks_obj),
-                _ => 0, // null KeyStore => default trust store (system roots)
-            };
-            // slot 2 = bound keystore registry id (0 = system roots only).
-            ctx.set_field(this, 2, Value::Int(ks_id));
-            // slot 1 = initialized flag.
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(None)
-        },
-    );
+    r.register(cls, "init", "(Ljava/security/KeyStore;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ks_id = match args.get(1) {
+            Some(Value::Object(Some(ks_obj))) => read_keystore_registry_id(ctx, *ks_obj),
+            _ => 0, // null KeyStore => default trust store (system roots)
+        };
+        // slot 2 = bound keystore registry id (0 = system roots only).
+        ctx.set_field(this, 2, Value::Int(ks_id));
+        // slot 1 = initialized flag.
+        ctx.set_field(this, 1, Value::Int(1));
+        Ok(None)
+    });
 
     // getTrustManagers() -> TrustManager[]
     // FIX (nb-tls-tmf): return a REAL javax/net/ssl/X509TrustManager (whose
@@ -1013,14 +1008,12 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
         |ctx, args| {
             let alg_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("SunX509")    => 0,
-                        Some("NewSunX509") => 1,
-                        Some("PKIX")       => 2,
-                        _                  => 0,
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("SunX509") => 0,
+                    Some("NewSunX509") => 1,
+                    Some("PKIX") => 2,
+                    _ => 0,
+                },
                 _ => 0,
             };
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3);
@@ -1043,21 +1036,16 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
     );
 
     // init(KeyStore, char[]) -> void
-    r.register(
-        cls,
-        "init",
-        "(Ljava/security/KeyStore;[C)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let ks_present = match args.get(1) {
-                Some(Value::Object(Some(_))) => 1,
-                _ => 0,
-            };
-            ctx.set_field(this, 2, Value::Int(ks_present));
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(None)
-        },
-    );
+    r.register(cls, "init", "(Ljava/security/KeyStore;[C)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ks_present = match args.get(1) {
+            Some(Value::Object(Some(_))) => 1,
+            _ => 0,
+        };
+        ctx.set_field(this, 2, Value::Int(ks_present));
+        ctx.set_field(this, 1, Value::Int(1));
+        Ok(None)
+    });
 
     // getKeyManagers() -> KeyManager[]
     r.register(
@@ -1100,14 +1088,12 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/security/KeyStore;",
         |ctx, args| {
             let (type_idx, _type_name) = match args.get(0) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("JKS")    => (0, "JKS"),
-                        Some("PKCS12") => (1, "PKCS12"),
-                        Some("JCEKS")  => (2, "JCEKS"),
-                        _              => (0, "JKS"),
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("JKS") => (0, "JKS"),
+                    Some("PKCS12") => (1, "PKCS12"),
+                    Some("JCEKS") => (2, "JCEKS"),
+                    _ => (0, "JKS"),
+                },
                 _ => (0, "JKS"),
             };
             let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyStore", 5);
@@ -1121,24 +1107,19 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     );
 
     // getType() -> String (instance method)
-    r.register(
-        cls,
-        "getType",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let type_name = if let Some(Value::Object(Some(this))) = args.get(0) {
-                match ctx.get_field(*this, 0) {
-                    Value::Int(1) => "PKCS12",
-                    Value::Int(2) => "JCEKS",
-                    _ => "JKS",
-                }
-            } else {
-                "PKCS12"
-            };
-            let s = ctx.create_string(type_name);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    r.register(cls, "getType", "()Ljava/lang/String;", |ctx, args| {
+        let type_name = if let Some(Value::Object(Some(this))) = args.get(0) {
+            match ctx.get_field(*this, 0) {
+                Value::Int(1) => "PKCS12",
+                Value::Int(2) => "JCEKS",
+                _ => "JKS",
+            }
+        } else {
+            "PKCS12"
+        };
+        let s = ctx.create_string(type_name);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // getDefaultType() -> String (static)
     r.register(
@@ -1152,71 +1133,81 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     );
 
     // load(InputStream, char[]) -> void
-    r.register(
-        cls,
-        "load",
-        "(Ljava/io/InputStream;[C)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1)); // mark loaded
+    r.register(cls, "load", "(Ljava/io/InputStream;[C)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 1, Value::Int(1)); // mark loaded
 
-            #[cfg(feature = "legacy-synthetic-crypto")]
-            {
-                let type_idx = match ctx.get_field(this, 0) { Value::Int(v) => v, _ => 0 };
-                let type_hint = match type_idx { 0 => "JKS", 1 => "PKCS12", 2 => "JCEKS", _ => "auto" };
+        #[cfg(feature = "legacy-synthetic-crypto")]
+        {
+            let type_idx = match ctx.get_field(this, 0) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let type_hint = match type_idx {
+                0 => "JKS",
+                1 => "PKCS12",
+                2 => "JCEKS",
+                _ => "auto",
+            };
 
-                // Read password from char[]
-                let password = if let Some(Value::Object(Some(pwd_arr))) = args.get(2) {
-                    let len = ctx.array_length(*pwd_arr);
-                    let mut pwd = Vec::with_capacity(len);
-                    for i in 0..len {
-                        let c = match ctx.get_array_element(*pwd_arr, i) {
-                            Value::Int(v) => v as u8,
-                            _ => 0,
-                        };
-                        pwd.push(c);
-                    }
-                    pwd
-                } else { Vec::new() };
+            // Read password from char[]
+            let password = if let Some(Value::Object(Some(pwd_arr))) = args.get(2) {
+                let len = ctx.array_length(*pwd_arr);
+                let mut pwd = Vec::with_capacity(len);
+                for i in 0..len {
+                    let c = match ctx.get_array_element(*pwd_arr, i) {
+                        Value::Int(v) => v as u8,
+                        _ => 0,
+                    };
+                    pwd.push(c);
+                }
+                pwd
+            } else {
+                Vec::new()
+            };
 
-                // Try to read data from InputStream
-                if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-                    // ByteArrayInputStream pattern: field 0 = byte[] buf
-                    if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
-                        let len = ctx.array_length(buf_ref);
-                        if len > 0 {
-                            let mut data = Vec::with_capacity(len);
-                            for i in 0..len {
-                                let b = match ctx.get_array_element(buf_ref, i) {
-                                    Value::Int(v) => v as u8,
-                                    _ => 0,
-                                };
-                                data.push(b);
-                            }
-                            if let Ok(ks_data) = crypto_impl::KeyStoreData::load(&data, &password, type_hint) {
-                                let entry_count = ks_data.entries.len() as i32;
-                                let store_id = crypto_impl::keystore_next_id();
-                                crypto_impl::keystore_store(store_id, ks_data);
-                                ctx.set_field(this, 2, Value::Int(entry_count));
-                                ctx.set_field(this, 4, Value::Long(store_id as i64));
-                                return Ok(None);
-                            }
+            // Try to read data from InputStream
+            if let Some(Value::Object(Some(is_ref))) = args.get(1) {
+                // ByteArrayInputStream pattern: field 0 = byte[] buf
+                if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
+                    let len = ctx.array_length(buf_ref);
+                    if len > 0 {
+                        let mut data = Vec::with_capacity(len);
+                        for i in 0..len {
+                            let b = match ctx.get_array_element(buf_ref, i) {
+                                Value::Int(v) => v as u8,
+                                _ => 0,
+                            };
+                            data.push(b);
+                        }
+                        if let Ok(ks_data) =
+                            crypto_impl::KeyStoreData::load(&data, &password, type_hint)
+                        {
+                            let entry_count = ks_data.entries.len() as i32;
+                            let store_id = crypto_impl::keystore_next_id();
+                            crypto_impl::keystore_store(store_id, ks_data);
+                            ctx.set_field(this, 2, Value::Int(entry_count));
+                            ctx.set_field(this, 4, Value::Long(store_id as i64));
+                            return Ok(None);
                         }
                     }
-                } else {
-                    // null InputStream = empty keystore (valid per spec)
-                    let store_id = crypto_impl::keystore_next_id();
-                    crypto_impl::keystore_store(store_id, crypto_impl::KeyStoreData {
+                }
+            } else {
+                // null InputStream = empty keystore (valid per spec)
+                let store_id = crypto_impl::keystore_next_id();
+                crypto_impl::keystore_store(
+                    store_id,
+                    crypto_impl::KeyStoreData {
                         store_type: type_hint.to_string(),
                         entries: std::collections::HashMap::new(),
-                    });
-                    ctx.set_field(this, 4, Value::Long(store_id as i64));
-                }
+                    },
+                );
+                ctx.set_field(this, 4, Value::Long(store_id as i64));
             }
+        }
 
-            Ok(None)
-        },
-    );
+        Ok(None)
+    });
 
     // getCertificate(String alias) -> Certificate
     r.register(
@@ -1227,7 +1218,10 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             #[cfg(feature = "legacy-synthetic-crypto")]
             {
                 let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
+                let store_id = match ctx.get_field(this, 4) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if store_id > 0 {
                     let alias = match args.get(1) {
                         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1237,11 +1231,17 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
                         if let Some(entry) = ks_data.entries.get(&alias) {
                             let x509_cert = match entry {
                                 crypto_impl::KeyStoreEntry::TrustedCert { cert } => Some(cert),
-                                crypto_impl::KeyStoreEntry::PrivateKeyEntry { cert_chain, .. } => cert_chain.first(),
+                                crypto_impl::KeyStoreEntry::PrivateKeyEntry {
+                                    cert_chain, ..
+                                } => cert_chain.first(),
                                 _ => None,
                             };
                             if let Some(cert) = x509_cert {
-                                let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
+                                let cert_obj = alloc_concurrent_synthetic(
+                                    ctx,
+                                    "java/security/cert/X509Certificate",
+                                    3,
+                                );
                                 let sub_str = ctx.create_string(&cert.subject_cn);
                                 let iss_str = ctx.create_string(&cert.issuer_cn);
                                 let cert_id = crypto_impl::cert_next_id();
@@ -1269,7 +1269,10 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             #[cfg(feature = "legacy-synthetic-crypto")]
             {
                 let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
+                let store_id = match ctx.get_field(this, 4) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if store_id > 0 {
                     let alias = match args.get(1) {
                         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1278,16 +1281,29 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
                     if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
                         if let Some(entry) = ks_data.entries.get(&alias) {
                             match entry {
-                                crypto_impl::KeyStoreEntry::PrivateKeyEntry { key_bytes, .. } => {
-                                    let pk = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4);
+                                crypto_impl::KeyStoreEntry::PrivateKeyEntry {
+                                    key_bytes, ..
+                                } => {
+                                    let pk = alloc_concurrent_synthetic(
+                                        ctx,
+                                        "java/security/PrivateKey",
+                                        4,
+                                    );
                                     ctx.set_field(pk, 0, Value::Int(6)); // RSA default
                                     ctx.set_field(pk, 1, Value::Int(2048));
                                     ctx.set_field(pk, 2, Value::Int(key_bytes.len() as i32));
                                     ctx.set_field(pk, 3, Value::Long(0));
                                     return Ok(Some(Value::Object(Some(pk))));
                                 }
-                                crypto_impl::KeyStoreEntry::SecretKeyEntry { key_bytes, algorithm } => {
-                                    let sk = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 3);
+                                crypto_impl::KeyStoreEntry::SecretKeyEntry {
+                                    key_bytes,
+                                    algorithm,
+                                } => {
+                                    let sk = alloc_concurrent_synthetic(
+                                        ctx,
+                                        "javax/crypto/SecretKey",
+                                        3,
+                                    );
                                     ctx.set_field(sk, 0, Value::Int(0));
                                     ctx.set_field(sk, 1, Value::Int((key_bytes.len() * 8) as i32));
                                     ctx.set_field(sk, 2, Value::Int(key_bytes.len() as i32));
@@ -1306,69 +1322,87 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     );
 
     // containsAlias(String alias) -> boolean
-    r.register(cls, "containsAlias", "(Ljava/lang/String;)Z", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let this = obj_arg(args, 0)?;
-            let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
-            if store_id > 0 {
-                let alias = match args.get(1) {
-                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    return Ok(Some(Value::Int(if ks_data.entries.contains_key(&alias) { 1 } else { 0 })));
-                }
-            }
-        }
-        let _ = (ctx, args);
-        Ok(Some(Value::Int(0)))
-    });
-
-    // aliases() -> Enumeration<String>
     r.register(
         cls,
-        "aliases",
-        "()Ljava/util/Enumeration;",
+        "containsAlias",
+        "(Ljava/lang/String;)Z",
         |ctx, args| {
             #[cfg(feature = "legacy-synthetic-crypto")]
             {
                 let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
+                let store_id = match ctx.get_field(this, 4) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
+                };
                 if store_id > 0 {
+                    let alias = match args.get(1) {
+                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
                     if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                        let aliases: Vec<&str> = ks_data.entries.keys().map(|s| s.as_str()).collect();
-                        if !aliases.is_empty() {
-                            // Build a Vector-backed enumeration
-                            let vec_obj = alloc_concurrent_synthetic(ctx, "java/util/Vector", 2);
-                            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, aliases.len());
-                            for (i, alias) in aliases.iter().enumerate() {
-                                let s = ctx.create_string(alias);
-                                ctx.set_array_element(arr, i, Value::Object(Some(s)));
-                            }
-                            ctx.set_field(vec_obj, 0, Value::Object(Some(arr)));
-                            ctx.set_field(vec_obj, 1, Value::Int(aliases.len() as i32));
-                            // Return a simple enumeration wrapping the vector
-                            let en = alloc_concurrent_synthetic(ctx, "java/util/Vector$VectorEnumeration", 2);
-                            ctx.set_field(en, 0, Value::Object(Some(vec_obj)));
-                            ctx.set_field(en, 1, Value::Int(0)); // cursor
-                            return Ok(Some(Value::Object(Some(en))));
-                        }
+                        return Ok(Some(Value::Int(if ks_data.entries.contains_key(&alias) {
+                            1
+                        } else {
+                            0
+                        })));
                     }
                 }
             }
-            let _ = args;
-            let en = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
-            Ok(Some(Value::Object(Some(en))))
+            let _ = (ctx, args);
+            Ok(Some(Value::Int(0)))
         },
     );
+
+    // aliases() -> Enumeration<String>
+    r.register(cls, "aliases", "()Ljava/util/Enumeration;", |ctx, args| {
+        #[cfg(feature = "legacy-synthetic-crypto")]
+        {
+            let this = obj_arg(args, 0)?;
+            let store_id = match ctx.get_field(this, 4) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
+            if store_id > 0 {
+                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
+                    let aliases: Vec<&str> = ks_data.entries.keys().map(|s| s.as_str()).collect();
+                    if !aliases.is_empty() {
+                        // Build a Vector-backed enumeration
+                        let vec_obj = alloc_concurrent_synthetic(ctx, "java/util/Vector", 2);
+                        let arr = ctx
+                            .new_array(cratonvm_types::ArrayElementType::Reference, aliases.len());
+                        for (i, alias) in aliases.iter().enumerate() {
+                            let s = ctx.create_string(alias);
+                            ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                        }
+                        ctx.set_field(vec_obj, 0, Value::Object(Some(arr)));
+                        ctx.set_field(vec_obj, 1, Value::Int(aliases.len() as i32));
+                        // Return a simple enumeration wrapping the vector
+                        let en = alloc_concurrent_synthetic(
+                            ctx,
+                            "java/util/Vector$VectorEnumeration",
+                            2,
+                        );
+                        ctx.set_field(en, 0, Value::Object(Some(vec_obj)));
+                        ctx.set_field(en, 1, Value::Int(0)); // cursor
+                        return Ok(Some(Value::Object(Some(en))));
+                    }
+                }
+            }
+        }
+        let _ = args;
+        let en = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+        Ok(Some(Value::Object(Some(en))))
+    });
 
     // size() -> int
     r.register(cls, "size", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         #[cfg(feature = "legacy-synthetic-crypto")]
         {
-            let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
+            let store_id = match ctx.get_field(this, 4) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if store_id > 0 {
                 if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
                     return Ok(Some(Value::Int(ks_data.entries.len() as i32)));
@@ -1411,22 +1445,17 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     );
 
     // deleteEntry(String alias) -> void
-    r.register(
-        cls,
-        "deleteEntry",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let count = match ctx.get_field(this, 2) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            if count > 0 {
-                ctx.set_field(this, 2, Value::Int(count - 1));
-            }
-            Ok(None)
-        },
-    );
+    r.register(cls, "deleteEntry", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let count = match ctx.get_field(this, 2) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if count > 0 {
+            ctx.set_field(this, 2, Value::Int(count - 1));
+        }
+        Ok(None)
+    });
 
     // store(OutputStream, char[]) -> void
     // KeyStore.store is an instance method that persists the store to
@@ -1440,40 +1469,55 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     );
 
     // isCertificateEntry(String alias) -> boolean
-    r.register(cls, "isCertificateEntry", "(Ljava/lang/String;)Z", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let this = obj_arg(args, 0)?;
-            let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
-            if store_id > 0 {
-                let alias = match args.get(1) {
-                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                    _ => String::new(),
+    r.register(
+        cls,
+        "isCertificateEntry",
+        "(Ljava/lang/String;)Z",
+        |ctx, args| {
+            #[cfg(feature = "legacy-synthetic-crypto")]
+            {
+                let this = obj_arg(args, 0)?;
+                let store_id = match ctx.get_field(this, 4) {
+                    Value::Long(id) => id as u64,
+                    _ => 0,
                 };
-                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    if let Some(crypto_impl::KeyStoreEntry::TrustedCert { .. }) = ks_data.entries.get(&alias) {
-                        return Ok(Some(Value::Int(1)));
+                if store_id > 0 {
+                    let alias = match args.get(1) {
+                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
+                        if let Some(crypto_impl::KeyStoreEntry::TrustedCert { .. }) =
+                            ks_data.entries.get(&alias)
+                        {
+                            return Ok(Some(Value::Int(1)));
+                        }
                     }
                 }
             }
-        }
-        let _ = (ctx, args);
-        Ok(Some(Value::Int(0)))
-    });
+            let _ = (ctx, args);
+            Ok(Some(Value::Int(0)))
+        },
+    );
 
     // isKeyEntry(String alias) -> boolean
     r.register(cls, "isKeyEntry", "(Ljava/lang/String;)Z", |ctx, args| {
         #[cfg(feature = "legacy-synthetic-crypto")]
         {
             let this = obj_arg(args, 0)?;
-            let store_id = match ctx.get_field(this, 4) { Value::Long(id) => id as u64, _ => 0 };
+            let store_id = match ctx.get_field(this, 4) {
+                Value::Long(id) => id as u64,
+                _ => 0,
+            };
             if store_id > 0 {
                 let alias = match args.get(1) {
                     Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                     _ => String::new(),
                 };
                 if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    if let Some(crypto_impl::KeyStoreEntry::PrivateKeyEntry { .. }) = ks_data.entries.get(&alias) {
+                    if let Some(crypto_impl::KeyStoreEntry::PrivateKeyEntry { .. }) =
+                        ks_data.entries.get(&alias)
+                    {
                         return Ok(Some(Value::Int(1)));
                     }
                 }
@@ -1593,7 +1637,8 @@ fn validate_cert_chain(
             // Null chain — reject (security: never accept missing certificates)
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "Certificate chain is null — TLS connection rejected".into(),
-            }.into());
+            }
+            .into());
         }
     };
     let chain_len = ctx.array_length(chain_arr);
@@ -1601,7 +1646,8 @@ fn validate_cert_chain(
         // Empty chain — reject
         return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "Certificate chain is empty — TLS connection rejected".into(),
-        }.into());
+        }
+        .into());
     }
 
     // VULN [nb-tls] FIX: perform REAL PKIX validation in every build by routing
@@ -1631,7 +1677,8 @@ fn validate_cert_chain(
                     "Certificate at index {} is null — TLS connection rejected",
                     i
                 ),
-            }.into());
+            }
+            .into());
         }
     }
 
@@ -1654,7 +1701,8 @@ fn validate_cert_chain(
             // native boundary) so apps see a real validation failure rather
             // than a silently-trusted connection.
             message: format!("CertificateException: {}", e),
-        }.into()),
+        }
+        .into()),
     }
 }
 
@@ -1777,7 +1825,8 @@ fn validate_cert_chain_crypto(
                             "Certificate not yet valid: {} (not before {})",
                             cert.subject_cn, cert.not_before
                         ),
-                    }.into());
+                    }
+                    .into());
                 }
                 if now > cert.not_after {
                     return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -1785,7 +1834,8 @@ fn validate_cert_chain_crypto(
                             "Certificate expired: {} (expired at {})",
                             cert.subject_cn, cert.not_after
                         ),
-                    }.into());
+                    }
+                    .into());
                 }
                 parsed_certs.push(Some(cert));
             } else {
@@ -1801,7 +1851,9 @@ fn validate_cert_chain_crypto(
         if let Some(ref cert) = parsed_certs[i] {
             let issuer_spki = if i + 1 < parsed_certs.len() {
                 // Use the next cert's public key as the issuer
-                parsed_certs[i + 1].as_ref().map(|c| c.public_key_bytes.as_slice())
+                parsed_certs[i + 1]
+                    .as_ref()
+                    .map(|c| c.public_key_bytes.as_slice())
             } else {
                 // Last cert in chain: verify as self-signed (root CA)
                 Some(cert.public_key_bytes.as_slice())
@@ -1813,7 +1865,8 @@ fn validate_cert_chain_crypto(
                             "Certificate signature verification failed for: {}",
                             cert.subject_cn
                         ),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -1828,7 +1881,8 @@ fn validate_cert_chain_crypto(
                         "Certificate chain broken: issuer of '{}' does not match subject of '{}'",
                         cert.subject_cn, issuer.subject_cn
                     ),
-                }.into());
+                }
+                .into());
             }
         }
     }
@@ -1852,9 +1906,7 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
         cls,
         "checkClientTrusted",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
-        |ctx, args| {
-            validate_cert_chain(ctx, args.first(), args.get(1))
-        },
+        |ctx, args| validate_cert_chain(ctx, args.first(), args.get(1)),
     );
 
     // checkServerTrusted(X509Certificate[] chain, String authType) -> void
@@ -1865,9 +1917,7 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
         cls,
         "checkServerTrusted",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
-        |ctx, args| {
-            validate_cert_chain(ctx, args.first(), args.get(1))
-        },
+        |ctx, args| validate_cert_chain(ctx, args.first(), args.get(1)),
     );
 
     // T19.9 CONSOLIDATION: getAcceptedIssuers() -> X509Certificate[] is now
@@ -1897,15 +1947,13 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
             let protocol_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => {
-                    match ctx.read_string(*s).as_deref() {
-                        Some("TLS")    => 0,
-                        Some("TLSv1.2") => 1,
-                        Some("TLSv1.3") => 2,
-                        Some("SSL")    => 3,
-                        _              => 0,
-                    }
-                }
+                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
+                    Some("TLS") => 0,
+                    Some("TLSv1.2") => 1,
+                    Some("TLSv1.3") => 2,
+                    Some("SSL") => 3,
+                    _ => 0,
+                },
                 _ => 0,
             };
             let obj = alloc_ssl_context(ctx, protocol_idx);
@@ -1945,26 +1993,21 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(
-        cls,
-        "getProtocol",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let idx = match ctx.get_field(this, CTX_PROTOCOL_IDX) {
-                Value::Int(i) => i,
-                _ => 0,
-            };
-            let proto = match idx {
-                1 => "TLSv1.2",
-                2 => "TLSv1.3",
-                3 => "SSL",
-                _ => "TLS",
-            };
-            let s = ctx.create_string(proto);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = match ctx.get_field(this, CTX_PROTOCOL_IDX) {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
+        let s = ctx.create_string(proto);
+        Ok(Some(Value::Object(Some(s))))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -1987,11 +2030,8 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status_obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$Status",
-                1,
-            );
+            let status_obj =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 1);
             let status_val = ctx.get_field(this, 0);
             ctx.set_field(status_obj, 0, status_val);
             Ok(Some(Value::Object(Some(status_obj))))
@@ -2005,11 +2045,8 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let hs_obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
-                1,
-            );
+            let hs_obj =
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1);
             let hs_val = ctx.get_field(this, 1);
             ctx.set_field(hs_obj, 0, hs_val);
             Ok(Some(Value::Object(Some(hs_obj))))
@@ -2263,19 +2300,59 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLContext";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;").is_some());
-        assert!(r.find(cls, "getDefault", "()Ljavax/net/ssl/SSLContext;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefault", "()Ljavax/net/ssl/SSLContext;")
+            .is_some());
         assert!(r.find(
             cls,
             "init",
             "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V"
         ).is_some());
-        assert!(r.find(cls, "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;").is_some());
-        assert!(r.find(cls, "createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;").is_some());
-        assert!(r.find(cls, "getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;").is_some());
-        assert!(r.find(cls, "getServerSocketFactory", "()Ljavax/net/ssl/SSLServerSocketFactory;").is_some());
-        assert!(r.find(cls, "getDefaultSSLParameters", "()Ljavax/net/ssl/SSLParameters;").is_some());
-        assert!(r.find(cls, "getSupportedSSLParameters", "()Ljavax/net/ssl/SSLParameters;").is_some());
+        assert!(r
+            .find(cls, "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "createSSLEngine",
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getDefaultSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getSupportedSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;"
+            )
+            .is_some());
         assert!(r.find(cls, "getProtocol", "()Ljava/lang/String;").is_some());
     }
 
@@ -2285,10 +2362,28 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLEngine";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "wrap", "([Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;").is_some());
-        assert!(r.find(cls, "unwrap", "(Ljava/nio/ByteBuffer;[Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "wrap",
+                "([Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "unwrap",
+                "(Ljava/nio/ByteBuffer;[Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;"
+            )
+            .is_some());
         assert!(r.find(cls, "beginHandshake", "()V").is_some());
-        assert!(r.find(cls, "getHandshakeStatus", "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getHandshakeStatus",
+                "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;"
+            )
+            .is_some());
         assert!(r.find(cls, "isInboundDone", "()Z").is_some());
         assert!(r.find(cls, "isOutboundDone", "()Z").is_some());
         assert!(r.find(cls, "closeInbound", "()V").is_some());
@@ -2297,11 +2392,21 @@ mod tls_tests {
         assert!(r.find(cls, "getUseClientMode", "()Z").is_some());
         assert!(r.find(cls, "getPeerHost", "()Ljava/lang/String;").is_some());
         assert!(r.find(cls, "getPeerPort", "()I").is_some());
-        assert!(r.find(cls, "setEnabledProtocols", "([Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "setEnabledCipherSuites", "([Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "getApplicationProtocol", "()Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V").is_some());
-        assert!(r.find(cls, "getSSLParameters", "()Ljavax/net/ssl/SSLParameters;").is_some());
+        assert!(r
+            .find(cls, "setEnabledProtocols", "([Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(cls, "setEnabledCipherSuites", "([Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(cls, "getApplicationProtocol", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V")
+            .is_some());
+        assert!(r
+            .find(cls, "getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
+            .is_some());
     }
 
     #[test]
@@ -2310,7 +2415,9 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLSession";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getCipherSuite", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(cls, "getCipherSuite", "()Ljava/lang/String;")
+            .is_some());
         assert!(r.find(cls, "getProtocol", "()Ljava/lang/String;").is_some());
         assert!(r.find(cls, "isValid", "()Z").is_some());
         assert!(r.find(cls, "invalidate", "()V").is_some());
@@ -2329,14 +2436,38 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLParameters";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getProtocols", "()[Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "setProtocols", "([Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "getCipherSuites", "()[Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "setCipherSuites", "([Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "getApplicationProtocols", "()[Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "setApplicationProtocols", "([Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "getEndpointIdentificationAlgorithm", "()Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "setEndpointIdentificationAlgorithm", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(cls, "getProtocols", "()[Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "setProtocols", "([Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(cls, "getCipherSuites", "()[Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "setCipherSuites", "([Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(cls, "getApplicationProtocols", "()[Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "setApplicationProtocols", "([Ljava/lang/String;)V")
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getEndpointIdentificationAlgorithm",
+                "()Ljava/lang/String;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "setEndpointIdentificationAlgorithm",
+                "(Ljava/lang/String;)V"
+            )
+            .is_some());
         assert!(r.find(cls, "getNeedClientAuth", "()Z").is_some());
         assert!(r.find(cls, "setNeedClientAuth", "(Z)V").is_some());
         assert!(r.find(cls, "getWantClientAuth", "()Z").is_some());
@@ -2349,10 +2480,20 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/TrustManagerFactory";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;").is_some());
-        assert!(r.find(cls, "getDefaultAlgorithm", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefaultAlgorithm", "()Ljava/lang/String;")
+            .is_some());
         assert!(r.find(cls, "init", "(Ljava/security/KeyStore;)V").is_some());
-        assert!(r.find(cls, "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;").is_some());
+        assert!(r
+            .find(cls, "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;")
+            .is_some());
     }
 
     // FIX (nb-tls-tmf): getTrustManagers() must propagate the keystore registry
@@ -2374,7 +2515,11 @@ mod tls_tests {
         // Obtain a factory instance via getInstance (PKIX), then simulate
         // init(KeyStore) having bound a keystore registry id by writing slot 2.
         let get_instance = r
-            .find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;")
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+            )
             .unwrap();
         let factory = match get_instance(&mut ctx, &[Value::Object(None)]) {
             Ok(Some(Value::Object(Some(o)))) => o,
@@ -2392,7 +2537,11 @@ mod tls_tests {
             Ok(Some(Value::Object(Some(a)))) => a,
             other => panic!("getTrustManagers should return an array, got {other:?}"),
         };
-        assert_eq!(ctx.array_length(arr), 1, "expected exactly one trust manager");
+        assert_eq!(
+            ctx.array_length(arr),
+            1,
+            "expected exactly one trust manager"
+        );
         let tm = match ctx.get_array_element(arr, 0) {
             Value::Object(Some(t)) => t,
             other => panic!("trust manager element should be an object, got {other:?}"),
@@ -2411,10 +2560,22 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/KeyManagerFactory";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;").is_some());
-        assert!(r.find(cls, "getDefaultAlgorithm", "()Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "init", "(Ljava/security/KeyStore;[C)V").is_some());
-        assert!(r.find(cls, "getKeyManagers", "()[Ljavax/net/ssl/KeyManager;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefaultAlgorithm", "()Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "init", "(Ljava/security/KeyStore;[C)V")
+            .is_some());
+        assert!(r
+            .find(cls, "getKeyManagers", "()[Ljavax/net/ssl/KeyManager;")
+            .is_some());
     }
 
     #[test]
@@ -2423,21 +2584,51 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "java/security/KeyStore";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;").is_some());
-        assert!(r.find(cls, "getDefaultType", "()Ljava/lang/String;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljava/security/KeyStore;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefaultType", "()Ljava/lang/String;")
+            .is_some());
         assert!(r.find(cls, "load", "(Ljava/io/InputStream;[C)V").is_some());
-        assert!(r.find(cls, "getCertificate", "(Ljava/lang/String;)Ljava/security/cert/Certificate;").is_some());
-        assert!(r.find(cls, "getKey", "(Ljava/lang/String;[C)Ljava/security/Key;").is_some());
-        assert!(r.find(cls, "containsAlias", "(Ljava/lang/String;)Z").is_some());
-        assert!(r.find(cls, "aliases", "()Ljava/util/Enumeration;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getCertificate",
+                "(Ljava/lang/String;)Ljava/security/cert/Certificate;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getKey", "(Ljava/lang/String;[C)Ljava/security/Key;")
+            .is_some());
+        assert!(r
+            .find(cls, "containsAlias", "(Ljava/lang/String;)Z")
+            .is_some());
+        assert!(r
+            .find(cls, "aliases", "()Ljava/util/Enumeration;")
+            .is_some());
         assert!(r.find(cls, "size", "()I").is_some());
-        assert!(r.find(cls, "setCertificateEntry", "(Ljava/lang/String;Ljava/security/cert/Certificate;)V").is_some());
-        assert!(r.find(
-            cls,
-            "setKeyEntry",
-            "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V"
-        ).is_some());
-        assert!(r.find(cls, "deleteEntry", "(Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(
+                cls,
+                "setCertificateEntry",
+                "(Ljava/lang/String;Ljava/security/cert/Certificate;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "setKeyEntry",
+                "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "deleteEntry", "(Ljava/lang/String;)V")
+            .is_some());
     }
 
     #[test]
@@ -2446,11 +2637,29 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLSocketFactory";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getDefault", "()Ljavax/net/ssl/SSLSocketFactory;").is_some());
-        assert!(r.find(cls, "createSocket", "(Ljava/lang/String;I)Ljava/net/Socket;").is_some());
-        assert!(r.find(cls, "createSocket", "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;").is_some());
-        assert!(r.find(cls, "getDefaultCipherSuites", "()[Ljava/lang/String;").is_some());
-        assert!(r.find(cls, "getSupportedCipherSuites", "()[Ljava/lang/String;").is_some());
+        assert!(r
+            .find(cls, "getDefault", "()Ljavax/net/ssl/SSLSocketFactory;")
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "createSocket",
+                "(Ljava/lang/String;I)Ljava/net/Socket;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "createSocket",
+                "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefaultCipherSuites", "()[Ljava/lang/String;")
+            .is_some());
+        assert!(r
+            .find(cls, "getSupportedCipherSuites", "()[Ljava/lang/String;")
+            .is_some());
     }
 
     #[test]
@@ -2459,11 +2668,29 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/X509TrustManager";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "checkClientTrusted", "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V").is_some());
-        assert!(r.find(cls, "checkServerTrusted", "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V").is_some());
+        assert!(r
+            .find(
+                cls,
+                "checkClientTrusted",
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "checkServerTrusted",
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V"
+            )
+            .is_some());
         // T19.9: getAcceptedIssuers moved to t27_tls.rs (rustls-backed). The
         // tls.rs baseline no longer registers it — t27 is the canonical home.
-        assert!(r.find(cls, "getAcceptedIssuers", "()[Ljava/security/cert/X509Certificate;").is_none());
+        assert!(r
+            .find(
+                cls,
+                "getAcceptedIssuers",
+                "()[Ljava/security/cert/X509Certificate;"
+            )
+            .is_none());
     }
 
     // VULN [nb-tls] regression: the X509TrustManager check{Server,Client}Trusted
@@ -2504,14 +2731,24 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "sun/security/ssl/SSLContextImpl";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;").is_some());
-        assert!(r.find(cls, "getDefault", "()Ljavax/net/ssl/SSLContext;").is_some());
+        assert!(r
+            .find(
+                cls,
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;"
+            )
+            .is_some());
+        assert!(r
+            .find(cls, "getDefault", "()Ljavax/net/ssl/SSLContext;")
+            .is_some());
         assert!(r.find(
             cls,
             "init",
             "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V"
         ).is_some());
-        assert!(r.find(cls, "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;").is_some());
+        assert!(r
+            .find(cls, "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
+            .is_some());
         assert!(r.find(cls, "getProtocol", "()Ljava/lang/String;").is_some());
     }
 
@@ -2521,8 +2758,16 @@ mod tls_tests {
         register_tls_natives(&mut r);
         let cls = "javax/net/ssl/SSLEngineResult";
         assert!(r.find(cls, "<init>", "()V").is_some());
-        assert!(r.find(cls, "getStatus", "()Ljavax/net/ssl/SSLEngineResult$Status;").is_some());
-        assert!(r.find(cls, "getHandshakeStatus", "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;").is_some());
+        assert!(r
+            .find(cls, "getStatus", "()Ljavax/net/ssl/SSLEngineResult$Status;")
+            .is_some());
+        assert!(r
+            .find(
+                cls,
+                "getHandshakeStatus",
+                "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;"
+            )
+            .is_some());
         assert!(r.find(cls, "bytesConsumed", "()I").is_some());
         assert!(r.find(cls, "bytesProduced", "()I").is_some());
     }
@@ -2547,12 +2792,21 @@ mod tls_tests {
     fn test_supported_protocols_order() {
         assert_eq!(SUPPORTED_PROTOCOLS[0], "TLSv1.3");
         assert_eq!(SUPPORTED_PROTOCOLS[1], "TLSv1.2");
-        assert_eq!(SUPPORTED_PROTOCOLS.len(), 2, "Only TLSv1.3 and TLSv1.2 should be supported");
+        assert_eq!(
+            SUPPORTED_PROTOCOLS.len(),
+            2,
+            "Only TLSv1.3 and TLSv1.2 should be supported"
+        );
     }
 
     #[test]
     fn test_status_constants_are_distinct() {
-        let statuses = [STATUS_OK, STATUS_CLOSED, STATUS_BUFFER_UNDERFLOW, STATUS_BUFFER_OVERFLOW];
+        let statuses = [
+            STATUS_OK,
+            STATUS_CLOSED,
+            STATUS_BUFFER_UNDERFLOW,
+            STATUS_BUFFER_OVERFLOW,
+        ];
         for i in 0..statuses.len() {
             for j in (i + 1)..statuses.len() {
                 assert_ne!(statuses[i], statuses[j]);
@@ -2562,7 +2816,13 @@ mod tls_tests {
 
     #[test]
     fn test_handshake_status_constants_are_distinct() {
-        let hs = [HS_NOT_HANDSHAKING, HS_NEED_WRAP, HS_NEED_UNWRAP, HS_NEED_TASK, HS_FINISHED];
+        let hs = [
+            HS_NOT_HANDSHAKING,
+            HS_NEED_WRAP,
+            HS_NEED_UNWRAP,
+            HS_NEED_TASK,
+            HS_FINISHED,
+        ];
         for i in 0..hs.len() {
             for j in (i + 1)..hs.len() {
                 assert_ne!(hs[i], hs[j]);
@@ -2602,19 +2862,18 @@ mod tls_tests {
     fn test_total_cipher_count() {
         // Combined pool must have enough variety for realistic TLS handshake simulation
         let total = TLS13_CIPHERS.len() + TLS12_CIPHERS.len();
-        assert!(total >= 8, "Expected at least 8 total ciphers, got {}", total);
+        assert!(
+            total >= 8,
+            "Expected at least 8 total ciphers, got {}",
+            total
+        );
     }
 
     #[test]
     fn test_protocol_index_mapping() {
         // Verify the documented mapping used in register_ssl_context
         // idx 0 -> TLS, 1 -> TLSv1.2, 2 -> TLSv1.3, 3 -> SSL
-        let mappings: &[(i32, &str)] = &[
-            (0, "TLS"),
-            (1, "TLSv1.2"),
-            (2, "TLSv1.3"),
-            (3, "SSL"),
-        ];
+        let mappings: &[(i32, &str)] = &[(0, "TLS"), (1, "TLSv1.2"), (2, "TLSv1.3"), (3, "SSL")];
         for (idx, proto) in mappings {
             let result = match *idx {
                 1 => "TLSv1.2",
@@ -2622,7 +2881,11 @@ mod tls_tests {
                 3 => "SSL",
                 _ => "TLS",
             };
-            assert_eq!(result, *proto, "Protocol index {} should map to {}", idx, proto);
+            assert_eq!(
+                result, *proto,
+                "Protocol index {} should map to {}",
+                idx, proto
+            );
         }
     }
 
@@ -2673,7 +2936,11 @@ mod tls_tests {
         ];
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
-                assert_ne!(indices[i], indices[j], "Duplicate field index at {} and {}", i, j);
+                assert_ne!(
+                    indices[i], indices[j],
+                    "Duplicate field index at {} and {}",
+                    i, j
+                );
             }
         }
     }
@@ -2754,7 +3021,10 @@ mod tls_tests {
     #[test]
     fn test_supported_protocols_does_not_include_tls11() {
         for proto in SUPPORTED_PROTOCOLS {
-            assert_ne!(*proto, "TLSv1.1", "TLSv1.1 must not be in SUPPORTED_PROTOCOLS");
+            assert_ne!(
+                *proto, "TLSv1.1",
+                "TLSv1.1 must not be in SUPPORTED_PROTOCOLS"
+            );
             assert_ne!(*proto, "TLSv1", "TLSv1 must not be in SUPPORTED_PROTOCOLS");
             assert_ne!(*proto, "SSLv3", "SSLv3 must not be in SUPPORTED_PROTOCOLS");
         }
@@ -2766,14 +3036,19 @@ mod tls_tests {
         for proto in SUPPORTED_PROTOCOLS {
             assert!(
                 *proto == "TLSv1.3" || *proto == "TLSv1.2",
-                "Unexpected protocol: {}", proto
+                "Unexpected protocol: {}",
+                proto
             );
         }
     }
 
     #[test]
     fn test_supported_protocols_len() {
-        assert_eq!(SUPPORTED_PROTOCOLS.len(), 2, "Expected exactly 2 protocols (TLSv1.3 + TLSv1.2)");
+        assert_eq!(
+            SUPPORTED_PROTOCOLS.len(),
+            2,
+            "Expected exactly 2 protocols (TLSv1.3 + TLSv1.2)"
+        );
     }
 
     // --- Handshake state machine tests ---
@@ -2782,7 +3057,11 @@ mod tls_tests {
     fn test_client_begins_handshake_with_need_wrap() {
         // Client mode (1) should start with NEED_WRAP to send ClientHello
         let client_mode = 1;
-        let initial_hs = if client_mode != 0 { HS_NEED_WRAP } else { HS_NEED_UNWRAP };
+        let initial_hs = if client_mode != 0 {
+            HS_NEED_WRAP
+        } else {
+            HS_NEED_UNWRAP
+        };
         assert_eq!(initial_hs, HS_NEED_WRAP);
     }
 
@@ -2790,7 +3069,11 @@ mod tls_tests {
     fn test_server_begins_handshake_with_need_unwrap() {
         // Server mode (0) should start with NEED_UNWRAP to receive ClientHello
         let client_mode = 0;
-        let initial_hs = if client_mode != 0 { HS_NEED_WRAP } else { HS_NEED_UNWRAP };
+        let initial_hs = if client_mode != 0 {
+            HS_NEED_WRAP
+        } else {
+            HS_NEED_UNWRAP
+        };
         assert_eq!(initial_hs, HS_NEED_UNWRAP);
     }
 
@@ -2843,35 +3126,60 @@ mod tls_tests {
     fn test_ssl_context_protocol_idx_tls() {
         // "TLS" -> idx 0
         let idx: i32 = 0;
-        let proto = match idx { 1 => "TLSv1.2", 2 => "TLSv1.3", 3 => "SSL", _ => "TLS" };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
         assert_eq!(proto, "TLS");
     }
 
     #[test]
     fn test_ssl_context_protocol_idx_tls12() {
         let idx: i32 = 1;
-        let proto = match idx { 1 => "TLSv1.2", 2 => "TLSv1.3", 3 => "SSL", _ => "TLS" };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
         assert_eq!(proto, "TLSv1.2");
     }
 
     #[test]
     fn test_ssl_context_protocol_idx_tls13() {
         let idx: i32 = 2;
-        let proto = match idx { 1 => "TLSv1.2", 2 => "TLSv1.3", 3 => "SSL", _ => "TLS" };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
         assert_eq!(proto, "TLSv1.3");
     }
 
     #[test]
     fn test_ssl_context_protocol_idx_ssl() {
         let idx: i32 = 3;
-        let proto = match idx { 1 => "TLSv1.2", 2 => "TLSv1.3", 3 => "SSL", _ => "TLS" };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
         assert_eq!(proto, "SSL");
     }
 
     #[test]
     fn test_ssl_context_protocol_idx_unknown_defaults_to_tls() {
         let idx: i32 = 99;
-        let proto = match idx { 1 => "TLSv1.2", 2 => "TLSv1.3", 3 => "SSL", _ => "TLS" };
+        let proto = match idx {
+            1 => "TLSv1.2",
+            2 => "TLSv1.3",
+            3 => "SSL",
+            _ => "TLS",
+        };
         assert_eq!(proto, "TLS");
     }
 
@@ -2888,7 +3196,11 @@ mod tls_tests {
         let indices = [CTX_PROTOCOL_IDX, CTX_INITIALIZED, CTX_KM_REF, CTX_TM_REF];
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
-                assert_ne!(indices[i], indices[j], "Duplicate SSLContext field at {} and {}", i, j);
+                assert_ne!(
+                    indices[i], indices[j],
+                    "Duplicate SSLContext field at {} and {}",
+                    i, j
+                );
             }
         }
     }
@@ -2908,13 +3220,22 @@ mod tls_tests {
             ("getApplicationProtocols", "()[Ljava/lang/String;"),
             ("setApplicationProtocols", "([Ljava/lang/String;)V"),
             ("getEndpointIdentificationAlgorithm", "()Ljava/lang/String;"),
-            ("setEndpointIdentificationAlgorithm", "(Ljava/lang/String;)V"),
+            (
+                "setEndpointIdentificationAlgorithm",
+                "(Ljava/lang/String;)V",
+            ),
             ("getNeedClientAuth", "()Z"),
             ("setNeedClientAuth", "(Z)V"),
             ("getWantClientAuth", "()Z"),
             ("setWantClientAuth", "(Z)V"),
-        ].iter().filter(|(name, desc)| r.find(cls, name, desc).is_some()).count();
-        assert_eq!(count, 13, "Expected all 13 SSLParameters methods registered");
+        ]
+        .iter()
+        .filter(|(name, desc)| r.find(cls, name, desc).is_some())
+        .count();
+        assert_eq!(
+            count, 13,
+            "Expected all 13 SSLParameters methods registered"
+        );
     }
 
     #[test]
@@ -2924,10 +3245,16 @@ mod tls_tests {
         let cls = "java/security/KeyStore";
         let all_methods = [
             ("<init>", "()V"),
-            ("getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;"),
+            (
+                "getInstance",
+                "(Ljava/lang/String;)Ljava/security/KeyStore;",
+            ),
             ("getDefaultType", "()Ljava/lang/String;"),
             ("load", "(Ljava/io/InputStream;[C)V"),
-            ("getCertificate", "(Ljava/lang/String;)Ljava/security/cert/Certificate;"),
+            (
+                "getCertificate",
+                "(Ljava/lang/String;)Ljava/security/cert/Certificate;",
+            ),
             ("getKey", "(Ljava/lang/String;[C)Ljava/security/Key;"),
             ("containsAlias", "(Ljava/lang/String;)Z"),
             ("aliases", "()Ljava/util/Enumeration;"),
@@ -3178,7 +3505,9 @@ mod tls_tests {
                 assert!(
                     r_impl.find(cls, name, desc).is_none(),
                     "tls_impl.rs must no longer register {}.{}{} (shadowed by phases_late.rs)",
-                    cls, name, desc,
+                    cls,
+                    name,
+                    desc,
                 );
             }
         }
@@ -3253,7 +3582,9 @@ mod tls_tests {
         // state-machine entry points they rely on still exist by
         // constructing one and walking a minimal client -> server ->
         // FINISHED transition.
-        use crate::tls::tls_impl::{CipherSuite, HandshakeMessage, Tls13StateMachine, TlsExtension};
+        use crate::tls::tls_impl::{
+            CipherSuite, HandshakeMessage, Tls13StateMachine, TlsExtension,
+        };
 
         let mut sm = Tls13StateMachine::new_server();
         let resp = sm

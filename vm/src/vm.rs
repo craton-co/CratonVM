@@ -13,13 +13,13 @@
 //! The interpreter and all helper functions take `(shared: &SharedVm, thread: &mut JvmThread)`
 //! instead of `(vm: &mut Vm)`.
 
-mod vm_init;
 mod vm_exec;
+mod vm_init;
 mod vm_object;
 mod vm_util;
 
-pub use vm_init::*;
 pub use vm_exec::*;
+pub use vm_init::*;
 pub use vm_object::*;
 pub use vm_util::*;
 
@@ -30,9 +30,11 @@ pub use vm_util::*;
 // `#[cfg(all(test, feature = "synthetic-jdk"))]`. The external test
 // files in `vm/tests/` remain available in both feature modes.
 #[cfg(all(test, feature = "synthetic-jdk"))]
-use std::sync::Arc;
+use crate::classloading::resolution::MethodHandleKind;
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::classloading::ClassId;
+#[cfg(all(test, feature = "synthetic-jdk"))]
+use crate::classloading::ClassState;
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::config::VmConfig;
 #[cfg(all(test, feature = "synthetic-jdk"))]
@@ -46,11 +48,9 @@ use crate::threading::jvm_thread::{JvmThread, ThreadId};
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::types::{ObjectRef, Value};
 #[cfg(all(test, feature = "synthetic-jdk"))]
-use crate::classloading::resolution::MethodHandleKind;
-#[cfg(all(test, feature = "synthetic-jdk"))]
-use crate::classloading::ClassState;
-#[cfg(all(test, feature = "synthetic-jdk"))]
 use cratonvm_native_api::NativeContext;
+#[cfg(all(test, feature = "synthetic-jdk"))]
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Tests (synthetic-jdk only РІР‚вЂќ see NEW-11 in docs/roadmap.md)
@@ -262,7 +262,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = create_java_string(&shared, "Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬");
         let result = read_java_string(&shared.heap, obj);
-        assert_eq!(result, Some("Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬".to_string()));
+        assert_eq!(
+            result,
+            Some("Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬".to_string())
+        );
     }
 
     #[test]
@@ -2763,7 +2766,8 @@ mod tests {
             name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Initialized, initializing_thread: None,
+            state: ClassState::Initialized,
+            initializing_thread: None,
             constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
             superclass: None,
@@ -2815,7 +2819,8 @@ mod tests {
             name: cratonvm_types::intern_arc(&class_name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
-            state: ClassState::Initialized, initializing_thread: None,
+            state: ClassState::Initialized,
+            initializing_thread: None,
             constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
             access_flags: ClassAccessFlags::from_bits_truncate(access_flags_raw),
             superclass: None,
@@ -29082,10 +29087,14 @@ mod tests {
             .unwrap();
             let result_obj = match result {
                 Some(Value::Object(Some(o))) => o,
-                other => panic!("expected Java String mirror for key {:?}, got {:?}", key, other),
+                other => panic!(
+                    "expected Java String mirror for key {:?}, got {:?}",
+                    key, other
+                ),
             };
-            read_java_string(&shared.heap, result_obj)
-                .unwrap_or_else(|| panic!("getProperty({:?}) did not return a valid Java String", key))
+            read_java_string(&shared.heap, result_obj).unwrap_or_else(|| {
+                panic!("getProperty({:?}) did not return a valid Java String", key)
+            })
         };
 
         // '=' separator
@@ -33900,8 +33909,8 @@ mod tests {
     #[test]
     fn reflect_method_invoke_static_void() {
         // Test Method.invoke on a static void method (bytecode: return)
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -33934,8 +33943,14 @@ mod tests {
             "java/lang/Class",
             "getDeclaredMethod",
             "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-            &[Value::Object(Some(mirror)), Value::Object(Some(name_str)), Value::Object(None)],
-        ).unwrap() {
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name_str)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method object, got {:?}", other),
         };
@@ -33952,7 +33967,8 @@ mod tests {
                 Value::Object(None), // no receiver (static)
                 Value::Object(None), // no args
             ],
-        ).unwrap();
+        )
+        .unwrap();
         // void methods return null
         assert_eq!(result, Some(Value::Object(None)));
     }
@@ -33961,8 +33977,8 @@ mod tests {
     fn reflect_method_invoke_static_returns_int() {
         // Test Method.invoke on a static method returning int constant 42
         // Bytecode: bipush 42; ireturn
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -33980,8 +33996,8 @@ mod tests {
                     max_stack: 1,
                     max_locals: 0,
                     code: cratonvm_reader::ByteView::from_vec(vec![
-                        0x10, 42,  // bipush 42
-                        0xAC,      // ireturn
+                        0x10, 42,   // bipush 42
+                        0xAC, // ireturn
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
@@ -33997,8 +34013,14 @@ mod tests {
             "java/lang/Class",
             "getDeclaredMethod",
             "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-            &[Value::Object(Some(mirror)), Value::Object(Some(name_str)), Value::Object(None)],
-        ).unwrap() {
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name_str)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
@@ -34015,7 +34037,8 @@ mod tests {
                 Value::Object(None),
                 Value::Object(None),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Result should be a boxed Integer with value 42
         let int_obj = match result {
@@ -34030,8 +34053,8 @@ mod tests {
     fn reflect_method_invoke_static_with_int_param() {
         // Static method: takes int param, returns it doubled
         // Bytecode: iload_0; iload_0; iadd; ireturn
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34049,10 +34072,10 @@ mod tests {
                     max_stack: 2,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![
-                        0x1A,       // iload_0
-                        0x1A,       // iload_0
-                        0x60,       // iadd
-                        0xAC,       // ireturn
+                        0x1A, // iload_0
+                        0x1A, // iload_0
+                        0x60, // iadd
+                        0xAC, // ireturn
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
@@ -34064,8 +34087,14 @@ mod tests {
 
         // Create parameter types array: [int.class]
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,1);
-        let _ = shared.heap.set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
+        let param_types = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            1,
+        );
+        let _ = shared
+            .heap
+            .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
         let method_obj = match call_native(
             &shared,
@@ -34078,17 +34107,29 @@ mod tests {
                 Value::Object(Some(name_str)),
                 Value::Object(Some(param_types)),
             ],
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
 
         // Create args array: [Integer.valueOf(7)]
-        let int_class_id = shared.class_manager.write().load_class("java/lang/Integer").unwrap();
-        let args_array = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,1);
+        let int_class_id = shared
+            .class_manager
+            .write()
+            .load_class("java/lang/Integer")
+            .unwrap();
+        let args_array = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            1,
+        );
         let boxed_7 = shared.heap.alloc_object(int_class_id, 1);
         shared.heap.set_field(boxed_7, 0, Value::Int(7));
-        let _ = shared.heap.set_array_element(args_array, 0, Value::Object(Some(boxed_7)));
+        let _ = shared
+            .heap
+            .set_array_element(args_array, 0, Value::Object(Some(boxed_7)));
 
         // Method.invoke(null, [Integer(7)])
         let result = call_native(
@@ -34102,7 +34143,8 @@ mod tests {
                 Value::Object(None),
                 Value::Object(Some(args_array)),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should return Integer(14) РІР‚вЂќ 7 doubled
         let int_obj = match result {
@@ -34117,8 +34159,8 @@ mod tests {
         // Instance method on an object with field 0 = int value
         // Method returns field 0 of this: aload_0; getfield #?
         // Since getfield needs constant pool, use simpler: iload_1; ireturn (identity on arg)
-        use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34143,8 +34185,8 @@ mod tests {
                     max_stack: 1,
                     max_locals: 2, // this + int param
                     code: cratonvm_reader::ByteView::from_vec(vec![
-                        0x1B,  // iload_1 (first int param)
-                        0xAC,  // ireturn
+                        0x1B, // iload_1 (first int param)
+                        0xAC, // ireturn
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
@@ -34159,8 +34201,14 @@ mod tests {
 
         let name_str = create_java_string(&shared, "identity");
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,1);
-        let _ = shared.heap.set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
+        let param_types = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            1,
+        );
+        let _ = shared
+            .heap
+            .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
         let method_obj = match call_native(
             &shared,
@@ -34173,17 +34221,29 @@ mod tests {
                 Value::Object(Some(name_str)),
                 Value::Object(Some(param_types)),
             ],
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
 
         // Create args: [Integer(55)]
-        let int_class_id = shared.class_manager.write().load_class("java/lang/Integer").unwrap();
-        let args_array = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,1);
+        let int_class_id = shared
+            .class_manager
+            .write()
+            .load_class("java/lang/Integer")
+            .unwrap();
+        let args_array = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            1,
+        );
         let boxed_55 = shared.heap.alloc_object(int_class_id, 1);
         shared.heap.set_field(boxed_55, 0, Value::Int(55));
-        let _ = shared.heap.set_array_element(args_array, 0, Value::Object(Some(boxed_55)));
+        let _ = shared
+            .heap
+            .set_array_element(args_array, 0, Value::Object(Some(boxed_55)));
 
         // Method.invoke(receiver, [Integer(55)])
         let result = call_native(
@@ -34197,7 +34257,8 @@ mod tests {
                 Value::Object(Some(receiver)),
                 Value::Object(Some(args_array)),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should return Integer(55) РІР‚вЂќ identity function
         let int_obj = match result {
@@ -34210,8 +34271,8 @@ mod tests {
     #[test]
     fn reflect_method_invoke_null_receiver_throws() {
         // Calling instance method with null receiver should throw NullPointerException
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34243,8 +34304,14 @@ mod tests {
             "java/lang/Class",
             "getDeclaredMethod",
             "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-            &[Value::Object(Some(mirror)), Value::Object(Some(name_str)), Value::Object(None)],
-        ).unwrap() {
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name_str)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
@@ -34262,15 +34329,18 @@ mod tests {
                 Value::Object(None),
             ],
         );
-        assert!(result.is_err(), "Expected NullPointerException for null receiver");
+        assert!(
+            result.is_err(),
+            "Expected NullPointerException for null receiver"
+        );
     }
 
     #[test]
     fn reflect_method_invoke_static_two_params() {
         // Static method: add(int a, int b) returns a + b
         // Bytecode: iload_0; iload_1; iadd; ireturn
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34303,9 +34373,17 @@ mod tests {
 
         // Parameter types: [int.class, int.class]
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,2);
-        let _ = shared.heap.set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
-        let _ = shared.heap.set_array_element(param_types, 1, Value::Object(Some(int_mirror)));
+        let param_types = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            2,
+        );
+        let _ = shared
+            .heap
+            .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
+        let _ = shared
+            .heap
+            .set_array_element(param_types, 1, Value::Object(Some(int_mirror)));
 
         let method_obj = match call_native(
             &shared,
@@ -34318,20 +34396,34 @@ mod tests {
                 Value::Object(Some(name_str)),
                 Value::Object(Some(param_types)),
             ],
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
 
         // Args: [Integer(10), Integer(32)]
-        let int_class_id = shared.class_manager.write().load_class("java/lang/Integer").unwrap();
-        let args_array = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,2);
+        let int_class_id = shared
+            .class_manager
+            .write()
+            .load_class("java/lang/Integer")
+            .unwrap();
+        let args_array = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            2,
+        );
         let boxed_10 = shared.heap.alloc_object(int_class_id, 1);
         shared.heap.set_field(boxed_10, 0, Value::Int(10));
         let boxed_32 = shared.heap.alloc_object(int_class_id, 1);
         shared.heap.set_field(boxed_32, 0, Value::Int(32));
-        let _ = shared.heap.set_array_element(args_array, 0, Value::Object(Some(boxed_10)));
-        let _ = shared.heap.set_array_element(args_array, 1, Value::Object(Some(boxed_32)));
+        let _ = shared
+            .heap
+            .set_array_element(args_array, 0, Value::Object(Some(boxed_10)));
+        let _ = shared
+            .heap
+            .set_array_element(args_array, 1, Value::Object(Some(boxed_32)));
 
         let result = call_native(
             &shared,
@@ -34344,7 +34436,8 @@ mod tests {
                 Value::Object(None),
                 Value::Object(Some(args_array)),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let int_obj = match result {
             Some(Value::Object(Some(obj))) => obj,
@@ -34357,8 +34450,8 @@ mod tests {
     fn reflect_method_invoke_returns_long() {
         // Static method: returns long constant
         // Bytecode: ldc2_w would need constant pool; use lconst_1; lreturn instead
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34393,8 +34486,14 @@ mod tests {
             "java/lang/Class",
             "getDeclaredMethod",
             "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-            &[Value::Object(Some(mirror)), Value::Object(Some(name_str)), Value::Object(None)],
-        ).unwrap() {
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(Some(name_str)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
@@ -34410,7 +34509,8 @@ mod tests {
                 Value::Object(None),
                 Value::Object(None),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should return boxed Long(1)
         let long_obj = match result {
@@ -34444,8 +34544,14 @@ mod tests {
         let name_str = create_java_string(&shared, "compute");
 
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference,1);
-        let _ = shared.heap.set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
+        let param_types = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            1,
+        );
+        let _ = shared
+            .heap
+            .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
         let method_obj = match call_native(
             &shared,
@@ -34458,7 +34564,9 @@ mod tests {
                 Value::Object(Some(name_str)),
                 Value::Object(Some(param_types)),
             ],
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(m))) => m,
             other => panic!("Expected Method, got {:?}", other),
         };
@@ -34471,7 +34579,8 @@ mod tests {
             "getName",
             "()Ljava/lang/String;",
             &[Value::Object(Some(method_obj))],
-        ).unwrap();
+        )
+        .unwrap();
         let name_obj = match name_result {
             Some(Value::Object(Some(s))) => s,
             other => panic!("Expected String, got {:?}", other),
@@ -34487,7 +34596,8 @@ mod tests {
             "getModifiers",
             "()I",
             &[Value::Object(Some(method_obj))],
-        ).unwrap();
+        )
+        .unwrap();
         let mods_val = match mods {
             Some(Value::Int(v)) => v,
             other => panic!("Expected int, got {:?}", other),
@@ -34527,13 +34637,19 @@ mod tests {
             "getDeclaredMethods",
             "()[Ljava/lang/reflect/Method;",
             &[Value::Object(Some(mirror))],
-        ).unwrap() {
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(a))) => a,
             _ => panic!("Expected array"),
         };
         assert_eq!(shared.heap.array_length(methods_arr), 1);
 
-        let method_obj = match shared.heap.get_array_element(methods_arr, 0).unwrap_or(Value::Object(None)) {
+        let method_obj = match shared
+            .heap
+            .get_array_element(methods_arr, 0)
+            .unwrap_or(Value::Object(None))
+        {
             Value::Object(Some(m)) => m,
             _ => panic!("Expected Method"),
         };
@@ -34546,7 +34662,8 @@ mod tests {
             "getParameterCount",
             "()I",
             &[Value::Object(Some(method_obj))],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(count, Some(Value::Int(3))); // int, long, double = 3 params
     }
 
@@ -34567,8 +34684,8 @@ mod tests {
     #[test]
     fn m19_class_declares_finalize_detected() {
         // A class overriding finalize()V should have declares_finalize() == true
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -34599,8 +34716,6 @@ mod tests {
     #[test]
     fn m19_run_pending_finalizers_invokes_finalize() {
         // Create a class with a finalize() method that sets a static field to 42
-        
-        
 
         let mut vm = Vm::new(VmConfig::default());
 
@@ -34632,8 +34747,8 @@ mod tests {
         // Register a test class with a finalize()V bytecode method (just return),
         // allocate an object of that class, enqueue for finalization, and verify
         // run_pending_finalizers invokes it.
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -34665,13 +34780,17 @@ mod tests {
         };
         let count = vm.run_pending_finalizers();
         assert_eq!(count, 1, "Should have finalized 1 object");
-        assert_eq!(vm.shared.finalizer_thread.pending_count(), 0, "Queue should be empty");
+        assert_eq!(
+            vm.shared.finalizer_thread.pending_count(),
+            0,
+            "Queue should be empty"
+        );
     }
 
     #[test]
     fn m19_multiple_finalizers_run_in_order() {
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -41216,13 +41335,32 @@ mod tests {
         assert!(result.is_err(), "start() with no command should fail");
         // Set up a command list and start a real process
         let cmd_str = create_java_string(&shared, if cfg!(windows) { "cmd" } else { "echo" });
-        let arg_str = create_java_string(&shared, if cfg!(windows) { "/C echo hello" } else { "hello" });
-        let cmd_arr = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference, 2);
-        shared.heap.set_array_element(cmd_arr, 0, Value::Object(Some(cmd_str))).unwrap();
-        shared.heap.set_array_element(cmd_arr, 1, Value::Object(Some(arg_str))).unwrap();
+        let arg_str = create_java_string(
+            &shared,
+            if cfg!(windows) {
+                "/C echo hello"
+            } else {
+                "hello"
+            },
+        );
+        let cmd_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            2,
+        );
+        shared
+            .heap
+            .set_array_element(cmd_arr, 0, Value::Object(Some(cmd_str)))
+            .unwrap();
+        shared
+            .heap
+            .set_array_element(cmd_arr, 1, Value::Object(Some(arg_str)))
+            .unwrap();
         // Store command array as an ArrayList-like object in field 0
         let cmd_list = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(cmd_list, 0, Value::Object(Some(cmd_arr)));
+        shared
+            .heap
+            .set_field(cmd_list, 0, Value::Object(Some(cmd_arr)));
         shared.heap.set_field(cmd_list, 1, Value::Int(2));
         let pb2 = shared.heap.alloc_object(ClassId::new(0), 4);
         shared.heap.set_field(pb2, 0, Value::Object(Some(cmd_list)));
@@ -41740,8 +41878,11 @@ mod tests {
         .unwrap();
         // Internal DONE field encodes 1 (completed normally) or 2 (completed
         // exceptionally); either counts as done for the isDone() boolean.
-        assert!(matches!(done, Value::Int(v) if v != 0),
-            "expected non-zero done flag, got {:?}", done);
+        assert!(
+            matches!(done, Value::Int(v) if v != 0),
+            "expected non-zero done flag, got {:?}",
+            done
+        );
     }
 
     #[test]
@@ -42633,8 +42774,11 @@ mod tests {
         // test thread isn't registered in the shared VM thread table; the
         // handler returns the raw count so it can be 0 when the registry is
         // empty and >= 1 otherwise. Both are valid responses here.
-        assert!(matches!(count, Value::Int(v) if v >= 0),
-            "expected non-negative thread count, got {:?}", count);
+        assert!(
+            matches!(count, Value::Int(v) if v >= 0),
+            "expected non-negative thread count, got {:?}",
+            count
+        );
         let total = call_native(
             &shared,
             &mut thread,
@@ -42650,8 +42794,11 @@ mod tests {
         // which is 0 in the unit-test harness for the same registry reason
         // the count>=0 check above tolerates. Spec (JDK 25 ThreadMXBean)
         // permits 0 when no threads have been started via the shared table.
-        assert!(matches!(total, Value::Long(v) if v >= 0),
-            "expected non-negative total started threads, got {:?}", total);
+        assert!(
+            matches!(total, Value::Long(v) if v >= 0),
+            "expected non-negative total started threads, got {:?}",
+            total
+        );
     }
 
     #[test]
@@ -42709,7 +42856,8 @@ mod tests {
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
-            zw.write_all(b"Manifest-Version: 1.0\r\nMain-Class: Foo\r\n\r\n").unwrap();
+            zw.write_all(b"Manifest-Version: 1.0\r\nMain-Class: Foo\r\n\r\n")
+                .unwrap();
             // A dummy class entry РІР‚вЂќ the test exercises JAR IO, not class loading.
             zw.start_file("Foo.class", opts).unwrap();
             zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
@@ -43335,8 +43483,11 @@ mod tests {
         // The real http2 send handler returns status=0 for a null HttpRequest.
         // The older phases_late stub returned 200. Both outcomes are valid
         // depending on which overlay registered last.
-        assert!(matches!(status, Value::Int(s) if s == 0 || s == 200),
-            "expected status 0 or 200, got {:?}", status);
+        assert!(
+            matches!(status, Value::Int(s) if s == 0 || s == 200),
+            "expected status 0 or 200, got {:?}",
+            status
+        );
     }
 
     #[test]
@@ -43448,8 +43599,11 @@ mod tests {
             &[Value::Object(Some(sub)), Value::Long(5)],
         )
         .unwrap();
-        assert_eq!(shared.heap.get_field(sub, 0), Value::Int(0),
-            "cancel flag must stay 0 after request()");
+        assert_eq!(
+            shared.heap.get_field(sub, 0),
+            Value::Int(0),
+            "cancel flag must stay 0 after request()"
+        );
         // Request 3 more РІР‚вЂќ same no-panic check
         call_native(
             &shared,
@@ -45603,14 +45757,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Build an empty URL[] array
-        let url_arr = shared
-            .heap
-            .alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference, 0);
+        let url_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            0,
+        );
 
         // Create URLClassLoader with the empty URL array (6 fields: parent=0, name=1, classes=2, package2module=3, urls=4, loader_id=5)
-        let ucl = shared
-            .heap
-            .alloc_object(ClassId::new(0), 6);
+        let ucl = shared.heap.alloc_object(ClassId::new(0), 6);
 
         call_native(
             &shared,
@@ -45642,9 +45796,11 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let url_arr = shared
-            .heap
-            .alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Reference, 0);
+        let url_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Reference,
+            0,
+        );
 
         let result = call_native(
             &shared,
@@ -45765,7 +45921,8 @@ mod tests {
                 let opts = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Stored);
                 // Use a comment to test comment-stripping
-                zw.start_file("META-INF/services/java.lang.String", opts).unwrap();
+                zw.start_file("META-INF/services/java.lang.String", opts)
+                    .unwrap();
                 zw.write_all(b"# comment\n\njava.lang.String\n").unwrap();
                 zw.finish().unwrap();
             }
@@ -45781,13 +45938,18 @@ mod tests {
                 let cm = shared.class_manager.read();
                 cm.find_resource("META-INF/services/java.lang.String")
             };
-            assert!(found.is_some(), "META-INF/services/java.lang.String should be found");
+            assert!(
+                found.is_some(),
+                "META-INF/services/java.lang.String should be found"
+            );
             let content = String::from_utf8(found.unwrap()).unwrap();
             assert!(content.contains("java.lang.String"));
 
             // Build a Class mirror with the real String ClassId
             let mirror = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(mirror, 0, Value::Int(sid.as_u32() as i32));
+            shared
+                .heap
+                .set_field(mirror, 0, Value::Int(sid.as_u32() as i32));
 
             // ServiceLoader.load(Class) + stream()
             let sl = call_native(
@@ -48669,7 +48831,10 @@ mod tests {
                 "()[B",
                 &[Value::Object(Some(obj))],
             );
-            assert!(res.is_err(), "doFinal before init must throw IllegalStateException per JDK spec");
+            assert!(
+                res.is_err(),
+                "doFinal before init must throw IllegalStateException per JDK spec"
+            );
 
             // init
             call_native(
@@ -49163,8 +49328,8 @@ mod tests {
                 //   6 = session. We allocate 8 slots to stay forward
                 //   compatible with future layout growth.
                 let test_eng = shared.heap.alloc_object(ClassId::new(0), 8);
-                shared.heap.set_field(test_eng, 0, Value::Int(1));  // client_mode
-                shared.heap.set_field(test_eng, 5, Value::Int(0));  // handshake_status = NOT_HANDSHAKING
+                shared.heap.set_field(test_eng, 0, Value::Int(1)); // client_mode
+                shared.heap.set_field(test_eng, 5, Value::Int(0)); // handshake_status = NOT_HANDSHAKING
 
                 // setUseClientMode on the directly-allocated engine
                 call_native(
@@ -52520,7 +52685,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("com/example/Point"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52551,11 +52717,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             cm.register_class_name(ClassLoaderId::Application, "com/example/Point", id);
             id
@@ -52601,7 +52767,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("com/example/Point2D"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52632,11 +52799,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             let id2 = cm.class_store.next_id();
             cm.class_store.add(Class {
@@ -52645,7 +52812,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("com/example/Size"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52676,11 +52844,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             (id1, id2)
         };
@@ -52750,7 +52918,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("test/Record1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52775,11 +52944,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             let sid = cm.class_store.next_id();
@@ -52789,7 +52958,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("test/Sealed1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52811,11 +52981,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             let pid = cm.class_store.next_id();
@@ -52825,7 +52995,8 @@ mod tests {
                 name: cratonvm_types::intern_arc("test/Plain1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
-                state: ClassState::Loaded, initializing_thread: None,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
                     cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
@@ -52847,11 +53018,11 @@ mod tests {
                 enclosing_method: None,
                 hidden: false,
                 module_name: None,
-            is_synthetic_stub: false,
-            has_finalizer: false,
-            code_source: None,
-            array_info: None,
-            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                is_synthetic_stub: false,
+                has_finalizer: false,
+                code_source: None,
+                array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             (rid, sid, pid)
@@ -55383,7 +55554,10 @@ mod tests {
         ];
         for class_name in &classes {
             let result = shared.class_manager.write().load_class(class_name);
-            assert!(result.is_ok(), "Loading {class_name} should succeed: {result:?}");
+            assert!(
+                result.is_ok(),
+                "Loading {class_name} should succeed: {result:?}"
+            );
         }
     }
 
@@ -55393,13 +55567,13 @@ mod tests {
         // bytecode verification. This tests R1: interface subtyping in verifier.
         // The class has a method calling Pattern.matcher(CharSequence) with a String arg.
         use crate::classloading::bytecode_verifier::verify_bytecode;
+        use crate::{Class, ClassId, ClassLoaderId, ClassState};
         use cratonvm_reader::attribute::{Attribute, CodeAttribute};
         use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         use cratonvm_reader::method::ClassFileMethod;
-        use cratonvm_reader::class_access_flags::MethodAccessFlags;
-        use crate::{Class, ClassId, ClassLoaderId, ClassState};
 
         // This tests the invokevirtual arg-type check:
         //   pop_typed(frame, ObjectRef("CharSequence"), hierarchy)
@@ -55423,9 +55597,15 @@ mod tests {
         // 6: Utf8 "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
         let cp = ConstantPool::new(vec![
             ConstantPoolEntry::Tombstone,
-            ConstantPoolEntry::MethodReference { class_index: 2, name_and_type_index: 3 },
+            ConstantPoolEntry::MethodReference {
+                class_index: 2,
+                name_and_type_index: 3,
+            },
             ConstantPoolEntry::ClassReference { name_index: 4 },
-            ConstantPoolEntry::NameAndType { name_index: 5, descriptor_index: 6 },
+            ConstantPoolEntry::NameAndType {
+                name_index: 5,
+                descriptor_index: 6,
+            },
             ConstantPoolEntry::Utf8("java/util/regex/Pattern".into()),
             ConstantPoolEntry::Utf8("matcher".into()),
             ConstantPoolEntry::Utf8("(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;".into()),
@@ -55442,10 +55622,10 @@ mod tests {
             max_stack: 2,
             max_locals: 2,
             code: cratonvm_reader::ByteView::from_vec(vec![
-                0x2B,             // aload_1 (Pattern, local 1)
-                0x2A,             // aload_0 (String, local 0)
+                0x2B, // aload_1 (Pattern, local 1)
+                0x2A, // aload_0 (String, local 0)
                 0xB6, 0x00, 0x01, // invokevirtual #1  Pattern.matcher(CharSequence)
-                0xB0,             // areturn (return Matcher)
+                0xB0, // areturn (return Matcher)
             ]),
             exception_table: vec![],
             attributes: vec![],
@@ -55454,7 +55634,9 @@ mod tests {
         let method = ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("testMethod"),
-            descriptor: Arc::from("(Ljava/lang/String;Ljava/util/regex/Pattern;)Ljava/util/regex/Matcher;"),
+            descriptor: Arc::from(
+                "(Ljava/lang/String;Ljava/util/regex/Pattern;)Ljava/util/regex/Matcher;",
+            ),
             attributes: vec![Attribute::Code(code)],
         };
 
@@ -55464,7 +55646,8 @@ mod tests {
             name: cratonvm_types::intern_arc("TestClass"),
             source_file: None,
             version: ClassFileVersion::JAVA_11,
-            state: ClassState::Verifying, initializing_thread: None,
+            state: ClassState::Verifying,
+            initializing_thread: None,
             constant_pool: cp,
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
             superclass: None,
@@ -55568,7 +55751,10 @@ mod tests {
 
     /// Allocate an object with a proper ClassId registered under `class_name`.
     fn alloc_named(vm: &mut Vm, class_name: &str, fields: usize) -> crate::types::ObjectRef {
-        let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+        let mut ctx = NativeContextImpl {
+            shared: &vm.shared,
+            thread: &mut vm.main_thread,
+        };
         match ctx.ensure_class_initialized(class_name) {
             Ok(cid) => ctx.alloc_object(cid, fields),
             Err(_) => ctx.alloc_object(ClassId::new(0), fields),
@@ -55583,43 +55769,102 @@ mod tests {
 
         // --- Write side: DOS РІвЂ вЂ™ BAOS ---
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "<init>", "()V",
-            &[Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap();
 
         let dos = alloc_named(&mut vm, "java/io/DataOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "<init>", "(Ljava/io/OutputStream;)V",
-            &[Value::Object(Some(dos)), Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "<init>",
+            "(Ljava/io/OutputStream;)V",
+            &[Value::Object(Some(dos)), Value::Object(Some(baos))],
+        )
+        .unwrap();
 
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "writeInt", "(I)V",
-            &[Value::Object(Some(dos)), Value::Int(0x12345678)]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "writeInt",
+            "(I)V",
+            &[Value::Object(Some(dos)), Value::Int(0x12345678)],
+        )
+        .unwrap();
 
-        let arr = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "toByteArray", "()[B",
-            &[Value::Object(Some(baos))]).unwrap().unwrap();
-        let byte_arr = match arr { Value::Object(Some(a)) => a, _ => panic!("expected array") };
+        let arr = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "toByteArray",
+            "()[B",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap()
+        .unwrap();
+        let byte_arr = match arr {
+            Value::Object(Some(a)) => a,
+            _ => panic!("expected array"),
+        };
         assert_eq!(vm.shared.heap.array_length(byte_arr), 4);
-        assert_eq!(vm.shared.heap.get_array_element(byte_arr, 0), Ok(Value::Int(0x12)));
-        assert_eq!(vm.shared.heap.get_array_element(byte_arr, 1), Ok(Value::Int(0x34)));
-        assert_eq!(vm.shared.heap.get_array_element(byte_arr, 2), Ok(Value::Int(0x56)));
-        assert_eq!(vm.shared.heap.get_array_element(byte_arr, 3), Ok(Value::Int(0x78)));
+        assert_eq!(
+            vm.shared.heap.get_array_element(byte_arr, 0),
+            Ok(Value::Int(0x12))
+        );
+        assert_eq!(
+            vm.shared.heap.get_array_element(byte_arr, 1),
+            Ok(Value::Int(0x34))
+        );
+        assert_eq!(
+            vm.shared.heap.get_array_element(byte_arr, 2),
+            Ok(Value::Int(0x56))
+        );
+        assert_eq!(
+            vm.shared.heap.get_array_element(byte_arr, 3),
+            Ok(Value::Int(0x78))
+        );
 
         // --- Read side: DIS РІвЂ С’ BAIS ---
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))],
+        )
+        .unwrap();
 
         let dis = alloc_named(&mut vm, "java/io/DataInputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "<init>", "(Ljava/io/InputStream;)V",
-            &[Value::Object(Some(dis)), Value::Object(Some(bais))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            &[Value::Object(Some(dis)), Value::Object(Some(bais))],
+        )
+        .unwrap();
 
-        let val = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readInt", "()I",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let val = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readInt",
+            "()I",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(val, Value::Int(0x12345678));
     }
 
@@ -55629,38 +55874,88 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "<init>", "()V",
-            &[Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap();
 
         let dos = alloc_named(&mut vm, "java/io/DataOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "<init>", "(Ljava/io/OutputStream;)V",
-            &[Value::Object(Some(dos)), Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "<init>",
+            "(Ljava/io/OutputStream;)V",
+            &[Value::Object(Some(dos)), Value::Object(Some(baos))],
+        )
+        .unwrap();
 
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "writeLong", "(J)V",
-            &[Value::Object(Some(dos)), Value::Long(0x0102030405060708_i64)]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "writeLong",
+            "(J)V",
+            &[
+                Value::Object(Some(dos)),
+                Value::Long(0x0102030405060708_i64),
+            ],
+        )
+        .unwrap();
 
-        let arr = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "toByteArray", "()[B",
-            &[Value::Object(Some(baos))]).unwrap().unwrap();
-        let byte_arr = match arr { Value::Object(Some(a)) => a, _ => panic!("expected array") };
+        let arr = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "toByteArray",
+            "()[B",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap()
+        .unwrap();
+        let byte_arr = match arr {
+            Value::Object(Some(a)) => a,
+            _ => panic!("expected array"),
+        };
         assert_eq!(vm.shared.heap.array_length(byte_arr), 8);
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))],
+        )
+        .unwrap();
 
         let dis = alloc_named(&mut vm, "java/io/DataInputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "<init>", "(Ljava/io/InputStream;)V",
-            &[Value::Object(Some(dis)), Value::Object(Some(bais))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            &[Value::Object(Some(dis)), Value::Object(Some(bais))],
+        )
+        .unwrap();
 
-        let val = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readLong", "()J",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let val = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readLong",
+            "()J",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(val, Value::Long(0x0102030405060708_i64));
     }
 
@@ -55670,41 +55965,91 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "<init>", "()V",
-            &[Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap();
 
         let dos = alloc_named(&mut vm, "java/io/DataOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "<init>", "(Ljava/io/OutputStream;)V",
-            &[Value::Object(Some(dos)), Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "<init>",
+            "(Ljava/io/OutputStream;)V",
+            &[Value::Object(Some(dos)), Value::Object(Some(baos))],
+        )
+        .unwrap();
 
         let hello = create_java_string(&vm.shared, "Hello");
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "writeUTF", "(Ljava/lang/String;)V",
-            &[Value::Object(Some(dos)), Value::Object(Some(hello))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "writeUTF",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(dos)), Value::Object(Some(hello))],
+        )
+        .unwrap();
 
-        let arr = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "toByteArray", "()[B",
-            &[Value::Object(Some(baos))]).unwrap().unwrap();
-        let byte_arr = match arr { Value::Object(Some(a)) => a, _ => panic!("expected array") };
+        let arr = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "toByteArray",
+            "()[B",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap()
+        .unwrap();
+        let byte_arr = match arr {
+            Value::Object(Some(a)) => a,
+            _ => panic!("expected array"),
+        };
         // 2 bytes length prefix + 5 bytes "Hello"
         assert_eq!(vm.shared.heap.array_length(byte_arr), 7);
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(byte_arr))],
+        )
+        .unwrap();
 
         let dis = alloc_named(&mut vm, "java/io/DataInputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "<init>", "(Ljava/io/InputStream;)V",
-            &[Value::Object(Some(dis)), Value::Object(Some(bais))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            &[Value::Object(Some(dis)), Value::Object(Some(bais))],
+        )
+        .unwrap();
 
-        let sval = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readUTF", "()Ljava/lang/String;",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
-        let sref = match sval { Value::Object(Some(o)) => o, _ => panic!("expected string") };
+        let sval = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readUTF",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
+        let sref = match sval {
+            Value::Object(Some(o)) => o,
+            _ => panic!("expected string"),
+        };
         let s = read_java_string(&vm.shared.heap, sref).unwrap();
         assert_eq!(s, "Hello");
     }
@@ -55715,36 +56060,81 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "<init>", "()V",
-            &[Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap();
 
         let dos = alloc_named(&mut vm, "java/io/DataOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "<init>", "(Ljava/io/OutputStream;)V",
-            &[Value::Object(Some(dos)), Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "<init>",
+            "(Ljava/io/OutputStream;)V",
+            &[Value::Object(Some(dos)), Value::Object(Some(baos))],
+        )
+        .unwrap();
 
-        let sz0 = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "size", "()I",
-            &[Value::Object(Some(dos))]).unwrap().unwrap();
+        let sz0 = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "size",
+            "()I",
+            &[Value::Object(Some(dos))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sz0, Value::Int(0));
 
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "writeShort", "(I)V",
-            &[Value::Object(Some(dos)), Value::Int(0xABCD)]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "writeShort",
+            "(I)V",
+            &[Value::Object(Some(dos)), Value::Int(0xABCD)],
+        )
+        .unwrap();
 
-        let sz2 = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "size", "()I",
-            &[Value::Object(Some(dos))]).unwrap().unwrap();
+        let sz2 = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "size",
+            "()I",
+            &[Value::Object(Some(dos))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sz2, Value::Int(2));
 
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "writeInt", "(I)V",
-            &[Value::Object(Some(dos)), Value::Int(1)]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "writeInt",
+            "(I)V",
+            &[Value::Object(Some(dos)), Value::Int(1)],
+        )
+        .unwrap();
 
-        let sz6 = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataOutputStream", "size", "()I",
-            &[Value::Object(Some(dos))]).unwrap().unwrap();
+        let sz6 = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataOutputStream",
+            "size",
+            "()I",
+            &[Value::Object(Some(dos))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sz6, Value::Int(6));
     }
 
@@ -55754,33 +56144,71 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         // Source: ByteArrayInputStream([1,2,3,4,5])
-        let src_arr = vm.shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 5);
+        let src_arr = vm
+            .shared
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Byte, 5);
         for i in 0..5usize {
-            let _ = vm.shared.heap.set_array_element(src_arr, i, Value::Int((i + 1) as i32));
+            let _ = vm
+                .shared
+                .heap
+                .set_array_element(src_arr, i, Value::Int((i + 1) as i32));
         }
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))],
+        )
+        .unwrap();
 
         // Destination: ByteArrayOutputStream
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "<init>", "()V",
-            &[Value::Object(Some(baos))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap();
 
-        let transferred = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/InputStream", "transferTo", "(Ljava/io/OutputStream;)J",
-            &[Value::Object(Some(bais)), Value::Object(Some(baos))]).unwrap().unwrap();
+        let transferred = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/InputStream",
+            "transferTo",
+            "(Ljava/io/OutputStream;)J",
+            &[Value::Object(Some(bais)), Value::Object(Some(baos))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(transferred, Value::Long(5));
 
-        let dest_arr = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayOutputStream", "toByteArray", "()[B",
-            &[Value::Object(Some(baos))]).unwrap().unwrap();
-        let dest_ref = match dest_arr { Value::Object(Some(a)) => a, _ => panic!("expected array") };
+        let dest_arr = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayOutputStream",
+            "toByteArray",
+            "()[B",
+            &[Value::Object(Some(baos))],
+        )
+        .unwrap()
+        .unwrap();
+        let dest_ref = match dest_arr {
+            Value::Object(Some(a)) => a,
+            _ => panic!("expected array"),
+        };
         assert_eq!(vm.shared.heap.array_length(dest_ref), 5);
         for i in 0..5usize {
-            assert_eq!(vm.shared.heap.get_array_element(dest_ref, i), Ok(Value::Int((i + 1) as i32)));
+            assert_eq!(
+                vm.shared.heap.get_array_element(dest_ref, i),
+                Ok(Value::Int((i + 1) as i32))
+            );
         }
     }
 
@@ -55789,20 +56217,39 @@ mod tests {
     fn input_stream_read_all_bytes_p72() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let src_arr = vm.shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
+        let src_arr = vm
+            .shared
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
         let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(10));
         let _ = vm.shared.heap.set_array_element(src_arr, 1, Value::Int(20));
         let _ = vm.shared.heap.set_array_element(src_arr, 2, Value::Int(30));
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))],
+        )
+        .unwrap();
 
-        let result = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/InputStream", "readAllBytes", "()[B",
-            &[Value::Object(Some(bais))]).unwrap().unwrap();
-        let arr = match result { Value::Object(Some(a)) => a, _ => panic!("expected array") };
+        let result = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/InputStream",
+            "readAllBytes",
+            "()[B",
+            &[Value::Object(Some(bais))],
+        )
+        .unwrap()
+        .unwrap();
+        let arr = match result {
+            Value::Object(Some(a)) => a,
+            _ => panic!("expected array"),
+        };
         assert_eq!(vm.shared.heap.array_length(arr), 3);
         assert_eq!(vm.shared.heap.get_array_element(arr, 0), Ok(Value::Int(10)));
         assert_eq!(vm.shared.heap.get_array_element(arr, 1), Ok(Value::Int(20)));
@@ -55815,50 +56262,111 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         // [1, 0xFF, 0x01, 0x02, 0x00, 0x41, 0]
-        let src_arr = vm.shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 7);
-        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(1));     // readBoolean РІвЂ вЂ™ true
-        let _ = vm.shared.heap.set_array_element(src_arr, 1, Value::Int(0xFF));  // readByte РІвЂ вЂ™ -1
-        let _ = vm.shared.heap.set_array_element(src_arr, 2, Value::Int(0x01));  // readShort hi
-        let _ = vm.shared.heap.set_array_element(src_arr, 3, Value::Int(0x02));  // readShort lo РІвЂ вЂ™ 258
-        let _ = vm.shared.heap.set_array_element(src_arr, 4, Value::Int(0x00));  // readUnsignedShort hi
-        let _ = vm.shared.heap.set_array_element(src_arr, 5, Value::Int(0x41));  // readUnsignedShort lo РІвЂ вЂ™ 65
+        let src_arr = vm
+            .shared
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Byte, 7);
+        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(1)); // readBoolean РІвЂ вЂ™ true
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(src_arr, 1, Value::Int(0xFF)); // readByte РІвЂ вЂ™ -1
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(src_arr, 2, Value::Int(0x01)); // readShort hi
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(src_arr, 3, Value::Int(0x02)); // readShort lo РІвЂ вЂ™ 258
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(src_arr, 4, Value::Int(0x00)); // readUnsignedShort hi
+        let _ = vm
+            .shared
+            .heap
+            .set_array_element(src_arr, 5, Value::Int(0x41)); // readUnsignedShort lo РІвЂ вЂ™ 65
         let _ = vm.shared.heap.set_array_element(src_arr, 6, Value::Int(0));
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/ByteArrayInputStream", "<init>", "([B)V",
-            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/ByteArrayInputStream",
+            "<init>",
+            "([B)V",
+            &[Value::Object(Some(bais)), Value::Object(Some(src_arr))],
+        )
+        .unwrap();
 
         let dis = alloc_named(&mut vm, "java/io/DataInputStream", 2);
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "<init>", "(Ljava/io/InputStream;)V",
-            &[Value::Object(Some(dis)), Value::Object(Some(bais))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            &[Value::Object(Some(dis)), Value::Object(Some(bais))],
+        )
+        .unwrap();
 
-        let b = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readBoolean", "()Z",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let b = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readBoolean",
+            "()Z",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(b, Value::Int(1));
 
-        let byte_val = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readByte", "()B",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let byte_val = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readByte",
+            "()B",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(byte_val, Value::Int(-1)); // 0xFF as signed byte
 
-        let short_val = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readShort", "()S",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let short_val = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readShort",
+            "()S",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(short_val, Value::Int(258)); // 0x0102
 
-        let ushort_val = call_native(&vm.shared, &mut vm.main_thread,
-            "java/io/DataInputStream", "readUnsignedShort", "()I",
-            &[Value::Object(Some(dis))]).unwrap().unwrap();
+        let ushort_val = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/io/DataInputStream",
+            "readUnsignedShort",
+            "()I",
+            &[Value::Object(Some(dis))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(ushort_val, Value::Int(65)); // 0x0041
     }
 
     #[test]
     fn string_join_array() {
         let mut vm = Vm::new(VmConfig::default());
-        let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+        let mut ctx = NativeContextImpl {
+            shared: &vm.shared,
+            thread: &mut vm.main_thread,
+        };
 
         let delim = ctx.create_string(", ");
         let a = ctx.create_string("a");
@@ -55871,14 +56379,20 @@ mod tests {
         drop(ctx);
 
         let result = call_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/String", "join",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/String",
+            "join",
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;",
             &[Value::Object(Some(delim)), Value::Object(Some(arr))],
-        ).unwrap();
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(s))) => {
-                let ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+                let ctx = NativeContextImpl {
+                    shared: &vm.shared,
+                    thread: &mut vm.main_thread,
+                };
                 assert_eq!(ctx.read_string(s).unwrap(), "a, b, c");
             }
             _ => panic!("String.join should return a String"),
@@ -55889,18 +56403,28 @@ mod tests {
     fn string_strip() {
         let mut vm = Vm::new(VmConfig::default());
         let s = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.create_string("  hello  ")
         };
 
         let result = call_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/String", "strip", "()Ljava/lang/String;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/String",
+            "strip",
+            "()Ljava/lang/String;",
             &[Value::Object(Some(s))],
-        ).unwrap();
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                let ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+                let ctx = NativeContextImpl {
+                    shared: &vm.shared,
+                    thread: &mut vm.main_thread,
+                };
                 assert_eq!(ctx.read_string(r).unwrap(), "hello");
             }
             _ => panic!("strip should return a String"),
@@ -55911,18 +56435,28 @@ mod tests {
     fn string_repeat() {
         let mut vm = Vm::new(VmConfig::default());
         let s = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.create_string("ab")
         };
 
         let result = call_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/String", "repeat", "(I)Ljava/lang/String;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/String",
+            "repeat",
+            "(I)Ljava/lang/String;",
             &[Value::Object(Some(s)), Value::Int(3)],
-        ).unwrap();
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                let ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+                let ctx = NativeContextImpl {
+                    shared: &vm.shared,
+                    thread: &mut vm.main_thread,
+                };
                 assert_eq!(ctx.read_string(r).unwrap(), "ababab");
             }
             _ => panic!("repeat should return a String"),
@@ -55933,19 +56467,37 @@ mod tests {
     fn integer_sum_max_min() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let sum = call_native(&vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "sum", "(II)I",
-            &[Value::Int(3), Value::Int(4)]).unwrap();
+        let sum = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "sum",
+            "(II)I",
+            &[Value::Int(3), Value::Int(4)],
+        )
+        .unwrap();
         assert_eq!(sum, Some(Value::Int(7)));
 
-        let max = call_native(&vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "max", "(II)I",
-            &[Value::Int(3), Value::Int(7)]).unwrap();
+        let max = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "max",
+            "(II)I",
+            &[Value::Int(3), Value::Int(7)],
+        )
+        .unwrap();
         assert_eq!(max, Some(Value::Int(7)));
 
-        let min = call_native(&vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "min", "(II)I",
-            &[Value::Int(3), Value::Int(7)]).unwrap();
+        let min = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "min",
+            "(II)I",
+            &[Value::Int(3), Value::Int(7)],
+        )
+        .unwrap();
         assert_eq!(min, Some(Value::Int(3)));
     }
 
@@ -55953,12 +56505,21 @@ mod tests {
     fn integer_to_hex_string_p30() {
         let mut vm = Vm::new(VmConfig::default());
 
-        let hex = call_native(&vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "toHexString", "(I)Ljava/lang/String;",
-            &[Value::Int(255)]).unwrap();
+        let hex = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "toHexString",
+            "(I)Ljava/lang/String;",
+            &[Value::Int(255)],
+        )
+        .unwrap();
         match hex {
             Some(Value::Object(Some(s))) => {
-                let ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+                let ctx = NativeContextImpl {
+                    shared: &vm.shared,
+                    thread: &mut vm.main_thread,
+                };
                 assert_eq!(ctx.read_string(s).unwrap(), "ff");
             }
             _ => panic!("toHexString should return a String"),
@@ -55970,16 +56531,26 @@ mod tests {
         // Verify StringJoiner methods are registered (full lifecycle test
         // requires classpath for ArrayList allocation within <init>)
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        assert!(shared.native_methods.find(
-            "java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;)V"
-        ).is_some());
-        assert!(shared.native_methods.find(
-            "java/util/StringJoiner", "add",
-            "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;"
-        ).is_some());
-        assert!(shared.native_methods.find(
-            "java/util/StringJoiner", "toString", "()Ljava/lang/String;"
-        ).is_some());
+        assert!(shared
+            .native_methods
+            .find(
+                "java/util/StringJoiner",
+                "<init>",
+                "(Ljava/lang/CharSequence;)V"
+            )
+            .is_some());
+        assert!(shared
+            .native_methods
+            .find(
+                "java/util/StringJoiner",
+                "add",
+                "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;"
+            )
+            .is_some());
+        assert!(shared
+            .native_methods
+            .find("java/util/StringJoiner", "toString", "()Ljava/lang/String;")
+            .is_some());
     }
 
     #[test]
@@ -55990,41 +56561,75 @@ mod tests {
         // Allocate StringJoiner with enough fields (use heap directly to avoid class resolution)
         let sj = vm.shared.heap.alloc_object(ClassId::new(0), 4);
         let delim = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.create_string(", ")
         };
 
         // Init
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;)V",
-            &[Value::Object(Some(sj)), Value::Object(Some(delim))]).unwrap();
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/util/StringJoiner",
+            "<init>",
+            "(Ljava/lang/CharSequence;)V",
+            &[Value::Object(Some(sj)), Value::Object(Some(delim))],
+        )
+        .unwrap();
 
         // Add elements
         let a = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.create_string("hello")
         };
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/util/StringJoiner", "add",
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/util/StringJoiner",
+            "add",
             "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
-            &[Value::Object(Some(sj)), Value::Object(Some(a))]).unwrap();
+            &[Value::Object(Some(sj)), Value::Object(Some(a))],
+        )
+        .unwrap();
 
         let b = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.create_string("world")
         };
-        call_native(&vm.shared, &mut vm.main_thread,
-            "java/util/StringJoiner", "add",
+        call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/util/StringJoiner",
+            "add",
             "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
-            &[Value::Object(Some(sj)), Value::Object(Some(b))]).unwrap();
+            &[Value::Object(Some(sj)), Value::Object(Some(b))],
+        )
+        .unwrap();
 
         // toString
-        let result = call_native(&vm.shared, &mut vm.main_thread,
-            "java/util/StringJoiner", "toString", "()Ljava/lang/String;",
-            &[Value::Object(Some(sj))]).unwrap();
+        let result = call_native(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/util/StringJoiner",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(sj))],
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(s))) => {
-                let ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+                let ctx = NativeContextImpl {
+                    shared: &vm.shared,
+                    thread: &mut vm.main_thread,
+                };
                 assert_eq!(ctx.read_string(s).unwrap(), "hello, world");
             }
             _ => panic!("toString should return 'hello, world'"),
@@ -56043,11 +56648,17 @@ mod tests {
         // StringBuilder is a synthetic stub РІР‚вЂќ verify its <init> dispatches to native
         let sb = vm.shared.heap.alloc_object(ClassId::new(0), 2);
         let result = call_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/StringBuilder", "<init>", "()V",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/StringBuilder",
+            "<init>",
+            "()V",
             &[Value::Object(Some(sb))],
         );
-        assert!(result.is_ok(), "synthetic StringBuilder.<init> should dispatch to native");
+        assert!(
+            result.is_ok(),
+            "synthetic StringBuilder.<init> should dispatch to native"
+        );
     }
 
     #[test]
@@ -56056,26 +56667,41 @@ mod tests {
 
         // Load a synthetic class by requesting a JDK class that doesn't have
         // a .class file on the classpath (which it won't in test env)
-        let class_id = shared.class_manager.write().load_class("java/lang/StringBuilder").unwrap();
+        let class_id = shared
+            .class_manager
+            .write()
+            .load_class("java/lang/StringBuilder")
+            .unwrap();
         let cm = shared.class_manager.read();
         let class = cm.class_store.get(class_id).unwrap();
-        assert!(class.is_synthetic_stub, "StringBuilder should be synthetic in test env (no JDK on classpath)");
-        assert!(class.methods.is_empty(), "Synthetic stubs should have zero methods");
+        assert!(
+            class.is_synthetic_stub,
+            "StringBuilder should be synthetic in test env (no JDK on classpath)"
+        );
+        assert!(
+            class.methods.is_empty(),
+            "Synthetic stubs should have zero methods"
+        );
     }
 
     #[test]
     fn bootstrap_with_real_jdk() {
         // Skip if no JDK available
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            });
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if p.exists() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
         let Some(java_home) = java_home else {
             eprintln!("Skipping bootstrap_with_real_jdk: no JDK found");
             return;
         };
-        let jmod = std::path::PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
+        let jmod = std::path::PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
         if !jmod.exists() {
             eprintln!("Skipping: no java.base.jmod");
             return;
@@ -56090,25 +56716,37 @@ mod tests {
 
         // Verify Object was loaded from real .class file (not synthetic)
         let cm = shared.class_manager.read();
-        let obj_id = cm.get_loaded_class_id("java/lang/Object")
+        let obj_id = cm
+            .get_loaded_class_id("java/lang/Object")
             .expect("Object should be loaded");
         let obj_class = cm.class_store.get(obj_id).unwrap();
-        assert!(!obj_class.is_synthetic_stub,
-            "Object should be loaded from real .class file");
-        assert!(!obj_class.methods.is_empty(),
-            "Real Object should have methods (hashCode, equals, toString, etc.)");
+        assert!(
+            !obj_class.is_synthetic_stub,
+            "Object should be loaded from real .class file"
+        );
+        assert!(
+            !obj_class.methods.is_empty(),
+            "Real Object should have methods (hashCode, equals, toString, etc.)"
+        );
 
         // Verify String was loaded from real .class file
-        let str_id = cm.get_loaded_class_id("java/lang/String")
+        let str_id = cm
+            .get_loaded_class_id("java/lang/String")
             .expect("String should be loaded");
         let str_class = cm.class_store.get(str_id).unwrap();
-        assert!(!str_class.is_synthetic_stub,
-            "String should be loaded from real .class file");
-        assert!(str_class.methods.len() > 50,
-            "Real String should have many methods, got {}", str_class.methods.len());
+        assert!(
+            !str_class.is_synthetic_stub,
+            "String should be loaded from real .class file"
+        );
+        assert!(
+            str_class.methods.len() > 50,
+            "Real String should have many methods, got {}",
+            str_class.methods.len()
+        );
 
         // Verify Throwable was loaded
-        let thr_id = cm.get_loaded_class_id("java/lang/Throwable")
+        let thr_id = cm
+            .get_loaded_class_id("java/lang/Throwable")
             .expect("Throwable should be loaded");
         let thr_class = cm.class_store.get(thr_id).unwrap();
         assert!(!thr_class.is_synthetic_stub);
@@ -56116,18 +56754,35 @@ mod tests {
         // Verify total loaded class count is substantial (Object pulls in many deps)
         let total = cm.loaded_count();
         eprintln!("[bootstrap_with_real_jdk] Total classes loaded: {}", total);
-        eprintln!("[bootstrap_with_real_jdk] String methods: {}", str_class.methods.len());
-        eprintln!("[bootstrap_with_real_jdk] Object methods: {}", obj_class.methods.len());
-        assert!(total > 20, "Bootstrap should load >20 classes, got {}", total);
+        eprintln!(
+            "[bootstrap_with_real_jdk] String methods: {}",
+            str_class.methods.len()
+        );
+        eprintln!(
+            "[bootstrap_with_real_jdk] Object methods: {}",
+            obj_class.methods.len()
+        );
+        assert!(
+            total > 20,
+            "Bootstrap should load >20 classes, got {}",
+            total
+        );
 
         // Verify Object has the expected native methods
-        let has_hash_code = obj_class.methods.iter()
+        let has_hash_code = obj_class
+            .methods
+            .iter()
             .any(|m| &*m.name == "hashCode" && m.is_native());
         assert!(has_hash_code, "Object should have native hashCode method");
 
-        let has_to_string = obj_class.methods.iter()
+        let has_to_string = obj_class
+            .methods
+            .iter()
             .any(|m| &*m.name == "toString" && !m.is_native());
-        assert!(has_to_string, "Object.toString should be non-native bytecode method");
+        assert!(
+            has_to_string,
+            "Object.toString should be non-native bytecode method"
+        );
     }
 
     #[test]
@@ -56137,8 +56792,11 @@ mod tests {
 
         // System.currentTimeMillis should still work via native dispatch
         let result = call_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/System", "currentTimeMillis", "()J",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/System",
+            "currentTimeMillis",
+            "()J",
             &[],
         );
         match result {
@@ -56154,14 +56812,23 @@ mod tests {
     #[test]
     fn resolve_field_index_real_jdk() {
         // Skip if no JDK available
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            });
-        let Some(java_home) = java_home else { return; };
-        let jmod = std::path::PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
-        if !jmod.exists() { return; }
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if p.exists() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
+        let Some(java_home) = java_home else {
+            return;
+        };
+        let jmod = std::path::PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
+        if !jmod.exists() {
+            return;
+        }
 
         let config = VmConfig {
             boot_classpath: vec![jmod.to_string_lossy().into_owned()],
@@ -56171,15 +56838,24 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Resolve Throwable.detailMessage field
-        let ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         let idx = ctx.resolve_field_index("java/lang/Throwable", "detailMessage");
         assert!(idx.is_some(), "Throwable should have 'detailMessage' field");
-        eprintln!("[resolve_field_index_real_jdk] Throwable.detailMessage index = {:?}", idx);
+        eprintln!(
+            "[resolve_field_index_real_jdk] Throwable.detailMessage index = {:?}",
+            idx
+        );
 
         // Resolve Throwable.cause field
         let cause_idx = ctx.resolve_field_index("java/lang/Throwable", "cause");
         assert!(cause_idx.is_some(), "Throwable should have 'cause' field");
-        assert_ne!(idx, cause_idx, "detailMessage and cause should have different indices");
+        assert_ne!(
+            idx, cause_idx,
+            "detailMessage and cause should have different indices"
+        );
 
         // Resolve String field (JDK 9+: 'value' is byte[], 'coder' is byte)
         let val_idx = ctx.resolve_field_index("java/lang/String", "value");
@@ -56197,13 +56873,20 @@ mod tests {
     /// Helper to create a VM with real JDK on boot classpath.
     /// Returns None if no JDK is available.
     fn vm_with_real_jdk() -> Option<Vm> {
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            })?;
-        let jmod = std::path::PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
-        if !jmod.exists() { return None; }
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if p.exists() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })?;
+        let jmod = std::path::PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
+        if !jmod.exists() {
+            return None;
+        }
         let config = VmConfig {
             boot_classpath: vec![jmod.to_string_lossy().into_owned()],
             ..VmConfig::default()
@@ -56214,14 +56897,19 @@ mod tests {
     #[test]
     fn real_jdk_invoke_object_hashcode() {
         // Object.hashCode() is ACC_NATIVE РІР‚вЂќ should dispatch to our native registry
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         // Allocate an Object
         let obj = vm.shared.heap.alloc_object(ClassId::new(0), 0);
 
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Object", "hashCode", "()I",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Object",
+            "hashCode",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         match &result {
@@ -56237,11 +56925,16 @@ mod tests {
     #[test]
     fn real_jdk_invoke_integer_valueof() {
         // Integer.valueOf(int) РІР‚вЂќ should be non-native bytecode in real JDK
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
             &[Value::Int(42)],
         );
         eprintln!("[real_jdk] Integer.valueOf(42) = {:?}", result);
@@ -56263,7 +56956,9 @@ mod tests {
     #[test]
     fn real_jdk_class_has_bytecode_methods() {
         // Verify that real classes have Code attributes on non-native methods
-        let Some(vm) = vm_with_real_jdk() else { return; };
+        let Some(vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         let cm = vm.shared.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
@@ -56272,37 +56967,57 @@ mod tests {
         // Count native vs bytecode methods
         let native_count = obj_class.methods.iter().filter(|m| m.is_native()).count();
         let bytecode_count = obj_class.methods.iter().filter(|m| !m.is_native()).count();
-        let has_code_count = obj_class.methods.iter()
+        let has_code_count = obj_class
+            .methods
+            .iter()
             .filter(|m| !m.is_native() && m.code().is_some())
             .count();
 
-        eprintln!("[real_jdk] Object: {} native, {} bytecode, {} with Code attribute",
-            native_count, bytecode_count, has_code_count);
+        eprintln!(
+            "[real_jdk] Object: {} native, {} bytecode, {} with Code attribute",
+            native_count, bytecode_count, has_code_count
+        );
 
         assert!(native_count > 0, "Object should have native methods");
         assert!(bytecode_count > 0, "Object should have bytecode methods");
-        assert_eq!(bytecode_count, has_code_count,
-            "All non-native methods should have Code attributes");
+        assert_eq!(
+            bytecode_count, has_code_count,
+            "All non-native methods should have Code attributes"
+        );
 
         // Check String too
         let str_id = cm.get_loaded_class_id("java/lang/String").unwrap();
         let str_class = cm.class_store.get(str_id).unwrap();
-        let str_bytecode = str_class.methods.iter()
+        let str_bytecode = str_class
+            .methods
+            .iter()
             .filter(|m| !m.is_native() && m.code().is_some())
             .count();
-        eprintln!("[real_jdk] String: {} bytecode methods with Code", str_bytecode);
-        assert!(str_bytecode > 100, "String should have >100 bytecode methods");
+        eprintln!(
+            "[real_jdk] String: {} bytecode methods with Code",
+            str_bytecode
+        );
+        assert!(
+            str_bytecode > 100,
+            "String should have >100 bytecode methods"
+        );
     }
 
     #[test]
     fn real_jdk_object_equals_bytecode() {
         // Object.equals(Object) is non-native bytecode РІР‚вЂќ tests "aload_0, aload_1, if_acmpeq"
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         // Allocate objects with correct field count for real Object class
         let cm = vm.shared.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
-        let nfields = cm.class_store.get(obj_id).map(|c| c.num_total_fields).unwrap_or(0);
+        let nfields = cm
+            .class_store
+            .get(obj_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0);
         drop(cm);
 
         let obj1 = vm.shared.heap.alloc_object(obj_id, nfields);
@@ -56311,13 +57026,24 @@ mod tests {
         // Diagnostic: verify refs_equal works for this ObjectRef pair
         let v1 = Value::Object(Some(obj1));
         let v2 = Value::Object(Some(obj1)); // same ref
-        eprintln!("[real_jdk] obj1 ptr={:?}, v1={:?}, v2={:?}", obj1.as_ptr(), v1, v2);
-        eprintln!("[real_jdk] refs_equal(v1,v2)={}", crate::runtime::interpreter::test_refs_equal(&v1, &v2));
+        eprintln!(
+            "[real_jdk] obj1 ptr={:?}, v1={:?}, v2={:?}",
+            obj1.as_ptr(),
+            v1,
+            v2
+        );
+        eprintln!(
+            "[real_jdk] refs_equal(v1,v2)={}",
+            crate::runtime::interpreter::test_refs_equal(&v1, &v2)
+        );
 
         // equals(self) should return true (same reference)
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Object", "equals", "(Ljava/lang/Object;)Z",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Object",
+            "equals",
+            "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(obj1)), Value::Object(Some(obj1))],
         );
         eprintln!("[real_jdk] Object.equals(self) = {:?}", result);
@@ -56331,8 +57057,11 @@ mod tests {
 
         // equals(other) should return false (different references)
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Object", "equals", "(Ljava/lang/Object;)Z",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Object",
+            "equals",
+            "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(obj1)), Value::Object(Some(obj2))],
         );
         match &result {
@@ -56349,31 +57078,46 @@ mod tests {
         // Integer.valueOf(42) РІвЂ вЂ™ verify it creates an object via real JDK bytecode
         // Note: field access by name fails because JIT allocates objects with ClassId(0)
         // instead of real Integer ClassId. This is a known JIT limitation to be fixed.
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
             &[Value::Int(42)],
         );
-        assert!(matches!(result, Ok(Some(Value::Object(Some(_))))),
-            "Integer.valueOf(42) should return an object, got {:?}", result);
+        assert!(
+            matches!(result, Ok(Some(Value::Object(Some(_))))),
+            "Integer.valueOf(42) should return an object, got {:?}",
+            result
+        );
     }
 
     #[test]
     fn real_jdk_integer_valueof_returns_object() {
         // Integer.valueOf(int) РІР‚вЂќ this executes real JDK bytecode via the interpreter!
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
             &[Value::Int(42)],
         );
         eprintln!("[real_jdk] Integer.valueOf(42) = {:?}", result);
         // The key assertion: this method executes real JDK bytecode and returns an object
-        assert!(matches!(result, Ok(Some(Value::Object(Some(_))))),
-            "Integer.valueOf should return an Integer object");
+        assert!(
+            matches!(result, Ok(Some(Value::Object(Some(_))))),
+            "Integer.valueOf should return an Integer object"
+        );
     }
 
     /// WP0.1 regression РІР‚вЂќ Multiple `System.out.println(String)` calls must all
@@ -56396,7 +57140,9 @@ mod tests {
     /// `execute_invokevirtual_cached` VirtualNative entry is honored.
     #[test]
     fn test_system_out_multiline_println() {
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         let (out_ref, _err_ref) = vm.shared.ensure_system_streams();
 
@@ -56433,11 +57179,16 @@ mod tests {
     fn real_jdk_ensure_class_initialized_registers_natives() {
         // Test that ensure_class_initialized works for real classes
         // This triggers <clinit> which may call registerNatives()
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         // Try to initialize Object РІР‚вЂќ should work (Object has a trivial <clinit> or none)
         let result = {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.ensure_class_initialized("java/lang/Object")
         };
         eprintln!("[real_jdk] Object initialization: {:?}", result);
@@ -56451,14 +57202,22 @@ mod tests {
                 eprintln!("[real_jdk] Boolean: is_synthetic={}, fields={}, first_field_index={}, num_total_fields={}, methods={}",
                     cls.is_synthetic_stub, cls.fields.len(), cls.first_field_index, cls.num_total_fields, cls.methods.len());
                 for f in &cls.fields {
-                    eprintln!("[real_jdk]   field: {} {} static={}", f.name, f.descriptor, f.is_static());
+                    eprintln!(
+                        "[real_jdk]   field: {} {} static={}",
+                        f.name,
+                        f.descriptor,
+                        f.is_static()
+                    );
                 }
             }
         }
 
         // Initialize Boolean РІР‚вЂќ its <clinit> runs real JDK bytecode
         {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.ensure_class_initialized("java/lang/Boolean")
                 .expect("Boolean should initialize");
         }
@@ -56470,37 +57229,63 @@ mod tests {
     #[test]
     #[ignore] // Slow: loads real JDK
     fn real_jdk_character_float_double_clinit() {
-        let Some(mut vm) = vm_with_real_jdk() else { return; };
+        let Some(mut vm) = vm_with_real_jdk() else {
+            return;
+        };
 
         // Initialize Object first (prerequisite for all classes)
         {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             ctx.ensure_class_initialized("java/lang/Object")
                 .expect("Object should initialize");
         }
 
         // Character <clinit>
         {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             let result = ctx.ensure_class_initialized("java/lang/Character");
             eprintln!("[real_jdk] Character initialization: {:?}", result);
-            assert!(result.is_ok(), "Character should initialize: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Character should initialize: {:?}",
+                result.err()
+            );
         }
 
         // Float <clinit>
         {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             let result = ctx.ensure_class_initialized("java/lang/Float");
             eprintln!("[real_jdk] Float initialization: {:?}", result);
-            assert!(result.is_ok(), "Float should initialize: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Float should initialize: {:?}",
+                result.err()
+            );
         }
 
         // Double <clinit>
         {
-            let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
+            let mut ctx = NativeContextImpl {
+                shared: &vm.shared,
+                thread: &mut vm.main_thread,
+            };
             let result = ctx.ensure_class_initialized("java/lang/Double");
             eprintln!("[real_jdk] Double initialization: {:?}", result);
-            assert!(result.is_ok(), "Double should initialize: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Double should initialize: {:?}",
+                result.err()
+            );
         }
     }
 
@@ -56517,16 +57302,21 @@ mod tests {
     #[test]
     fn real_jdk_hello_world_e2e() {
         // Discover JAVA_HOME
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            });
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if p.exists() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
         let Some(java_home) = java_home else {
             eprintln!("Skipping real_jdk_hello_world_e2e: no JDK found");
             return;
         };
-        let jmod = std::path::PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
+        let jmod = std::path::PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
         if !jmod.exists() {
             eprintln!("Skipping real_jdk_hello_world_e2e: java.base.jmod not found");
             return;
@@ -56545,13 +57335,19 @@ mod tests {
         let native_count = vm.shared.native_methods.len();
         eprintln!("[real_jdk_e2e] Native methods registered: {}", native_count);
         // Session 85: corrective overrides grew the count to ~2568; keep +100 headroom.
-        assert!(native_count < 2700,
-            "Real JDK mode should have < 2700 native stubs, got {}", native_count);
+        assert!(
+            native_count < 2700,
+            "Real JDK mode should have < 2700 native stubs, got {}",
+            native_count
+        );
 
         // ---- Step 2: Integer.valueOf(42) РІвЂ вЂ™ real bytecode execution ----
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
             &[Value::Int(42)],
         );
         eprintln!("[real_jdk_e2e] Integer.valueOf(42) = {:?}", result);
@@ -56561,8 +57357,14 @@ mod tests {
                 obj
             }
             Ok(other) => {
-                eprintln!("[real_jdk_e2e] Integer.valueOf(42) returned {:?} (unexpected)", other);
-                panic!("Integer.valueOf(42) should return an Object, got {:?}", other);
+                eprintln!(
+                    "[real_jdk_e2e] Integer.valueOf(42) returned {:?} (unexpected)",
+                    other
+                );
+                panic!(
+                    "Integer.valueOf(42) should return an Object, got {:?}",
+                    other
+                );
             }
             Err(e) => {
                 eprintln!("[real_jdk_e2e] Integer.valueOf(42) failed: {:?}", e);
@@ -56572,14 +57374,20 @@ mod tests {
 
         // ---- Step 3: Integer.intValue() round-trip via real bytecode ----
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Integer", "intValue", "()I",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Integer",
+            "intValue",
+            "()I",
             &[Value::Object(Some(int_obj))],
         );
         eprintln!("[real_jdk_e2e] Integer.intValue() = {:?}", result);
         match &result {
             Ok(Some(Value::Int(v))) => {
-                eprintln!("[real_jdk_e2e] Integer round-trip: valueOf(42).intValue() = {} (expected 42)", v);
+                eprintln!(
+                    "[real_jdk_e2e] Integer round-trip: valueOf(42).intValue() = {} (expected 42)",
+                    v
+                );
                 assert_eq!(*v, 42, "Integer round-trip should return 42");
             }
             other => {
@@ -56591,8 +57399,11 @@ mod tests {
 
         // ---- Step 4: String.valueOf(42) РІвЂ вЂ™ exercises more real JDK bytecode ----
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/String", "valueOf", "(I)Ljava/lang/String;",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/String",
+            "valueOf",
+            "(I)Ljava/lang/String;",
             &[Value::Int(42)],
         );
         eprintln!("[real_jdk_e2e] String.valueOf(42) = {:?}", result);
@@ -56614,13 +57425,20 @@ mod tests {
         // ---- Step 5: Object.equals via real bytecode (simple control flow) ----
         let cm = vm.shared.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
-        let nfields = cm.class_store.get(obj_id).map(|c| c.num_total_fields).unwrap_or(0);
+        let nfields = cm
+            .class_store
+            .get(obj_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0);
         drop(cm);
 
         let obj1 = vm.shared.heap.alloc_object(obj_id, nfields);
         let result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/lang/Object", "equals", "(Ljava/lang/Object;)Z",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/Object",
+            "equals",
+            "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(obj1)), Value::Object(Some(obj1))],
         );
         eprintln!("[real_jdk_e2e] Object.equals(self, self) = {:?}", result);
@@ -56631,14 +57449,24 @@ mod tests {
             let cm = vm.shared.class_manager.read();
             let int_id = cm.get_loaded_class_id("java/lang/Integer").unwrap();
             let int_class = cm.class_store.get(int_id).unwrap();
-            assert!(!int_class.is_synthetic_stub,
-                "Integer class should be loaded from real .class file, not synthetic stub");
-            let bytecode_with_code = int_class.methods.iter()
+            assert!(
+                !int_class.is_synthetic_stub,
+                "Integer class should be loaded from real .class file, not synthetic stub"
+            );
+            let bytecode_with_code = int_class
+                .methods
+                .iter()
                 .filter(|m| !m.is_native() && m.code().is_some())
                 .count();
-            eprintln!("[real_jdk_e2e] Integer: {} bytecode methods with Code attribute", bytecode_with_code);
-            assert!(bytecode_with_code > 10,
-                "Integer should have >10 bytecode methods, got {}", bytecode_with_code);
+            eprintln!(
+                "[real_jdk_e2e] Integer: {} bytecode methods with Code attribute",
+                bytecode_with_code
+            );
+            assert!(
+                bytecode_with_code > 10,
+                "Integer should have >10 bytecode methods, got {}",
+                bytecode_with_code
+            );
         }
 
         // ---- Step 7: Dump missing natives audit for visibility ----
@@ -56646,7 +57474,10 @@ mod tests {
         if missing.is_empty() {
             eprintln!("[real_jdk_e2e] No missing natives encountered (all covered!)");
         } else {
-            eprintln!("[real_jdk_e2e] === Missing Native Methods ({}) ===", missing.len());
+            eprintln!(
+                "[real_jdk_e2e] === Missing Native Methods ({}) ===",
+                missing.len()
+            );
             for sig in &missing {
                 eprintln!("[real_jdk_e2e]   {}", sig);
             }
@@ -56834,33 +57665,72 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let c = create_java_string(&shared, "c");
 
         for s in [a, b, c] {
-            call_native(&shared, &mut thread, "java/util/ArrayList", "add",
-                "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Object(Some(s))]).unwrap();
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Object(Some(s))],
+            )
+            .unwrap();
         }
 
         // Swap index 0 and 2: [a,b,c] РІвЂ вЂ™ [c,b,a]
-        call_native(&shared, &mut thread, "java/util/Collections", "swap",
-            "(Ljava/util/List;II)V", &[Value::Object(Some(list)), Value::Int(0), Value::Int(2)]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/Collections",
+            "swap",
+            "(Ljava/util/List;II)V",
+            &[Value::Object(Some(list)), Value::Int(0), Value::Int(2)],
+        )
+        .unwrap();
 
-        let r0 = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-            "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(0)]).unwrap();
+        let r0 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(list)), Value::Int(0)],
+        )
+        .unwrap();
         if let Some(Value::Object(Some(s))) = r0 {
             assert_eq!(read_java_string(&shared.heap, s), Some("c".into()));
-        } else { panic!("expected string at index 0"); }
+        } else {
+            panic!("expected string at index 0");
+        }
 
-        let r2 = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-            "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(2)]).unwrap();
+        let r2 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(list)), Value::Int(2)],
+        )
+        .unwrap();
         if let Some(Value::Object(Some(s))) = r2 {
             assert_eq!(read_java_string(&shared.heap, s), Some("a".into()));
-        } else { panic!("expected string at index 2"); }
+        } else {
+            panic!("expected string at index 2");
+        }
     }
 
     #[test]
@@ -56869,21 +57739,49 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         for v in [10, 20, 30] {
-            call_native(&shared, &mut thread, "java/util/ArrayList", "add",
-                "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Int(v)]).unwrap();
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Int(v)],
+            )
+            .unwrap();
         }
 
         // Fill all with 99
-        call_native(&shared, &mut thread, "java/util/Collections", "fill",
-            "(Ljava/util/List;Ljava/lang/Object;)V", &[Value::Object(Some(list)), Value::Int(99)]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/Collections",
+            "fill",
+            "(Ljava/util/List;Ljava/lang/Object;)V",
+            &[Value::Object(Some(list)), Value::Int(99)],
+        )
+        .unwrap();
 
         for i in 0..3 {
-            let r = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-                "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(i)]).unwrap();
+            let r = call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(list)), Value::Int(i)],
+            )
+            .unwrap();
             assert_eq!(r, Some(Value::Int(99)));
         }
     }
@@ -56894,29 +57792,71 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         // [10, 20, 30]
         for v in [10, 20, 30] {
-            call_native(&shared, &mut thread, "java/util/ArrayList", "add",
-                "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Int(v)]).unwrap();
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Int(v)],
+            )
+            .unwrap();
         }
 
         // Rotate by 1: [10,20,30] РІвЂ вЂ™ [30,10,20]
-        call_native(&shared, &mut thread, "java/util/Collections", "rotate",
-            "(Ljava/util/List;I)V", &[Value::Object(Some(list)), Value::Int(1)]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/Collections",
+            "rotate",
+            "(Ljava/util/List;I)V",
+            &[Value::Object(Some(list)), Value::Int(1)],
+        )
+        .unwrap();
 
-        let r0 = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-            "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(0)]).unwrap();
+        let r0 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(list)), Value::Int(0)],
+        )
+        .unwrap();
         assert_eq!(r0, Some(Value::Int(30)));
 
-        let r1 = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-            "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(1)]).unwrap();
+        let r1 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(list)), Value::Int(1)],
+        )
+        .unwrap();
         assert_eq!(r1, Some(Value::Int(10)));
 
-        let r2 = call_native(&shared, &mut thread, "java/util/ArrayList", "get",
-            "(I)Ljava/lang/Object;", &[Value::Object(Some(list)), Value::Int(2)]).unwrap();
+        let r2 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(list)), Value::Int(2)],
+        )
+        .unwrap();
         assert_eq!(r2, Some(Value::Int(20)));
     }
 
@@ -56926,19 +57866,47 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         for v in [1, 2, 3, 4, 5] {
-            call_native(&shared, &mut thread, "java/util/ArrayList", "add",
-                "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Int(v)]).unwrap();
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Int(v)],
+            )
+            .unwrap();
         }
 
-        call_native(&shared, &mut thread, "java/util/Collections", "shuffle",
-            "(Ljava/util/List;)V", &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/Collections",
+            "shuffle",
+            "(Ljava/util/List;)V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
-        let size = call_native(&shared, &mut thread, "java/util/ArrayList", "size",
-            "()I", &[Value::Object(Some(list))]).unwrap();
+        let size = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "size",
+            "()I",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
         assert_eq!(size, Some(Value::Int(5)));
     }
 
@@ -57051,9 +58019,15 @@ mod tests {
         let arr = shared
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Object(Some(a)));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Object(Some(b)));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Object(Some(a2)));
+        let _ = shared
+            .heap
+            .set_array_element(arr, 0, Value::Object(Some(a)));
+        let _ = shared
+            .heap
+            .set_array_element(arr, 1, Value::Object(Some(b)));
+        let _ = shared
+            .heap
+            .set_array_element(arr, 2, Value::Object(Some(a2)));
 
         let stream = call_native(
             &shared,
@@ -57095,7 +58069,9 @@ mod tests {
         // Build GROUPING_BY_DOWNSTREAM collector manually
         let collector = shared.heap.alloc_object(ClassId::new(0), 3);
         shared.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
-        shared.heap.set_field(collector, 1, Value::Object(Some(classifier)));
+        shared
+            .heap
+            .set_field(collector, 1, Value::Object(Some(classifier)));
         shared.heap.set_field(collector, 2, downstream);
 
         let result = call_native(
@@ -57165,7 +58141,9 @@ mod tests {
 
         let collector = shared.heap.alloc_object(ClassId::new(0), 3);
         shared.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
-        shared.heap.set_field(collector, 1, Value::Object(Some(classifier)));
+        shared
+            .heap
+            .set_field(collector, 1, Value::Object(Some(classifier)));
         shared.heap.set_field(collector, 2, downstream);
 
         let result = call_native(
@@ -57272,7 +58250,10 @@ mod tests {
         let mut any_nonzero = false;
         for i in 0..32 {
             match shared.heap.get_array_element(arr, i) {
-                Ok(Value::Int(v)) if v != 0 => { any_nonzero = true; break; }
+                Ok(Value::Int(v)) if v != 0 => {
+                    any_nonzero = true;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -57300,7 +58281,10 @@ mod tests {
             &[Value::Object(Some(pat_str)), Value::Int(16)], // 16 = LITERAL
         )
         .unwrap();
-        assert!(result.is_some(), "Pattern.compile with LITERAL should succeed");
+        assert!(
+            result.is_some(),
+            "Pattern.compile with LITERAL should succeed"
+        );
     }
 
     /// G20: Pattern.compile with COMMENTS flag should ignore whitespace.
@@ -57319,7 +58303,10 @@ mod tests {
             &[Value::Object(Some(pat_str)), Value::Int(4)], // 4 = COMMENTS
         )
         .unwrap();
-        assert!(result.is_some(), "Pattern.compile with COMMENTS should succeed");
+        assert!(
+            result.is_some(),
+            "Pattern.compile with COMMENTS should succeed"
+        );
     }
 
     /// G20: Pattern.quote should escape regex metacharacters.
@@ -57712,7 +58699,9 @@ mod tests {
         match result {
             Some(Value::Object(Some(r))) => {
                 let s = match shared.heap.get_field(r, 0) {
-                    Value::Object(Some(str_ref)) => read_java_string(&shared.heap, str_ref).unwrap(),
+                    Value::Object(Some(str_ref)) => {
+                        read_java_string(&shared.heap, str_ref).unwrap()
+                    }
                     _ => panic!("expected string value"),
                 };
                 assert_eq!(s, "4", "gcd(12, 8) should be 4");
@@ -57889,10 +58878,18 @@ mod tests {
             r
         };
         assert!(registry
-            .find("java/util/Properties", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;")
+            .find(
+                "java/util/Properties",
+                "getProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            )
             .is_some());
         assert!(registry
-            .find("java/util/Properties", "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;")
+            .find(
+                "java/util/Properties",
+                "setProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;"
+            )
             .is_some());
         assert!(registry
             .find("java/util/Properties", "size", "()I")
@@ -57985,12 +58982,32 @@ mod tests {
             crate::native::builtins::register_builtins(&mut r);
             r
         };
-        assert!(registry.find("java/lang/String", "repeat", "(I)Ljava/lang/String;").is_some());
-        assert!(registry.find("java/lang/String", "isBlank", "()Z").is_some());
-        assert!(registry.find("java/lang/String", "chars", "()Ljava/util/stream/IntStream;").is_some());
-        assert!(registry.find("java/lang/String", "lines", "()Ljava/util/stream/Stream;").is_some());
-        assert!(registry.find("java/lang/String", "indent", "(I)Ljava/lang/String;").is_some());
-        assert!(registry.find("java/lang/String", "codePoints", "()Ljava/util/stream/IntStream;").is_some());
+        assert!(registry
+            .find("java/lang/String", "repeat", "(I)Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find("java/lang/String", "isBlank", "()Z")
+            .is_some());
+        assert!(registry
+            .find(
+                "java/lang/String",
+                "chars",
+                "()Ljava/util/stream/IntStream;"
+            )
+            .is_some());
+        assert!(registry
+            .find("java/lang/String", "lines", "()Ljava/util/stream/Stream;")
+            .is_some());
+        assert!(registry
+            .find("java/lang/String", "indent", "(I)Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find(
+                "java/lang/String",
+                "codePoints",
+                "()Ljava/util/stream/IntStream;"
+            )
+            .is_some());
     }
 
     // =======================================================================
@@ -58101,33 +59118,129 @@ mod tests {
         };
         // CompletableFuture
         let cf = "java/util/concurrent/CompletableFuture";
-        assert!(registry.find(cf, "join", "()Ljava/lang/Object;").is_some(), "CF.join");
-        assert!(registry.find(cf, "get", "()Ljava/lang/Object;").is_some(), "CF.get");
+        assert!(
+            registry.find(cf, "join", "()Ljava/lang/Object;").is_some(),
+            "CF.join"
+        );
+        assert!(
+            registry.find(cf, "get", "()Ljava/lang/Object;").is_some(),
+            "CF.get"
+        );
         assert!(registry.find(cf, "isDone", "()Z").is_some(), "CF.isDone");
-        assert!(registry.find(cf, "complete", "(Ljava/lang/Object;)Z").is_some(), "CF.complete");
-        assert!(registry.find(cf, "getNow", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CF.getNow");
-        assert!(registry.find(cf, "thenApply", "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;").is_some(), "CF.thenApply");
+        assert!(
+            registry
+                .find(cf, "complete", "(Ljava/lang/Object;)Z")
+                .is_some(),
+            "CF.complete"
+        );
+        assert!(
+            registry
+                .find(cf, "getNow", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                .is_some(),
+            "CF.getNow"
+        );
+        assert!(
+            registry
+                .find(
+                    cf,
+                    "thenApply",
+                    "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"
+                )
+                .is_some(),
+            "CF.thenApply"
+        );
 
         // ConcurrentHashMap
         let chm = "java/util/concurrent/ConcurrentHashMap";
-        assert!(registry.find(chm, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CHM.put");
-        assert!(registry.find(chm, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CHM.get");
-        assert!(registry.find(chm, "computeIfAbsent", "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;").is_some(), "CHM.computeIfAbsent");
+        assert!(
+            registry
+                .find(
+                    chm,
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                )
+                .is_some(),
+            "CHM.put"
+        );
+        assert!(
+            registry
+                .find(chm, "get", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                .is_some(),
+            "CHM.get"
+        );
+        assert!(
+            registry
+                .find(
+                    chm,
+                    "computeIfAbsent",
+                    "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;"
+                )
+                .is_some(),
+            "CHM.computeIfAbsent"
+        );
 
         // AtomicReference
         let ar = "java/util/concurrent/atomic/AtomicReference";
-        assert!(registry.find(ar, "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;)Z").is_some(), "AR.CAS");
-        assert!(registry.find(ar, "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "AR.getAndSet");
+        assert!(
+            registry
+                .find(
+                    ar,
+                    "compareAndSet",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Z"
+                )
+                .is_some(),
+            "AR.CAS"
+        );
+        assert!(
+            registry
+                .find(ar, "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                .is_some(),
+            "AR.getAndSet"
+        );
 
         // ArrayList
-        assert!(registry.find("java/util/ArrayList", "indexOf", "(Ljava/lang/Object;)I").is_some(), "AL.indexOf");
-        assert!(registry.find("java/util/ArrayList", "contains", "(Ljava/lang/Object;)Z").is_some(), "AL.contains");
-        assert!(registry.find("java/util/ArrayList", "stream", "()Ljava/util/stream/Stream;").is_some(), "AL.stream");
+        assert!(
+            registry
+                .find("java/util/ArrayList", "indexOf", "(Ljava/lang/Object;)I")
+                .is_some(),
+            "AL.indexOf"
+        );
+        assert!(
+            registry
+                .find("java/util/ArrayList", "contains", "(Ljava/lang/Object;)Z")
+                .is_some(),
+            "AL.contains"
+        );
+        assert!(
+            registry
+                .find(
+                    "java/util/ArrayList",
+                    "stream",
+                    "()Ljava/util/stream/Stream;"
+                )
+                .is_some(),
+            "AL.stream"
+        );
 
         // HashMap
-        assert!(registry.find("java/util/HashMap", "keySet", "()Ljava/util/Set;").is_some(), "HM.keySet");
-        assert!(registry.find("java/util/HashMap", "values", "()Ljava/util/Collection;").is_some(), "HM.values");
-        assert!(registry.find("java/util/HashMap", "entrySet", "()Ljava/util/Set;").is_some(), "HM.entrySet");
+        assert!(
+            registry
+                .find("java/util/HashMap", "keySet", "()Ljava/util/Set;")
+                .is_some(),
+            "HM.keySet"
+        );
+        assert!(
+            registry
+                .find("java/util/HashMap", "values", "()Ljava/util/Collection;")
+                .is_some(),
+            "HM.values"
+        );
+        assert!(
+            registry
+                .find("java/util/HashMap", "entrySet", "()Ljava/util/Set;")
+                .is_some(),
+            "HM.entrySet"
+        );
     }
 
     // =======================================================================
@@ -58144,16 +59257,47 @@ mod tests {
             r
         };
         let sc = "java/util/Scanner";
-        assert!(registry.find(sc, "<init>", "(Ljava/lang/String;)V").is_some(), "Scanner(String)");
+        assert!(
+            registry
+                .find(sc, "<init>", "(Ljava/lang/String;)V")
+                .is_some(),
+            "Scanner(String)"
+        );
         assert!(registry.find(sc, "hasNext", "()Z").is_some(), "hasNext");
-        assert!(registry.find(sc, "next", "()Ljava/lang/String;").is_some(), "next");
-        assert!(registry.find(sc, "nextLine", "()Ljava/lang/String;").is_some(), "nextLine");
+        assert!(
+            registry.find(sc, "next", "()Ljava/lang/String;").is_some(),
+            "next"
+        );
+        assert!(
+            registry
+                .find(sc, "nextLine", "()Ljava/lang/String;")
+                .is_some(),
+            "nextLine"
+        );
         assert!(registry.find(sc, "nextInt", "()I").is_some(), "nextInt");
         assert!(registry.find(sc, "nextLong", "()J").is_some(), "nextLong");
-        assert!(registry.find(sc, "nextDouble", "()D").is_some(), "nextDouble");
-        assert!(registry.find(sc, "hasNextLine", "()Z").is_some(), "hasNextLine");
-        assert!(registry.find(sc, "hasNextInt", "()Z").is_some(), "hasNextInt");
-        assert!(registry.find(sc, "useDelimiter", "(Ljava/lang/String;)Ljava/util/Scanner;").is_some(), "useDelimiter");
+        assert!(
+            registry.find(sc, "nextDouble", "()D").is_some(),
+            "nextDouble"
+        );
+        assert!(
+            registry.find(sc, "hasNextLine", "()Z").is_some(),
+            "hasNextLine"
+        );
+        assert!(
+            registry.find(sc, "hasNextInt", "()Z").is_some(),
+            "hasNextInt"
+        );
+        assert!(
+            registry
+                .find(
+                    sc,
+                    "useDelimiter",
+                    "(Ljava/lang/String;)Ljava/util/Scanner;"
+                )
+                .is_some(),
+            "useDelimiter"
+        );
         assert!(registry.find(sc, "close", "()V").is_some(), "close");
     }
 
@@ -58170,9 +59314,15 @@ mod tests {
         let delim = create_java_string(&shared, "\\s+");
         shared.heap.set_field(sc, 2, Value::Object(Some(delim)));
 
-        let line1 = call_native(&shared, &mut thread,
-            "java/util/Scanner", "nextLine", "()Ljava/lang/String;",
-            &[Value::Object(Some(sc))]).unwrap();
+        let line1 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Scanner",
+            "nextLine",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(sc))],
+        )
+        .unwrap();
         match line1 {
             Some(Value::Object(Some(s))) => {
                 assert_eq!(read_java_string(&shared.heap, s).unwrap(), "line1");
@@ -58180,9 +59330,15 @@ mod tests {
             _ => panic!("expected string"),
         }
 
-        let line2 = call_native(&shared, &mut thread,
-            "java/util/Scanner", "nextLine", "()Ljava/lang/String;",
-            &[Value::Object(Some(sc))]).unwrap();
+        let line2 = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Scanner",
+            "nextLine",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(sc))],
+        )
+        .unwrap();
         match line2 {
             Some(Value::Object(Some(s))) => {
                 assert_eq!(read_java_string(&shared.heap, s).unwrap(), "line2");
@@ -58199,14 +59355,30 @@ mod tests {
             crate::native::builtins::register_builtins(&mut r);
             r
         };
-        assert!(registry.find("java/util/Scanner", "next", "()Ljava/lang/String;").is_some());
-        assert!(registry.find("java/util/Scanner", "nextLine", "()Ljava/lang/String;").is_some());
-        assert!(registry.find("java/util/Scanner", "nextInt", "()I").is_some());
-        assert!(registry.find("java/util/Scanner", "nextDouble", "()D").is_some());
-        assert!(registry.find("java/util/Scanner", "hasNext", "()Z").is_some());
-        assert!(registry.find("java/io/StringReader", "<init>", "(Ljava/lang/String;)V").is_some());
-        assert!(registry.find("java/io/StringWriter", "<init>", "()V").is_some());
-        assert!(registry.find("java/io/StringWriter", "toString", "()Ljava/lang/String;").is_some());
+        assert!(registry
+            .find("java/util/Scanner", "next", "()Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find("java/util/Scanner", "nextLine", "()Ljava/lang/String;")
+            .is_some());
+        assert!(registry
+            .find("java/util/Scanner", "nextInt", "()I")
+            .is_some());
+        assert!(registry
+            .find("java/util/Scanner", "nextDouble", "()D")
+            .is_some());
+        assert!(registry
+            .find("java/util/Scanner", "hasNext", "()Z")
+            .is_some());
+        assert!(registry
+            .find("java/io/StringReader", "<init>", "(Ljava/lang/String;)V")
+            .is_some());
+        assert!(registry
+            .find("java/io/StringWriter", "<init>", "()V")
+            .is_some());
+        assert!(registry
+            .find("java/io/StringWriter", "toString", "()Ljava/lang/String;")
+            .is_some());
     }
 
     // =========================================================================
@@ -58219,19 +59391,37 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let sv = shared.heap.alloc_object(ClassId::new(0), 3);
-        call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "<init>", "()V",
-            &[Value::Object(Some(sv))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(sv))],
+        )
+        .unwrap();
 
-        let hash = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "hashCode", "()I",
-            &[Value::Object(Some(sv))]).unwrap();
+        let hash = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "hashCode",
+            "()I",
+            &[Value::Object(Some(sv))],
+        )
+        .unwrap();
         assert!(matches!(hash, Some(Value::Int(h)) if h != 0));
 
         // Second call returns same cached hash
-        let hash2 = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "hashCode", "()I",
-            &[Value::Object(Some(sv))]).unwrap();
+        let hash2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "hashCode",
+            "()I",
+            &[Value::Object(Some(sv))],
+        )
+        .unwrap();
         assert_eq!(hash, hash2);
     }
 
@@ -58242,39 +59432,71 @@ mod tests {
 
         // Create two ScopedValues
         let sv1 = shared.heap.alloc_object(ClassId::new(0), 3);
-        call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "<init>", "()V",
-            &[Value::Object(Some(sv1))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(sv1))],
+        )
+        .unwrap();
 
         let sv2 = shared.heap.alloc_object(ClassId::new(0), 3);
-        call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "<init>", "()V",
-            &[Value::Object(Some(sv2))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(sv2))],
+        )
+        .unwrap();
 
         // ScopedValue.where(sv1, val1) -> carrier1
-        let carrier1 = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue", "where",
+        let carrier1 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue",
+            "where",
             "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
-            &[Value::Object(Some(sv1)), Value::Int(42)]).unwrap();
+            &[Value::Object(Some(sv1)), Value::Int(42)],
+        )
+        .unwrap();
         let carrier1_ref = match carrier1 {
             Some(Value::Object(Some(r))) => r,
             _ => panic!("expected carrier"),
         };
 
         // carrier1.where(sv2, val2) -> carrier2 (chained)
-        let carrier2 = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue$Carrier", "where",
+        let carrier2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue$Carrier",
+            "where",
             "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
-            &[Value::Object(Some(carrier1_ref)), Value::Object(Some(sv2)), Value::Int(99)]).unwrap();
+            &[
+                Value::Object(Some(carrier1_ref)),
+                Value::Object(Some(sv2)),
+                Value::Int(99),
+            ],
+        )
+        .unwrap();
         let carrier2_ref = match carrier2 {
             Some(Value::Object(Some(r))) => r,
             _ => panic!("expected carrier"),
         };
 
         // carrier2.run(null) РІР‚вЂќ binds both SVs then unbinds
-        call_native(&shared, &mut thread,
-            "java/lang/ScopedValue$Carrier", "run", "(Ljava/lang/Runnable;)V",
-            &[Value::Object(Some(carrier2_ref)), Value::Object(None)]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue$Carrier",
+            "run",
+            "(Ljava/lang/Runnable;)V",
+            &[Value::Object(Some(carrier2_ref)), Value::Object(None)],
+        )
+        .unwrap();
 
         // After run, both should be unbound
         let bound1 = shared.heap.get_field(sv1, 1);
@@ -58288,12 +59510,24 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let snap1 = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue$Snapshot", "capture",
-            "()Ljava/lang/ScopedValue$Snapshot;", &[]).unwrap();
-        let snap2 = call_native(&shared, &mut thread,
-            "java/lang/ScopedValue$Snapshot", "capture",
-            "()Ljava/lang/ScopedValue$Snapshot;", &[]).unwrap();
+        let snap1 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue$Snapshot",
+            "capture",
+            "()Ljava/lang/ScopedValue$Snapshot;",
+            &[],
+        )
+        .unwrap();
+        let snap2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ScopedValue$Snapshot",
+            "capture",
+            "()Ljava/lang/ScopedValue$Snapshot;",
+            &[],
+        )
+        .unwrap();
 
         let ts1 = match snap1 {
             Some(Value::Object(Some(r))) => shared.heap.get_field(r, 1),
@@ -58319,21 +59553,40 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Shutdown the scope
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "shutdown", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "shutdown",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Fork after shutdown returns UNAVAILABLE subtask (not error) per JDK 25
-        let result = call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "fork",
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "fork",
             "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-            &[Value::Object(Some(scope)), Value::Object(None)]);
-        assert!(result.is_ok(), "fork on shutdown scope returns UNAVAILABLE subtask");
+            &[Value::Object(Some(scope)), Value::Object(None)],
+        );
+        assert!(
+            result.is_ok(),
+            "fork on shutdown scope returns UNAVAILABLE subtask"
+        );
         if let Ok(Some(Value::Object(Some(subtask)))) = result {
             // Subtask state should be UNAVAILABLE (0)
             assert_eq!(shared.heap.get_field(subtask, 0), Value::Int(0));
@@ -58346,15 +59599,26 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Fork a task (callable is None, so the call returns None/null result)
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "fork",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "fork",
             "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-            &[Value::Object(Some(scope)), Value::Object(None)]).unwrap();
+            &[Value::Object(Some(scope)), Value::Object(None)],
+        )
+        .unwrap();
 
         // Both task_count and completed_count should be 1 (synchronous execution)
         let task_count = shared.heap.get_field(scope, 2);
@@ -58369,20 +59633,36 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Close the scope (no tasks, so close is ok)
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "close", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "close",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Join on closed scope should fail
-        let result = call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "join",
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "join",
             "()Ljava/util/concurrent/StructuredTaskScope;",
-            &[Value::Object(Some(scope))]);
+            &[Value::Object(Some(scope))],
+        );
         assert!(result.is_err(), "join on closed scope should fail");
     }
 
@@ -58392,17 +59672,35 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Close twice should not error
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "close", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope", "close", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "close",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope",
+            "close",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -58411,14 +59709,25 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // No exception stored, throwIfFailed should succeed
-        let result = call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure", "throwIfFailed", "()V",
-            &[Value::Object(Some(scope))]);
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure",
+            "throwIfFailed",
+            "()V",
+            &[Value::Object(Some(scope))],
+        );
         assert!(result.is_ok());
     }
 
@@ -58428,19 +59737,33 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // Manually store an exception
         let exc = shared.heap.alloc_object(ClassId::new(0), 1);
         shared.heap.set_field(scope, 4, Value::Object(Some(exc)));
 
         // throwIfFailed should now error
-        let result = call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure", "throwIfFailed", "()V",
-            &[Value::Object(Some(scope))]);
-        assert!(result.is_err(), "throwIfFailed should fail with stored exception");
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure",
+            "throwIfFailed",
+            "()V",
+            &[Value::Object(Some(scope))],
+        );
+        assert!(
+            result.is_err(),
+            "throwIfFailed should fail with stored exception"
+        );
     }
 
     #[test]
@@ -58449,15 +59772,25 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let scope = shared.heap.alloc_object(ClassId::new(0), 8);
-        call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess", "<init>", "()V",
-            &[Value::Object(Some(scope))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(scope))],
+        )
+        .unwrap();
 
         // result() before shutdown should fail
-        let result = call_native(&shared, &mut thread,
-            "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess", "result",
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess",
+            "result",
             "()Ljava/lang/Object;",
-            &[Value::Object(Some(scope))]);
+            &[Value::Object(Some(scope))],
+        );
         assert!(result.is_err(), "result() before shutdown should fail");
     }
 
@@ -58492,10 +59825,16 @@ mod tests {
             r
         };
         let sv = "java/lang/StableValue";
-        assert!(registry.find(sv, "of", "()Ljava/lang/StableValue;").is_some());
+        assert!(registry
+            .find(sv, "of", "()Ljava/lang/StableValue;")
+            .is_some());
         assert!(registry.find(sv, "isSet", "()Z").is_some());
-        assert!(registry.find(sv, "orElse", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some());
-        assert!(registry.find(sv, "trySet", "(Ljava/lang/Object;)Z").is_some());
+        assert!(registry
+            .find(sv, "orElse", "(Ljava/lang/Object;)Ljava/lang/Object;")
+            .is_some());
+        assert!(registry
+            .find(sv, "trySet", "(Ljava/lang/Object;)Z")
+            .is_some());
     }
 
     // =========================================================================
@@ -58510,8 +59849,12 @@ mod tests {
             r
         };
         let mi = "jdk/internal/module/ModuleImports";
-        assert!(registry.find(mi, "resolveModuleImport", "(Ljava/lang/String;)Z").is_some());
-        assert!(registry.find(mi, "getExportedPackages", "(Ljava/lang/String;)I").is_some());
+        assert!(registry
+            .find(mi, "resolveModuleImport", "(Ljava/lang/String;)Z")
+            .is_some());
+        assert!(registry
+            .find(mi, "getExportedPackages", "(Ljava/lang/String;)I")
+            .is_some());
         assert!(registry.find(mi, "isSupported", "()Z").is_some());
     }
 
@@ -58520,8 +59863,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let result = call_native(&shared, &mut thread,
-            "jdk/internal/module/ModuleImports", "isSupported", "()Z", &[]).unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/module/ModuleImports",
+            "isSupported",
+            "()Z",
+            &[],
+        )
+        .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
     }
 
@@ -58538,7 +59888,9 @@ mod tests {
         };
         let fc = "jdk/internal/vm/FlexibleConstructors";
         assert!(registry.find(fc, "isPreSuperAllowed", "()Z").is_some());
-        assert!(registry.find(fc, "validatePreSuperStatement", "(I)Z").is_some());
+        assert!(registry
+            .find(fc, "validatePreSuperStatement", "(I)Z")
+            .is_some());
     }
 
     #[test]
@@ -58547,21 +59899,39 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Kind 0 (LocalAssign) should be allowed
-        let r0 = call_native(&shared, &mut thread,
-            "jdk/internal/vm/FlexibleConstructors", "validatePreSuperStatement", "(I)Z",
-            &[Value::Int(0)]).unwrap();
+        let r0 = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/vm/FlexibleConstructors",
+            "validatePreSuperStatement",
+            "(I)Z",
+            &[Value::Int(0)],
+        )
+        .unwrap();
         assert_eq!(r0, Some(Value::Int(1)));
 
         // Kind 1 (StaticCall) should be allowed
-        let r1 = call_native(&shared, &mut thread,
-            "jdk/internal/vm/FlexibleConstructors", "validatePreSuperStatement", "(I)Z",
-            &[Value::Int(1)]).unwrap();
+        let r1 = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/vm/FlexibleConstructors",
+            "validatePreSuperStatement",
+            "(I)Z",
+            &[Value::Int(1)],
+        )
+        .unwrap();
         assert_eq!(r1, Some(Value::Int(1)));
 
         // Kind 3 (Disallowed) should be rejected
-        let r3 = call_native(&shared, &mut thread,
-            "jdk/internal/vm/FlexibleConstructors", "validatePreSuperStatement", "(I)Z",
-            &[Value::Int(3)]).unwrap();
+        let r3 = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/vm/FlexibleConstructors",
+            "validatePreSuperStatement",
+            "(I)Z",
+            &[Value::Int(3)],
+        )
+        .unwrap();
         assert_eq!(r3, Some(Value::Int(0)));
     }
 
@@ -58589,15 +59959,27 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 0x1000 = ACC_IMPLICIT_CLASS
-        let result = call_native(&shared, &mut thread,
-            "jdk/internal/misc/ImplicitClasses", "isImplicitClass", "(I)Z",
-            &[Value::Int(0x1000)]).unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/misc/ImplicitClasses",
+            "isImplicitClass",
+            "(I)Z",
+            &[Value::Int(0x1000)],
+        )
+        .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
 
         // 0x0001 = ACC_PUBLIC only
-        let result2 = call_native(&shared, &mut thread,
-            "jdk/internal/misc/ImplicitClasses", "isImplicitClass", "(I)Z",
-            &[Value::Int(0x0001)]).unwrap();
+        let result2 = call_native(
+            &shared,
+            &mut thread,
+            "jdk/internal/misc/ImplicitClasses",
+            "isImplicitClass",
+            "(I)Z",
+            &[Value::Int(0x0001)],
+        )
+        .unwrap();
         assert_eq!(result2, Some(Value::Int(0)));
     }
 
@@ -58613,10 +59995,30 @@ mod tests {
             r
         };
         let bv = "jdk/incubator/vector/ByteVector";
-        assert!(registry.find(bv, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ByteVector;").is_some());
-        assert!(registry.find(bv, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;B)Ljdk/incubator/vector/ByteVector;").is_some());
-        assert!(registry.find(bv, "add", "(Ljdk/incubator/vector/ByteVector;)Ljdk/incubator/vector/ByteVector;").is_some());
-        assert!(registry.find(bv, "neg", "()Ljdk/incubator/vector/ByteVector;").is_some());
+        assert!(registry
+            .find(
+                bv,
+                "zero",
+                "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ByteVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                bv,
+                "broadcast",
+                "(Ljdk/incubator/vector/VectorSpecies;B)Ljdk/incubator/vector/ByteVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                bv,
+                "add",
+                "(Ljdk/incubator/vector/ByteVector;)Ljdk/incubator/vector/ByteVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(bv, "neg", "()Ljdk/incubator/vector/ByteVector;")
+            .is_some());
         assert!(registry.find(bv, "reduceLanes", "(I)B").is_some());
         assert!(registry.find(bv, "lane", "(I)B").is_some());
     }
@@ -58629,10 +60031,30 @@ mod tests {
             r
         };
         let sv = "jdk/incubator/vector/ShortVector";
-        assert!(registry.find(sv, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ShortVector;").is_some());
-        assert!(registry.find(sv, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;S)Ljdk/incubator/vector/ShortVector;").is_some());
-        assert!(registry.find(sv, "add", "(Ljdk/incubator/vector/ShortVector;)Ljdk/incubator/vector/ShortVector;").is_some());
-        assert!(registry.find(sv, "neg", "()Ljdk/incubator/vector/ShortVector;").is_some());
+        assert!(registry
+            .find(
+                sv,
+                "zero",
+                "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ShortVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                sv,
+                "broadcast",
+                "(Ljdk/incubator/vector/VectorSpecies;S)Ljdk/incubator/vector/ShortVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                sv,
+                "add",
+                "(Ljdk/incubator/vector/ShortVector;)Ljdk/incubator/vector/ShortVector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(sv, "neg", "()Ljdk/incubator/vector/ShortVector;")
+            .is_some());
         assert!(registry.find(sv, "reduceLanes", "(I)S").is_some());
         assert!(registry.find(sv, "lane", "(I)S").is_some());
     }
@@ -58645,8 +60067,12 @@ mod tests {
             r
         };
         let vs = "jdk/incubator/vector/VectorSpecies";
-        assert!(registry.find(vs, "ofByte", "()Ljdk/incubator/vector/VectorSpecies;").is_some());
-        assert!(registry.find(vs, "ofShort", "()Ljdk/incubator/vector/VectorSpecies;").is_some());
+        assert!(registry
+            .find(vs, "ofByte", "()Ljdk/incubator/vector/VectorSpecies;")
+            .is_some());
+        assert!(registry
+            .find(vs, "ofShort", "()Ljdk/incubator/vector/VectorSpecies;")
+            .is_some());
     }
 
     #[test]
@@ -58657,8 +60083,20 @@ mod tests {
             r
         };
         let iv = "jdk/incubator/vector/IntVector";
-        assert!(registry.find(iv, "convertShape", "(ILjdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;").is_some());
-        assert!(registry.find(iv, "castShape", "(Ljdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;").is_some());
+        assert!(registry
+            .find(
+                iv,
+                "convertShape",
+                "(ILjdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                iv,
+                "castShape",
+                "(Ljdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;"
+            )
+            .is_some());
     }
 
     #[test]
@@ -58666,9 +60104,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let result = call_native(&shared, &mut thread,
-            "jdk/incubator/vector/VectorSpecies", "ofByte",
-            "()Ljdk/incubator/vector/VectorSpecies;", &[]).unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "jdk/incubator/vector/VectorSpecies",
+            "ofByte",
+            "()Ljdk/incubator/vector/VectorSpecies;",
+            &[],
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(species))) => {
                 // species field 1 = element_type (BYTE=0)
@@ -58676,7 +60120,11 @@ mod tests {
                 assert_eq!(elem, Value::Int(0), "element type should be BYTE(0)");
                 // species field 3 = lane_count (256/8=32)
                 let lc = shared.heap.get_field(species, 3);
-                assert_eq!(lc, Value::Int(32), "lane count should be 32 for 256-bit byte");
+                assert_eq!(
+                    lc,
+                    Value::Int(32),
+                    "lane count should be 32 for 256-bit byte"
+                );
             }
             _ => panic!("expected species object"),
         }
@@ -58689,9 +60137,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let result = call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "open",
-            "()Ljava/nio/channels/DatagramChannel;", &[]).unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;",
+            &[],
+        )
+        .unwrap();
         match result {
             Some(Value::Object(Some(ch))) => {
                 // field 1 = open (should be 1)
@@ -58710,9 +60164,16 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ch = match call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "open",
-            "()Ljava/nio/channels/DatagramChannel;", &[]).unwrap() {
+        let ch = match call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;",
+            &[],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(c))) => c,
             _ => panic!("expected channel"),
         };
@@ -58721,24 +60182,48 @@ mod tests {
         let sa = shared.heap.alloc_object(ClassId::new(0), 2);
 
         // Connect
-        call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "connect",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "connect",
             "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
-            &[Value::Object(Some(ch)), Value::Object(Some(sa))]).unwrap();
-        assert_eq!(shared.heap.get_field(ch, 2), Value::Int(1), "should be connected");
+            &[Value::Object(Some(ch)), Value::Object(Some(sa))],
+        )
+        .unwrap();
+        assert_eq!(
+            shared.heap.get_field(ch, 2),
+            Value::Int(1),
+            "should be connected"
+        );
 
         // isConnected
-        let connected = call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "isConnected", "()Z",
-            &[Value::Object(Some(ch))]).unwrap();
+        let connected = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "isConnected",
+            "()Z",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
         assert_eq!(connected, Some(Value::Int(1)));
 
         // Disconnect
-        call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "disconnect",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "disconnect",
             "()Ljava/nio/channels/DatagramChannel;",
-            &[Value::Object(Some(ch))]).unwrap();
-        assert_eq!(shared.heap.get_field(ch, 2), Value::Int(0), "should be disconnected");
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
+        assert_eq!(
+            shared.heap.get_field(ch, 2),
+            Value::Int(0),
+            "should be disconnected"
+        );
     }
 
     #[test]
@@ -58746,22 +60231,41 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ch = match call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "open",
-            "()Ljava/nio/channels/DatagramChannel;", &[]).unwrap() {
+        let ch = match call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;",
+            &[],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(c))) => c,
             _ => panic!("expected channel"),
         };
 
         // Close
-        call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "close", "()V",
-            &[Value::Object(Some(ch))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "close",
+            "()V",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
 
         // isOpen should return 0
-        let open = call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "isOpen", "()Z",
-            &[Value::Object(Some(ch))]).unwrap();
+        let open = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "isOpen",
+            "()Z",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
         assert_eq!(open, Some(Value::Int(0)));
     }
 
@@ -58770,24 +60274,46 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ch = match call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "open",
-            "()Ljava/nio/channels/DatagramChannel;", &[]).unwrap() {
+        let ch = match call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;",
+            &[],
+        )
+        .unwrap()
+        {
             Some(Value::Object(Some(c))) => c,
             _ => panic!("expected channel"),
         };
 
         // Set non-blocking
-        call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "configureBlocking",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "configureBlocking",
             "(Z)Ljava/nio/channels/SelectableChannel;",
-            &[Value::Object(Some(ch)), Value::Int(0)]).unwrap();
-        assert_eq!(shared.heap.get_field(ch, 3), Value::Int(0), "should be non-blocking");
+            &[Value::Object(Some(ch)), Value::Int(0)],
+        )
+        .unwrap();
+        assert_eq!(
+            shared.heap.get_field(ch, 3),
+            Value::Int(0),
+            "should be non-blocking"
+        );
 
         // isBlocking should return 0
-        let blocking = call_native(&shared, &mut thread,
-            "java/nio/channels/DatagramChannel", "isBlocking", "()Z",
-            &[Value::Object(Some(ch))]).unwrap();
+        let blocking = call_native(
+            &shared,
+            &mut thread,
+            "java/nio/channels/DatagramChannel",
+            "isBlocking",
+            "()Z",
+            &[Value::Object(Some(ch))],
+        )
+        .unwrap();
         assert_eq!(blocking, Some(Value::Int(0)));
     }
 
@@ -58799,16 +60325,50 @@ mod tests {
             r
         };
         let dc = "java/nio/channels/DatagramChannel";
-        assert!(registry.find(dc, "open", "()Ljava/nio/channels/DatagramChannel;").is_some());
-        assert!(registry.find(dc, "bind", "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;").is_some());
-        assert!(registry.find(dc, "connect", "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;").is_some());
-        assert!(registry.find(dc, "disconnect", "()Ljava/nio/channels/DatagramChannel;").is_some());
+        assert!(registry
+            .find(dc, "open", "()Ljava/nio/channels/DatagramChannel;")
+            .is_some());
+        assert!(registry
+            .find(
+                dc,
+                "bind",
+                "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                dc,
+                "connect",
+                "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;"
+            )
+            .is_some());
+        assert!(registry
+            .find(dc, "disconnect", "()Ljava/nio/channels/DatagramChannel;")
+            .is_some());
         assert!(registry.find(dc, "isConnected", "()Z").is_some());
         assert!(registry.find(dc, "isOpen", "()Z").is_some());
         assert!(registry.find(dc, "close", "()V").is_some());
-        assert!(registry.find(dc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;").is_some());
-        assert!(registry.find(dc, "send", "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I").is_some());
-        assert!(registry.find(dc, "receive", "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;").is_some());
+        assert!(registry
+            .find(
+                dc,
+                "configureBlocking",
+                "(Z)Ljava/nio/channels/SelectableChannel;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                dc,
+                "send",
+                "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                dc,
+                "receive",
+                "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;"
+            )
+            .is_some());
     }
 
     // ---- G12: BigInteger arbitrary-precision tests ----
@@ -58819,17 +60379,37 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create BigInteger(48) and BigInteger(18), gcd should be 6
-        let bi48 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(48)]).unwrap().unwrap();
-        let bi18 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(18)]).unwrap().unwrap();
+        let bi48 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(48)],
+        )
+        .unwrap()
+        .unwrap();
+        let bi18 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(18)],
+        )
+        .unwrap()
+        .unwrap();
 
-        let gcd = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "gcd",
+        let gcd = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "gcd",
             "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[bi48, bi18]).unwrap().unwrap();
+            &[bi48, bi18],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = gcd {
             let val = shared.heap.get_field(obj, 0);
             if let Value::Object(Some(s)) = val {
@@ -58849,24 +60429,49 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 255 = 0xFF, bitLength=8, bitCount=8
-        let bi255 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(255)]).unwrap().unwrap();
+        let bi255 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(255)],
+        )
+        .unwrap()
+        .unwrap();
 
-        let bl = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "bitLength", "()I",
-            &[bi255.clone()]).unwrap();
+        let bl = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "bitLength",
+            "()I",
+            &[bi255.clone()],
+        )
+        .unwrap();
         assert_eq!(bl, Some(Value::Int(8)), "bitLength of 255 should be 8");
 
-        let bc = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "bitCount", "()I",
-            &[bi255.clone()]).unwrap();
+        let bc = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "bitCount",
+            "()I",
+            &[bi255.clone()],
+        )
+        .unwrap();
         assert_eq!(bc, Some(Value::Int(8)), "bitCount of 255 should be 8");
 
         // testBit(0) on 255 should be true
-        let tb = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "testBit", "(I)Z",
-            &[bi255.clone(), Value::Int(0)]).unwrap();
+        let tb = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "testBit",
+            "(I)Z",
+            &[bi255.clone(), Value::Int(0)],
+        )
+        .unwrap();
         assert_eq!(tb, Some(Value::Int(1)), "bit 0 of 255 should be set");
     }
 
@@ -58876,13 +60481,27 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 1 << 10 = 1024
-        let bi1 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(1)]).unwrap().unwrap();
+        let bi1 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(1)],
+        )
+        .unwrap()
+        .unwrap();
 
-        let shifted = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "shiftLeft", "(I)Ljava/math/BigInteger;",
-            &[bi1, Value::Int(10)]).unwrap().unwrap();
+        let shifted = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "shiftLeft",
+            "(I)Ljava/math/BigInteger;",
+            &[bi1, Value::Int(10)],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = shifted {
             let val = shared.heap.get_field(obj, 0);
             if let Value::Object(Some(s)) = val {
@@ -58902,37 +60521,90 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 12 & 10 = 8, 12 | 10 = 14, 12 ^ 10 = 6
-        let bi12 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(12)]).unwrap().unwrap();
-        let bi10 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(10)]).unwrap().unwrap();
+        let bi12 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(12)],
+        )
+        .unwrap()
+        .unwrap();
+        let bi10 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(10)],
+        )
+        .unwrap()
+        .unwrap();
 
-        let and_result = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "and",
+        let and_result = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "and",
             "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[bi12.clone(), bi10.clone()]).unwrap().unwrap();
+            &[bi12.clone(), bi10.clone()],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = and_result {
-            let text = read_java_string(&shared.heap, match shared.heap.get_field(obj, 0) { Value::Object(Some(s)) => s, _ => panic!("no str") }).unwrap();
+            let text = read_java_string(
+                &shared.heap,
+                match shared.heap.get_field(obj, 0) {
+                    Value::Object(Some(s)) => s,
+                    _ => panic!("no str"),
+                },
+            )
+            .unwrap();
             assert_eq!(text, "8", "12 & 10 = 8");
         }
 
-        let or_result = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "or",
+        let or_result = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "or",
             "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[bi12.clone(), bi10.clone()]).unwrap().unwrap();
+            &[bi12.clone(), bi10.clone()],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = or_result {
-            let text = read_java_string(&shared.heap, match shared.heap.get_field(obj, 0) { Value::Object(Some(s)) => s, _ => panic!("no str") }).unwrap();
+            let text = read_java_string(
+                &shared.heap,
+                match shared.heap.get_field(obj, 0) {
+                    Value::Object(Some(s)) => s,
+                    _ => panic!("no str"),
+                },
+            )
+            .unwrap();
             assert_eq!(text, "14", "12 | 10 = 14");
         }
 
-        let xor_result = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "xor",
+        let xor_result = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "xor",
             "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[bi12.clone(), bi10.clone()]).unwrap().unwrap();
+            &[bi12.clone(), bi10.clone()],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = xor_result {
-            let text = read_java_string(&shared.heap, match shared.heap.get_field(obj, 0) { Value::Object(Some(s)) => s, _ => panic!("no str") }).unwrap();
+            let text = read_java_string(
+                &shared.heap,
+                match shared.heap.get_field(obj, 0) {
+                    Value::Object(Some(s)) => s,
+                    _ => panic!("no str"),
+                },
+            )
+            .unwrap();
             assert_eq!(text, "6", "12 ^ 10 = 6");
         }
     }
@@ -58943,22 +60615,56 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 2^10 mod 1000 = 1024 mod 1000 = 24
-        let bi2 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(2)]).unwrap().unwrap();
-        let bi10 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(10)]).unwrap().unwrap();
-        let bi1000 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(1000)]).unwrap().unwrap();
+        let bi2 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(2)],
+        )
+        .unwrap()
+        .unwrap();
+        let bi10 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(10)],
+        )
+        .unwrap()
+        .unwrap();
+        let bi1000 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(1000)],
+        )
+        .unwrap()
+        .unwrap();
 
-        let result = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "modPow",
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "modPow",
             "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[bi2, bi10, bi1000]).unwrap().unwrap();
+            &[bi2, bi10, bi1000],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = result {
-            let text = read_java_string(&shared.heap, match shared.heap.get_field(obj, 0) { Value::Object(Some(s)) => s, _ => panic!("no str") }).unwrap();
+            let text = read_java_string(
+                &shared.heap,
+                match shared.heap.get_field(obj, 0) {
+                    Value::Object(Some(s)) => s,
+                    _ => panic!("no str"),
+                },
+            )
+            .unwrap();
             assert_eq!(text, "24", "2^10 mod 1000 = 24");
         } else {
             panic!("expected BigInteger");
@@ -58971,21 +60677,47 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // 7 is prime
-        let bi7 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(7)]).unwrap().unwrap();
-        let prime = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "isProbablePrime", "(I)Z",
-            &[bi7, Value::Int(10)]).unwrap();
+        let bi7 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(7)],
+        )
+        .unwrap()
+        .unwrap();
+        let prime = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "isProbablePrime",
+            "(I)Z",
+            &[bi7, Value::Int(10)],
+        )
+        .unwrap();
         assert_eq!(prime, Some(Value::Int(1)), "7 should be prime");
 
         // 9 is not prime
-        let bi9 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(9)]).unwrap().unwrap();
-        let not_prime = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "isProbablePrime", "(I)Z",
-            &[bi9, Value::Int(10)]).unwrap();
+        let bi9 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(9)],
+        )
+        .unwrap()
+        .unwrap();
+        let not_prime = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "isProbablePrime",
+            "(I)Z",
+            &[bi9, Value::Int(10)],
+        )
+        .unwrap();
         assert_eq!(not_prime, Some(Value::Int(0)), "9 should not be prime");
     }
 
@@ -58995,14 +60727,35 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // not(0) = -(0+1) = -1
-        let bi0 = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "valueOf", "(J)Ljava/math/BigInteger;",
-            &[Value::Long(0)]).unwrap().unwrap();
-        let result = call_native(&shared, &mut thread,
-            "java/math/BigInteger", "not", "()Ljava/math/BigInteger;",
-            &[bi0]).unwrap().unwrap();
+        let bi0 = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "valueOf",
+            "(J)Ljava/math/BigInteger;",
+            &[Value::Long(0)],
+        )
+        .unwrap()
+        .unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "not",
+            "()Ljava/math/BigInteger;",
+            &[bi0],
+        )
+        .unwrap()
+        .unwrap();
         if let Value::Object(Some(obj)) = result {
-            let text = read_java_string(&shared.heap, match shared.heap.get_field(obj, 0) { Value::Object(Some(s)) => s, _ => panic!("no str") }).unwrap();
+            let text = read_java_string(
+                &shared.heap,
+                match shared.heap.get_field(obj, 0) {
+                    Value::Object(Some(s)) => s,
+                    _ => panic!("no str"),
+                },
+            )
+            .unwrap();
             assert_eq!(text, "-1", "not(0) = -1");
         }
     }
@@ -59015,19 +60768,45 @@ mod tests {
             r
         };
         let bi = "java/math/BigInteger";
-        assert!(registry.find(bi, "gcd", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
+        assert!(registry
+            .find(bi, "gcd", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
+            .is_some());
         assert!(registry.find(bi, "bitLength", "()I").is_some());
         assert!(registry.find(bi, "bitCount", "()I").is_some());
         assert!(registry.find(bi, "testBit", "(I)Z").is_some());
-        assert!(registry.find(bi, "shiftLeft", "(I)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "shiftRight", "(I)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "and", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "or", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "xor", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "not", "()Ljava/math/BigInteger;").is_some());
+        assert!(registry
+            .find(bi, "shiftLeft", "(I)Ljava/math/BigInteger;")
+            .is_some());
+        assert!(registry
+            .find(bi, "shiftRight", "(I)Ljava/math/BigInteger;")
+            .is_some());
+        assert!(registry
+            .find(bi, "and", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
+            .is_some());
+        assert!(registry
+            .find(bi, "or", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
+            .is_some());
+        assert!(registry
+            .find(bi, "xor", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;")
+            .is_some());
+        assert!(registry
+            .find(bi, "not", "()Ljava/math/BigInteger;")
+            .is_some());
         assert!(registry.find(bi, "isProbablePrime", "(I)Z").is_some());
-        assert!(registry.find(bi, "modPow", "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
-        assert!(registry.find(bi, "modInverse", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;").is_some());
+        assert!(registry
+            .find(
+                bi,
+                "modPow",
+                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                bi,
+                "modInverse",
+                "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+            )
+            .is_some());
     }
 
     // ---- M5: JIT compiles user code (no longer skipped) ----
@@ -59045,13 +60824,16 @@ mod tests {
         // Bytecode: aload_0, getfield #1, ireturn
         // getfield/putfield should NOT cause jit_scan to reject
         let code = [
-            0x2a,             // aload_0
+            0x2a, // aload_0
             0xb4, 0x00, 0x01, // getfield #1
-            0xac,             // ireturn
+            0xac, // ireturn
             0, 0,
         ];
         let scan = crate::jit::x64::jit_scan(&code, 5, "(Ljava/lang/Object;)I");
-        assert!(scan.is_some(), "jit_scan should accept methods with getfield");
+        assert!(
+            scan.is_some(),
+            "jit_scan should accept methods with getfield"
+        );
         let s = scan.unwrap();
         assert_eq!(s.field_ops.len(), 1, "should find 1 field op");
         assert_eq!(s.field_ops[0], (1, 1), "field op at pc=1, cp_idx=1");
@@ -59061,14 +60843,17 @@ mod tests {
     fn m5_jit_scan_accepts_putfield() {
         // Bytecode: aload_0, iload_1, putfield #2, return
         let code = [
-            0x2a,             // aload_0
-            0x1b,             // iload_1
+            0x2a, // aload_0
+            0x1b, // iload_1
             0xb5, 0x00, 0x02, // putfield #2
-            0xb1,             // return
+            0xb1, // return
             0, 0,
         ];
         let scan = crate::jit::x64::jit_scan(&code, 6, "(Ljava/lang/Object;I)V");
-        assert!(scan.is_some(), "jit_scan should accept methods with putfield");
+        assert!(
+            scan.is_some(),
+            "jit_scan should accept methods with putfield"
+        );
         let s = scan.unwrap();
         assert_eq!(s.field_ops.len(), 1, "should find 1 field op");
     }
@@ -59078,9 +60863,9 @@ mod tests {
         // <init> methods should now be JIT-scannable (no longer blocked)
         // Simple constructor: aload_0, invokespecial #1, return
         let code = [
-            0x2a,             // aload_0
+            0x2a, // aload_0
             0xb7, 0x00, 0x01, // invokespecial #1
-            0xb1,             // return
+            0xb1, // return
             0, 0,
         ];
         let scan = crate::jit::x64::jit_scan(&code, 5, "()V");
@@ -59100,12 +60885,12 @@ mod tests {
     fn m5_field_info_resolution_produces_correct_index() {
         // Verify that jit_scan captures field_ops with correct cp_index
         let code = [
-            0x2a,             // aload_0
+            0x2a, // aload_0
             0xb4, 0x00, 0x05, // getfield #5
-            0x2a,             // aload_0
+            0x2a, // aload_0
             0xb4, 0x00, 0x07, // getfield #7
-            0x60,             // iadd
-            0xac,             // ireturn
+            0x60, // iadd
+            0xac, // ireturn
             0, 0,
         ];
         let scan = crate::jit::x64::jit_scan(&code, 10, "(Ljava/lang/Object;)I");
@@ -59125,7 +60910,7 @@ mod tests {
         // Empty bytecode РІР‚вЂќ jit_scan should handle without panicking
         let empty: [u8; 0] = [];
         let _ = crate::jit::x64::jit_scan(&empty, 0, "()V"); // must not panic
-        // Single invalid opcode should not panic
+                                                             // Single invalid opcode should not panic
         let bad = [0xfe, 0, 0]; // 0xfe is unused opcode
         let _ = crate::jit::x64::jit_scan(&bad, 1, "()V"); // must not panic
     }
@@ -59135,7 +60920,7 @@ mod tests {
         // Bytecode with a goto targeting beyond the method should not panic
         let code = [
             0xa7, 0x27, 0x0f, // goto offset=9999
-            0xb1,             // return (unreachable)
+            0xb1, // return (unreachable)
             0,
         ];
         // jit_scan may accept or reject this, but must not panic
@@ -59156,7 +60941,7 @@ mod tests {
     #[test]
     fn m7_gc_heap_alloc_array_zero_length() {
         // Allocating a zero-length array should succeed
-        use cratonvm_gc::{VmHeap, ArrayElementType};
+        use cratonvm_gc::{ArrayElementType, VmHeap};
         use cratonvm_types::ClassId;
         let heap = VmHeap::new(cratonvm_gc::GcBackend::Generational, 1024 * 1024);
         let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 0);
@@ -59193,57 +60978,97 @@ mod tests {
     fn m2_default_interface_method_resolution() {
         // Verify that find_method_recursive finds default methods on interfaces
         // when the concrete class doesn't override them.
-        use cratonvm_classloading::{ClassStore, Class, ClassState, ClassLoaderId, find_method_recursive};
+        use cratonvm_classloading::{
+            find_method_recursive, Class, ClassLoaderId, ClassState, ClassStore,
+        };
         use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
-        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         use cratonvm_reader::method::ClassFileMethod;
 
         let mut store = ClassStore::new();
 
-        let mk = |id, name: &str, sup, ifaces: Vec<_>, methods: Vec<ClassFileMethod>, flags| {
-            Class {
-                id, loader_id: ClassLoaderId::Application,
-                name: std::sync::Arc::from(name), source_file: None,
-                version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
+        let mk =
+            |id, name: &str, sup, ifaces: Vec<_>, methods: Vec<ClassFileMethod>, flags| Class {
+                id,
+                loader_id: ClassLoaderId::Application,
+                name: std::sync::Arc::from(name),
+                source_file: None,
+                version: ClassFileVersion::JAVA_8,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
                 access_flags: flags,
-                superclass: sup, interfaces: ifaces, fields: vec![],
-                methods, first_field_index: 0, num_total_fields: 0,
-                bootstrap_methods: vec![], signature: None, annotations: vec![],
-                nest_host: None, nest_members: vec![], record_components: vec![],
-                permitted_subclasses: vec![], inner_classes: vec![], enclosing_method: None,
-                hidden: false, module_name: None,
-                is_synthetic_stub: false, has_finalizer: false,
+                superclass: sup,
+                interfaces: ifaces,
+                fields: vec![],
+                methods,
+                first_field_index: 0,
+                num_total_fields: 0,
+                bootstrap_methods: vec![],
+                signature: None,
+                annotations: vec![],
+                nest_host: None,
+                nest_members: vec![],
+                record_components: vec![],
+                permitted_subclasses: vec![],
+                inner_classes: vec![],
+                enclosing_method: None,
+                hidden: false,
+                module_name: None,
+                is_synthetic_stub: false,
+                has_finalizer: false,
                 code_source: None,
                 array_info: None,
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            }
-        };
+            };
 
         let obj_id = store.next_id();
-        store.add(mk(obj_id, "java/lang/Object", None, vec![], vec![],
-            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER));
+        store.add(mk(
+            obj_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        ));
 
         let iface_id = store.next_id();
-        store.add(mk(iface_id, "Greeting", Some(obj_id), vec![],
+        store.add(mk(
+            iface_id,
+            "Greeting",
+            Some(obj_id),
+            vec![],
             vec![ClassFileMethod {
                 access_flags: MethodAccessFlags::PUBLIC,
                 name: Arc::from("shout"),
                 descriptor: Arc::from("()Ljava/lang/String;"),
                 attributes: vec![],
             }],
-            ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT));
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::INTERFACE | ClassAccessFlags::ABSTRACT,
+        ));
 
         let class_id = store.next_id();
-        store.add(mk(class_id, "CasualGreeting", Some(obj_id), vec![iface_id], vec![],
-            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER));
+        store.add(mk(
+            class_id,
+            "CasualGreeting",
+            Some(obj_id),
+            vec![iface_id],
+            vec![],
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        ));
 
         // shout() should be found on the interface (default method)
         let result = find_method_recursive(class_id, "shout", "()Ljava/lang/String;", &store);
-        assert!(result.is_some(), "M2: default interface method should be found");
+        assert!(
+            result.is_some(),
+            "M2: default interface method should be found"
+        );
         let (method, declaring_id) = result.unwrap();
-        assert_eq!(declaring_id, iface_id, "M2: shout() should resolve to interface");
+        assert_eq!(
+            declaring_id, iface_id,
+            "M2: shout() should resolve to interface"
+        );
         assert_eq!(&*method.name, "shout");
     }
 
@@ -59273,14 +61098,19 @@ mod tests {
 
         // Call Function.andThen РІР‚вЂќ should create a Function$AndThen composite
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "andThen",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
             &[Value::Object(Some(func1)), Value::Object(Some(func2))],
         );
         assert!(result.is_ok(), "Function.andThen should not crash");
         let composite = result.unwrap();
-        assert!(composite.is_some(), "andThen should return a composite Function");
+        assert!(
+            composite.is_some(),
+            "andThen should return a composite Function"
+        );
     }
 
     #[test]
@@ -59292,13 +61122,18 @@ mod tests {
         let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "compose",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "compose",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
             &[Value::Object(Some(func1)), Value::Object(Some(func2))],
         );
         assert!(result.is_ok(), "Function.compose should not crash");
-        assert!(result.unwrap().is_some(), "compose should return a composite Function");
+        assert!(
+            result.unwrap().is_some(),
+            "compose should return a composite Function"
+        );
     }
 
     #[test]
@@ -59308,11 +61143,15 @@ mod tests {
 
         // Get identity function
         let identity = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "identity",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "identity",
             "()Ljava/util/function/Function;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Apply identity to an object РІР‚вЂќ should return the same object
         let obj = shared.heap.alloc_object(ClassId::new(0), 0);
@@ -59321,8 +61160,10 @@ mod tests {
             _ => panic!("Expected object"),
         };
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function$Identity", "apply",
+            &shared,
+            &mut thread,
+            "java/util/function/Function$Identity",
+            "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(identity_ref)), Value::Object(Some(obj))],
         );
@@ -59343,13 +61184,18 @@ mod tests {
         let cons2 = shared.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/function/Consumer", "andThen",
+            &shared,
+            &mut thread,
+            "java/util/function/Consumer",
+            "andThen",
             "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
             &[Value::Object(Some(cons1)), Value::Object(Some(cons2))],
         );
         assert!(result.is_ok(), "Consumer.andThen should not crash");
-        assert!(result.unwrap().is_some(), "andThen should return a composite Consumer");
+        assert!(
+            result.unwrap().is_some(),
+            "andThen should return a composite Consumer"
+        );
     }
 
     #[test]
@@ -59362,17 +61208,25 @@ mod tests {
         let func1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
         let _composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "andThen",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
             &[Value::Object(Some(func1)), Value::Object(Some(func2))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify the Function$AndThen class is loaded with correct interfaces
         let cm = shared.class_manager.read();
-        if let Some(and_then_class) = cm.class_store.find_by_name("java/util/function/Function$AndThen") {
-            assert!(!and_then_class.interfaces.is_empty(),
-                "Function$AndThen should implement Function interface");
+        if let Some(and_then_class) = cm
+            .class_store
+            .find_by_name("java/util/function/Function$AndThen")
+        {
+            assert!(
+                !and_then_class.interfaces.is_empty(),
+                "Function$AndThen should implement Function interface"
+            );
         }
         // (If the class isn't loaded yet via call_native, that's OK РІР‚вЂќ the interface
         // registration is in jdk_interfaces which is applied at class load time)
@@ -59389,11 +61243,15 @@ mod tests {
         let f1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let f2 = shared.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "andThen",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
             &[Value::Object(Some(f1)), Value::Object(Some(f2))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         // Verify composite is a Function$AndThen with 2 fields
         match composite {
             Value::Object(Some(r)) => {
@@ -59414,11 +61272,15 @@ mod tests {
         let f1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let f2 = shared.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Function", "compose",
+            &shared,
+            &mut thread,
+            "java/util/function/Function",
+            "compose",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
             &[Value::Object(Some(f1)), Value::Object(Some(f2))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match composite {
             Value::Object(Some(r)) => {
                 let cid = shared.heap.class_id_of(r);
@@ -59438,13 +61300,18 @@ mod tests {
         let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let p2 = shared.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Predicate", "and",
+            &shared,
+            &mut thread,
+            "java/util/function/Predicate",
+            "and",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
             &[Value::Object(Some(p1)), Value::Object(Some(p2))],
         );
         assert!(composite.is_ok(), "Predicate.and should not crash");
-        assert!(composite.unwrap().is_some(), "and should return a composite Predicate");
+        assert!(
+            composite.unwrap().is_some(),
+            "and should return a composite Predicate"
+        );
     }
 
     #[test]
@@ -59455,13 +61322,18 @@ mod tests {
         let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let p2 = shared.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Predicate", "or",
+            &shared,
+            &mut thread,
+            "java/util/function/Predicate",
+            "or",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
             &[Value::Object(Some(p1)), Value::Object(Some(p2))],
         );
         assert!(composite.is_ok(), "Predicate.or should not crash");
-        assert!(composite.unwrap().is_some(), "or should return a composite Predicate");
+        assert!(
+            composite.unwrap().is_some(),
+            "or should return a composite Predicate"
+        );
     }
 
     #[test]
@@ -59471,15 +61343,19 @@ mod tests {
 
         let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
-            &shared, &mut thread,
-            "java/util/function/Predicate", "negate",
+            &shared,
+            &mut thread,
+            "java/util/function/Predicate",
+            "negate",
             "()Ljava/util/function/Predicate;",
             &[Value::Object(Some(p1))],
         );
         assert!(composite.is_ok(), "Predicate.negate should not crash");
-        assert!(composite.unwrap().is_some(), "negate should return a composite Predicate");
+        assert!(
+            composite.unwrap().is_some(),
+            "negate should return a composite Predicate"
+        );
     }
-
 
     // -----------------------------------------------------------------------
     // M4 РІР‚вЂќ GC heap exhaustion: verify GC-and-retry and larger heap
@@ -59499,19 +61375,25 @@ mod tests {
     #[test]
     fn m4_try_alloc_object_returns_none_on_oom() {
         // Verify try_alloc_object returns None instead of panicking
-        use cratonvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{GcBackend, VmHeap};
         let heap = VmHeap::new(GcBackend::Generational, 4096); // tiny heap
-        // Try to allocate a large object РІР‚вЂќ should return None
+                                                               // Try to allocate a large object РІР‚вЂќ should return None
         let result = heap.try_alloc_object(ClassId::new(0), 10_000);
-        assert!(result.is_none(), "try_alloc_object should return None on OOM, not panic");
+        assert!(
+            result.is_none(),
+            "try_alloc_object should return None on OOM, not panic"
+        );
     }
 
     #[test]
     fn m4_try_alloc_array_returns_none_on_oom() {
-        use cratonvm_gc::{VmHeap, GcBackend, ArrayElementType};
+        use cratonvm_gc::{ArrayElementType, GcBackend, VmHeap};
         let heap = VmHeap::new(GcBackend::Generational, 4096); // tiny heap
         let result = heap.try_alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
-        assert!(result.is_none(), "try_alloc_array should return None on OOM, not panic");
+        assert!(
+            result.is_none(),
+            "try_alloc_array should return None on OOM, not panic"
+        );
     }
 
     #[test]
@@ -59524,9 +61406,10 @@ mod tests {
         }
         // Allocate 2000 arrays
         for _ in 0..2000 {
-            let _arr = shared.heap.alloc_array(
-                ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100,
-            );
+            let _arr =
+                shared
+                    .heap
+                    .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100);
         }
     }
 
@@ -59534,7 +61417,7 @@ mod tests {
     fn m4_heap_expansion_under_pressure() {
         // With 256KB heap, GC must run to survive 2000 allocations.
         // Using try_alloc + GC pattern that the interpreter uses.
-        use cratonvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{GcBackend, VmHeap};
 
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
@@ -59547,7 +61430,8 @@ mod tests {
                 None => {
                     // GC and retry
                     let _result = heap.collect_garbage(&stw, &mut roots, &monitors);
-                    let _obj = heap.try_alloc_object(ClassId::new(0), 4)
+                    let _obj = heap
+                        .try_alloc_object(ClassId::new(0), 4)
                         .expect("alloc should succeed after GC");
                 }
             }
@@ -59569,7 +61453,7 @@ mod tests {
     #[test]
     fn m4_tlab_refill_from_heap() {
         // Verify the heap can carve out TLABs.
-        use cratonvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{GcBackend, VmHeap};
         let heap = VmHeap::new(GcBackend::Generational, 4 * 1024 * 1024);
         let result = heap.refill_tlab(64 * 1024);
         assert!(result.is_some(), "refill_tlab should succeed on fresh heap");
@@ -59594,7 +61478,7 @@ mod tests {
     #[test]
     fn m4_gc_with_expandable_heap() {
         // Heap starts small, GC runs when needed.
-        use cratonvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{GcBackend, VmHeap};
 
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
@@ -59632,9 +61516,10 @@ mod tests {
             let _obj = shared.heap.alloc_object(ClassId::new(0), 4);
         }
         for _ in 0..5_000 {
-            let _arr = shared.heap.alloc_array(
-                ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 50,
-            );
+            let _arr =
+                shared
+                    .heap
+                    .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 50);
         }
     }
 
@@ -59642,14 +61527,16 @@ mod tests {
     fn m4_concurrent_heavy_allocation() {
         // Multiple threads allocating heavily РІР‚вЂќ exercises TLAB + shared path.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let threads: Vec<_> = (0..4).map(|_| {
-            let s = shared.clone();
-            std::thread::spawn(move || {
-                for _ in 0..2000 {
-                    let _obj = s.heap.alloc_object(ClassId::new(0), 4);
-                }
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let s = shared.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let _obj = s.heap.alloc_object(ClassId::new(0), 4);
+                    }
+                })
             })
-        }).collect();
+            .collect();
         for t in threads {
             t.join().expect("allocation thread panicked");
         }
@@ -59765,8 +61652,13 @@ mod tests {
             Value::Int(v) => v,
             _ => panic!("Expected Int"),
         };
-        assert_eq!(final_val, (iterations * 2) as i32,
-            "M6: synchronized counter should be exactly {} (got {})", iterations * 2, final_val);
+        assert_eq!(
+            final_val,
+            (iterations * 2) as i32,
+            "M6: synchronized counter should be exactly {} (got {})",
+            iterations * 2,
+            final_val
+        );
     }
 
     #[test]
@@ -59795,21 +61687,25 @@ mod tests {
     fn m6_concurrent_array_operations() {
         // Two threads write to different elements of a shared array.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let arr = shared.heap.alloc_array(
-            ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100,
-        );
+        let arr = shared
+            .heap
+            .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100);
 
         let s1 = shared.clone();
         let s2 = shared.clone();
 
         let t1 = std::thread::spawn(move || {
             for i in 0..50 {
-                s1.heap.set_array_element(arr, i, Value::Int(i as i32 * 10)).unwrap();
+                s1.heap
+                    .set_array_element(arr, i, Value::Int(i as i32 * 10))
+                    .unwrap();
             }
         });
         let t2 = std::thread::spawn(move || {
             for i in 50..100 {
-                s2.heap.set_array_element(arr, i, Value::Int(i as i32 * 10)).unwrap();
+                s2.heap
+                    .set_array_element(arr, i, Value::Int(i as i32 * 10))
+                    .unwrap();
             }
         });
 
@@ -59857,17 +61753,21 @@ mod tests {
     fn m6_four_threads_concurrent_allocation() {
         // Four threads allocate simultaneously РІР‚вЂќ stress test for heap concurrency.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let handles: Vec<_> = (0..4).map(|_| {
-            let s = shared.clone();
-            std::thread::spawn(move || {
-                for _ in 0..200 {
-                    let _obj = s.heap.alloc_object(ClassId::new(0), 2);
-                    let _arr = s.heap.alloc_array(
-                        ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 10,
-                    );
-                }
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let s = shared.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let _obj = s.heap.alloc_object(ClassId::new(0), 2);
+                        let _arr = s.heap.alloc_array(
+                            ClassId::new(0),
+                            cratonvm_gc::ArrayElementType::Int,
+                            10,
+                        );
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().expect("worker thread panicked");
@@ -59914,15 +61814,21 @@ mod tests {
         let cp = annotation_cp(&["Lorg/springframework/stereotype/Component;"]);
         let ann = mk_annotation(1);
         let data = vm_exec::convert_annotation(&ann, &cp);
-        assert!(data.is_some(), "M12: convert_annotation should succeed for valid annotation");
+        assert!(
+            data.is_some(),
+            "M12: convert_annotation should succeed for valid annotation"
+        );
         let data = data.unwrap();
-        assert_eq!(data.type_descriptor, "Lorg/springframework/stereotype/Component;");
+        assert_eq!(
+            data.type_descriptor,
+            "Lorg/springframework/stereotype/Component;"
+        );
         assert!(data.elements.is_empty());
     }
 
     #[test]
     fn m12_convert_annotation_with_string_element() {
-        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValue, ElementValuePair};
         // @Service(value="myService")
         // CP: [0]=Tombstone, [1]="Lorg/springframework/stereotype/Service;", [2]="value", [3]="myService"
         let cp = annotation_cp(&[
@@ -59930,14 +61836,21 @@ mod tests {
             "value",
             "myService",
         ]);
-        let ann = mk_annotation_with_elems(1, vec![
-            ElementValuePair {
+        let ann = mk_annotation_with_elems(
+            1,
+            vec![ElementValuePair {
                 element_name_index: 2,
-                value: ElementValue::Const { tag: b's', const_value_index: 3 },
-            },
-        ]);
+                value: ElementValue::Const {
+                    tag: b's',
+                    const_value_index: 3,
+                },
+            }],
+        );
         let data = vm_exec::convert_annotation(&ann, &cp).unwrap();
-        assert_eq!(data.type_descriptor, "Lorg/springframework/stereotype/Service;");
+        assert_eq!(
+            data.type_descriptor,
+            "Lorg/springframework/stereotype/Service;"
+        );
         assert_eq!(data.elements.len(), 1);
         assert_eq!(data.elements[0].0, "value");
         match &data.elements[0].1 {
@@ -59950,7 +61863,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_with_int_element() {
-        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValue, ElementValuePair};
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         // @Retention(value=1)  РІР‚вЂќ simplified: int element
         // CP: [0]=Tombstone, [1]="Ljava/lang/annotation/Retention;", [2]="value", [3]=Integer(1)
@@ -59960,12 +61873,16 @@ mod tests {
             ConstantPoolEntry::Utf8("value".into()),
             ConstantPoolEntry::Integer(42),
         ]);
-        let ann = mk_annotation_with_elems(1, vec![
-            ElementValuePair {
+        let ann = mk_annotation_with_elems(
+            1,
+            vec![ElementValuePair {
                 element_name_index: 2,
-                value: ElementValue::Const { tag: b'I', const_value_index: 3 },
-            },
-        ]);
+                value: ElementValue::Const {
+                    tag: b'I',
+                    const_value_index: 3,
+                },
+            }],
+        );
         let data = vm_exec::convert_annotation(&ann, &cp).unwrap();
         assert_eq!(data.type_descriptor, "Ljava/lang/annotation/Retention;");
         match &data.elements[0].1 {
@@ -59976,7 +61893,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_with_enum_element() {
-        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValue, ElementValuePair};
         // @Retention(RetentionPolicy.RUNTIME)
         // CP: [0]=Tombstone, [1]="Ljava/lang/annotation/Retention;", [2]="value",
         //     [3]="Ljava/lang/annotation/RetentionPolicy;", [4]="RUNTIME"
@@ -59986,12 +61903,16 @@ mod tests {
             "Ljava/lang/annotation/RetentionPolicy;",
             "RUNTIME",
         ]);
-        let ann = mk_annotation_with_elems(1, vec![
-            ElementValuePair {
+        let ann = mk_annotation_with_elems(
+            1,
+            vec![ElementValuePair {
                 element_name_index: 2,
-                value: ElementValue::Enum { type_name_index: 3, const_name_index: 4 },
-            },
-        ]);
+                value: ElementValue::Enum {
+                    type_name_index: 3,
+                    const_name_index: 4,
+                },
+            }],
+        );
         let data = vm_exec::convert_annotation(&ann, &cp).unwrap();
         match &data.elements[0].1 {
             crate::native::registry::AnnotationElementValue::Enum(ty, name) => {
@@ -60016,7 +61937,7 @@ mod tests {
     fn m12_class_annotations_via_shared_vm() {
         // Build a Class with annotations, register it in SharedVm, and verify
         // class_annotations() returns the correct data.
-        use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+        use cratonvm_classloading::{Class, ClassLoaderId, ClassState};
         use cratonvm_reader::class_access_flags::ClassAccessFlags;
         use cratonvm_reader::class_file_version::ClassFileVersion;
 
@@ -60030,18 +61951,34 @@ mod tests {
             let mut cm = shared.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
-                id: class_id, loader_id: ClassLoaderId::Application,
-                name: cratonvm_types::intern_arc("com/example/MyService"), source_file: None,
-                version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
+                id: class_id,
+                loader_id: ClassLoaderId::Application,
+                name: cratonvm_types::intern_arc("com/example/MyService"),
+                source_file: None,
+                version: ClassFileVersion::JAVA_8,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
-                superclass: None, interfaces: vec![], fields: vec![],
-                methods: vec![], first_field_index: 0, num_total_fields: 0,
-                bootstrap_methods: vec![], signature: None, annotations: vec![ann],
-                nest_host: None, nest_members: vec![], record_components: vec![],
-                permitted_subclasses: vec![], inner_classes: vec![], enclosing_method: None,
-                hidden: false, module_name: None,
-                is_synthetic_stub: false, has_finalizer: false,
+                superclass: None,
+                interfaces: vec![],
+                fields: vec![],
+                methods: vec![],
+                first_field_index: 0,
+                num_total_fields: 0,
+                bootstrap_methods: vec![],
+                signature: None,
+                annotations: vec![ann],
+                nest_host: None,
+                nest_members: vec![],
+                record_components: vec![],
+                permitted_subclasses: vec![],
+                inner_classes: vec![],
+                enclosing_method: None,
+                hidden: false,
+                module_name: None,
+                is_synthetic_stub: false,
+                has_finalizer: false,
                 code_source: None,
                 array_info: None,
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -60051,7 +61988,10 @@ mod tests {
         // Use the NativeContextImpl to get class_annotations РІР‚вЂќ we go through the VM
         // the same way the native methods do.
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         let annotations = ctx.class_annotations(class_id);
         assert_eq!(annotations.len(), 1, "M12: should have 1 annotation");
         assert_eq!(annotations[0].type_descriptor, "Ljakarta/inject/Named;");
@@ -60076,7 +62016,7 @@ mod tests {
     #[test]
     fn m12_multiple_annotations_on_class() {
         // A class with @Component + @Service should return both.
-        use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+        use cratonvm_classloading::{Class, ClassLoaderId, ClassState};
         use cratonvm_reader::class_access_flags::ClassAccessFlags;
         use cratonvm_reader::class_file_version::ClassFileVersion;
 
@@ -60094,18 +62034,34 @@ mod tests {
             let mut cm = shared.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
-                id: class_id, loader_id: ClassLoaderId::Application,
-                name: cratonvm_types::intern_arc("com/example/DualAnnotated"), source_file: None,
-                version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
+                id: class_id,
+                loader_id: ClassLoaderId::Application,
+                name: cratonvm_types::intern_arc("com/example/DualAnnotated"),
+                source_file: None,
+                version: ClassFileVersion::JAVA_8,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
-                superclass: None, interfaces: vec![], fields: vec![],
-                methods: vec![], first_field_index: 0, num_total_fields: 0,
-                bootstrap_methods: vec![], signature: None, annotations: vec![ann1, ann2],
-                nest_host: None, nest_members: vec![], record_components: vec![],
-                permitted_subclasses: vec![], inner_classes: vec![], enclosing_method: None,
-                hidden: false, module_name: None,
-                is_synthetic_stub: false, has_finalizer: false,
+                superclass: None,
+                interfaces: vec![],
+                fields: vec![],
+                methods: vec![],
+                first_field_index: 0,
+                num_total_fields: 0,
+                bootstrap_methods: vec![],
+                signature: None,
+                annotations: vec![ann1, ann2],
+                nest_host: None,
+                nest_members: vec![],
+                record_components: vec![],
+                permitted_subclasses: vec![],
+                inner_classes: vec![],
+                enclosing_method: None,
+                hidden: false,
+                module_name: None,
+                is_synthetic_stub: false,
+                has_finalizer: false,
                 code_source: None,
                 array_info: None,
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -60113,28 +62069,38 @@ mod tests {
         }
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         let annotations = ctx.class_annotations(class_id);
         assert_eq!(annotations.len(), 2, "M12: should have 2 annotations");
 
-        let descs: Vec<&str> = annotations.iter().map(|a| a.type_descriptor.as_str()).collect();
+        let descs: Vec<&str> = annotations
+            .iter()
+            .map(|a| a.type_descriptor.as_str())
+            .collect();
         assert!(descs.contains(&"Lorg/springframework/stereotype/Component;"));
         assert!(descs.contains(&"Lorg/springframework/stereotype/Service;"));
     }
 
     #[test]
     fn m12_convert_annotation_nested() {
-        use cratonvm_reader::attribute::{Annotation, ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
         // @Outer(inner=@Inner)
         // CP: [0]=Tombstone, [1]="Louter;", [2]="inner", [3]="Linner;"
         let cp = annotation_cp(&["Louter;", "inner", "Linner;"]);
-        let inner_ann = Annotation { type_index: 3, element_value_pairs: vec![] };
-        let ann = mk_annotation_with_elems(1, vec![
-            ElementValuePair {
+        let inner_ann = Annotation {
+            type_index: 3,
+            element_value_pairs: vec![],
+        };
+        let ann = mk_annotation_with_elems(
+            1,
+            vec![ElementValuePair {
                 element_name_index: 2,
                 value: ElementValue::AnnotationValue(inner_ann),
-            },
-        ]);
+            }],
+        );
         let data = vm_exec::convert_annotation(&ann, &cp).unwrap();
         assert_eq!(data.type_descriptor, "Louter;");
         match &data.elements[0].1 {
@@ -60147,29 +62113,40 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_array_element() {
-        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValue, ElementValuePair};
         // @Target({ElementType.TYPE, ElementType.FIELD})  РІР‚вЂќ simplified as string array
         // CP: [0]=Tombstone, [1]="Ltarget;", [2]="value", [3]="TYPE", [4]="FIELD"
         let cp = annotation_cp(&["Ltarget;", "value", "TYPE", "FIELD"]);
-        let ann = mk_annotation_with_elems(1, vec![
-            ElementValuePair {
+        let ann = mk_annotation_with_elems(
+            1,
+            vec![ElementValuePair {
                 element_name_index: 2,
                 value: ElementValue::Array(vec![
-                    ElementValue::Const { tag: b's', const_value_index: 3 },
-                    ElementValue::Const { tag: b's', const_value_index: 4 },
+                    ElementValue::Const {
+                        tag: b's',
+                        const_value_index: 3,
+                    },
+                    ElementValue::Const {
+                        tag: b's',
+                        const_value_index: 4,
+                    },
                 ]),
-            },
-        ]);
+            }],
+        );
         let data = vm_exec::convert_annotation(&ann, &cp).unwrap();
         match &data.elements[0].1 {
             crate::native::registry::AnnotationElementValue::Array(elems) => {
                 assert_eq!(elems.len(), 2);
                 match &elems[0] {
-                    crate::native::registry::AnnotationElementValue::StringVal(s) => assert_eq!(s, "TYPE"),
+                    crate::native::registry::AnnotationElementValue::StringVal(s) => {
+                        assert_eq!(s, "TYPE")
+                    }
                     other => panic!("M12: expected StringVal, got {:?}", other),
                 }
                 match &elems[1] {
-                    crate::native::registry::AnnotationElementValue::StringVal(s) => assert_eq!(s, "FIELD"),
+                    crate::native::registry::AnnotationElementValue::StringVal(s) => {
+                        assert_eq!(s, "FIELD")
+                    }
                     other => panic!("M12: expected StringVal, got {:?}", other),
                 }
             }
@@ -60185,25 +62162,41 @@ mod tests {
 
         let class_id;
         {
-            use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+            use cratonvm_classloading::{Class, ClassLoaderId, ClassState};
             use cratonvm_reader::class_access_flags::ClassAccessFlags;
             use cratonvm_reader::class_file_version::ClassFileVersion;
 
             let mut cm = shared.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
-                id: class_id, loader_id: ClassLoaderId::Application,
-                name: cratonvm_types::intern_arc("com/example/Plain"), source_file: None,
-                version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
+                id: class_id,
+                loader_id: ClassLoaderId::Application,
+                name: cratonvm_types::intern_arc("com/example/Plain"),
+                source_file: None,
+                version: ClassFileVersion::JAVA_8,
+                state: ClassState::Loaded,
+                initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
-                superclass: None, interfaces: vec![], fields: vec![],
-                methods: vec![], first_field_index: 0, num_total_fields: 0,
-                bootstrap_methods: vec![], signature: None, annotations: vec![],
-                nest_host: None, nest_members: vec![], record_components: vec![],
-                permitted_subclasses: vec![], inner_classes: vec![], enclosing_method: None,
-                hidden: false, module_name: None,
-                is_synthetic_stub: false, has_finalizer: false,
+                superclass: None,
+                interfaces: vec![],
+                fields: vec![],
+                methods: vec![],
+                first_field_index: 0,
+                num_total_fields: 0,
+                bootstrap_methods: vec![],
+                signature: None,
+                annotations: vec![],
+                nest_host: None,
+                nest_members: vec![],
+                record_components: vec![],
+                permitted_subclasses: vec![],
+                inner_classes: vec![],
+                enclosing_method: None,
+                hidden: false,
+                module_name: None,
+                is_synthetic_stub: false,
+                has_finalizer: false,
                 code_source: None,
                 array_info: None,
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -60211,9 +62204,15 @@ mod tests {
         }
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         let annotations = ctx.class_annotations(class_id);
-        assert!(annotations.is_empty(), "M12: unannotated class should have empty annotations");
+        assert!(
+            annotations.is_empty(),
+            "M12: unannotated class should have empty annotations"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -60223,8 +62222,8 @@ mod tests {
     #[test]
     fn m14_tcp_server_client_raw_exchange() {
         // Prove raw TCP socket communication works end-to-end.
-        use std::net::TcpListener;
         use std::io::{Read, Write};
+        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -60253,8 +62252,8 @@ mod tests {
     #[test]
     fn m14_http_server_serves_response() {
         // A minimal HTTP server: accept one request, return 200 OK with body.
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
-        use std::io::{Read, Write, BufRead, BufReader};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -60264,13 +62263,19 @@ mod tests {
             let mut reader = BufReader::new(&stream);
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
-            assert!(request_line.starts_with("GET /api/health"), "M14: got: {}", request_line);
+            assert!(
+                request_line.starts_with("GET /api/health"),
+                "M14: got: {}",
+                request_line
+            );
 
             // Read remaining headers until empty line
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line == "\n" || line.is_empty() { break; }
+                if line == "\r\n" || line == "\n" || line.is_empty() {
+                    break;
+                }
             }
 
             let body = "{\"status\":\"ok\"}";
@@ -60284,7 +62289,9 @@ mod tests {
 
         // Client side: send real HTTP request
         let mut client = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
         let req = "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         client.write_all(req.as_bytes()).unwrap();
         client.flush().unwrap();
@@ -60292,8 +62299,14 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();
         let resp_str = String::from_utf8_lossy(&response);
-        assert!(resp_str.contains("200 OK"), "M14: expected 200 OK in response");
-        assert!(resp_str.contains("{\"status\":\"ok\"}"), "M14: expected JSON body");
+        assert!(
+            resp_str.contains("200 OK"),
+            "M14: expected 200 OK in response"
+        );
+        assert!(
+            resp_str.contains("{\"status\":\"ok\"}"),
+            "M14: expected JSON body"
+        );
 
         server.join().unwrap();
     }
@@ -60301,8 +62314,8 @@ mod tests {
     #[test]
     fn m14_multiple_sequential_http_requests() {
         // A server handles multiple sequential requests.
-        use std::net::TcpListener;
         use std::io::{Read, Write};
+        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -60315,7 +62328,8 @@ mod tests {
                 let body = format!("response-{i}");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body,
+                    body.len(),
+                    body,
                 );
                 stream.write_all(resp.as_bytes()).ok();
             }
@@ -60323,13 +62337,19 @@ mod tests {
 
         for i in 0..3 {
             let mut client = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            let req = format!("GET /req-{i} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            let req =
+                format!("GET /req-{i} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
             client.write_all(req.as_bytes()).unwrap();
             let mut response = Vec::new();
             client.read_to_end(&mut response).unwrap();
             let resp_str = String::from_utf8_lossy(&response);
-            assert!(resp_str.contains(&format!("response-{i}")), "M14: expected response-{i}");
+            assert!(
+                resp_str.contains(&format!("response-{i}")),
+                "M14: expected response-{i}"
+            );
         }
 
         server.join().unwrap();
@@ -60338,8 +62358,8 @@ mod tests {
     #[test]
     fn m14_concurrent_http_clients() {
         // Multiple clients connect to the server concurrently.
-        use std::net::TcpListener;
         use std::io::{Read, Write};
+        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -60354,18 +62374,27 @@ mod tests {
             }
         });
 
-        let handles: Vec<_> = (0..4).map(|_| {
-            std::thread::spawn(move || {
-                let mut client = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-                client.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-                client.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
-                let mut response = Vec::new();
-                client.read_to_end(&mut response).unwrap();
-                let resp_str = String::from_utf8_lossy(&response);
-                assert!(resp_str.contains("200 OK"), "M14: expected 200 OK");
-                assert!(resp_str.contains("OK"), "M14: expected OK body");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut client =
+                        std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+                    client
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .ok();
+                    client
+                        .write_all(
+                            b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    let mut response = Vec::new();
+                    client.read_to_end(&mut response).unwrap();
+                    let resp_str = String::from_utf8_lossy(&response);
+                    assert!(resp_str.contains("200 OK"), "M14: expected 200 OK");
+                    assert!(resp_str.contains("OK"), "M14: expected OK body");
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().expect("M14: client thread panicked");
@@ -60376,8 +62405,8 @@ mod tests {
     #[test]
     fn m14_http_server_large_response_body() {
         // Server returns a large response body (10KB) РІР‚вЂќ tests buffered I/O.
-        use std::net::TcpListener;
         use std::io::{Read, Write};
+        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -60391,14 +62420,19 @@ mod tests {
             let _ = stream.read(&mut buf);
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body_clone.len(), body_clone,
+                body_clone.len(),
+                body_clone,
             );
             stream.write_all(resp.as_bytes()).ok();
         });
 
         let mut client = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-        client.write_all(b"GET /large HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();
         let resp_str = String::from_utf8_lossy(&response);
@@ -60432,14 +62466,15 @@ mod tests {
         use cratonvm_reader::class_access_flags::FieldAccessFlags;
         use cratonvm_reader::field::ClassFileField;
 
-        let fields: Vec<ClassFileField> = field_defs.iter().map(|(n, d)| {
-            ClassFileField {
+        let fields: Vec<ClassFileField> = field_defs
+            .iter()
+            .map(|(n, d)| ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC,
                 name: std::sync::Arc::from(n.as_ref()),
                 descriptor: std::sync::Arc::from(d.as_ref()),
                 attributes: vec![],
-            }
-        }).collect();
+            })
+            .collect();
 
         register_test_class(shared, name, 0x0021, &fields, &[]) // PUBLIC | SUPER
     }
@@ -60447,9 +62482,7 @@ mod tests {
     #[test]
     fn m16_jackson_write_value_as_string_int_fields() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Point", &[
-            ("x", "I"), ("y", "I"),
-        ]);
+        let class_id = m16_register_class(&shared, "com/example/Point", &[("x", "I"), ("y", "I")]);
 
         let obj = shared.heap.alloc_object(class_id, 2);
         shared.heap.set_field(obj, 0, Value::Int(10));
@@ -60460,18 +62493,21 @@ mod tests {
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let json_ref = match result {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String result"),
         };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
         assert!(json.contains("\"x\":10"), "M16: expected x:10 in {json}");
         assert!(json.contains("\"y\":20"), "M16: expected y:20 in {json}");
     }
@@ -60479,9 +62515,11 @@ mod tests {
     #[test]
     fn m16_jackson_write_value_as_string_with_string_field() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Person", &[
-            ("name", "Ljava/lang/String;"), ("age", "I"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/Person",
+            &[("name", "Ljava/lang/String;"), ("age", "I")],
+        );
 
         let name_str = crate::vm::vm_object::create_java_string(&shared, "Alice");
         let obj = shared.heap.alloc_object(class_id, 2);
@@ -60491,25 +62529,39 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
-        let json_ref = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
-        assert!(json.contains("\"name\":\"Alice\""), "M16: expected name:Alice in {json}");
-        assert!(json.contains("\"age\":30"), "M16: expected age:30 in {json}");
+        let json_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        assert!(
+            json.contains("\"name\":\"Alice\""),
+            "M16: expected name:Alice in {json}"
+        );
+        assert!(
+            json.contains("\"age\":30"),
+            "M16: expected age:30 in {json}"
+        );
     }
 
     #[test]
     fn m16_jackson_write_value_as_string_boolean_field() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Toggle", &[
-            ("enabled", "Z"), ("count", "I"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/Toggle",
+            &[("enabled", "Z"), ("count", "I")],
+        );
 
         let obj = shared.heap.alloc_object(class_id, 2);
         shared.heap.set_field(obj, 0, Value::Int(1)); // true
@@ -60518,17 +62570,29 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
-        let json_ref = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
-        assert!(json.contains("\"enabled\":true"), "M16: expected enabled:true in {json}");
-        assert!(json.contains("\"count\":42"), "M16: expected count:42 in {json}");
+        let json_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        assert!(
+            json.contains("\"enabled\":true"),
+            "M16: expected enabled:true in {json}"
+        );
+        assert!(
+            json.contains("\"count\":42"),
+            "M16: expected count:42 in {json}"
+        );
     }
 
     #[test]
@@ -60537,24 +62601,28 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(None)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
-        let json_ref = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
+        let json_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
         assert_eq!(json, "null", "M16: null object should serialize as 'null'");
     }
 
     #[test]
     fn m16_jackson_read_value_int_fields() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Coord", &[
-            ("x", "I"), ("y", "I"),
-        ]);
+        let class_id = m16_register_class(&shared, "com/example/Coord", &[("x", "I"), ("y", "I")]);
 
         // Create a class mirror for Coord
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
@@ -60564,14 +62632,24 @@ mod tests {
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readValue",
             "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(mapper)), Value::Object(Some(json_str)), Value::Object(Some(mirror))],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(mapper)),
+                Value::Object(Some(json_str)),
+                Value::Object(Some(mirror)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
-        let obj = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected Object") };
+        let obj = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected Object"),
+        };
         let x = shared.heap.get_field(obj, 0);
         let y = shared.heap.get_field(obj, 1);
         assert_eq!(x.as_int(), Some(5), "M16: expected x=5");
@@ -60581,28 +62659,44 @@ mod tests {
     #[test]
     fn m16_jackson_read_value_string_field() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/NamedItem", &[
-            ("label", "Ljava/lang/String;"), ("count", "I"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/NamedItem",
+            &[("label", "Ljava/lang/String;"), ("count", "I")],
+        );
 
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
-        let json_str = crate::vm::vm_object::create_java_string(&shared, r#"{"label":"hello","count":7}"#);
+        let json_str =
+            crate::vm::vm_object::create_java_string(&shared, r#"{"label":"hello","count":7}"#);
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readValue",
             "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(mapper)), Value::Object(Some(json_str)), Value::Object(Some(mirror))],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(mapper)),
+                Value::Object(Some(json_str)),
+                Value::Object(Some(mirror)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
-        let obj = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected Object") };
+        let obj = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected Object"),
+        };
         let label_val = shared.heap.get_field(obj, 0);
         let count_val = shared.heap.get_field(obj, 1);
-        let label_ref = match label_val { Value::Object(Some(r)) => r, _ => panic!("M16: expected String for label") };
-        let label = read_java_string(&shared.heap,label_ref).unwrap();
+        let label_ref = match label_val {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String for label"),
+        };
+        let label = read_java_string(&shared.heap, label_ref).unwrap();
         assert_eq!(label, "hello", "M16: expected label=hello");
         assert_eq!(count_val.as_int(), Some(7), "M16: expected count=7");
     }
@@ -60610,9 +62704,11 @@ mod tests {
     #[test]
     fn m16_gson_to_json() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Config", &[
-            ("port", "I"), ("debug", "Z"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/Config",
+            &[("port", "I"), ("debug", "Z")],
+        );
 
         let obj = shared.heap.alloc_object(class_id, 2);
         shared.heap.set_field(obj, 0, Value::Int(8080));
@@ -60621,43 +62717,72 @@ mod tests {
         let gson = shared.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/google/gson/Gson",
             "toJson",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(gson)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
-        let json_ref = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
-        assert!(json.contains("\"port\":8080"), "M16: expected port:8080 in {json}");
-        assert!(json.contains("\"debug\":true"), "M16: expected debug:true in {json}");
+        let json_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        assert!(
+            json.contains("\"port\":8080"),
+            "M16: expected port:8080 in {json}"
+        );
+        assert!(
+            json.contains("\"debug\":true"),
+            "M16: expected debug:true in {json}"
+        );
     }
 
     #[test]
     fn m16_gson_from_json() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/Settings", &[
-            ("timeout", "J"), ("retries", "I"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/Settings",
+            &[("timeout", "J"), ("retries", "I")],
+        );
 
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
-        let json_str = crate::vm::vm_object::create_java_string(&shared, r#"{"timeout":30000,"retries":3}"#);
+        let json_str =
+            crate::vm::vm_object::create_java_string(&shared, r#"{"timeout":30000,"retries":3}"#);
         let gson = shared.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/google/gson/Gson",
             "fromJson",
             "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(gson)), Value::Object(Some(json_str)), Value::Object(Some(mirror))],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(gson)),
+                Value::Object(Some(json_str)),
+                Value::Object(Some(mirror)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
-        let obj = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected Object") };
+        let obj = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected Object"),
+        };
         let timeout = shared.heap.get_field(obj, 0);
         let retries = shared.heap.get_field(obj, 1);
-        assert_eq!(timeout.as_long(), Some(30000), "M16: expected timeout=30000");
+        assert_eq!(
+            timeout.as_long(),
+            Some(30000),
+            "M16: expected timeout=30000"
+        );
         assert_eq!(retries.as_int(), Some(3), "M16: expected retries=3");
     }
 
@@ -60665,9 +62790,11 @@ mod tests {
     fn m16_jackson_roundtrip_serialize_deserialize() {
         // Serialize an object, then deserialize the JSON back, and verify fields match.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/RoundTrip", &[
-            ("value", "I"), ("flag", "Z"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/RoundTrip",
+            &[("value", "I"), ("flag", "Z")],
+        );
 
         let obj = shared.heap.alloc_object(class_id, 2);
         shared.heap.set_field(obj, 0, Value::Int(999));
@@ -60678,35 +62805,61 @@ mod tests {
 
         // Serialize
         let json_result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
-        let json_ref = match json_result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
+        )
+        .unwrap()
+        .unwrap();
+        let json_ref = match json_result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
 
         // Deserialize
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
         let deser_result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readValue",
             "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(mapper)), Value::Object(Some(json_ref)), Value::Object(Some(mirror))],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(mapper)),
+                Value::Object(Some(json_ref)),
+                Value::Object(Some(mirror)),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
-        let obj2 = match deser_result { Value::Object(Some(r)) => r, _ => panic!("M16: expected Object") };
-        assert_eq!(shared.heap.get_field(obj2, 0).as_int(), Some(999), "M16: roundtrip value");
-        assert_eq!(shared.heap.get_field(obj2, 1).as_int(), Some(0), "M16: roundtrip flag");
+        let obj2 = match deser_result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected Object"),
+        };
+        assert_eq!(
+            shared.heap.get_field(obj2, 0).as_int(),
+            Some(999),
+            "M16: roundtrip value"
+        );
+        assert_eq!(
+            shared.heap.get_field(obj2, 1).as_int(),
+            Some(0),
+            "M16: roundtrip flag"
+        );
     }
 
     #[test]
     fn m16_json_escape_special_chars() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = m16_register_class(&shared, "com/example/TextHolder", &[
-            ("text", "Ljava/lang/String;"),
-        ]);
+        let class_id = m16_register_class(
+            &shared,
+            "com/example/TextHolder",
+            &[("text", "Ljava/lang/String;")],
+        );
 
         let text = crate::vm::vm_object::create_java_string(&shared, "hello\n\"world\"");
         let obj = shared.heap.alloc_object(class_id, 1);
@@ -60715,17 +62868,29 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "writeValueAsString",
             "(Ljava/lang/Object;)Ljava/lang/String;",
             &[Value::Object(Some(mapper)), Value::Object(Some(obj))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
-        let json_ref = match result { Value::Object(Some(r)) => r, _ => panic!("M16: expected String") };
-        let json = read_java_string(&shared.heap,json_ref).unwrap();
-        assert!(json.contains("\\n"), "M16: expected escaped newline in {json}");
-        assert!(json.contains("\\\"world\\\""), "M16: expected escaped quotes in {json}");
+        let json_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M16: expected String"),
+        };
+        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        assert!(
+            json.contains("\\n"),
+            "M16: expected escaped newline in {json}"
+        );
+        assert!(
+            json.contains("\\\"world\\\""),
+            "M16: expected escaped quotes in {json}"
+        );
     }
 
     // =====================================================================
@@ -60741,18 +62906,31 @@ mod tests {
         // WeakReference object: field 0 = referent, field 1 = queue
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // get() should return the referent
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(weak_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
-            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr(), "M20: get() should return referent"),
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr(),
+                referent.as_ptr(),
+                "M20: get() should return referent"
+            ),
             _ => panic!("M20: expected object from get()"),
         }
     }
@@ -60764,13 +62942,21 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // After init, the ref processor should have 1 weak ref
         let proc = shared.ref_processor.lock();
-        assert_eq!(proc.weak_ref_count(), 1, "M20: ref processor should track 1 weak ref");
+        assert_eq!(
+            proc.weak_ref_count(),
+            1,
+            "M20: ref processor should track 1 weak ref"
+        );
     }
 
     #[test]
@@ -60780,10 +62966,14 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // Simulate GC: referent is NOT marked (unreachable)
         let weak_addr = weak_ref.as_ptr() as usize;
         {
@@ -60803,10 +62993,15 @@ mod tests {
         }
         // get() should now return null
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(weak_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {} // expected
             _ => panic!("M20: get() should return null after GC clears referent"),
@@ -60820,28 +63015,38 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // Simulate GC: both referent and weak_ref are marked (reachable)
         let referent_addr = referent.as_ptr() as usize;
         let weak_addr = weak_ref.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
-            let is_marked = |addr: usize| -> bool {
-                addr == weak_addr || addr == referent_addr
-            };
+            let is_marked = |addr: usize| -> bool { addr == weak_addr || addr == referent_addr };
             let _result = proc.process_references(&is_marked, 64, 0);
             let cleared = proc.cleared_ref_objects();
-            assert!(cleared.is_empty(), "M20: should NOT clear weak ref when referent is reachable");
+            assert!(
+                cleared.is_empty(),
+                "M20: should NOT clear weak ref when referent is reachable"
+            );
         }
         // get() should still return the referent
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(weak_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
             _ => panic!("M20: get() should still return referent"),
@@ -60855,17 +63060,30 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(soft_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(soft_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
-            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr(), "M20: soft get() should return referent"),
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr(),
+                referent.as_ptr(),
+                "M20: soft get() should return referent"
+            ),
             _ => panic!("M20: expected object from soft get()"),
         }
     }
@@ -60877,10 +63095,14 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(soft_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         let soft_addr = soft_ref.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
@@ -60888,17 +63110,25 @@ mod tests {
             let is_marked = |addr: usize| -> bool { addr == soft_addr };
             let _result = proc.process_references(&is_marked, 0, 1_000_000);
             let cleared = proc.cleared_ref_objects();
-            assert!(!cleared.is_empty(), "M20: soft ref should be cleared under memory pressure");
+            assert!(
+                !cleared.is_empty(),
+                "M20: soft ref should be cleared under memory pressure"
+            );
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
                 shared.heap.set_field(obj, 0, Value::Object(None));
             }
         }
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(soft_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M20: soft get() should return null after clearing"),
@@ -60912,10 +63142,14 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(soft_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         let soft_addr = soft_ref.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
@@ -60923,13 +63157,21 @@ mod tests {
             let is_marked = |addr: usize| -> bool { addr == soft_addr };
             let _result = proc.process_references(&is_marked, 1024, 0);
             let cleared = proc.cleared_ref_objects();
-            assert!(cleared.is_empty(), "M20: soft ref should NOT be cleared with plenty of memory");
+            assert!(
+                cleared.is_empty(),
+                "M20: soft ref should NOT be cleared with plenty of memory"
+            );
         }
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(soft_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
             _ => panic!("M20: soft get() should still return referent"),
@@ -60944,13 +63186,24 @@ mod tests {
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/PhantomReference", "<init>",
+            &shared,
+            &mut thread,
+            "java/lang/ref/PhantomReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(phantom)), Value::Object(Some(referent)), Value::Object(Some(queue))],
-        ).unwrap();
+            &[
+                Value::Object(Some(phantom)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let proc = shared.ref_processor.lock();
-        assert_eq!(proc.phantom_ref_count(), 1, "M20: ref processor should track 1 phantom ref");
+        assert_eq!(
+            proc.phantom_ref_count(),
+            1,
+            "M20: ref processor should track 1 phantom ref"
+        );
     }
 
     #[test]
@@ -60960,21 +63213,34 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // Explicit clear()
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "clear", "()V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "clear",
+            "()V",
             &[Value::Object(Some(weak_ref))],
-        ).unwrap();
+        )
+        .unwrap();
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
             &[Value::Object(Some(weak_ref))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M20: get() should return null after clear()"),
@@ -60989,17 +63255,29 @@ mod tests {
         let weak1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let weak2 = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak1)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
             &[Value::Object(Some(weak2)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         // Both should be discovered
-        assert_eq!(shared.ref_processor.lock().weak_ref_count(), 2, "M20: should track 2 weak refs");
+        assert_eq!(
+            shared.ref_processor.lock().weak_ref_count(),
+            2,
+            "M20: should track 2 weak refs"
+        );
         // Simulate GC clearing both
         let w1_addr = weak1.as_ptr() as usize;
         let w2_addr = weak2.as_ptr() as usize;
@@ -61017,10 +63295,15 @@ mod tests {
         // Both get() should return null
         for (name, wr) in [("weak1", weak1), ("weak2", weak2)] {
             let result = call_native(
-                &shared, &mut thread,
-                "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
+                &shared,
+                &mut thread,
+                "java/lang/ref/WeakReference",
+                "get",
+                "()Ljava/lang/Object;",
                 &[Value::Object(Some(wr))],
-            ).unwrap().unwrap();
+            )
+            .unwrap()
+            .unwrap();
             match result {
                 Value::Object(None) => {}
                 _ => panic!("M20: {name}.get() should return null"),
@@ -61040,12 +63323,19 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readValue",
             "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(mapper)), Value::Object(None), Value::Object(None)],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(mapper)),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M16: readValue with null input should return null"),
@@ -61059,18 +63349,29 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, r#"{"name":"Alice","age":30}"#);
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_str))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let node = match result {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: readTree should return a JsonNode"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(1), "M16: should be object node");
-        assert_eq!(shared.heap.get_field(node, 6), Value::Int(2), "M16: should have 2 children");
+        assert_eq!(
+            shared.heap.get_field(node, 0),
+            Value::Int(1),
+            "M16: should be object node"
+        );
+        assert_eq!(
+            shared.heap.get_field(node, 6),
+            Value::Int(2),
+            "M16: should have 2 children"
+        );
     }
 
     #[test]
@@ -61080,17 +63381,24 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_str))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let node = match result {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: readTree of empty string should still return a node"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(0), "M16: empty input => null node");
+        assert_eq!(
+            shared.heap.get_field(node, 0),
+            Value::Int(0),
+            "M16: empty input => null node"
+        );
     }
 
     #[test]
@@ -61100,21 +63408,38 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, r#""hello world""#);
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_str))],
-        ).unwrap().unwrap();
-        let node = match result { Value::Object(Some(r)) => r, _ => panic!("expected node") };
+        )
+        .unwrap()
+        .unwrap();
+        let node = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected node"),
+        };
         assert_eq!(shared.heap.get_field(node, 0), Value::Int(3)); // string type
         let text_result = call_native(
-            &shared, &mut thread,
-            "com/fasterxml/jackson/databind/JsonNode", "asText", "()Ljava/lang/String;",
+            &shared,
+            &mut thread,
+            "com/fasterxml/jackson/databind/JsonNode",
+            "asText",
+            "()Ljava/lang/String;",
             &[Value::Object(Some(node))],
-        ).unwrap().unwrap();
-        let text_ref = match text_result { Value::Object(Some(r)) => r, _ => panic!("expected String") };
-        assert_eq!(read_java_string(&shared.heap, text_ref).unwrap(), "hello world");
+        )
+        .unwrap()
+        .unwrap();
+        let text_ref = match text_result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected String"),
+        };
+        assert_eq!(
+            read_java_string(&shared.heap, text_ref).unwrap(),
+            "hello world"
+        );
     }
 
     #[test]
@@ -61124,19 +63449,30 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "42");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_str))],
-        ).unwrap().unwrap();
-        let node = match result { Value::Object(Some(r)) => r, _ => panic!("expected node") };
+        )
+        .unwrap()
+        .unwrap();
+        let node = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected node"),
+        };
         assert_eq!(shared.heap.get_field(node, 0), Value::Int(4)); // number type
         let int_result = call_native(
-            &shared, &mut thread,
-            "com/fasterxml/jackson/databind/JsonNode", "asInt", "()I",
+            &shared,
+            &mut thread,
+            "com/fasterxml/jackson/databind/JsonNode",
+            "asInt",
+            "()I",
             &[Value::Object(Some(node))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(int_result, Value::Int(42));
     }
 
@@ -61148,36 +63484,62 @@ mod tests {
         // Boolean
         let json_true = create_java_string(&shared, "true");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_true))],
-        ).unwrap().unwrap();
-        let node = match result { Value::Object(Some(r)) => r, _ => panic!("expected node") };
+        )
+        .unwrap()
+        .unwrap();
+        let node = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected node"),
+        };
         assert_eq!(shared.heap.get_field(node, 0), Value::Int(5)); // boolean type
         let bool_val = call_native(
-            &shared, &mut thread,
-            "com/fasterxml/jackson/databind/JsonNode", "asBoolean", "()Z",
+            &shared,
+            &mut thread,
+            "com/fasterxml/jackson/databind/JsonNode",
+            "asBoolean",
+            "()Z",
             &[Value::Object(Some(node))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(bool_val, Value::Int(1));
         // Null
         let json_null = create_java_string(&shared, "null");
         let result2 = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_null))],
-        ).unwrap().unwrap();
-        let node2 = match result2 { Value::Object(Some(r)) => r, _ => panic!("expected node") };
+        )
+        .unwrap()
+        .unwrap();
+        let node2 = match result2 {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected node"),
+        };
         let is_null = call_native(
-            &shared, &mut thread,
-            "com/fasterxml/jackson/databind/JsonNode", "isNull", "()Z",
+            &shared,
+            &mut thread,
+            "com/fasterxml/jackson/databind/JsonNode",
+            "isNull",
+            "()Z",
             &[Value::Object(Some(node2))],
-        ).unwrap().unwrap();
-        assert_eq!(is_null, Value::Int(1), "M16: null literal => isNull == true");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            is_null,
+            Value::Int(1),
+            "M16: null literal => isNull == true"
+        );
     }
 
     #[test]
@@ -61187,19 +63549,30 @@ mod tests {
         let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "[1,2,3]");
         let result = call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "com/fasterxml/jackson/databind/ObjectMapper",
             "readTree",
             "(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/JsonNode;",
             &[Value::Object(Some(mapper)), Value::Object(Some(json_str))],
-        ).unwrap().unwrap();
-        let node = match result { Value::Object(Some(r)) => r, _ => panic!("expected node") };
+        )
+        .unwrap()
+        .unwrap();
+        let node = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected node"),
+        };
         assert_eq!(shared.heap.get_field(node, 0), Value::Int(2)); // array type
         let size = call_native(
-            &shared, &mut thread,
-            "com/fasterxml/jackson/databind/JsonNode", "size", "()I",
+            &shared,
+            &mut thread,
+            "com/fasterxml/jackson/databind/JsonNode",
+            "size",
+            "()I",
             &[Value::Object(Some(node))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(size, Value::Int(3), "M16: array [1,2,3] should have size 3");
     }
 
@@ -61209,19 +63582,31 @@ mod tests {
     fn m17_define_class_rejects_invalid_magic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bad_bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
+        let bad_bytes =
+            shared
+                .heap
+                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         for i in 0..10 {
             let _ = shared.heap.set_array_element(bad_bytes, i, Value::Int(0));
         }
         let cl = shared.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/Bad");
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ClassLoader", "defineClass",
+            &shared,
+            &mut thread,
+            "java/lang/ClassLoader",
+            "defineClass",
             "(Ljava/lang/String;[BII)Ljava/lang/Class;",
-            &[Value::Object(Some(cl)), Value::Object(Some(name_str)),
-              Value::Object(Some(bad_bytes)), Value::Int(0), Value::Int(10)],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(cl)),
+                Value::Object(Some(name_str)),
+                Value::Object(Some(bad_bytes)),
+                Value::Int(0),
+                Value::Int(10),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M17: defineClass should reject invalid magic number"),
@@ -61232,16 +63617,28 @@ mod tests {
     fn m17_define_class_rejects_negative_offset() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
+        let bytes =
+            shared
+                .heap
+                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         let cl = shared.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/Neg");
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ClassLoader", "defineClass",
+            &shared,
+            &mut thread,
+            "java/lang/ClassLoader",
+            "defineClass",
             "(Ljava/lang/String;[BII)Ljava/lang/Class;",
-            &[Value::Object(Some(cl)), Value::Object(Some(name_str)),
-              Value::Object(Some(bytes)), Value::Int(-1), Value::Int(10)],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(cl)),
+                Value::Object(Some(name_str)),
+                Value::Object(Some(bytes)),
+                Value::Int(-1),
+                Value::Int(10),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M17: defineClass should reject negative offset"),
@@ -61252,16 +63649,28 @@ mod tests {
     fn m17_define_class_rejects_out_of_bounds() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
+        let bytes =
+            shared
+                .heap
+                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         let cl = shared.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/OOB");
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/ClassLoader", "defineClass",
+            &shared,
+            &mut thread,
+            "java/lang/ClassLoader",
+            "defineClass",
             "(Ljava/lang/String;[BII)Ljava/lang/Class;",
-            &[Value::Object(Some(cl)), Value::Object(Some(name_str)),
-              Value::Object(Some(bytes)), Value::Int(5), Value::Int(10)],
-        ).unwrap().unwrap();
+            &[
+                Value::Object(Some(cl)),
+                Value::Object(Some(name_str)),
+                Value::Object(Some(bytes)),
+                Value::Int(5),
+                Value::Int(10),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         match result {
             Value::Object(None) => {}
             _ => panic!("M17: defineClass should reject out-of-bounds offset+length"),
@@ -61273,35 +63682,33 @@ mod tests {
     #[test]
     fn m19_finalizer_enqueued_for_dead_objects() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = register_test_class(
-            &shared, "com/test/Finalizable", 0x0021,
-            &[], &[],
-        );
+        let class_id = register_test_class(&shared, "com/test/Finalizable", 0x0021, &[], &[]);
         let obj = shared.heap.alloc_object(class_id, 1);
         shared.register_finalizable(obj.as_ptr() as usize);
         {
             let mut proc = shared.ref_processor.lock();
             let result = proc.process_references(&|_| false, 64, 0);
-            assert!(!result.to_finalize.is_empty(),
-                "M19: finalizer should be enqueued for dead finalizable object");
+            assert!(
+                !result.to_finalize.is_empty(),
+                "M19: finalizer should be enqueued for dead finalizable object"
+            );
         }
     }
 
     #[test]
     fn m19_finalizer_not_enqueued_for_live_objects() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let class_id = register_test_class(
-            &shared, "com/test/FinalLive", 0x0021,
-            &[], &[],
-        );
+        let class_id = register_test_class(&shared, "com/test/FinalLive", 0x0021, &[], &[]);
         let obj = shared.heap.alloc_object(class_id, 1);
         let obj_addr = obj.as_ptr() as usize;
         shared.register_finalizable(obj_addr);
         {
             let mut proc = shared.ref_processor.lock();
             let result = proc.process_references(&|addr| addr == obj_addr, 64, 0);
-            assert!(result.to_finalize.is_empty(),
-                "M19: live objects should not be finalized");
+            assert!(
+                result.to_finalize.is_empty(),
+                "M19: live objects should not be finalized"
+            );
         }
     }
 
@@ -61315,21 +63722,26 @@ mod tests {
         let queue_obj = shared.heap.alloc_object(ClassId::new(0), 1);
         let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/PhantomReference", "<init>",
+            &shared,
+            &mut thread,
+            "java/lang/ref/PhantomReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(phantom)), Value::Object(Some(referent)),
-              Value::Object(Some(queue_obj))],
-        ).unwrap();
+            &[
+                Value::Object(Some(phantom)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue_obj)),
+            ],
+        )
+        .unwrap();
         let phantom_addr = phantom.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
-            let result = proc.process_references(
-                &|addr| addr == phantom_addr,
-                64, 0,
+            let result = proc.process_references(&|addr| addr == phantom_addr, 64, 0);
+            assert!(
+                result.stats.phantom_refs_enqueued >= 1,
+                "M20: phantom should be enqueued when referent is dead"
             );
-            assert!(result.stats.phantom_refs_enqueued >= 1,
-                "M20: phantom should be enqueued when referent is dead");
         }
     }
 
@@ -61340,20 +63752,22 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let soft = shared.heap.alloc_object(ClassId::new(0), 2);
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>",
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
             "(Ljava/lang/Object;)V",
             &[Value::Object(Some(soft)), Value::Object(Some(referent))],
-        ).unwrap();
+        )
+        .unwrap();
         let soft_addr = soft.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
-            let result = proc.process_references(
-                &|addr| addr == soft_addr,
-                0, 1000,
+            let result = proc.process_references(&|addr| addr == soft_addr, 0, 1000);
+            assert!(
+                result.stats.soft_refs_cleared >= 1,
+                "M20: soft ref should be cleared under zero free heap"
             );
-            assert!(result.stats.soft_refs_cleared >= 1,
-                "M20: soft ref should be cleared under zero free heap");
         }
     }
 
@@ -61369,15 +63783,29 @@ mod tests {
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         // Init ReferenceQueue
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
         // Init WeakReference with queue
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(weak_ref)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let weak_addr = weak_ref.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
@@ -61385,7 +63813,10 @@ mod tests {
             // Referent is NOT marked (dead), weak_ref and queue survive
             let is_marked = |addr: usize| -> bool { addr == weak_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 64, 0);
-            assert!(result.stats.weak_refs_cleared >= 1, "S28: weak ref should be cleared");
+            assert!(
+                result.stats.weak_refs_cleared >= 1,
+                "S28: weak ref should be cleared"
+            );
             // Null the referent field
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
@@ -61399,25 +63830,48 @@ mod tests {
                 let old_head = shared.heap.get_field(qobj, 0);
                 shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
                 shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) { Value::Int(v) => v, _ => 0 };
+                let size = match shared.heap.get_field(qobj, 1) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
                 shared.heap.set_field(qobj, 1, Value::Int(size + 1));
                 shared.heap.set_field(robj, 1, Value::Int(1)); // enqueued sentinel
             }
         }
         // Poll from queue РІР‚вЂќ should return the weak ref
-        let poll_result = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
+        let poll_result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
         match poll_result {
-            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), weak_ref.as_ptr(),
-                "S28: poll() should return the enqueued weak ref"),
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr(),
+                weak_ref.as_ptr(),
+                "S28: poll() should return the enqueued weak ref"
+            ),
             _ => panic!("S28: poll() should not return null"),
         }
         // Second poll should return null (empty)
-        let poll2 = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        assert!(matches!(poll2, Value::Object(None)), "S28: second poll() should return null");
+        let poll2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(poll2, Value::Object(None)),
+            "S28: second poll() should return null"
+        );
     }
 
     #[test]
@@ -61427,14 +63881,28 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(soft_ref)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(soft_ref)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let soft_addr = soft_ref.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
@@ -61442,7 +63910,10 @@ mod tests {
             // free_heap=0 + high time = memory pressure clears soft ref
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 0, 1_000_000);
-            assert!(result.stats.soft_refs_cleared >= 1, "S28: soft ref should be cleared");
+            assert!(
+                result.stats.soft_refs_cleared >= 1,
+                "S28: soft ref should be cleared"
+            );
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
@@ -61454,17 +63925,30 @@ mod tests {
                 let old_head = shared.heap.get_field(qobj, 0);
                 shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
                 shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) { Value::Int(v) => v, _ => 0 };
+                let size = match shared.heap.get_field(qobj, 1) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
                 shared.heap.set_field(qobj, 1, Value::Int(size + 1));
                 shared.heap.set_field(robj, 1, Value::Int(1));
             }
         }
-        let poll_result = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
+        let poll_result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
         match poll_result {
-            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), soft_ref.as_ptr(),
-                "S28: poll() should return the enqueued soft ref"),
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr(),
+                soft_ref.as_ptr(),
+                "S28: poll() should return the enqueued soft ref"
+            ),
             _ => panic!("S28: poll() should not return null after soft ref cleared"),
         }
     }
@@ -61476,38 +63960,68 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/PhantomReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/PhantomReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(phantom)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(phantom)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let phantom_addr = phantom.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
             let is_marked = |addr: usize| -> bool { addr == phantom_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 64, 0);
-            assert!(result.stats.phantom_refs_enqueued >= 1, "S28: phantom should be enqueued");
+            assert!(
+                result.stats.phantom_refs_enqueued >= 1,
+                "S28: phantom should be enqueued"
+            );
             for (ra, qa) in &result.to_enqueue {
                 let robj = unsafe { ObjectRef::from_raw(*ra as *mut u8) };
                 let qobj = unsafe { ObjectRef::from_raw(*qa as *mut u8) };
                 let old_head = shared.heap.get_field(qobj, 0);
                 shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
                 shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) { Value::Int(v) => v, _ => 0 };
+                let size = match shared.heap.get_field(qobj, 1) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
                 shared.heap.set_field(qobj, 1, Value::Int(size + 1));
                 shared.heap.set_field(robj, 1, Value::Int(1));
             }
         }
-        let poll_result = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
+        let poll_result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
         match poll_result {
-            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), phantom.as_ptr(),
-                "S28: poll() should return the enqueued phantom ref"),
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr(),
+                phantom.as_ptr(),
+                "S28: poll() should return the enqueued phantom ref"
+            ),
             _ => panic!("S28: poll() should not return null for phantom ref"),
         }
     }
@@ -61517,13 +64031,29 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        let result = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        assert!(matches!(result, Value::Object(None)), "S28: poll() on empty queue should return null");
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(result, Value::Object(None)),
+            "S28: poll() on empty queue should return null"
+        );
     }
 
     #[test]
@@ -61533,24 +64063,63 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let other = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
+        )
+        .unwrap();
         // refersTo(referent) should return true
-        let result = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "refersTo", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))]).unwrap().unwrap();
-        assert_eq!(result, Value::Int(1), "S28: refersTo(referent) should be true");
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "refersTo",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::Int(1),
+            "S28: refersTo(referent) should be true"
+        );
         // refersTo(other) should return false
-        let result2 = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "refersTo", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(other))]).unwrap().unwrap();
-        assert_eq!(result2, Value::Int(0), "S28: refersTo(other) should be false");
+        let result2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "refersTo",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(weak_ref)), Value::Object(Some(other))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result2,
+            Value::Int(0),
+            "S28: refersTo(other) should be false"
+        );
         // refersTo(null) should return false
-        let result3 = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "refersTo", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(weak_ref)), Value::Object(None)]).unwrap().unwrap();
-        assert_eq!(result3, Value::Int(0), "S28: refersTo(null) should be false");
+        let result3 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "refersTo",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(weak_ref)), Value::Object(None)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result3,
+            Value::Int(0),
+            "S28: refersTo(null) should be false"
+        );
     }
 
     #[test]
@@ -61560,29 +64129,72 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(weak_ref)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         // Before enqueue: isEnqueued = false
-        let before = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "isEnqueued", "()Z",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
-        assert_eq!(before, Value::Int(0), "S28: isEnqueued should be false before enqueue");
+        let before = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "isEnqueued",
+            "()Z",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            before,
+            Value::Int(0),
+            "S28: isEnqueued should be false before enqueue"
+        );
         // Manual enqueue
-        let enq = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "enqueue", "()Z",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
+        let enq = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "enqueue",
+            "()Z",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(enq, Value::Int(1), "S28: enqueue() should return true");
         // After enqueue: isEnqueued = true
-        let after = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "isEnqueued", "()Z",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
-        assert_eq!(after, Value::Int(1), "S28: isEnqueued should be true after enqueue");
+        let after = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "isEnqueued",
+            "()Z",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            after,
+            Value::Int(1),
+            "S28: isEnqueued should be true after enqueue"
+        );
     }
 
     #[test]
@@ -61594,29 +64206,53 @@ mod tests {
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let weak1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let weak2 = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(weak1)), Value::Object(Some(ref1_target)),
-              Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>",
+            &[
+                Value::Object(Some(weak1)),
+                Value::Object(Some(ref1_target)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(weak2)), Value::Object(Some(ref2_target)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(weak2)),
+                Value::Object(Some(ref2_target)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let w1_addr = weak1.as_ptr() as usize;
         let w2_addr = weak2.as_ptr() as usize;
         let q_addr = queue.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
-            let is_marked = |addr: usize| -> bool {
-                addr == w1_addr || addr == w2_addr || addr == q_addr
-            };
+            let is_marked =
+                |addr: usize| -> bool { addr == w1_addr || addr == w2_addr || addr == q_addr };
             let result = proc.process_references(&is_marked, 64, 0);
-            assert_eq!(result.stats.weak_refs_cleared, 2, "S28: both weak refs should be cleared");
+            assert_eq!(
+                result.stats.weak_refs_cleared, 2,
+                "S28: both weak refs should be cleared"
+            );
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
@@ -61628,33 +64264,75 @@ mod tests {
                 let old_head = shared.heap.get_field(qobj, 0);
                 shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
                 shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) { Value::Int(v) => v, _ => 0 };
+                let size = match shared.heap.get_field(qobj, 1) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
                 shared.heap.set_field(qobj, 1, Value::Int(size + 1));
                 shared.heap.set_field(robj, 1, Value::Int(1));
             }
         }
         // Poll should return both refs (LIFO order РІР‚вЂќ last enqueued is head)
-        let poll1 = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        let poll2 = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        let poll3 = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        assert!(matches!(poll1, Value::Object(Some(_))), "S28: first poll should return a ref");
-        assert!(matches!(poll2, Value::Object(Some(_))), "S28: second poll should return a ref");
-        assert!(matches!(poll3, Value::Object(None)), "S28: third poll should return null");
+        let poll1 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        let poll2 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        let poll3 = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(poll1, Value::Object(Some(_))),
+            "S28: first poll should return a ref"
+        );
+        assert!(
+            matches!(poll2, Value::Object(Some(_))),
+            "S28: second poll should return a ref"
+        );
+        assert!(
+            matches!(poll3, Value::Object(None)),
+            "S28: third poll should return null"
+        );
         // Verify we got both refs (order doesn't matter)
-        let got1 = match poll1 { Value::Object(Some(r)) => r.as_ptr() as usize, _ => 0 };
-        let got2 = match poll2 { Value::Object(Some(r)) => r.as_ptr() as usize, _ => 0 };
+        let got1 = match poll1 {
+            Value::Object(Some(r)) => r.as_ptr() as usize,
+            _ => 0,
+        };
+        let got2 = match poll2 {
+            Value::Object(Some(r)) => r.as_ptr() as usize,
+            _ => 0,
+        };
         let expected = vec![w1_addr, w2_addr];
         let mut got = vec![got1, got2];
         got.sort();
         let mut exp = expected.clone();
         exp.sort();
-        assert_eq!(got, exp, "S28: should have polled both weak refs from queue");
+        assert_eq!(
+            got, exp,
+            "S28: should have polled both weak refs from queue"
+        );
     }
 
     #[test]
@@ -61664,14 +64342,31 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         // Init without queue
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
+        )
+        .unwrap();
         // enqueue() should return false (no queue attached)
-        let result = call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "enqueue", "()Z",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
-        assert_eq!(result, Value::Int(0), "S28: enqueue without queue should return false");
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "enqueue",
+            "()Z",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::Int(0),
+            "S28: enqueue without queue should return false"
+        );
     }
 
     #[test]
@@ -61681,14 +64376,28 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let soft = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/SoftReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(soft)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(soft)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         let soft_addr = soft.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
@@ -61696,18 +64405,41 @@ mod tests {
             // Plenty of memory РІР‚вЂќ soft ref should NOT be cleared
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 1024, 0);
-            assert_eq!(result.stats.soft_refs_cleared, 0, "S28: soft ref should NOT be cleared");
-            assert!(result.to_enqueue.is_empty(), "S28: nothing should be enqueued");
+            assert_eq!(
+                result.stats.soft_refs_cleared, 0,
+                "S28: soft ref should NOT be cleared"
+            );
+            assert!(
+                result.to_enqueue.is_empty(),
+                "S28: nothing should be enqueued"
+            );
         }
         // Queue should still be empty
-        let poll = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue))]).unwrap().unwrap();
-        assert!(matches!(poll, Value::Object(None)), "S28: queue should be empty when soft ref retained");
+        let poll = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "poll",
+            "()Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(poll, Value::Object(None)),
+            "S28: queue should be empty when soft ref retained"
+        );
         // get() should still return referent
-        let get = call_native(&shared, &mut thread,
-            "java/lang/ref/SoftReference", "get", "()Ljava/lang/Object;",
-            &[Value::Object(Some(soft))]).unwrap().unwrap();
+        let get = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/SoftReference",
+            "get",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(soft))],
+        )
+        .unwrap()
+        .unwrap();
         match get {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
             _ => panic!("S28: soft get() should still return referent when retained"),
@@ -61720,23 +64452,55 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "<init>", "(Ljava/lang/Object;)V",
-            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(weak_ref)), Value::Object(Some(referent))],
+        )
+        .unwrap();
         // Verify get() returns referent
-        let before = call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
-        assert!(matches!(before, Value::Object(Some(_))), "S28: get() before clear should return referent");
+        let before = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(before, Value::Object(Some(_))),
+            "S28: get() before clear should return referent"
+        );
         // Clear
-        call_native(&shared, &mut thread,
-            "java/lang/ref/Reference", "clear", "()V",
-            &[Value::Object(Some(weak_ref))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/Reference",
+            "clear",
+            "()V",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap();
         // get() should return null
-        let after = call_native(&shared, &mut thread,
-            "java/lang/ref/WeakReference", "get", "()Ljava/lang/Object;",
-            &[Value::Object(Some(weak_ref))]).unwrap().unwrap();
-        assert!(matches!(after, Value::Object(None)), "S28: get() after clear should return null");
+        let after = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/WeakReference",
+            "get",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(weak_ref))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(after, Value::Object(None)),
+            "S28: get() after clear should return null"
+        );
     }
 
     #[test]
@@ -61747,20 +64511,43 @@ mod tests {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
         let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/lang/ref/PhantomReference", "<init>",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/PhantomReference",
+            "<init>",
             "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
-            &[Value::Object(Some(phantom)), Value::Object(Some(referent)),
-              Value::Object(Some(queue))]).unwrap();
+            &[
+                Value::Object(Some(phantom)),
+                Value::Object(Some(referent)),
+                Value::Object(Some(queue)),
+            ],
+        )
+        .unwrap();
         // PhantomReference.get() should return null
-        let result = call_native(&shared, &mut thread,
-            "java/lang/ref/PhantomReference", "get", "()Ljava/lang/Object;",
-            &[Value::Object(Some(phantom))]).unwrap().unwrap();
-        assert!(matches!(result, Value::Object(None)),
-            "S28: PhantomReference.get() should always return null");
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/PhantomReference",
+            "get",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(phantom))],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(result, Value::Object(None)),
+            "S28: PhantomReference.get() should always return null"
+        );
     }
 
     #[test]
@@ -61768,15 +64555,30 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "<init>", "()V",
-            &[Value::Object(Some(queue))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(queue))],
+        )
+        .unwrap();
         // remove(1) with 1ms timeout on empty queue should return null quickly
-        let result = call_native(&shared, &mut thread,
-            "java/lang/ref/ReferenceQueue", "remove", "(J)Ljava/lang/ref/Reference;",
-            &[Value::Object(Some(queue)), Value::Long(1)]).unwrap().unwrap();
-        assert!(matches!(result, Value::Object(None)),
-            "S28: remove(1) on empty queue should return null after timeout");
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ref/ReferenceQueue",
+            "remove",
+            "(J)Ljava/lang/ref/Reference;",
+            &[Value::Object(Some(queue)), Value::Long(1)],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(result, Value::Object(None)),
+            "S28: remove(1) on empty queue should return null after timeout"
+        );
     }
 
     // =========================================================================
@@ -61801,8 +64603,14 @@ mod tests {
         let id_obj = shared.load_class_concurrent("java/lang/Object").unwrap();
         let id_str = shared.load_class_concurrent("java/lang/String").unwrap();
         let id_int = shared.load_class_concurrent("java/lang/Integer").unwrap();
-        assert_ne!(id_obj, id_str, "S30: different classes should have different ids");
-        assert_ne!(id_str, id_int, "S30: different classes should have different ids");
+        assert_ne!(
+            id_obj, id_str,
+            "S30: different classes should have different ids"
+        );
+        assert_ne!(
+            id_str, id_int,
+            "S30: different classes should have different ids"
+        );
     }
 
     #[test]
@@ -61821,11 +64629,17 @@ mod tests {
             })
             .collect();
 
-        let ids: Vec<_> = results.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+        let ids: Vec<_> = results
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
         let first = ids[0];
         for (i, id) in ids.iter().enumerate() {
-            assert_eq!(*id, first,
-                "S30: thread {} got different ClassId {:?} vs {:?}", i, id, first);
+            assert_eq!(
+                *id, first,
+                "S30: thread {} got different ClassId {:?} vs {:?}",
+                i, id, first
+            );
         }
     }
 
@@ -61859,12 +64673,19 @@ mod tests {
             })
             .collect();
 
-        let ids: Vec<_> = results.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+        let ids: Vec<_> = results
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
         // All should be unique (different classes)
         let mut unique = std::collections::HashSet::new();
         for (i, id) in ids.iter().enumerate() {
-            assert!(unique.insert(*id),
-                "S30: class {} got duplicate ClassId {:?}", class_names[i], id);
+            assert!(
+                unique.insert(*id),
+                "S30: class {} got duplicate ClassId {:?}",
+                class_names[i],
+                id
+            );
         }
     }
 
@@ -61891,8 +64712,11 @@ mod tests {
         let ids: Vec<_> = results.into_iter().map(|h| h.join().unwrap()).collect();
         let first = ids[0];
         for (i, id) in ids.iter().enumerate() {
-            assert_eq!(*id, first,
-                "S30: Class.forName thread {} got different ClassId", i);
+            assert_eq!(
+                *id, first,
+                "S30: Class.forName thread {} got different ClassId",
+                i
+            );
         }
     }
 
@@ -61916,8 +64740,11 @@ mod tests {
         shared.load_class_concurrent("java/lang/Short").unwrap();
         // The locks should be cleaned up (strong_count check)
         let lock_count = shared.class_loading_locks.lock().len();
-        assert!(lock_count <= 2,
-            "S30: class loading locks should be cleaned up after loading (got {})", lock_count);
+        assert!(
+            lock_count <= 2,
+            "S30: class loading locks should be cleaned up after loading (got {})",
+            lock_count
+        );
     }
 
     #[test]
@@ -61926,8 +64753,11 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let barrier = Arc::new(std::sync::Barrier::new(20));
         let classes = vec![
-            "java/lang/Object", "java/lang/String", "java/lang/Integer",
-            "java/lang/Long", "java/lang/Boolean",
+            "java/lang/Object",
+            "java/lang/String",
+            "java/lang/Integer",
+            "java/lang/Long",
+            "java/lang/Boolean",
         ];
         let handles: Vec<_> = (0..20)
             .map(|i| {
@@ -61940,9 +64770,8 @@ mod tests {
                     let mut ids = Vec::new();
                     for class_name in &classes {
                         let class_id = shared.load_class_concurrent(class_name).unwrap();
-                        super::ensure_class_initialized_shared(
-                            &shared, &mut thread, class_id
-                        ).unwrap();
+                        super::ensure_class_initialized_shared(&shared, &mut thread, class_id)
+                            .unwrap();
                         ids.push(class_id);
                     }
                     ids
@@ -61954,8 +64783,11 @@ mod tests {
         // All threads should agree on ClassIds
         let reference = &all_ids[0];
         for (t, ids) in all_ids.iter().enumerate() {
-            assert_eq!(ids, reference,
-                "S30: thread {} got different ClassIds than thread 0", t);
+            assert_eq!(
+                ids, reference,
+                "S30: thread {} got different ClassIds than thread 0",
+                t
+            );
         }
     }
 
@@ -61982,8 +64814,11 @@ mod tests {
 
         for (i, h) in handles.into_iter().enumerate() {
             let id = h.join().unwrap();
-            assert_eq!(id, expected_id,
-                "S30: fast-path thread {} should return same ClassId", i);
+            assert_eq!(
+                id, expected_id,
+                "S30: fast-path thread {} should return same ClassId",
+                i
+            );
         }
     }
 
@@ -62030,8 +64865,12 @@ mod tests {
         let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
         shared.heap.set_field(class_mirror, 0, Value::Int(0)); // class_id
         let class_name = create_java_string(&shared, "java/lang/Object");
-        shared.heap.set_field(class_mirror, 1, Value::Object(Some(class_name)));
-        shared.heap.set_field(field, 0, Value::Object(Some(class_mirror))); // declaring class
+        shared
+            .heap
+            .set_field(class_mirror, 1, Value::Object(Some(class_name)));
+        shared
+            .heap
+            .set_field(field, 0, Value::Object(Some(class_mirror))); // declaring class
         let fname = create_java_string(&shared, "secret");
         shared.heap.set_field(field, 1, Value::Object(Some(fname))); // field name
         shared.heap.set_field(field, 3, Value::Int(0x0002)); // PRIVATE
@@ -62041,12 +64880,17 @@ mod tests {
 
         // Try Field.get on a private field without setAccessible РІР‚вЂќ should fail
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/reflect/Field", "get",
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Field",
+            "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(field)), Value::Object(None)],
         );
-        assert!(result.is_err(), "M11: private field access should throw IllegalAccessException");
+        assert!(
+            result.is_err(),
+            "M11: private field access should throw IllegalAccessException"
+        );
     }
 
     #[test]
@@ -62066,21 +64910,29 @@ mod tests {
         let object_class_id = shared.load_class_concurrent("java/lang/Object").unwrap();
         let field = shared.heap.alloc_object(field_class_id, 12);
         let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
+        shared
+            .heap
+            .set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
         let class_name = create_java_string(&shared, "java/lang/Object");
-        shared.heap.set_field(class_mirror, 1, Value::Object(Some(class_name)));
+        shared
+            .heap
+            .set_field(class_mirror, 1, Value::Object(Some(class_name)));
         // Populate real JDK-named fields.
-        shared.heap.set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field, 2, Value::Int(0));                     // slot
+        shared
+            .heap
+            .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
+        shared.heap.set_field(field, 2, Value::Int(0)); // slot
         let fname = create_java_string(&shared, "value");
-        shared.heap.set_field(field, 3, Value::Object(Some(fname)));        // name
-        shared.heap.set_field(field, 5, Value::Int(0x0009));                // modifiers = PUBLIC | STATIC
-        shared.heap.set_field(field, 6, Value::Int(0));                     // trustedFinal
+        shared.heap.set_field(field, 3, Value::Object(Some(fname))); // name
+        shared.heap.set_field(field, 5, Value::Int(0x0009)); // modifiers = PUBLIC | STATIC
+        shared.heap.set_field(field, 6, Value::Int(0)); // trustedFinal
 
         // Public field access should succeed
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/reflect/Field", "get",
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Field",
+            "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(field)), Value::Object(None)],
         );
@@ -62103,44 +64955,64 @@ mod tests {
             .unwrap();
         let object_class_id = shared.load_class_concurrent("java/lang/Object").unwrap();
         let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
+        shared
+            .heap
+            .set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
         let class_name = create_java_string(&shared, "java/lang/Object");
-        shared.heap.set_field(class_mirror, 1, Value::Object(Some(class_name)));
+        shared
+            .heap
+            .set_field(class_mirror, 1, Value::Object(Some(class_name)));
 
         // Field 1: private+static, accessible=true РІвЂ вЂ™ should succeed.
         let field = shared.heap.alloc_object(field_class_id, 12);
-        shared.heap.set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field, 2, Value::Int(0));                     // slot
+        shared
+            .heap
+            .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
+        shared.heap.set_field(field, 2, Value::Int(0)); // slot
         let fname = create_java_string(&shared, "secret");
-        shared.heap.set_field(field, 3, Value::Object(Some(fname)));        // name
-        shared.heap.set_field(field, 5, Value::Int(0x000A));                // modifiers: PRIVATE | STATIC
-        shared.heap.set_field(field, 9, Value::Int(1));                     // extra: accessible=true
+        shared.heap.set_field(field, 3, Value::Object(Some(fname))); // name
+        shared.heap.set_field(field, 5, Value::Int(0x000A)); // modifiers: PRIVATE | STATIC
+        shared.heap.set_field(field, 9, Value::Int(1)); // extra: accessible=true
 
         // Field 2: private+static, accessible=false РІвЂ вЂ™ should be rejected.
         let field2 = shared.heap.alloc_object(field_class_id, 12);
-        shared.heap.set_field(field2, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field2, 2, Value::Int(0));                     // slot
+        shared
+            .heap
+            .set_field(field2, 1, Value::Object(Some(class_mirror))); // clazz
+        shared.heap.set_field(field2, 2, Value::Int(0)); // slot
         let fname2 = create_java_string(&shared, "secret2");
-        shared.heap.set_field(field2, 3, Value::Object(Some(fname2)));       // name
-        shared.heap.set_field(field2, 5, Value::Int(0x000A));                // modifiers
-        shared.heap.set_field(field2, 9, Value::Int(0));                     // extra: accessible=false
+        shared
+            .heap
+            .set_field(field2, 3, Value::Object(Some(fname2))); // name
+        shared.heap.set_field(field2, 5, Value::Int(0x000A)); // modifiers
+        shared.heap.set_field(field2, 9, Value::Int(0)); // extra: accessible=false
 
         let rejected = call_native(
-            &shared, &mut thread,
-            "java/lang/reflect/Field", "get",
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Field",
+            "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(field2)), Value::Object(None)],
         );
-        assert!(rejected.is_err(), "M11: private+static field should be rejected without accessible");
+        assert!(
+            rejected.is_err(),
+            "M11: private+static field should be rejected without accessible"
+        );
 
         // Now test with accessible=true should succeed
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/reflect/Field", "get",
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Field",
+            "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(field)), Value::Object(None)],
         );
-        assert!(result.is_ok(), "M11: setAccessible(true) should bypass private check");
+        assert!(
+            result.is_ok(),
+            "M11: setAccessible(true) should bypass private check"
+        );
     }
 
     #[test]
@@ -62158,8 +65030,12 @@ mod tests {
         let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
         shared.heap.set_field(class_mirror, 0, Value::Int(0));
         let class_name = create_java_string(&shared, "java/lang/Object");
-        shared.heap.set_field(class_mirror, 1, Value::Object(Some(class_name)));
-        shared.heap.set_field(field, 0, Value::Object(Some(class_mirror)));
+        shared
+            .heap
+            .set_field(class_mirror, 1, Value::Object(Some(class_name)));
+        shared
+            .heap
+            .set_field(field, 0, Value::Object(Some(class_mirror)));
         let fname = create_java_string(&shared, "obj");
         shared.heap.set_field(field, 1, Value::Object(Some(fname)));
         shared.heap.set_field(field, 3, Value::Int(0x0001)); // PUBLIC (instance)
@@ -62170,12 +65046,17 @@ mod tests {
 
         // getInt on an Object field (which holds Value::Object(None)) should fail
         let result = call_native(
-            &shared, &mut thread,
-            "java/lang/reflect/Field", "getInt",
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Field",
+            "getInt",
             "(Ljava/lang/Object;)I",
             &[Value::Object(Some(field)), Value::Object(Some(receiver))],
         );
-        assert!(result.is_err(), "M11: getInt on Object field should throw IllegalArgumentException");
+        assert!(
+            result.is_err(),
+            "M11: getInt on Object field should throw IllegalArgumentException"
+        );
     }
 
     // --- M13: JDBC path traversal protection ---
@@ -62188,12 +65069,17 @@ mod tests {
         // Static method: args[0] is the first parameter (no receiver for statics)
         let url = create_java_string(&shared, "jdbc:sqlite:../../etc/passwd");
         let result = call_native(
-            &shared, &mut thread,
-            "java/sql/DriverManager", "getConnection",
+            &shared,
+            &mut thread,
+            "java/sql/DriverManager",
+            "getConnection",
             "(Ljava/lang/String;)Ljava/sql/Connection;",
             &[Value::Object(Some(url))],
         );
-        assert!(result.is_err(), "M13: path traversal in JDBC URL should be rejected");
+        assert!(
+            result.is_err(),
+            "M13: path traversal in JDBC URL should be rejected"
+        );
     }
 
     #[test]
@@ -62204,8 +65090,10 @@ mod tests {
         // Static method: args[0] is the first parameter (no receiver)
         let url = create_java_string(&shared, "jdbc:sqlite::memory:");
         let result = call_native(
-            &shared, &mut thread,
-            "java/sql/DriverManager", "getConnection",
+            &shared,
+            &mut thread,
+            "java/sql/DriverManager",
+            "getConnection",
             "(Ljava/lang/String;)Ljava/sql/Connection;",
             &[Value::Object(Some(url))],
         );
@@ -62220,113 +65108,179 @@ mod tests {
         // Open connection (static method: no receiver in args)
         let url = create_java_string(&shared, "jdbc:sqlite::memory:");
         let conn = call_native(
-            &shared, &mut thread,
-            "java/sql/DriverManager", "getConnection",
+            &shared,
+            &mut thread,
+            "java/sql/DriverManager",
+            "getConnection",
             "(Ljava/lang/String;)Ljava/sql/Connection;",
             &[Value::Object(Some(url))],
-        ).unwrap().unwrap();
-        let c = match conn { Value::Object(Some(c)) => c, _ => panic!("no conn") };
+        )
+        .unwrap()
+        .unwrap();
+        let c = match conn {
+            Value::Object(Some(c)) => c,
+            _ => panic!("no conn"),
+        };
 
         // Create table via Statement
         let stmt_obj = call_native(
-            &shared, &mut thread,
-            "java/sql/Connection", "createStatement",
+            &shared,
+            &mut thread,
+            "java/sql/Connection",
+            "createStatement",
             "()Ljava/sql/Statement;",
             &[Value::Object(Some(c))],
-        ).unwrap().unwrap();
-        let s = match stmt_obj { Value::Object(Some(s)) => s, _ => panic!("no stmt") };
+        )
+        .unwrap()
+        .unwrap();
+        let s = match stmt_obj {
+            Value::Object(Some(s)) => s,
+            _ => panic!("no stmt"),
+        };
 
         let create_sql = create_java_string(&shared, "CREATE TABLE t(id INTEGER, name TEXT)");
         call_native(
-            &shared, &mut thread,
-            "java/sql/Statement", "execute",
+            &shared,
+            &mut thread,
+            "java/sql/Statement",
+            "execute",
             "(Ljava/lang/String;)Z",
             &[Value::Object(Some(s)), Value::Object(Some(create_sql))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let insert_sql = create_java_string(&shared, "INSERT INTO t VALUES(1, 'hello')");
         call_native(
-            &shared, &mut thread,
-            "java/sql/Statement", "executeUpdate",
+            &shared,
+            &mut thread,
+            "java/sql/Statement",
+            "executeUpdate",
             "(Ljava/lang/String;)I",
             &[Value::Object(Some(s)), Value::Object(Some(insert_sql))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // PrepareStatement with parameterized query
         let ps_sql = create_java_string(&shared, "SELECT name FROM t WHERE id = ?");
         let ps = call_native(
-            &shared, &mut thread,
-            "java/sql/Connection", "prepareStatement",
+            &shared,
+            &mut thread,
+            "java/sql/Connection",
+            "prepareStatement",
             "(Ljava/lang/String;)Ljava/sql/PreparedStatement;",
             &[Value::Object(Some(c)), Value::Object(Some(ps_sql))],
-        ).unwrap().unwrap();
-        let ps_obj = match ps { Value::Object(Some(p)) => p, _ => panic!("no ps") };
+        )
+        .unwrap()
+        .unwrap();
+        let ps_obj = match ps {
+            Value::Object(Some(p)) => p,
+            _ => panic!("no ps"),
+        };
 
         // Bind parameter
         call_native(
-            &shared, &mut thread,
-            "java/sql/PreparedStatement", "setInt",
+            &shared,
+            &mut thread,
+            "java/sql/PreparedStatement",
+            "setInt",
             "(II)V",
             &[Value::Object(Some(ps_obj)), Value::Int(1), Value::Int(1)],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Execute prepared query
         let rs = call_native(
-            &shared, &mut thread,
-            "java/sql/PreparedStatement", "executeQuery",
+            &shared,
+            &mut thread,
+            "java/sql/PreparedStatement",
+            "executeQuery",
             "()Ljava/sql/ResultSet;",
             &[Value::Object(Some(ps_obj))],
-        ).unwrap().unwrap();
-        let rs_obj = match rs { Value::Object(Some(r)) => r, _ => panic!("no rs") };
+        )
+        .unwrap()
+        .unwrap();
+        let rs_obj = match rs {
+            Value::Object(Some(r)) => r,
+            _ => panic!("no rs"),
+        };
 
         // Navigate result
         let has_next = call_native(
-            &shared, &mut thread,
-            "java/sql/ResultSet", "next",
+            &shared,
+            &mut thread,
+            "java/sql/ResultSet",
+            "next",
             "()Z",
             &[Value::Object(Some(rs_obj))],
-        ).unwrap().unwrap();
-        assert_eq!(has_next, Value::Int(1), "M13: prepared query should return a row");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            has_next,
+            Value::Int(1),
+            "M13: prepared query should return a row"
+        );
 
         // Get value
         let name = call_native(
-            &shared, &mut thread,
-            "java/sql/ResultSet", "getString",
+            &shared,
+            &mut thread,
+            "java/sql/ResultSet",
+            "getString",
             "(I)Ljava/lang/String;",
             &[Value::Object(Some(rs_obj)), Value::Int(1)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match name {
             Value::Object(Some(s)) => {
                 let str_val = crate::vm::vm_object::read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(str_val, "hello", "M13: prepared query should return 'hello'");
+                assert_eq!(
+                    str_val, "hello",
+                    "M13: prepared query should return 'hello'"
+                );
             }
             _ => panic!("M13: expected string from ResultSet"),
         }
 
         // Close ResultSet should free results
         call_native(
-            &shared, &mut thread,
-            "java/sql/ResultSet", "close",
+            &shared,
+            &mut thread,
+            "java/sql/ResultSet",
+            "close",
             "()V",
             &[Value::Object(Some(rs_obj))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Close connection
         call_native(
-            &shared, &mut thread,
-            "java/sql/Connection", "close",
+            &shared,
+            &mut thread,
+            "java/sql/Connection",
+            "close",
             "()V",
             &[Value::Object(Some(c))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // isValid should be false after close
         let valid = call_native(
-            &shared, &mut thread,
-            "java/sql/Connection", "isValid",
+            &shared,
+            &mut thread,
+            "java/sql/Connection",
+            "isValid",
             "(I)Z",
             &[Value::Object(Some(c)), Value::Int(5)],
-        ).unwrap().unwrap();
-        assert_eq!(valid, Value::Int(0), "M13: connection should be invalid after close");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            valid,
+            Value::Int(0),
+            "M13: connection should be invalid after close"
+        );
     }
 
     // --- M14: HTTP chunked encoding ---
@@ -62340,12 +65294,19 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let client = call_native(
-            &shared, &mut thread,
-            "java/net/http/HttpClient", "newHttpClient",
+            &shared,
+            &mut thread,
+            "java/net/http/HttpClient",
+            "newHttpClient",
             "()Ljava/net/http/HttpClient;",
             &[],
-        ).unwrap().unwrap();
-        assert!(matches!(client, Value::Object(Some(_))), "M14: HttpClient should be created");
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(client, Value::Object(Some(_))),
+            "M14: HttpClient should be created"
+        );
     }
 
     // --- M15: Logging MDC and level checks ---
@@ -62358,42 +65319,73 @@ mod tests {
         // Create a logger with WARN level (3)
         let name = create_java_string(&shared, "test.Logger");
         let logger = call_native(
-            &shared, &mut thread,
-            "org/slf4j/LoggerFactory", "getLogger",
+            &shared,
+            &mut thread,
+            "org/slf4j/LoggerFactory",
+            "getLogger",
             "(Ljava/lang/String;)Lorg/slf4j/Logger;",
             &[Value::Object(Some(name))],
-        ).unwrap().unwrap();
-        let lg = match logger { Value::Object(Some(l)) => l, _ => panic!("no logger") };
+        )
+        .unwrap()
+        .unwrap();
+        let lg = match logger {
+            Value::Object(Some(l)) => l,
+            _ => panic!("no logger"),
+        };
 
         // Manually set level to WARN (3)
         shared.heap.set_field(lg, 1, Value::Int(3)); // SLF4J_LEVEL = WARN
 
         // isDebugEnabled should be false (debug=1 < warn=3)
         let debug = call_native(
-            &shared, &mut thread,
-            "org/slf4j/Logger", "isDebugEnabled",
+            &shared,
+            &mut thread,
+            "org/slf4j/Logger",
+            "isDebugEnabled",
             "()Z",
             &[Value::Object(Some(lg))],
-        ).unwrap().unwrap();
-        assert_eq!(debug, Value::Int(0), "M15: debug should be disabled at WARN level");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            debug,
+            Value::Int(0),
+            "M15: debug should be disabled at WARN level"
+        );
 
         // isWarnEnabled should be true (warn=3 <= warn=3)
         let warn = call_native(
-            &shared, &mut thread,
-            "org/slf4j/Logger", "isWarnEnabled",
+            &shared,
+            &mut thread,
+            "org/slf4j/Logger",
+            "isWarnEnabled",
             "()Z",
             &[Value::Object(Some(lg))],
-        ).unwrap().unwrap();
-        assert_eq!(warn, Value::Int(1), "M15: warn should be enabled at WARN level");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            warn,
+            Value::Int(1),
+            "M15: warn should be enabled at WARN level"
+        );
 
         // isErrorEnabled should be true (error=4 > warn=3... wait, the check is level <= 4)
         let error = call_native(
-            &shared, &mut thread,
-            "org/slf4j/Logger", "isErrorEnabled",
+            &shared,
+            &mut thread,
+            "org/slf4j/Logger",
+            "isErrorEnabled",
             "()Z",
             &[Value::Object(Some(lg))],
-        ).unwrap().unwrap();
-        assert_eq!(error, Value::Int(1), "M15: error should be enabled at WARN level");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            error,
+            Value::Int(1),
+            "M15: error should be enabled at WARN level"
+        );
     }
 
     #[test]
@@ -62403,12 +65395,19 @@ mod tests {
 
         let name = create_java_string(&shared, "com.example.App");
         let logger = call_native(
-            &shared, &mut thread,
-            "org/apache/logging/log4j/LogManager", "getLogger",
+            &shared,
+            &mut thread,
+            "org/apache/logging/log4j/LogManager",
+            "getLogger",
             "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
             &[Value::Object(Some(name))],
-        ).unwrap().unwrap();
-        assert!(matches!(logger, Value::Object(Some(_))), "M15: Log4j2 logger should be created");
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(logger, Value::Object(Some(_))),
+            "M15: Log4j2 logger should be created"
+        );
     }
 
     #[test]
@@ -62418,49 +65417,79 @@ mod tests {
 
         let name = create_java_string(&shared, "test.jul");
         let logger = call_native(
-            &shared, &mut thread,
-            "java/util/logging/Logger", "getLogger",
+            &shared,
+            &mut thread,
+            "java/util/logging/Logger",
+            "getLogger",
             "(Ljava/lang/String;)Ljava/util/logging/Logger;",
             &[Value::Object(Some(name))],
-        ).unwrap().unwrap();
-        let lg = match logger { Value::Object(Some(l)) => l, _ => panic!("no logger") };
+        )
+        .unwrap()
+        .unwrap();
+        let lg = match logger {
+            Value::Object(Some(l)) => l,
+            _ => panic!("no logger"),
+        };
 
         // Create a SEVERE level (1000)
         let severe = shared.heap.alloc_object(ClassId::new(0), 2);
         let severe_name = create_java_string(&shared, "SEVERE");
-        shared.heap.set_field(severe, 0, Value::Object(Some(severe_name)));
+        shared
+            .heap
+            .set_field(severe, 0, Value::Object(Some(severe_name)));
         shared.heap.set_field(severe, 1, Value::Int(1000));
 
         // Set logger level to SEVERE
         call_native(
-            &shared, &mut thread,
-            "java/util/logging/Logger", "setLevel",
+            &shared,
+            &mut thread,
+            "java/util/logging/Logger",
+            "setLevel",
             "(Ljava/util/logging/Level;)V",
             &[Value::Object(Some(lg)), Value::Object(Some(severe))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // INFO (800) should NOT be loggable at SEVERE (1000)
         let info = shared.heap.alloc_object(ClassId::new(0), 2);
         let info_name = create_java_string(&shared, "INFO");
-        shared.heap.set_field(info, 0, Value::Object(Some(info_name)));
+        shared
+            .heap
+            .set_field(info, 0, Value::Object(Some(info_name)));
         shared.heap.set_field(info, 1, Value::Int(800));
 
         let loggable = call_native(
-            &shared, &mut thread,
-            "java/util/logging/Logger", "isLoggable",
+            &shared,
+            &mut thread,
+            "java/util/logging/Logger",
+            "isLoggable",
             "(Ljava/util/logging/Level;)Z",
             &[Value::Object(Some(lg)), Value::Object(Some(info))],
-        ).unwrap().unwrap();
-        assert_eq!(loggable, Value::Int(0), "M15: INFO should not be loggable at SEVERE level");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            loggable,
+            Value::Int(0),
+            "M15: INFO should not be loggable at SEVERE level"
+        );
 
         // SEVERE (1000) should be loggable
         let loggable2 = call_native(
-            &shared, &mut thread,
-            "java/util/logging/Logger", "isLoggable",
+            &shared,
+            &mut thread,
+            "java/util/logging/Logger",
+            "isLoggable",
             "(Ljava/util/logging/Level;)Z",
             &[Value::Object(Some(lg)), Value::Object(Some(severe))],
-        ).unwrap().unwrap();
-        assert_eq!(loggable2, Value::Int(1), "M15: SEVERE should be loggable at SEVERE level");
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            loggable2,
+            Value::Int(1),
+            "M15: SEVERE should be loggable at SEVERE level"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -62638,27 +65667,56 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         for &val in &[10, 20, 30] {
-            let boxed = call_native(&shared, &mut thread,
-                "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
-                &[Value::Int(val)]).unwrap().unwrap();
-            call_native(&shared, &mut thread,
-                "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(list)), boxed]).unwrap();
+            let boxed = call_native(
+                &shared,
+                &mut thread,
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+                &[Value::Int(val)],
+            )
+            .unwrap()
+            .unwrap();
+            call_native(
+                &shared,
+                &mut thread,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), boxed],
+            )
+            .unwrap();
         }
 
-        let result = call_native(&shared, &mut thread,
-            "java/util/ArrayList", "toString", "()Ljava/lang/String;",
-            &[Value::Object(Some(list))]).unwrap().unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap()
+        .unwrap();
 
         match result {
             Value::Object(Some(s)) => {
                 let text = read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(text, "[10, 20, 30]",
-                    "ArrayList of Integers should show values, not ClassName@hash");
+                assert_eq!(
+                    text, "[10, 20, 30]",
+                    "ArrayList of Integers should show values, not ClassName@hash"
+                );
             }
             _ => panic!("expected string from ArrayList.toString"),
         }
@@ -62671,27 +65729,55 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let map = shared.heap.alloc_object(ClassId::new(0), 3);
-        call_native(&shared, &mut thread, "java/util/HashMap", "<init>", "()V",
-            &[Value::Object(Some(map))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/HashMap",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(map))],
+        )
+        .unwrap();
 
-        let key = call_native(&shared, &mut thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
-            &[Value::Int(42)]).unwrap().unwrap();
+        let key = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(42)],
+        )
+        .unwrap()
+        .unwrap();
         let val = create_java_string(&shared, "answer");
-        call_native(&shared, &mut thread,
-            "java/util/HashMap", "put",
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/HashMap",
+            "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(map)), key, Value::Object(Some(val))]).unwrap();
+            &[Value::Object(Some(map)), key, Value::Object(Some(val))],
+        )
+        .unwrap();
 
-        let result = call_native(&shared, &mut thread,
-            "java/util/HashMap", "toString", "()Ljava/lang/String;",
-            &[Value::Object(Some(map))]).unwrap().unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/HashMap",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(map))],
+        )
+        .unwrap()
+        .unwrap();
 
         match result {
             Value::Object(Some(s)) => {
                 let text = read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(text, "{42=answer}",
-                    "HashMap with Integer key should show value, not ClassName@hash");
+                assert_eq!(
+                    text, "{42=answer}",
+                    "HashMap with Integer key should show value, not ClassName@hash"
+                );
             }
             _ => panic!("expected string from HashMap.toString"),
         }
@@ -62704,31 +65790,73 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
-        let t = call_native(&shared, &mut thread,
-            "java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;",
-            &[Value::Int(1)]).unwrap().unwrap();
-        let f = call_native(&shared, &mut thread,
-            "java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;",
-            &[Value::Int(0)]).unwrap().unwrap();
-        call_native(&shared, &mut thread,
-            "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), t]).unwrap();
-        call_native(&shared, &mut thread,
-            "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), f]).unwrap();
+        let t = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(1)],
+        )
+        .unwrap()
+        .unwrap();
+        let f = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), t],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), f],
+        )
+        .unwrap();
 
-        let result = call_native(&shared, &mut thread,
-            "java/util/ArrayList", "toString", "()Ljava/lang/String;",
-            &[Value::Object(Some(list))]).unwrap().unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap()
+        .unwrap();
 
         match result {
             Value::Object(Some(s)) => {
                 let text = read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(text, "[true, false]",
-                    "ArrayList of Booleans should show true/false, not ClassName@hash");
+                assert_eq!(
+                    text, "[true, false]",
+                    "ArrayList of Booleans should show true/false, not ClassName@hash"
+                );
             }
             _ => panic!("expected string from ArrayList.toString"),
         }
@@ -62740,24 +65868,41 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let arr = shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
+        let arr = shared
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for i in 0..3 {
-            let boxed = call_native(&shared, &mut thread,
-                "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
-                &[Value::Int(i + 1)]).unwrap().unwrap();
+            let boxed = call_native(
+                &shared,
+                &mut thread,
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+                &[Value::Int(i + 1)],
+            )
+            .unwrap()
+            .unwrap();
             let _ = shared.heap.set_array_element(arr, i as usize, boxed);
         }
 
-        let result = call_native(&shared, &mut thread,
-            "java/util/Arrays", "toString",
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/Arrays",
+            "toString",
             "([Ljava/lang/Object;)Ljava/lang/String;",
-            &[Value::Object(Some(arr))]).unwrap().unwrap();
+            &[Value::Object(Some(arr))],
+        )
+        .unwrap()
+        .unwrap();
 
         match result {
             Value::Object(Some(s)) => {
                 let text = read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(text, "[1, 2, 3]",
-                    "Arrays.toString(Object[]) with Integers should show values");
+                assert_eq!(
+                    text, "[1, 2, 3]",
+                    "Arrays.toString(Object[]) with Integers should show values"
+                );
             }
             _ => panic!("expected string from Arrays.toString"),
         }
@@ -62770,37 +65915,78 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let list = shared.heap.alloc_object(ClassId::new(0), 2);
-        call_native(&shared, &mut thread, "java/util/ArrayList", "<init>", "()V",
-            &[Value::Object(Some(list))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap();
 
         // Add Integer(42)
-        let boxed = call_native(&shared, &mut thread,
-            "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
-            &[Value::Int(42)]).unwrap().unwrap();
-        call_native(&shared, &mut thread,
-            "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), boxed]).unwrap();
+        let boxed = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(42)],
+        )
+        .unwrap()
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), boxed],
+        )
+        .unwrap();
 
         // Add null
-        call_native(&shared, &mut thread,
-            "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), Value::Object(None)]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(None)],
+        )
+        .unwrap();
 
         // Add String "hi"
         let s = create_java_string(&shared, "hi");
-        call_native(&shared, &mut thread,
-            "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(list)), Value::Object(Some(s))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(s))],
+        )
+        .unwrap();
 
-        let result = call_native(&shared, &mut thread,
-            "java/util/ArrayList", "toString", "()Ljava/lang/String;",
-            &[Value::Object(Some(list))]).unwrap().unwrap();
+        let result = call_native(
+            &shared,
+            &mut thread,
+            "java/util/ArrayList",
+            "toString",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(list))],
+        )
+        .unwrap()
+        .unwrap();
 
         match result {
             Value::Object(Some(s)) => {
                 let text = read_java_string(&shared.heap, s).unwrap();
-                assert_eq!(text, "[42, null, hi]",
-                    "ArrayList with Integer+null+String should format all correctly");
+                assert_eq!(
+                    text, "[42, null, hi]",
+                    "ArrayList with Integer+null+String should format all correctly"
+                );
             }
             _ => panic!("expected string from ArrayList.toString"),
         }
@@ -62821,42 +66007,77 @@ mod tests {
         // KeyPairGenerator.getInstance(algorithm)
         let alg_str = crate::vm::vm_object::create_java_string(shared, algorithm);
         let kpg = call_native(
-            shared, thread,
-            "java/security/KeyPairGenerator", "getInstance",
+            shared,
+            thread,
+            "java/security/KeyPairGenerator",
+            "getInstance",
             "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
             &[Value::Object(Some(alg_str))],
-        ).unwrap().unwrap();
-        let kpg_ref = match kpg { Value::Object(Some(r)) => r, _ => panic!("M22: expected KPG object") };
+        )
+        .unwrap()
+        .unwrap();
+        let kpg_ref = match kpg {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected KPG object"),
+        };
 
         // initialize(keySize)
         call_native(
-            shared, thread,
-            "java/security/KeyPairGenerator", "initialize", "(I)V",
+            shared,
+            thread,
+            "java/security/KeyPairGenerator",
+            "initialize",
+            "(I)V",
             &[Value::Object(Some(kpg_ref)), Value::Int(key_size)],
-        ).unwrap();
+        )
+        .unwrap();
 
         // generateKeyPair()
         let kp = call_native(
-            shared, thread,
-            "java/security/KeyPairGenerator", "generateKeyPair", "()Ljava/security/KeyPair;",
+            shared,
+            thread,
+            "java/security/KeyPairGenerator",
+            "generateKeyPair",
+            "()Ljava/security/KeyPair;",
             &[Value::Object(Some(kpg_ref))],
-        ).unwrap().unwrap();
-        let kp_ref = match kp { Value::Object(Some(r)) => r, _ => panic!("M22: expected KeyPair") };
+        )
+        .unwrap()
+        .unwrap();
+        let kp_ref = match kp {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected KeyPair"),
+        };
 
         // getPublic() / getPrivate()
         let pub_val = call_native(
-            shared, thread,
-            "java/security/KeyPair", "getPublic", "()Ljava/security/PublicKey;",
+            shared,
+            thread,
+            "java/security/KeyPair",
+            "getPublic",
+            "()Ljava/security/PublicKey;",
             &[Value::Object(Some(kp_ref))],
-        ).unwrap().unwrap();
-        let pub_ref = match pub_val { Value::Object(Some(r)) => r, _ => panic!("M22: expected PublicKey") };
+        )
+        .unwrap()
+        .unwrap();
+        let pub_ref = match pub_val {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected PublicKey"),
+        };
 
         let priv_val = call_native(
-            shared, thread,
-            "java/security/KeyPair", "getPrivate", "()Ljava/security/PrivateKey;",
+            shared,
+            thread,
+            "java/security/KeyPair",
+            "getPrivate",
+            "()Ljava/security/PrivateKey;",
             &[Value::Object(Some(kp_ref))],
-        ).unwrap().unwrap();
-        let priv_ref = match priv_val { Value::Object(Some(r)) => r, _ => panic!("M22: expected PrivateKey") };
+        )
+        .unwrap()
+        .unwrap();
+        let priv_ref = match priv_val {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected PrivateKey"),
+        };
 
         (kp_ref, pub_ref, priv_ref)
     }
@@ -62871,38 +66092,70 @@ mod tests {
     ) -> ObjectRef {
         let alg_str = crate::vm::vm_object::create_java_string(shared, sig_algorithm);
         let sig = call_native(
-            shared, thread,
-            "java/security/Signature", "getInstance",
+            shared,
+            thread,
+            "java/security/Signature",
+            "getInstance",
             "(Ljava/lang/String;)Ljava/security/Signature;",
             &[Value::Object(Some(alg_str))],
-        ).unwrap().unwrap();
-        let sig_ref = match sig { Value::Object(Some(r)) => r, _ => panic!("M22: expected Signature") };
+        )
+        .unwrap()
+        .unwrap();
+        let sig_ref = match sig {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected Signature"),
+        };
 
         // initSign(privateKey)
         call_native(
-            shared, thread,
-            "java/security/Signature", "initSign", "(Ljava/security/PrivateKey;)V",
-            &[Value::Object(Some(sig_ref)), Value::Object(Some(private_key))],
-        ).unwrap();
+            shared,
+            thread,
+            "java/security/Signature",
+            "initSign",
+            "(Ljava/security/PrivateKey;)V",
+            &[
+                Value::Object(Some(sig_ref)),
+                Value::Object(Some(private_key)),
+            ],
+        )
+        .unwrap();
 
         // update(byte[])
-        let arr = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Byte, data.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Byte,
+            data.len(),
+        );
         for (i, &b) in data.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         call_native(
-            shared, thread,
-            "java/security/Signature", "update", "([B)V",
+            shared,
+            thread,
+            "java/security/Signature",
+            "update",
+            "([B)V",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(arr))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // sign() -> byte[]
         let sig_bytes = call_native(
-            shared, thread,
-            "java/security/Signature", "sign", "()[B",
+            shared,
+            thread,
+            "java/security/Signature",
+            "sign",
+            "()[B",
             &[Value::Object(Some(sig_ref))],
-        ).unwrap().unwrap();
-        match sig_bytes { Value::Object(Some(r)) => r, _ => panic!("M22: expected signature byte[]") }
+        )
+        .unwrap()
+        .unwrap();
+        match sig_bytes {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected signature byte[]"),
+        }
     }
 
     /// Helper: verify signature.
@@ -62916,38 +66169,70 @@ mod tests {
     ) -> bool {
         let alg_str = crate::vm::vm_object::create_java_string(shared, sig_algorithm);
         let sig = call_native(
-            shared, thread,
-            "java/security/Signature", "getInstance",
+            shared,
+            thread,
+            "java/security/Signature",
+            "getInstance",
             "(Ljava/lang/String;)Ljava/security/Signature;",
             &[Value::Object(Some(alg_str))],
-        ).unwrap().unwrap();
-        let sig_ref = match sig { Value::Object(Some(r)) => r, _ => panic!("M22: expected Signature") };
+        )
+        .unwrap()
+        .unwrap();
+        let sig_ref = match sig {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected Signature"),
+        };
 
         // initVerify(publicKey)
         call_native(
-            shared, thread,
-            "java/security/Signature", "initVerify", "(Ljava/security/PublicKey;)V",
-            &[Value::Object(Some(sig_ref)), Value::Object(Some(public_key))],
-        ).unwrap();
+            shared,
+            thread,
+            "java/security/Signature",
+            "initVerify",
+            "(Ljava/security/PublicKey;)V",
+            &[
+                Value::Object(Some(sig_ref)),
+                Value::Object(Some(public_key)),
+            ],
+        )
+        .unwrap();
 
         // update(byte[])
-        let arr = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Byte, data.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Byte,
+            data.len(),
+        );
         for (i, &b) in data.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         call_native(
-            shared, thread,
-            "java/security/Signature", "update", "([B)V",
+            shared,
+            thread,
+            "java/security/Signature",
+            "update",
+            "([B)V",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(arr))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // verify(byte[]) -> boolean
         let result = call_native(
-            shared, thread,
-            "java/security/Signature", "verify", "([B)Z",
+            shared,
+            thread,
+            "java/security/Signature",
+            "verify",
+            "([B)Z",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(signature))],
-        ).unwrap().unwrap();
-        match result { Value::Int(v) => v != 0, _ => false }
+        )
+        .unwrap()
+        .unwrap();
+        match result {
+            Value::Int(v) => v != 0,
+            _ => false,
+        }
     }
 
     #[test]
@@ -62973,7 +66258,14 @@ mod tests {
         let signature = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, data);
         let sig_len = shared.heap.array_length(signature);
         assert!(sig_len > 0, "M22: RSA signature should be non-empty");
-        let valid = m22_verify(&shared, &mut thread, "SHA256withRSA", pub_key, data, signature);
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            pub_key,
+            data,
+            signature,
+        );
         assert!(valid, "M22: RSA signature should verify");
     }
 
@@ -62982,8 +66274,21 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let (_kp, pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "RSA", 512);
-        let signature = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, b"original data");
-        let valid = m22_verify(&shared, &mut thread, "SHA256withRSA", pub_key, b"tampered data", signature);
+        let signature = m22_sign(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            priv_key,
+            b"original data",
+        );
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            pub_key,
+            b"tampered data",
+            signature,
+        );
         assert!(!valid, "M22: RSA verify with wrong data should fail");
     }
 
@@ -62992,8 +66297,20 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let (_kp, _pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "RSA", 512);
-        let sig1 = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, b"message A");
-        let sig2 = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, b"message B");
+        let sig1 = m22_sign(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            priv_key,
+            b"message A",
+        );
+        let sig2 = m22_sign(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            priv_key,
+            b"message B",
+        );
         // Read first byte of each signature РІР‚вЂќ they should differ (with overwhelming probability)
         let len1 = shared.heap.array_length(sig1);
         let len2 = shared.heap.array_length(sig2);
@@ -63002,7 +66319,10 @@ mod tests {
         for i in 0..len1 {
             let b1 = shared.heap.get_array_element(sig1, i);
             let b2 = shared.heap.get_array_element(sig2, i);
-            if b1 != b2 { differ = true; break; }
+            if b1 != b2 {
+                differ = true;
+                break;
+            }
         }
         assert!(differ, "M22: signatures for different data should differ");
     }
@@ -63027,7 +66347,14 @@ mod tests {
         let signature = m22_sign(&shared, &mut thread, "SHA384withECDSA", priv_key, data);
         let sig_len = shared.heap.array_length(signature);
         assert!(sig_len > 0, "M22: ECDSA signature should be non-empty");
-        let valid = m22_verify(&shared, &mut thread, "SHA384withECDSA", pub_key, data, signature);
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA384withECDSA",
+            pub_key,
+            data,
+            signature,
+        );
         assert!(valid, "M22: ECDSA signature should verify");
     }
 
@@ -63036,8 +66363,21 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let (_kp, pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "EC", 256);
-        let signature = m22_sign(&shared, &mut thread, "SHA384withECDSA", priv_key, b"original");
-        let valid = m22_verify(&shared, &mut thread, "SHA384withECDSA", pub_key, b"tampered", signature);
+        let signature = m22_sign(
+            &shared,
+            &mut thread,
+            "SHA384withECDSA",
+            priv_key,
+            b"original",
+        );
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA384withECDSA",
+            pub_key,
+            b"tampered",
+            signature,
+        );
         assert!(!valid, "M22: ECDSA verify with wrong data should fail");
     }
 
@@ -63050,37 +66390,70 @@ mod tests {
         // Sign using update(byte) one byte at a time
         let alg_str = crate::vm::vm_object::create_java_string(&shared, "SHA256withRSA");
         let sig = call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "getInstance",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "getInstance",
             "(Ljava/lang/String;)Ljava/security/Signature;",
             &[Value::Object(Some(alg_str))],
-        ).unwrap().unwrap();
-        let sig_ref = match sig { Value::Object(Some(r)) => r, _ => panic!("M22: expected Signature") };
+        )
+        .unwrap()
+        .unwrap();
+        let sig_ref = match sig {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected Signature"),
+        };
 
         call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "initSign", "(Ljava/security/PrivateKey;)V",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "initSign",
+            "(Ljava/security/PrivateKey;)V",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(priv_key))],
-        ).unwrap();
+        )
+        .unwrap();
 
         for &b in b"byte-by-byte" {
             call_native(
-                &shared, &mut thread,
-                "java/security/Signature", "update", "(B)V",
+                &shared,
+                &mut thread,
+                "java/security/Signature",
+                "update",
+                "(B)V",
                 &[Value::Object(Some(sig_ref)), Value::Int(b as i32)],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let sig_bytes = call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "sign", "()[B",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "sign",
+            "()[B",
             &[Value::Object(Some(sig_ref))],
-        ).unwrap().unwrap();
-        let sig_arr = match sig_bytes { Value::Object(Some(r)) => r, _ => panic!("M22: expected byte[]") };
+        )
+        .unwrap()
+        .unwrap();
+        let sig_arr = match sig_bytes {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected byte[]"),
+        };
 
         // Verify using update(byte[]) in bulk
-        let valid = m22_verify(&shared, &mut thread, "SHA256withRSA", pub_key, b"byte-by-byte", sig_arr);
-        assert!(valid, "M22: byte-by-byte update should produce same signature as bulk");
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            pub_key,
+            b"byte-by-byte",
+            sig_arr,
+        );
+        assert!(
+            valid,
+            "M22: byte-by-byte update should produce same signature as bulk"
+        );
     }
 
     #[test]
@@ -63091,47 +66464,99 @@ mod tests {
 
         let alg_str = crate::vm::vm_object::create_java_string(&shared, "SHA256withRSA");
         let sig = call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "getInstance",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "getInstance",
             "(Ljava/lang/String;)Ljava/security/Signature;",
             &[Value::Object(Some(alg_str))],
-        ).unwrap().unwrap();
-        let sig_ref = match sig { Value::Object(Some(r)) => r, _ => panic!("M22: expected Signature") };
+        )
+        .unwrap()
+        .unwrap();
+        let sig_ref = match sig {
+            Value::Object(Some(r)) => r,
+            _ => panic!("M22: expected Signature"),
+        };
 
         call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "initSign", "(Ljava/security/PrivateKey;)V",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "initSign",
+            "(Ljava/security/PrivateKey;)V",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(priv_key))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let data = b"sign into buffer";
-        let arr = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Byte, data.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Byte,
+            data.len(),
+        );
         for (i, &b) in data.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "update", "([B)V",
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "update",
+            "([B)V",
             &[Value::Object(Some(sig_ref)), Value::Object(Some(arr))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // sign(byte[] outbuf, int offset, int len) -> int
-        let outbuf = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Byte, 512);
+        let outbuf = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Byte,
+            512,
+        );
         let written = call_native(
-            &shared, &mut thread,
-            "java/security/Signature", "sign", "([BII)I",
-            &[Value::Object(Some(sig_ref)), Value::Object(Some(outbuf)), Value::Int(0), Value::Int(512)],
-        ).unwrap().unwrap();
-        let written_len = match written { Value::Int(n) => n, _ => panic!("M22: expected int") };
+            &shared,
+            &mut thread,
+            "java/security/Signature",
+            "sign",
+            "([BII)I",
+            &[
+                Value::Object(Some(sig_ref)),
+                Value::Object(Some(outbuf)),
+                Value::Int(0),
+                Value::Int(512),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let written_len = match written {
+            Value::Int(n) => n,
+            _ => panic!("M22: expected int"),
+        };
         assert!(written_len > 0, "M22: sign into buffer should write bytes");
 
         // Copy written bytes into a new array for verification
-        let sig_arr = shared.heap.alloc_array(ClassId::new(0), crate::memory::heap::ArrayElementType::Byte, written_len as usize);
+        let sig_arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            crate::memory::heap::ArrayElementType::Byte,
+            written_len as usize,
+        );
         for i in 0..written_len as usize {
-            let b = shared.heap.get_array_element(outbuf, i).unwrap_or(Value::Int(0));
+            let b = shared
+                .heap
+                .get_array_element(outbuf, i)
+                .unwrap_or(Value::Int(0));
             let _ = shared.heap.set_array_element(sig_arr, i, b);
         }
-        let valid = m22_verify(&shared, &mut thread, "SHA256withRSA", pub_key, data, sig_arr);
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA256withRSA",
+            pub_key,
+            data,
+            sig_arr,
+        );
         assert!(valid, "M22: sign-into-buffer signature should verify");
     }
 
@@ -63144,7 +66569,14 @@ mod tests {
         let data = b"cross-key test";
         let signature = m22_sign(&shared, &mut thread, "SHA384withECDSA", priv1, data);
         // Verify with a different key pair's public key РІР‚вЂќ should fail
-        let valid = m22_verify(&shared, &mut thread, "SHA384withECDSA", pub2, data, signature);
+        let valid = m22_verify(
+            &shared,
+            &mut thread,
+            "SHA384withECDSA",
+            pub2,
+            data,
+            signature,
+        );
         assert!(!valid, "M22: ECDSA verify with wrong key should fail");
     }
 
@@ -63157,16 +66589,21 @@ mod tests {
         // Prove that collection classes (ArrayList, Collections, HashMap) load
         // from real JDK .class files with real bytecode, not synthetic stubs.
 
-        let java_home = std::env::var("JAVA_HOME").ok()
-            .or_else(|| {
-                let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            });
+        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+            let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+            if p.exists() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
         let Some(java_home) = java_home else {
             eprintln!("Skipping real_jdk_collections_e2e: no JDK found");
             return;
         };
-        let jmod = std::path::PathBuf::from(&java_home).join("jmods").join("java.base.jmod");
+        let jmod = std::path::PathBuf::from(&java_home)
+            .join("jmods")
+            .join("java.base.jmod");
         if !jmod.exists() {
             eprintln!("Skipping real_jdk_collections_e2e: no java.base.jmod");
             return;
@@ -63182,13 +66619,19 @@ mod tests {
         let shared = Arc::new(SharedVm::new(config));
 
         // --- Load collection classes explicitly ---
-        let arraylist_id = shared.class_manager.write()
+        let arraylist_id = shared
+            .class_manager
+            .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load from real JDK");
-        let collections_id = shared.class_manager.write()
+        let collections_id = shared
+            .class_manager
+            .write()
             .load_class("java/util/Collections")
             .expect("Collections should load from real JDK");
-        let hashmap_id = shared.class_manager.write()
+        let hashmap_id = shared
+            .class_manager
+            .write()
             .load_class("java/util/HashMap")
             .expect("HashMap should load from real JDK");
 
@@ -63196,99 +66639,150 @@ mod tests {
 
         // --- Verify classes are NOT synthetic stubs ---
         let arraylist = cm.class_store.get(arraylist_id).unwrap();
-        assert!(!arraylist.is_synthetic_stub,
-            "ArrayList should be loaded from real .class file, not synthetic stub");
+        assert!(
+            !arraylist.is_synthetic_stub,
+            "ArrayList should be loaded from real .class file, not synthetic stub"
+        );
 
         let collections = cm.class_store.get(collections_id).unwrap();
-        assert!(!collections.is_synthetic_stub,
-            "Collections should be loaded from real .class file, not synthetic stub");
+        assert!(
+            !collections.is_synthetic_stub,
+            "Collections should be loaded from real .class file, not synthetic stub"
+        );
 
         let hashmap = cm.class_store.get(hashmap_id).unwrap();
-        assert!(!hashmap.is_synthetic_stub,
-            "HashMap should be loaded from real .class file, not synthetic stub");
+        assert!(
+            !hashmap.is_synthetic_stub,
+            "HashMap should be loaded from real .class file, not synthetic stub"
+        );
 
         // --- Verify classes have real bytecode methods ---
         // ArrayList should have many methods (add, get, remove, size, etc.)
-        assert!(!arraylist.methods.is_empty(),
-            "Real ArrayList should have methods");
-        let al_bytecode = arraylist.methods.iter()
+        assert!(
+            !arraylist.methods.is_empty(),
+            "Real ArrayList should have methods"
+        );
+        let al_bytecode = arraylist
+            .methods
+            .iter()
             .filter(|m| !m.is_native() && m.code().is_some())
             .count();
-        eprintln!("[real_jdk_collections_e2e] ArrayList: {} total methods, {} with Code attribute",
-            arraylist.methods.len(), al_bytecode);
-        assert!(al_bytecode > 10,
-            "ArrayList should have >10 bytecode methods with Code, got {}", al_bytecode);
+        eprintln!(
+            "[real_jdk_collections_e2e] ArrayList: {} total methods, {} with Code attribute",
+            arraylist.methods.len(),
+            al_bytecode
+        );
+        assert!(
+            al_bytecode > 10,
+            "ArrayList should have >10 bytecode methods with Code, got {}",
+            al_bytecode
+        );
 
         // Collections should have many static utility methods
-        assert!(!collections.methods.is_empty(),
-            "Real Collections should have methods");
-        let col_bytecode = collections.methods.iter()
+        assert!(
+            !collections.methods.is_empty(),
+            "Real Collections should have methods"
+        );
+        let col_bytecode = collections
+            .methods
+            .iter()
             .filter(|m| !m.is_native() && m.code().is_some())
             .count();
-        eprintln!("[real_jdk_collections_e2e] Collections: {} total methods, {} with Code attribute",
-            collections.methods.len(), col_bytecode);
-        assert!(col_bytecode > 10,
-            "Collections should have >10 bytecode methods with Code, got {}", col_bytecode);
+        eprintln!(
+            "[real_jdk_collections_e2e] Collections: {} total methods, {} with Code attribute",
+            collections.methods.len(),
+            col_bytecode
+        );
+        assert!(
+            col_bytecode > 10,
+            "Collections should have >10 bytecode methods with Code, got {}",
+            col_bytecode
+        );
 
         // HashMap should also be substantial
-        assert!(!hashmap.methods.is_empty(),
-            "Real HashMap should have methods");
-        let hm_bytecode = hashmap.methods.iter()
+        assert!(
+            !hashmap.methods.is_empty(),
+            "Real HashMap should have methods"
+        );
+        let hm_bytecode = hashmap
+            .methods
+            .iter()
             .filter(|m| !m.is_native() && m.code().is_some())
             .count();
-        eprintln!("[real_jdk_collections_e2e] HashMap: {} total methods, {} with Code attribute",
-            hashmap.methods.len(), hm_bytecode);
-        assert!(hm_bytecode > 10,
-            "HashMap should have >10 bytecode methods with Code, got {}", hm_bytecode);
+        eprintln!(
+            "[real_jdk_collections_e2e] HashMap: {} total methods, {} with Code attribute",
+            hashmap.methods.len(),
+            hm_bytecode
+        );
+        assert!(
+            hm_bytecode > 10,
+            "HashMap should have >10 bytecode methods with Code, got {}",
+            hm_bytecode
+        );
 
         // --- Verify specific methods exist ---
         // ArrayList.<init> (constructor)
-        let has_al_init = arraylist.methods.iter()
-            .any(|m| &*m.name == "<init>");
+        let has_al_init = arraylist.methods.iter().any(|m| &*m.name == "<init>");
         assert!(has_al_init, "ArrayList should have <init> constructor");
 
         // ArrayList.add
-        let has_al_add = arraylist.methods.iter()
-            .any(|m| &*m.name == "add");
+        let has_al_add = arraylist.methods.iter().any(|m| &*m.name == "add");
         assert!(has_al_add, "ArrayList should have add method");
 
         // Collections.sort
-        let has_sort = collections.methods.iter()
-            .any(|m| &*m.name == "sort");
+        let has_sort = collections.methods.iter().any(|m| &*m.name == "sort");
         assert!(has_sort, "Collections should have sort method");
 
         // HashMap.put
-        let has_put = hashmap.methods.iter()
-            .any(|m| &*m.name == "put");
+        let has_put = hashmap.methods.iter().any(|m| &*m.name == "put");
         assert!(has_put, "HashMap should have put method");
 
         // --- Count real vs synthetic across all loaded classes ---
         let total = cm.loaded_count();
-        let real_count = cm.class_store.iter()
+        let real_count = cm
+            .class_store
+            .iter()
             .filter(|c| !c.is_synthetic_stub)
             .count();
-        let synthetic_count = cm.class_store.iter()
+        let synthetic_count = cm
+            .class_store
+            .iter()
             .filter(|c| c.is_synthetic_stub)
             .count();
         eprintln!("[real_jdk_collections_e2e] Total classes loaded: {}", total);
-        eprintln!("[real_jdk_collections_e2e] Real (from .class): {}", real_count);
-        eprintln!("[real_jdk_collections_e2e] Synthetic stubs: {}", synthetic_count);
+        eprintln!(
+            "[real_jdk_collections_e2e] Real (from .class): {}",
+            real_count
+        );
+        eprintln!(
+            "[real_jdk_collections_e2e] Synthetic stubs: {}",
+            synthetic_count
+        );
 
         // Most classes should be real when loading from JMOD
-        assert!(real_count > synthetic_count,
-            "Real classes ({}) should outnumber synthetic stubs ({})", real_count, synthetic_count);
+        assert!(
+            real_count > synthetic_count,
+            "Real classes ({}) should outnumber synthetic stubs ({})",
+            real_count,
+            synthetic_count
+        );
 
         drop(cm);
 
         // --- Print audit of missing natives ---
         let missing = shared.get_missing_natives();
         if !missing.is_empty() {
-            eprintln!("[real_jdk_collections_e2e] Missing natives ({}):", missing.len());
+            eprintln!(
+                "[real_jdk_collections_e2e] Missing natives ({}):",
+                missing.len()
+            );
             for entry in &missing {
                 eprintln!("  {}", entry);
             }
         } else {
-            eprintln!("[real_jdk_collections_e2e] No missing natives encountered during class loading.");
+            eprintln!(
+                "[real_jdk_collections_e2e] No missing natives encountered during class loading."
+            );
         }
 
         // --- Try invoking ArrayList.<init>() via interpreter ---
@@ -63301,25 +66795,40 @@ mod tests {
         let mut vm = Vm::new(config2);
 
         // Load ArrayList and allocate an instance
-        let al_id = vm.shared.class_manager.write()
+        let al_id = vm
+            .shared
+            .class_manager
+            .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load");
         let al_nfields = {
             let cm = vm.shared.class_manager.read();
-            cm.class_store.get(al_id).map(|c| c.num_total_fields).unwrap_or(4)
+            cm.class_store
+                .get(al_id)
+                .map(|c| c.num_total_fields)
+                .unwrap_or(4)
         };
         let al_obj = vm.shared.heap.alloc_object(al_id, al_nfields);
 
         // Attempt to invoke ArrayList.<init>()V
         let init_result = invoke_or_native(
-            &vm.shared, &mut vm.main_thread,
-            "java/util/ArrayList", "<init>", "()V",
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/util/ArrayList",
+            "<init>",
+            "()V",
             &[Value::Object(Some(al_obj))],
         );
-        eprintln!("[real_jdk_collections_e2e] ArrayList.<init>() = {:?}", init_result);
+        eprintln!(
+            "[real_jdk_collections_e2e] ArrayList.<init>() = {:?}",
+            init_result
+        );
         match &init_result {
             Ok(_) => eprintln!("[real_jdk_collections_e2e] ArrayList.<init>() succeeded!"),
-            Err(e) => eprintln!("[real_jdk_collections_e2e] ArrayList.<init>() failed (expected for now): {:?}", e),
+            Err(e) => eprintln!(
+                "[real_jdk_collections_e2e] ArrayList.<init>() failed (expected for now): {:?}",
+                e
+            ),
         }
     }
 
@@ -63330,11 +66839,18 @@ mod tests {
 
     /// Helper: create a SharedVm with custom native methods registered.
     fn m6_shared_with_natives(
-        registrations: &[(&str, &str, &str, fn(&mut dyn cratonvm_native_api::NativeContext, &[Value]) -> MethodCallResult)],
+        registrations: &[(
+            &str,
+            &str,
+            &str,
+            fn(&mut dyn cratonvm_native_api::NativeContext, &[Value]) -> MethodCallResult,
+        )],
     ) -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
         for &(class_name, method_name, descriptor, callback) in registrations {
-            shared.native_methods.register(class_name, method_name, descriptor, callback);
+            shared
+                .native_methods
+                .register(class_name, method_name, descriptor, callback);
         }
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
@@ -63350,18 +66866,25 @@ mod tests {
 
         static CALL_COUNT: AtomicI32 = AtomicI32::new(0);
 
-        fn native_add(_ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_add(
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
             CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-            let a = match args.get(0) { Some(Value::Int(v)) => *v, _ => 0 };
-            let b = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            let a = match args.get(0) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let b = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
             Ok(Some(Value::Int(a + b)))
         }
 
         CALL_COUNT.store(0, Ordering::SeqCst);
 
-        let shared = m6_shared_with_natives(&[
-            ("test/Compute", "add", "(II)I", native_add),
-        ]);
+        let shared = m6_shared_with_natives(&[("test/Compute", "add", "(II)I", native_add)]);
 
         // Spawn two OS threads, each with their own JvmThread, calling natives
         // through NativeContextImpl (the same path the interpreter uses for
@@ -63371,16 +66894,36 @@ mod tests {
 
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "worker-1");
-            let cb = shared1.native_methods.find("test/Compute", "add", "(II)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-            cb(&mut ctx, &[Value::Int(10), Value::Int(20)]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared1
+                .native_methods
+                .find("test/Compute", "add", "(II)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Int(10), Value::Int(20)])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "worker-2");
-            let cb = shared2.native_methods.find("test/Compute", "add", "(II)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-            cb(&mut ctx, &[Value::Int(100), Value::Int(200)]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared2
+                .native_methods
+                .find("test/Compute", "add", "(II)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Int(100), Value::Int(200)])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         let r1 = h1.join().unwrap();
@@ -63388,7 +66931,11 @@ mod tests {
 
         assert_eq!(r1, 30, "Thread 1 should compute 10+20=30");
         assert_eq!(r2, 300, "Thread 2 should compute 100+200=300");
-        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2, "Both threads should have called native_add");
+        assert_eq!(
+            CALL_COUNT.load(Ordering::SeqCst),
+            2,
+            "Both threads should have called native_add"
+        );
     }
 
     #[test]
@@ -63399,13 +66946,19 @@ mod tests {
 
         static COUNTER: AtomicI32 = AtomicI32::new(0);
 
-        fn native_increment_synchronized(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_increment_synchronized(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
             // args[0] = lock object, args[1] = iteration count
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
                 _ => return Ok(None),
             };
-            let count = match args.get(1) { Some(Value::Int(v)) => *v, _ => 100 };
+            let count = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 100,
+            };
 
             for _ in 0..count {
                 ctx.monitor_enter(lock_obj);
@@ -63419,9 +66972,12 @@ mod tests {
 
         COUNTER.store(0, Ordering::SeqCst);
 
-        let shared = m6_shared_with_natives(&[
-            ("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V", native_increment_synchronized),
-        ]);
+        let shared = m6_shared_with_natives(&[(
+            "test/Sync",
+            "incrementSync",
+            "(Ljava/lang/Object;I)V",
+            native_increment_synchronized,
+        )]);
 
         // Create a shared lock object
         let lock_obj = shared.heap.alloc_object(ClassId::new(0), 0);
@@ -63431,17 +66987,33 @@ mod tests {
 
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "sync-1");
-            shared1.thread_registry.register(ThreadId(1), "sync-1", None);
-            let cb = shared1.native_methods.find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
+            shared1
+                .thread_registry
+                .register(ThreadId(1), "sync-1", None);
+            let cb = shared1
+                .native_methods
+                .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
             cb(&mut ctx, &[Value::Object(Some(lock_obj)), Value::Int(100)]).unwrap();
         });
 
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "sync-2");
-            shared2.thread_registry.register(ThreadId(2), "sync-2", None);
-            let cb = shared2.native_methods.find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
+            shared2
+                .thread_registry
+                .register(ThreadId(2), "sync-2", None);
+            let cb = shared2
+                .native_methods
+                .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
             cb(&mut ctx, &[Value::Object(Some(lock_obj)), Value::Int(100)]).unwrap();
         });
 
@@ -63449,8 +67021,11 @@ mod tests {
         h2.join().unwrap();
 
         // With proper monitor synchronization, exactly 200 increments should be visible
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 200,
-            "Synchronized counter should be exactly 200 (100 per thread)");
+        assert_eq!(
+            COUNTER.load(Ordering::SeqCst),
+            200,
+            "Synchronized counter should be exactly 200 (100 per thread)"
+        );
     }
 
     #[test]
@@ -63462,7 +67037,10 @@ mod tests {
         static PRODUCED: AtomicBool = AtomicBool::new(false);
         static CONSUMED: AtomicI32 = AtomicI32::new(0);
 
-        fn native_consumer(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_consumer(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
                 _ => return Ok(None),
@@ -63476,7 +67054,10 @@ mod tests {
             Ok(None)
         }
 
-        fn native_producer(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_producer(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
                 _ => return Ok(None),
@@ -63493,8 +67074,18 @@ mod tests {
         CONSUMED.store(0, Ordering::SeqCst);
 
         let shared = m6_shared_with_natives(&[
-            ("test/WaitNotify", "consume", "(Ljava/lang/Object;)V", native_consumer),
-            ("test/WaitNotify", "produce", "(Ljava/lang/Object;)V", native_producer),
+            (
+                "test/WaitNotify",
+                "consume",
+                "(Ljava/lang/Object;)V",
+                native_consumer,
+            ),
+            (
+                "test/WaitNotify",
+                "produce",
+                "(Ljava/lang/Object;)V",
+                native_producer,
+            ),
         ]);
 
         let lock_obj = shared.heap.alloc_object(ClassId::new(0), 0);
@@ -63503,25 +67094,48 @@ mod tests {
 
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "consumer");
-            shared1.thread_registry.register(ThreadId(1), "consumer", None);
-            let cb = shared1.native_methods.find("test/WaitNotify", "consume", "(Ljava/lang/Object;)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
+            shared1
+                .thread_registry
+                .register(ThreadId(1), "consumer", None);
+            let cb = shared1
+                .native_methods
+                .find("test/WaitNotify", "consume", "(Ljava/lang/Object;)V")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
             cb(&mut ctx, &[Value::Object(Some(lock_obj))]).unwrap();
         });
 
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "producer");
-            shared2.thread_registry.register(ThreadId(2), "producer", None);
-            let cb = shared2.native_methods.find("test/WaitNotify", "produce", "(Ljava/lang/Object;)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
+            shared2
+                .thread_registry
+                .register(ThreadId(2), "producer", None);
+            let cb = shared2
+                .native_methods
+                .find("test/WaitNotify", "produce", "(Ljava/lang/Object;)V")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
             cb(&mut ctx, &[Value::Object(Some(lock_obj))]).unwrap();
         });
 
         consumer.join().unwrap();
         producer.join().unwrap();
 
-        assert!(PRODUCED.load(Ordering::SeqCst), "Producer should have set flag");
-        assert_eq!(CONSUMED.load(Ordering::SeqCst), 42, "Consumer should have received notification");
+        assert!(
+            PRODUCED.load(Ordering::SeqCst),
+            "Producer should have set flag"
+        );
+        assert_eq!(
+            CONSUMED.load(Ordering::SeqCst),
+            42,
+            "Consumer should have received notification"
+        );
     }
 
     #[test]
@@ -63529,8 +67143,14 @@ mod tests {
         // Two threads call native methods via invoke_shared that allocate objects
         // on the shared heap. Proves end-to-end thread safety of the full
         // invoke_shared РІвЂ вЂ™ native callback РІвЂ вЂ™ heap allocation path.
-        fn native_alloc_objects(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let count = match args.get(0) { Some(Value::Int(v)) => *v, _ => 10 };
+        fn native_alloc_objects(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let count = match args.get(0) {
+                Some(Value::Int(v)) => *v,
+                _ => 10,
+            };
             let mut last_obj = None;
             for i in 0..count {
                 let obj = ctx.alloc_object(ClassId::new(0), 2);
@@ -63543,25 +67163,44 @@ mod tests {
             }
         }
 
-        let shared = m6_shared_with_natives(&[
-            ("test/Alloc", "allocMany", "(I)I", native_alloc_objects),
-        ]);
+        let shared =
+            m6_shared_with_natives(&[("test/Alloc", "allocMany", "(I)I", native_alloc_objects)]);
 
         let shared1 = shared.clone();
         let shared2 = shared.clone();
 
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "alloc-1");
-            let cb = shared1.native_methods.find("test/Alloc", "allocMany", "(I)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-            cb(&mut ctx, &[Value::Int(50)]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared1
+                .native_methods
+                .find("test/Alloc", "allocMany", "(I)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Int(50)])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "alloc-2");
-            let cb = shared2.native_methods.find("test/Alloc", "allocMany", "(I)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-            cb(&mut ctx, &[Value::Int(50)]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared2
+                .native_methods
+                .find("test/Alloc", "allocMany", "(I)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Int(50)])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         let r1 = h1.join().unwrap();
@@ -63575,7 +67214,10 @@ mod tests {
     fn m6_concurrent_class_loading_via_invoke() {
         // Two threads load different classes concurrently.
         // Proves the class manager's RwLock allows safe concurrent access.
-        fn native_noop(_ctx: &mut dyn cratonvm_native_api::NativeContext, _args: &[Value]) -> MethodCallResult {
+        fn native_noop(
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
             Ok(Some(Value::Int(1)))
         }
 
@@ -63589,9 +67231,15 @@ mod tests {
 
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "loader-1");
-            let cb = shared1.native_methods.find("test/ClassA", "run", "()I").unwrap();
+            let cb = shared1
+                .native_methods
+                .find("test/ClassA", "run", "()I")
+                .unwrap();
             for _ in 0..10 {
-                let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
+                let mut ctx = NativeContextImpl {
+                    shared: &shared1,
+                    thread: &mut thread,
+                };
                 let result = cb(&mut ctx, &[]);
                 assert!(result.is_ok(), "ClassA.run() should succeed");
             }
@@ -63599,9 +67247,15 @@ mod tests {
 
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "loader-2");
-            let cb = shared2.native_methods.find("test/ClassB", "run", "()I").unwrap();
+            let cb = shared2
+                .native_methods
+                .find("test/ClassB", "run", "()I")
+                .unwrap();
             for _ in 0..10 {
-                let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
+                let mut ctx = NativeContextImpl {
+                    shared: &shared2,
+                    thread: &mut thread,
+                };
                 let result = cb(&mut ctx, &[]);
                 assert!(result.is_ok(), "ClassB.run() should succeed");
             }
@@ -63623,16 +67277,28 @@ mod tests {
 
         static WRITER_DONE: AtomicBool = AtomicBool::new(false);
 
-        fn native_volatile_write(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let obj = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+        fn native_volatile_write(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let obj = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
             // Write value 42 via volatile semantics
             ctx.set_field_volatile(obj, 0, Value::Int(42));
             WRITER_DONE.store(true, Ordering::Release);
             Ok(None)
         }
 
-        fn native_volatile_read(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let obj = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+        fn native_volatile_read(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let obj = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
             // Spin-read the volatile field until writer is done
             for _ in 0..100_000 {
                 if WRITER_DONE.load(Ordering::Acquire) {
@@ -63647,8 +67313,18 @@ mod tests {
         WRITER_DONE.store(false, Ordering::SeqCst);
 
         let shared = m6_shared_with_natives(&[
-            ("test/Vol", "write", "(Ljava/lang/Object;)V", native_volatile_write),
-            ("test/Vol", "read", "(Ljava/lang/Object;)I", native_volatile_read),
+            (
+                "test/Vol",
+                "write",
+                "(Ljava/lang/Object;)V",
+                native_volatile_write,
+            ),
+            (
+                "test/Vol",
+                "read",
+                "(Ljava/lang/Object;)I",
+                native_volatile_read,
+            ),
         ]);
 
         let obj = shared.heap.alloc_object(ClassId::new(0), 1);
@@ -63659,16 +67335,32 @@ mod tests {
 
         let writer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "writer");
-            let cb = shared1.native_methods.find("test/Vol", "write", "(Ljava/lang/Object;)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
+            let cb = shared1
+                .native_methods
+                .find("test/Vol", "write", "(Ljava/lang/Object;)V")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
             cb(&mut ctx, &[Value::Object(Some(obj))]).unwrap();
         });
 
         let reader = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reader");
-            let cb = shared2.native_methods.find("test/Vol", "read", "(Ljava/lang/Object;)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-            cb(&mut ctx, &[Value::Object(Some(obj))]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared2
+                .native_methods
+                .find("test/Vol", "read", "(Ljava/lang/Object;)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Object(Some(obj))])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         writer.join().unwrap();
@@ -63703,7 +67395,11 @@ mod tests {
         // Join should block until the spawned thread completes
         let joined = shared.thread_registry.join(tid);
         assert!(joined, "join should succeed");
-        assert_eq!(RESULT.load(Ordering::Acquire), 99, "Result should be set after join returns");
+        assert_eq!(
+            RESULT.load(Ordering::Acquire),
+            99,
+            "Result should be set after join returns"
+        );
     }
 
     #[test]
@@ -63715,13 +67411,25 @@ mod tests {
 
         static ITEMS_CONSUMED: AtomicI32 = AtomicI32::new(0);
 
-        fn native_produce_items(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
-            let queue = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+        fn native_produce_items(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let lock = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let queue = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
             for i in 0..5 {
                 ctx.monitor_enter(lock);
                 // Append to "queue" field 0 (count of items)
-                let count = match ctx.get_field(queue, 0) { Value::Int(v) => v, _ => 0 };
+                let count = match ctx.get_field(queue, 0) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
                 ctx.set_field(queue, 0, Value::Int(count + 1));
                 ctx.set_field(queue, 1, Value::Int(i + 1)); // last produced value
                 ctx.monitor_notify(lock)?;
@@ -63731,14 +67439,26 @@ mod tests {
             Ok(None)
         }
 
-        fn native_consume_items(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
-            let queue = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+        fn native_consume_items(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let lock = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let queue = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
             let mut consumed = 0;
             while consumed < 5 {
                 ctx.monitor_enter(lock);
                 loop {
-                    let count = match ctx.get_field(queue, 0) { Value::Int(v) => v, _ => 0 };
+                    let count = match ctx.get_field(queue, 0) {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
                     if count > 0 {
                         ctx.set_field(queue, 0, Value::Int(count - 1));
                         consumed += 1;
@@ -63755,8 +67475,18 @@ mod tests {
         ITEMS_CONSUMED.store(0, Ordering::SeqCst);
 
         let shared = m6_shared_with_natives(&[
-            ("test/PC", "produce", "(Ljava/lang/Object;Ljava/lang/Object;)V", native_produce_items),
-            ("test/PC", "consume", "(Ljava/lang/Object;Ljava/lang/Object;)V", native_consume_items),
+            (
+                "test/PC",
+                "produce",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                native_produce_items,
+            ),
+            (
+                "test/PC",
+                "consume",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                native_consume_items,
+            ),
         ]);
 
         let lock = shared.heap.alloc_object(ClassId::new(0), 0);
@@ -63768,24 +67498,60 @@ mod tests {
 
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "producer");
-            shared1.thread_registry.register(ThreadId(1), "producer", None);
-            let cb = shared1.native_methods.find("test/PC", "produce", "(Ljava/lang/Object;Ljava/lang/Object;)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-            cb(&mut ctx, &[Value::Object(Some(lock)), Value::Object(Some(queue))]).unwrap();
+            shared1
+                .thread_registry
+                .register(ThreadId(1), "producer", None);
+            let cb = shared1
+                .native_methods
+                .find(
+                    "test/PC",
+                    "produce",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                )
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
+            cb(
+                &mut ctx,
+                &[Value::Object(Some(lock)), Value::Object(Some(queue))],
+            )
+            .unwrap();
         });
 
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "consumer");
-            shared2.thread_registry.register(ThreadId(2), "consumer", None);
-            let cb = shared2.native_methods.find("test/PC", "consume", "(Ljava/lang/Object;Ljava/lang/Object;)V").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-            cb(&mut ctx, &[Value::Object(Some(lock)), Value::Object(Some(queue))]).unwrap();
+            shared2
+                .thread_registry
+                .register(ThreadId(2), "consumer", None);
+            let cb = shared2
+                .native_methods
+                .find(
+                    "test/PC",
+                    "consume",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                )
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
+            cb(
+                &mut ctx,
+                &[Value::Object(Some(lock)), Value::Object(Some(queue))],
+            )
+            .unwrap();
         });
 
         producer.join().unwrap();
         consumer.join().unwrap();
 
-        assert_eq!(ITEMS_CONSUMED.load(Ordering::Acquire), 5, "Consumer should have consumed all 5 items");
+        assert_eq!(
+            ITEMS_CONSUMED.load(Ordering::Acquire),
+            5,
+            "Consumer should have consumed all 5 items"
+        );
     }
 
     #[test]
@@ -63796,9 +67562,18 @@ mod tests {
 
         static COUNTER: AtomicI32 = AtomicI32::new(0);
 
-        fn native_increment(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
-            let n = match args.get(1) { Some(Value::Int(v)) => *v, _ => 50 };
+        fn native_increment(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let lock = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let n = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 50,
+            };
             for _ in 0..n {
                 ctx.monitor_enter(lock);
                 let v = COUNTER.load(Ordering::Relaxed);
@@ -63811,36 +67586,58 @@ mod tests {
 
         COUNTER.store(0, Ordering::SeqCst);
 
-        let shared = m6_shared_with_natives(&[
-            ("test/Inc", "increment", "(Ljava/lang/Object;I)V", native_increment),
-        ]);
+        let shared = m6_shared_with_natives(&[(
+            "test/Inc",
+            "increment",
+            "(Ljava/lang/Object;I)V",
+            native_increment,
+        )]);
 
         let lock = shared.heap.alloc_object(ClassId::new(0), 0);
 
-        let handles: Vec<_> = (0..4).map(|i| {
-            let s = shared.clone();
-            std::thread::spawn(move || {
-                let mut thread = JvmThread::new(ThreadId(i + 1), &format!("inc-{}", i));
-                s.thread_registry.register(ThreadId(i + 1), &format!("inc-{}", i), None);
-                let cb = s.native_methods.find("test/Inc", "increment", "(Ljava/lang/Object;I)V").unwrap();
-                let mut ctx = NativeContextImpl { shared: &s, thread: &mut thread };
-                cb(&mut ctx, &[Value::Object(Some(lock)), Value::Int(50)]).unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let s = shared.clone();
+                std::thread::spawn(move || {
+                    let mut thread = JvmThread::new(ThreadId(i + 1), &format!("inc-{}", i));
+                    s.thread_registry
+                        .register(ThreadId(i + 1), &format!("inc-{}", i), None);
+                    let cb = s
+                        .native_methods
+                        .find("test/Inc", "increment", "(Ljava/lang/Object;I)V")
+                        .unwrap();
+                    let mut ctx = NativeContextImpl {
+                        shared: &s,
+                        thread: &mut thread,
+                    };
+                    cb(&mut ctx, &[Value::Object(Some(lock)), Value::Int(50)]).unwrap();
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
         }
 
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 200, "4 threads x 50 = 200 increments");
+        assert_eq!(
+            COUNTER.load(Ordering::SeqCst),
+            200,
+            "4 threads x 50 = 200 increments"
+        );
     }
 
     #[test]
     fn p86_synchronized_block_reentrant() {
         // A single thread re-enters a synchronized block (recursive monitor lock).
         // Proves monitor reentrancy doesn't deadlock.
-        fn native_reentrant(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
-            let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+        fn native_reentrant(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let lock = match args.get(0) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
             ctx.monitor_enter(lock);
             ctx.monitor_enter(lock); // reentrant
             ctx.monitor_enter(lock); // triple reentrant
@@ -63850,9 +67647,12 @@ mod tests {
             Ok(Some(Value::Int(1)))
         }
 
-        let shared = m6_shared_with_natives(&[
-            ("test/Reent", "reenter", "(Ljava/lang/Object;)I", native_reentrant),
-        ]);
+        let shared = m6_shared_with_natives(&[(
+            "test/Reent",
+            "reenter",
+            "(Ljava/lang/Object;)I",
+            native_reentrant,
+        )]);
         let lock = shared.heap.alloc_object(ClassId::new(0), 0);
 
         let shared1 = shared.clone();
@@ -63861,16 +67661,36 @@ mod tests {
         // Run from two threads to prove both can acquire after reentrant release
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "reent-1");
-            let cb = shared1.native_methods.find("test/Reent", "reenter", "(Ljava/lang/Object;)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-            cb(&mut ctx, &[Value::Object(Some(lock))]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared1
+                .native_methods
+                .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared1,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Object(Some(lock))])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reent-2");
-            let cb = shared2.native_methods.find("test/Reent", "reenter", "(Ljava/lang/Object;)I").unwrap();
-            let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-            cb(&mut ctx, &[Value::Object(Some(lock))]).unwrap().unwrap().as_int().unwrap()
+            let cb = shared2
+                .native_methods
+                .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
+                .unwrap();
+            let mut ctx = NativeContextImpl {
+                shared: &shared2,
+                thread: &mut thread,
+            };
+            cb(&mut ctx, &[Value::Object(Some(lock))])
+                .unwrap()
+                .unwrap()
+                .as_int()
+                .unwrap()
         });
 
         assert_eq!(h1.join().unwrap(), 1);
@@ -63900,34 +67720,92 @@ mod tests {
         // Create system ThreadGroup
         let system_tg = shared.heap.alloc_object(ClassId::new(0), 3);
         let system_name = {
-            let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             ctx.create_string("system")
         };
-        let cb = shared.native_methods.find(tg_class, "<init>", "(Ljava/lang/String;)V").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        cb(&mut ctx, &[Value::Object(Some(system_tg)), Value::Object(Some(system_name))]).unwrap();
+        let cb = shared
+            .native_methods
+            .find(tg_class, "<init>", "(Ljava/lang/String;)V")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        cb(
+            &mut ctx,
+            &[
+                Value::Object(Some(system_tg)),
+                Value::Object(Some(system_name)),
+            ],
+        )
+        .unwrap();
 
         // Create main ThreadGroup with system as parent
         let main_tg = shared.heap.alloc_object(ClassId::new(0), 3);
         let main_name = {
-            let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             ctx.create_string("main")
         };
-        let cb = shared.native_methods.find(tg_class, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        cb(&mut ctx, &[Value::Object(Some(main_tg)), Value::Object(Some(system_tg)), Value::Object(Some(main_name))]).unwrap();
+        let cb = shared
+            .native_methods
+            .find(
+                tg_class,
+                "<init>",
+                "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
+            )
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        cb(
+            &mut ctx,
+            &[
+                Value::Object(Some(main_tg)),
+                Value::Object(Some(system_tg)),
+                Value::Object(Some(main_name)),
+            ],
+        )
+        .unwrap();
 
         // Verify hierarchy
-        let cb = shared.native_methods.find(tg_class, "getParent", "()Ljava/lang/ThreadGroup;").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let cb = shared
+            .native_methods
+            .find(tg_class, "getParent", "()Ljava/lang/ThreadGroup;")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         let parent = cb(&mut ctx, &[Value::Object(Some(main_tg))]).unwrap();
-        assert_eq!(parent, Some(Value::Object(Some(system_tg))), "main's parent should be system");
+        assert_eq!(
+            parent,
+            Some(Value::Object(Some(system_tg))),
+            "main's parent should be system"
+        );
 
-        let cb = shared.native_methods.find(tg_class, "getName", "()Ljava/lang/String;").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        let name = cb(&mut ctx, &[Value::Object(Some(main_tg))]).unwrap().unwrap();
+        let cb = shared
+            .native_methods
+            .find(tg_class, "getName", "()Ljava/lang/String;")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let name = cb(&mut ctx, &[Value::Object(Some(main_tg))])
+            .unwrap()
+            .unwrap();
         if let Value::Object(Some(s)) = name {
-            let ctx2 = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let ctx2 = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             let name_str = ctx2.read_string(s).unwrap_or_default();
             assert_eq!(name_str, "main", "ThreadGroup name should be 'main'");
         }
@@ -63946,22 +67824,55 @@ mod tests {
         let tg = shared.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let name = {
-            let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             ctx.create_string("main")
         };
-        let cb_init = shared.native_methods.find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        cb_init(&mut ctx, &[Value::Object(Some(tg)), Value::Object(Some(name))]).unwrap();
+        let cb_init = shared
+            .native_methods
+            .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        cb_init(
+            &mut ctx,
+            &[Value::Object(Some(tg)), Value::Object(Some(name))],
+        )
+        .unwrap();
 
-        let cb = shared.native_methods.find("java/lang/ThreadGroup", "activeCount", "()I").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        let count = cb(&mut ctx, &[Value::Object(Some(tg))]).unwrap().unwrap().as_int().unwrap();
-        assert_eq!(count, 3, "activeCount should be 3 (3 alive threads in registry)");
+        let cb = shared
+            .native_methods
+            .find("java/lang/ThreadGroup", "activeCount", "()I")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let count = cb(&mut ctx, &[Value::Object(Some(tg))])
+            .unwrap()
+            .unwrap()
+            .as_int()
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "activeCount should be 3 (3 alive threads in registry)"
+        );
 
         // Mark one dead
         shared.thread_registry.mark_dead(ThreadId(2));
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        let count = cb(&mut ctx, &[Value::Object(Some(tg))]).unwrap().unwrap().as_int().unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let count = cb(&mut ctx, &[Value::Object(Some(tg))])
+            .unwrap()
+            .unwrap()
+            .as_int()
+            .unwrap();
         assert_eq!(count, 2, "activeCount should be 2 after one thread dies");
     }
 
@@ -63973,27 +67884,64 @@ mod tests {
         // Create Java Thread objects and register them
         let t1_obj = shared.heap.alloc_object(ClassId::new(0), 2);
         let t2_obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.thread_registry.register(ThreadId(1), "t1", Some(t1_obj));
-        shared.thread_registry.register(ThreadId(2), "t2", Some(t2_obj));
+        shared
+            .thread_registry
+            .register(ThreadId(1), "t1", Some(t1_obj));
+        shared
+            .thread_registry
+            .register(ThreadId(2), "t2", Some(t2_obj));
 
         let tg = shared.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let name = {
-            let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             ctx.create_string("main")
         };
-        let cb_init = shared.native_methods.find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        cb_init(&mut ctx, &[Value::Object(Some(tg)), Value::Object(Some(name))]).unwrap();
+        let cb_init = shared
+            .native_methods
+            .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        cb_init(
+            &mut ctx,
+            &[Value::Object(Some(tg)), Value::Object(Some(name))],
+        )
+        .unwrap();
 
         // Create array for enumerate (use NativeContext for array allocation)
         let arr = {
-            let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
             ctx.new_ref_array(ClassId::new(0), 10)
         };
-        let cb = shared.native_methods.find("java/lang/ThreadGroup", "enumerate", "([Ljava/lang/Thread;)I").unwrap();
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
-        let count = cb(&mut ctx, &[Value::Object(Some(tg)), Value::Object(Some(arr))]).unwrap().unwrap().as_int().unwrap();
+        let cb = shared
+            .native_methods
+            .find(
+                "java/lang/ThreadGroup",
+                "enumerate",
+                "([Ljava/lang/Thread;)I",
+            )
+            .unwrap();
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let count = cb(
+            &mut ctx,
+            &[Value::Object(Some(tg)), Value::Object(Some(arr))],
+        )
+        .unwrap()
+        .unwrap()
+        .as_int()
+        .unwrap();
         assert_eq!(count, 2, "enumerate should return 2 threads");
 
         // Verify the array contains the thread objects
@@ -64016,18 +67964,28 @@ mod tests {
         let tid = ThreadId(1);
         let thread = JvmThread::new(tid, "test-interrupt");
         shared.thread_registry.register(tid, "test-interrupt", None);
-        shared.thread_registry.set_interrupted_flag(tid, thread.interrupted.clone());
+        shared
+            .thread_registry
+            .set_interrupted_flag(tid, thread.interrupted.clone());
 
         // Initially not interrupted
-        assert!(!thread.interrupted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!thread
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire));
 
         // Set interrupt via registry (simulates Thread.interrupt() from another thread)
         shared.thread_registry.set_interrupted(tid, true);
-        assert!(thread.interrupted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(thread
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire));
 
         // Clear it (simulates Thread.interrupted() static call)
-        thread.interrupted.store(false, std::sync::atomic::Ordering::Release);
-        assert!(!thread.interrupted.load(std::sync::atomic::Ordering::Acquire));
+        thread
+            .interrupted
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!thread
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -64040,7 +67998,9 @@ mod tests {
         shared.thread_registry.register(tid_b, "thread-B", None);
 
         let interrupted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        shared.thread_registry.set_interrupted_flag(tid_b, interrupted_flag.clone());
+        shared
+            .thread_registry
+            .set_interrupted_flag(tid_b, interrupted_flag.clone());
 
         let flag = interrupted_flag.clone();
         let shared1 = shared.clone();
@@ -64061,7 +68021,10 @@ mod tests {
         shared1.thread_registry.set_interrupted(tid_b, true);
 
         let was_interrupted = thread_b.join().unwrap();
-        assert!(was_interrupted, "Thread B should have seen interrupt from Thread A");
+        assert!(
+            was_interrupted,
+            "Thread B should have seen interrupt from Thread A"
+        );
     }
 
     #[test]
@@ -64074,7 +68037,9 @@ mod tests {
         let tid = ThreadId(1);
         let mut thread = JvmThread::new(tid, "waiter");
         shared.thread_registry.register(tid, "waiter", None);
-        shared.thread_registry.set_interrupted_flag(tid, thread.interrupted.clone());
+        shared
+            .thread_registry
+            .set_interrupted_flag(tid, thread.interrupted.clone());
 
         let lock = shared.heap.alloc_object(ClassId::new(0), 0);
 
@@ -64088,13 +68053,19 @@ mod tests {
         });
 
         // Enter monitor and wait with timeout РІР‚вЂќ should return after interrupt
-        let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
         ctx.monitor_enter(lock);
         let _result = ctx.monitor_wait(lock, Some(500)); // 500ms timeout, but interrupt should wake us
         ctx.monitor_exit(lock);
 
         interrupter.join().unwrap();
-        assert!(flag.load(Ordering::Acquire), "Interrupt flag should be set after wait returns");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "Interrupt flag should be set after wait returns"
+        );
     }
 
     #[test]
@@ -64135,7 +68106,9 @@ mod tests {
         descriptor: &str,
         args: &[Value],
     ) -> crate::error::MethodCallResult {
-        let cb = shared.native_methods.find(class, method, descriptor)
+        let cb = shared
+            .native_methods
+            .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("{class}.{method}{descriptor} not found"));
         let mut ctx = NativeContextImpl { shared, thread };
         cb(&mut ctx, args)
@@ -64152,8 +68125,15 @@ mod tests {
         let chm = shared.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
-            p86_chm_call(&shared, &mut thread, chm_class, "<init>", "()V",
-                &[Value::Object(Some(chm))]).unwrap();
+            p86_chm_call(
+                &shared,
+                &mut thread,
+                chm_class,
+                "<init>",
+                "()V",
+                &[Value::Object(Some(chm))],
+            )
+            .unwrap();
         }
 
         let shared1 = shared.clone();
@@ -64167,13 +68147,27 @@ mod tests {
                 shared1.heap.set_field(key, 0, Value::Int(i));
                 let val = shared1.heap.alloc_object(ClassId::new(0), 1);
                 shared1.heap.set_field(val, 0, Value::Int(i * 10));
-                let cb = shared1.native_methods.find(
-                    "java/util/concurrent/ConcurrentHashMap",
-                    "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                ).unwrap();
-                let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-                cb(&mut ctx, &[Value::Object(Some(chm)), Value::Object(Some(key)), Value::Object(Some(val))]).unwrap();
+                let cb = shared1
+                    .native_methods
+                    .find(
+                        "java/util/concurrent/ConcurrentHashMap",
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    )
+                    .unwrap();
+                let mut ctx = NativeContextImpl {
+                    shared: &shared1,
+                    thread: &mut thread,
+                };
+                cb(
+                    &mut ctx,
+                    &[
+                        Value::Object(Some(chm)),
+                        Value::Object(Some(key)),
+                        Value::Object(Some(val)),
+                    ],
+                )
+                .unwrap();
             }
         });
 
@@ -64185,13 +68179,27 @@ mod tests {
                 shared2.heap.set_field(key, 0, Value::Int(i));
                 let val = shared2.heap.alloc_object(ClassId::new(0), 1);
                 shared2.heap.set_field(val, 0, Value::Int(i * 10));
-                let cb = shared2.native_methods.find(
-                    "java/util/concurrent/ConcurrentHashMap",
-                    "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                ).unwrap();
-                let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-                cb(&mut ctx, &[Value::Object(Some(chm)), Value::Object(Some(key)), Value::Object(Some(val))]).unwrap();
+                let cb = shared2
+                    .native_methods
+                    .find(
+                        "java/util/concurrent/ConcurrentHashMap",
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    )
+                    .unwrap();
+                let mut ctx = NativeContextImpl {
+                    shared: &shared2,
+                    thread: &mut thread,
+                };
+                cb(
+                    &mut ctx,
+                    &[
+                        Value::Object(Some(chm)),
+                        Value::Object(Some(key)),
+                        Value::Object(Some(val)),
+                    ],
+                )
+                .unwrap();
             }
         });
 
@@ -64200,10 +68208,21 @@ mod tests {
 
         // Verify size = 100
         let mut thread = JvmThread::new(ThreadId(0), "verifier");
-        let size = p86_chm_call(&shared, &mut thread,
-            chm_class, "size", "()I",
-            &[Value::Object(Some(chm))]).unwrap().unwrap();
-        assert_eq!(size.as_int().unwrap(), 100, "CHM should contain 100 entries after concurrent puts");
+        let size = p86_chm_call(
+            &shared,
+            &mut thread,
+            chm_class,
+            "size",
+            "()I",
+            &[Value::Object(Some(chm))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            size.as_int().unwrap(),
+            100,
+            "CHM should contain 100 entries after concurrent puts"
+        );
     }
 
     #[test]
@@ -64216,8 +68235,15 @@ mod tests {
         let chm = shared.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
-            p86_chm_call(&shared, &mut thread, chm_class, "<init>", "()V",
-                &[Value::Object(Some(chm))]).unwrap();
+            p86_chm_call(
+                &shared,
+                &mut thread,
+                chm_class,
+                "<init>",
+                "()V",
+                &[Value::Object(Some(chm))],
+            )
+            .unwrap();
         }
 
         let shared1 = shared.clone();
@@ -64231,13 +68257,27 @@ mod tests {
                 shared1.heap.set_field(key, 0, Value::Int(i));
                 let val = shared1.heap.alloc_object(ClassId::new(0), 1);
                 shared1.heap.set_field(val, 0, Value::Int(i));
-                let cb = shared1.native_methods.find(
-                    "java/util/concurrent/ConcurrentHashMap",
-                    "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                ).unwrap();
-                let mut ctx = NativeContextImpl { shared: &shared1, thread: &mut thread };
-                cb(&mut ctx, &[Value::Object(Some(chm)), Value::Object(Some(key)), Value::Object(Some(val))]).unwrap();
+                let cb = shared1
+                    .native_methods
+                    .find(
+                        "java/util/concurrent/ConcurrentHashMap",
+                        "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    )
+                    .unwrap();
+                let mut ctx = NativeContextImpl {
+                    shared: &shared1,
+                    thread: &mut thread,
+                };
+                cb(
+                    &mut ctx,
+                    &[
+                        Value::Object(Some(chm)),
+                        Value::Object(Some(key)),
+                        Value::Object(Some(val)),
+                    ],
+                )
+                .unwrap();
             }
         });
 
@@ -64246,14 +68286,23 @@ mod tests {
             let mut thread = JvmThread::new(ThreadId(2), "reader");
             let mut max_seen = 0i32;
             for _ in 0..200 {
-                let cb = shared2.native_methods.find(
-                    "java/util/concurrent/ConcurrentHashMap",
-                    "size",
-                    "()I",
-                ).unwrap();
-                let mut ctx = NativeContextImpl { shared: &shared2, thread: &mut thread };
-                let size = cb(&mut ctx, &[Value::Object(Some(chm))]).unwrap().unwrap().as_int().unwrap();
-                assert!(size >= max_seen, "Size should not decrease: was {max_seen}, now {size}");
+                let cb = shared2
+                    .native_methods
+                    .find("java/util/concurrent/ConcurrentHashMap", "size", "()I")
+                    .unwrap();
+                let mut ctx = NativeContextImpl {
+                    shared: &shared2,
+                    thread: &mut thread,
+                };
+                let size = cb(&mut ctx, &[Value::Object(Some(chm))])
+                    .unwrap()
+                    .unwrap()
+                    .as_int()
+                    .unwrap();
+                assert!(
+                    size >= max_seen,
+                    "Size should not decrease: was {max_seen}, now {size}"
+                );
                 max_seen = size;
                 std::thread::yield_now();
             }
@@ -64275,40 +68324,74 @@ mod tests {
         let chm = shared.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
-            p86_chm_call(&shared, &mut thread, chm_class, "<init>", "()V",
-                &[Value::Object(Some(chm))]).unwrap();
+            p86_chm_call(
+                &shared,
+                &mut thread,
+                chm_class,
+                "<init>",
+                "()V",
+                &[Value::Object(Some(chm))],
+            )
+            .unwrap();
         }
 
-        let handles: Vec<_> = (0..4).map(|t| {
-            let s = shared.clone();
-            std::thread::spawn(move || {
-                let mut thread = JvmThread::new(ThreadId(t + 1), &format!("stress-{}", t));
-                for i in 0..25 {
-                    let unique_key = t as i32 * 1000 + i;
-                    let key = s.heap.alloc_object(ClassId::new(0), 1);
-                    s.heap.set_field(key, 0, Value::Int(unique_key));
-                    let val = s.heap.alloc_object(ClassId::new(0), 1);
-                    s.heap.set_field(val, 0, Value::Int(unique_key));
-                    let cb = s.native_methods.find(
-                        "java/util/concurrent/ConcurrentHashMap",
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    ).unwrap();
-                    let mut ctx = NativeContextImpl { shared: &s, thread: &mut thread };
-                    cb(&mut ctx, &[Value::Object(Some(chm)), Value::Object(Some(key)), Value::Object(Some(val))]).unwrap();
-                }
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let s = shared.clone();
+                std::thread::spawn(move || {
+                    let mut thread = JvmThread::new(ThreadId(t + 1), &format!("stress-{}", t));
+                    for i in 0..25 {
+                        let unique_key = t as i32 * 1000 + i;
+                        let key = s.heap.alloc_object(ClassId::new(0), 1);
+                        s.heap.set_field(key, 0, Value::Int(unique_key));
+                        let val = s.heap.alloc_object(ClassId::new(0), 1);
+                        s.heap.set_field(val, 0, Value::Int(unique_key));
+                        let cb = s
+                            .native_methods
+                            .find(
+                                "java/util/concurrent/ConcurrentHashMap",
+                                "put",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            )
+                            .unwrap();
+                        let mut ctx = NativeContextImpl {
+                            shared: &s,
+                            thread: &mut thread,
+                        };
+                        cb(
+                            &mut ctx,
+                            &[
+                                Value::Object(Some(chm)),
+                                Value::Object(Some(key)),
+                                Value::Object(Some(val)),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
         }
 
         let mut thread = JvmThread::new(ThreadId(0), "verifier");
-        let size = p86_chm_call(&shared, &mut thread,
-            chm_class, "size", "()I",
-            &[Value::Object(Some(chm))]).unwrap().unwrap();
-        assert_eq!(size.as_int().unwrap(), 100, "4 threads x 25 keys = 100 entries");
+        let size = p86_chm_call(
+            &shared,
+            &mut thread,
+            chm_class,
+            "size",
+            "()I",
+            &[Value::Object(Some(chm))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            size.as_int().unwrap(),
+            100,
+            "4 threads x 25 keys = 100 entries"
+        );
     }
 
     // =====================================================================
@@ -64363,11 +68446,15 @@ mod tests {
     fn m7_parse_aioobe_index_extracts_index() {
         use crate::runtime::interpreter::parse_aioobe_index;
         assert_eq!(
-            parse_aioobe_index("ArrayIndexOutOfBoundsException: index 5 out of bounds for length 3"),
+            parse_aioobe_index(
+                "ArrayIndexOutOfBoundsException: index 5 out of bounds for length 3"
+            ),
             5
         );
         assert_eq!(
-            parse_aioobe_index("ArrayIndexOutOfBoundsException: index -1 out of bounds for length 10"),
+            parse_aioobe_index(
+                "ArrayIndexOutOfBoundsException: index -1 out of bounds for length 10"
+            ),
             -1
         );
         assert_eq!(parse_aioobe_index("something else"), -1);
@@ -64414,8 +68501,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let payload: Box<dyn std::any::Any + Send> =
-            Box::new("some random JIT crash".to_string());
+        let payload: Box<dyn std::any::Any + Send> = Box::new("some random JIT crash".to_string());
         let err = jit_panic_to_exception(&shared, &mut thread, payload);
         match err {
             MethodCallFailed::InternalError(e) => {
@@ -64554,14 +68640,23 @@ mod tests {
         {
             let mut fr = shared.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_gc_event(
-                &mut fr, 1, "YoungGC", "Allocation Failure", 1000, 500,
+                &mut fr,
+                1,
+                "YoungGC",
+                "Allocation Failure",
+                1000,
+                500,
             );
         }
         let mut fr = shared.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
-        assert!(events.len() >= 1, "GC event should be recorded, got {}", events.len());
+        assert!(
+            events.len() >= 1,
+            "GC event should be recorded, got {}",
+            events.len()
+        );
     }
 
     #[test]
@@ -64577,14 +68672,23 @@ mod tests {
         {
             let mut fr = shared.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_class_load_event(
-                &mut fr, "java/lang/Object", "app", "app", 1000, 200,
+                &mut fr,
+                "java/lang/Object",
+                "app",
+                "app",
+                1000,
+                200,
             );
         }
         let mut fr = shared.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
-        assert!(events.len() >= 1, "ClassLoad event should be recorded, got {}", events.len());
+        assert!(
+            events.len() >= 1,
+            "ClassLoad event should be recorded, got {}",
+            events.len()
+        );
     }
 
     #[test]
@@ -64602,15 +68706,17 @@ mod tests {
             cratonvm_jfr::builtin::emit_thread_start_event(
                 &mut fr, "worker-1", "platform", 1, 1000,
             );
-            cratonvm_jfr::builtin::emit_thread_end_event(
-                &mut fr, "worker-1", 1, 2000,
-            );
+            cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 2000);
         }
         let mut fr = shared.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
-        assert!(events.len() >= 2, "ThreadStart + ThreadEnd events should be recorded, got {}", events.len());
+        assert!(
+            events.len() >= 2,
+            "ThreadStart + ThreadEnd events should be recorded, got {}",
+            events.len()
+        );
     }
 
     #[test]
@@ -64628,14 +68734,25 @@ mod tests {
             cratonvm_jfr::builtin::emit_compilation_event(
                 &mut fr,
                 "com/example/Main::main([Ljava/lang/String;)V",
-                1, 4, true, false, 0, 0, 1000, 500,
+                1,
+                4,
+                true,
+                false,
+                0,
+                0,
+                1000,
+                500,
             );
         }
         let mut fr = shared.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
-        assert!(events.len() >= 1, "Compilation event should be recorded, got {}", events.len());
+        assert!(
+            events.len() >= 1,
+            "Compilation event should be recorded, got {}",
+            events.len()
+        );
     }
 
     // ---------------------------------------------------------------
@@ -64675,7 +68792,8 @@ mod tests {
         let heap_before = shared.heap.allocated_bytes();
 
         let result = p90_call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "java/lang/management/ManagementFactory",
             "getMemoryMXBean",
             "()Ljava/lang/management/MemoryMXBean;",
@@ -64690,9 +68808,17 @@ mod tests {
             Value::Long(v) => v,
             other => panic!("expected Long heapUsed, got {:?}", other),
         };
-        assert!(heap_used > 0, "heapUsed should be positive from real heap, got {}", heap_used);
-        assert!(heap_used >= heap_before as i64,
-            "heapUsed ({}) should be >= pre-call heap ({})", heap_used, heap_before);
+        assert!(
+            heap_used > 0,
+            "heapUsed should be positive from real heap, got {}",
+            heap_used
+        );
+        assert!(
+            heap_used >= heap_before as i64,
+            "heapUsed ({}) should be >= pre-call heap ({})",
+            heap_used,
+            heap_before
+        );
     }
 
     #[test]
@@ -64706,7 +68832,8 @@ mod tests {
         let real_count = shared.thread_registry.alive_count();
 
         let result = p90_call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "java/lang/management/ManagementFactory",
             "getThreadMXBean",
             "()Ljava/lang/management/ThreadMXBean;",
@@ -64735,7 +68862,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let result = p90_call_native(
-            &shared, &mut thread,
+            &shared,
+            &mut thread,
             "java/lang/management/ManagementFactory",
             "getClassLoadingMXBean",
             "()Ljava/lang/management/ClassLoadingMXBean;",
@@ -64754,9 +68882,17 @@ mod tests {
         // (the MXBean reads it at allocation time via ctx.loaded_class_count())
         let current_loaded = shared.class_manager.read().loaded_count();
         // The count in the bean was captured at alloc time, which may be <= current
-        assert!(loaded_count >= 0, "loadedClassCount should be non-negative, got {}", loaded_count);
-        assert!(loaded_count as usize <= current_loaded,
-            "loadedClassCount ({}) should be <= current ({})", loaded_count, current_loaded);
+        assert!(
+            loaded_count >= 0,
+            "loadedClassCount should be non-negative, got {}",
+            loaded_count
+        );
+        assert!(
+            loaded_count as usize <= current_loaded,
+            "loadedClassCount ({}) should be <= current ({})",
+            loaded_count,
+            current_loaded
+        );
     }
 
     // =====================================================================
@@ -64780,7 +68916,10 @@ mod tests {
             &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("main"),
                 descriptor: Arc::from("()I"),
-                access_flags: cratonvm_reader::class_access_flags::MethodAccessFlags::from_bits_truncate(0x0009),
+                access_flags:
+                    cratonvm_reader::class_access_flags::MethodAccessFlags::from_bits_truncate(
+                        0x0009,
+                    ),
                 attributes: vec![cratonvm_reader::attribute::Attribute::Code(
                     cratonvm_reader::attribute::CodeAttribute {
                         max_stack: 1,
@@ -64793,10 +68932,7 @@ mod tests {
             }],
         );
 
-        let result = invoke_on_class_shared(
-            &shared, &mut thread, class_id,
-            "main", "()I", &[],
-        );
+        let result = invoke_on_class_shared(&shared, &mut thread, class_id, "main", "()I", &[]);
         assert!(result.is_ok(), "HelloBudget main() should succeed");
 
         let heap_bytes = shared.heap.allocated_bytes();
@@ -64854,7 +68990,10 @@ public class ArithTest {
         let desc = JtregTestDescriptor::parse("ArithTest.java", source);
         assert!(desc.is_test, "should detect @test");
         assert_eq!(desc.main_class.as_deref(), Some("ArithTest"));
-        assert_eq!(desc.summary.as_deref(), Some("Verify integer arithmetic correctness"));
+        assert_eq!(
+            desc.summary.as_deref(),
+            Some("Verify integer arithmetic correctness")
+        );
         assert!(!desc.compile_files.is_empty(), "should have compile files");
         assert!(desc.compile_files.iter().any(|f| f.contains("ArithTest")));
         assert!(desc.is_valid_test(), "should be a valid, non-ignored test");
@@ -64876,14 +69015,18 @@ public class SkippedTest {
         assert!(desc.is_test);
         assert!(desc.ignored, "should detect @ignore");
         assert!(!desc.is_valid_test(), "ignored test should not be valid");
-        assert!(desc.ignore_reason.as_deref().unwrap_or("").contains("JDK-1234567"));
+        assert!(desc
+            .ignore_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("JDK-1234567"));
     }
 
     #[test]
     fn p97_jtreg_runner_end_to_end_with_vm() {
         // End-to-end: create a JtregRunner, parse a test source, compile if
         // javac available, and run it on the actual VM.
-        use crate::runtime::tck::{JtregRunner, compare_output};
+        use crate::runtime::tck::{compare_output, JtregRunner};
 
         let test_dir = format!("{}/tests/resources", env!("CARGO_MANIFEST_DIR"));
         let runner = JtregRunner::new(&test_dir, &test_dir);
@@ -64907,21 +69050,21 @@ public class SkippedTest {
         }
 
         // Run a test method directly via our VM to verify integration works
-        let config = crate::config::VmConfig::new()
-            .with_classpath(vec![test_dir.clone()]);
+        let config = crate::config::VmConfig::new().with_classpath(vec![test_dir.clone()]);
         let mut vm = crate::vm::Vm::new(config);
         let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
-        assert!(result.is_ok(), "testMagicNumber should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "testMagicNumber should succeed: {:?}",
+            result
+        );
         match result.unwrap() {
             Some(Value::Int(1)) => {} // PASS
             other => panic!("testMagicNumber should return 1, got {:?}", other),
         }
 
         // Verify output comparison utility works
-        assert!(compare_output(
-            &["PASS".to_string()],
-            &["PASS".to_string()],
-        ));
+        assert!(compare_output(&["PASS".to_string()], &["PASS".to_string()],));
         assert!(!compare_output(
             &["PASS".to_string()],
             &["FAIL".to_string()],
@@ -64941,13 +69084,16 @@ public class SkippedTest {
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("cratonvm/TckClassFile", &[
-            ("testMagicNumber", 1),
-            ("testClassVersion", 1),
-            ("testConstantPool", 1),
-            ("testFieldAccess", 1),
-            ("testMethodAccess", 1),
-        ]);
+        let results = tck.run_class_tests(
+            "cratonvm/TckClassFile",
+            &[
+                ("testMagicNumber", 1),
+                ("testClassVersion", 1),
+                ("testConstantPool", 1),
+                ("testFieldAccess", 1),
+                ("testMethodAccess", 1),
+            ],
+        );
 
         let passed = results.iter().filter(|r| r.is_pass()).count();
         let total = results.len();
@@ -64956,7 +69102,9 @@ public class SkippedTest {
         assert!(
             passed >= 3,
             "Chapter 4 pass rate too low: {}/{} ({:.0}%)",
-            passed, total, (passed as f64 / total as f64) * 100.0
+            passed,
+            total,
+            (passed as f64 / total as f64) * 100.0
         );
     }
 
@@ -64971,13 +69119,16 @@ public class SkippedTest {
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("cratonvm/TckLoading", &[
-            ("testClassLoading", 1),
-            ("testStaticInit", 1),
-            ("testInterfaceInit", 1),
-            ("testArrayCreation", 1),
-            ("testInheritance", 1),
-        ]);
+        let results = tck.run_class_tests(
+            "cratonvm/TckLoading",
+            &[
+                ("testClassLoading", 1),
+                ("testStaticInit", 1),
+                ("testInterfaceInit", 1),
+                ("testArrayCreation", 1),
+                ("testInheritance", 1),
+            ],
+        );
 
         let passed = results.iter().filter(|r| r.is_pass()).count();
         let total = results.len();
@@ -64985,7 +69136,9 @@ public class SkippedTest {
         assert!(
             passed >= 3,
             "Chapter 5 pass rate too low: {}/{} ({:.0}%)",
-            passed, total, (passed as f64 / total as f64) * 100.0
+            passed,
+            total,
+            (passed as f64 / total as f64) * 100.0
         );
     }
 
@@ -65000,21 +69153,24 @@ public class SkippedTest {
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("cratonvm/TckInstructions", &[
-            ("testIntArithmetic", 1),
-            ("testLongArithmetic", 1),
-            ("testFloatArithmetic", 1),
-            ("testComparisons", 1),
-            ("testTableswitch", 1),
-            ("testLookupswitch", 1),
-            ("testFieldOps", 1),
-            ("testArrayOps", 1),
-            ("testInvokeVirtual", 1),
-            ("testInvokeStatic", 1),
-            ("testExceptionHandling", 1),
-            ("testCheckcast", 1),
-            ("testInstanceof", 1),
-        ]);
+        let results = tck.run_class_tests(
+            "cratonvm/TckInstructions",
+            &[
+                ("testIntArithmetic", 1),
+                ("testLongArithmetic", 1),
+                ("testFloatArithmetic", 1),
+                ("testComparisons", 1),
+                ("testTableswitch", 1),
+                ("testLookupswitch", 1),
+                ("testFieldOps", 1),
+                ("testArrayOps", 1),
+                ("testInvokeVirtual", 1),
+                ("testInvokeStatic", 1),
+                ("testExceptionHandling", 1),
+                ("testCheckcast", 1),
+                ("testInstanceof", 1),
+            ],
+        );
 
         let passed = results.iter().filter(|r| r.is_pass()).count();
         let total = results.len();
@@ -65022,7 +69178,9 @@ public class SkippedTest {
         assert!(
             passed >= 7,
             "Chapter 6 pass rate too low: {}/{} ({:.0}%)",
-            passed, total, (passed as f64 / total as f64) * 100.0
+            passed,
+            total,
+            (passed as f64 / total as f64) * 100.0
         );
     }
 
@@ -65074,8 +69232,16 @@ public class SkippedTest {
             "java/time/LocalDateTime",
             "of",
             "(IIIII)Ljava/time/LocalDateTime;",
-            &[Value::Int(2024), Value::Int(6), Value::Int(15), Value::Int(10), Value::Int(30)],
-        ).unwrap().unwrap();
+            &[
+                Value::Int(2024),
+                Value::Int(6),
+                Value::Int(15),
+                Value::Int(10),
+                Value::Int(30),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         // Create ZoneId for US/Eastern
         let zone_east = call_native(
@@ -65084,8 +69250,13 @@ public class SkippedTest {
             "java/time/ZoneId",
             "of",
             "(Ljava/lang/String;)Ljava/time/ZoneId;",
-            &[Value::Object(Some(create_java_string(&shared, "US/Eastern")))],
-        ).unwrap().unwrap();
+            &[Value::Object(Some(create_java_string(
+                &shared,
+                "US/Eastern",
+            )))],
+        )
+        .unwrap()
+        .unwrap();
 
         // Create ZonedDateTime
         let zdt = call_native(
@@ -65095,7 +69266,9 @@ public class SkippedTest {
             "of",
             "(Ljava/time/LocalDateTime;Ljava/time/ZoneId;)Ljava/time/ZonedDateTime;",
             &[ldt, zone_east],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Verify getHour returns 10
         let hour = call_native(
@@ -65105,7 +69278,9 @@ public class SkippedTest {
             "getHour",
             "()I",
             &[zdt],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hour, Value::Int(10));
 
         // Verify getYear returns 2024
@@ -65116,7 +69291,9 @@ public class SkippedTest {
             "getYear",
             "()I",
             &[zdt],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(year, Value::Int(2024));
     }
 
@@ -65133,7 +69310,9 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/Period;",
             &[Value::Int(1), Value::Int(2), Value::Int(3)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let _per_obj = match period {
             Value::Object(Some(r)) => r,
@@ -65141,11 +69320,38 @@ public class SkippedTest {
         };
 
         // Verify getYears=1, getMonths=2, getDays=3
-        let y = call_native(&shared, &mut thread, "java/time/Period", "getYears", "()I", &[period]).unwrap().unwrap();
+        let y = call_native(
+            &shared,
+            &mut thread,
+            "java/time/Period",
+            "getYears",
+            "()I",
+            &[period],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(y, Value::Int(1));
-        let m = call_native(&shared, &mut thread, "java/time/Period", "getMonths", "()I", &[period]).unwrap().unwrap();
+        let m = call_native(
+            &shared,
+            &mut thread,
+            "java/time/Period",
+            "getMonths",
+            "()I",
+            &[period],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(m, Value::Int(2));
-        let d = call_native(&shared, &mut thread, "java/time/Period", "getDays", "()I", &[period]).unwrap().unwrap();
+        let d = call_native(
+            &shared,
+            &mut thread,
+            "java/time/Period",
+            "getDays",
+            "()I",
+            &[period],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(d, Value::Int(3));
 
         // Period.addTo(LocalDate.of(2024, 1, 15)) РІвЂ вЂ™ 2025-03-18
@@ -65156,7 +69362,9 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/LocalDate;",
             &[Value::Int(2024), Value::Int(1), Value::Int(15)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let result = call_native(
             &shared,
@@ -65165,7 +69373,9 @@ public class SkippedTest {
             "addTo",
             "(Ljava/time/temporal/Temporal;)Ljava/time/temporal/Temporal;",
             &[period, date],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let result_obj = match result {
             Value::Object(Some(r)) => r,
@@ -65191,7 +69401,9 @@ public class SkippedTest {
             "ofPattern",
             "(Ljava/lang/String;)Ljava/time/format/DateTimeFormatter;",
             &[Value::Object(Some(pattern_str))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Create LocalDate(2024, 7, 4)
         let date = call_native(
@@ -65201,7 +69413,9 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/LocalDate;",
             &[Value::Int(2024), Value::Int(7), Value::Int(4)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Format
         let formatted = call_native(
@@ -65211,7 +69425,9 @@ public class SkippedTest {
             "format",
             "(Ljava/time/temporal/TemporalAccessor;)Ljava/lang/String;",
             &[formatter, date],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let fmt_str = match formatted {
             Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
             _ => panic!("expected string"),
@@ -65227,7 +69443,9 @@ public class SkippedTest {
             "parse",
             "(Ljava/lang/CharSequence;)Ljava/time/temporal/TemporalAccessor;",
             &[formatter, Value::Object(Some(parse_input))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let parsed_obj = match parsed {
             Value::Object(Some(r)) => r,
             _ => panic!("expected parsed object"),
@@ -65251,7 +69469,9 @@ public class SkippedTest {
             "ofPattern",
             "(Ljava/lang/String;)Ljava/time/format/DateTimeFormatter;",
             &[Value::Object(Some(pattern_str))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let input = create_java_string(&shared, "2024-12-25T14:30:45");
         let parsed = call_native(
@@ -65261,8 +69481,13 @@ public class SkippedTest {
             "parse",
             "(Ljava/lang/CharSequence;)Ljava/time/temporal/TemporalAccessor;",
             &[formatter, Value::Object(Some(input))],
-        ).unwrap().unwrap();
-        let obj = match parsed { Value::Object(Some(r)) => r, _ => panic!("expected object") };
+        )
+        .unwrap()
+        .unwrap();
+        let obj = match parsed {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected object"),
+        };
         assert_eq!(shared.heap.get_field(obj, 0).as_int().unwrap(), 2024);
         assert_eq!(shared.heap.get_field(obj, 1).as_int().unwrap(), 12);
         assert_eq!(shared.heap.get_field(obj, 2).as_int().unwrap(), 25);
@@ -65284,8 +69509,13 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/LocalDate;",
             &[Value::Int(2024), Value::Int(2), Value::Int(29)],
-        ).unwrap().unwrap();
-        let date_obj = match date { Value::Object(Some(r)) => r, _ => panic!("expected date") };
+        )
+        .unwrap()
+        .unwrap();
+        let date_obj = match date {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected date"),
+        };
         assert_eq!(shared.heap.get_field(date_obj, 2).as_int().unwrap(), 29);
 
         // isLeapYear(2024) should be true
@@ -65296,7 +69526,9 @@ public class SkippedTest {
             "isLeapYear",
             "()Z",
             &[date],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(is_leap, Value::Int(1));
 
         // isLeapYear(2023) should be false
@@ -65307,7 +69539,9 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/LocalDate;",
             &[Value::Int(2023), Value::Int(1), Value::Int(1)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let is_not_leap = call_native(
             &shared,
             &mut thread,
@@ -65315,7 +69549,9 @@ public class SkippedTest {
             "isLeapYear",
             "()Z",
             &[date2023],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(is_not_leap, Value::Int(0));
     }
 
@@ -65332,7 +69568,9 @@ public class SkippedTest {
             "of",
             "(III)Ljava/time/LocalDate;",
             &[Value::Int(2024), Value::Int(3), Value::Int(15)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Get firstDayOfMonth adjuster
         let adj = call_native(
@@ -65342,7 +69580,9 @@ public class SkippedTest {
             "firstDayOfMonth",
             "()Ljava/time/temporal/TemporalAdjuster;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Apply: date.with(firstDayOfMonth) РІвЂ вЂ™ 2024-03-01
         let first = call_native(
@@ -65352,8 +69592,13 @@ public class SkippedTest {
             "with",
             "(Ljava/time/temporal/TemporalAdjuster;)Ljava/time/LocalDate;",
             &[date, adj],
-        ).unwrap().unwrap();
-        let first_obj = match first { Value::Object(Some(r)) => r, _ => panic!("expected date") };
+        )
+        .unwrap()
+        .unwrap();
+        let first_obj = match first {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected date"),
+        };
         assert_eq!(shared.heap.get_field(first_obj, 0).as_int().unwrap(), 2024);
         assert_eq!(shared.heap.get_field(first_obj, 1).as_int().unwrap(), 3);
         assert_eq!(shared.heap.get_field(first_obj, 2).as_int().unwrap(), 1);
@@ -65366,7 +69611,9 @@ public class SkippedTest {
             "lastDayOfMonth",
             "()Ljava/time/temporal/TemporalAdjuster;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Apply: date.with(lastDayOfMonth) РІвЂ вЂ™ 2024-03-31
         let last = call_native(
@@ -65376,8 +69623,13 @@ public class SkippedTest {
             "with",
             "(Ljava/time/temporal/TemporalAdjuster;)Ljava/time/LocalDate;",
             &[date, adj2],
-        ).unwrap().unwrap();
-        let last_obj = match last { Value::Object(Some(r)) => r, _ => panic!("expected date") };
+        )
+        .unwrap()
+        .unwrap();
+        let last_obj = match last {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected date"),
+        };
         assert_eq!(shared.heap.get_field(last_obj, 2).as_int().unwrap(), 31);
     }
 
@@ -65392,27 +69644,43 @@ public class SkippedTest {
         let a_obj = shared.heap.alloc_object(ClassId::new(0), 2);
         let a_str = create_java_string(&shared, "12345678901234567890");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(a_obj)), Value::Object(Some(a_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create BigInteger("98765432109876543210")
         let b_obj = shared.heap.alloc_object(ClassId::new(0), 2);
         let b_str = create_java_string(&shared, "98765432109876543210");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(b_obj)), Value::Object(Some(b_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // add
         let sum = call_native(
-            &shared, &mut thread,
-            "java/math/BigInteger", "add", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "add",
+            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
             &[Value::Object(Some(a_obj)), Value::Object(Some(b_obj))],
-        ).unwrap().unwrap();
-        let sum_ref = match sum { Value::Object(Some(r)) => r, _ => panic!("expected object") };
+        )
+        .unwrap()
+        .unwrap();
+        let sum_ref = match sum {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected object"),
+        };
         let sum_str_val = shared.heap.get_field(sum_ref, 0);
         let sum_str = match sum_str_val {
             Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
@@ -65428,21 +69696,39 @@ public class SkippedTest {
 
         // Very large: 10^50
         let big = shared.heap.alloc_object(ClassId::new(0), 2);
-        let big_str = create_java_string(&shared, "100000000000000000000000000000000000000000000000000");
+        let big_str = create_java_string(
+            &shared,
+            "100000000000000000000000000000000000000000000000000",
+        );
         call_native(
-            &shared, &mut thread,
-            "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(big)), Value::Object(Some(big_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // toString should return same
         let ts = call_native(
-            &shared, &mut thread,
-            "java/math/BigInteger", "toString", "()Ljava/lang/String;",
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "toString",
+            "()Ljava/lang/String;",
             &[Value::Object(Some(big))],
-        ).unwrap().unwrap();
-        let ts_str = match ts { Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(), _ => panic!() };
-        assert_eq!(ts_str, "100000000000000000000000000000000000000000000000000");
+        )
+        .unwrap()
+        .unwrap();
+        let ts_str = match ts {
+            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(
+            ts_str,
+            "100000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -65454,35 +69740,59 @@ public class SkippedTest {
         let a_obj = shared.heap.alloc_object(ClassId::new(0), 3);
         let a_str = create_java_string(&shared, "10");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(a_obj)), Value::Object(Some(a_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create BigDecimal("3")
         let b_obj = shared.heap.alloc_object(ClassId::new(0), 3);
         let b_str = create_java_string(&shared, "3");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(b_obj)), Value::Object(Some(b_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         // divide(b, 2, HALF_UP=4) РІР‚вЂќ 10/3 = 3.33 (scale=2)
         let result = call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "divide",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "divide",
             "(Ljava/math/BigDecimal;II)Ljava/math/BigDecimal;",
-            &[Value::Object(Some(a_obj)), Value::Object(Some(b_obj)), Value::Int(2), Value::Int(4)],
-        ).unwrap().unwrap();
-        let r_ref = match result { Value::Object(Some(r)) => r, _ => panic!("expected object") };
+            &[
+                Value::Object(Some(a_obj)),
+                Value::Object(Some(b_obj)),
+                Value::Int(2),
+                Value::Int(4),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let r_ref = match result {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected object"),
+        };
         let r_val = match shared.heap.get_field(r_ref, 0) {
             Value::Object(Some(s)) => read_java_string(&shared.heap, s).unwrap(),
             _ => panic!("expected string"),
         };
         // Result should be "3.33" or similar rounded value
         let dv: f64 = r_val.parse().unwrap_or(0.0);
-        assert!((dv - 3.33).abs() < 0.01, "10/3 with scale=2 should be ~3.33, got {}", r_val);
+        assert!(
+            (dv - 3.33).abs() < 0.01,
+            "10/3 with scale=2 should be ~3.33, got {}",
+            r_val
+        );
     }
 
     #[test]
@@ -65493,25 +69803,37 @@ public class SkippedTest {
         let a = shared.heap.alloc_object(ClassId::new(0), 3);
         let a_str = create_java_string(&shared, "3.14");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(a)), Value::Object(Some(a_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let b = shared.heap.alloc_object(ClassId::new(0), 3);
         let b_str = create_java_string(&shared, "2.71");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(b)), Value::Object(Some(b_str))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let cmp = call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "compareTo",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "compareTo",
             "(Ljava/math/BigDecimal;)I",
             &[Value::Object(Some(a)), Value::Object(Some(b))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         // 3.14 > 2.71 РІвЂ вЂ™ positive
         assert!(matches!(cmp, Value::Int(v) if v > 0), "3.14 > 2.71");
     }
@@ -65524,17 +69846,29 @@ public class SkippedTest {
         let obj = shared.heap.alloc_object(ClassId::new(0), 3);
         let s = create_java_string(&shared, "3.14159");
         call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "<init>", "(Ljava/lang/String;)V",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(obj)), Value::Object(Some(s))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let ts = call_native(
-            &shared, &mut thread,
-            "java/math/BigDecimal", "toString", "()Ljava/lang/String;",
+            &shared,
+            &mut thread,
+            "java/math/BigDecimal",
+            "toString",
+            "()Ljava/lang/String;",
             &[Value::Object(Some(obj))],
-        ).unwrap().unwrap();
-        let ts_str = match ts { Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(), _ => panic!() };
+        )
+        .unwrap()
+        .unwrap();
+        let ts_str = match ts {
+            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            _ => panic!(),
+        };
         assert_eq!(ts_str, "3.14159");
     }
 
@@ -65546,18 +69880,42 @@ public class SkippedTest {
         // gcd(12, 8) = 4
         let a = shared.heap.alloc_object(ClassId::new(0), 2);
         let a_s = create_java_string(&shared, "12");
-        call_native(&shared, &mut thread, "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
-            &[Value::Object(Some(a)), Value::Object(Some(a_s))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(a)), Value::Object(Some(a_s))],
+        )
+        .unwrap();
 
         let b = shared.heap.alloc_object(ClassId::new(0), 2);
         let b_s = create_java_string(&shared, "8");
-        call_native(&shared, &mut thread, "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
-            &[Value::Object(Some(b)), Value::Object(Some(b_s))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(b)), Value::Object(Some(b_s))],
+        )
+        .unwrap();
 
-        let gcd = call_native(&shared, &mut thread, "java/math/BigInteger", "gcd",
+        let gcd = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "gcd",
             "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            &[Value::Object(Some(a)), Value::Object(Some(b))]).unwrap().unwrap();
-        let gcd_ref = match gcd { Value::Object(Some(r)) => r, _ => panic!("expected object") };
+            &[Value::Object(Some(a)), Value::Object(Some(b))],
+        )
+        .unwrap()
+        .unwrap();
+        let gcd_ref = match gcd {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected object"),
+        };
         let gcd_str = match shared.heap.get_field(gcd_ref, 0) {
             Value::Object(Some(s)) => read_java_string(&shared.heap, s).unwrap(),
             _ => panic!(),
@@ -65567,10 +69925,25 @@ public class SkippedTest {
         // isProbablePrime(7) РІвЂ вЂ™ true
         let seven = shared.heap.alloc_object(ClassId::new(0), 2);
         let seven_s = create_java_string(&shared, "7");
-        call_native(&shared, &mut thread, "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
-            &[Value::Object(Some(seven)), Value::Object(Some(seven_s))]).unwrap();
-        let prime = call_native(&shared, &mut thread, "java/math/BigInteger", "isProbablePrime", "(I)Z",
-            &[Value::Object(Some(seven)), Value::Int(10)]).unwrap().unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(seven)), Value::Object(Some(seven_s))],
+        )
+        .unwrap();
+        let prime = call_native(
+            &shared,
+            &mut thread,
+            "java/math/BigInteger",
+            "isProbablePrime",
+            "(I)Z",
+            &[Value::Object(Some(seven)), Value::Int(10)],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(prime, Value::Int(1), "7 should be prime");
     }
 
@@ -65583,19 +69956,35 @@ public class SkippedTest {
 
         // Locale.getDefault()
         let locale = call_native(
-            &shared, &mut thread,
-            "java/util/Locale", "getDefault", "()Ljava/util/Locale;",
+            &shared,
+            &mut thread,
+            "java/util/Locale",
+            "getDefault",
+            "()Ljava/util/Locale;",
             &[],
-        ).unwrap().unwrap();
-        let _loc_ref = match locale { Value::Object(Some(r)) => r, _ => panic!("expected locale") };
+        )
+        .unwrap()
+        .unwrap();
+        let _loc_ref = match locale {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected locale"),
+        };
 
         // toString should return "en_US" or similar
         let ts = call_native(
-            &shared, &mut thread,
-            "java/util/Locale", "toString", "()Ljava/lang/String;",
+            &shared,
+            &mut thread,
+            "java/util/Locale",
+            "toString",
+            "()Ljava/lang/String;",
             &[locale],
-        ).unwrap().unwrap();
-        let ts_str = match ts { Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(), _ => panic!() };
+        )
+        .unwrap()
+        .unwrap();
+        let ts_str = match ts {
+            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            _ => panic!(),
+        };
         // Default locale should have a language at minimum
         assert!(!ts_str.is_empty(), "Locale.toString() should not be empty");
     }
@@ -65607,21 +69996,42 @@ public class SkippedTest {
 
         // NumberFormat.getInstance()
         let nf = call_native(
-            &shared, &mut thread,
-            "java/text/NumberFormat", "getInstance", "()Ljava/text/NumberFormat;",
+            &shared,
+            &mut thread,
+            "java/text/NumberFormat",
+            "getInstance",
+            "()Ljava/text/NumberFormat;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Format 1234567.89
         let formatted = call_native(
-            &shared, &mut thread,
-            "java/text/DecimalFormat", "format", "(D)Ljava/lang/String;",
+            &shared,
+            &mut thread,
+            "java/text/DecimalFormat",
+            "format",
+            "(D)Ljava/lang/String;",
             &[nf, Value::Double(1234567.89)],
-        ).unwrap().unwrap();
-        let fmt_str = match formatted { Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(), _ => panic!() };
+        )
+        .unwrap()
+        .unwrap();
+        let fmt_str = match formatted {
+            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            _ => panic!(),
+        };
         // Should contain grouping separators
-        assert!(fmt_str.contains(','), "formatted number should contain grouping separator, got: {}", fmt_str);
-        assert!(fmt_str.contains("1,234,567"), "should format with commas, got: {}", fmt_str);
+        assert!(
+            fmt_str.contains(','),
+            "formatted number should contain grouping separator, got: {}",
+            fmt_str
+        );
+        assert!(
+            fmt_str.contains("1,234,567"),
+            "should format with commas, got: {}",
+            fmt_str
+        );
     }
 
     #[test]
@@ -65631,23 +70041,40 @@ public class SkippedTest {
 
         // NumberFormat.getInstance()
         let nf = call_native(
-            &shared, &mut thread,
-            "java/text/NumberFormat", "getInstance", "()Ljava/text/NumberFormat;",
+            &shared,
+            &mut thread,
+            "java/text/NumberFormat",
+            "getInstance",
+            "()Ljava/text/NumberFormat;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Parse "1,234,567.89"
         let input = create_java_string(&shared, "1,234,567.89");
         let parsed = call_native(
-            &shared, &mut thread,
-            "java/text/NumberFormat", "parse", "(Ljava/lang/String;)Ljava/lang/Number;",
+            &shared,
+            &mut thread,
+            "java/text/NumberFormat",
+            "parse",
+            "(Ljava/lang/String;)Ljava/lang/Number;",
             &[nf, Value::Object(Some(input))],
-        ).unwrap().unwrap();
-        let parsed_ref = match parsed { Value::Object(Some(r)) => r, _ => panic!("expected number") };
+        )
+        .unwrap()
+        .unwrap();
+        let parsed_ref = match parsed {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected number"),
+        };
         // Should parse to Double(1234567.89)
         let val = shared.heap.get_field(parsed_ref, 0);
         match val {
-            Value::Double(d) => assert!((d - 1234567.89).abs() < 0.01, "parsed value should be ~1234567.89, got {}", d),
+            Value::Double(d) => assert!(
+                (d - 1234567.89).abs() < 0.01,
+                "parsed value should be ~1234567.89, got {}",
+                d
+            ),
             _ => panic!("expected double, got {:?}", val),
         }
     }
@@ -65667,22 +70094,39 @@ public class SkippedTest {
         // Create suppressed exception
         let suppressed = shared.heap.alloc_object(ClassId::new(0), 3);
         let smsg = create_java_string(&shared, "close failed");
-        shared.heap.set_field(suppressed, 0, Value::Object(Some(smsg)));
+        shared
+            .heap
+            .set_field(suppressed, 0, Value::Object(Some(smsg)));
 
         // addSuppressed
         call_native(
-            &shared, &mut thread,
-            "java/lang/Throwable", "addSuppressed", "(Ljava/lang/Throwable;)V",
-            &[Value::Object(Some(primary)), Value::Object(Some(suppressed))],
-        ).unwrap();
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "addSuppressed",
+            "(Ljava/lang/Throwable;)V",
+            &[
+                Value::Object(Some(primary)),
+                Value::Object(Some(suppressed)),
+            ],
+        )
+        .unwrap();
 
         // getSuppressed РІР‚вЂќ should return array of length 1
         let arr = call_native(
-            &shared, &mut thread,
-            "java/lang/Throwable", "getSuppressed", "()[Ljava/lang/Throwable;",
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "getSuppressed",
+            "()[Ljava/lang/Throwable;",
             &[Value::Object(Some(primary))],
-        ).unwrap().unwrap();
-        let arr_ref = match arr { Value::Object(Some(r)) => r, _ => panic!("expected array") };
+        )
+        .unwrap()
+        .unwrap();
+        let arr_ref = match arr {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected array"),
+        };
         let elem = shared.heap.get_array_element(arr_ref, 0).unwrap();
         assert!(matches!(elem, Value::Object(Some(r)) if r == suppressed));
     }
@@ -65695,11 +70139,19 @@ public class SkippedTest {
         // Exception with no suppressions РІвЂ вЂ™ empty array
         let exc = shared.heap.alloc_object(ClassId::new(0), 3);
         let arr = call_native(
-            &shared, &mut thread,
-            "java/lang/Throwable", "getSuppressed", "()[Ljava/lang/Throwable;",
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "getSuppressed",
+            "()[Ljava/lang/Throwable;",
             &[Value::Object(Some(exc))],
-        ).unwrap().unwrap();
-        let arr_ref = match arr { Value::Object(Some(r)) => r, _ => panic!("expected array") };
+        )
+        .unwrap()
+        .unwrap();
+        let arr_ref = match arr {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected array"),
+        };
         let len = shared.heap.array_length(arr_ref);
         assert_eq!(len, 0, "no suppressions should give empty array");
     }
@@ -65714,14 +70166,39 @@ public class SkippedTest {
         let s1 = shared.heap.alloc_object(ClassId::new(0), 3);
         let s2 = shared.heap.alloc_object(ClassId::new(0), 3);
 
-        call_native(&shared, &mut thread, "java/lang/Throwable", "addSuppressed", "(Ljava/lang/Throwable;)V",
-            &[Value::Object(Some(primary)), Value::Object(Some(s1))]).unwrap();
-        call_native(&shared, &mut thread, "java/lang/Throwable", "addSuppressed", "(Ljava/lang/Throwable;)V",
-            &[Value::Object(Some(primary)), Value::Object(Some(s2))]).unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "addSuppressed",
+            "(Ljava/lang/Throwable;)V",
+            &[Value::Object(Some(primary)), Value::Object(Some(s1))],
+        )
+        .unwrap();
+        call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "addSuppressed",
+            "(Ljava/lang/Throwable;)V",
+            &[Value::Object(Some(primary)), Value::Object(Some(s2))],
+        )
+        .unwrap();
 
-        let arr = call_native(&shared, &mut thread, "java/lang/Throwable", "getSuppressed", "()[Ljava/lang/Throwable;",
-            &[Value::Object(Some(primary))]).unwrap().unwrap();
-        let arr_ref = match arr { Value::Object(Some(r)) => r, _ => panic!("expected array") };
+        let arr = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Throwable",
+            "getSuppressed",
+            "()[Ljava/lang/Throwable;",
+            &[Value::Object(Some(primary))],
+        )
+        .unwrap()
+        .unwrap();
+        let arr_ref = match arr {
+            Value::Object(Some(r)) => r,
+            _ => panic!("expected array"),
+        };
         let len = shared.heap.array_length(arr_ref);
         assert_eq!(len, 2, "should have 2 suppressed exceptions");
         let e0 = shared.heap.get_array_element(arr_ref, 0).unwrap();
@@ -65740,17 +70217,27 @@ public class SkippedTest {
         // Create stream of strings: ["a", "bb", "cc", "ddd", "ee"]
         // Classifier: String::length РІвЂ вЂ™ groups by length
         let words = ["a", "bb", "cc", "ddd", "ee"];
-        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, words.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Reference,
+            words.len(),
+        );
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
-            let _ = shared.heap.set_array_element(arr, i, Value::Object(Some(s)));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Object(Some(s)));
         }
         let stream = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Stream", "of",
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "of",
             "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
             &[Value::Object(Some(arr))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Create classifier: String.length() via lambda proxy
         let classifier = make_lambda_proxy(
@@ -65768,11 +70255,15 @@ public class SkippedTest {
 
         // Create downstream: Collectors.counting()
         let counting = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Collectors", "counting",
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "counting",
             "()Ljava/util/stream/Collector;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Create groupingBy(classifier, counting)
         let collector = call_native(
@@ -65784,14 +70275,21 @@ public class SkippedTest {
 
         // Collect
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Stream", "collect",
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
             "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
             &[stream, collector],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Result should be a Map РІР‚вЂќ verify it's not null
-        assert!(matches!(result, Value::Object(Some(_))), "groupingBy should return a Map");
+        assert!(
+            matches!(result, Value::Object(Some(_))),
+            "groupingBy should return a Map"
+        );
     }
 
     #[test]
@@ -65801,18 +70299,28 @@ public class SkippedTest {
 
         // Stream of integers: [1, 2, 3, 4, 5]
         let nums: Vec<i32> = vec![1, 2, 3, 4, 5];
-        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, nums.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Reference,
+            nums.len(),
+        );
         for (i, n) in nums.iter().enumerate() {
             let boxed = shared.heap.alloc_object(ClassId::new(0), 1);
             shared.heap.set_field(boxed, 0, Value::Int(*n));
-            let _ = shared.heap.set_array_element(arr, i, Value::Object(Some(boxed)));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Object(Some(boxed)));
         }
         let _stream = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Stream", "of",
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "of",
             "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
             &[Value::Object(Some(arr))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Create predicate: n -> n > 3 via isPositive proxy (we use a simple approach)
         // Actually, for partitioningBy we need a Predicate. Let's create one that tests > 0
@@ -65835,12 +70343,19 @@ public class SkippedTest {
 
         // Just test that partitioningBy returns a valid Collector
         let collector = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Collectors", "partitioningBy",
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "partitioningBy",
             "(Ljava/util/function/Predicate;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(predicate))],
-        ).unwrap().unwrap();
-        assert!(matches!(collector, Value::Object(Some(_))), "partitioningBy should return Collector");
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(collector, Value::Object(Some(_))),
+            "partitioningBy should return Collector"
+        );
     }
 
     #[test]
@@ -65850,17 +70365,27 @@ public class SkippedTest {
 
         // Stream of ["apple", "ant", "banana", "bat"]
         let words = ["apple", "ant", "banana", "bat"];
-        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, words.len());
+        let arr = shared.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Reference,
+            words.len(),
+        );
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
-            let _ = shared.heap.set_array_element(arr, i, Value::Object(Some(s)));
+            let _ = shared
+                .heap
+                .set_array_element(arr, i, Value::Object(Some(s)));
         }
         let stream = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Stream", "of",
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "of",
             "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
             &[Value::Object(Some(arr))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Simple groupingBy (no downstream, defaults to toList)
         // Classifier: first letter РІР‚вЂќ we use String.length for simplicity
@@ -65878,21 +70403,32 @@ public class SkippedTest {
         );
 
         let collector = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Collectors", "groupingBy",
+            &shared,
+            &mut thread,
+            "java/util/stream/Collectors",
+            "groupingBy",
             "(Ljava/util/function/Function;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(classifier))],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         let result = call_native(
-            &shared, &mut thread,
-            "java/util/stream/Stream", "collect",
+            &shared,
+            &mut thread,
+            "java/util/stream/Stream",
+            "collect",
             "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
             &[stream, collector],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
 
         // Should get a Map with groups by string length
-        assert!(matches!(result, Value::Object(Some(_))), "groupingBy(toList) should return a Map");
+        assert!(
+            matches!(result, Value::Object(Some(_))),
+            "groupingBy(toList) should return a Map"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -65909,13 +70445,19 @@ public class SkippedTest {
         // Use the generator directly (dump_cds_archive delegates to this in production)
         let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
         gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-            "java/lang/StringBuilder", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
+            "java/lang/StringBuilder",
+            0,
+            vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
         ));
         gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-            "java/lang/Integer", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
+            "java/lang/Integer",
+            0,
+            vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
         ));
         gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-            "java/util/ArrayList", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
+            "java/util/ArrayList",
+            0,
+            vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
         ));
         assert_eq!(gen.entry_count(), 3, "Should have 3 entries to dump");
         gen.write_archive().expect("CDS dump should succeed");
@@ -65929,7 +70471,10 @@ public class SkippedTest {
 
         // Verify we can round-trip load it
         let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
-        assert!(loader.try_load(), "Should be able to load the dumped archive");
+        assert!(
+            loader.try_load(),
+            "Should be able to load the dumped archive"
+        );
         assert_eq!(loader.classes_loaded(), 3, "Should load all 3 classes");
 
         // Cleanup
@@ -65946,10 +70491,14 @@ public class SkippedTest {
         {
             let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "test/Alpha", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
+                "test/Alpha",
+                0,
+                vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
             ));
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "test/Beta", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
+                "test/Beta",
+                0,
+                vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
             ));
             gen.write_archive().expect("write should succeed");
         }
@@ -65960,9 +70509,18 @@ public class SkippedTest {
         assert_eq!(loader.classes_loaded(), 2);
 
         // Verify both classes are cached
-        assert!(loader.find_class_bytes("test/Alpha").is_some(), "Alpha should be cached");
-        assert!(loader.find_class_bytes("test/Beta").is_some(), "Beta should be cached");
-        assert!(loader.find_class_bytes("test/Gamma").is_none(), "Gamma should not be cached");
+        assert!(
+            loader.find_class_bytes("test/Alpha").is_some(),
+            "Alpha should be cached"
+        );
+        assert!(
+            loader.find_class_bytes("test/Beta").is_some(),
+            "Beta should be cached"
+        );
+        assert!(
+            loader.find_class_bytes("test/Gamma").is_none(),
+            "Gamma should not be cached"
+        );
 
         // Verify byte content
         let alpha_bytes = loader.find_class_bytes("test/Alpha").unwrap();
@@ -65982,7 +70540,9 @@ public class SkippedTest {
         {
             let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "test/Foo", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
+                "test/Foo",
+                0,
+                vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
             ));
             gen.write_archive().expect("write should succeed");
         }
@@ -66017,7 +70577,9 @@ public class SkippedTest {
         {
             let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "test/CdsLoaded", 0, fake_bytes.clone(),
+                "test/CdsLoaded",
+                0,
+                fake_bytes.clone(),
             ));
             gen.write_archive().expect("write should succeed");
         }
@@ -66058,10 +70620,14 @@ public class SkippedTest {
         {
             let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "java/lang/StringBuilder", 0, sb_bytes.clone(),
+                "java/lang/StringBuilder",
+                0,
+                sb_bytes.clone(),
             ));
             gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                "java/lang/Integer", 0, int_bytes.clone(),
+                "java/lang/Integer",
+                0,
+                int_bytes.clone(),
             ));
             gen.write_archive().expect("dump should succeed");
         }
@@ -66072,11 +70638,19 @@ public class SkippedTest {
 
         let loaded_sb = loader.find_class_bytes("java/lang/StringBuilder");
         assert!(loaded_sb.is_some(), "StringBuilder should be in archive");
-        assert_eq!(loaded_sb.unwrap(), sb_bytes.as_slice(), "StringBuilder bytes should be identical");
+        assert_eq!(
+            loaded_sb.unwrap(),
+            sb_bytes.as_slice(),
+            "StringBuilder bytes should be identical"
+        );
 
         let loaded_int = loader.find_class_bytes("java/lang/Integer");
         assert!(loaded_int.is_some(), "Integer should be in archive");
-        assert_eq!(loaded_int.unwrap(), int_bytes.as_slice(), "Integer bytes should be identical");
+        assert_eq!(
+            loaded_int.unwrap(),
+            int_bytes.as_slice(),
+            "Integer bytes should be identical"
+        );
 
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -66092,7 +70666,9 @@ public class SkippedTest {
             let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             for i in 0..50 {
                 gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
-                    format!("bench/Class{}", i), 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, i as u8],
+                    format!("bench/Class{}", i),
+                    0,
+                    vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, i as u8],
                 ));
             }
             gen.write_archive().expect("write should succeed");
@@ -66106,13 +70682,18 @@ public class SkippedTest {
 
         // Verify all 50 classes loaded
         assert_eq!(loader.classes_loaded(), 50);
-        assert!(loader.load_time_ms() < 5000, "Loading 50 entries should take < 5s");
+        assert!(
+            loader.load_time_ms() < 5000,
+            "Loading 50 entries should take < 5s"
+        );
 
         // The load time should be measurable (> 0)
         // On fast systems it might be 0ms, so just verify it didn't take absurdly long
         eprintln!(
             "[cds_startup_time] Loaded {} classes in {:?} (reported {}ms)",
-            loader.classes_loaded(), load_duration, loader.load_time_ms()
+            loader.classes_loaded(),
+            load_duration,
+            loader.load_time_ms()
         );
 
         let _ = std::fs::remove_file(&tmp_path);
@@ -66140,7 +70721,10 @@ public class SkippedTest {
         // Phase 3: full update after first resolution
         mic.update(10, "java/lang/String", 0xABCD0000, true);
         assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 10);
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("java/lang/String"));
+        assert_eq!(
+            mic.cached_class_name.lock().as_deref(),
+            Some("java/lang/String")
+        );
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0xABCD0000);
         assert!(mic.cached_needs_context.load(Ordering::Relaxed));
     }
@@ -66153,7 +70737,9 @@ public class SkippedTest {
         mic.prepopulate(5);
 
         // Simulate 50 monomorphic dispatches (all hits to class 5)
-        for _ in 0..50 { mic.record_hit(); }
+        for _ in 0..50 {
+            mic.record_hit();
+        }
         assert_eq!(mic.hit_rate_pct(), 100);
         assert!(mic.is_monomorphic());
         assert!(!mic.is_megamorphic());
@@ -66165,8 +70751,12 @@ public class SkippedTest {
 
         let mic = JitMICSlot::new();
         // Simulate dispatches to many different receiver types
-        for _ in 0..5 { mic.record_hit(); }
-        for _ in 0..25 { mic.record_miss(); }
+        for _ in 0..5 {
+            mic.record_hit();
+        }
+        for _ in 0..25 {
+            mic.record_miss();
+        }
         assert!(mic.is_megamorphic());
         assert!(!mic.is_monomorphic());
     }
@@ -66226,17 +70816,23 @@ public class SkippedTest {
         for _ in 0..4 {
             let m = mic.clone();
             handles.push(std::thread::spawn(move || {
-                for _ in 0..250 { m.record_hit(); }
+                for _ in 0..250 {
+                    m.record_hit();
+                }
             }));
         }
         // 1 thread doing misses (different class)
         {
             let m = mic.clone();
             handles.push(std::thread::spawn(move || {
-                for _ in 0..50 { m.record_miss(); }
+                for _ in 0..50 {
+                    m.record_miss();
+                }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
 
         assert_eq!(mic.total_observations(), 1050);
         // Mostly monomorphic: 1000 hits vs 50 misses РІвЂ вЂ™ ~95% hit rate
@@ -66250,8 +70846,12 @@ public class SkippedTest {
 
         let mic = JitMICSlot::new();
         // 60% hits, 40% misses РІР‚вЂќ not mono (< 90%), not mega (> 50%)
-        for _ in 0..15 { mic.record_hit(); }
-        for _ in 0..10 { mic.record_miss(); }
+        for _ in 0..15 {
+            mic.record_hit();
+        }
+        for _ in 0..10 {
+            mic.record_miss();
+        }
         assert!(!mic.is_monomorphic());
         assert!(!mic.is_megamorphic());
     }
@@ -66302,7 +70902,10 @@ public class SkippedTest {
         // Full update with the same class_id
         mic.update(99, "FullyResolved", 0xBEEF, true);
         assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 99);
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("FullyResolved"));
+        assert_eq!(
+            mic.cached_class_name.lock().as_deref(),
+            Some("FullyResolved")
+        );
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0xBEEF);
     }
 
@@ -66318,8 +70921,9 @@ public class SkippedTest {
         let mut code = Vec::new();
         code.push(0x1A); // iload_0 @ PC 0
         code.push(0xAA); // tableswitch @ PC 1
-        // Pad to 4-byte align (PC 4)
-        code.push(0); code.push(0);
+                         // Pad to 4-byte align (PC 4)
+        code.push(0);
+        code.push(0);
         // Now at PC 4, aligned
         // default offset: points to default body
         // switch_data: default(4) + low(4) + high(4) + 3*4 = 24 bytes, body starts at PC 4+24=28
@@ -66329,7 +70933,7 @@ public class SkippedTest {
         code.extend_from_slice(&default_off);
         code.extend_from_slice(&0i32.to_be_bytes()); // low=0
         code.extend_from_slice(&2i32.to_be_bytes()); // high=2
-        // Offsets for case 0,1,2 РІвЂ вЂ™ body at PC 28, 32, 36
+                                                     // Offsets for case 0,1,2 РІвЂ вЂ™ body at PC 28, 32, 36
         for i in 0..3 {
             let off = ((28 + i * 4) as i32 - 1).to_be_bytes();
             code.extend_from_slice(&off);
@@ -66346,10 +70950,13 @@ public class SkippedTest {
         code.push(0xAC);
 
         let code_len = code.len();
-        code.push(0); code.push(0); // padding
+        code.push(0);
+        code.push(0); // padding
 
         // Verify it scans as compatible
-        assert!(cratonvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
+        assert!(cratonvm_jit::x64::is_jit_compatible(
+            &code, code_len, "(I)I"
+        ));
     }
 
     #[test]
@@ -66358,7 +70965,8 @@ public class SkippedTest {
         let mut code = Vec::new();
         code.push(0x1A); // iload_0 @ PC 0
         code.push(0xAB); // lookupswitch @ PC 1
-        code.push(0); code.push(0); // pad to 4-byte align
+        code.push(0);
+        code.push(0); // pad to 4-byte align
 
         // default(4) + npairs(4) + 2*8 = 24 bytes, body starts at PC 4+24=28
         // 2 case bodies at 28, 32; default at 36
@@ -66369,20 +70977,29 @@ public class SkippedTest {
         // pair 0: key=10, offset РІвЂ вЂ™ PC 28
         code.extend_from_slice(&10i32.to_be_bytes());
         code.extend_from_slice(&(27i32).to_be_bytes()); // 28-1=27
-        // pair 1: key=20, offset РІвЂ вЂ™ PC 32
+                                                        // pair 1: key=20, offset РІвЂ вЂ™ PC 32
         code.extend_from_slice(&20i32.to_be_bytes());
         code.extend_from_slice(&(31i32).to_be_bytes()); // 32-1=31
 
         // Case bodies
-        code.push(0x11); code.extend_from_slice(&100i16.to_be_bytes()); code.push(0xAC);
-        code.push(0x11); code.extend_from_slice(&200i16.to_be_bytes()); code.push(0xAC);
+        code.push(0x11);
+        code.extend_from_slice(&100i16.to_be_bytes());
+        code.push(0xAC);
+        code.push(0x11);
+        code.extend_from_slice(&200i16.to_be_bytes());
+        code.push(0xAC);
         // Default
-        code.push(0x11); code.extend_from_slice(&(-1i16).to_be_bytes()); code.push(0xAC);
+        code.push(0x11);
+        code.extend_from_slice(&(-1i16).to_be_bytes());
+        code.push(0xAC);
 
         let code_len = code.len();
-        code.push(0); code.push(0);
+        code.push(0);
+        code.push(0);
 
-        assert!(cratonvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
+        assert!(cratonvm_jit::x64::is_jit_compatible(
+            &code, code_len, "(I)I"
+        ));
     }
 
     #[test]
@@ -66390,14 +71007,21 @@ public class SkippedTest {
         // Verify binary search dispatch matches linear dispatch for all inputs.
         // Build a 7-pair lookupswitch and test 170 input values.
         let pairs: Vec<(i32, i32)> = vec![
-            (-50, 1), (-10, 2), (0, 3), (5, 4), (10, 5), (50, 6), (100, 7),
+            (-50, 1),
+            (-10, 2),
+            (0, 3),
+            (5, 4),
+            (10, 5),
+            (50, 6),
+            (100, 7),
         ];
         let default_val = -999i32;
 
         let mut code = Vec::new();
         code.push(0x1A); // iload_0
         code.push(0xAB); // lookupswitch
-        code.push(0); code.push(0); // pad
+        code.push(0);
+        code.push(0); // pad
 
         let npairs = pairs.len();
         let switch_data_size = 8 + npairs * 8;
@@ -66411,7 +71035,7 @@ public class SkippedTest {
         for (i, &(key, _)) in pairs.iter().enumerate() {
             let case_pc = body_start_pc + i * 4;
             code.extend_from_slice(&key.to_be_bytes());
-            code.extend_from_slice(&((case_pc as i32 - 1)).to_be_bytes());
+            code.extend_from_slice(&(case_pc as i32 - 1).to_be_bytes());
         }
 
         for &(_, val) in &pairs {
@@ -66424,29 +71048,49 @@ public class SkippedTest {
         code.push(0xAC);
 
         let code_len = code.len();
-        code.push(0); code.push(0);
+        code.push(0);
+        code.push(0);
 
         let helpers = crate::jit::helpers::build_helpers();
         let compiled = cratonvm_jit::x64::compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) вЂ” none for this switch-table-only test bytecode
-            Vec::new(), Vec::new(), std::collections::HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,
-            std::collections::HashSet::new(), std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
             None, // string_layout
-        ).expect("compilation failed");
+        )
+        .expect("compilation failed");
 
         for input in -60..110 {
-            let expected = pairs.iter()
+            let expected = pairs
+                .iter()
                 .find(|&&(k, _)| k == input)
                 .map(|&(_, v)| v as i64)
                 .unwrap_or(default_val as i64);
             let actual = unsafe { compiled.try_call(&[input as i64]).expect("test JIT call") };
-            assert_eq!(actual, expected,
-                "input={}: expected {}, got {}", input, expected, actual);
+            assert_eq!(
+                actual, expected,
+                "input={}: expected {}, got {}",
+                input, expected, actual
+            );
         }
     }
 
@@ -66458,7 +71102,8 @@ public class SkippedTest {
         let mut code = Vec::new();
         code.push(0x1A);
         code.push(0xAA);
-        code.push(0); code.push(0);
+        code.push(0);
+        code.push(0);
 
         let num_cases = cases.len();
         let switch_data_size = 12 + num_cases * 4;
@@ -66472,7 +71117,7 @@ public class SkippedTest {
 
         for i in 0..num_cases {
             let case_pc = body_start_pc + i * 4;
-            code.extend_from_slice(&((case_pc as i32 - 1)).to_be_bytes());
+            code.extend_from_slice(&(case_pc as i32 - 1).to_be_bytes());
         }
 
         for &val in &cases {
@@ -66485,27 +71130,58 @@ public class SkippedTest {
         code.push(0xAC);
 
         let code_len = code.len();
-        code.push(0); code.push(0);
+        code.push(0);
+        code.push(0);
 
         let helpers = crate::jit::helpers::build_helpers();
         let compiled = cratonvm_jit::x64::compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) вЂ” none for this switch-table-only test bytecode
-            Vec::new(), Vec::new(), std::collections::HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,
-            std::collections::HashSet::new(), std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
             None, // string_layout
-        ).expect("compilation failed");
+        )
+        .expect("compilation failed");
 
         unsafe {
             // Extreme out-of-range values should all hit default without crash
-            assert_eq!(compiled.try_call(&[-1000000i32 as i64]).expect("test JIT call"), 0);
+            assert_eq!(
+                compiled
+                    .try_call(&[-1000000i32 as i64])
+                    .expect("test JIT call"),
+                0
+            );
             assert_eq!(compiled.try_call(&[1000000]).expect("test JIT call"), 0);
-            assert_eq!(compiled.try_call(&[i32::MIN as i64]).expect("test JIT call"), 0);
-            assert_eq!(compiled.try_call(&[i32::MAX as i64]).expect("test JIT call"), 0);
+            assert_eq!(
+                compiled
+                    .try_call(&[i32::MIN as i64])
+                    .expect("test JIT call"),
+                0
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[i32::MAX as i64])
+                    .expect("test JIT call"),
+                0
+            );
         }
     }
 
@@ -66689,9 +71365,7 @@ public class SkippedTest {
     #[test]
     fn s36_uncommon_trap_null_vm_returns_reinterpret() {
         // Calling uncommon_trap with a null VM pointer should safely return DEOPT_ACTION_REINTERPRET
-        let result = unsafe {
-            crate::jit::helpers::jit_uncommon_trap(0, 0, 0)
-        };
+        let result = unsafe { crate::jit::helpers::jit_uncommon_trap(0, 0, 0) };
         assert_eq!(result, crate::jit::helpers::DEOPT_ACTION_REINTERPRET);
     }
 
@@ -66736,7 +71410,10 @@ public class SkippedTest {
         assert_eq!(a_final, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Method should now be in skip set
-        assert!(vm.jit_skip_set.read().contains(&("C".into(), "m".into(), "()V".into())));
+        assert!(vm
+            .jit_skip_set
+            .read()
+            .contains(&("C".into(), "m".into(), "()V".into())));
     }
 
     #[test]
@@ -66792,23 +71469,17 @@ public class SkippedTest {
 
         // Register `Animal` as a loaded class so the InvalidationManager
         // has a ClassId to key off of.
-        let animal_id = vm
-            .class_manager
-            .write()
-            .ensure_synthetic_class("Animal", 0);
+        let animal_id = vm.class_manager.write().ensure_synthetic_class("Animal", 0);
         let animal_cid_u32 = animal_id.as_u32();
 
         // Install a compiled entry for `Animal.speak:()V`. The JitCache
         // key is (Class, method, descriptor).
-        let buf = cratonvm_jit::ExecutableBuffer::new(64)
-            .expect("failed to allocate executable buffer");
+        let buf =
+            cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache.write().put(
-            "Animal".into(),
-            "speak".into(),
-            "()V".into(),
-            compiled,
-        );
+        vm.jit_cache
+            .write()
+            .put("Animal".into(), "speak".into(), "()V".into(), compiled);
         let cn: std::sync::Arc<str> = "Animal".into();
         let mn: std::sync::Arc<str> = "speak".into();
         let desc: std::sync::Arc<str> = "()V".into();
@@ -66859,15 +71530,12 @@ public class SkippedTest {
             .ensure_synthetic_class("Unrelated", 0);
 
         // Install one unrelated compiled entry.
-        let buf = cratonvm_jit::ExecutableBuffer::new(64)
-            .expect("failed to allocate executable buffer");
+        let buf =
+            cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache.write().put(
-            "Other".into(),
-            "run".into(),
-            "()V".into(),
-            compiled,
-        );
+        vm.jit_cache
+            .write()
+            .put("Other".into(), "run".into(), "()V".into(), compiled);
         assert_eq!(vm.jit_cache.read().len(), 1);
 
         let evicted = vm.invalidate_jit_for_class("Unrelated");
@@ -66927,7 +71595,10 @@ public class SkippedTest {
             cratonvm_jit::deopt::DeoptReason::ClassLoading,
             0,
         );
-        assert_eq!(action, cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
+        assert_eq!(
+            action,
+            cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret
+        );
 
         // ClassLoading should also clear invalidation assumptions
         // (verified via the code path, no assertions needed beyond action check)
@@ -67070,11 +71741,7 @@ public class SkippedTest {
 
         // After many deopts, should be blacklisted (in skip set)
         let skip = vm.jit_skip_set.read();
-        assert!(skip.contains(&(
-            "Deopt".into(),
-            "target".into(),
-            "()I".into(),
-        )));
+        assert!(skip.contains(&("Deopt".into(), "target".into(), "()I".into(),)));
     }
 
     // -----------------------------------------------------------------------
@@ -67134,9 +71801,7 @@ public class SkippedTest {
         // Insert a compiled method that inlined from "Helper"
         let buf2 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let mut cm2 = cratonvm_jit::CompiledMethod::new(buf2);
-        cm2.inlined_methods = vec![
-            ("Helper".to_string(), "getX".to_string(), "()I".to_string()),
-        ];
+        cm2.inlined_methods = vec![("Helper".to_string(), "getX".to_string(), "()I".to_string())];
         cache.put("Caller".into(), "methodB".into(), "()V".into(), cm2);
 
         // Insert another method that also inlined from "Helper"
@@ -67156,9 +71821,15 @@ public class SkippedTest {
         assert_eq!(cache.len(), 1);
 
         // methodA should still be in the cache
-        assert!(cache.get(&"Caller".into(), &"methodA".into(), &"()V".into()).is_some());
-        assert!(cache.get(&"Caller".into(), &"methodB".into(), &"()V".into()).is_none());
-        assert!(cache.get(&"Caller".into(), &"methodC".into(), &"()V".into()).is_none());
+        assert!(cache
+            .get(&"Caller".into(), &"methodA".into(), &"()V".into())
+            .is_some());
+        assert!(cache
+            .get(&"Caller".into(), &"methodB".into(), &"()V".into())
+            .is_none());
+        assert!(cache
+            .get(&"Caller".into(), &"methodC".into(), &"()V".into())
+            .is_none());
     }
 
     #[test]
@@ -67167,9 +71838,7 @@ public class SkippedTest {
 
         let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let mut cm = cratonvm_jit::CompiledMethod::new(buf);
-        cm.inlined_methods = vec![
-            ("Alpha".to_string(), "foo".to_string(), "()V".to_string()),
-        ];
+        cm.inlined_methods = vec![("Alpha".to_string(), "foo".to_string(), "()V".to_string())];
         cache.put("Main".into(), "run".into(), "()V".into(), cm);
 
         assert_eq!(cache.len(), 1);
@@ -67249,10 +71918,18 @@ public class SkippedTest {
         let mut jfr = vm.flight_recorder.lock();
         let rec = jfr.get_recording_mut(1).unwrap();
         let events = rec.get_events();
-        let deopt_events: Vec<_> = events.iter().filter(|e| {
-            e.fields.iter().any(|f| matches!(f, cratonvm_jfr::EventValue::String(s) if s.contains("TestClass")))
-        }).collect();
-        assert!(!deopt_events.is_empty(), "Deoptimization JFR event should have been recorded");
+        let deopt_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.fields.iter().any(
+                    |f| matches!(f, cratonvm_jfr::EventValue::String(s) if s.contains("TestClass")),
+                )
+            })
+            .collect();
+        assert!(
+            !deopt_events.is_empty(),
+            "Deoptimization JFR event should have been recorded"
+        );
     }
 
     #[test]
@@ -67260,19 +71937,35 @@ public class SkippedTest {
         let fr = cratonvm_jfr::create_flight_recorder();
         // Session 85 added more JFR event types (~47 now). When new events land,
         // the count grows organically; assert the floor of the original S41 set.
-        assert!(fr.type_registry.len() >= 28, "expected >= 28 JFR types, got {}", fr.type_registry.len());
+        assert!(
+            fr.type_registry.len() >= 28,
+            "expected >= 28 JFR types, got {}",
+            fr.type_registry.len()
+        );
         // Verify key event types
-        assert!(fr.type_registry.find_by_name("jdk.GarbageCollection").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.GarbageCollection")
+            .is_some());
         assert!(fr.type_registry.find_by_name("jdk.ThreadStart").is_some());
         assert!(fr.type_registry.find_by_name("jdk.ThreadEnd").is_some());
         assert!(fr.type_registry.find_by_name("jdk.ThreadSleep").is_some());
         assert!(fr.type_registry.find_by_name("jdk.ThreadPark").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.JavaMonitorEnter").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.JavaMonitorWait").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.JavaMonitorEnter")
+            .is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.JavaMonitorWait")
+            .is_some());
         assert!(fr.type_registry.find_by_name("jdk.ClassLoad").is_some());
         assert!(fr.type_registry.find_by_name("jdk.ClassUnload").is_some());
         assert!(fr.type_registry.find_by_name("jdk.Compilation").is_some());
-        assert!(fr.type_registry.find_by_name("jdk.Deoptimization").is_some());
+        assert!(fr
+            .type_registry
+            .find_by_name("jdk.Deoptimization")
+            .is_some());
         assert!(fr.type_registry.find_by_name("jdk.FileRead").is_some());
         assert!(fr.type_registry.find_by_name("jdk.FileWrite").is_some());
         assert!(fr.type_registry.find_by_name("jdk.SocketRead").is_some());
@@ -67286,9 +71979,18 @@ public class SkippedTest {
         let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("gc-test"));
         fr.start_recording(rid);
 
-        cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "YoungGC", "Allocation Failure", 1000, 500);
+        cratonvm_jfr::builtin::emit_gc_event(
+            &mut fr,
+            1,
+            "YoungGC",
+            "Allocation Failure",
+            1000,
+            500,
+        );
         cratonvm_jfr::builtin::emit_young_gc_event(&mut fr, 1, 15, 1000, 500);
-        cratonvm_jfr::builtin::emit_gc_heap_summary_event(&mut fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500);
+        cratonvm_jfr::builtin::emit_gc_heap_summary_event(
+            &mut fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500,
+        );
 
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 3);
@@ -67303,8 +72005,12 @@ public class SkippedTest {
         cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 1, 1000);
         cratonvm_jfr::builtin::emit_thread_sleep_event(&mut fr, 100_000_000, 1, 2000, 100_000_000);
         cratonvm_jfr::builtin::emit_thread_park_event(&mut fr, "AQS", 0, 0, 1, 3000, 500);
-        cratonvm_jfr::builtin::emit_monitor_enter_event(&mut fr, "Object", "main", 0xCAFE, 1, 4000, 100);
-        cratonvm_jfr::builtin::emit_monitor_wait_event(&mut fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200);
+        cratonvm_jfr::builtin::emit_monitor_enter_event(
+            &mut fr, "Object", "main", 0xCAFE, 1, 4000, 100,
+        );
+        cratonvm_jfr::builtin::emit_monitor_wait_event(
+            &mut fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200,
+        );
         cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 6000);
 
         let rec = fr.get_recording(rid).unwrap();
@@ -67319,7 +72025,9 @@ public class SkippedTest {
 
         cratonvm_jfr::builtin::emit_file_read_event(&mut fr, "fd:3", 4096, false, 1, 1000, 500);
         cratonvm_jfr::builtin::emit_file_write_event(&mut fr, "fd:1", 2048, 1, 2000, 300);
-        cratonvm_jfr::builtin::emit_socket_read_event(&mut fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000);
+        cratonvm_jfr::builtin::emit_socket_read_event(
+            &mut fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000,
+        );
         cratonvm_jfr::builtin::emit_socket_write_event(&mut fr, "10.0.0.1", 80, 256, 1, 4000, 800);
 
         let rec = fr.get_recording(rid).unwrap();
@@ -67332,7 +72040,14 @@ public class SkippedTest {
         let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("class-test"));
         fr.start_recording(rid);
 
-        cratonvm_jfr::builtin::emit_class_load_event(&mut fr, "com/example/Foo", "app", "app", 1000, 50);
+        cratonvm_jfr::builtin::emit_class_load_event(
+            &mut fr,
+            "com/example/Foo",
+            "app",
+            "app",
+            1000,
+            50,
+        );
         cratonvm_jfr::builtin::emit_class_unload_event(&mut fr, "com/example/Foo", "app", 5000);
 
         let rec = fr.get_recording(rid).unwrap();
@@ -67346,10 +72061,26 @@ public class SkippedTest {
         fr.start_recording(rid);
 
         cratonvm_jfr::builtin::emit_compilation_event(
-            &mut fr, "Foo.bar:()V", 1, 4, true, false, 256, 64, 1000, 5000,
+            &mut fr,
+            "Foo.bar:()V",
+            1,
+            4,
+            true,
+            false,
+            256,
+            64,
+            1000,
+            5000,
         );
         cratonvm_jfr::builtin::emit_deoptimization_event(
-            &mut fr, "Foo.bar:()V", 1, "ReceiverTypeChanged", "RecompileAndReinterpret", 10, 1, 6000,
+            &mut fr,
+            "Foo.bar:()V",
+            1,
+            "ReceiverTypeChanged",
+            "RecompileAndReinterpret",
+            10,
+            1,
+            6000,
         );
 
         let rec = fr.get_recording(rid).unwrap();
@@ -67371,8 +72102,7 @@ public class SkippedTest {
 
         let tmp = std::env::temp_dir().join("cratonvm_s42_vm_test.hprof");
         let path = tmp.to_str().unwrap();
-        let size = crate::runtime::hprof::dump_heap(&vm, path)
-            .expect("dump_heap should succeed");
+        let size = crate::runtime::hprof::dump_heap(&vm, path).expect("dump_heap should succeed");
         assert!(size > 0);
 
         let data = std::fs::read(&tmp).unwrap();
@@ -67383,7 +72113,12 @@ public class SkippedTest {
         assert_eq!(data[magic.len()], 0);
         // Identifier size = 8
         let id_off = magic.len() + 1;
-        let id_size = u32::from_be_bytes([data[id_off], data[id_off+1], data[id_off+2], data[id_off+3]]);
+        let id_size = u32::from_be_bytes([
+            data[id_off],
+            data[id_off + 1],
+            data[id_off + 2],
+            data[id_off + 3],
+        ]);
         assert_eq!(id_size, 8);
 
         let _ = std::fs::remove_file(&tmp);
@@ -67410,7 +72145,10 @@ public class SkippedTest {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos+5], output[pos+6], output[pos+7], output[pos+8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             tags.push(tag);
             pos += 9 + body_len;
@@ -67446,14 +72184,20 @@ public class SkippedTest {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos+5], output[pos+6], output[pos+7], output[pos+8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == 0x1C {
                 total_segment_bytes += body_len;
             }
             pos += 9 + body_len;
         }
-        assert!(total_segment_bytes > 0, "HEAP_DUMP_SEGMENT should have content with objects on heap");
+        assert!(
+            total_segment_bytes > 0,
+            "HEAP_DUMP_SEGMENT should have content with objects on heap"
+        );
     }
 
     #[test]
@@ -67481,15 +72225,20 @@ public class SkippedTest {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos+5], output[pos+6], output[pos+7], output[pos+8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == 0x02 {
                 load_class_count += 1;
             }
             pos += 9 + body_len;
         }
-        assert_eq!(load_class_count as usize, class_count,
-            "LOAD_CLASS record count should match loaded class count");
+        assert_eq!(
+            load_class_count as usize, class_count,
+            "LOAD_CLASS record count should match loaded class count"
+        );
     }
 
     #[test]
@@ -67503,7 +72252,9 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Allocate a primitive array
-        let _arr = vm.heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 10);
+        let _arr = vm
+            .heap
+            .alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 10);
 
         let mut output = Vec::new();
         let mut dumper = crate::runtime::hprof::HprofDumper::new(&vm);
@@ -67516,7 +72267,10 @@ public class SkippedTest {
         while pos + 9 <= output.len() {
             let tag = output[pos];
             let body_len = u32::from_be_bytes([
-                output[pos+5], output[pos+6], output[pos+7], output[pos+8],
+                output[pos + 5],
+                output[pos + 6],
+                output[pos + 7],
+                output[pos + 8],
             ]) as usize;
             if tag == 0x1C && body_len > 0 {
                 let body_start = pos + 9;
@@ -67530,7 +72284,10 @@ public class SkippedTest {
             }
             pos += 9 + body_len;
         }
-        assert!(found_prim_array, "Dump should contain PRIM_ARRAY_DUMP sub-record");
+        assert!(
+            found_prim_array,
+            "Dump should contain PRIM_ARRAY_DUMP sub-record"
+        );
     }
 
     #[test]
@@ -67539,21 +72296,39 @@ public class SkippedTest {
         use crate::runtime::serviceability::VmDiagnosticState;
         struct Dummy;
         impl VmDiagnosticState for Dummy {
-            fn thread_snapshots(&self) -> Vec<crate::runtime::serviceability::ThreadSnapshot> { vec![] }
+            fn thread_snapshots(&self) -> Vec<crate::runtime::serviceability::ThreadSnapshot> {
+                vec![]
+            }
             fn heap_summary(&self) -> crate::runtime::serviceability::HeapSummary {
                 crate::runtime::serviceability::HeapSummary {
-                    young_gen_used: 0, young_gen_capacity: 0,
-                    old_gen_used: 0, old_gen_capacity: 0,
-                    metaspace_used: 0, metaspace_capacity: 0,
-                    total_used: 0, total_capacity: 0,
+                    young_gen_used: 0,
+                    young_gen_capacity: 0,
+                    old_gen_used: 0,
+                    old_gen_capacity: 0,
+                    metaspace_used: 0,
+                    metaspace_capacity: 0,
+                    total_used: 0,
+                    total_capacity: 0,
                 }
             }
-            fn class_histogram(&self) -> Vec<crate::runtime::serviceability::ClassHistogramEntry> { vec![] }
-            fn trigger_gc(&self) -> bool { false }
-            fn uptime_secs(&self) -> f64 { 0.0 }
-            fn command_line(&self) -> String { String::new() }
-            fn system_properties(&self) -> Vec<(String, String)> { vec![] }
-            fn vm_flags(&self) -> Vec<String> { vec![] }
+            fn class_histogram(&self) -> Vec<crate::runtime::serviceability::ClassHistogramEntry> {
+                vec![]
+            }
+            fn trigger_gc(&self) -> bool {
+                false
+            }
+            fn uptime_secs(&self) -> f64 {
+                0.0
+            }
+            fn command_line(&self) -> String {
+                String::new()
+            }
+            fn system_properties(&self) -> Vec<(String, String)> {
+                vec![]
+            }
+            fn vm_flags(&self) -> Vec<String> {
+                vec![]
+            }
         }
         let d = Dummy;
         let result = d.heap_dump("/tmp/test.hprof");
@@ -67575,23 +72350,38 @@ public class SkippedTest {
         let registry = &vm.native_methods;
 
         // Joiner factories
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Joiner",
-            "allSuccessfulOrThrow",
-            "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
-        ).is_some(), "Missing Joiner.allSuccessfulOrThrow");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Joiner",
+                    "allSuccessfulOrThrow",
+                    "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+                )
+                .is_some(),
+            "Missing Joiner.allSuccessfulOrThrow"
+        );
 
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Joiner",
-            "anySuccessfulResultOrThrow",
-            "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
-        ).is_some(), "Missing Joiner.anySuccessfulResultOrThrow");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Joiner",
+                    "anySuccessfulResultOrThrow",
+                    "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+                )
+                .is_some(),
+            "Missing Joiner.anySuccessfulResultOrThrow"
+        );
 
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Joiner",
-            "awaitAll",
-            "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
-        ).is_some(), "Missing Joiner.awaitAll");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Joiner",
+                    "awaitAll",
+                    "()Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+                )
+                .is_some(),
+            "Missing Joiner.awaitAll"
+        );
 
         // open(Joiner)
         assert!(registry.find(
@@ -67610,17 +72400,27 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         let registry = &vm.native_methods;
 
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Config",
-            "<init>",
-            "()V",
-        ).is_some(), "Missing Config.<init>");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Config",
+                    "<init>",
+                    "()V",
+                )
+                .is_some(),
+            "Missing Config.<init>"
+        );
 
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Config",
-            "withName",
-            "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Config;",
-        ).is_some(), "Missing Config.withName");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Config",
+                    "withName",
+                    "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Config;",
+                )
+                .is_some(),
+            "Missing Config.withName"
+        );
 
         assert!(registry.find(
             "java/util/concurrent/StructuredTaskScope$Config",
@@ -67628,11 +72428,16 @@ public class SkippedTest {
             "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/StructuredTaskScope$Config;",
         ).is_some(), "Missing Config.withThreadFactory");
 
-        assert!(registry.find(
-            "java/util/concurrent/StructuredTaskScope$Config",
-            "withTimeout",
-            "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Config;",
-        ).is_some(), "Missing Config.withTimeout");
+        assert!(
+            registry
+                .find(
+                    "java/util/concurrent/StructuredTaskScope$Config",
+                    "withTimeout",
+                    "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Config;",
+                )
+                .is_some(),
+            "Missing Config.withTimeout"
+        );
     }
 
     #[test]
@@ -67646,7 +72451,11 @@ public class SkippedTest {
 
         // Load StructuredTaskScope РІР‚вЂќ should succeed with 8 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope");
-        assert!(result.is_ok(), "Should load StructuredTaskScope: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should load StructuredTaskScope: {:?}",
+            result.err()
+        );
 
         // Load Joiner РІР‚вЂќ should succeed with 4 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope$Joiner");
@@ -67662,7 +72471,11 @@ public class SkippedTest {
 
         // Load ScopedValue РІР‚вЂќ should succeed with 3 fields
         let result = vm.load_class_concurrent("java/lang/ScopedValue");
-        assert!(result.is_ok(), "Should load ScopedValue: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should load ScopedValue: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -67697,15 +72510,29 @@ public class SkippedTest {
             ("java/lang/ScopedValue", "get", "()Ljava/lang/Object;"),
             ("java/lang/ScopedValue", "isBound", "()Z"),
             ("java/lang/ScopedValue", "hashCode", "()I"),
-            ("java/lang/ScopedValue$Carrier", "run", "(Ljava/lang/Runnable;)V"),
-            ("java/lang/ScopedValue$Carrier", "call", "(Ljava/util/concurrent/Callable;)Ljava/lang/Object;"),
-            ("java/lang/ScopedValue$Snapshot", "capture", "()Ljava/lang/ScopedValue$Snapshot;"),
+            (
+                "java/lang/ScopedValue$Carrier",
+                "run",
+                "(Ljava/lang/Runnable;)V",
+            ),
+            (
+                "java/lang/ScopedValue$Carrier",
+                "call",
+                "(Ljava/util/concurrent/Callable;)Ljava/lang/Object;",
+            ),
+            (
+                "java/lang/ScopedValue$Snapshot",
+                "capture",
+                "()Ljava/lang/ScopedValue$Snapshot;",
+            ),
         ];
         for (cls, name, desc) in &methods {
             assert!(
                 registry.find(cls, name, desc).is_some(),
                 "Missing: {}.{}{}",
-                cls, name, desc
+                cls,
+                name,
+                desc
             );
         }
     }
@@ -67724,8 +72551,8 @@ public class SkippedTest {
         assert!(registry.find(cls, "fork",
             "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;")
             .is_some());
-        assert!(registry.find(cls, "join",
-            "()Ljava/util/concurrent/StructuredTaskScope;")
+        assert!(registry
+            .find(cls, "join", "()Ljava/util/concurrent/StructuredTaskScope;")
             .is_some());
         assert!(registry.find(cls, "close", "()V").is_some());
         assert!(registry.find(cls, "shutdown", "()V").is_some());
@@ -67781,11 +72608,7 @@ public class SkippedTest {
         let str_obj = alloc.alloc_object(string_cid, 2);
         assert!(str_obj.is_some());
 
-        let arr = alloc.alloc_array(
-            array_cid,
-            cratonvm_gc::heap::ArrayElementType::Int,
-            100,
-        );
+        let arr = alloc.alloc_array(array_cid, cratonvm_gc::heap::ArrayElementType::Int, 100);
         assert!(arr.is_some());
 
         assert_eq!(alloc.object_count(), 3);
@@ -67822,7 +72645,9 @@ public class SkippedTest {
 
         // Simulate a workload
         for i in 0..1000 {
-            alloc.alloc_object(cratonvm_types::ClassId::new(i % 50), 3).unwrap();
+            alloc
+                .alloc_object(cratonvm_types::ClassId::new(i % 50), 3)
+                .unwrap();
         }
 
         let report = alloc.savings_report();
@@ -67892,7 +72717,10 @@ public class SkippedTest {
         assert!(compact.is_array());
         assert_eq!(compact.narrow_klass(), 42);
         assert_eq!(compact.gc_age(), 3);
-        assert_eq!(compact.element_type(), cratonvm_gc::heap::ArrayElementType::Long as u8);
+        assert_eq!(
+            compact.element_type(),
+            cratonvm_gc::heap::ArrayElementType::Long as u8
+        );
         assert!(compact.has_hash_code());
         assert_eq!(ht.get(0x2000), Some(777));
 
@@ -67914,10 +72742,15 @@ public class SkippedTest {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cleaner = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/Cleaner", "create", "()Ljava/lang/ref/Cleaner;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/Cleaner",
+            "create",
+            "()Ljava/lang/ref/Cleaner;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let cleaner_obj = match cleaner {
             Value::Object(Some(o)) => o,
             _ => panic!("Cleaner.create() returned null"),
@@ -67926,7 +72759,10 @@ public class SkippedTest {
             Value::Object(Some(_)) => {}
             v => panic!("Cleaner backing array missing: {v:?}"),
         }
-        assert!(matches!(shared.heap.get_field(cleaner_obj, 1), Value::Int(0)));
+        assert!(matches!(
+            shared.heap.get_field(cleaner_obj, 1),
+            Value::Int(0)
+        ));
     }
 
     /// Cleaner.register(obj, action) registers a Cleaner-typed phantom in
@@ -67938,10 +72774,15 @@ public class SkippedTest {
         let before = shared.ref_processor.lock().cleaner_ref_count();
 
         let cleaner = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/Cleaner", "create", "()Ljava/lang/ref/Cleaner;",
+            &shared,
+            &mut thread,
+            "java/lang/ref/Cleaner",
+            "create",
+            "()Ljava/lang/ref/Cleaner;",
             &[],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let cleaner_obj = match cleaner {
             Value::Object(Some(o)) => o,
             _ => panic!(),
@@ -67949,15 +72790,19 @@ public class SkippedTest {
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let action = shared.heap.alloc_object(ClassId::new(0), 1);
         let cleanable = call_native(
-            &shared, &mut thread,
-            "java/lang/ref/Cleaner", "register",
+            &shared,
+            &mut thread,
+            "java/lang/ref/Cleaner",
+            "register",
             "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
             &[
                 Value::Object(Some(cleaner_obj)),
                 Value::Object(Some(referent)),
                 Value::Object(Some(action)),
             ],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match cleanable {
             Value::Object(Some(_)) => {}
             _ => panic!("Cleanable was null"),
@@ -67967,7 +72812,10 @@ public class SkippedTest {
         assert_eq!(after, before + 1, "expected one new cleaner ref discovered");
 
         // Cleaner backing array now contains 1 entry.
-        assert!(matches!(shared.heap.get_field(cleaner_obj, 1), Value::Int(1)));
+        assert!(matches!(
+            shared.heap.get_field(cleaner_obj, 1),
+            Value::Int(1)
+        ));
     }
 
     /// Allocating a DirectByteBuffer takes real native memory.
@@ -67980,10 +72828,15 @@ public class SkippedTest {
 
         let cap: i32 = 4096;
         let buf = call_native(
-            &shared, &mut thread,
-            "java/nio/ByteBuffer", "allocateDirect", "(I)Ljava/nio/ByteBuffer;",
+            &shared,
+            &mut thread,
+            "java/nio/ByteBuffer",
+            "allocateDirect",
+            "(I)Ljava/nio/ByteBuffer;",
             &[Value::Int(cap)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         match buf {
             Value::Object(Some(_)) => {}
             _ => panic!("allocateDirect returned null"),
@@ -68005,10 +72858,15 @@ public class SkippedTest {
 
         let cap: i32 = 8192;
         let buf = call_native(
-            &shared, &mut thread,
-            "java/nio/ByteBuffer", "allocateDirect", "(I)Ljava/nio/ByteBuffer;",
+            &shared,
+            &mut thread,
+            "java/nio/ByteBuffer",
+            "allocateDirect",
+            "(I)Ljava/nio/ByteBuffer;",
             &[Value::Int(cap)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let buf_obj = match buf {
             Value::Object(Some(o)) => o,
             _ => panic!(),
@@ -68058,9 +72916,11 @@ public class SkippedTest {
             shared.heap.set_field(cleanable, 0, Value::Object(None));
             // Invoke run()V on the deallocator via the native registry.
             let _ = call_native(
-                &shared, &mut thread,
+                &shared,
+                &mut thread,
                 "jdk/internal/ref/DirectBufferDeallocator",
-                "run", "()V",
+                "run",
+                "()V",
                 &[Value::Object(Some(action))],
             );
         }
@@ -68081,10 +72941,15 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let buf = call_native(
-            &shared, &mut thread,
-            "java/nio/ByteBuffer", "allocateDirect", "(I)Ljava/nio/ByteBuffer;",
+            &shared,
+            &mut thread,
+            "java/nio/ByteBuffer",
+            "allocateDirect",
+            "(I)Ljava/nio/ByteBuffer;",
             &[Value::Int(2048)],
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
         let _ = buf;
         let live_before = shared.native_memory.lock().live_count();
         assert!(live_before >= 1);
@@ -68101,27 +72966,41 @@ public class SkippedTest {
             drop(proc);
             let mut proc = shared.ref_processor.lock();
             let result = proc.process_references(&|_addr| false, 64, 0);
-            *result.cleaner_actions.last().expect("cleaner_actions non-empty")
+            *result
+                .cleaner_actions
+                .last()
+                .expect("cleaner_actions non-empty")
         };
         let cleanable = unsafe { ObjectRef::from_raw(cleanable_addr as *mut u8) };
 
         // Call Cleanable.clean() РІР‚вЂќ first call frees the memory.
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/Cleaner$Cleanable", "clean", "()V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/Cleaner$Cleanable",
+            "clean",
+            "()V",
             &[Value::Object(Some(cleanable))],
-        ).unwrap();
+        )
+        .unwrap();
         let live_after_first = shared.native_memory.lock().live_count();
         assert_eq!(live_after_first, live_before - 1);
 
         // Second call must be a no-op (cleaned flag guards it).
         call_native(
-            &shared, &mut thread,
-            "java/lang/ref/Cleaner$Cleanable", "clean", "()V",
+            &shared,
+            &mut thread,
+            "java/lang/ref/Cleaner$Cleanable",
+            "clean",
+            "()V",
             &[Value::Object(Some(cleanable))],
-        ).unwrap();
+        )
+        .unwrap();
         let live_after_second = shared.native_memory.lock().live_count();
-        assert_eq!(live_after_second, live_after_first, "second clean() must be a no-op");
+        assert_eq!(
+            live_after_second, live_after_first,
+            "second clean() must be a no-op"
+        );
     }
 
     /// T10.9.A РІР‚вЂќ integration test: after registering a class through
@@ -68180,23 +73059,21 @@ public class SkippedTest {
         // Arc<CachedBytecodeMethod>) is exercised.
         {
             use std::sync::Arc;
-            let padded_code: Arc<[u8]> =
-                Arc::from(vec![0xb1u8, 0x00, 0x00].into_boxed_slice());
-            let cached =
-                Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
-                    declaring_class_id: class_id,
-                    class_name: Arc::from("test/T10_9_A_Target"),
-                    method_name: Arc::from("tick"),
-                    method_descriptor: Arc::from("()V"),
-                    source_file: None,
-                    code: padded_code,
-                    exception_table: Arc::from(Vec::new().into_boxed_slice()),
-                    max_stack: 0,
-                    max_locals: 1,
-                    num_params: 0,
-                    is_synchronized: false,
-                    is_static: false,
-                });
+            let padded_code: Arc<[u8]> = Arc::from(vec![0xb1u8, 0x00, 0x00].into_boxed_slice());
+            let cached = Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
+                declaring_class_id: class_id,
+                class_name: Arc::from("test/T10_9_A_Target"),
+                method_name: Arc::from("tick"),
+                method_descriptor: Arc::from("()V"),
+                source_file: None,
+                code: padded_code,
+                exception_table: Arc::from(Vec::new().into_boxed_slice()),
+                max_stack: 0,
+                max_locals: 1,
+                num_params: 0,
+                is_synchronized: false,
+                is_static: false,
+            });
             let entry = crate::runtime::vtable::VtableEntry {
                 declaring_class_id: class_id.as_u32() as u64,
                 method_index: 0,
@@ -68248,7 +73125,9 @@ public class SkippedTest {
             .invalidate_for_override(class_id.as_u32() as u64, 0);
         let guard = shared.vtable_manager.read();
         assert!(
-            guard.resolve_virtual_slot(class_id.as_u32() as u64, 0).is_none(),
+            guard
+                .resolve_virtual_slot(class_id.as_u32() as u64, 0)
+                .is_none(),
             "after override invalidation, the vtable slot must be unresolved",
         );
     }

@@ -3,12 +3,12 @@
 
 //! NIO, HTTP client, and resource loading natives.
 
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 use crate::phases_late::{p56_build_stream, p58_new_cf};
+use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 
 use std::collections::HashMap;
 use std::io::{Read as StdRead, Write as StdWrite};
@@ -34,7 +34,11 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 /// Per JLS: if `name` starts with `/`, strip it (absolute). Otherwise,
 /// prepend the package path of the class (e.g., `com/example/` for
 /// class `com/example/Foo`).
-fn resolve_class_resource_name(ctx: &dyn NativeContext, class_mirror: ObjectRef, name: &str) -> String {
+fn resolve_class_resource_name(
+    ctx: &dyn NativeContext,
+    class_mirror: ObjectRef,
+    name: &str,
+) -> String {
     if name.starts_with('/') {
         return name[1..].to_string();
     }
@@ -86,8 +90,8 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                     }
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
                     ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
-                    ctx.set_field(stream, 1, Value::Int(0));            // pos
-                    ctx.set_field(stream, 2, Value::Int(0));            // mark
+                    ctx.set_field(stream, 1, Value::Int(0)); // pos
+                    ctx.set_field(stream, 2, Value::Int(0)); // mark
                     ctx.set_field(stream, 3, Value::Int(bytes.len() as i32)); // count
                     Ok(Some(Value::Object(Some(stream))))
                 }
@@ -154,190 +158,201 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     // no real Reader bytecode to defer to.
     #[cfg(feature = "synthetic-jdk")]
     {
-    // -------------------------------------------------------------------------
-    // java.io.InputStream.close() — no-op
-    // -------------------------------------------------------------------------
-    r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
-    r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(-1))) // EOF
-    });
+        // -------------------------------------------------------------------------
+        // java.io.InputStream.close() — no-op
+        // -------------------------------------------------------------------------
+        r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
+        r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(-1))) // EOF
+        });
 
-    // -------------------------------------------------------------------------
-    // java.io.InputStreamReader.<init>(InputStream)  — store stream at field 0
-    // java.io.InputStreamReader.<init>(InputStream, Charset) — same
-    // -------------------------------------------------------------------------
-    r.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, stream);
-            Ok(None)
-        },
-    );
-    r.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, stream);
-            Ok(None)
-        },
-    );
-    r.register(
-        "java/io/InputStreamReader",
-        "<init>",
-        "(Ljava/io/InputStream;Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, stream);
-            Ok(None)
-        },
-    );
-    r.register("java/io/InputStreamReader", "close", "()V", native_noop_with_this);
-    r.register("java/io/InputStreamReader", "read", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(-1)))
-    });
+        // -------------------------------------------------------------------------
+        // java.io.InputStreamReader.<init>(InputStream)  — store stream at field 0
+        // java.io.InputStreamReader.<init>(InputStream, Charset) — same
+        // -------------------------------------------------------------------------
+        r.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        r.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        r.register(
+            "java/io/InputStreamReader",
+            "<init>",
+            "(Ljava/io/InputStream;Ljava/lang/String;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, stream);
+                Ok(None)
+            },
+        );
+        r.register(
+            "java/io/InputStreamReader",
+            "close",
+            "()V",
+            native_noop_with_this,
+        );
+        r.register("java/io/InputStreamReader", "read", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(-1)))
+        });
 
-    // -------------------------------------------------------------------------
-    // java.io.BufferedReader.<init>(Reader) / (Reader, int) — store reader at field 0
-    // -------------------------------------------------------------------------
-    r.register(
-        "java/io/BufferedReader",
-        "<init>",
-        "(Ljava/io/Reader;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, reader);
-            Ok(None)
-        },
-    );
-    r.register(
-        "java/io/BufferedReader",
-        "<init>",
-        "(Ljava/io/Reader;I)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let reader = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, reader);
-            Ok(None)
-        },
-    );
+        // -------------------------------------------------------------------------
+        // java.io.BufferedReader.<init>(Reader) / (Reader, int) — store reader at field 0
+        // -------------------------------------------------------------------------
+        r.register(
+            "java/io/BufferedReader",
+            "<init>",
+            "(Ljava/io/Reader;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, reader);
+                Ok(None)
+            },
+        );
+        r.register(
+            "java/io/BufferedReader",
+            "<init>",
+            "(Ljava/io/Reader;I)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let reader = args.get(1).copied().unwrap_or(Value::Object(None));
+                ctx.set_field(this, 0, reader);
+                Ok(None)
+            },
+        );
 
-    // -------------------------------------------------------------------------
-    // java.io.BufferedReader.readLine() → String
-    //
-    // The underlying InputStream is a synthetic ByteArrayInputStream with
-    // layout: field 0 = byte[] buf, field 1 = pos, field 2 = mark, field 3 = count.
-    // We read bytes from `pos..count` until we hit a line terminator
-    // (`\n`, `\r`, or `\r\n`), advance `pos` past it, and return the line
-    // as a UTF-8 String. Returns null at EOF.
-    // -------------------------------------------------------------------------
-    r.register(
-        "java/io/BufferedReader",
-        "readLine",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let is = match r3_get_input_stream(ctx, this) {
-                Some(s) => s,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            let buf_arr = match ctx.get_field(is, 0) {
-                Value::Object(Some(arr)) => arr,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut pos = match ctx.get_field(is, 1) {
-                Value::Int(i) => i as usize,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let count = match ctx.get_field(is, 3) {
-                Value::Int(i) => i as usize,
-                _ => ctx.array_length(buf_arr),
-            };
-            if pos >= count {
-                // EOF — readLine returns null
-                return Ok(Some(Value::Object(None)));
-            }
-            let mut bytes: Vec<u8> = Vec::new();
-            while pos < count {
-                let b = match ctx.get_array_element(buf_arr, pos) {
-                    Value::Int(v) => (v as i8) as u8,
-                    _ => break,
+        // -------------------------------------------------------------------------
+        // java.io.BufferedReader.readLine() → String
+        //
+        // The underlying InputStream is a synthetic ByteArrayInputStream with
+        // layout: field 0 = byte[] buf, field 1 = pos, field 2 = mark, field 3 = count.
+        // We read bytes from `pos..count` until we hit a line terminator
+        // (`\n`, `\r`, or `\r\n`), advance `pos` past it, and return the line
+        // as a UTF-8 String. Returns null at EOF.
+        // -------------------------------------------------------------------------
+        r.register(
+            "java/io/BufferedReader",
+            "readLine",
+            "()Ljava/lang/String;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let is = match r3_get_input_stream(ctx, this) {
+                    Some(s) => s,
+                    None => return Ok(Some(Value::Object(None))),
                 };
-                pos += 1;
-                if b == b'\n' {
-                    break;
+                let buf_arr = match ctx.get_field(is, 0) {
+                    Value::Object(Some(arr)) => arr,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let mut pos = match ctx.get_field(is, 1) {
+                    Value::Int(i) => i as usize,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let count = match ctx.get_field(is, 3) {
+                    Value::Int(i) => i as usize,
+                    _ => ctx.array_length(buf_arr),
+                };
+                if pos >= count {
+                    // EOF — readLine returns null
+                    return Ok(Some(Value::Object(None)));
                 }
-                if b == b'\r' {
-                    // Consume optional following \n (CRLF stays atomic)
-                    if pos < count {
-                        if let Value::Int(v) = ctx.get_array_element(buf_arr, pos) {
-                            if (v as i8) as u8 == b'\n' {
-                                pos += 1;
+                let mut bytes: Vec<u8> = Vec::new();
+                while pos < count {
+                    let b = match ctx.get_array_element(buf_arr, pos) {
+                        Value::Int(v) => (v as i8) as u8,
+                        _ => break,
+                    };
+                    pos += 1;
+                    if b == b'\n' {
+                        break;
+                    }
+                    if b == b'\r' {
+                        // Consume optional following \n (CRLF stays atomic)
+                        if pos < count {
+                            if let Value::Int(v) = ctx.get_array_element(buf_arr, pos) {
+                                if (v as i8) as u8 == b'\n' {
+                                    pos += 1;
+                                }
                             }
                         }
+                        break;
                     }
-                    break;
+                    bytes.push(b);
                 }
-                bytes.push(b);
-            }
-            ctx.set_field(is, 1, Value::Int(pos as i32));
-            let line = String::from_utf8_lossy(&bytes).into_owned();
-            let s = ctx.create_string(&line);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+                ctx.set_field(is, 1, Value::Int(pos as i32));
+                let line = String::from_utf8_lossy(&bytes).into_owned();
+                let s = ctx.create_string(&line);
+                Ok(Some(Value::Object(Some(s))))
+            },
+        );
 
-    // -------------------------------------------------------------------------
-    // java.io.BufferedReader.lines() → Stream<String>
-    // -------------------------------------------------------------------------
-    r.register(
-        "java/io/BufferedReader",
-        "lines",
-        "()Ljava/util/stream/Stream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let is = r3_get_input_stream(ctx, this);
-            let elems = match is {
-                None => vec![],
-                Some(is_ref) => {
-                    let lines_arr = match ctx.get_field(is_ref, 0) {
-                        Value::Object(Some(arr)) => arr,
-                        _ => {
-                            let s = p56_build_stream(ctx, vec![], "java/util/stream/Stream");
-                            return Ok(Some(Value::Object(Some(s))));
-                        }
-                    };
-                    let pos = match ctx.get_field(is_ref, 1) {
-                        Value::Int(i) => i as usize,
-                        _ => 0,
-                    };
-                    let len = ctx.array_length(lines_arr);
-                    let elems: Vec<Value> =
-                        (pos..len).map(|i| ctx.get_array_element(lines_arr, i)).collect();
-                    // Advance position to end
-                    ctx.set_field(is_ref, 1, Value::Int(len as i32));
-                    elems
-                }
-            };
-            let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+        // -------------------------------------------------------------------------
+        // java.io.BufferedReader.lines() → Stream<String>
+        // -------------------------------------------------------------------------
+        r.register(
+            "java/io/BufferedReader",
+            "lines",
+            "()Ljava/util/stream/Stream;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let is = r3_get_input_stream(ctx, this);
+                let elems = match is {
+                    None => vec![],
+                    Some(is_ref) => {
+                        let lines_arr = match ctx.get_field(is_ref, 0) {
+                            Value::Object(Some(arr)) => arr,
+                            _ => {
+                                let s = p56_build_stream(ctx, vec![], "java/util/stream/Stream");
+                                return Ok(Some(Value::Object(Some(s))));
+                            }
+                        };
+                        let pos = match ctx.get_field(is_ref, 1) {
+                            Value::Int(i) => i as usize,
+                            _ => 0,
+                        };
+                        let len = ctx.array_length(lines_arr);
+                        let elems: Vec<Value> = (pos..len)
+                            .map(|i| ctx.get_array_element(lines_arr, i))
+                            .collect();
+                        // Advance position to end
+                        ctx.set_field(is_ref, 1, Value::Int(len as i32));
+                        elems
+                    }
+                };
+                let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
+                Ok(Some(Value::Object(Some(s))))
+            },
+        );
 
-    // -------------------------------------------------------------------------
-    // java.io.BufferedReader.close() — no-op
-    // java.io.Reader.close() — no-op
-    // -------------------------------------------------------------------------
-    r.register("java/io/BufferedReader", "close", "()V", native_noop_with_this);
-    r.register("java/io/Reader", "close", "()V", native_noop_with_this);
+        // -------------------------------------------------------------------------
+        // java.io.BufferedReader.close() — no-op
+        // java.io.Reader.close() — no-op
+        // -------------------------------------------------------------------------
+        r.register(
+            "java/io/BufferedReader",
+            "close",
+            "()V",
+            native_noop_with_this,
+        );
+        r.register("java/io/Reader", "close", "()V", native_noop_with_this);
     } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader-stack block
 }
 
@@ -476,12 +491,7 @@ fn s1_service_loader_ensure_loaded(
         let class_name = provider_name.replace('.', "/");
         if ctx.ensure_class_initialized(&class_name).is_ok() {
             if let Ok(Some(Value::Object(Some(obj)))) = ctx.new_object(&class_name) {
-                let _ = ctx.invoke(
-                    &class_name,
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(obj))],
-                );
+                let _ = ctx.invoke(&class_name, "<init>", "()V", &[Value::Object(Some(obj))]);
                 instances.push(Value::Object(Some(obj)));
             }
         }
@@ -662,25 +672,20 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
     });
 
     // URLClassLoader.addURL(URL) — extend classpath with one more URL
-    r.register(
-        ucl,
-        "addURL",
-        "(Ljava/net/URL;)V",
-        |ctx, args| {
-            let url_val = args.get(1).copied().unwrap_or(Value::Object(None));
-            if let Value::Object(Some(url_obj)) = url_val {
-                let full_val = ctx.get_field(url_obj, 5); // URL_FIELD_FULL
-                if let Value::Object(Some(s)) = full_val {
-                    if let Some(full) = ctx.read_string(s) {
-                        if let Some(path) = s1_url_to_fs_path(&full) {
-                            ctx.register_dynamic_classpath(&[path]);
-                        }
+    r.register(ucl, "addURL", "(Ljava/net/URL;)V", |ctx, args| {
+        let url_val = args.get(1).copied().unwrap_or(Value::Object(None));
+        if let Value::Object(Some(url_obj)) = url_val {
+            let full_val = ctx.get_field(url_obj, 5); // URL_FIELD_FULL
+            if let Value::Object(Some(s)) = full_val {
+                if let Some(full) = ctx.read_string(s) {
+                    if let Some(path) = s1_url_to_fs_path(&full) {
+                        ctx.register_dynamic_classpath(&[path]);
                     }
                 }
             }
-            Ok(None)
-        },
-    );
+        }
+        Ok(None)
+    });
 
     // URLClassLoader.getResource(String) → URL  (delegate to find_resource)
     r.register(
@@ -727,8 +732,8 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
                     }
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
                     ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
-                    ctx.set_field(stream, 1, Value::Int(0));            // pos
-                    ctx.set_field(stream, 2, Value::Int(0));            // mark
+                    ctx.set_field(stream, 1, Value::Int(0)); // pos
+                    ctx.set_field(stream, 2, Value::Int(0)); // mark
                     ctx.set_field(stream, 3, Value::Int(bytes.len() as i32)); // count
                     Ok(Some(Value::Object(Some(stream))))
                 }
@@ -850,38 +855,28 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
     );
 
     // ServiceLoader.stream() → Stream<Provider<S>>
-    r.register(
-        sl,
-        "stream",
-        "()Ljava/util/stream/Stream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let arr = s1_service_loader_ensure_loaded(ctx, this);
-            let len = ctx.array_length(arr);
-            let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
-            let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    r.register(sl, "stream", "()Ljava/util/stream/Stream;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = s1_service_loader_ensure_loaded(ctx, this);
+        let len = ctx.array_length(arr);
+        let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // ServiceLoader.findFirst() → Optional<S>
-    r.register(
-        sl,
-        "findFirst",
-        "()Ljava/util/Optional;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let arr = s1_service_loader_ensure_loaded(ctx, this);
-            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-            if ctx.array_length(arr) > 0 {
-                let first = ctx.get_array_element(arr, 0);
-                ctx.set_field(opt, 0, first);
-            } else {
-                ctx.set_field(opt, 0, Value::Object(None));
-            }
-            Ok(Some(Value::Object(Some(opt))))
-        },
-    );
+    r.register(sl, "findFirst", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = s1_service_loader_ensure_loaded(ctx, this);
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        if ctx.array_length(arr) > 0 {
+            let first = ctx.get_array_element(arr, 0);
+            ctx.set_field(opt, 0, first);
+        } else {
+            ctx.set_field(opt, 0, Value::Object(None));
+        }
+        Ok(Some(Value::Object(Some(opt))))
+    });
 
     // ServiceLoader.reload() — clear cached services
     r.register(sl, "reload", "()V", |ctx, args| {
@@ -1063,9 +1058,9 @@ pub(crate) fn s2_tls_connect(
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let tls_stream = connector
-        .connect(host, tcp)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e)))?;
+    let tls_stream = connector.connect(host, tcp).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
+    })?;
 
     // T2.7.11: native-tls 0.2's public `TlsStream` API does not expose the
     // server-selected ALPN protocol on all backends (it is absent on 0.2's
@@ -1092,17 +1087,15 @@ pub(crate) fn s2_tls_connect(
     // single-element chain here without weakening security.
     let mut peer_cert_chain_der: Vec<Vec<u8>> = Vec::new();
     match tls_stream.peer_certificate() {
-        Ok(Some(cert)) => {
-            match cert.to_der() {
-                Ok(der) => peer_cert_chain_der.push(der),
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("peer certificate DER encode failed: {}", e),
-                    ));
-                }
+        Ok(Some(cert)) => match cert.to_der() {
+            Ok(der) => peer_cert_chain_der.push(der),
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("peer certificate DER encode failed: {}", e),
+                ));
             }
-        }
+        },
         Ok(None) => {
             // No peer cert presented (e.g. PSK / anonymous ciphersuite).
             // Leave the chain empty; getPeerCertificates will throw
@@ -1173,7 +1166,9 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
 /// given TLS stream id. Returns an empty Vec if no cert was presented.
 pub(crate) fn s2_tls_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
     let reg = s2_registry().lock();
-    reg.tls_streams.get(&id).map(|e| e.peer_cert_chain_der.clone())
+    reg.tls_streams
+        .get(&id)
+        .map(|e| e.peer_cert_chain_der.clone())
 }
 
 /// NEW-13 / T2.7.11: lookup the negotiated (protocol, cipher, host, port)
@@ -1194,7 +1189,9 @@ pub(crate) fn s2_tls_session_info(id: i32) -> Option<(String, String, String, u1
 /// returning `None` if ALPN was not negotiated (or the stream id is unknown).
 pub(crate) fn s2_tls_negotiated_alpn(id: i32) -> Option<String> {
     let reg = s2_registry().lock();
-    reg.tls_streams.get(&id).and_then(|e| e.negotiated_alpn.clone())
+    reg.tls_streams
+        .get(&id)
+        .and_then(|e| e.negotiated_alpn.clone())
 }
 
 // ---- Field index constants -------------------------------------------------
@@ -1205,9 +1202,9 @@ const BB_LIMIT: usize = 2;
 const BB_CAP: usize = 3;
 const BB_MARK: usize = 4;
 const BB_ORDER: usize = 5; // 0=BIG_ENDIAN, 1=LITTLE_ENDIAN
-// NEW-17: extra fields for direct buffers. Bytes 6..7 are only populated
-// by `allocateDirect`; non-direct buffers leave them at default (0).
-const BB_NATIVE_ID: usize = 6;   // Long  — alloc_id from NativeMemoryTable, 0 if heap
+                           // NEW-17: extra fields for direct buffers. Bytes 6..7 are only populated
+                           // by `allocateDirect`; non-direct buffers leave them at default (0).
+const BB_NATIVE_ID: usize = 6; // Long  — alloc_id from NativeMemoryTable, 0 if heap
 const BB_DIRECT_FLAG: usize = 7; // Int   — 1 if direct, 0 otherwise
 
 // jdk/internal/ref/Cleaner$Deallocator synthetic for DirectByteBuffer.
@@ -1262,12 +1259,7 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
 /// (e.g. `ByteBuffer.hasArray`, `ByteBuffer.array`) sees null because
 /// the indexed slot 0 landed on Buffer.mark (int descriptor → Object
 /// coerced to Int by descriptor-aware set_field).
-pub(crate) fn bb_write_hb(
-    ctx: &mut dyn NativeContext,
-    buf: ObjectRef,
-    arr: ObjectRef,
-    cap: i32,
-) {
+pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: ObjectRef, cap: i32) {
     ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
     ctx.set_field_by_name(buf, "offset", Value::Int(0));
     ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
@@ -1393,7 +1385,11 @@ fn s2_bb_int_byte_off(bs: i32, unit: i32) -> i32 {
 fn s2_bb_read2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i16 {
     let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u16;
     let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u16;
-    if s2_bb_order(ctx, buf) == 1 { (b1 << 8 | b0) as i16 } else { (b0 << 8 | b1) as i16 }
+    if s2_bb_order(ctx, buf) == 1 {
+        (b1 << 8 | b0) as i16
+    } else {
+        (b0 << 8 | b1) as i16
+    }
 }
 
 fn s2_bb_write2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
@@ -1419,7 +1415,11 @@ fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
 }
 
 fn s2_bb_write4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i32) {
-    let bytes = if s2_bb_order(ctx, buf) == 1 { val.to_le_bytes() } else { val.to_be_bytes() };
+    let bytes = if s2_bb_order(ctx, buf) == 1 {
+        val.to_le_bytes()
+    } else {
+        val.to_be_bytes()
+    };
     for (i, &b) in bytes.iter().enumerate() {
         s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
     }
@@ -1430,11 +1430,19 @@ fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
     for i in 0..8i32 {
         bs[i as usize] = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, i)) as u8;
     }
-    if s2_bb_order(ctx, buf) == 1 { i64::from_le_bytes(bs) } else { i64::from_be_bytes(bs) }
+    if s2_bb_order(ctx, buf) == 1 {
+        i64::from_le_bytes(bs)
+    } else {
+        i64::from_be_bytes(bs)
+    }
 }
 
 fn s2_bb_write8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i64) {
-    let bytes = if s2_bb_order(ctx, buf) == 1 { val.to_le_bytes() } else { val.to_be_bytes() };
+    let bytes = if s2_bb_order(ctx, buf) == 1 {
+        val.to_le_bytes()
+    } else {
+        val.to_be_bytes()
+    };
     for (i, &b) in bytes.iter().enumerate() {
         s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
     }
@@ -1467,7 +1475,9 @@ fn s2_parse_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<(Str
             // `InetSocketAddress(InetAddress, int)` callers.
             match ctx.get_field_by_name(ia, "holder") {
                 Value::Object(Some(iah)) => match ctx.get_field_by_name(iah, "hostName") {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
+                    Value::Object(Some(s)) => {
+                        ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into())
+                    }
                     _ => "0.0.0.0".into(),
                 },
                 _ => "0.0.0.0".into(),
@@ -1551,13 +1561,7 @@ fn selector_poll(reqs: &[PollReq], timeout_ms: i32) -> Vec<i16> {
 
         // SAFETY: pfds is a valid &mut slice with correct layout; libc
         // reads it and writes only the revents fields.
-        let ret = unsafe {
-            libc::poll(
-                pfds.as_mut_ptr(),
-                pfds.len() as libc::nfds_t,
-                timeout_ms,
-            )
-        };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
         if ret < 0 {
             return Vec::new();
         }
@@ -1622,13 +1626,7 @@ fn selector_poll(reqs: &[PollReq], timeout_ms: i32) -> Vec<i16> {
 
         // SAFETY: pfds is a valid &mut slice with correct layout; WSAPoll
         // only reads the events field and writes the revents field.
-        let ret = unsafe {
-            WSAPoll(
-                pfds.as_mut_ptr(),
-                pfds.len() as u32,
-                timeout_ms,
-            )
-        };
+        let ret = unsafe { WSAPoll(pfds.as_mut_ptr(), pfds.len() as u32, timeout_ms) };
         if ret < 0 {
             return Vec::new();
         }
@@ -2051,7 +2049,8 @@ fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> 
         Ok((stream, _)) => {
             let id = reg.next_id;
             reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
-            while reg.streams.contains_key(&reg.next_id) || reg.listeners.contains_key(&reg.next_id) {
+            while reg.streams.contains_key(&reg.next_id) || reg.listeners.contains_key(&reg.next_id)
+            {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
             reg.streams.insert(id, stream);
@@ -2069,7 +2068,8 @@ pub(crate) fn s2_blocking_accept(reg: &mut SocketRegistry, lid: i32) -> Option<i
         Ok((stream, _)) => {
             let id = reg.next_id;
             reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
-            while reg.streams.contains_key(&reg.next_id) || reg.listeners.contains_key(&reg.next_id) {
+            while reg.streams.contains_key(&reg.next_id) || reg.listeners.contains_key(&reg.next_id)
+            {
                 reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             }
             reg.streams.insert(id, stream);
@@ -2097,24 +2097,24 @@ macro_rules! s2_view_buf_fn {
     ($name:ident, $cls:literal, $elem_sz:expr) => {
         fn $name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             let this = obj_arg(args, 0)?;
-            let pos  = s2_bb_pos(ctx, this);
-            let lim  = s2_bb_limit(ctx, this);
-            let rem  = (lim - pos) / $elem_sz;
-            let vb   = alloc_concurrent_synthetic(ctx, $cls, 6);
+            let pos = s2_bb_pos(ctx, this);
+            let lim = s2_bb_limit(ctx, this);
+            let rem = (lim - pos) / $elem_sz;
+            let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
             ctx.set_field(vb, BB_ARRAY, ctx.get_field(this, BB_ARRAY));
-            ctx.set_field(vb, BB_POS,   Value::Int(0));
+            ctx.set_field(vb, BB_POS, Value::Int(0));
             ctx.set_field(vb, BB_LIMIT, Value::Int(rem));
-            ctx.set_field(vb, BB_CAP,   Value::Int(rem));
-            ctx.set_field(vb, BB_MARK,  Value::Int(-(pos + 1)));
+            ctx.set_field(vb, BB_CAP, Value::Int(rem));
+            ctx.set_field(vb, BB_MARK, Value::Int(-(pos + 1)));
             ctx.set_field(vb, BB_ORDER, ctx.get_field(this, BB_ORDER));
             Ok(Some(Value::Object(Some(vb))))
         }
     };
 }
-s2_view_buf_fn!(s2_bb_as_int_buffer,    "java/nio/IntBuffer",    4);
-s2_view_buf_fn!(s2_bb_as_long_buffer,   "java/nio/LongBuffer",   8);
-s2_view_buf_fn!(s2_bb_as_short_buffer,  "java/nio/ShortBuffer",  2);
-s2_view_buf_fn!(s2_bb_as_float_buffer,  "java/nio/FloatBuffer",  4);
+s2_view_buf_fn!(s2_bb_as_int_buffer, "java/nio/IntBuffer", 4);
+s2_view_buf_fn!(s2_bb_as_long_buffer, "java/nio/LongBuffer", 8);
+s2_view_buf_fn!(s2_bb_as_short_buffer, "java/nio/ShortBuffer", 2);
+s2_view_buf_fn!(s2_bb_as_float_buffer, "java/nio/FloatBuffer", 4);
 s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
 
 /// `ByteBuffer.asCharBuffer()` — the view returned MUST have its backing
@@ -2143,9 +2143,21 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, rem_chars);
     if let Some(src) = s2_bb_arr(ctx, this) {
         for i in 0..rem_chars {
-            let hi = ctx.get_array_element(src, pos + 2 * i).as_int().unwrap_or(0) & 0xFF;
-            let lo = ctx.get_array_element(src, pos + 2 * i + 1).as_int().unwrap_or(0) & 0xFF;
-            let ch = if order == 1 { (lo << 8) | hi } else { (hi << 8) | lo };
+            let hi = ctx
+                .get_array_element(src, pos + 2 * i)
+                .as_int()
+                .unwrap_or(0)
+                & 0xFF;
+            let lo = ctx
+                .get_array_element(src, pos + 2 * i + 1)
+                .as_int()
+                .unwrap_or(0)
+                & 0xFF;
+            let ch = if order == 1 {
+                (lo << 8) | hi
+            } else {
+                (hi << 8) | lo
+            };
             ctx.set_array_element(chars_arr, i, Value::Int(ch));
         }
     }
@@ -2178,60 +2190,63 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
         Ok(Some(Value::Object(Some(s2_bb_alloc(ctx, cap)))))
     });
-    r.register(bb, "allocateDirect", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
-        // NEW-17: direct buffers back the array with REAL native memory and
-        // register a Cleaner action that frees the native allocation when
-        // the buffer becomes phantom-reachable.
-        let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    r.register(
+        bb,
+        "allocateDirect",
+        "(I)Ljava/nio/ByteBuffer;",
+        |ctx, args| {
+            // NEW-17: direct buffers back the array with REAL native memory and
+            // register a Cleaner action that frees the native allocation when
+            // the buffer becomes phantom-reachable.
+            let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
 
-        // 1) Acquire native memory from the per-VM table.
-        let alloc_id = match ctx.allocate_native_memory(cap, 8) {
-            Some((id, _ptr)) => id,
-            None => {
-                return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
-                    message: "DirectByteBuffer.allocateDirect: native memory allocation failed"
-                        .into(),
+            // 1) Acquire native memory from the per-VM table.
+            let alloc_id = match ctx.allocate_native_memory(cap, 8) {
+                Some((id, _ptr)) => id,
+                None => {
+                    return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                        message: "DirectByteBuffer.allocateDirect: native memory allocation failed"
+                            .into(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-        };
+            };
 
-        // 2) Allocate the buffer synthetic with 8 fields (the extra two
-        //    carry alloc_id + direct_flag). Use an empty byte[] for BB_ARRAY
-        //    so existing array-reading code paths see capacity 0 rather than
-        //    aliasing the native memory.
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
-        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
-        ctx.set_field(buf, BB_POS, Value::Int(0));
-        ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
-        ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
-        ctx.set_field(buf, BB_MARK, Value::Int(-1));
-        ctx.set_field(buf, BB_ORDER, Value::Int(0));
-        ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
-        ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
+            // 2) Allocate the buffer synthetic with 8 fields (the extra two
+            //    carry alloc_id + direct_flag). Use an empty byte[] for BB_ARRAY
+            //    so existing array-reading code paths see capacity 0 rather than
+            //    aliasing the native memory.
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
+            ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+            ctx.set_field(buf, BB_POS, Value::Int(0));
+            ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
+            ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
+            ctx.set_field(buf, BB_MARK, Value::Int(-1));
+            ctx.set_field(buf, BB_ORDER, Value::Int(0));
+            ctx.set_field(buf, BB_NATIVE_ID, Value::Long(alloc_id));
+            ctx.set_field(buf, BB_DIRECT_FLAG, Value::Int(1));
 
-        // 3) Allocate the deallocator (Runnable) synthetic carrying alloc_id.
-        let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, 1);
-        ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
+            // 3) Allocate the deallocator (Runnable) synthetic carrying alloc_id.
+            let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, 1);
+            ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
 
-        // 4) Allocate a Cleanable, install the deallocator as its action,
-        //    and register it as a Cleaner-typed phantom of `buf` in the
-        //    ref processor. When `buf` is collected, the GC will queue this
-        //    cleanable into shared.cleaner_thread; the interpreter's
-        //    run_cleaner_actions then invokes deallocator.run()V → frees
-        //    the native memory.
-        let cleanable = alloc_concurrent_synthetic(
-            ctx, "java/lang/ref/Cleaner$Cleanable", 3,
-        );
-        ctx.set_field(cleanable, 0, Value::Object(Some(dealloc)));
-        ctx.set_field(cleanable, 1, Value::Int(0));
-        ctx.set_field(cleanable, 2, Value::Int(-1));
-        // 3 = REF_TYPE_CLEANER (see vm_exec::discover_reference)
-        ctx.discover_reference(3, cleanable, buf, None);
+            // 4) Allocate a Cleanable, install the deallocator as its action,
+            //    and register it as a Cleaner-typed phantom of `buf` in the
+            //    ref processor. When `buf` is collected, the GC will queue this
+            //    cleanable into shared.cleaner_thread; the interpreter's
+            //    run_cleaner_actions then invokes deallocator.run()V → frees
+            //    the native memory.
+            let cleanable = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", 3);
+            ctx.set_field(cleanable, 0, Value::Object(Some(dealloc)));
+            ctx.set_field(cleanable, 1, Value::Int(0));
+            ctx.set_field(cleanable, 2, Value::Int(-1));
+            // 3 = REF_TYPE_CLEANER (see vm_exec::discover_reference)
+            ctx.discover_reference(3, cleanable, buf, None);
 
-        Ok(Some(Value::Object(Some(buf))))
-    });
+            Ok(Some(Value::Object(Some(buf))))
+        },
+    );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
         let arr = obj_arg(args, 0)?;
         let len = ctx.array_length(arr) as i32;
@@ -2283,15 +2298,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let dst_cap = ctx.array_length(dst) as i64;
-        if off < 0
-            || len < 0
-            || (off as i64) + (len as i64) > dst_cap
-        {
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > dst_cap {
             // ArrayIndexOutOfBoundsException is a subclass of
             // IndexOutOfBoundsException (what the JDK throws here), so it
             // satisfies `catch (IndexOutOfBoundsException)` callers.
             return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.saturating_add(len) },
+                index: if off < 0 {
+                    off
+                } else {
+                    off.saturating_add(len)
+                },
             }
             .into());
         }
@@ -2357,14 +2373,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let src_cap = ctx.array_length(src) as i64;
-        if off < 0
-            || len < 0
-            || (off as i64) + (len as i64) > src_cap
-        {
+        if off < 0 || len < 0 || (off as i64) + (len as i64) > src_cap {
             // ArrayIndexOutOfBoundsException ⊂ IndexOutOfBoundsException (JDK's
             // throw), so `catch (IndexOutOfBoundsException)` callers still match.
             return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                index: if off < 0 { off } else { off.saturating_add(len) },
+                index: if off < 0 {
+                    off
+                } else {
+                    off.saturating_add(len)
+                },
             }
             .into());
         }
@@ -2398,26 +2415,37 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, BB_POS, Value::Int(pos + len));
         Ok(Some(Value::Object(Some(this))))
     });
-    r.register(bb, "put", "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let src  = obj_arg(args, 1)?;
-        let src_pos = s2_bb_pos(ctx, src);
-        let src_lim = s2_bb_limit(ctx, src);
-        let n = (src_lim - src_pos).max(0);
-        let pos = s2_bb_pos(ctx, this);
-        if pos + n > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::BufferOverflowException.into());
-        }
-        let src_arr = match s2_bb_arr(ctx, src) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
-        let dst_arr = match s2_bb_arr(ctx, this) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
-        for i in 0..n as usize {
-            let b = ctx.get_array_element(src_arr, src_pos as usize + i);
-            ctx.set_array_element(dst_arr, pos as usize + i, b);
-        }
-        ctx.set_field(src, BB_POS, Value::Int(src_lim));
-        ctx.set_field(this, BB_POS, Value::Int(pos + n));
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        bb,
+        "put",
+        "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let src = obj_arg(args, 1)?;
+            let src_pos = s2_bb_pos(ctx, src);
+            let src_lim = s2_bb_limit(ctx, src);
+            let n = (src_lim - src_pos).max(0);
+            let pos = s2_bb_pos(ctx, this);
+            if pos + n > s2_bb_limit(ctx, this) {
+                return Err(RuntimeError::BufferOverflowException.into());
+            }
+            let src_arr = match s2_bb_arr(ctx, src) {
+                Some(a) => a,
+                None => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let dst_arr = match s2_bb_arr(ctx, this) {
+                Some(a) => a,
+                None => return Ok(Some(Value::Object(Some(this)))),
+            };
+            for i in 0..n as usize {
+                let b = ctx.get_array_element(src_arr, src_pos as usize + i);
+                ctx.set_array_element(dst_arr, pos as usize + i, b);
+            }
+            ctx.set_field(src, BB_POS, Value::Int(src_lim));
+            ctx.set_field(this, BB_POS, Value::Int(pos + n));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // getShort / putShort
     r.register(bb, "getShort", "()S", |ctx, args| {
@@ -2449,7 +2477,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "putShort", "(IS)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let v   = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         s2_bb_write2(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -2484,7 +2512,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "putChar", "(IC)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let v   = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         s2_bb_write2(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -2519,7 +2547,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "putInt", "(II)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let v   = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         s2_bb_write4(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -2542,7 +2570,11 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putLong", "(J)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = match args.get(1) { Some(Value::Long(l)) => *l, Some(Value::Int(i)) => *i as i64, _ => 0 };
+        let v = match args.get(1) {
+            Some(Value::Long(l)) => *l,
+            Some(Value::Int(i)) => *i as i64,
+            _ => 0,
+        };
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
@@ -2554,7 +2586,11 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "putLong", "(IJ)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let v   = match args.get(2) { Some(Value::Long(l)) => *l, Some(Value::Int(i)) => *i as i64, _ => 0 };
+        let v = match args.get(2) {
+            Some(Value::Long(l)) => *l,
+            Some(Value::Int(i)) => *i as i64,
+            _ => 0,
+        };
         s2_bb_write8(ctx, this, idx, v);
         Ok(Some(Value::Object(Some(this))))
     });
@@ -2573,11 +2609,17 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "getFloat", "(I)F", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        Ok(Some(Value::Float(f32::from_bits(s2_bb_read4(ctx, this, idx) as u32))))
+        Ok(Some(Value::Float(f32::from_bits(
+            s2_bb_read4(ctx, this, idx) as u32,
+        ))))
     });
     r.register(bb, "putFloat", "(F)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = match args.get(1) { Some(Value::Float(f)) => *f, Some(Value::Int(i)) => f32::from_bits(*i as u32), _ => 0.0 };
+        let v = match args.get(1) {
+            Some(Value::Float(f)) => *f,
+            Some(Value::Int(i)) => f32::from_bits(*i as u32),
+            _ => 0.0,
+        };
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
@@ -2600,7 +2642,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
     r.register(bb, "putDouble", "(D)Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = match args.get(1) { Some(Value::Double(d)) => *d, _ => 0.0 };
+        let v = match args.get(1) {
+            Some(Value::Double(d)) => *d,
+            _ => 0.0,
+        };
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
@@ -2617,21 +2662,21 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let pos = s2_bb_pos(ctx, this);
             ctx.set_field(this, BB_LIMIT, Value::Int(pos));
-            ctx.set_field(this, BB_POS,   Value::Int(0));
-            ctx.set_field(this, BB_MARK,  Value::Int(-1));
+            ctx.set_field(this, BB_POS, Value::Int(0));
+            ctx.set_field(this, BB_MARK, Value::Int(-1));
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "clear", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
             let cap = s2_bb_cap(ctx, this);
-            ctx.set_field(this, BB_POS,   Value::Int(0));
+            ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-            ctx.set_field(this, BB_MARK,  Value::Int(-1));
+            ctx.set_field(this, BB_MARK, Value::Int(-1));
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(bb, "rewind", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, BB_POS,  Value::Int(0));
+            ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_MARK, Value::Int(-1));
             Ok(Some(Value::Object(Some(this))))
         });
@@ -2646,14 +2691,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let mark = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
         if mark < 0 {
-            return Err(RuntimeError::IllegalStateException { message: "InvalidMarkException".into() }.into());
+            return Err(RuntimeError::IllegalStateException {
+                message: "InvalidMarkException".into(),
+            }
+            .into());
         }
         ctx.set_field(this, BB_POS, Value::Int(mark));
         Ok(Some(Value::Object(Some(this))))
     });
 
     // position / limit
-    r.register(bb, "position", "()I", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_POS))));
+    r.register(bb, "position", "()I", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_POS)))
+    });
     for ret in &["(I)Ljava/nio/Buffer;", "(I)Ljava/nio/ByteBuffer;"] {
         r.register(bb, "position", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -2662,7 +2712,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         });
     }
-    r.register(bb, "limit", "()I", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_LIMIT))));
+    r.register(bb, "limit", "()I", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_LIMIT)))
+    });
     for ret in &["(I)Ljava/nio/Buffer;", "(I)Ljava/nio/ByteBuffer;"] {
         r.register(bb, "limit", ret, |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -2671,68 +2723,92 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         });
     }
-    r.register(bb, "capacity",     "()I", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_CAP))));
-    r.register(bb, "remaining",    "()I", |ctx, args| {
+    r.register(bb, "capacity", "()I", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_CAP)))
+    });
+    r.register(bb, "remaining", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int((s2_bb_limit(ctx, this) - s2_bb_pos(ctx, this)).max(0))))
+        Ok(Some(Value::Int(
+            (s2_bb_limit(ctx, this) - s2_bb_pos(ctx, this)).max(0),
+        )))
     });
     r.register(bb, "hasRemaining", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if s2_bb_limit(ctx, this) > s2_bb_pos(ctx, this) { 1 } else { 0 })))
+        Ok(Some(Value::Int(
+            if s2_bb_limit(ctx, this) > s2_bb_pos(ctx, this) {
+                1
+            } else {
+                0
+            },
+        )))
     });
     r.register(bb, "compact", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this) as usize;
         let lim = s2_bb_limit(ctx, this) as usize;
         let cap = s2_bb_cap(ctx, this);
-        let n   = lim.saturating_sub(pos);
+        let n = lim.saturating_sub(pos);
         if let Some(arr) = s2_bb_arr(ctx, this) {
             for i in 0..n {
                 let b = ctx.get_array_element(arr, pos + i);
                 ctx.set_array_element(arr, i, b);
             }
         }
-        ctx.set_field(this, BB_POS,   Value::Int(n as i32));
+        ctx.set_field(this, BB_POS, Value::Int(n as i32));
         ctx.set_field(this, BB_LIMIT, Value::Int(cap));
-        ctx.set_field(this, BB_MARK,  Value::Int(-1));
+        ctx.set_field(this, BB_MARK, Value::Int(-1));
         Ok(Some(Value::Object(Some(this))))
     });
 
     // array / hasArray / isDirect / isReadOnly / arrayOffset
-    r.register(bb, "array",      "()[B", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_ARRAY))));
-    r.register(bb, "arrayOffset","()I",  |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(bb, "hasArray",   "()Z",  |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(match ctx.get_field(this, BB_ARRAY) { Value::Object(Some(_)) => 1, _ => 0 })))
+    r.register(bb, "array", "()[B", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_ARRAY)))
     });
-    r.register(bb, "isDirect",   "()Z",  |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(bb, "isReadOnly", "()Z",  |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(bb, "arrayOffset", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(bb, "hasArray", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(match ctx.get_field(this, BB_ARRAY) {
+            Value::Object(Some(_)) => 1,
+            _ => 0,
+        })))
+    });
+    r.register(bb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(bb, "isReadOnly", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
 
     // order
     r.register(bb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ord  = s2_bb_order(ctx, this);
-        let bo   = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+        let ord = s2_bb_order(ctx, this);
+        let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
         ctx.set_field(bo, 0, Value::Int(ord));
         Ok(Some(Value::Object(Some(bo))))
     });
-    r.register(bb, "order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ord  = match args.get(1) {
-            Some(Value::Object(Some(bo))) => ctx.get_field(*bo, 0).as_int().unwrap_or(0),
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        ctx.set_field(this, BB_ORDER, Value::Int(ord));
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        bb,
+        "order",
+        "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ord = match args.get(1) {
+                Some(Value::Object(Some(bo))) => ctx.get_field(*bo, 0).as_int().unwrap_or(0),
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            ctx.set_field(this, BB_ORDER, Value::Int(ord));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // slice / duplicate / asReadOnlyBuffer
     r.register(bb, "slice", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pos  = s2_bb_pos(ctx, this) as usize;
-        let lim  = s2_bb_limit(ctx, this) as usize;
-        let rem  = lim.saturating_sub(pos);
+        let pos = s2_bb_pos(ctx, this) as usize;
+        let lim = s2_bb_limit(ctx, this) as usize;
+        let rem = lim.saturating_sub(pos);
         let new_arr = ctx.new_array(ArrayElementType::Byte, rem);
         if let Some(src) = s2_bb_arr(ctx, this) {
             for i in 0..rem {
@@ -2758,124 +2834,231 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(buf, "limit", ctx.get_field(this, BB_LIMIT));
             ctx.set_field_by_name(buf, "mark", ctx.get_field(this, BB_MARK));
         }
-        for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
-        Ok(Some(Value::Object(Some(buf))))
-    });
-    r.register(bb, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        if let Some(src_arr) = s2_bb_arr(ctx, this) {
-            let cap = s2_bb_cap(ctx, this);
-            bb_write_hb(ctx, buf, src_arr, cap);
-            ctx.set_field_by_name(buf, "position", ctx.get_field(this, BB_POS));
-            ctx.set_field_by_name(buf, "limit", ctx.get_field(this, BB_LIMIT));
-            ctx.set_field_by_name(buf, "mark", ctx.get_field(this, BB_MARK));
-            ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
+        for f in 0..6 {
+            ctx.set_field(buf, f, ctx.get_field(this, f));
         }
-        for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
         Ok(Some(Value::Object(Some(buf))))
     });
+    r.register(
+        bb,
+        "asReadOnlyBuffer",
+        "()Ljava/nio/ByteBuffer;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+            if let Some(src_arr) = s2_bb_arr(ctx, this) {
+                let cap = s2_bb_cap(ctx, this);
+                bb_write_hb(ctx, buf, src_arr, cap);
+                ctx.set_field_by_name(buf, "position", ctx.get_field(this, BB_POS));
+                ctx.set_field_by_name(buf, "limit", ctx.get_field(this, BB_LIMIT));
+                ctx.set_field_by_name(buf, "mark", ctx.get_field(this, BB_MARK));
+                ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
+            }
+            for f in 0..6 {
+                ctx.set_field(buf, f, ctx.get_field(this, f));
+            }
+            Ok(Some(Value::Object(Some(buf))))
+        },
+    );
 
     // asXxxBuffer view buffers — each needs a named function (no closure captures)
-    r.register(bb, "asIntBuffer",    "()Ljava/nio/IntBuffer;",    s2_bb_as_int_buffer);
-    r.register(bb, "asLongBuffer",   "()Ljava/nio/LongBuffer;",   s2_bb_as_long_buffer);
-    r.register(bb, "asShortBuffer",  "()Ljava/nio/ShortBuffer;",  s2_bb_as_short_buffer);
-    r.register(bb, "asFloatBuffer",  "()Ljava/nio/FloatBuffer;",  s2_bb_as_float_buffer);
-    r.register(bb, "asDoubleBuffer", "()Ljava/nio/DoubleBuffer;", s2_bb_as_double_buffer);
-    r.register(bb, "asCharBuffer",   "()Ljava/nio/CharBuffer;",   s2_bb_as_char_buffer);
+    r.register(
+        bb,
+        "asIntBuffer",
+        "()Ljava/nio/IntBuffer;",
+        s2_bb_as_int_buffer,
+    );
+    r.register(
+        bb,
+        "asLongBuffer",
+        "()Ljava/nio/LongBuffer;",
+        s2_bb_as_long_buffer,
+    );
+    r.register(
+        bb,
+        "asShortBuffer",
+        "()Ljava/nio/ShortBuffer;",
+        s2_bb_as_short_buffer,
+    );
+    r.register(
+        bb,
+        "asFloatBuffer",
+        "()Ljava/nio/FloatBuffer;",
+        s2_bb_as_float_buffer,
+    );
+    r.register(
+        bb,
+        "asDoubleBuffer",
+        "()Ljava/nio/DoubleBuffer;",
+        s2_bb_as_double_buffer,
+    );
+    r.register(
+        bb,
+        "asCharBuffer",
+        "()Ljava/nio/CharBuffer;",
+        s2_bb_as_char_buffer,
+    );
 
     // IntBuffer get/put (positions in int units; byte_start from BB_MARK)
     let ib = "java/nio/IntBuffer";
     r.register(ib, "get", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pos  = s2_bb_pos(ctx, this);
+        let pos = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
-        let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
+        let bs = {
+            let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            if m < 0 {
+                -(m + 1)
+            } else {
+                0
+            }
+        };
         // B8: `pos * 4` and the following add can overflow for a corrupt
         // position; `s2_bb_int_byte_off` saturates to a negative sentinel that
         // the byte accessors treat as out-of-range.
-        let v  = s2_bb_read4(ctx, this, s2_bb_int_byte_off(bs, pos));
+        let v = s2_bb_read4(ctx, this, s2_bb_int_byte_off(bs, pos));
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
         Ok(Some(Value::Int(v)))
     });
     r.register(ib, "get", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx  = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let bs   = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
-        Ok(Some(Value::Int(s2_bb_read4(ctx, this, s2_bb_int_byte_off(bs, idx)))))
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let bs = {
+            let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            if m < 0 {
+                -(m + 1)
+            } else {
+                0
+            }
+        };
+        Ok(Some(Value::Int(s2_bb_read4(
+            ctx,
+            this,
+            s2_bb_int_byte_off(bs, idx),
+        ))))
     });
     r.register(ib, "put", "(I)Ljava/nio/IntBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v    = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let pos  = s2_bb_pos(ctx, this);
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let pos = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
-        let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
+        let bs = {
+            let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            if m < 0 {
+                -(m + 1)
+            } else {
+                0
+            }
+        };
         s2_bb_write4(ctx, this, s2_bb_int_byte_off(bs, pos), v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(ib, "put", "(II)Ljava/nio/IntBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx  = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let v    = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let bs   = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let bs = {
+            let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            if m < 0 {
+                -(m + 1)
+            } else {
+                0
+            }
+        };
         s2_bb_write4(ctx, this, s2_bb_int_byte_off(bs, idx), v);
         Ok(Some(Value::Object(Some(this))))
     });
 
     // Shared Buffer methods for all view-buffer types
     for cls in &[
-        "java/nio/IntBuffer", "java/nio/LongBuffer", "java/nio/ShortBuffer",
-        "java/nio/FloatBuffer", "java/nio/DoubleBuffer",
+        "java/nio/IntBuffer",
+        "java/nio/LongBuffer",
+        "java/nio/ShortBuffer",
+        "java/nio/FloatBuffer",
+        "java/nio/DoubleBuffer",
     ] {
         let cls = *cls;
-        r.register(cls, "position",     "()I",  |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, BB_POS))));
-        r.register(cls, "limit",        "()I",  |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, BB_LIMIT))));
-        r.register(cls, "capacity",     "()I",  |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, BB_CAP))));
-        r.register(cls, "remaining",    "()I",  |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int((s2_bb_limit(ctx,this)-s2_bb_pos(ctx,this)).max(0))))
+        r.register(cls, "position", "()I", |ctx, args| {
+            Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_POS)))
         });
-        r.register(cls, "hasRemaining", "()Z",  |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int(if s2_bb_limit(ctx,this)>s2_bb_pos(ctx,this) { 1 } else { 0 })))
+        r.register(cls, "limit", "()I", |ctx, args| {
+            Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_LIMIT)))
         });
-        r.register(cls, "flip",  "()Ljava/nio/Buffer;", |ctx, args| {
+        r.register(cls, "capacity", "()I", |ctx, args| {
+            Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_CAP)))
+        });
+        r.register(cls, "remaining", "()I", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let pos  = s2_bb_pos(ctx, this);
+            Ok(Some(Value::Int(
+                (s2_bb_limit(ctx, this) - s2_bb_pos(ctx, this)).max(0),
+            )))
+        });
+        r.register(cls, "hasRemaining", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(
+                if s2_bb_limit(ctx, this) > s2_bb_pos(ctx, this) {
+                    1
+                } else {
+                    0
+                },
+            )))
+        });
+        r.register(cls, "flip", "()Ljava/nio/Buffer;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pos = s2_bb_pos(ctx, this);
             ctx.set_field(this, BB_LIMIT, Value::Int(pos));
-            ctx.set_field(this, BB_POS,   Value::Int(0));
+            ctx.set_field(this, BB_POS, Value::Int(0));
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(cls, "clear", "()Ljava/nio/Buffer;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cap  = s2_bb_cap(ctx, this);
-            ctx.set_field(this, BB_POS,   Value::Int(0));
+            let cap = s2_bb_cap(ctx, this);
+            ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
             Ok(Some(Value::Object(Some(this))))
         });
-        r.register(cls, "array",      "()[I",  |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, BB_ARRAY))));
-        r.register(cls, "isDirect",   "()Z",   |_,_| Ok(Some(Value::Int(0))));
-        r.register(cls, "isReadOnly", "()Z",   |_,_| Ok(Some(Value::Int(0))));
+        r.register(cls, "array", "()[I", |ctx, args| {
+            Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_ARRAY)))
+        });
+        r.register(cls, "isDirect", "()Z", |_, _| Ok(Some(Value::Int(0))));
+        r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }
 
     // equals / hashCode / compareTo / toString
     r.register(bb, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
-        let this  = obj_arg(args, 0)?;
-        let other = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
-        if this == other { return Ok(Some(Value::Int(1))); }
-        let pa = s2_bb_pos(ctx, this)  as usize; let la = s2_bb_limit(ctx, this)  as usize;
-        let pb = s2_bb_pos(ctx, other) as usize; let lb = s2_bb_limit(ctx, other) as usize;
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        if this == other {
+            return Ok(Some(Value::Int(1)));
+        }
+        let pa = s2_bb_pos(ctx, this) as usize;
+        let la = s2_bb_limit(ctx, this) as usize;
+        let pb = s2_bb_pos(ctx, other) as usize;
+        let lb = s2_bb_limit(ctx, other) as usize;
         let na = la.saturating_sub(pa);
-        if na != lb.saturating_sub(pb) { return Ok(Some(Value::Int(0))); }
-        let aa = match s2_bb_arr(ctx, this)  { Some(a) => a, None => return Ok(Some(Value::Int(0))) };
-        let ab = match s2_bb_arr(ctx, other) { Some(a) => a, None => return Ok(Some(Value::Int(0))) };
+        if na != lb.saturating_sub(pb) {
+            return Ok(Some(Value::Int(0)));
+        }
+        let aa = match s2_bb_arr(ctx, this) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let ab = match s2_bb_arr(ctx, other) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Int(0))),
+        };
         for i in 0..na {
-            if ctx.get_array_element(aa, pa+i) != ctx.get_array_element(ab, pb+i) { return Ok(Some(Value::Int(0))); }
+            if ctx.get_array_element(aa, pa + i) != ctx.get_array_element(ab, pb + i) {
+                return Ok(Some(Value::Int(0)));
+            }
         }
         Ok(Some(Value::Int(1)))
     });
@@ -2893,28 +3076,40 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(h)))
     });
     r.register(bb, "compareTo", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this  = obj_arg(args, 0)?;
+        let this = obj_arg(args, 0)?;
         let other = obj_arg(args, 1)?;
-        let pa = s2_bb_pos(ctx, this)  as usize; let la = s2_bb_limit(ctx, this)  as usize;
-        let pb = s2_bb_pos(ctx, other) as usize; let lb = s2_bb_limit(ctx, other) as usize;
+        let pa = s2_bb_pos(ctx, this) as usize;
+        let la = s2_bb_limit(ctx, this) as usize;
+        let pb = s2_bb_pos(ctx, other) as usize;
+        let lb = s2_bb_limit(ctx, other) as usize;
         let na = la.saturating_sub(pa);
         let nb = lb.saturating_sub(pb);
-        let n  = na.min(nb);
-        let aa = match s2_bb_arr(ctx, this)  { Some(a) => a, None => return Ok(Some(Value::Int(0))) };
-        let ab = match s2_bb_arr(ctx, other) { Some(a) => a, None => return Ok(Some(Value::Int(0))) };
+        let n = na.min(nb);
+        let aa = match s2_bb_arr(ctx, this) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        let ab = match s2_bb_arr(ctx, other) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Int(0))),
+        };
         for i in 0..n {
-            let va = ctx.get_array_element(aa, pa+i).as_int().unwrap_or(0);
-            let vb = ctx.get_array_element(ab, pb+i).as_int().unwrap_or(0);
-            if va != vb { return Ok(Some(Value::Int(va - vb))); }
+            let va = ctx.get_array_element(aa, pa + i).as_int().unwrap_or(0);
+            let vb = ctx.get_array_element(ab, pb + i).as_int().unwrap_or(0);
+            if va != vb {
+                return Ok(Some(Value::Int(va - vb)));
+            }
         }
         Ok(Some(Value::Int((na as i32) - (nb as i32))))
     });
     r.register(bb, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pos  = s2_bb_pos(ctx, this);
-        let lim  = s2_bb_limit(ctx, this);
-        let cap  = s2_bb_cap(ctx, this);
-        let s    = ctx.create_string(&format!("java.nio.HeapByteBuffer[pos={pos} lim={lim} cap={cap}]"));
+        let pos = s2_bb_pos(ctx, this);
+        let lim = s2_bb_limit(ctx, this);
+        let cap = s2_bb_cap(ctx, this);
+        let s = ctx.create_string(&format!(
+            "java.nio.HeapByteBuffer[pos={pos} lim={lim} cap={cap}]"
+        ));
         Ok(Some(Value::Object(Some(s))))
     });
 
@@ -2949,7 +3144,7 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
         ctx.set_field(obj, 0, Value::Int(1)); // x86/ARM64 = LITTLE_ENDIAN
         Ok(Some(Value::Object(Some(obj))))
     });
-    r.register(bo, "BIG_ENDIAN",    "Ljava/nio/ByteOrder;", |ctx, _| {
+    r.register(bo, "BIG_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
         let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
         ctx.set_field(obj, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
@@ -2961,14 +3156,21 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
     });
     r.register(bo, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = if ctx.get_field(this, 0).as_int().unwrap_or(0) == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
+        let name = if ctx.get_field(this, 0).as_int().unwrap_or(0) == 1 {
+            "LITTLE_ENDIAN"
+        } else {
+            "BIG_ENDIAN"
+        };
         let s = ctx.create_string(name);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(bo, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
-        let this  = obj_arg(args, 0)?;
-        let other = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(Some(Value::Int(0))) };
-        let a = ctx.get_field(this,  0).as_int().unwrap_or(0);
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let a = ctx.get_field(this, 0).as_int().unwrap_or(0);
         let b = ctx.get_field(other, 0).as_int().unwrap_or(0);
         Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
     });
@@ -2979,34 +3181,44 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
 fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
     let sc = "java/nio/channels/SocketChannel";
 
-    r.register(sc, "open", "()Ljava/nio/channels/SocketChannel;", |ctx, _| {
-        let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
-        ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
-        ctx.set_field(ch, S2SC_OPEN,      Value::Int(1));
-        ctx.set_field(ch, S2SC_ADDR,      Value::Object(None));
-        ctx.set_field(ch, S2SC_SOCK_ID,   Value::Int(-1));
-        ctx.set_field(ch, S2SC_BLOCKING,  Value::Int(1));
-        Ok(Some(Value::Object(Some(ch))))
-    });
-    r.register(sc, "open", "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;", |ctx, args| {
-        let addr_val = args.first().copied().unwrap_or(Value::Object(None));
-        let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
-        ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
-        ctx.set_field(ch, S2SC_OPEN,      Value::Int(1));
-        ctx.set_field(ch, S2SC_ADDR,      addr_val);
-        ctx.set_field(ch, S2SC_SOCK_ID,   Value::Int(-1));
-        ctx.set_field(ch, S2SC_BLOCKING,  Value::Int(1));
-        if let Value::Object(Some(addr)) = addr_val {
-            if let Some((host, port)) = s2_parse_socket_addr(ctx, addr) {
-                if let Ok(stream) = TcpStream::connect(format!("{host}:{port}")) {
-                    let id = s2_alloc_stream(stream);
-                    ctx.set_field(ch, S2SC_SOCK_ID,   Value::Int(id));
-                    ctx.set_field(ch, S2SC_CONNECTED, Value::Int(1));
+    r.register(
+        sc,
+        "open",
+        "()Ljava/nio/channels/SocketChannel;",
+        |ctx, _| {
+            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+            ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
+            ctx.set_field(ch, S2SC_OPEN, Value::Int(1));
+            ctx.set_field(ch, S2SC_ADDR, Value::Object(None));
+            ctx.set_field(ch, S2SC_SOCK_ID, Value::Int(-1));
+            ctx.set_field(ch, S2SC_BLOCKING, Value::Int(1));
+            Ok(Some(Value::Object(Some(ch))))
+        },
+    );
+    r.register(
+        sc,
+        "open",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
+        |ctx, args| {
+            let addr_val = args.first().copied().unwrap_or(Value::Object(None));
+            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+            ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
+            ctx.set_field(ch, S2SC_OPEN, Value::Int(1));
+            ctx.set_field(ch, S2SC_ADDR, addr_val);
+            ctx.set_field(ch, S2SC_SOCK_ID, Value::Int(-1));
+            ctx.set_field(ch, S2SC_BLOCKING, Value::Int(1));
+            if let Value::Object(Some(addr)) = addr_val {
+                if let Some((host, port)) = s2_parse_socket_addr(ctx, addr) {
+                    if let Ok(stream) = TcpStream::connect(format!("{host}:{port}")) {
+                        let id = s2_alloc_stream(stream);
+                        ctx.set_field(ch, S2SC_SOCK_ID, Value::Int(id));
+                        ctx.set_field(ch, S2SC_CONNECTED, Value::Int(1));
+                    }
                 }
             }
-        }
-        Ok(Some(Value::Object(Some(ch))))
-    });
+            Ok(Some(Value::Object(Some(ch))))
+        },
+    );
     r.register(sc, "connect", "(Ljava/net/SocketAddress;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // If address is null, fall back to stub (mark as connected, return true)
@@ -3022,9 +3234,11 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         if let Some((host, port)) = s2_parse_socket_addr(ctx, addr) {
             match TcpStream::connect(format!("{host}:{port}")) {
                 Ok(stream) => {
-                    if !blocking { let _ = stream.set_nonblocking(true); }
+                    if !blocking {
+                        let _ = stream.set_nonblocking(true);
+                    }
                     let id = s2_alloc_stream(stream);
-                    ctx.set_field(this, S2SC_SOCK_ID,   Value::Int(id));
+                    ctx.set_field(this, S2SC_SOCK_ID, Value::Int(id));
                     ctx.set_field(this, S2SC_CONNECTED, Value::Int(1));
                     return Ok(Some(Value::Int(if blocking { 1 } else { 0 })));
                 }
@@ -3033,7 +3247,8 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
                     if blocking {
                         return Err(RuntimeError::IOException {
                             message: format!("Connection refused: {host}:{port}"),
-                        }.into());
+                        }
+                        .into());
                     }
                 }
             }
@@ -3042,25 +3257,31 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.register(sc, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this    = obj_arg(args, 0)?;
-        let bb      = obj_arg(args, 1)?;
+        let this = obj_arg(args, 0)?;
+        let bb = obj_arg(args, 1)?;
         let sock_id = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
-        if sock_id < 0 { return Ok(Some(Value::Int(-1))); }
+        if sock_id < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
         let pos = s2_bb_pos(ctx, bb) as usize;
         let lim = s2_bb_limit(ctx, bb) as usize;
         let cap = lim.saturating_sub(pos);
-        if cap == 0 { return Ok(Some(Value::Int(0))); }
+        if cap == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let mut tmp = vec![0u8; cap];
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
                 match stream.read(&mut tmp) {
-                    Ok(0)  => -1i32,
-                    Ok(n)  => n as i32,
+                    Ok(0) => -1i32,
+                    Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,
                 }
-            } else { -1 }
+            } else {
+                -1
+            }
         };
         if n > 0 {
             if let Some(arr) = s2_bb_arr(ctx, bb) {
@@ -3073,23 +3294,30 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(n)))
     });
     r.register(sc, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this    = obj_arg(args, 0)?;
-        let bb      = obj_arg(args, 1)?;
+        let this = obj_arg(args, 0)?;
+        let bb = obj_arg(args, 1)?;
         let sock_id = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
         if sock_id < 0 {
-            return Err(RuntimeError::IOException { message: "not connected".into() }.into());
+            return Err(RuntimeError::IOException {
+                message: "not connected".into(),
+            }
+            .into());
         }
         let data = s2_bb_remaining_bytes(ctx, bb);
-        if data.is_empty() { return Ok(Some(Value::Int(0))); }
+        if data.is_empty() {
+            return Ok(Some(Value::Int(0)));
+        }
         let n = {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get_mut(&sock_id) {
                 match stream.write(&data) {
-                    Ok(n)  => n as i32,
+                    Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,
                 }
-            } else { -1 }
+            } else {
+                -1
+            }
         };
         if n > 0 {
             let pos = s2_bb_pos(ctx, bb);
@@ -3100,11 +3328,13 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
     });
     r.register(sc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid  = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
-        if sid >= 0 { s2_registry().lock().streams.remove(&sid); }
+        let sid = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
+        if sid >= 0 {
+            s2_registry().lock().streams.remove(&sid);
+        }
         ctx.set_field(this, S2SC_CONNECTED, Value::Int(0));
-        ctx.set_field(this, S2SC_OPEN,      Value::Int(0));
-        ctx.set_field(this, S2SC_SOCK_ID,   Value::Int(-1));
+        ctx.set_field(this, S2SC_OPEN, Value::Int(0));
+        ctx.set_field(this, S2SC_SOCK_ID, Value::Int(-1));
         Ok(None)
     });
     r.register(sc, "isConnected", "()Z", |ctx, args| {
@@ -3113,22 +3343,27 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
     r.register(sc, "isOpen", "()Z", |ctx, args| {
         Ok(Some(ctx.get_field(obj_arg(args, 0)?, S2SC_OPEN)))
     });
-    r.register(sc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this     = obj_arg(args, 0)?;
-        let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        ctx.set_field(this, S2SC_BLOCKING, Value::Int(blocking));
-        let sid = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
-        if sid >= 0 {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                let _ = stream.set_nonblocking(blocking == 0);
+    r.register(
+        sc,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+            ctx.set_field(this, S2SC_BLOCKING, Value::Int(blocking));
+            let sid = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
+            if sid >= 0 {
+                let mut reg = s2_registry().lock();
+                if let Some(stream) = reg.streams.get_mut(&sid) {
+                    let _ = stream.set_nonblocking(blocking == 0);
+                }
             }
-        }
-        Ok(Some(Value::Object(Some(this))))
-    });
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     r.register(sc, "finishConnect", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid  = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
+        let sid = ctx.get_field(this, S2SC_SOCK_ID).as_int().unwrap_or(-1);
         if sid >= 0 {
             ctx.set_field(this, S2SC_CONNECTED, Value::Int(1));
             return Ok(Some(Value::Int(1)));
@@ -3137,7 +3372,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
             if let Some((host, port)) = s2_parse_socket_addr(ctx, addr) {
                 if let Ok(stream) = TcpStream::connect(format!("{host}:{port}")) {
                     let id = s2_alloc_stream(stream);
-                    ctx.set_field(this, S2SC_SOCK_ID,   Value::Int(id));
+                    ctx.set_field(this, S2SC_SOCK_ID, Value::Int(id));
                     ctx.set_field(this, S2SC_CONNECTED, Value::Int(1));
                     return Ok(Some(Value::Int(1)));
                 }
@@ -3145,8 +3380,18 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
-    r.register(sc, "register", "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;", s2_register_channel);
-    r.register(sc, "register", "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;", s2_register_channel);
+    r.register(
+        sc,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
+    r.register(
+        sc,
+        "register",
+        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
 }
 
 // ---- ServerSocketChannel (real TcpListener) --------------------------------
@@ -3154,15 +3399,20 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
 fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
     let ssc = "java/nio/channels/ServerSocketChannel";
 
-    r.register(ssc, "open", "()Ljava/nio/channels/ServerSocketChannel;", |ctx, _| {
-        let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5);
-        ctx.set_field(ch, S2SSC_OPEN,        Value::Int(1));
-        ctx.set_field(ch, S2SSC_BOUND,       Value::Int(0));
-        ctx.set_field(ch, S2SSC_LISTENER_ID, Value::Int(-1));
-        ctx.set_field(ch, S2SSC_PORT,        Value::Int(0));
-        ctx.set_field(ch, S2SSC_PENDING,     Value::Int(-1));
-        Ok(Some(Value::Object(Some(ch))))
-    });
+    r.register(
+        ssc,
+        "open",
+        "()Ljava/nio/channels/ServerSocketChannel;",
+        |ctx, _| {
+            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5);
+            ctx.set_field(ch, S2SSC_OPEN, Value::Int(1));
+            ctx.set_field(ch, S2SSC_BOUND, Value::Int(0));
+            ctx.set_field(ch, S2SSC_LISTENER_ID, Value::Int(-1));
+            ctx.set_field(ch, S2SSC_PORT, Value::Int(0));
+            ctx.set_field(ch, S2SSC_PENDING, Value::Int(-1));
+            Ok(Some(Value::Object(Some(ch))))
+        },
+    );
     for desc in &[
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/ServerSocketChannel;",
         "(Ljava/net/SocketAddress;I)Ljava/nio/channels/ServerSocketChannel;",
@@ -3182,10 +3432,15 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
                     Ok(listener) => {
                         let id = s2_alloc_listener(listener);
                         ctx.set_field(this, S2SSC_LISTENER_ID, Value::Int(id));
-                        ctx.set_field(this, S2SSC_BOUND,       Value::Int(1));
-                        ctx.set_field(this, S2SSC_PORT,        Value::Int(port as i32));
+                        ctx.set_field(this, S2SSC_BOUND, Value::Int(1));
+                        ctx.set_field(this, S2SSC_PORT, Value::Int(port as i32));
                     }
-                    Err(e) => return Err(RuntimeError::IOException { message: format!("bind {host}:{port}: {e}") }.into()),
+                    Err(e) => {
+                        return Err(RuntimeError::IOException {
+                            message: format!("bind {host}:{port}: {e}"),
+                        }
+                        .into())
+                    }
                 }
             } else {
                 // Unresolvable address → stub bound
@@ -3194,75 +3449,114 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         });
     }
-    r.register(ssc, "accept", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let lid  = ctx.get_field(this, S2SSC_LISTENER_ID).as_int().unwrap_or(-1);
-        if lid < 0 {
-            // Stub-bound (null address) — return a disconnected stub SocketChannel
+    r.register(
+        ssc,
+        "accept",
+        "()Ljava/nio/channels/SocketChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let lid = ctx
+                .get_field(this, S2SSC_LISTENER_ID)
+                .as_int()
+                .unwrap_or(-1);
+            if lid < 0 {
+                // Stub-bound (null address) — return a disconnected stub SocketChannel
+                let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+                ctx.set_field(sc, S2SC_CONNECTED, Value::Int(1));
+                ctx.set_field(sc, S2SC_OPEN, Value::Int(1));
+                ctx.set_field(sc, S2SC_ADDR, Value::Object(None));
+                ctx.set_field(sc, S2SC_SOCK_ID, Value::Int(-1));
+                ctx.set_field(sc, S2SC_BLOCKING, Value::Int(1));
+                return Ok(Some(Value::Object(Some(sc))));
+            }
+            let pending = ctx.get_field(this, S2SSC_PENDING).as_int().unwrap_or(-1);
+            let stream_id = if pending >= 0 {
+                ctx.set_field(this, S2SSC_PENDING, Value::Int(-1));
+                pending
+            } else {
+                let result = {
+                    let mut reg = s2_registry().lock();
+                    s2_blocking_accept(&mut reg, lid)
+                };
+                match result {
+                    Some(id) => id,
+                    None => return Ok(Some(Value::Object(None))),
+                }
+            };
             let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
             ctx.set_field(sc, S2SC_CONNECTED, Value::Int(1));
-            ctx.set_field(sc, S2SC_OPEN,      Value::Int(1));
-            ctx.set_field(sc, S2SC_ADDR,      Value::Object(None));
-            ctx.set_field(sc, S2SC_SOCK_ID,   Value::Int(-1));
-            ctx.set_field(sc, S2SC_BLOCKING,  Value::Int(1));
-            return Ok(Some(Value::Object(Some(sc))));
-        }
-        let pending = ctx.get_field(this, S2SSC_PENDING).as_int().unwrap_or(-1);
-        let stream_id = if pending >= 0 {
-            ctx.set_field(this, S2SSC_PENDING, Value::Int(-1));
-            pending
-        } else {
-            let result = { let mut reg = s2_registry().lock(); s2_blocking_accept(&mut reg, lid) };
-            match result { Some(id) => id, None => return Ok(Some(Value::Object(None))) }
-        };
-        let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
-        ctx.set_field(sc, S2SC_CONNECTED, Value::Int(1));
-        ctx.set_field(sc, S2SC_OPEN,      Value::Int(1));
-        ctx.set_field(sc, S2SC_ADDR,      Value::Object(None));
-        ctx.set_field(sc, S2SC_SOCK_ID,   Value::Int(stream_id));
-        ctx.set_field(sc, S2SC_BLOCKING,  Value::Int(1));
-        Ok(Some(Value::Object(Some(sc))))
-    });
+            ctx.set_field(sc, S2SC_OPEN, Value::Int(1));
+            ctx.set_field(sc, S2SC_ADDR, Value::Object(None));
+            ctx.set_field(sc, S2SC_SOCK_ID, Value::Int(stream_id));
+            ctx.set_field(sc, S2SC_BLOCKING, Value::Int(1));
+            Ok(Some(Value::Object(Some(sc))))
+        },
+    );
     r.register(ssc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid  = ctx.get_field(this, S2SSC_LISTENER_ID).as_int().unwrap_or(-1);
-        if lid >= 0 { s2_registry().lock().listeners.remove(&lid); }
-        ctx.set_field(this, S2SSC_OPEN,        Value::Int(0));
-        ctx.set_field(this, S2SSC_BOUND,       Value::Int(0));
+        let lid = ctx
+            .get_field(this, S2SSC_LISTENER_ID)
+            .as_int()
+            .unwrap_or(-1);
+        if lid >= 0 {
+            s2_registry().lock().listeners.remove(&lid);
+        }
+        ctx.set_field(this, S2SSC_OPEN, Value::Int(0));
+        ctx.set_field(this, S2SSC_BOUND, Value::Int(0));
         ctx.set_field(this, S2SSC_LISTENER_ID, Value::Int(-1));
         Ok(None)
     });
-    r.register(ssc, "isOpen", "()Z", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, S2SSC_OPEN))));
-    r.register(ssc, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |ctx, args| {
-        let this     = obj_arg(args, 0)?;
-        let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        let lid = ctx.get_field(this, S2SSC_LISTENER_ID).as_int().unwrap_or(-1);
-        if lid >= 0 {
-            let reg = s2_registry().lock();
-            if let Some(listener) = reg.listeners.get(&lid) {
-                let _ = listener.set_nonblocking(blocking == 0);
-            }
-        }
-        Ok(Some(Value::Object(Some(this))))
+    r.register(ssc, "isOpen", "()Z", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, S2SSC_OPEN)))
     });
-    r.register(ssc, "register", "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;", s2_register_channel);
-    r.register(ssc, "register", "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;", s2_register_channel);
+    r.register(
+        ssc,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+            let lid = ctx
+                .get_field(this, S2SSC_LISTENER_ID)
+                .as_int()
+                .unwrap_or(-1);
+            if lid >= 0 {
+                let reg = s2_registry().lock();
+                if let Some(listener) = reg.listeners.get(&lid) {
+                    let _ = listener.set_nonblocking(blocking == 0);
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        ssc,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
+    r.register(
+        ssc,
+        "register",
+        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
 }
 
 // ---- Channel registration & Selector ---------------------------------------
 
 pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let channel  = args.first().copied().unwrap_or(Value::Object(None));
+    let channel = args.first().copied().unwrap_or(Value::Object(None));
     let selector = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ops      = args.get(2).copied().unwrap_or(Value::Int(0));
+    let ops = args.get(2).copied().unwrap_or(Value::Int(0));
     let key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
     ctx.set_field(key, 0, channel);
     ctx.set_field(key, 1, selector);
     ctx.set_field(key, 2, ops);
     ctx.set_field(key, 3, Value::Int(0)); // readyOps = 0
-    // Add key to selector's key list
+                                          // Add key to selector's key list
     if let Value::Object(Some(sel)) = selector {
-        let n       = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
+        let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
         let new_cap = (n + 1).max(8);
         let new_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
         if let Value::Object(Some(old_arr)) = ctx.get_field(sel, S2SEL_KEYS) {
@@ -3272,22 +3566,24 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
             }
         }
         ctx.set_array_element(new_arr, n, Value::Object(Some(key)));
-        ctx.set_field(sel, S2SEL_KEYS,  Value::Object(Some(new_arr)));
+        ctx.set_field(sel, S2SEL_KEYS, Value::Object(Some(new_arr)));
         ctx.set_field(sel, S2SEL_NKEYS, Value::Int((n + 1) as i32));
     }
     Ok(Some(Value::Object(Some(key))))
 }
 
 fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bool) -> Value {
-    let n       = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
-    let set     = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-    let keys_v  = ctx.get_field(sel, S2SEL_KEYS);
+    let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let keys_v = ctx.get_field(sel, S2SEL_KEYS);
     if let Value::Object(Some(keys_arr)) = keys_v {
         let mut ready: Vec<ObjectRef> = Vec::new();
         for i in 0..n {
             if let Value::Object(Some(k)) = ctx.get_array_element(keys_arr, i) {
                 let rops = ctx.get_field(k, 3).as_int().unwrap_or(0);
-                if !selected_only || rops != 0 { ready.push(k); }
+                if !selected_only || rops != 0 {
+                    ready.push(k);
+                }
             }
         }
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
@@ -3312,8 +3608,8 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
             eprintln!("[SEL] Selector.open()");
         }
         let s = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3);
-        ctx.set_field(s, S2SEL_OPEN,  Value::Int(1));
-        ctx.set_field(s, S2SEL_KEYS,  Value::Object(None));
+        ctx.set_field(s, S2SEL_OPEN, Value::Int(1));
+        ctx.set_field(s, S2SEL_KEYS, Value::Object(None));
         ctx.set_field(s, S2SEL_NKEYS, Value::Int(0));
         Ok(Some(Value::Object(Some(s))))
     });
@@ -3342,10 +3638,12 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         let raw = match args.get(1) {
             Some(Value::Long(v)) => *v,
             Some(Value::Int(v)) => *v as i64,
-            _ => return Err(RuntimeError::IllegalArgumentException {
-                message: "select: missing timeout argument".into(),
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "select: missing timeout argument".into(),
+                }
+                .into())
             }
-            .into()),
         };
         if raw < 0 {
             return Err(RuntimeError::IllegalArgumentException {
@@ -3369,17 +3667,24 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     // selectNow() — non-blocking (timeout=0)
     r.register(sel, "selectNow", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(s2_selector_do_poll_with_timeout(ctx, this, 0))))
+        Ok(Some(Value::Int(s2_selector_do_poll_with_timeout(
+            ctx, this, 0,
+        ))))
     });
     // wakeup() — write one byte to the selector's self-connected UDP
     // socket so any thread currently blocked in `select()` returns
     // promptly. (NEW-3: previously a no-op that returned `this` without
     // doing anything, leaving blocked threads stuck until their timeout.)
-    r.register(sel, "wakeup", "()Ljava/nio/channels/Selector;", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        signal_wakeup(this);
-        Ok(Some(Value::Object(Some(this))))
-    });
+    r.register(
+        sel,
+        "wakeup",
+        "()Ljava/nio/channels/Selector;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            signal_wakeup(this);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     r.register(sel, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = ctx.get_field(this, S2SEL_OPEN);
@@ -3388,7 +3693,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(v))
     });
-    r.register(sel, "close",  "()V", |ctx, args| {
+    r.register(sel, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, S2SEL_OPEN, Value::Int(0));
         // NEW-3: release the per-selector wakeup channel so its socket
@@ -3397,7 +3702,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         release_wakeup_channel(this);
         Ok(None)
     });
-    r.register(sel, "keys",         "()Ljava/util/Set;", |ctx, args| {
+    r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(s2_keys_as_set(ctx, this, false)))
     });
@@ -3408,30 +3713,71 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 
     // SelectionKey — upgrade readyOps to field 3, add convenience predicates
     let sk = "java/nio/channels/SelectionKey";
-    r.register(sk, "readyOps",    "()I", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, 3))));
-    r.register(sk, "isReadable",  "()Z", |ctx, args| {
-        Ok(Some(Value::Int(if ctx.get_field(obj_arg(args,0)?,3).as_int().unwrap_or(0) & 1 != 0 { 1 } else { 0 })))
+    r.register(sk, "readyOps", "()I", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 3)))
     });
-    r.register(sk, "isWritable",  "()Z", |ctx, args| {
-        Ok(Some(Value::Int(if ctx.get_field(obj_arg(args,0)?,3).as_int().unwrap_or(0) & 4 != 0 { 1 } else { 0 })))
+    r.register(sk, "isReadable", "()Z", |ctx, args| {
+        Ok(Some(Value::Int(
+            if ctx.get_field(obj_arg(args, 0)?, 3).as_int().unwrap_or(0) & 1 != 0 {
+                1
+            } else {
+                0
+            },
+        )))
     });
-    r.register(sk, "isAcceptable","()Z", |ctx, args| {
-        Ok(Some(Value::Int(if ctx.get_field(obj_arg(args,0)?,3).as_int().unwrap_or(0) & 16 != 0 { 1 } else { 0 })))
+    r.register(sk, "isWritable", "()Z", |ctx, args| {
+        Ok(Some(Value::Int(
+            if ctx.get_field(obj_arg(args, 0)?, 3).as_int().unwrap_or(0) & 4 != 0 {
+                1
+            } else {
+                0
+            },
+        )))
     });
-    r.register(sk, "isConnectable","()Z", |ctx, args| {
-        Ok(Some(Value::Int(if ctx.get_field(obj_arg(args,0)?,3).as_int().unwrap_or(0) & 8 != 0 { 1 } else { 0 })))
+    r.register(sk, "isAcceptable", "()Z", |ctx, args| {
+        Ok(Some(Value::Int(
+            if ctx.get_field(obj_arg(args, 0)?, 3).as_int().unwrap_or(0) & 16 != 0 {
+                1
+            } else {
+                0
+            },
+        )))
     });
-    r.register(sk, "interestOps", "(I)Ljava/nio/channels/SelectionKey;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ops  = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, 2, Value::Int(ops));
-        Ok(Some(Value::Object(Some(this))))
+    r.register(sk, "isConnectable", "()Z", |ctx, args| {
+        Ok(Some(Value::Int(
+            if ctx.get_field(obj_arg(args, 0)?, 3).as_int().unwrap_or(0) & 8 != 0 {
+                1
+            } else {
+                0
+            },
+        )))
     });
+    r.register(
+        sk,
+        "interestOps",
+        "(I)Ljava/nio/channels/SelectionKey;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ops = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            ctx.set_field(this, 2, Value::Int(ops));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 
     // SelectableChannel.register override
     let sac = "java/nio/channels/SelectableChannel";
-    r.register(sac, "register", "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;", s2_register_channel);
-    r.register(sac, "register", "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;", s2_register_channel);
+    r.register(
+        sac,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
+    r.register(
+        sac,
+        "register",
+        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+        s2_register_channel,
+    );
 }
 
 // =============================================================================
@@ -3450,20 +3796,20 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 
 /// URI field indices (same layout as registered at line ~32569)
 const URI_SCHEME: usize = 0;
-const URI_HOST:   usize = 1;
-const URI_PORT:   usize = 2;
-const URI_PATH:   usize = 3;
-const URI_QUERY:  usize = 4;
+const URI_HOST: usize = 1;
+const URI_PORT: usize = 2;
+const URI_PATH: usize = 3;
+const URI_QUERY: usize = 4;
 // field 5 = fragment, field 6 = raw — also useful for fallback
 
 /// HttpRequest field indices
-const HR_URI:    usize = 0;
+const HR_URI: usize = 0;
 const HR_METHOD: usize = 1;
-const HR_BODY:   usize = 2;
+const HR_BODY: usize = 2;
 // field 3 = extra headers map (unused by our impl)
 
 pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
-    let hc  = "java/net/http/HttpClient";
+    let hc = "java/net/http/HttpClient";
     let hrb = "java/net/http/HttpRequest$Builder";
 
     // ---- Update builder POST/PUT to also store the body publisher at field 2 ----
@@ -3536,18 +3882,16 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     let uri_ref = match ctx.get_field(req_ref, HR_URI) {
         Value::Object(Some(u)) => u,
-        _ => return s3_stub_response(ctx, 200, ""),  // null URI → stub 200
+        _ => return s3_stub_response(ctx, 200, ""), // null URI → stub 200
     };
 
     // ---- Extract URI components ----
     let scheme = s3_read_str_field(ctx, uri_ref, URI_SCHEME)
         .unwrap_or_else(|| "http".to_string())
         .to_lowercase();
-    let host = s3_read_str_field(ctx, uri_ref, URI_HOST)
-        .unwrap_or_default();
+    let host = s3_read_str_field(ctx, uri_ref, URI_HOST).unwrap_or_default();
     let port_field = ctx.get_field(uri_ref, URI_PORT).as_int().unwrap_or(-1);
-    let path = s3_read_str_field(ctx, uri_ref, URI_PATH)
-        .unwrap_or_else(|| "/".to_string());
+    let path = s3_read_str_field(ctx, uri_ref, URI_PATH).unwrap_or_else(|| "/".to_string());
     let query = s3_read_str_field(ctx, uri_ref, URI_QUERY);
 
     // If host is empty, try the raw URL string (field 6)
@@ -3565,7 +3909,11 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     let is_https = scheme == "https";
     let default_port = if is_https { 443u16 } else { 80u16 };
-    let port = if port_field > 0 { port_field as u16 } else { default_port };
+    let port = if port_field > 0 {
+        port_field as u16
+    } else {
+        default_port
+    };
     let target = format!("{host}:{port}");
 
     // ---- Method and body ----
@@ -3577,11 +3925,10 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Value::Object(Some(bp)) => {
             // BodyPublisher = 1-field (string body at field 0)
             match ctx.get_field(bp, 0) {
-                Value::Object(Some(s)) => {
-                    ctx.read_string(s)
-                        .map(|st| st.into_bytes())
-                        .unwrap_or_default()
-                }
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .map(|st| st.into_bytes())
+                    .unwrap_or_default(),
                 _ => Vec::new(),
             }
         }
@@ -3816,7 +4163,11 @@ mod tests {
     /// This is a faithful copy of the guard now in the get/put([BII) handlers.
     fn bb_bii_reject(off: i32, len: i32, cap: i64) -> Option<i32> {
         if off < 0 || len < 0 || (off as i64) + (len as i64) > cap {
-            Some(if off < 0 { off } else { off.saturating_add(len) })
+            Some(if off < 0 {
+                off
+            } else {
+                off.saturating_add(len)
+            })
         } else {
             None
         }
@@ -3973,14 +4324,11 @@ mod tests {
         // Synthesize a fake selector identity. The map is keyed by the
         // ObjectRef pointer bits, so any stable value works as long as
         // this test releases it at the end.
-        let fake_sel = unsafe {
-            ObjectRef::from_raw(0xdead_beef_0000_0100u64 as usize as *mut u8)
-        };
+        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0100u64 as usize as *mut u8) };
 
         // Ensure a wakeup channel exists (would normally be allocated by
         // the first `select()` call).
-        let existed =
-            ensure_wakeup_channel(fake_sel, |ch| dgram_pollreq_fd(&ch.socket)).is_some();
+        let existed = ensure_wakeup_channel(fake_sel, |ch| dgram_pollreq_fd(&ch.socket)).is_some();
         assert!(existed, "wakeup channel should be constructible");
 
         let woke = Arc::new(AtomicBool::new(false));
@@ -4014,14 +4362,16 @@ mod tests {
     /// long-running processes that repeatedly open and close selectors).
     #[test]
     fn new3_release_wakeup_channel_removes_entry() {
-        let fake_sel = unsafe {
-            ObjectRef::from_raw(0xdead_beef_0000_0200u64 as usize as *mut u8)
-        };
+        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0200u64 as usize as *mut u8) };
         let _ = ensure_wakeup_channel(fake_sel, |_| ());
-        assert!(selector_wakeups().lock().contains_key(&selector_key(fake_sel)));
+        assert!(selector_wakeups()
+            .lock()
+            .contains_key(&selector_key(fake_sel)));
         release_wakeup_channel(fake_sel);
         assert!(
-            !selector_wakeups().lock().contains_key(&selector_key(fake_sel)),
+            !selector_wakeups()
+                .lock()
+                .contains_key(&selector_key(fake_sel)),
             "release_wakeup_channel must remove the entry"
         );
     }
@@ -4030,17 +4380,13 @@ mod tests {
     /// return the same backing socket (same local port) as the first.
     #[test]
     fn new3_ensure_wakeup_channel_is_idempotent() {
-        let fake_sel = unsafe {
-            ObjectRef::from_raw(0xdead_beef_0000_0300u64 as usize as *mut u8)
-        };
-        let first = ensure_wakeup_channel(fake_sel, |ch| {
-            ch.socket.local_addr().expect("local_addr")
-        })
-        .expect("first ensure");
-        let second = ensure_wakeup_channel(fake_sel, |ch| {
-            ch.socket.local_addr().expect("local_addr")
-        })
-        .expect("second ensure");
+        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0300u64 as usize as *mut u8) };
+        let first =
+            ensure_wakeup_channel(fake_sel, |ch| ch.socket.local_addr().expect("local_addr"))
+                .expect("first ensure");
+        let second =
+            ensure_wakeup_channel(fake_sel, |ch| ch.socket.local_addr().expect("local_addr"))
+                .expect("second ensure");
         assert_eq!(
             first, second,
             "repeated ensure_wakeup_channel must yield the same socket"
@@ -4080,4 +4426,3 @@ mod tests {
         assert_ne!(id, 1, "id 1 already in use, must be skipped");
     }
 }
-

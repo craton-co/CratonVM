@@ -439,7 +439,8 @@ fn detect_int_array_sum(
     if code[pc] != 0x84 {
         return None;
     }
-    if code[pc + 1] as usize != iv_local { // Widening: always safe
+    if code[pc + 1] as usize != iv_local {
+        // Widening: always safe
         return None;
     }
     if code[pc + 2] != 0x01 {
@@ -464,11 +465,11 @@ fn detect_int_array_sum(
 /// Extract local index from an lload instruction at pc.
 fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x1e => Some(0),                                  // lload_0
-        0x1f => Some(1),                                  // lload_1
-        0x20 => Some(2),                                  // lload_2
-        0x21 => Some(3),                                  // lload_3
-        0x16 => code.get(pc + 1).map(|&b| b as usize),    // lload
+        0x1e => Some(0),                               // lload_0
+        0x1f => Some(1),                               // lload_1
+        0x20 => Some(2),                               // lload_2
+        0x21 => Some(3),                               // lload_3
+        0x16 => code.get(pc + 1).map(|&b| b as usize), // lload
         _ => None,
     }
 }
@@ -476,11 +477,11 @@ fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from an lstore instruction at pc.
 fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x3f => Some(0),                                  // lstore_0
-        0x40 => Some(1),                                  // lstore_1
-        0x41 => Some(2),                                  // lstore_2
-        0x42 => Some(3),                                  // lstore_3
-        0x37 => code.get(pc + 1).map(|&b| b as usize),    // lstore
+        0x3f => Some(0),                               // lstore_0
+        0x40 => Some(1),                               // lstore_1
+        0x41 => Some(2),                               // lstore_2
+        0x42 => Some(3),                               // lstore_3
+        0x37 => code.get(pc + 1).map(|&b| b as usize), // lstore
         _ => None,
     }
 }
@@ -488,11 +489,11 @@ fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from a dload instruction at pc.
 fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x26 => Some(0),                                  // dload_0
-        0x27 => Some(1),                                  // dload_1
-        0x28 => Some(2),                                  // dload_2
-        0x29 => Some(3),                                  // dload_3
-        0x18 => code.get(pc + 1).map(|&b| b as usize),    // dload
+        0x26 => Some(0),                               // dload_0
+        0x27 => Some(1),                               // dload_1
+        0x28 => Some(2),                               // dload_2
+        0x29 => Some(3),                               // dload_3
+        0x18 => code.get(pc + 1).map(|&b| b as usize), // dload
         _ => None,
     }
 }
@@ -500,11 +501,11 @@ fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from a dstore instruction at pc.
 fn extract_dstore_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x47 => Some(0),                                  // dstore_0
-        0x48 => Some(1),                                  // dstore_1
-        0x49 => Some(2),                                  // dstore_2
-        0x4a => Some(3),                                  // dstore_3
-        0x39 => code.get(pc + 1).map(|&b| b as usize),    // dstore
+        0x47 => Some(0),                               // dstore_0
+        0x48 => Some(1),                               // dstore_1
+        0x49 => Some(2),                               // dstore_2
+        0x4a => Some(3),                               // dstore_3
+        0x39 => code.get(pc + 1).map(|&b| b as usize), // dstore
         _ => None,
     }
 }
@@ -958,10 +959,7 @@ pub(crate) fn detect_loop_unswitch_candidates(
                     // match the simpler ifeq..ifle (0x99..=0x9E) that
                     // operate on the single top-of-stack.
                     let is_unary_branch = matches!(op, 0x99..=0x9E);
-                    if is_unary_branch
-                        && local < 64
-                        && (written & (1u64 << local)) == 0
-                    {
+                    if is_unary_branch && local < 64 && (written & (1u64 << local)) == 0 {
                         out.push(LoopUnswitchCandidate {
                             header_pc: header,
                             back_edge_pc: back_edge,
@@ -1723,7 +1721,9 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         // tableswitch — variable length
         0xaa => {
             let mut p = pc + 1;
-            while p % 4 != 0 { p += 1; }
+            while p % 4 != 0 {
+                p += 1;
+            }
             // Truncated header: a tableswitch placed near the end of `code` may
             // not carry the full 12-byte default/low/high header. Reading it
             // would index past `code_len` and panic. Return a length that
@@ -1745,7 +1745,9 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         // lookupswitch — variable length
         0xab => {
             let mut p = pc + 1;
-            while p % 4 != 0 { p += 1; }
+            while p % 4 != 0 {
+                p += 1;
+            }
             // Truncated header (see tableswitch above): bail to a remainder
             // length rather than reading the 8-byte default/npairs header OOB.
             if p + 8 > code.len() {
@@ -1754,7 +1756,8 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
             // A negative `npairs` (crafted bytecode) cast straight to usize would
             // become an enormous value and overflow the address math below; clamp
             // to 0 so the length stays sane (the main loop rejects such methods).
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0) as usize; // Widening: always safe
+            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]])
+                .max(0) as usize; // Widening: always safe
             (p + 8 + npairs * 8) - pc
         }
         _ => 1,
@@ -1850,7 +1853,12 @@ fn shadow_reload_dbg() -> bool {
 
 /// DBG helper called from JIT-emitted reload code (see `shadow_reload_dbg`).
 /// Logs the values that explain a reload that produced a non-pointer home value.
-extern "C" fn jit_dbg_shadow_reload_log(thread: usize, orig_savebase: usize, slotval: usize, read_addr: usize) {
+extern "C" fn jit_dbg_shadow_reload_log(
+    thread: usize,
+    orig_savebase: usize,
+    slotval: usize,
+    read_addr: usize,
+) {
     eprintln!(
         "[RELOAD] thread={:#x} orig_savebase={:#x} slotval={:#x} read_addr={:#x}",
         thread, orig_savebase, slotval, read_addr
@@ -1983,8 +1991,7 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
             // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
             0x99..=0xA8 | 0xC6 | 0xC7 => {
                 if pc + 2 < code_len {
-                    let off =
-                        i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
                     let t = pc as isize + off;
                     if t >= 0 && (t as usize) < code_len {
                         targets[t as usize] = true;
@@ -2018,12 +2025,8 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                     break;
                 }
                 let read_off = |code: &[u8], at: usize| -> isize {
-                    i32::from_be_bytes([
-                        code[at],
-                        code[at + 1],
-                        code[at + 2],
-                        code[at + 3],
-                    ]) as isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        as isize
                 };
                 let mark = |targets: &mut Vec<bool>, off: isize| {
                     let t = pc as isize + off;
@@ -2055,12 +2058,8 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                     break;
                 }
                 let read_off = |code: &[u8], at: usize| -> isize {
-                    i32::from_be_bytes([
-                        code[at],
-                        code[at + 1],
-                        code[at + 2],
-                        code[at + 3],
-                    ]) as isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        as isize
                 };
                 let mark = |targets: &mut Vec<bool>, off: isize| {
                     let t = pc as isize + off;
@@ -2069,13 +2068,9 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                     }
                 };
                 mark(&mut targets, read_off(code, p)); // default
-                let npairs = i32::from_be_bytes([
-                    code[p + 4],
-                    code[p + 5],
-                    code[p + 6],
-                    code[p + 7],
-                ])
-                .max(0) as usize;
+                let npairs =
+                    i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
+                        as usize;
                 let mut jp = p + 8;
                 for _ in 0..npairs {
                     if jp + 8 > code_len {
@@ -2247,11 +2242,11 @@ fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -
         0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize),                     // astore_0..3
         0x36 | 0x38 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // istore/fstore
         0x37 | 0x39 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 2), // lstore/dstore
-        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                      // istore_0..3
-        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                      // fstore_0..3
-        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                      // lstore_0..3
-        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                      // dstore_0..3
-        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),  // iinc
+        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                            // istore_0..3
+        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                            // fstore_0..3
+        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                            // lstore_0..3
+        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                            // dstore_0..3
+        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),        // iinc
         0xC4 => {
             // wide <store>/<iinc>: 2-byte index.
             let wop = code.get(pc + 1).copied().unwrap_or(0);
@@ -2333,7 +2328,11 @@ fn compute_local_oop_masks(
                 continue;
             }
             // First real predecessor seeds; later ones intersect (AND).
-            let new_in = if reached[succ] { in_mask[succ] & out } else { out };
+            let new_in = if reached[succ] {
+                in_mask[succ] & out
+            } else {
+                out
+            };
             if !reached[succ] || new_in != in_mask[succ] {
                 in_mask[succ] = new_in;
                 reached[succ] = true;
@@ -2463,45 +2462,119 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // iload*, fload*, aload*, i/f/a/b/c/saload, new, newarray,
             // anewarray, arraylength, instanceof, i2f/i2b/i2c/i2s/l2i/f2i/
             // d2i/l2f/d2f, fcmp/lcmp/dcmp (push int), etc.
-            0x01 | 0x02..=0x08 | 0x0b..=0x0d => { push!(1); pc += 1; }
-            0x10 => { push!(1); pc += 2; }      // bipush
-            0x11 => { push!(1); pc += 3; }      // sipush
-            0x12 => { push!(1); pc += 2; }      // ldc
-            0x13 => { push!(1); pc += 3; }      // ldc_w
-            0x15 => { push!(1); pc += 2; }      // iload
-            0x17 => { push!(1); pc += 2; }      // fload
-            0x19 => { push!(1); pc += 2; }      // aload
-            0x1a..=0x1d => { push!(1); pc += 1; } // iload_0..3
-            0x22..=0x25 => { push!(1); pc += 1; } // fload_0..3
-            0x2a..=0x2d => { push!(1); pc += 1; } // aload_0..3
+            0x01 | 0x02..=0x08 | 0x0b..=0x0d => {
+                push!(1);
+                pc += 1;
+            }
+            0x10 => {
+                push!(1);
+                pc += 2;
+            } // bipush
+            0x11 => {
+                push!(1);
+                pc += 3;
+            } // sipush
+            0x12 => {
+                push!(1);
+                pc += 2;
+            } // ldc
+            0x13 => {
+                push!(1);
+                pc += 3;
+            } // ldc_w
+            0x15 => {
+                push!(1);
+                pc += 2;
+            } // iload
+            0x17 => {
+                push!(1);
+                pc += 2;
+            } // fload
+            0x19 => {
+                push!(1);
+                pc += 2;
+            } // aload
+            0x1a..=0x1d => {
+                push!(1);
+                pc += 1;
+            } // iload_0..3
+            0x22..=0x25 => {
+                push!(1);
+                pc += 1;
+            } // fload_0..3
+            0x2a..=0x2d => {
+                push!(1);
+                pc += 1;
+            } // aload_0..3
 
             // --- pushes: category-2 producers ---
-            0x09 | 0x0a | 0x0e | 0x0f => { push!(2); pc += 1; } // l/dconst
-            0x14 => { push!(2); pc += 3; }      // ldc2_w (long/double)
-            0x16 => { push!(2); pc += 2; }      // lload
-            0x18 => { push!(2); pc += 2; }      // dload
-            0x1e..=0x21 => { push!(2); pc += 1; } // lload_0..3
-            0x26..=0x29 => { push!(2); pc += 1; } // dload_0..3
+            0x09 | 0x0a | 0x0e | 0x0f => {
+                push!(2);
+                pc += 1;
+            } // l/dconst
+            0x14 => {
+                push!(2);
+                pc += 3;
+            } // ldc2_w (long/double)
+            0x16 => {
+                push!(2);
+                pc += 2;
+            } // lload
+            0x18 => {
+                push!(2);
+                pc += 2;
+            } // dload
+            0x1e..=0x21 => {
+                push!(2);
+                pc += 1;
+            } // lload_0..3
+            0x26..=0x29 => {
+                push!(2);
+                pc += 1;
+            } // dload_0..3
 
             // --- array loads (pop arrayref+index, push element) ---
             // iaload/faload/aaload/baload/caload/saload → cat-1 element
             0x2e | 0x30 | 0x32 | 0x33 | 0x34 | 0x35 => {
-                pop!(); pop!(); push!(1); pc += 1;
+                pop!();
+                pop!();
+                push!(1);
+                pc += 1;
             }
             // laload (0x2f) / daload (0x31) → cat-2 element
             0x2f | 0x31 => {
-                pop!(); pop!(); push!(2); pc += 1;
+                pop!();
+                pop!();
+                push!(2);
+                pc += 1;
             }
 
             // --- stores (pop the value; locals are untracked) ---
-            0x36 | 0x37 | 0x3a => { pop!(); pc += 2; }       // istore/fstore/astore
-            0x38 | 0x39 => { pop!(); pc += 2; }              // lstore/dstore (one entry)
-            0x3b..=0x3e | 0x43..=0x4e => { pop!(); pc += 1; } // istore_/fstore_/astore_
-            0x3f..=0x42 => { pop!(); pc += 1; }              // lstore_0..3 (one entry)
+            0x36 | 0x37 | 0x3a => {
+                pop!();
+                pc += 2;
+            } // istore/fstore/astore
+            0x38 | 0x39 => {
+                pop!();
+                pc += 2;
+            } // lstore/dstore (one entry)
+            0x3b..=0x3e | 0x43..=0x4e => {
+                pop!();
+                pc += 1;
+            } // istore_/fstore_/astore_
+            0x3f..=0x42 => {
+                pop!();
+                pc += 1;
+            } // lstore_0..3 (one entry)
             // dstore_0..3 fall under 0x47..=0x4a, included in 0x43..=0x4a above
 
             // --- array stores (pop value, index, arrayref) ---
-            0x4f..=0x56 => { pop!(); pop!(); pop!(); pc += 1; }
+            0x4f..=0x56 => {
+                pop!();
+                pop!();
+                pop!();
+                pc += 1;
+            }
 
             // --- stack manipulation (the crux) ---
             //
@@ -2522,13 +2595,21 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // small JIT-coverage loss — see the `_` arm under opcode 0x5c.
             //
             // pop (cat-1)
-            0x57 => { pop!(); pc += 1; }
+            0x57 => {
+                pop!();
+                pc += 1;
+            }
             // pop2: two cat-1 OR one cat-2 — codegen's `pop2` is unimplemented
             // (bails), so we only need to keep the model's height roughly sane.
             0x58 => {
                 match widths.last().copied() {
-                    Some(2) => { pop!(); }
-                    _ => { pop!(); pop!(); }
+                    Some(2) => {
+                        pop!();
+                    }
+                    _ => {
+                        pop!();
+                        pop!();
+                    }
                 }
                 pc += 1;
             }
@@ -2541,7 +2622,10 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // dup_x1 / dup_x2 — unimplemented by codegen (safe bail); just
             // resync the model loosely. Clear so we do not mis-evaluate a later
             // dup2 against a now-shuffled stack we no longer model precisely.
-            0x5a | 0x5b => { widths.clear(); pc += 1; }
+            0x5a | 0x5b => {
+                widths.clear();
+                pc += 1;
+            }
             // dup2 — THE checked op. Reject ONLY when the top is PROVABLY
             // category-2 (FORM 2), which the codegen mis-duplicates as two
             // category-1 entries.
@@ -2594,7 +2678,10 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             }
             // dup2_x1 / dup2_x2 — unimplemented by codegen (safe bail); resync
             // the model loosely by clearing.
-            0x5d | 0x5e => { widths.clear(); pc += 1; }
+            0x5d | 0x5e => {
+                widths.clear();
+                pc += 1;
+            }
             // swap (two cat-1) — unimplemented for cat-2 mixes; just model.
             0x5f => {
                 let len = widths.len();
@@ -2607,66 +2694,181 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // --- arithmetic / logic ---
             // int ops that pop 2 push 1 (cat-1): iadd/isub/imul/idiv/irem,
             // ishl/ishr/iushr/iand/ior/ixor.
-            0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e
-            | 0x80 | 0x82 => { pop!(); /* top stays cat-1 */ pc += 1; }
+            0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 => {
+                pop!(); /* top stays cat-1 */
+                pc += 1;
+            }
             // float ops pop2 push1 (cat-1): fadd/fsub/fmul/fdiv/frem.
-            0x62 | 0x66 | 0x6a | 0x6e | 0x72 => { pop!(); pc += 1; }
+            0x62 | 0x66 | 0x6a | 0x6e | 0x72 => {
+                pop!();
+                pc += 1;
+            }
             // long ops that pop 2 push 1 (cat-2): ladd/lsub/lmul/ldiv/lrem,
             // land/lor/lxor.
             0x61 | 0x65 | 0x69 | 0x6d | 0x71 | 0x7f | 0x81 | 0x83 => {
-                pop!(); /* result cat-2, top entry already cat-2 */ pc += 1;
+                pop!(); /* result cat-2, top entry already cat-2 */
+                pc += 1;
             }
             // double ops pop2 push1 (cat-2): dadd/dsub/dmul/ddiv/drem.
-            0x63 | 0x67 | 0x6b | 0x6f | 0x73 => { pop!(); pc += 1; }
+            0x63 | 0x67 | 0x6b | 0x6f | 0x73 => {
+                pop!();
+                pc += 1;
+            }
             // long shifts: lshl/lshr/lushr pop an int shift amount (cat-1),
             // value stays cat-2.
-            0x79 | 0x7b | 0x7d => { pop!(); pc += 1; }
+            0x79 | 0x7b | 0x7d => {
+                pop!();
+                pc += 1;
+            }
             // unary negate: ineg/fneg (cat-1), lneg/dneg (cat-2) — width
             // unchanged.
-            0x74..=0x77 => { pc += 1; }
+            0x74..=0x77 => {
+                pc += 1;
+            }
 
             // --- conversions (replace top width) ---
-            0x85 => { pop!(); push!(2); pc += 1; }        // i2l → long  (cat-2)
-            0x86 => { pop!(); push!(1); pc += 1; }        // i2f → float (cat-1)
-            0x87 => { pop!(); push!(2); pc += 1; }        // i2d → double(cat-2)
-            0x88 => { pop!(); push!(1); pc += 1; }        // l2i → int   (cat-1)
-            0x89 => { pop!(); push!(1); pc += 1; }        // l2f → float (cat-1)
-            0x8a => { pop!(); push!(2); pc += 1; }        // l2d → double(cat-2)
-            0x8b => { pop!(); push!(1); pc += 1; }        // f2i → int   (cat-1)
-            0x8c => { pop!(); push!(2); pc += 1; }        // f2l → long  (cat-2)
-            0x8d => { pop!(); push!(2); pc += 1; }        // f2d → double(cat-2)
-            0x8e => { pop!(); push!(1); pc += 1; }        // d2i → int   (cat-1)
-            0x8f => { pop!(); push!(2); pc += 1; }        // d2l → long  (cat-2)
-            0x90 => { pop!(); push!(1); pc += 1; }        // d2f → float (cat-1)
-            0x91..=0x93 => { pop!(); push!(1); pc += 1; } // i2b, i2c, i2s (cat-1)
+            0x85 => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // i2l → long  (cat-2)
+            0x86 => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // i2f → float (cat-1)
+            0x87 => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // i2d → double(cat-2)
+            0x88 => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // l2i → int   (cat-1)
+            0x89 => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // l2f → float (cat-1)
+            0x8a => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // l2d → double(cat-2)
+            0x8b => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // f2i → int   (cat-1)
+            0x8c => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // f2l → long  (cat-2)
+            0x8d => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // f2d → double(cat-2)
+            0x8e => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // d2i → int   (cat-1)
+            0x8f => {
+                pop!();
+                push!(2);
+                pc += 1;
+            } // d2l → long  (cat-2)
+            0x90 => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // d2f → float (cat-1)
+            0x91..=0x93 => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // i2b, i2c, i2s (cat-1)
 
             // --- comparisons → push int (cat-1). Each pops two operands;
             // cat-2 operands (lcmp/dcmp) are a single entry each, so popping
             // two entries is correct for both cat-1 and cat-2 forms. ---
-            0x94 => { pop!(); pop!(); push!(1); pc += 1; } // lcmp  (long, long)
-            0x95 | 0x96 => { pop!(); pop!(); push!(1); pc += 1; } // fcmpl/fcmpg
-            0x97 | 0x98 => { pop!(); pop!(); push!(1); pc += 1; } // dcmpl/dcmpg
+            0x94 => {
+                pop!();
+                pop!();
+                push!(1);
+                pc += 1;
+            } // lcmp  (long, long)
+            0x95 | 0x96 => {
+                pop!();
+                pop!();
+                push!(1);
+                pc += 1;
+            } // fcmpl/fcmpg
+            0x97 | 0x98 => {
+                pop!();
+                pop!();
+                push!(1);
+                pc += 1;
+            } // dcmpl/dcmpg
 
             // --- control flow: per JVMS, stack height/width is invariant at
             // each PC across edges, so a linear walk stays consistent. Pop the
             // branch operands; provenance/width of the rest is preserved. ---
-            0x99..=0x9e | 0xc6 | 0xc7 => { pop!(); pc += 3; } // if<cond>, ifnull/nonnull
-            0x9f..=0xa6 => { pop!(); pop!(); pc += 3; }       // if_icmp/if_acmp
-            0xa7 => { pc += 3; }                              // goto
-            0xa8 => { push!(1); pc += 3; }                    // jsr (pushes returnAddress)
-            0xa9 => { pc += 2; }                              // ret
+            0x99..=0x9e | 0xc6 | 0xc7 => {
+                pop!();
+                pc += 3;
+            } // if<cond>, ifnull/nonnull
+            0x9f..=0xa6 => {
+                pop!();
+                pop!();
+                pc += 3;
+            } // if_icmp/if_acmp
+            0xa7 => {
+                pc += 3;
+            } // goto
+            0xa8 => {
+                push!(1);
+                pc += 3;
+            } // jsr (pushes returnAddress)
+            0xa9 => {
+                pc += 2;
+            } // ret
 
             // returns / athrow — terminate this straight-line run; the abstract
             // stack is reset implicitly because the next PC begins a new block
             // (a branch target). Pop the returned value where applicable.
-            0xac | 0xae | 0xb0 => { pop!(); widths.clear(); pc += 1; } // ireturn/freturn/areturn
-            0xad | 0xaf => { pop!(); widths.clear(); pc += 1; }        // lreturn/dreturn (one entry)
-            0xb1 => { widths.clear(); pc += 1; }                       // return
-            0xbf => { widths.clear(); pc += 1; }                       // athrow
+            0xac | 0xae | 0xb0 => {
+                pop!();
+                widths.clear();
+                pc += 1;
+            } // ireturn/freturn/areturn
+            0xad | 0xaf => {
+                pop!();
+                widths.clear();
+                pc += 1;
+            } // lreturn/dreturn (one entry)
+            0xb1 => {
+                widths.clear();
+                pc += 1;
+            } // return
+            0xbf => {
+                widths.clear();
+                pc += 1;
+            } // athrow
 
             // switches — pop the int key; rest invariant.
-            0xaa => { pop!(); pc += bytecode_len_at(code, pc); }
-            0xab => { pop!(); pc += bytecode_len_at(code, pc); }
+            0xaa => {
+                pop!();
+                pc += bytecode_len_at(code, pc);
+            }
+            0xab => {
+                pop!();
+                pc += bytecode_len_at(code, pc);
+            }
 
             // --- field / method ops: the width effect depends on the CP
             // descriptor, which this standalone helper does not parse. Rather
@@ -2684,15 +2886,43 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             }
 
             // new / checkcast / instanceof / monitor / nop / iinc / arrays.
-            0x00 => { pc += 1; }                              // nop
-            0x84 => { pc += 3; }                              // iinc (no stack effect)
-            0xbb => { push!(1); pc += 3; }                    // new → objectref (cat-1)
-            0xbc => { pop!(); push!(1); pc += 2; }            // newarray
-            0xbd => { pop!(); push!(1); pc += 3; }            // anewarray
-            0xbe => { pop!(); push!(1); pc += 1; }            // arraylength → int
-            0xc0 => { pc += 3; }                              // checkcast (width unchanged)
-            0xc1 => { pop!(); push!(1); pc += 3; }            // instanceof → int
-            0xc2 | 0xc3 => { pop!(); pc += 1; }               // monitorenter/exit
+            0x00 => {
+                pc += 1;
+            } // nop
+            0x84 => {
+                pc += 3;
+            } // iinc (no stack effect)
+            0xbb => {
+                push!(1);
+                pc += 3;
+            } // new → objectref (cat-1)
+            0xbc => {
+                pop!();
+                push!(1);
+                pc += 2;
+            } // newarray
+            0xbd => {
+                pop!();
+                push!(1);
+                pc += 3;
+            } // anewarray
+            0xbe => {
+                pop!();
+                push!(1);
+                pc += 1;
+            } // arraylength → int
+            0xc0 => {
+                pc += 3;
+            } // checkcast (width unchanged)
+            0xc1 => {
+                pop!();
+                push!(1);
+                pc += 3;
+            } // instanceof → int
+            0xc2 | 0xc3 => {
+                pop!();
+                pc += 1;
+            } // monitorenter/exit
             // wide (0xc4), multianewarray (0xc5), goto_w/jsr_w (0xc8/0xc9), and
             // any other unmodeled opcode: clear the model and advance by the
             // correct instruction length. Clearing keeps us sound (a later
@@ -3377,7 +3607,13 @@ fn plan_scalar_replacement(
         if let Some(&num_fields) = new_info_by_pc.get(&new_pc) {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
-                objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });
+                objects.insert(
+                    new_pc,
+                    ScalarReplacedObject {
+                        num_fields,
+                        field_base_offset,
+                    },
+                );
                 total_slots += num_fields * (SLOT_SIZE / 8);
             }
         }
@@ -3412,7 +3648,11 @@ fn plan_scalar_replacement(
         match op {
             // new
             0xBB => {
-                abs_stack.push(if objects.contains_key(&pc) { Some(pc) } else { None });
+                abs_stack.push(if objects.contains_key(&pc) {
+                    Some(pc)
+                } else {
+                    None
+                });
                 pc += 3;
             }
             // dup
@@ -3422,25 +3662,55 @@ fn plan_scalar_replacement(
                 pc += 1;
             }
             // aconst_null
-            0x01 => { abs_stack.push(None); pc += 1; }
+            0x01 => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // iconst_m1..iconst_5
-            0x02..=0x08 => { abs_stack.push(None); pc += 1; }
+            0x02..=0x08 => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // lconst_0, lconst_1
-            0x09 | 0x0A => { abs_stack.push(None); pc += 1; }
+            0x09 | 0x0A => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // fconst_0..fconst_2
-            0x0B..=0x0D => { abs_stack.push(None); pc += 1; }
+            0x0B..=0x0D => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // dconst_0, dconst_1
-            0x0E | 0x0F => { abs_stack.push(None); pc += 1; }
+            0x0E | 0x0F => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // bipush
-            0x10 => { abs_stack.push(None); pc += 2; }
+            0x10 => {
+                abs_stack.push(None);
+                pc += 2;
+            }
             // sipush
-            0x11 => { abs_stack.push(None); pc += 3; }
+            0x11 => {
+                abs_stack.push(None);
+                pc += 3;
+            }
             // ldc
-            0x12 => { abs_stack.push(None); pc += 2; }
+            0x12 => {
+                abs_stack.push(None);
+                pc += 2;
+            }
             // ldc_w, ldc2_w
-            0x13 | 0x14 => { abs_stack.push(None); pc += 3; }
+            0x13 | 0x14 => {
+                abs_stack.push(None);
+                pc += 3;
+            }
             // iload, lload, fload, dload
-            0x15..=0x18 => { abs_stack.push(None); pc += 2; }
+            0x15..=0x18 => {
+                abs_stack.push(None);
+                pc += 2;
+            }
             // aload
             0x19 => {
                 let idx = code[pc + 1] as usize; // Widening: always safe
@@ -3448,7 +3718,10 @@ fn plan_scalar_replacement(
                 pc += 2;
             }
             // iload_0..3, lload_0..3, fload_0..3, dload_0..3
-            0x1A..=0x29 => { abs_stack.push(None); pc += 1; }
+            0x1A..=0x29 => {
+                abs_stack.push(None);
+                pc += 1;
+            }
             // aload_0..3
             0x2A..=0x2D => {
                 let idx = (op - 0x2A) as usize; // Widening: always safe
@@ -3457,21 +3730,30 @@ fn plan_scalar_replacement(
             }
             // Xaload (iaload..saload): pop index + arrayref, push value
             0x2E..=0x35 => {
-                abs_stack.pop(); abs_stack.pop();
+                abs_stack.pop();
+                abs_stack.pop();
                 abs_stack.push(None);
                 pc += 1;
             }
             // istore, lstore, fstore, dstore
-            0x36..=0x39 => { abs_stack.pop(); pc += 2; }
+            0x36..=0x39 => {
+                abs_stack.pop();
+                pc += 2;
+            }
             // astore
             0x3A => {
                 let idx = code[pc + 1] as usize; // Widening: always safe
                 let val = abs_stack.pop().flatten();
-                if idx < 256 { local_prov[idx] = val; }
+                if idx < 256 {
+                    local_prov[idx] = val;
+                }
                 pc += 2;
             }
             // istore_0..3, lstore_0..3, fstore_0..3, dstore_0..3
-            0x3B..=0x4A => { abs_stack.pop(); pc += 1; }
+            0x3B..=0x4A => {
+                abs_stack.pop();
+                pc += 1;
+            }
             // astore_0..3
             0x4B..=0x4E => {
                 let idx = (op - 0x4B) as usize; // Widening: always safe
@@ -3481,18 +3763,29 @@ fn plan_scalar_replacement(
             }
             // Xastore (iastore..sastore): pop value, index, arrayref
             0x4F..=0x56 => {
-                abs_stack.pop(); abs_stack.pop(); abs_stack.pop();
+                abs_stack.pop();
+                abs_stack.pop();
+                abs_stack.pop();
                 pc += 1;
             }
             // pop
-            0x57 => { abs_stack.pop(); pc += 1; }
+            0x57 => {
+                abs_stack.pop();
+                pc += 1;
+            }
             // pop2
-            0x58 => { abs_stack.pop(); abs_stack.pop(); pc += 1; }
+            0x58 => {
+                abs_stack.pop();
+                abs_stack.pop();
+                pc += 1;
+            }
             // dup_x1
             0x5A => {
                 let v1 = abs_stack.pop().flatten();
                 let v2 = abs_stack.pop().flatten();
-                abs_stack.push(v1); abs_stack.push(v2); abs_stack.push(v1);
+                abs_stack.push(v1);
+                abs_stack.push(v2);
+                abs_stack.push(v1);
                 pc += 1;
             }
             // dup_x2
@@ -3500,7 +3793,10 @@ fn plan_scalar_replacement(
                 let v1 = abs_stack.pop().flatten();
                 let v2 = abs_stack.pop().flatten();
                 let v3 = abs_stack.pop().flatten();
-                abs_stack.push(v1); abs_stack.push(v3); abs_stack.push(v2); abs_stack.push(v1);
+                abs_stack.push(v1);
+                abs_stack.push(v3);
+                abs_stack.push(v2);
+                abs_stack.push(v1);
                 pc += 1;
             }
             // dup2
@@ -3508,35 +3804,46 @@ fn plan_scalar_replacement(
                 let len = abs_stack.len();
                 let v1 = if len >= 1 { abs_stack[len - 1] } else { None };
                 let v2 = if len >= 2 { abs_stack[len - 2] } else { None };
-                abs_stack.push(v2); abs_stack.push(v1);
+                abs_stack.push(v2);
+                abs_stack.push(v1);
                 pc += 1;
             }
             // swap
             0x5F => {
                 let len = abs_stack.len();
-                if len >= 2 { abs_stack.swap(len - 1, len - 2); }
+                if len >= 2 {
+                    abs_stack.swap(len - 1, len - 2);
+                }
                 pc += 1;
             }
             // Binary arithmetic: iadd(0x60)..drem(0x73), ishl(0x78)..lxor(0x83)
             0x60..=0x73 | 0x78..=0x83 => {
                 abs_stack.pop();
-                if let Some(last) = abs_stack.last_mut() { *last = None; }
+                if let Some(last) = abs_stack.last_mut() {
+                    *last = None;
+                }
                 pc += 1;
             }
             // Unary: ineg..dneg
             0x74..=0x77 => {
-                if let Some(last) = abs_stack.last_mut() { *last = None; }
+                if let Some(last) = abs_stack.last_mut() {
+                    *last = None;
+                }
                 pc += 1;
             }
             // Conversion: i2l..i2s
             0x85..=0x93 => {
-                if let Some(last) = abs_stack.last_mut() { *last = None; }
+                if let Some(last) = abs_stack.last_mut() {
+                    *last = None;
+                }
                 pc += 1;
             }
             // Comparison: lcmp..dcmpg (pop 2, push 1)
             0x94..=0x98 => {
                 abs_stack.pop();
-                if let Some(last) = abs_stack.last_mut() { *last = None; }
+                if let Some(last) = abs_stack.last_mut() {
+                    *last = None;
+                }
                 pc += 1;
             }
             // Conditional branches.
@@ -3561,27 +3868,47 @@ fn plan_scalar_replacement(
             0x99..=0xA6 => {
                 // Pop comparison operands
                 match op {
-                    0x99..=0x9E | 0xC6 | 0xC7 => { abs_stack.pop(); }
-                    _ => { abs_stack.pop(); abs_stack.pop(); }
+                    0x99..=0x9E | 0xC6 | 0xC7 => {
+                        abs_stack.pop();
+                    }
+                    _ => {
+                        abs_stack.pop();
+                        abs_stack.pop();
+                    }
                 }
                 abs_stack.clear();
-                for prov in local_prov.iter_mut() { *prov = None; }
+                for prov in local_prov.iter_mut() {
+                    *prov = None;
+                }
                 pc += 3;
             }
             // goto — control transfer; same hard barrier as above.
             0xA7 => {
                 abs_stack.clear();
-                for prov in local_prov.iter_mut() { *prov = None; }
+                for prov in local_prov.iter_mut() {
+                    *prov = None;
+                }
                 pc += 3;
             }
             // ireturn, lreturn, freturn, dreturn, areturn
-            0xAC..=0xB0 => { abs_stack.pop(); pc += 1; }
+            0xAC..=0xB0 => {
+                abs_stack.pop();
+                pc += 1;
+            }
             // return (void)
-            0xB1 => { pc += 1; }
+            0xB1 => {
+                pc += 1;
+            }
             // getstatic
-            0xB2 => { abs_stack.push(None); pc += 3; }
+            0xB2 => {
+                abs_stack.push(None);
+                pc += 3;
+            }
             // putstatic
-            0xB3 => { abs_stack.pop(); pc += 3; }
+            0xB3 => {
+                abs_stack.pop();
+                pc += 3;
+            }
             // getfield
             0xB4 => {
                 let obj = abs_stack.pop().flatten();
@@ -3606,7 +3933,8 @@ fn plan_scalar_replacement(
             }
             // invokespecial
             0xB7 => {
-                let info_ptr = invoke_info.iter()
+                let info_ptr = invoke_info
+                    .iter()
                     .find(|&&(ipc, _)| ipc == pc)
                     .map(|&(_, ptr)| ptr);
                 if let Some(ptr) = info_ptr {
@@ -3624,8 +3952,12 @@ fn plan_scalar_replacement(
                         }
                     } else {
                         // Pop all args (including this)
-                        for _ in 0..n { abs_stack.pop(); }
-                        if info.return_type != b'V' { abs_stack.push(None); }
+                        for _ in 0..n {
+                            abs_stack.pop();
+                        }
+                        if info.return_type != b'V' {
+                            abs_stack.push(None);
+                        }
                     }
                 } else {
                     abs_stack.clear();
@@ -3646,7 +3978,9 @@ fn plan_scalar_replacement(
                 pc += 5;
             }
             // checkcast: keeps object on stack with same provenance
-            0xC0 => { pc += 3; }
+            0xC0 => {
+                pc += 3;
+            }
             // instanceof: pop ref, push int
             0xC1 => {
                 abs_stack.pop();
@@ -3660,13 +3994,17 @@ fn plan_scalar_replacement(
             0xC6 | 0xC7 => {
                 abs_stack.pop();
                 abs_stack.clear();
-                for prov in local_prov.iter_mut() { *prov = None; }
+                for prov in local_prov.iter_mut() {
+                    *prov = None;
+                }
                 pc += 3;
             }
             // athrow — control transfer (to handler or caller); same barrier.
             0xBF => {
                 abs_stack.clear();
-                for prov in local_prov.iter_mut() { *prov = None; }
+                for prov in local_prov.iter_mut() {
+                    *prov = None;
+                }
                 pc += 1;
             }
             // arraylength
@@ -3676,25 +4014,43 @@ fn plan_scalar_replacement(
                 pc += 1;
             }
             // iinc
-            0x84 => { pc += 3; }
+            0x84 => {
+                pc += 3;
+            }
             // newarray, anewarray
-            0xBC => { abs_stack.pop(); abs_stack.push(None); pc += 2; }
-            0xBD => { abs_stack.pop(); abs_stack.push(None); pc += 3; }
+            0xBC => {
+                abs_stack.pop();
+                abs_stack.push(None);
+                pc += 2;
+            }
+            0xBD => {
+                abs_stack.pop();
+                abs_stack.push(None);
+                pc += 3;
+            }
             // For anything else, conservatively clear all provenance
             _ => {
                 abs_stack.clear();
-                for prov in local_prov.iter_mut() { *prov = None; }
+                for prov in local_prov.iter_mut() {
+                    *prov = None;
+                }
                 pc += bytecode_len_at(code, pc);
             }
         }
     }
 
     // Only keep objects that have at least one field op or init skip
-    let used_objects: std::collections::HashSet<usize> = field_ops.values().copied()
+    let used_objects: std::collections::HashSet<usize> = field_ops
+        .values()
+        .copied()
         .chain(init_skips.iter().copied().filter_map(|init_pc| {
             // Map init_pc to the new_pc (init is always at new_pc + 4)
             let new_pc = init_pc.wrapping_sub(4);
-            if objects.contains_key(&new_pc) { Some(new_pc) } else { None }
+            if objects.contains_key(&new_pc) {
+                Some(new_pc)
+            } else {
+                None
+            }
         }))
         .collect();
 
@@ -3705,20 +4061,25 @@ fn plan_scalar_replacement(
         if used_objects.contains(&new_pc) {
             if let Some(obj) = objects.get(&new_pc) {
                 let field_base_offset = ((scalar_base + final_total) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
-                final_objects.insert(new_pc, ScalarReplacedObject {
-                    num_fields: obj.num_fields,
-                    field_base_offset,
-                });
+                final_objects.insert(
+                    new_pc,
+                    ScalarReplacedObject {
+                        num_fields: obj.num_fields,
+                        field_base_offset,
+                    },
+                );
                 final_total += obj.num_fields * (SLOT_SIZE / 8);
             }
         }
     }
 
     // Remap field_ops to only reference final objects
-    let final_field_ops: FxHashMap<usize, usize> = field_ops.into_iter()
+    let final_field_ops: FxHashMap<usize, usize> = field_ops
+        .into_iter()
         .filter(|(_, new_pc)| final_objects.contains_key(new_pc))
         .collect();
-    let final_init_skips: std::collections::HashSet<usize> = init_skips.into_iter()
+    let final_init_skips: std::collections::HashSet<usize> = init_skips
+        .into_iter()
         .filter(|init_pc| {
             let new_pc = init_pc.wrapping_sub(4);
             final_objects.contains_key(&new_pc)
@@ -3744,9 +4105,13 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
             0xa7 => {
                 if pc + 2 < code_len {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) if t < code_len => t,
-                        _ => { pc += 3; continue; } // invalid target — skip
+                        _ => {
+                            pc += 3;
+                            continue;
+                        } // invalid target — skip
                     };
                     if target <= pc {
                         loops.push((target, pc));
@@ -3758,9 +4123,13 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
             0x99..=0xa6 | 0xc6 | 0xc7 => {
                 if pc + 2 < code_len {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) if t < code_len => t,
-                        _ => { pc += 3; continue; } // invalid target — skip
+                        _ => {
+                            pc += 3;
+                            continue;
+                        } // invalid target — skip
                     };
                     if target <= pc {
                         loops.push((target, pc));
@@ -4014,9 +4383,12 @@ struct ArithLoopHoist {
 
 /// Decode the int-pushing instruction at `pc`. Returns `(ArithStep, next_pc)`
 /// if it is a constant push or an `iload` of a *loop-invariant* local.
-fn match_iarith_push(code: &[u8], pc: usize, modified: u64, code_len: usize)
-    -> Option<(ArithStep, usize)>
-{
+fn match_iarith_push(
+    code: &[u8],
+    pc: usize,
+    modified: u64,
+    code_len: usize,
+) -> Option<(ArithStep, usize)> {
     match code[pc] {
         // iconst_m1..iconst_5
         0x02..=0x08 => Some((ArithStep::PushConst(code[pc] as i32 - 3), pc + 1)),
@@ -4055,7 +4427,8 @@ fn match_iarith_push(code: &[u8], pc: usize, modified: u64, code_len: usize)
 /// Deliberately EXCLUDES idiv (0x6c) and irem (0x70), which throw
 /// ArithmeticException on divide-by-zero, and all long/float/double ops.
 fn is_hoistable_iarith_binop(op: u8) -> bool {
-    matches!(op,
+    matches!(
+        op,
         0x60 | // iadd
         0x64 | // isub
         0x68 | // imul
@@ -4064,7 +4437,7 @@ fn is_hoistable_iarith_binop(op: u8) -> bool {
         0x7c | // iushr
         0x7e | // iand
         0x80 | // ior
-        0x82   // ixor
+        0x82 // ixor
     )
 }
 
@@ -4073,9 +4446,12 @@ fn is_hoistable_iarith_binop(op: u8) -> bool {
 /// leave exactly one value on the (simulated) value stack and consist solely
 /// of constant pushes, invariant `iload`s and the whitelisted non-faulting
 /// binary ALU ops.
-fn match_invariant_iarith(code: &[u8], pc: usize, modified: u64, code_len: usize)
-    -> Option<(Vec<ArithStep>, usize)>
-{
+fn match_invariant_iarith(
+    code: &[u8],
+    pc: usize,
+    modified: u64,
+    code_len: usize,
+) -> Option<(Vec<ArithStep>, usize)> {
     // The run must START with a push (constant or invariant load). Anything
     // else means the first value comes from elsewhere on the operand stack
     // and the run is not self-contained.
@@ -4119,7 +4495,12 @@ fn match_invariant_iarith(code: &[u8], pc: usize, modified: u64, code_len: usize
     // single invariant load is already cheap / handled elsewhere).
     let end = best_end?;
     steps.truncate(best_len);
-    if steps.iter().filter(|s| matches!(s, ArithStep::BinOp(_))).count() == 0 {
+    if steps
+        .iter()
+        .filter(|s| matches!(s, ArithStep::BinOp(_)))
+        .count()
+        == 0
+    {
         return None;
     }
     Some((steps, end))
@@ -4183,9 +4564,10 @@ fn decode_int_const_push(code: &[u8], pc: usize, code_len: usize) -> Option<(i32
     match *code.get(pc)? {
         0x02..=0x08 => Some((code[pc] as i32 - 3, pc + 1)),
         0x10 if pc + 1 < code_len => Some((code[pc + 1] as i8 as i32, pc + 2)),
-        0x11 if pc + 2 < code_len => {
-            Some((i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32, pc + 3))
-        }
+        0x11 if pc + 2 < code_len => Some((
+            i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32,
+            pc + 3,
+        )),
         _ => None,
     }
 }
@@ -4292,9 +4674,11 @@ fn match_affine_chain(
 /// which all its operands are invariant (largest span first), so it is
 /// computed as few times as possible. A run already claimed by an outer loop
 /// is not re-hoisted by an inner one.
-fn find_arith_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)])
-    -> Vec<ArithLoopHoist>
-{
+fn find_arith_loop_hoists(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> Vec<ArithLoopHoist> {
     if loops.is_empty() {
         return Vec::new();
     }
@@ -4318,9 +4702,7 @@ fn find_arith_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]
                 pc += bytecode_len_at(code, pc);
                 continue;
             }
-            if let Some((steps, seq_end)) =
-                match_invariant_iarith(code, pc, modified, code_len)
-            {
+            if let Some((steps, seq_end)) = match_invariant_iarith(code, pc, modified, code_len) {
                 // The whole run must lie inside this loop body.
                 if seq_end <= loop_end && seq_end > pc {
                     // Mark every PC of the run as claimed so neither this nor
@@ -4553,7 +4935,7 @@ fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize> {
 fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
-    // Track iadd+istore pattern: iload X; ...; iadd; istore X
+                                    // Track iadd+istore pattern: iload X; ...; iadd; istore X
     let mut iadd_store_locals: Vec<usize> = Vec::new();
 
     let mut pc = header;
@@ -4679,7 +5061,8 @@ fn analyze_loop_bound(
             0x1b if induction_var == 1 => Some(1),
             0x1c if induction_var == 2 => Some(2),
             0x1d if induction_var == 3 => Some(3),
-            0x15 if pc + 1 < back_edge_end && code[pc + 1] as usize == induction_var => { // Widening: always safe
+            0x15 if pc + 1 < back_edge_end && code[pc + 1] as usize == induction_var => {
+                // Widening: always safe
                 Some(induction_var)
             }
             _ => None,
@@ -5093,13 +5476,12 @@ fn analyze_bounds_elimination(
         // isolate whether the speculative guard is the unsound corruptor.
         // Cached in a OnceLock so the env lookup is paid once, not per loop.
         let no_spec_bce = jit_no_spec_bce();
-        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant && !no_spec_bce) {
-            let speculative_accesses = find_speculative_array_accesses(
-                &bounds,
-                modified,
-                &loop_safe,
-                &operands,
-            );
+        if let Some(bound_local) = bounds
+            .bound_local
+            .filter(|_| bound_invariant && !no_spec_bce)
+        {
+            let speculative_accesses =
+                find_speculative_array_accesses(&bounds, modified, &loop_safe, &operands);
             if !speculative_accesses.is_empty() {
                 let mut guard_arrays: Vec<usize> = Vec::new();
                 for &(access_pc, arr_local) in &speculative_accesses {
@@ -5792,22 +6174,22 @@ impl Compiler {
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
-        // Reserved bytes ABOVE the shadow region for in-frame stack args to
-        // any helper called without `emit_stack_arg_setup` (which would
-        // bump RSP itself). The worst-case site is the PIC/MIC slow path
-        // that invokes `jit_invoke_virtual_mic` with 6 args: on Windows
-        // args 5..=6 are written by the JIT to `[RSP+32]` and `[RSP+40]`
-        // BEFORE the CALL (see the `MOV [RSP+0x28], RAX` emission in the
-        // invokevirtual slow-path). Reserving only 8 bytes (one slot) made
-        // the `[RSP+40]` write corrupt either a saved callee-saved GPR or
-        // the saved XMM region, which surfaced as a delayed STATUS_ACCESS_
-        // VIOLATION (rc=139) on Windows once the corrupted register was
-        // restored after the helper returned — observed in Keycloak 26
-        // `quarkus-run.jar start-dev` SEGFAULTing inside the JIT-compiled
-        // `picocli/CommandLine$Assert.hashCode(Object)` PIC dispatch and
-        // recurring across the W2-CHM / RBC.1 / SPB.* cascade documented
-        // in `vm/src/jit/skip_list.rs`. Reserve 16 bytes (two slots) so
-        // the 6th stack arg slot lands inside the allocated frame.
+                                  // Reserved bytes ABOVE the shadow region for in-frame stack args to
+                                  // any helper called without `emit_stack_arg_setup` (which would
+                                  // bump RSP itself). The worst-case site is the PIC/MIC slow path
+                                  // that invokes `jit_invoke_virtual_mic` with 6 args: on Windows
+                                  // args 5..=6 are written by the JIT to `[RSP+32]` and `[RSP+40]`
+                                  // BEFORE the CALL (see the `MOV [RSP+0x28], RAX` emission in the
+                                  // invokevirtual slow-path). Reserving only 8 bytes (one slot) made
+                                  // the `[RSP+40]` write corrupt either a saved callee-saved GPR or
+                                  // the saved XMM region, which surfaced as a delayed STATUS_ACCESS_
+                                  // VIOLATION (rc=139) on Windows once the corrupted register was
+                                  // restored after the helper returned — observed in Keycloak 26
+                                  // `quarkus-run.jar start-dev` SEGFAULTing inside the JIT-compiled
+                                  // `picocli/CommandLine$Assert.hashCode(Object)` PIC dispatch and
+                                  // recurring across the W2-CHM / RBC.1 / SPB.* cascade documented
+                                  // in `vm/src/jit/skip_list.rs`. Reserve 16 bytes (two slots) so
+                                  // the 6th stack arg slot lands inside the allocated frame.
         let stack_arg_reserve: i32 = 16;
 
         // Use graph-coloring allocator results
@@ -5819,7 +6201,7 @@ impl Compiler {
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
-        // XMM save slots: 8 bytes each (we store the 64-bit value via MOVQ through RAX)
+                                                                  // XMM save slots: 8 bytes each (we store the 64-bit value via MOVQ through RAX)
         let xmm_saved_size = alloc_used_xmms.len() as i32 * 8; // Cast: x86-64 immediate encoding
 
         // Callee-saved registers are saved using MOV into frame slots (not PUSH)
@@ -5835,7 +6217,11 @@ impl Compiler {
         // safepoint's CURRENT live values for the GC root scan). Sits above the
         // shadow space / stack-arg region (those are nearest RSP), so it never
         // overlaps the helper-call shadow space or the 6th stack-arg slot.
-        let reg_spill_size = if safepoint_reg_spill { callee_saved_size } else { 0 };
+        let reg_spill_size = if safepoint_reg_spill {
+            callee_saved_size
+        } else {
+            0
+        };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
         // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs
@@ -6006,7 +6392,8 @@ impl Compiler {
             self.field_info_idx.insert(e.0, i);
         }
         self.static_field_info_idx.clear();
-        self.static_field_info_idx.reserve(self.static_field_info.len());
+        self.static_field_info_idx
+            .reserve(self.static_field_info.len());
         for (i, e) in self.static_field_info.iter().enumerate() {
             self.static_field_info_idx.insert(e.0, i);
         }
@@ -6064,11 +6451,10 @@ impl Compiler {
     /// stride/bound fields to make unrolling and vectorization
     /// decisions.
     #[allow(dead_code)]
-    pub(crate) fn induction_var_for(
-        &self,
-        header_pc: usize,
-    ) -> Option<&crate::scev::InductionVar> {
-        self.induction_vars.iter().find(|iv| iv.header_pc == header_pc)
+    pub(crate) fn induction_var_for(&self, header_pc: usize) -> Option<&crate::scev::InductionVar> {
+        self.induction_vars
+            .iter()
+            .find(|iv| iv.header_pc == header_pc)
     }
 
     /// T5.2.14 — query the null-check elimination info.
@@ -6165,8 +6551,12 @@ impl Compiler {
         }
         // Free scratch XMM if no other stack entry references it
         if let StackSlot::Xmm(xmm) = slot {
-            if xmm >= 2 && xmm <= 7
-                && !self.stack.iter().any(|s| matches!(s, StackSlot::Xmm(x) if *x == xmm))
+            if xmm >= 2
+                && xmm <= 7
+                && !self
+                    .stack
+                    .iter()
+                    .any(|s| matches!(s, StackSlot::Xmm(x) if *x == xmm))
             {
                 self.free_scratch_xmm(xmm);
             }
@@ -6366,9 +6756,7 @@ impl Compiler {
         // the register keeps a valid address). The slots are scanned by the
         // conservative `[scanner_sp, entry_sp)` frame walk. `=nostore` reserves
         // the slots but skips the stores (frame-perturbation A/B control).
-        if self.safepoint_reg_spill
-            && !self.safepoint_reg_spill_nostore
-            && self.reg_spill_base != 0
+        if self.safepoint_reg_spill && !self.safepoint_reg_spill_nostore && self.reg_spill_base != 0
         {
             for i in 0..self.alloc_used_regs.len() {
                 let reg = self.alloc_used_regs[i];
@@ -6459,11 +6847,7 @@ impl Compiler {
                 .unwrap_or(0);
             eprintln!(
                 "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
-                self.cur_bc_pc,
-                &self.stack,
-                &self.stack_oop_marks,
-                lm,
-                homes
+                self.cur_bc_pc, &self.stack, &self.stack_oop_marks, lm, homes
             );
         }
         if homes.is_empty() {
@@ -6473,12 +6857,12 @@ impl Compiler {
         // resident oop, so the prologue thread-fetch must be KEPT (not NOP'd).
         self.shadow_pushed_any = true;
         let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
-        // spring-bug-10 DIAGNOSTIC (CRATONVM_SHADOW_SENTINEL): write a recognizable
-        // NON-CANONICAL sentinel into the savebase slot UNCONDITIONALLY (before the
-        // null-thread guard), so the matching reload's value distinguishes the three
-        // hypotheses if it faults: 0x5151_5151_5151_5151 ⇒ the push BODY was skipped
-        // (null thread) and the slot kept the sentinel; 0xFFFF…FFFE ⇒ an EXTERNAL
-        // write overwrote the real top with -2; a valid buffer ptr ⇒ no corruption.
+                                                // spring-bug-10 DIAGNOSTIC (CRATONVM_SHADOW_SENTINEL): write a recognizable
+                                                // NON-CANONICAL sentinel into the savebase slot UNCONDITIONALLY (before the
+                                                // null-thread guard), so the matching reload's value distinguishes the three
+                                                // hypotheses if it faults: 0x5151_5151_5151_5151 ⇒ the push BODY was skipped
+                                                // (null thread) and the slot kept the sentinel; 0xFFFF…FFFE ⇒ an EXTERNAL
+                                                // write overwrote the real top with -2; a valid buffer ptr ⇒ no corruption.
         if shadow_sentinel() && self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
             self.emit_mov_imm64_full(R11, 0x5151_5151_5151_5151u64 as i64);
             self.emit_store_local(self.shadow_savebase_slot_off, R11);
@@ -6582,9 +6966,9 @@ impl Compiler {
         // and pinned (slot holds the unchanged value; the restore is a harmless
         // no-op since the callee-saved home was preserved).
         let n_bytes = -(homes.len() as i32) * 8; // Cast: x86-64 disp32
-        // SB-CRASH-04 fix: branches to here (resolved after the commit) when the
-        // savebase is invalid — the reload then leaves the home registers + `top`
-        // untouched instead of reading an out-of-bounds healed slot.
+                                                 // SB-CRASH-04 fix: branches to here (resolved after the commit) when the
+                                                 // savebase is invalid — the reload then leaves the home registers + `top`
+                                                 // untouched instead of reading an out-of-bounds healed slot.
         let mut sr_patches: Vec<usize> = Vec::new();
         if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() && shadow_reload_raw() {
             // DIAGNOSTIC raw deref: load savebase and use it unvalidated, so a
@@ -6603,16 +6987,16 @@ impl Compiler {
             // On heal, fall back to popping `homes.len()` slots off the live
             // `top` — never out of the backing buffer, so it cannot fault.
             self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
-            // SB-CRASH-04 fix: on an invalid savebase (corrupt/uninitialised —
-            // the observed 0xFFFF_FFFF_FFFF_FFFE), SKIP the value-restore rather
-            // than healing to `top - n*8`. The old heal read `[top - n*8]`, which
-            // is OUT OF BOUNDS below `base` when the stack is shallow/empty
-            // (top≈base) → it loaded an adjacent non-pointer word (the observed
-            // `0x1`) and wrote it into the `this` register → SIGSEGV at the next
-            // field access. Under the non-moving sweep the home registers already
-            // hold the correct, un-moved object, so leaving them (and `top`)
-            // untouched is correct; an over-high `top` is reset by the JIT-exit
-            // boundary heal (`restore_jit_thread`).
+                                                                 // SB-CRASH-04 fix: on an invalid savebase (corrupt/uninitialised —
+                                                                 // the observed 0xFFFF_FFFF_FFFF_FFFE), SKIP the value-restore rather
+                                                                 // than healing to `top - n*8`. The old heal read `[top - n*8]`, which
+                                                                 // is OUT OF BOUNDS below `base` when the stack is shallow/empty
+                                                                 // (top≈base) → it loaded an adjacent non-pointer word (the observed
+                                                                 // `0x1`) and wrote it into the `this` register → SIGSEGV at the next
+                                                                 // field access. Under the non-moving sweep the home registers already
+                                                                 // hold the correct, un-moved object, so leaving them (and `top`)
+                                                                 // untouched is correct; an over-high `top` is reset by the JIT-exit
+                                                                 // boundary heal (`restore_jit_thread`).
             sr_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB  (savebase < base) → skip restore
             self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
             sr_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE (savebase >= end) → skip restore
@@ -6657,10 +7041,7 @@ impl Compiler {
         // value is a non-pointer (< 0x10000) — the `1`-as-`this` bug — call the log
         // helper with (thread=R10, orig-savebase=[rbp-savebase_slot], slotval=home,
         // read_addr=R11). Bad-path only: the pointer path emits just cmp+jae.
-        if shadow_reload_dbg()
-            && homes.len() == 1
-            && self.shadow_savebase_slot_off != 0
-        {
+        if shadow_reload_dbg() && homes.len() == 1 && self.shadow_savebase_slot_off != 0 {
             if let ShadowHome::Reg(r) = homes[0] {
                 // cmp r, 0x10000   (REX.W+B, 0x81 /7 id) — r is r8..r15 here.
                 self.buf.emit(&[0x49, 0x81, 0xC0 | (7 << 3) | (r & 7)]);
@@ -6974,8 +7355,7 @@ impl Compiler {
                         seen[walk] = true;
                         let target = base + (walk as i32) * 8; // Cast: x86-64 immediate encoding
                         match pending.iter().find(|&&(j, src)| {
-                            j != walk
-                                && matches!(src, Some(StackSlot::Frame(off)) if off == target)
+                            j != walk && matches!(src, Some(StackSlot::Frame(off)) if off == target)
                         }) {
                             Some(&(j, _)) => walk = j,
                             None => {
@@ -7513,7 +7893,7 @@ impl Compiler {
         debug_assert!(positive_disp > 0, "caller arg disp must be positive");
         self.rex_w_r(reg);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
-        // ModRM r/m=101 (RBP) with positive displacement.
+                                  // ModRM r/m=101 (RBP) with positive displacement.
         if (-128..=127).contains(&positive_disp) {
             // mod=01, disp8
             self.buf.emit_byte(0x45 | ((reg & 7) << 3));
@@ -7561,12 +7941,18 @@ impl Compiler {
     /// (0x40..0x4F). dst/src are encoded register-direct (mod=11).
     #[allow(dead_code)]
     fn emit_cmov_cc_reg_reg(&mut self, cc: u8, dst: u8, src: u8) {
-        debug_assert!((0x40..=0x4F).contains(&cc),
-            "CMOV cc opcode must be in 0x40..0x4F");
+        debug_assert!(
+            (0x40..=0x4F).contains(&cc),
+            "CMOV cc opcode must be in 0x40..0x4F"
+        );
         // REX.W with R (dst extended) and B (src extended).
         let mut rex: u8 = 0x48;
-        if dst >= 8 { rex |= 0x04; }
-        if src >= 8 { rex |= 0x01; }
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if src >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(cc);
@@ -7617,7 +8003,8 @@ impl Compiler {
             self.emit_xor_reg_self(reg);
             return;
         }
-        if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 { // Widening: always safe
+        if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+            // Widening: always safe
             self.emit_mov_imm32_sx(reg, imm as i32); // Cast: x86-64 immediate encoding
             return;
         }
@@ -7755,7 +8142,7 @@ impl Compiler {
         #[cfg(not(target_os = "windows"))]
         let (shadow, base) = (0i32, 0i32);
         let raw = shadow + (stack_arg_count as i32) * 8; // Cast: x86-64 immediate encoding
-        // Round up to 16 bytes to preserve RSP alignment at the CALL.
+                                                         // Round up to 16 bytes to preserve RSP alignment at the CALL.
         let total = (raw + 15) & !15;
         (total, base)
     }
@@ -7772,11 +8159,7 @@ impl Compiler {
     /// Behaviour when all args fit in registers: emits no SUB RSP and
     /// returns 0 (so callers in the small-arg fast path observe no
     /// behavioural change).
-    fn emit_stack_arg_setup(
-        &mut self,
-        arg_slots: &[StackSlot],
-        has_ctx: bool,
-    ) -> i32 {
+    fn emit_stack_arg_setup(&mut self, arg_slots: &[StackSlot], has_ctx: bool) -> i32 {
         let ctx_offset = if has_ctx { 1 } else { 0 };
         let total_regs_for_java = ARG_REGS.len() - ctx_offset;
         let n = arg_slots.len();
@@ -8566,7 +8949,7 @@ impl Compiler {
         let total_shift = 32 + shift;
         self.rex_w();
         self.buf.emit(&[0xC1, 0xF8, total_shift as u8]); // Cast: x86-64 immediate encoding
-        // Sign correction: MOV EDX, ECX; SHR EDX, 31; ADD EAX, EDX
+                                                         // Sign correction: MOV EDX, ECX; SHR EDX, 31; ADD EAX, EDX
         self.buf.emit(&[0x89, 0xCA]); // MOV EDX, ECX
         self.buf.emit(&[0xC1, 0xEA, 0x1F]); // SHR EDX, 31
         self.buf.emit(&[0x01, 0xD0]); // ADD EAX, EDX — quotient in EAX
@@ -8858,9 +9241,7 @@ impl Compiler {
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         let pos = simd_skip_patch;
-        self.buf
-            .try_patch_i32(pos, skip_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(pos, skip_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // Now set up for scalar cleanup:
         // R10D needs to be updated to: old_i + num_simd_elements
@@ -8911,9 +9292,7 @@ impl Compiler {
         // Patch scalar end
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(scalar_end_patch, end_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
@@ -8928,7 +9307,7 @@ impl Compiler {
         self.buf.emit(&[0xC1, 0xE8, 0x02]); // SHR EAX, 2 (divide by 4)
         self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
-        // JZ to scalar cleanup (patch later)
+                                            // JZ to scalar cleanup (patch later)
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(0x84);
         let simd_skip_patch = self.buf.pos();
@@ -9015,9 +9394,7 @@ impl Compiler {
         // Patch the skip jump target
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(simd_skip_patch, skip_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(simd_skip_patch, skip_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // --- Scalar cleanup loop ---
         let scalar_loop_start = self.buf.pos();
@@ -9051,9 +9428,7 @@ impl Compiler {
         // Patch scalar end
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(scalar_end_patch, end_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     // -----------------------------------------------------------------------
@@ -9088,9 +9463,7 @@ impl Compiler {
         };
         // Defensive gate — detection already checks this, but we
         // re-apply so the emission path is self-contained.
-        let body_size = cand
-            .back_edge_pc
-            .saturating_sub(cand.header_pc);
+        let body_size = cand.back_edge_pc.saturating_sub(cand.header_pc);
         if body_size == 0 || body_size > MAX_UNSWITCH_BYTECODES {
             return;
         }
@@ -9142,7 +9515,15 @@ impl Compiler {
     /// `mm` selects the leading-opcode map:
     /// - 1 = 0F (covers VPADDD/VPSUBD/VPAND/VPOR/VPXOR)
     /// - 2 = 0F38 (covers VPMULLD only)
-    fn emit_avx2_ymm_mem_66(&mut self, opcode: u8, mm: u8, dst: u8, src1: u8, base_reg: u8, disp: i32) {
+    fn emit_avx2_ymm_mem_66(
+        &mut self,
+        opcode: u8,
+        mm: u8,
+        dst: u8,
+        src1: u8,
+        base_reg: u8,
+        disp: i32,
+    ) {
         let r = dst < 8;
         let b = base_reg < 8;
         // 0F38 map always needs the 3-byte VEX prefix (C4). For the
@@ -9155,8 +9536,7 @@ impl Compiler {
         }
         self.buf.emit_byte(opcode);
         // ModRM: mod=10 (disp32), reg=dst, rm=base_reg
-        self.buf
-            .emit_byte(0x80 | ((dst & 7) << 3) | (base_reg & 7));
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base_reg & 7));
         // SIB needed when base_reg encodes to RSP(4) or R12(12).
         if (base_reg & 7) == 4 {
             self.buf.emit_byte(0x24);
@@ -9197,7 +9577,14 @@ impl Compiler {
     /// Dispatch table from [`ElementWiseOp`] to the matching
     /// `op YMM_dst, YMM_src1, [mem]` emitter. Keeps
     /// `emit_simd_int_array_element_wise` short.
-    fn emit_ewise_ymm_mem(&mut self, op: ElementWiseOp, dst: u8, src1: u8, base_reg: u8, disp: i32) {
+    fn emit_ewise_ymm_mem(
+        &mut self,
+        op: ElementWiseOp,
+        dst: u8,
+        src1: u8,
+        base_reg: u8,
+        disp: i32,
+    ) {
         match op {
             ElementWiseOp::Add => self.emit_vpaddd_ymm_mem(dst, src1, base_reg, disp),
             ElementWiseOp::Sub => self.emit_vpsubd_ymm_mem(dst, src1, base_reg, disp),
@@ -9276,7 +9663,7 @@ impl Compiler {
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
         self.buf.emit(&[0x41, 0xC1, 0xE8, 0x03]); // SHR R8D, 3
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
-        // JZ to scalar remainder (patch later)
+                                            // JZ to scalar remainder (patch later)
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(0x84);
         let simd_skip_patch = self.buf.pos();
@@ -9376,9 +9763,7 @@ impl Compiler {
         // Patch skip-to-scalar target — when R8D == 0, jump here.
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(simd_skip_patch, skip_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(simd_skip_patch, skip_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // --- Scalar remainder ---
         //
@@ -9434,9 +9819,7 @@ impl Compiler {
         // Patch scalar end.
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(scalar_end_patch, end_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     fn emit_prologue(&mut self) {
@@ -9573,7 +9956,9 @@ impl Compiler {
         // guards against zeroing a register a parameter was coalesced into.
         for i in zero_floor..self.num_locals {
             if let Some(reg) = self.reg_for_local(i) {
-                let already_param = param_slots.iter().any(|&j| self.reg_for_local(j) == Some(reg));
+                let already_param = param_slots
+                    .iter()
+                    .any(|&j| self.reg_for_local(j) == Some(reg));
                 if !already_param {
                     self.emit_xor_reg_self(reg);
                 }
@@ -9583,7 +9968,9 @@ impl Compiler {
         // Skip if the XMM register is already initialized for a param (shared live range).
         for i in zero_floor..self.num_locals {
             if let Some(xmm) = self.xmm_for_local(i) {
-                let already_param = param_slots.iter().any(|&j| self.xmm_for_local(j) == Some(xmm));
+                let already_param = param_slots
+                    .iter()
+                    .any(|&j| self.xmm_for_local(j) == Some(xmm));
                 if !already_param {
                     self.emit_pxor_xmm_self(xmm);
                 }
@@ -9760,7 +10147,7 @@ impl Compiler {
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
             let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            // Direct `MOVQ XMMn, [rbp-offset]` (see emit_epilogue notes).
+                                                             // Direct `MOVQ XMMn, [rbp-offset]` (see emit_epilogue notes).
             self.emit_movq_xmm_from_mem_rbp(xmm, offset);
         }
         let fs = self.frame_size;
@@ -9778,7 +10165,7 @@ impl Compiler {
         self.rex_w();
         self.buf.emit_byte(0xB8); // MOV rax, imm64
         self.buf.emit(&(addr as i64).to_le_bytes()); // Cast: address arithmetic
-        // JMP RAX (FF /4)
+                                                     // JMP RAX (FF /4)
         self.buf.emit(&[0xFF, 0xE0]);
     }
 
@@ -9873,7 +10260,7 @@ impl Compiler {
         self.rex_w();
         self.buf.emit_byte(0xB8); // MOV rax, imm64
         self.buf.emit(&(addr as i64).to_le_bytes()); // Cast: address arithmetic
-        // CALL RAX (FF /2)
+                                                     // CALL RAX (FF /2)
         self.buf.emit(&[0xFF, 0xD0]);
     }
 
@@ -9890,12 +10277,16 @@ impl Compiler {
     fn emit_mov_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
         // REX.W + REX.R for dst >= 8 + REX.B for base >= 8.
         let mut rex = 0x48u8;
-        if dst >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
-        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
-        // base==RSP/R12 would require a SIB byte; neither is used here.
+                                  // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
+                                  // base==RSP/R12 would require a SIB byte; neither is used here.
         self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());
     }
@@ -9910,11 +10301,15 @@ impl Compiler {
     fn emit_movsxd_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
         // REX.W (0x48) + REX.R for dst>=8 + REX.B for base>=8.
         let mut rex = 0x48u8;
-        if dst >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x63); // MOVSXD r64, r/m32
-        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
+                                  // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
         self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());
     }
@@ -9931,12 +10326,16 @@ impl Compiler {
         // REX is only needed for extended (>=8) registers; no REX.W (32-bit op).
         if dst >= 8 || base >= 8 {
             let mut rex = 0x40u8;
-            if dst >= 8 { rex |= 0x04; }
-            if base >= 8 { rex |= 0x01; }
+            if dst >= 8 {
+                rex |= 0x04;
+            }
+            if base >= 8 {
+                rex |= 0x01;
+            }
             self.buf.emit_byte(rex);
         }
         self.buf.emit_byte(0x8B); // MOV r32, r/m32
-        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
+                                  // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
         self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());
     }
@@ -9944,8 +10343,12 @@ impl Compiler {
     /// Emit `MOV [base + disp32], r64` (the bump-commit store).
     fn emit_mov_mem_disp32_r64(&mut self, base: u8, src: u8, disp: i32) {
         let mut rex = 0x48u8;
-        if src >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if src >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x80 | ((src & 7) << 3) | (base & 7));
@@ -9969,8 +10372,12 @@ impl Compiler {
     /// touching the source register.
     fn emit_lea_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
         let mut rex = 0x48u8;
-        if dst >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x8D); // LEA r64, m
         self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
@@ -9980,8 +10387,12 @@ impl Compiler {
     /// Emit `CMP r64, [base + disp32]` — the TLAB-overflow check.
     fn emit_cmp_r64_mem_disp32(&mut self, lhs: u8, base: u8, disp: i32) {
         let mut rex = 0x48u8;
-        if lhs >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if lhs >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x3B); // CMP r64, r/m64
         self.buf.emit_byte(0x80 | ((lhs & 7) << 3) | (base & 7));
@@ -9995,8 +10406,12 @@ impl Compiler {
             return;
         }
         let mut rex = 0x48u8;
-        if src >= 8 { rex |= 0x04; }
-        if dst >= 8 { rex |= 0x01; }
+        if src >= 8 {
+            rex |= 0x04;
+        }
+        if dst >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
@@ -10006,7 +10421,9 @@ impl Compiler {
     /// (`cursor + 7` before AND with -8).
     fn emit_add_r64_imm8(&mut self, reg: u8, imm: i8) {
         let mut rex = 0x48u8;
-        if reg >= 8 { rex |= 0x01; }
+        if reg >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x83); // /0 = ADD
         self.buf.emit_byte(0xC0 | (reg & 7));
@@ -10017,7 +10434,9 @@ impl Compiler {
     /// (`cursor & -8`).
     fn emit_and_r64_imm8(&mut self, reg: u8, imm: i8) {
         let mut rex = 0x48u8;
-        if reg >= 8 { rex |= 0x01; }
+        if reg >= 8 {
+            rex |= 0x01;
+        }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x83); // /4 = AND
         self.buf.emit_byte(0xE0 | (reg & 7));
@@ -10027,7 +10446,9 @@ impl Compiler {
     /// Emit `TEST r64, r64` — sets ZF if the register is zero.
     fn emit_test_r64_r64(&mut self, reg: u8) {
         let mut rex = 0x48u8;
-        if reg >= 8 { rex |= 0x05; } // REX.W + REX.R + REX.B
+        if reg >= 8 {
+            rex |= 0x05;
+        } // REX.W + REX.R + REX.B
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x85); // TEST r/m64, r64
         self.buf.emit_byte(0xC0 | ((reg & 7) << 3) | (reg & 7));
@@ -10047,13 +10468,7 @@ impl Compiler {
     /// the SIB base and may be any register (R12/RSP as a base is legal
     /// with the disp8 ModRM used here). No CALL; no memory beyond the array
     /// payload is touched.
-    fn emit_string_decode_char(
-        &mut self,
-        dst: u8,
-        val_reg: u8,
-        idx_reg: u8,
-        coder_reg: u8,
-    ) {
+    fn emit_string_decode_char(&mut self, dst: u8, val_reg: u8, idx_reg: u8, coder_reg: u8) {
         // TEST coder_reg, coder_reg ; JNZ utf16
         let mut rex = 0x48u8;
         if coder_reg >= 8 {
@@ -10084,8 +10499,7 @@ impl Compiler {
         // ModRM: mod=01 (disp8), reg=dst, r/m=100 (SIB follows).
         self.buf.emit_byte(0x40 | ((dst & 7) << 3) | 0x04);
         // SIB: scale=00, index=idx_reg, base=val_reg.
-        self.buf
-            .emit_byte(((idx_reg & 7) << 3) | (val_reg & 7));
+        self.buf.emit_byte(((idx_reg & 7) << 3) | (val_reg & 7));
         self.buf.emit_byte(HEADER_SIZE as u8);
         let done = self.emit_jmp_rel32_patch();
 
@@ -10131,8 +10545,7 @@ impl Compiler {
             self.buf.emit_byte(rex);
         }
         self.buf.emit_byte(opcode);
-        self.buf
-            .emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
+        self.buf.emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
     }
 
     /// Emit `Jcc rel32` and return the byte offset of the 4-byte
@@ -10159,9 +10572,7 @@ impl Compiler {
     /// current buffer position.
     fn patch_rel32_to_here(&mut self, patch: usize) {
         let rel = (self.buf.pos() as i32) - (patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(patch, rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(patch, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
@@ -10469,8 +10880,12 @@ impl Compiler {
         let need_rex = a >= 8 || b >= 8;
         if need_rex {
             let mut rex = 0x40u8;
-            if b >= 8 { rex |= 0x04; } // REX.R
-            if a >= 8 { rex |= 0x01; } // REX.B
+            if b >= 8 {
+                rex |= 0x04;
+            } // REX.R
+            if a >= 8 {
+                rex |= 0x01;
+            } // REX.B
             self.buf.emit_byte(rex);
         }
         self.buf.emit_byte(0x39);
@@ -10601,7 +11016,6 @@ impl Compiler {
             self.emit_store_local(local_off, RAX);
         }
 
-
         // Track forward branches within the inlined code: (patch_offset, target_callee_pc)
         let mut branch_patches: Vec<(usize, usize)> = Vec::new();
         // Map callee PC → native offset for branch targets
@@ -10648,7 +11062,9 @@ impl Compiler {
 
             match op {
                 // nop
-                0x00 => { cpc += 1; }
+                0x00 => {
+                    cpc += 1;
+                }
 
                 // aconst_null
                 0x01 => {
@@ -10697,7 +11113,10 @@ impl Compiler {
 
                 // bipush
                 0x10 => {
-                    if cpc + 1 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 1 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let val = callee_code[cpc + 1] as i8 as i32; // Widening: always safe
                     self.emit_mov_imm32_sx(RAX, val);
                     self.push_from_rax();
@@ -10706,8 +11125,12 @@ impl Compiler {
 
                 // sipush
                 0x11 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let val = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let val =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     self.emit_mov_imm32_sx(RAX, val);
                     self.push_from_rax();
                     cpc += 3;
@@ -10721,7 +11144,10 @@ impl Compiler {
                 // `cpc` — the prior CP-index lookup silently missed and
                 // pushed 0 for the constant.
                 0x12 => {
-                    if cpc + 1 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 1 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     } else {
@@ -10733,7 +11159,10 @@ impl Compiler {
 
                 // ldc_w
                 0x13 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     } else {
@@ -10745,7 +11174,10 @@ impl Compiler {
 
                 // ldc2_w
                 0x14 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     if let Some((_, val)) = site.ldc2w_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm64(RAX, *val);
                     } else {
@@ -10757,7 +11189,10 @@ impl Compiler {
 
                 // iload, lload, fload, dload, aload
                 0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
-                    if cpc + 1 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 1 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let idx = callee_code[cpc + 1] as usize; // Widening: always safe
                     let local_off = callee_local_base + (idx as i32) * 8; // Cast: x86-64 immediate encoding
                     self.emit_load_local(RAX, local_off);
@@ -10812,7 +11247,10 @@ impl Compiler {
 
                 // istore, lstore, fstore, dstore, astore
                 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => {
-                    if cpc + 1 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 1 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let idx = callee_code[cpc + 1] as usize; // Widening: always safe
                     let local_off = callee_local_base + (idx as i32) * 8; // Cast: x86-64 immediate encoding
                     self.pop_to_rax();
@@ -10910,7 +11348,8 @@ impl Compiler {
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
                     // ADD RAX, RCX
-                    self.rex_w(); self.buf.emit(&[0x01, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x01, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -10920,7 +11359,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x01, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x01, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -10931,7 +11371,8 @@ impl Compiler {
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
                     // SUB RAX, RCX
-                    self.rex_w(); self.buf.emit(&[0x29, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x29, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -10941,7 +11382,8 @@ impl Compiler {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    self.rex_w(); self.buf.emit(&[0x29, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x29, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -10952,7 +11394,8 @@ impl Compiler {
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
                     // IMUL RAX, RCX
-                    self.rex_w(); self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                    self.rex_w();
+                    self.buf.emit(&[0x0F, 0xAF, 0xC1]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -10962,7 +11405,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                    self.rex_w();
+                    self.buf.emit(&[0x0F, 0xAF, 0xC1]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11016,7 +11460,8 @@ impl Compiler {
                     // NEG EAX
                     self.buf.emit(&[0xF7, 0xD8]);
                     // MOVSXD RAX, EAX
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11025,7 +11470,8 @@ impl Compiler {
                 0x75 => {
                     self.pop_to_rax();
                     // NEG RAX
-                    self.rex_w(); self.buf.emit(&[0xF7, 0xD8]);
+                    self.rex_w();
+                    self.buf.emit(&[0xF7, 0xD8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11037,7 +11483,8 @@ impl Compiler {
                     self.load_slot_to_reg(RCX, shift);
                     // SHL EAX, CL
                     self.buf.emit(&[0xD3, 0xE0]);
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11048,7 +11495,8 @@ impl Compiler {
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, shift);
                     // SHL RAX, CL
-                    self.rex_w(); self.buf.emit(&[0xD3, 0xE0]);
+                    self.rex_w();
+                    self.buf.emit(&[0xD3, 0xE0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11060,7 +11508,8 @@ impl Compiler {
                     self.load_slot_to_reg(RCX, shift);
                     // SAR EAX, CL
                     self.buf.emit(&[0xD3, 0xF8]);
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11070,7 +11519,8 @@ impl Compiler {
                     let shift = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, shift);
-                    self.rex_w(); self.buf.emit(&[0xD3, 0xF8]);
+                    self.rex_w();
+                    self.buf.emit(&[0xD3, 0xF8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11082,7 +11532,8 @@ impl Compiler {
                     self.load_slot_to_reg(RCX, shift);
                     // SHR EAX, CL
                     self.buf.emit(&[0xD3, 0xE8]);
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11092,7 +11543,8 @@ impl Compiler {
                     let shift = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, shift);
-                    self.rex_w(); self.buf.emit(&[0xD3, 0xE8]);
+                    self.rex_w();
+                    self.buf.emit(&[0xD3, 0xE8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11102,7 +11554,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x21, 0xC8]); // AND RAX, RCX
+                    self.rex_w();
+                    self.buf.emit(&[0x21, 0xC8]); // AND RAX, RCX
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11112,7 +11565,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x21, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x21, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11122,7 +11576,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x09, 0xC8]); // OR RAX, RCX
+                    self.rex_w();
+                    self.buf.emit(&[0x09, 0xC8]); // OR RAX, RCX
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11132,7 +11587,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x09, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x09, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11142,7 +11598,8 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x31, 0xC8]); // XOR RAX, RCX
+                    self.rex_w();
+                    self.buf.emit(&[0x31, 0xC8]); // XOR RAX, RCX
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11152,33 +11609,41 @@ impl Compiler {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    self.rex_w(); self.buf.emit(&[0x31, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x31, 0xC8]);
                     self.push_from_rax();
                     cpc += 1;
                 }
 
                 // iinc
                 0x84 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let idx = callee_code[cpc + 1] as usize; // Widening: always safe
                     let inc = callee_code[cpc + 2] as i8 as i32; // Widening: always safe
                     let local_off = callee_local_base + (idx as i32) * 8; // Cast: x86-64 immediate encoding
                     self.emit_load_local(RAX, local_off);
                     // ADD RAX, imm32
-                    self.rex_w(); self.buf.emit_byte(0x05);
+                    self.rex_w();
+                    self.buf.emit_byte(0x05);
                     self.buf.emit(&inc.to_le_bytes());
                     self.emit_store_local(local_off, RAX);
                     cpc += 3;
                 }
 
                 // i2l — identity in our i64 representation
-                0x85 => { cpc += 1; }
+                0x85 => {
+                    cpc += 1;
+                }
 
                 // l2i — truncate to 32-bit, sign-extend back
                 0x88 => {
                     self.pop_to_rax();
                     // MOVSXD RAX, EAX
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11187,7 +11652,8 @@ impl Compiler {
                 0x91 => {
                     self.pop_to_rax();
                     // MOVSX RAX, AL
-                    self.rex_w(); self.buf.emit(&[0x0F, 0xBE, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x0F, 0xBE, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11207,7 +11673,8 @@ impl Compiler {
                     self.pop_to_rax();
                     // MOVSX EAX, AX (sign-extend 16-bit)
                     self.buf.emit(&[0x0F, 0xBF, 0xC0]);
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11218,7 +11685,8 @@ impl Compiler {
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
                     // CMP RAX, RCX
-                    self.rex_w(); self.buf.emit(&[0x39, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x39, 0xC8]);
                     // SETG AL (1 if >)
                     self.buf.emit(&[0x0F, 0x9F, 0xC0]);
                     // MOVZX EAX, AL
@@ -11230,7 +11698,8 @@ impl Compiler {
                     // SUB EAX, ECX
                     self.buf.emit(&[0x29, 0xC8]);
                     // MOVSXD RAX, EAX
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -11250,12 +11719,22 @@ impl Compiler {
                 // branches only — backward edges (loops) re-enter an already-
                 // emitted target whose slot layout we can't re-canonicalise.
                 0x99..=0x9e => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let offset =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if target <= cpc {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    if self.stack.len() != caller_base_depth {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.buf.emit(&[0x85, 0xC0]); // TEST EAX, EAX
                     let cc = match op {
                         0x99 => 0x84u8, // JE
@@ -11276,13 +11755,23 @@ impl Compiler {
                 // if_icmpeq..if_icmple (0x9f..0xa4) — int compare branch. Same
                 // empty-stack-at-merge safety as 0x99..0x9e above.
                 0x9f..=0xa4 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let offset =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if target <= cpc {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    if self.stack.len() != caller_base_depth {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.load_slot_to_reg(RCX, top);
                     self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
                     let cc = match op {
@@ -11303,11 +11792,21 @@ impl Compiler {
 
                 // goto (0xa7) — unconditional forward branch. Same safety.
                 0xa7 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let offset =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
-                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    if target <= cpc {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    if self.stack.len() != caller_base_depth {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.buf.emit_byte(0xE9); // JMP rel32
                     let patch_off = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -11344,7 +11843,10 @@ impl Compiler {
 
                 // getfield (0xb4) — use callee's field_info
                 0xb4 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.flush_scratch_registers();
                     // `site.field_info` is keyed by the callee bytecode PC
                     // (`fpc` in `try_jit_compile_callee` / the inline
@@ -11352,8 +11854,8 @@ impl Compiler {
                     // CP index here silently mismatched — a multi-field
                     // callee could pick another field op's `field_index`
                     // and read/write the wrong slot. Look up by `cpc`.
-                    if let Some((_, field_index, _type_tag)) = site.field_info.iter()
-                        .find(|(p, _, _)| *p == cpc).copied()
+                    if let Some((_, field_index, _type_tag)) =
+                        site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(ARG_REGS[0], obj_slot);
@@ -11370,14 +11872,17 @@ impl Compiler {
 
                 // putfield (0xb5) — use callee's field_info
                 0xb5 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.flush_scratch_registers();
                     // Keyed by callee bytecode PC — see the `getfield`
                     // note above. Mismatching CP index vs PC here is the
                     // bug that dropped constructor field writes (boxed
                     // ints / `String.value` came back as 0).
-                    if let Some((_, field_index, type_tag)) = site.field_info.iter()
-                        .find(|(p, _, _)| *p == cpc).copied()
+                    if let Some((_, field_index, type_tag)) =
+                        site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
@@ -11415,13 +11920,19 @@ impl Compiler {
                 // so we can't bake them as `imm64` and emit `MOV reg,
                 // [imm64]`. Stay on the helper-call path.
                 0xb2 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.flush_scratch_registers();
                     // `static_field_info` is keyed by callee bytecode PC,
                     // not CP index — match on `cpc` (see the `getfield`
                     // note above).
-                    if let Some((_, class_id_raw, field_index, _type_tag, is_volatile)) = site.static_field_info.iter()
-                        .find(|(p, _, _, _, _)| *p == cpc).copied()
+                    if let Some((_, class_id_raw, field_index, _type_tag, is_volatile)) = site
+                        .static_field_info
+                        .iter()
+                        .find(|(p, _, _, _, _)| *p == cpc)
+                        .copied()
                     {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
@@ -11446,11 +11957,17 @@ impl Compiler {
                 // from `jit`. See the comment on the top-level 0xb2 handler
                 // for the full unblocking plan.
                 0xb3 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.flush_scratch_registers();
                     // Keyed by callee bytecode PC — match on `cpc`.
-                    if let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = site.static_field_info.iter()
-                        .find(|(p, _, _, _, _)| *p == cpc).copied()
+                    if let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = site
+                        .static_field_info
+                        .iter()
+                        .find(|(p, _, _, _, _)| *p == cpc)
+                        .copied()
                     {
                         let val_slot = self.pop_stack();
                         let helper_fn: usize = match type_tag {
@@ -11483,15 +12000,26 @@ impl Compiler {
                 // if_acmpeq/if_acmpne (0xa5/0xa6) — reference compare branch.
                 // Same empty-stack-at-merge safety as 0x99..0x9e.
                 0xa5 | 0xa6 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let offset =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if target <= cpc {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    if self.stack.len() != caller_base_depth {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.load_slot_to_reg(RCX, top);
-                    self.rex_w(); self.buf.emit(&[0x39, 0xC8]); // CMP RAX, RCX
+                    self.rex_w();
+                    self.buf.emit(&[0x39, 0xC8]); // CMP RAX, RCX
                     let cc = if op == 0xa5 { 0x84u8 } else { 0x85 }; // JE / JNE
                     self.buf.emit(&[0x0F, cc]);
                     let patch_off = self.buf.pos();
@@ -11502,13 +12030,24 @@ impl Compiler {
 
                 // ifnull/ifnonnull (0xc6/0xc7) — null-compare branch. Same safety.
                 0xc6 | 0xc7 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    if cpc + 2 >= callee_len {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let offset =
+                        i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if target <= cpc {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
-                    self.rex_w(); self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
+                    if self.stack.len() != caller_base_depth {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    self.rex_w();
+                    self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
                     let cc = if op == 0xc6 { 0x84u8 } else { 0x85 }; // JE / JNE
                     self.buf.emit(&[0x0F, cc]);
                     let patch_off = self.buf.pos();
@@ -11546,14 +12085,10 @@ impl Compiler {
                 // Target not yet emitted (shouldn't happen for forward branches after full emission)
                 // Fall back: point to current position
                 let rel32 = (self.buf.pos() as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(*patch_off, rel32)
-                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                self.buf.try_patch_i32(*patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
             } else {
                 let rel32 = (target_native as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(*patch_off, rel32)
-                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                self.buf.try_patch_i32(*patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
             }
         }
 
@@ -11576,16 +12111,11 @@ impl Compiler {
         true
     }
 
-
     /// Emit a balanced binary search for lookupswitch.
     /// `pairs` is sorted by key (per JVM spec). Value to match is in EAX.
     /// At each node: CMP EAX, mid_key → JE target, JL left_subtree, fall to right_subtree.
     /// Leaves fall through to `default_target`.
-    fn emit_binary_search_lookup(
-        &mut self,
-        pairs: &[(i32, usize)],
-        default_target: usize,
-    ) {
+    fn emit_binary_search_lookup(&mut self, pairs: &[(i32, usize)], default_target: usize) {
         if pairs.is_empty() {
             // Base case: no keys left → jump to default
             self.buf.emit_byte(0xE9); // JMP rel32
@@ -11656,9 +12186,7 @@ impl Compiler {
         // Patch JL to point here (start of left subtree)
         let left_start = self.buf.pos();
         let jl_rel = left_start as i32 - (jl_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf
-            .try_patch_i32(jl_patch, jl_rel)
-            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        self.buf.try_patch_i32(jl_patch, jl_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // Left subtree
         self.emit_binary_search_lookup(left, default_target);
@@ -11692,7 +12220,11 @@ impl Compiler {
             .enumerate()
             .filter_map(|(i, slot)| {
                 if let StackSlot::Xmm(xmm) = *slot {
-                    if xmm < 8 { Some((i, xmm)) } else { None }
+                    if xmm < 8 {
+                        Some((i, xmm))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -11721,7 +12253,11 @@ impl Compiler {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| {
-                if matches!(slot, StackSlot::Xmm(0)) { Some(i) } else { None }
+                if matches!(slot, StackSlot::Xmm(0)) {
+                    Some(i)
+                } else {
+                    None
+                }
             })
             .collect();
         if xmm0_slots.is_empty() {
@@ -11877,7 +12413,7 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
-        // Sign-extend EAX to RAX
+                                               // Sign-extend EAX to RAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
     }
@@ -11891,7 +12427,7 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
-        // MOVZX already zero-extends to EAX, upper 32 bits of RAX auto-zeroed
+                                               // MOVZX already zero-extends to EAX, upper 32 bits of RAX auto-zeroed
     }
 
     /// Inline short/char element store (compact: 2 bytes/element). RAX=array, RCX=index, RDX=value.
@@ -12259,12 +12795,8 @@ impl Compiler {
             self.buf.mark_overflowed();
             return;
         }
-        self.buf
-            .try_patch_byte(jne1_patch, rel1 as u8)
-            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-        self.buf
-            .try_patch_byte(jne2_patch, rel2 as u8)
-            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+        self.buf.try_patch_byte(jne1_patch, rel1 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+        self.buf.try_patch_byte(jne2_patch, rel2 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
 
         // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
         if is_64bit {
@@ -12304,9 +12836,7 @@ impl Compiler {
             self.buf.mark_overflowed();
             return;
         }
-        self.buf
-            .try_patch_byte(jmp_after_patch, rel_jmp as u8)
-            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+        self.buf.try_patch_byte(jmp_after_patch, rel_jmp as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -12357,9 +12887,7 @@ impl Compiler {
         // Patch all JAE branches to point to the shared stub
         for &patch_off in &self.bounds_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf
-                .try_patch_i32(patch_off, rel32)
-                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+            self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -12444,9 +12972,7 @@ impl Compiler {
                     continue;
                 }
                 let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(patch_off, rel32)
-                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
             }
         }
     }
@@ -12480,7 +13006,7 @@ impl Compiler {
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
         self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-        // CMP RAX, R10  (4C 39 D0)
+                                                         // CMP RAX, R10  (4C 39 D0)
         self.buf.emit(&[0x4C, 0x39, 0xD0]);
         // JE rel32 → shared exception-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
@@ -12512,9 +13038,7 @@ impl Compiler {
         // Patch every recorded JE branch to point to the shared stub.
         for &patch_off in &self.exception_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf
-                .try_patch_i32(patch_off, rel32)
-                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+            self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -12540,9 +13064,7 @@ impl Compiler {
             if let Some(&stub_off) = stub_offsets.get(&key) {
                 // Reuse existing stub
                 let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(patch_off, rel32)
-                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                 continue;
             }
 
@@ -12560,7 +13082,7 @@ impl Compiler {
                 self.rex_w();
                 self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
                 self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                // MOV R8, bci (immediate)
+                                                               // MOV R8, bci (immediate)
                 self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
                 self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
             }
@@ -12573,7 +13095,7 @@ impl Compiler {
                 self.rex_w();
                 self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
                 self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                // MOV RDX, bci (immediate)
+                                                               // MOV RDX, bci (immediate)
                 self.rex_w();
                 self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding
                 self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
@@ -12594,9 +13116,7 @@ impl Compiler {
 
             // Patch the branch to point here
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf
-                .try_patch_i32(patch_off, rel32)
-                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+            self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -12622,7 +13142,7 @@ impl Compiler {
         self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC9]); // MOVD XMM1, ECX
         self.load_slot_to_reg(RAX, slot1);
         self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]); // MOVD XMM0, EAX
-        // F3 0F <sse_op> C1 — XMM0 = XMM0 op XMM1
+                                                  // F3 0F <sse_op> C1 — XMM0 = XMM0 op XMM1
         self.buf.emit(&[0xF3, 0x0F, sse_op, 0xC1]);
         // MOVD EAX, XMM0
         self.buf.emit(&[0x66, 0x0F, 0x7E, 0xC0]);
@@ -12654,7 +13174,7 @@ impl Compiler {
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC9]); // MOVQ XMM1, RCX
         self.load_slot_to_reg(RAX, slot1);
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // MOVQ XMM0, RAX
-        // F2 0F <sse_op> C1 — XMM0 = XMM0 op XMM1
+                                                        // F2 0F <sse_op> C1 — XMM0 = XMM0 op XMM1
         self.buf.emit(&[0xF2, 0x0F, sse_op, 0xC1]);
         // MOVQ RAX, XMM0
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
@@ -12802,7 +13322,8 @@ impl Compiler {
                     0x99..=0xa6 | 0xa7 | 0xc6 | 0xc7 => {
                         if p + 2 < code_len {
                             let off = i16::from_be_bytes([code[p + 1], code[p + 2]]) as i32; // Widening: always safe
-                            if let Some(target) = p.checked_add_signed(off as isize) { // Cast: address arithmetic
+                            if let Some(target) = p.checked_add_signed(off as isize) {
+                                // Cast: address arithmetic
                                 if target < code_len {
                                     branch_targets[target] = true;
                                 }
@@ -12813,14 +13334,34 @@ impl Compiler {
                     0xaa => {
                         let base = p;
                         let mut q = p + 1;
-                        while q % 4 != 0 { q += 1; }
+                        while q % 4 != 0 {
+                            q += 1;
+                        }
                         if q + 12 <= code_len {
-                            let def = i32::from_be_bytes([code[q], code[q+1], code[q+2], code[q+3]]);
-                            if let Some(t) = base.checked_add_signed(def as isize) { // Cast: address arithmetic
-                                if t < code_len { branch_targets[t] = true; }
+                            let def = i32::from_be_bytes([
+                                code[q],
+                                code[q + 1],
+                                code[q + 2],
+                                code[q + 3],
+                            ]);
+                            if let Some(t) = base.checked_add_signed(def as isize) {
+                                // Cast: address arithmetic
+                                if t < code_len {
+                                    branch_targets[t] = true;
+                                }
                             }
-                            let low = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
-                            let high = i32::from_be_bytes([code[q+8], code[q+9], code[q+10], code[q+11]]);
+                            let low = i32::from_be_bytes([
+                                code[q + 4],
+                                code[q + 5],
+                                code[q + 6],
+                                code[q + 7],
+                            ]);
+                            let high = i32::from_be_bytes([
+                                code[q + 8],
+                                code[q + 9],
+                                code[q + 10],
+                                code[q + 11],
+                            ]);
                             // Checked `high - low + 1`: raw i32 arithmetic
                             // overflows on attacker-controlled bounds. Such
                             // methods are rejected upstream by `jit_scan`; treat
@@ -12829,9 +13370,17 @@ impl Compiler {
                             q += 12;
                             for _ in 0..cnt {
                                 if q + 4 <= code_len {
-                                    let off = i32::from_be_bytes([code[q], code[q+1], code[q+2], code[q+3]]);
-                                    if let Some(t) = base.checked_add_signed(off as isize) { // Cast: address arithmetic
-                                        if t < code_len { branch_targets[t] = true; }
+                                    let off = i32::from_be_bytes([
+                                        code[q],
+                                        code[q + 1],
+                                        code[q + 2],
+                                        code[q + 3],
+                                    ]);
+                                    if let Some(t) = base.checked_add_signed(off as isize) {
+                                        // Cast: address arithmetic
+                                        if t < code_len {
+                                            branch_targets[t] = true;
+                                        }
                                     }
                                 }
                                 q += 4;
@@ -12842,11 +13391,21 @@ impl Compiler {
                     0xab => {
                         let base = p;
                         let mut q = p + 1;
-                        while q % 4 != 0 { q += 1; }
+                        while q % 4 != 0 {
+                            q += 1;
+                        }
                         if q + 8 <= code_len {
-                            let def = i32::from_be_bytes([code[q], code[q+1], code[q+2], code[q+3]]);
-                            if let Some(t) = base.checked_add_signed(def as isize) { // Cast: address arithmetic
-                                if t < code_len { branch_targets[t] = true; }
+                            let def = i32::from_be_bytes([
+                                code[q],
+                                code[q + 1],
+                                code[q + 2],
+                                code[q + 3],
+                            ]);
+                            if let Some(t) = base.checked_add_signed(def as isize) {
+                                // Cast: address arithmetic
+                                if t < code_len {
+                                    branch_targets[t] = true;
+                                }
                             }
                             // A negative `npairs` cast straight to `usize` becomes
                             // ~1.8e19 and the loop below spins effectively forever
@@ -12855,14 +13414,27 @@ impl Compiler {
                             // actually fit before `code_len`, so a bogus huge
                             // `npairs` cannot drive an unbounded loop. The method
                             // is rejected later by the main lookupswitch handler.
-                            let npairs_raw = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
+                            let npairs_raw = i32::from_be_bytes([
+                                code[q + 4],
+                                code[q + 5],
+                                code[q + 6],
+                                code[q + 7],
+                            ]);
                             let npairs = npairs_raw.max(0) as usize;
                             q += 8;
                             let max_pairs = (code_len - q) / 8;
                             for _ in 0..npairs.min(max_pairs) {
-                                let off = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
-                                if let Some(t) = base.checked_add_signed(off as isize) { // Cast: address arithmetic
-                                    if t < code_len { branch_targets[t] = true; }
+                                let off = i32::from_be_bytes([
+                                    code[q + 4],
+                                    code[q + 5],
+                                    code[q + 6],
+                                    code[q + 7],
+                                ]);
+                                if let Some(t) = base.checked_add_signed(off as isize) {
+                                    // Cast: address arithmetic
+                                    if t < code_len {
+                                        branch_targets[t] = true;
+                                    }
                                 }
                                 q += 8;
                             }
@@ -12889,11 +13461,15 @@ impl Compiler {
             if dead {
                 if branch_targets[pc] {
                     dead = false; // reachable via branch
-                    // At merge points after unconditional branches, reconstruct
-                    // the simulated stack using canonical frame offsets. The
-                    // predecessor path called canonicalize_stack() before the
-                    // goto, so values live at base_spill + i*8.
-                    let expected_depth = self.branch_target_stack_depth.get(&pc).copied().unwrap_or(0);
+                                  // At merge points after unconditional branches, reconstruct
+                                  // the simulated stack using canonical frame offsets. The
+                                  // predecessor path called canonicalize_stack() before the
+                                  // goto, so values live at base_spill + i*8.
+                    let expected_depth = self
+                        .branch_target_stack_depth
+                        .get(&pc)
+                        .copied()
+                        .unwrap_or(0);
                     self.stack.clear();
                     let base = self.base_spill_offset;
                     for i in 0..expected_depth {
@@ -12901,24 +13477,24 @@ impl Compiler {
                         self.stack.push(StackSlot::Frame(canonical_off));
                     }
                     self.next_spill_offset = base + (expected_depth as i32) * 8; // Cast: x86-64 immediate encoding
-                    // SECURITY FIX (V15): rebuild the parallel oop-mark
-                    // vector in lock-step with the reconstructed stack.
-                    // Previously only `self.stack` was rebuilt here, leaving
-                    // `stack_oop_marks` holding stale type bits from the DEAD
-                    // predecessor path. At the next safepoint,
-                    // `emit_oop_map_for_safepoint` would index those stale
-                    // bits against the freshly canonicalised frame slots and
-                    // could emit an oop map that mislabels a slot (a stale
-                    // `true` pins a non-reference word; a stale `false` would
-                    // omit a real oop, which the conservative frame sweep
-                    // still catches, but we must not rely on that here). We
-                    // reset every reconstructed slot to `false` (conservative
-                    // / sound default): the merge-target's own bytecode will
-                    // re-tag any slot that genuinely holds an oop as it
-                    // re-executes the producing instruction. Resetting to a
-                    // known length also keeps marks aligned with `stack`,
-                    // satisfying the lock-step invariant assumed everywhere
-                    // marks is read.
+                                                                                 // SECURITY FIX (V15): rebuild the parallel oop-mark
+                                                                                 // vector in lock-step with the reconstructed stack.
+                                                                                 // Previously only `self.stack` was rebuilt here, leaving
+                                                                                 // `stack_oop_marks` holding stale type bits from the DEAD
+                                                                                 // predecessor path. At the next safepoint,
+                                                                                 // `emit_oop_map_for_safepoint` would index those stale
+                                                                                 // bits against the freshly canonicalised frame slots and
+                                                                                 // could emit an oop map that mislabels a slot (a stale
+                                                                                 // `true` pins a non-reference word; a stale `false` would
+                                                                                 // omit a real oop, which the conservative frame sweep
+                                                                                 // still catches, but we must not rely on that here). We
+                                                                                 // reset every reconstructed slot to `false` (conservative
+                                                                                 // / sound default): the merge-target's own bytecode will
+                                                                                 // re-tag any slot that genuinely holds an oop as it
+                                                                                 // re-executes the producing instruction. Resetting to a
+                                                                                 // known length also keeps marks aligned with `stack`,
+                                                                                 // satisfying the lock-step invariant assumed everywhere
+                                                                                 // marks is read.
                     self.stack_oop_marks.clear();
                     self.stack_oop_marks.resize(expected_depth, false);
                 } else {
@@ -12961,25 +13537,27 @@ impl Compiler {
             // loops (no LICM hoisting) are unaffected. The check is O(num_hoists),
             // and `num_hoists` is bounded by the static analysis upstream.
             if !dead && pc < self.osr_entry_native.len() {
-                let inside_aaload_hoisted = self.hoist_info.iter().any(|h| {
-                    h.loop_header < pc && pc < h.loop_end
-                });
-                let inside_arith_hoisted = self.arith_hoist_info.iter().any(|h| {
-                    h.loop_header < pc && pc < h.loop_end
-                });
+                let inside_aaload_hoisted = self
+                    .hoist_info
+                    .iter()
+                    .any(|h| h.loop_header < pc && pc < h.loop_end);
+                let inside_arith_hoisted = self
+                    .arith_hoist_info
+                    .iter()
+                    .any(|h| h.loop_header < pc && pc < h.loop_end);
                 if inside_aaload_hoisted || inside_arith_hoisted {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
-                    // Shadow-stack note: this position is reached by BOTH the OSR
-                    // entry (which bypasses the prologue → thread/watermark slots
-                    // uninitialised) AND the initial fall-through (slots already
-                    // set by the prologue). So we can't (re)initialise the slots
-                    // here without corrupting the normal path. Instead the VM-side
-                    // OSR setup zeroes the slots before jumping (see
-                    // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
-                    // makes OSR-entered frames skip shadow tracking via the
-                    // null-guards (safe; precise OSR-frame tracking is a follow-up).
+                                                                       // Shadow-stack note: this position is reached by BOTH the OSR
+                                                                       // entry (which bypasses the prologue → thread/watermark slots
+                                                                       // uninitialised) AND the initial fall-through (slots already
+                                                                       // set by the prologue). So we can't (re)initialise the slots
+                                                                       // here without corrupting the normal path. Instead the VM-side
+                                                                       // OSR setup zeroes the slots before jumping (see
+                                                                       // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
+                                                                       // makes OSR-entered frames skip shadow tracking via the
+                                                                       // null-guards (safe; precise OSR-frame tracking is a follow-up).
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -13098,9 +13676,11 @@ impl Compiler {
 
             // === SIMD FP: Emit vectorized preheader for double-array-sum loops ===
             {
-                let simd_fp_match = self.simd_fp_loops.iter().find(|s| s.header_pc == pc).map(|s| {
-                    (s.iv_local, s.acc_local, s.array_local, s.bound_local)
-                });
+                let simd_fp_match = self
+                    .simd_fp_loops
+                    .iter()
+                    .find(|s| s.header_pc == pc)
+                    .map(|s| (s.iv_local, s.acc_local, s.array_local, s.bound_local));
 
                 if let Some((iv_local, acc_local, array_local, bound_local)) = simd_fp_match {
                     let acc_offset = self.local_offset(acc_local);
@@ -13191,9 +13771,19 @@ impl Compiler {
                     .simd_element_wise_loops
                     .iter()
                     .find(|e| e.header_pc == pc)
-                    .map(|e| (e.iv_local, e.out_local, e.a_local, e.b_local, e.bound_local, e.op));
+                    .map(|e| {
+                        (
+                            e.iv_local,
+                            e.out_local,
+                            e.a_local,
+                            e.b_local,
+                            e.bound_local,
+                            e.op,
+                        )
+                    });
 
-                if let Some((iv_local, out_local, a_local, b_local, bound_local, op)) = ewise_match {
+                if let Some((iv_local, out_local, a_local, b_local, bound_local, op)) = ewise_match
+                {
                     // Load A base → RAX
                     if let Some(reg) = self.reg_for_local(a_local) {
                         self.emit_mov_reg_reg(RAX, reg);
@@ -13261,7 +13851,7 @@ impl Compiler {
                     // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET] — array length
                     self.buf
                         .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
-                    // Load loop bound into ECX
+                                                                               // Load loop bound into ECX
                     if let Some(reg) = self.reg_for_local(guard.bound_local) {
                         self.emit_mov_reg_reg(RCX, reg);
                     } else {
@@ -13373,9 +13963,13 @@ impl Compiler {
                     let val = op as i32 - 3; // Widening: always safe
                     if self.try_const_arith_peephole(val, pc + 1, code, code_len, &branch_targets) {
                         pc += 2;
-                    } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 1, code, code_len, &branch_targets)
-                    {
+                    } else if let Some(next_pc) = self.try_const_compare_peephole(
+                        val,
+                        pc + 1,
+                        code,
+                        code_len,
+                        &branch_targets,
+                    ) {
                         pc = next_pc;
                     } else {
                         self.emit_mov_imm32_sx(RAX, val);
@@ -13443,9 +14037,13 @@ impl Compiler {
                     let val = code[pc + 1] as i8 as i32; // Widening: always safe
                     if self.try_const_arith_peephole(val, pc + 2, code, code_len, &branch_targets) {
                         pc += 3;
-                    } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 2, code, code_len, &branch_targets)
-                    {
+                    } else if let Some(next_pc) = self.try_const_compare_peephole(
+                        val,
+                        pc + 2,
+                        code,
+                        code_len,
+                        &branch_targets,
+                    ) {
                         pc = next_pc;
                     } else {
                         self.emit_mov_imm32_sx(RAX, val);
@@ -13459,9 +14057,13 @@ impl Compiler {
                     let val = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     if self.try_const_arith_peephole(val, pc + 3, code, code_len, &branch_targets) {
                         pc += 4;
-                    } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 3, code, code_len, &branch_targets)
-                    {
+                    } else if let Some(next_pc) = self.try_const_compare_peephole(
+                        val,
+                        pc + 3,
+                        code,
+                        code_len,
+                        &branch_targets,
+                    ) {
                         pc = next_pc;
                     } else {
                         self.emit_mov_imm32_sx(RAX, val);
@@ -13529,7 +14131,7 @@ impl Compiler {
                         }
                     }
                     let idx = code[pc + 1] as usize; // Widening: always safe
-                    // fload (0x17) and dload (0x18) may have XMM-allocated locals
+                                                     // fload (0x17) and dload (0x18) may have XMM-allocated locals
                     if matches!(op, 0x17 | 0x18) {
                         if let Some(xmm) = self.xmm_for_local(idx) {
                             // FP value — never an oop.
@@ -13765,7 +14367,7 @@ impl Compiler {
                 // istore/lstore/fstore/dstore/astore (wide index)
                 0x36..=0x3a => {
                     let idx = code[pc + 1] as usize; // Widening: always safe
-                    // fstore (0x38) and dstore (0x39) may have XMM-allocated locals
+                                                     // fstore (0x38) and dstore (0x39) may have XMM-allocated locals
                     if matches!(op, 0x38 | 0x39) {
                         if let Some(dst_xmm) = self.xmm_for_local(idx) {
                             let slot = self.pop_stack();
@@ -13861,8 +14463,8 @@ impl Compiler {
                 // dstore_0..dstore_3 (double store)
                 0x47..=0x4a => {
                     let idx = (op - 0x47) as usize; // Widening: always safe
-                    // Optimize: if top-of-stack is Xmm and target is XMM local,
-                    // move directly XMM→XMM without going through RAX.
+                                                    // Optimize: if top-of-stack is Xmm and target is XMM local,
+                                                    // move directly XMM→XMM without going through RAX.
                     if let Some(dst_xmm) = self.xmm_for_local(idx) {
                         let slot = self.pop_stack();
                         match slot {
@@ -14199,13 +14801,13 @@ impl Compiler {
                 // `canonicalize_stack` resolves arbitrary offset permutations as
                 // a parallel-move problem at the next branch/call boundary.
                 0x5a => {
-                    if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2 {
+                    if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2
+                    {
                         self.failed = true;
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
-                        let a_oop =
-                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                         self.load_slot_to_reg(RAX, a_slot);
                         self.push_from_rax(); // […, b, a, aC]
                         if a_oop {
@@ -14235,11 +14837,12 @@ impl Compiler {
                 // bailing on this opcode. Any other shape stays interpreted.
                 0x5b => {
                     let next_is_cat1_astore = pc + 1 < code_len
-                        && matches!(
-                            code[pc + 1],
-                            0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56
-                        );
-                    if dupx_codegen_disabled() || dup_x2_codegen_disabled() || !next_is_cat1_astore || self.stack.len() < 3 {
+                        && matches!(code[pc + 1], 0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56);
+                    if dupx_codegen_disabled()
+                        || dup_x2_codegen_disabled()
+                        || !next_is_cat1_astore
+                        || self.stack.len() < 3
+                    {
                         // Unprovable form (or malformed height) — stay
                         // interpreted; placeholder keeps the model height
                         // plausible until the post-loop `failed` check.
@@ -14247,8 +14850,7 @@ impl Compiler {
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
-                        let a_oop =
-                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                         self.load_slot_to_reg(RAX, a_slot);
                         self.push_from_rax(); // […, c, b, a, aC]
                         if a_oop {
@@ -14288,20 +14890,32 @@ impl Compiler {
                             let len = self.stack.len();
                             let a = self.stack[len - 2]; // deeper
                             let b = self.stack[len - 1]; // top
-                            // EC oop-map fix: carry the two source oop marks onto
-                            // the two duplicated entries (push_from_rax pushes `false`).
+                                                         // EC oop-map fix: carry the two source oop marks onto
+                                                         // the two duplicated entries (push_from_rax pushes `false`).
                             let ml = self.stack_oop_marks.len();
-                            let a_oop = self.stack_oop_marks.get(ml.wrapping_sub(2)).copied().unwrap_or(false);
-                            let b_oop = self.stack_oop_marks.get(ml.wrapping_sub(1)).copied().unwrap_or(false);
+                            let a_oop = self
+                                .stack_oop_marks
+                                .get(ml.wrapping_sub(2))
+                                .copied()
+                                .unwrap_or(false);
+                            let b_oop = self
+                                .stack_oop_marks
+                                .get(ml.wrapping_sub(1))
+                                .copied()
+                                .unwrap_or(false);
                             self.load_slot_to_reg(RAX, a);
                             self.push_from_rax();
                             if a_oop {
-                                if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                                if let Some(m) = self.stack_oop_marks.last_mut() {
+                                    *m = true;
+                                }
                             }
                             self.load_slot_to_reg(RAX, b);
                             self.push_from_rax();
                             if b_oop {
-                                if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                                if let Some(m) = self.stack_oop_marks.last_mut() {
+                                    *m = true;
+                                }
                             }
                         }
                         _ => {
@@ -15001,7 +15615,8 @@ impl Compiler {
                 0x99..=0x9e => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -15054,7 +15669,8 @@ impl Compiler {
                 0x9f..=0xa4 => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -15078,9 +15694,7 @@ impl Compiler {
                     // the if_icmp, the fall-through iload, the goto,
                     // and the taken-side iload all at once; on hit
                     // we resume at the merge PC L2.
-                    if let Some(new_pc) =
-                        self.try_cmov_minmax_peephole(code, pc, op, val1, val2)
-                    {
+                    if let Some(new_pc) = self.try_cmov_minmax_peephole(code, pc, op, val1, val2) {
                         // Map the original if_icmp PC to the start of
                         // the CMOV sequence so downstream branch
                         // resolution keeps working.
@@ -15124,7 +15738,8 @@ impl Compiler {
                 // goto
                 0xa7 => {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -15284,16 +15899,13 @@ impl Compiler {
                                             let orig_target = self.pc_to_native[tp];
                                             if orig_target >= 0 {
                                                 let shifted_target = orig_target + shift;
-                                                let rel = shifted_target
-                                                    - (shifted_po as i32 + 4); // Cast: x86-64 immediate encoding
-                                                self.buf
-                                                    .try_patch_i32(shifted_po, rel)
-                                                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                let rel = shifted_target - (shifted_po as i32 + 4); // Cast: x86-64 immediate encoding
+                                                self.buf.try_patch_i32(shifted_po, rel).ok();
+                                                // on Err try_patch_i32 set buf.overflowed; compile bails
                                             }
                                         } else {
                                             // External: defer to normal resolution
-                                            self.forward_patches
-                                                .push((shifted_po, tp));
+                                            self.forward_patches.push((shifted_po, tp));
                                         }
                                     }
 
@@ -15322,14 +15934,12 @@ impl Compiler {
                                         // borrow ends before the upcoming
                                         // `patch_i32` mutable call.
                                         let mut rel_bytes = [0u8; 4];
-                                        rel_bytes.copy_from_slice(
-                                            &self.buf.as_slice()[po..po + 4],
-                                        );
+                                        rel_bytes.copy_from_slice(&self.buf.as_slice()[po..po + 4]);
                                         let orig_rel32 = i32::from_le_bytes(rel_bytes);
                                         let orig_next_pc =
                                             buf_base.wrapping_add(po).wrapping_add(4);
-                                        let helper_addr = (orig_next_pc as i64)
-                                            .wrapping_add(orig_rel32 as i64);
+                                        let helper_addr =
+                                            (orig_next_pc as i64).wrapping_add(orig_rel32 as i64);
                                         let copy_po = po + shift_us;
                                         let copy_next_pc =
                                             buf_base.wrapping_add(copy_po).wrapping_add(4);
@@ -15343,11 +15953,11 @@ impl Compiler {
                                         // assert to catch any pathological
                                         // future code-cache layout.
                                         debug_assert!(
-                                            delta >= i32::MIN as i128
-                                                && delta <= i32::MAX as i128,
+                                            delta >= i32::MIN as i128 && delta <= i32::MAX as i128,
                                             "unrolled helper rel32 out of range",
                                         );
-                                        self.buf.try_patch_i32(copy_po, delta as i32) // Cast: rel32 displacement
+                                        self.buf
+                                            .try_patch_i32(copy_po, delta as i32) // Cast: rel32 displacement
                                             .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                     }
 
@@ -15367,35 +15977,26 @@ impl Compiler {
                                         let copy_po = po + shift_us;
                                         let fresh_ptr: i64 = match kind {
                                             0 => {
-                                                let mic =
-                                                    Box::new(super::JitMICSlot::new());
-                                                let p: *const super::JitMICSlot =
-                                                    &*mic;
+                                                let mic = Box::new(super::JitMICSlot::new());
+                                                let p: *const super::JitMICSlot = &*mic;
                                                 self.cloned_mic_slots.push(mic);
                                                 p as i64 // Cast: function pointer for JIT call target
                                             }
                                             1 => {
-                                                let pic =
-                                                    Box::new(super::JitPICSlot::new());
-                                                let p: *const super::JitPICSlot =
-                                                    &*pic;
+                                                let pic = Box::new(super::JitPICSlot::new());
+                                                let p: *const super::JitPICSlot = &*pic;
                                                 self.cloned_pic_slots.push(pic);
                                                 p as i64 // Cast: function pointer for JIT call target
                                             }
-                                            _ => unreachable!(
-                                                "unknown ic_patches kind {}",
-                                                kind,
-                                            ),
+                                            _ => unreachable!("unknown ic_patches kind {}", kind,),
                                         };
                                         // Overwrite the 8-byte little-endian
                                         // imm64 baked into the duplicated
                                         // `MOV R10, imm64` (10-byte form).
                                         let bytes = fresh_ptr.to_le_bytes();
                                         for i in 0..8 {
-                                            self.buf.try_patch_byte(
-                                                copy_po + i,
-                                                bytes[i],
-                                            ).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                            self.buf.try_patch_byte(copy_po + i, bytes[i]).ok();
+                                            // on Err try_patch_byte set buf.overflowed; compile bails
                                         }
                                     }
 
@@ -15403,26 +16004,17 @@ impl Compiler {
                                     // null-check-store, and self-call patch
                                     // sites so the late stub emitters see
                                     // every duplicated branch.
-                                    self.bounds_check_stubs.extend(
-                                        orig_bounds_stubs
-                                            .iter()
-                                            .map(|&po| po + shift_us),
-                                    );
-                                    self.exception_check_stubs.extend(
-                                        orig_excn_stubs
-                                            .iter()
-                                            .map(|&po| po + shift_us),
-                                    );
+                                    self.bounds_check_stubs
+                                        .extend(orig_bounds_stubs.iter().map(|&po| po + shift_us));
+                                    self.exception_check_stubs
+                                        .extend(orig_excn_stubs.iter().map(|&po| po + shift_us));
                                     self.null_check_store_stubs.extend(
                                         orig_nullstore_stubs
                                             .iter()
                                             .map(|&(action, po)| (action, po + shift_us)),
                                     );
-                                    self.self_call_patches.extend(
-                                        orig_self_calls
-                                            .iter()
-                                            .map(|&po| po + shift_us),
-                                    );
+                                    self.self_call_patches
+                                        .extend(orig_self_calls.iter().map(|&po| po + shift_us));
                                     // Deopt stub patches: (patch_offset, bci,
                                     // reason). bci and reason are the same
                                     // across copies (it's the same logical
@@ -15434,9 +16026,7 @@ impl Compiler {
                                     self.deopt_stubs.extend(
                                         orig_deopt_stubs
                                             .iter()
-                                            .map(|&(po, bci, reason)| {
-                                                (po + shift_us, bci, reason)
-                                            }),
+                                            .map(|&(po, bci, reason)| (po + shift_us, bci, reason)),
                                     );
                                     // Jump-table patches use RIP-relative
                                     // offsets stored as i32 from
@@ -15451,11 +16041,9 @@ impl Compiler {
                                     // tuple itself so the late patcher
                                     // re-resolves the copy.
                                     self.jump_table_patches.extend(
-                                        orig_jump_table_patches.iter().map(
-                                            |&(eo, tb, tpc)| {
-                                                (eo + shift_us, tb + shift_us, tpc)
-                                            },
-                                        ),
+                                        orig_jump_table_patches.iter().map(|&(eo, tb, tpc)| {
+                                            (eo + shift_us, tb + shift_us, tpc)
+                                        }),
                                     );
                                     // Oop maps: each entry stashes the
                                     // native_pc_offset of the instruction
@@ -15463,37 +16051,29 @@ impl Compiler {
                                     // looks up the map by PC, so duplicated
                                     // safepoints need their own shifted
                                     // entries — same frame slots, new PC.
-                                    self.oop_maps.extend(
-                                        orig_oop_maps.iter().map(|e| {
-                                            let mut copy = e.clone();
-                                            // native_pc_offset is u32; shift
-                                            // is i32 but always positive
-                                            // (copy_start > body_start), so
-                                            // saturate-add via usize for safe
-                                            // arithmetic.
-                                            copy.native_pc_offset =
-                                                (e.native_pc_offset as usize)
-                                                    .wrapping_add(shift_us)
-                                                    as u32; // Cast: native_pc_offset width
-                                            copy
-                                        }),
-                                    );
+                                    self.oop_maps.extend(orig_oop_maps.iter().map(|e| {
+                                        let mut copy = e.clone();
+                                        // native_pc_offset is u32; shift
+                                        // is i32 but always positive
+                                        // (copy_start > body_start), so
+                                        // saturate-add via usize for safe
+                                        // arithmetic.
+                                        copy.native_pc_offset = (e.native_pc_offset as usize)
+                                            .wrapping_add(shift_us)
+                                            as u32; // Cast: native_pc_offset width
+                                        copy
+                                    }));
                                     // Helper-call patches: track the
                                     // duplicated rel32 site so any future
                                     // pass that walks helper_call_patches
                                     // (e.g. a nested unroll) sees the copy.
-                                    self.helper_call_patches.extend(
-                                        orig_helper_calls
-                                            .iter()
-                                            .map(|&po| po + shift_us),
-                                    );
+                                    self.helper_call_patches
+                                        .extend(orig_helper_calls.iter().map(|&po| po + shift_us));
                                     // IC patches: same idea — record the
                                     // shifted imm64 location with its kind
                                     // so any later pass can find it.
                                     self.ic_patches.extend(
-                                        orig_ic_patches
-                                            .iter()
-                                            .map(|&(po, k)| (po + shift_us, k)),
+                                        orig_ic_patches.iter().map(|&(po, k)| (po + shift_us, k)),
                                     );
                                 }
                             }
@@ -15566,7 +16146,10 @@ impl Compiler {
                     let mut targets = Vec::with_capacity(count);
                     for _ in 0..count {
                         let off = i32::from_be_bytes([
-                            code[pc], code[pc + 1], code[pc + 2], code[pc + 3],
+                            code[pc],
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
                         ]);
                         targets.push((base_pc as i32 + off) as usize); // Cast: x86-64 immediate encoding
                         pc += 4;
@@ -15636,15 +16219,14 @@ impl Compiler {
                         // Patch LEA: disp32 = table_start - (lea_patch + 4)
                         let table_start = self.buf.pos();
                         let lea_rel = table_start as i32 - (lea_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-                        self.buf
-                            .try_patch_i32(lea_patch, lea_rel)
-                            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                        self.buf.try_patch_i32(lea_patch, lea_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
                         // Emit jump table: count entries, each i32 offset from table_start
                         for &target in &targets {
                             let entry_offset = self.buf.pos();
                             self.buf.emit(&[0; 4]); // placeholder
-                            self.jump_table_patches.push((entry_offset, table_start, target));
+                            self.jump_table_patches
+                                .push((entry_offset, table_start, target));
                         }
                     }
                     self.reset_spills();
@@ -15672,8 +16254,12 @@ impl Compiler {
                     // would become a huge usize and drive an OOM allocation /
                     // OOB read. Reject it, and validate the pair table (8 bytes
                     // each) fits the remaining bytes before allocating.
-                    let npairs_i32 =
-                        i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
+                    let npairs_i32 = i32::from_be_bytes([
+                        code[pc + 4],
+                        code[pc + 5],
+                        code[pc + 6],
+                        code[pc + 7],
+                    ]);
                     pc += 8;
                     if npairs_i32 < 0 {
                         return false;
@@ -15688,10 +16274,16 @@ impl Compiler {
                     let mut pairs = Vec::with_capacity(npairs);
                     for _ in 0..npairs {
                         let key = i32::from_be_bytes([
-                            code[pc], code[pc + 1], code[pc + 2], code[pc + 3],
+                            code[pc],
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
                         ]);
                         let off = i32::from_be_bytes([
-                            code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7],
+                            code[pc + 4],
+                            code[pc + 5],
+                            code[pc + 6],
+                            code[pc + 7],
                         ]);
                         let target = (base_pc as i32 + off) as usize; // Cast: x86-64 immediate encoding
                         pc += 8;
@@ -15859,11 +16451,11 @@ impl Compiler {
                 // RwLock and reads `Value` properly) but slow.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, _type_tag, is_volatile) =
-                        self.static_field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.static_field_info[i])
-                            .unwrap_or((pc, 0, 0, b'I', false));
+                    let (_, class_id_raw, field_index, _type_tag, is_volatile) = self
+                        .static_field_info_idx
+                        .get(&pc)
+                        .map(|&i| self.static_field_info[i])
+                        .unwrap_or((pc, 0, 0, b'I', false));
 
                     self.flush_scratch_registers();
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -15892,11 +16484,11 @@ impl Compiler {
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) =
-                        self.static_field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.static_field_info[i])
-                            .unwrap_or((pc, 0, 0, b'I', false));
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
+                        .static_field_info_idx
+                        .get(&pc)
+                        .map(|&i| self.static_field_info[i])
+                        .unwrap_or((pc, 0, 0, b'I', false));
 
                     let val_slot = self.pop_stack();
 
@@ -15938,12 +16530,16 @@ impl Compiler {
                             .unwrap_or((pc, 0, b'I'));
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
-                        let field_off = sr_obj.field_base_offset
-                            + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
+                        let field_off =
+                            sr_obj.field_base_offset + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
-                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc).filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none()) {
+                    } else if let Some(&info_idx) = self
+                        .field_info_idx
+                        .get(&pc)
+                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                    {
                         // Inline field load — the field index and type tag are
                         // statically resolved (`field_info` was built from
                         // `resolve_field_ref` in lib.rs), so we can emit a raw
@@ -15965,8 +16561,7 @@ impl Compiler {
                         // `FIELD_CELL_PAYLOAD*_OFFSET` constants in `types`
                         // (layout pinned by `field_cell_layout_matches_value_enum`).
                         let (_, field_index, type_tag) = self.field_info[info_idx];
-                        let cell_off =
-                            (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
+                        let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                         let obj_slot = self.pop_stack();
                         // Receiver → RAX.
                         self.load_slot_to_reg(RAX, obj_slot);
@@ -16036,8 +16631,8 @@ impl Compiler {
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
-                        let field_off = sr_obj.field_base_offset
-                            + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
+                        let field_off =
+                            sr_obj.field_base_offset + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.load_slot_to_reg(RAX, val_slot);
                         self.emit_store_local(field_off, RAX);
                         // Each scalar field reserves SLOT_SIZE bytes (see `new` zero-init). Always
@@ -16106,13 +16701,10 @@ impl Compiler {
 
                     // Check for direct call target
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let direct = self
-                        .direct_calls_idx
-                        .get(&pc)
-                        .map(|&i| {
-                            let dc = &self.direct_calls[i].1;
-                            (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
-                        });
+                    let direct = self.direct_calls_idx.get(&pc).map(|&i| {
+                        let dc = &self.direct_calls[i].1;
+                        (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
+                    });
 
                     // Check for invoke_info (fallback to jit_invoke_dispatch)
                     let info_ptr = self
@@ -16120,7 +16712,8 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.invoke_info[i].1);
 
-                    if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
+                    if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
+                    {
                         if callee_entry == super::MATH_SQRT_INTRINSIC {
                             // Math.sqrt(double) intrinsic: inline SQRTSD — no call overhead
                             let arg_slot = self.pop_stack();
@@ -16399,12 +16992,11 @@ impl Compiler {
                             self.load_slot_to_reg(RAX, a_slot);
                             self.load_slot_to_reg(RCX, b_slot);
                             // IMUL RCX (48 F7 E9) signed / MUL RCX (48 F7 E1) unsigned.
-                            let modrm =
-                                if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC {
-                                    0xE9u8 // /5 IMUL
-                                } else {
-                                    0xE1u8 // /4 MUL
-                                };
+                            let modrm = if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC {
+                                0xE9u8 // /5 IMUL
+                            } else {
+                                0xE1u8 // /4 MUL
+                            };
                             self.buf.emit(&[0x48, 0xF7, modrm]);
                             // MOV RAX, RDX (48 89 D0) — high half is the result.
                             self.buf.emit(&[0x48, 0x89, 0xD0]);
@@ -16424,9 +17016,7 @@ impl Compiler {
                         // operand stack, computes into EAX and pushes the
                         // result. All emitted code is bit-identical to the
                         // JDK semantics (verified by intrinsic_int_bits.rs).
-                        else if callee_entry
-                            == super::JitIntrinsic::IntBitCount.as_entry()
-                        {
+                        else if callee_entry == super::JitIntrinsic::IntBitCount.as_entry() {
                             // Integer.bitCount(i): POPCNT EAX, EAX. The
                             // matcher only registers this when has_popcnt()
                             // is true, so the instruction is always valid.
@@ -16491,17 +17081,13 @@ impl Compiler {
                                 self.buf.emit(&[0x89, 0xC8]);
                             }
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntReverseBytes.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::IntReverseBytes.as_entry() {
                             // Integer.reverseBytes(i): BSWAP EAX (0F C8).
                             let arg = self.pop_stack();
                             self.load_slot_to_reg(RAX, arg);
                             self.buf.emit(&[0x0F, 0xC8]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntHighestOneBit.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::IntHighestOneBit.as_entry() {
                             // Integer.highestOneBit(i): the value with only
                             // the highest set bit of `i`, or 0 when i == 0.
                             let arg = self.pop_stack();
@@ -16521,9 +17107,7 @@ impl Compiler {
                             // CMOVZ EAX, EDX: 0F 44 C2 — input 0 → result 0.
                             self.buf.emit(&[0x0F, 0x44, 0xC2]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntLowestOneBit.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::IntLowestOneBit.as_entry() {
                             // Integer.lowestOneBit(i): i & -i. Naturally
                             // yields 0 for input 0, matching the JDK.
                             let arg = self.pop_stack();
@@ -16535,9 +17119,7 @@ impl Compiler {
                             // AND EAX, ECX: 21 C8  → EAX = -i & i
                             self.buf.emit(&[0x21, 0xC8]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntReverse.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::IntReverse.as_entry() {
                             // Integer.reverse(i): reverse the bit order via
                             // the standard SWAR sequence. The JDK does five
                             // stages; the final two (swap byte pairs, then
@@ -16574,9 +17156,7 @@ impl Compiler {
                             // completes the 8- and 16-bit reversal stages.
                             self.buf.emit(&[0x0F, 0xC8]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntCompare.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::IntCompare.as_entry() {
                             // Integer.compare(x, y): branchless (x>y)-(x<y).
                             // The stack holds x (deeper) then y.
                             let y = self.pop_stack();
@@ -16596,10 +17176,8 @@ impl Compiler {
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::IntRotateLeft.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::IntRotateRight.as_entry()
+                        } else if callee_entry == super::JitIntrinsic::IntRotateLeft.as_entry()
+                            || callee_entry == super::JitIntrinsic::IntRotateRight.as_entry()
                         {
                             // Integer.rotateLeft(i, distance) / rotateRight:
                             // ROL/ROR EAX, CL. x86 masks CL & 0x1f for a 32-bit
@@ -16611,13 +17189,12 @@ impl Compiler {
                             self.load_slot_to_reg(RAX, val);
                             self.load_slot_to_reg(RCX, dist);
                             // ROL EAX, CL: D3 /0 = D3 C0 ; ROR EAX, CL: D3 /1 = D3 C8
-                            let modrm = if callee_entry
-                                == super::JitIntrinsic::IntRotateLeft.as_entry()
-                            {
-                                0xC0u8
-                            } else {
-                                0xC8u8
-                            };
+                            let modrm =
+                                if callee_entry == super::JitIntrinsic::IntRotateLeft.as_entry() {
+                                    0xC0u8
+                                } else {
+                                    0xC8u8
+                                };
                             self.buf.emit(&[0xD3, modrm]);
                             // MOVSXD RAX, EAX (48 63 C0): a 32-bit rotate may set
                             // the high bit (negative int); re-extend to the
@@ -16636,9 +17213,7 @@ impl Compiler {
                         // 64-bit value. bitCount/numberOfLeadingZeros/
                         // numberOfTrailingZeros return an int (0..=64) which
                         // is left in EAX with the upper 32 bits cleared.
-                        else if callee_entry
-                            == super::JitIntrinsic::LongBitCount.as_entry()
-                        {
+                        else if callee_entry == super::JitIntrinsic::LongBitCount.as_entry() {
                             // Long.bitCount(j): 64-bit POPCNT. Matcher gates
                             // this on has_popcnt(), so the instruction is
                             // always valid here. Result 0..=64 fits in EAX.
@@ -16711,17 +17286,14 @@ impl Compiler {
                                 self.buf.emit(&[0x89, 0xC8]);
                             }
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::LongReverseBytes.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::LongReverseBytes.as_entry() {
                             // Long.reverseBytes(j): 64-bit BSWAP.
                             let arg = self.pop_stack();
                             self.load_slot_to_reg(RAX, arg);
                             // BSWAP RAX: 48 0F C8
                             self.buf.emit(&[0x48, 0x0F, 0xC8]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::LongHighestOneBit.as_entry()
+                        } else if callee_entry == super::JitIntrinsic::LongHighestOneBit.as_entry()
                         {
                             // Long.highestOneBit(j): 1L << bitIndex of the MSB,
                             // or 0 for a zero input. BSR leaves the index in
@@ -16746,9 +17318,7 @@ impl Compiler {
                             // MOV RAX, RDX: 48 89 D0
                             self.buf.emit(&[0x48, 0x89, 0xD0]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::LongLowestOneBit.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::LongLowestOneBit.as_entry() {
                             // Long.lowestOneBit(j): j & -j. Naturally yields 0
                             // for a zero input, matching the JDK.
                             let arg = self.pop_stack();
@@ -16760,9 +17330,7 @@ impl Compiler {
                             // AND RAX, RCX: 48 21 C8 — RAX = j & -j
                             self.buf.emit(&[0x48, 0x21, 0xC8]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::LongCompare.as_entry()
-                        {
+                        } else if callee_entry == super::JitIntrinsic::LongCompare.as_entry() {
                             // Long.compare(x, y): branchless signed
                             // (x > y) - (x < y). The stack holds x (deeper)
                             // then y. SETcc reads the flags from CMP without
@@ -16784,10 +17352,8 @@ impl Compiler {
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
                             self.push_from_rax();
-                        } else if callee_entry
-                            == super::JitIntrinsic::LongRotateLeft.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::LongRotateRight.as_entry()
+                        } else if callee_entry == super::JitIntrinsic::LongRotateLeft.as_entry()
+                            || callee_entry == super::JitIntrinsic::LongRotateRight.as_entry()
                         {
                             // Long.rotateLeft(i, distance) / rotateRight:
                             // ROL/ROR RAX, CL. x86 masks CL & 0x3f for a 64-bit
@@ -16799,21 +17365,19 @@ impl Compiler {
                             self.load_slot_to_reg(RAX, val);
                             self.load_slot_to_reg(RCX, dist);
                             // ROL RAX, CL: 48 D3 C0 ; ROR RAX, CL: 48 D3 C8.
-                            let modrm = if callee_entry
-                                == super::JitIntrinsic::LongRotateLeft.as_entry()
-                            {
-                                0xC0u8
-                            } else {
-                                0xC8u8
-                            };
+                            let modrm =
+                                if callee_entry == super::JitIntrinsic::LongRotateLeft.as_entry() {
+                                    0xC0u8
+                                } else {
+                                    0xC8u8
+                                };
                             self.buf.emit(&[0x48, 0xD3, modrm]);
                             self.push_from_rax();
                         }
                         // ===== INTRINSIC REGION END: LONG_BITS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
-                        else if callee_entry
-                            == super::JitIntrinsic::ArraycopyPrimitive.as_entry()
+                        else if callee_entry == super::JitIntrinsic::ArraycopyPrimitive.as_entry()
                         {
                             // Phase 2 — System.arraycopy(src, srcPos, dst,
                             // dstPos, len). The descriptor is type-erased;
@@ -16902,7 +17466,7 @@ impl Compiler {
                             // CMP EDX, 1
                             self.buf.emit(&[0x83, 0xFA, 0x01]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                            // MOVZX EDX, BYTE [RCX + 4]  (dst kind)
+                                                                                // MOVZX EDX, BYTE [RCX + 4]  (dst kind)
                             self.buf.emit(&[0x0F, 0xB6, 0x51, 0x04]);
                             self.buf.emit(&[0x83, 0xFA, 0x01]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
@@ -16919,10 +17483,10 @@ impl Compiler {
                             // CMP EDX, R10D  → element kinds must be equal
                             self.buf.emit(&[0x44, 0x3B, 0xD2]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                            // CMP EDX, 4 → primitive kinds are 4..=11; a
-                            // value < 4 means Reference (0) — bail (the GC
-                            // store barrier / ArrayStoreException make
-                            // reference copies unsafe to inline).
+                                                                                // CMP EDX, 4 → primitive kinds are 4..=11; a
+                                                                                // value < 4 means Reference (0) — bail (the GC
+                                                                                // store barrier / ArrayStoreException make
+                                                                                // reference copies unsafe to inline).
                             self.buf.emit(&[0x83, 0xFA, 0x04]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB (unsigned <)
 
@@ -16945,20 +17509,20 @@ impl Compiler {
                             // srcPos → RAX
                             self.emit_load_local(RAX, s_src_pos);
                             self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX
-                            // dstPos → RDX
+                                                                // dstPos → RDX
                             self.emit_load_local(RDX, s_dst_pos);
                             self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX, EDX
-                            // len → RCX
+                                                                // len → RCX
                             self.emit_load_local(RCX, s_len);
                             self.buf.emit(&[0x48, 0x63, 0xC9]); // MOVSXD RCX, ECX
 
                             // srcPos < 0 ?  TEST RAX,RAX; JS bail
                             self.emit_test_r64_r64(RAX);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
-                            // dstPos < 0 ?  TEST RDX,RDX; JS bail
+                                                                                // dstPos < 0 ?  TEST RDX,RDX; JS bail
                             self.emit_test_r64_r64(RDX);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
-                            // len < 0 ?  TEST RCX,RCX; JS bail
+                                                                                // len < 0 ?  TEST RCX,RCX; JS bail
                             self.emit_test_r64_r64(RCX);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
 
@@ -16966,11 +17530,11 @@ impl Compiler {
                             // R10 = srcPos + len
                             self.buf.emit(&[0x49, 0x89, 0xC2]); // MOV R10, RAX
                             self.buf.emit(&[0x49, 0x01, 0xCA]); // ADD R10, RCX
-                            // RAX = src ptr; EAX = src.length (zero-extended,
-                            // so the 64-bit value is non-negative).
+                                                                // RAX = src ptr; EAX = src.length (zero-extended,
+                                                                // so the 64-bit value is non-negative).
                             self.emit_load_local(RAX, s_src);
                             self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RAX+12]
-                            // CMP R10, RAX  (srcPos+len vs src.length)
+                                                                                     // CMP R10, RAX  (srcPos+len vs src.length)
                             self.buf.emit(&[0x49, 0x39, 0xC2]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG (signed >)
 
@@ -17035,8 +17599,8 @@ impl Compiler {
                             // CMP RAX, RCX
                             self.buf.emit(&[0x48, 0x39, 0xC8]);
                             let fwd_if_diff = self.emit_jcc_rel32_patch(0x85); // JNE → forward
-                            // same array: compare dstPos vs srcPos (signed
-                            // 32-bit; both already validated >= 0).
+                                                                               // same array: compare dstPos vs srcPos (signed
+                                                                               // 32-bit; both already validated >= 0).
                             self.emit_load_local(RAX, s_dst_pos);
                             self.emit_load_local(RCX, s_src_pos);
                             // CMP EAX, ECX  (dstPos vs srcPos)
@@ -17144,8 +17708,7 @@ impl Compiler {
                             // PUSH RDI  (57)
                             self.buf.emit_byte(0x57);
                             // LEA RDI, [R8 + HEADER_SIZE]  (49 8D 78 28)
-                            self.buf
-                                .emit(&[0x49, 0x8D, 0x78, HEADER_SIZE as u8]);
+                            self.buf.emit(&[0x49, 0x8D, 0x78, HEADER_SIZE as u8]);
                             if callee_entry == super::JitIntrinsic::ArraysFill1.as_entry() {
                                 // REP STOSB  (F3 AA)
                                 self.buf.emit(&[0xF3, 0xAA]);
@@ -17188,20 +17751,19 @@ impl Compiler {
                             self.load_slot_to_reg(R8, a_slot);
                             self.load_slot_to_reg(R9, b_slot);
 
-                            let shift: u8 =
-                                if callee_entry == super::JitIntrinsic::ArraysEquals1.as_entry() {
-                                    0
-                                } else if callee_entry
-                                    == super::JitIntrinsic::ArraysEquals2.as_entry()
-                                {
-                                    1
-                                } else if callee_entry
-                                    == super::JitIntrinsic::ArraysEquals4.as_entry()
-                                {
-                                    2
-                                } else {
-                                    3
-                                };
+                            let shift: u8 = if callee_entry
+                                == super::JitIntrinsic::ArraysEquals1.as_entry()
+                            {
+                                0
+                            } else if callee_entry == super::JitIntrinsic::ArraysEquals2.as_entry()
+                            {
+                                1
+                            } else if callee_entry == super::JitIntrinsic::ArraysEquals4.as_entry()
+                            {
+                                2
+                            } else {
+                                3
+                            };
 
                             // CMP R8, R9  (4D 39 C8) — same reference?
                             self.buf.emit(&[0x4D, 0x39, 0xC8]);
@@ -17266,11 +17828,9 @@ impl Compiler {
                             // PUSH RSI (56) ; PUSH RDI (57)
                             self.buf.emit(&[0x56, 0x57]);
                             // LEA RSI, [R8 + HEADER_SIZE]  (49 8D 70 28)
-                            self.buf
-                                .emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
+                            self.buf.emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
                             // LEA RDI, [R9 + HEADER_SIZE]  (49 8D 79 28)
-                            self.buf
-                                .emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
+                            self.buf.emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
                             // REP CMPSB  (F3 A6) — compares RCX bytes;
                             // stops early on the first mismatch. ZF=1 iff
                             // every byte matched.
@@ -17320,9 +17880,7 @@ impl Compiler {
                                     (-128..=127).contains(&rel),
                                     "Arrays.equals intrinsic rel8 out of range: {rel}"
                                 );
-                                self.buf
-                                    .try_patch_byte(patch, rel as u8)
-                                    .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                self.buf.try_patch_byte(patch, rel as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                             }
 
                             // boolean result in RAX → operand stack.
@@ -17331,16 +17889,11 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
-                        else if callee_entry
-                            == super::JitIntrinsic::ArraysSortInt.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::ArraysSortLong.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::ArraysSortChar.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::ArraysSortShort.as_entry()
-                            || callee_entry
-                                == super::JitIntrinsic::ArraysSortByte.as_entry()
+                        else if callee_entry == super::JitIntrinsic::ArraysSortInt.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysSortLong.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysSortChar.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysSortShort.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysSortByte.as_entry()
                         {
                             // Phase 4b — java.util.Arrays.sort(prim[]) inline
                             // insertion sort. Void return: nothing is pushed.
@@ -17379,14 +17932,14 @@ impl Compiler {
                             // non-negative, so signed compare still works).
 
                             // SIB scale bits + load/store encodings per width.
-                            let is_int = callee_entry
-                                == super::JitIntrinsic::ArraysSortInt.as_entry();
-                            let is_long = callee_entry
-                                == super::JitIntrinsic::ArraysSortLong.as_entry();
-                            let is_char = callee_entry
-                                == super::JitIntrinsic::ArraysSortChar.as_entry();
-                            let is_short = callee_entry
-                                == super::JitIntrinsic::ArraysSortShort.as_entry();
+                            let is_int =
+                                callee_entry == super::JitIntrinsic::ArraysSortInt.as_entry();
+                            let is_long =
+                                callee_entry == super::JitIntrinsic::ArraysSortLong.as_entry();
+                            let is_char =
+                                callee_entry == super::JitIntrinsic::ArraysSortChar.as_entry();
+                            let is_short =
+                                callee_entry == super::JitIntrinsic::ArraysSortShort.as_entry();
                             // is_byte is the remaining case.
                             let scale_ss: u8 = if is_long {
                                 0b11 // *8
@@ -17435,56 +17988,54 @@ impl Compiler {
                                     | 1 // REX.B: base = R8
                             };
                             // load r <- [R8 + idx*scale + hdr]
-                            let emit_load =
-                                |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
-                                    let sib = (scale_ss << 6) | ((idx & 7) << 3);
-                                    let modrm = 0x40 | ((r & 7) << 3) | 0x04;
-                                    if is_long {
-                                        // MOV r64,[..]  REX.W, 8B
-                                        buf.emit(&[rex(1, r, idx), 0x8B, modrm, sib, hdr]);
-                                    } else if is_int {
-                                        // MOVSXD r64,[..]  REX.W, 63
-                                        buf.emit(&[rex(1, r, idx), 0x63, modrm, sib, hdr]);
-                                    } else if is_char {
-                                        // MOVZX r32,m16  0F B7. char is
-                                        // unsigned 0..=65535; zero-extending
-                                        // to 32 bits also clears RAX[63:32],
-                                        // so the 64-bit signed CMP is correct.
-                                        buf.emit(&[rex(0, r, idx), 0x0F, 0xB7, modrm, sib, hdr]);
-                                    } else if is_short {
-                                        // MOVSX r64,m16  REX.W 0F BF — MUST
-                                        // sign-extend to the FULL 64-bit
-                                        // register: the inner-loop CMP is
-                                        // 64-bit, and a 32-bit MOVSX would
-                                        // leave a negative short looking like
-                                        // a large positive (0x0000_0000_FFFF…).
-                                        buf.emit(&[rex(1, r, idx), 0x0F, 0xBF, modrm, sib, hdr]);
-                                    } else {
-                                        // MOVSX r64,m8  REX.W 0F BE — sign-
-                                        // extend a signed byte to 64 bits
-                                        // (same rationale as short above).
-                                        buf.emit(&[rex(1, r, idx), 0x0F, 0xBE, modrm, sib, hdr]);
-                                    }
-                                };
+                            let emit_load = |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
+                                let sib = (scale_ss << 6) | ((idx & 7) << 3);
+                                let modrm = 0x40 | ((r & 7) << 3) | 0x04;
+                                if is_long {
+                                    // MOV r64,[..]  REX.W, 8B
+                                    buf.emit(&[rex(1, r, idx), 0x8B, modrm, sib, hdr]);
+                                } else if is_int {
+                                    // MOVSXD r64,[..]  REX.W, 63
+                                    buf.emit(&[rex(1, r, idx), 0x63, modrm, sib, hdr]);
+                                } else if is_char {
+                                    // MOVZX r32,m16  0F B7. char is
+                                    // unsigned 0..=65535; zero-extending
+                                    // to 32 bits also clears RAX[63:32],
+                                    // so the 64-bit signed CMP is correct.
+                                    buf.emit(&[rex(0, r, idx), 0x0F, 0xB7, modrm, sib, hdr]);
+                                } else if is_short {
+                                    // MOVSX r64,m16  REX.W 0F BF — MUST
+                                    // sign-extend to the FULL 64-bit
+                                    // register: the inner-loop CMP is
+                                    // 64-bit, and a 32-bit MOVSX would
+                                    // leave a negative short looking like
+                                    // a large positive (0x0000_0000_FFFF…).
+                                    buf.emit(&[rex(1, r, idx), 0x0F, 0xBF, modrm, sib, hdr]);
+                                } else {
+                                    // MOVSX r64,m8  REX.W 0F BE — sign-
+                                    // extend a signed byte to 64 bits
+                                    // (same rationale as short above).
+                                    buf.emit(&[rex(1, r, idx), 0x0F, 0xBE, modrm, sib, hdr]);
+                                }
+                            };
                             // store [R8 + idx*scale + hdr] <- r
-                            let emit_store =
-                                |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
-                                    let sib = (scale_ss << 6) | ((idx & 7) << 3);
-                                    let modrm = 0x40 | ((r & 7) << 3) | 0x04;
-                                    if is_long {
-                                        // MOV [..],r64  REX.W, 89
-                                        buf.emit(&[rex(1, r, idx), 0x89, modrm, sib, hdr]);
-                                    } else if is_int {
-                                        // MOV [..],r32  89
-                                        buf.emit(&[rex(0, r, idx), 0x89, modrm, sib, hdr]);
-                                    } else if is_char || is_short {
-                                        // MOV [..],r16  66 prefix, 89
-                                        buf.emit(&[0x66, rex(0, r, idx), 0x89, modrm, sib, hdr]);
-                                    } else {
-                                        // MOV [..],r8   88
-                                        buf.emit(&[rex(0, r, idx), 0x88, modrm, sib, hdr]);
-                                    }
-                                };
+                            let emit_store = |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
+                                let sib = (scale_ss << 6) | ((idx & 7) << 3);
+                                let modrm = 0x40 | ((r & 7) << 3) | 0x04;
+                                if is_long {
+                                    // MOV [..],r64  REX.W, 89
+                                    buf.emit(&[rex(1, r, idx), 0x89, modrm, sib, hdr]);
+                                } else if is_int {
+                                    // MOV [..],r32  89
+                                    buf.emit(&[rex(0, r, idx), 0x89, modrm, sib, hdr]);
+                                } else if is_char || is_short {
+                                    // MOV [..],r16  66 prefix, 89
+                                    buf.emit(&[0x66, rex(0, r, idx), 0x89, modrm, sib, hdr]);
+                                } else {
+                                    // MOV [..],r8   88
+                                    buf.emit(&[rex(0, r, idx), 0x88, modrm, sib, hdr]);
+                                }
+                            };
 
                             // .outer:
                             let outer_label = self.buf.pos();
@@ -17549,7 +18100,6 @@ impl Compiler {
                             let _ = ret_type;
                         }
                         // ===== INTRINSIC REGION END: ARRAYS_SORT =====
-
                         else {
                             // Direct call to a JIT-compiled callee
                             let n = callee_params;
@@ -17588,8 +18138,8 @@ impl Compiler {
                                     (b'V', 0xB1) => true,
                                     _ => false,
                                 };
-                            let is_sibling_tail = tail_op_matches
-                                && callee_needs_ctx == self.needs_heap;
+                            let is_sibling_tail =
+                                tail_op_matches && callee_needs_ctx == self.needs_heap;
 
                             // Round-8 wave-3: sibling-tail demotion.
                             // Tail-calling with stack args is non-trivial
@@ -17612,10 +18162,7 @@ impl Compiler {
                                 // Load args into ABI registers, tear
                                 // down our frame, then JMP.
                                 if callee_needs_ctx {
-                                    self.emit_load_local(
-                                        ARG_REGS[0],
-                                        self.heap_local_offset,
-                                    );
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                     for (i, slot) in arg_slots.iter().enumerate() {
                                         if i + 1 < ARG_REGS.len() {
                                             self.load_slot_to_reg(ARG_REGS[i + 1], *slot);
@@ -17643,10 +18190,7 @@ impl Compiler {
                             // exceeds ARG_REGS. Uses platform ABI
                             // (Win64 32-byte shadow + stack; SysV pure
                             // stack), 16-byte aligned at the CALL site.
-                            let total_sub = self.emit_stack_arg_setup(
-                                &arg_slots,
-                                callee_needs_ctx,
-                            );
+                            let total_sub = self.emit_stack_arg_setup(&arg_slots, callee_needs_ctx);
                             // Round-8 wave-3: defensive callee-saved spill
                             // before any GC-triggering CALL.
                             self.emit_pre_safepoint_spill();
@@ -17710,12 +18254,12 @@ impl Compiler {
                         let args_base_offset = pre_pop_spill;
                         if n > 0 {
                             self.next_spill_offset = args_base_offset + (n as i32) * 8; // Cast: x86-64 immediate encoding
-                            // Store args in reverse offset order so they form
-                            // a contiguous ascending-address buffer:
-                            //   arg[0] at [rbp - highest_offset] (lowest addr)
-                            //   arg[n-1] at [rbp - args_base_offset] (highest addr)
-                            // This is necessary because modrm_rbp_disp negates
-                            // the offset, so higher offsets map to lower addresses.
+                                                                                        // Store args in reverse offset order so they form
+                                                                                        // a contiguous ascending-address buffer:
+                                                                                        //   arg[0] at [rbp - highest_offset] (lowest addr)
+                                                                                        //   arg[n-1] at [rbp - args_base_offset] (highest addr)
+                                                                                        // This is necessary because modrm_rbp_disp negates
+                                                                                        // the offset, so higher offsets map to lower addresses.
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                 self.load_slot_to_reg(RAX, *slot);
@@ -17732,8 +18276,8 @@ impl Compiler {
                             self.emit_xor_reg_self(ARG_REGS[2]);
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
-                        // Round-8 wave-3: defensive callee-saved spill
-                        // before any GC-triggering CALL.
+                                                                       // Round-8 wave-3: defensive callee-saved spill
+                                                                       // before any GC-triggering CALL.
                         self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(self.helpers.invoke_dispatch);
                         // T1.1.2 — invoke dispatch is a full safepoint:
@@ -17781,8 +18325,7 @@ impl Compiler {
                         let n = self.num_params;
 
                         // Check for tail call: invokestatic self at PC, xreturn at PC+3
-                        let is_tail_call = pc + 3 < code_len
-                            && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
+                        let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
 
                         let mut arg_slots = Vec::with_capacity(n);
                         for _ in 0..n {
@@ -17811,9 +18354,7 @@ impl Compiler {
                             // Patch: target = body_entry_offset
                             let rel = self.body_entry_offset as i32 - (jmp_offset as i32 + 4); // Cast: x86-64 rel32 displacement
                             let pos = self.buf.pos();
-                            self.buf
-                                .try_patch_i32(jmp_offset, rel)
-                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                            self.buf.try_patch_i32(jmp_offset, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             let _ = pos;
 
                             // Skip the following xreturn — we already jumped
@@ -17825,10 +18366,7 @@ impl Compiler {
 
                         // Round-8 wave-3 HIGH fix: stack-arg setup for
                         // self-recursive direct calls past ARG_REGS.
-                        let total_sub = self.emit_stack_arg_setup(
-                            &arg_slots,
-                            self.needs_heap,
-                        );
+                        let total_sub = self.emit_stack_arg_setup(&arg_slots, self.needs_heap);
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the recursive CALL (which transitively
                         // can allocate and reach a GC safepoint).
@@ -17918,19 +18456,16 @@ impl Compiler {
 
                     // Check for direct call target (invokespecial with compiled callee)
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let direct = self
-                        .direct_calls_idx
-                        .get(&pc)
-                        .map(|&i| {
-                            let dc = &self.direct_calls[i].1;
-                            (
-                                dc.entry,
-                                dc.needs_context,
-                                dc.num_params,
-                                dc.return_type,
-                                dc.guard_class_id,
-                            )
-                        });
+                    let direct = self.direct_calls_idx.get(&pc).map(|&i| {
+                        let dc = &self.direct_calls[i].1;
+                        (
+                            dc.entry,
+                            dc.needs_context,
+                            dc.num_params,
+                            dc.return_type,
+                            dc.guard_class_id,
+                        )
+                    });
 
                     if let Some((
                         callee_entry,
@@ -17989,16 +18524,12 @@ impl Compiler {
                                 == super::JitIntrinsic::StringLength.as_entry()
                             {
                                 Some(0u8)
-                            } else if callee_entry
-                                == super::JitIntrinsic::StringIsEmpty.as_entry()
+                            } else if callee_entry == super::JitIntrinsic::StringIsEmpty.as_entry()
                             {
                                 Some(1)
-                            } else if callee_entry
-                                == super::JitIntrinsic::StringCharAt.as_entry()
-                            {
+                            } else if callee_entry == super::JitIntrinsic::StringCharAt.as_entry() {
                                 Some(2)
-                            } else if callee_entry
-                                == super::JitIntrinsic::StringHashCode.as_entry()
+                            } else if callee_entry == super::JitIntrinsic::StringHashCode.as_entry()
                             {
                                 Some(3)
                             } else {
@@ -18047,8 +18578,7 @@ impl Compiler {
                                 self.emit_mov_r64_mem_disp32(
                                     RCX,
                                     RAX,
-                                    layout.value_cell_offset
-                                        + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
@@ -18057,8 +18587,7 @@ impl Compiler {
                                 self.emit_movsxd_r64_mem_disp32(
                                     R10,
                                     RAX,
-                                    layout.coder_cell_offset
-                                        + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
 
                                 if kind == 3 {
@@ -18078,16 +18607,13 @@ impl Compiler {
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
                                     self.buf.emit(&[0x85, 0xC0]);
-                                    let cached_done =
-                                        self.emit_jcc_rel32_patch(0x85); // JNZ
+                                    let cached_done = self.emit_jcc_rel32_patch(0x85); // JNZ
 
                                     // Recompute: char_count = value.len >> coder.
                                     // R11D = value.length (zero-extended).
-                                    self.buf.emit(&[
-                                        0x44, 0x8B, 0x59,
-                                        ARRAY_LENGTH_OFFSET as u8,
-                                    ]); // MOV R11D,[RCX+12]
-                                    // MOV ECX, R10D ; SHR R11D, CL
+                                    self.buf
+                                        .emit(&[0x44, 0x8B, 0x59, ARRAY_LENGTH_OFFSET as u8]); // MOV R11D,[RCX+12]
+                                                                                               // MOV ECX, R10D ; SHR R11D, CL
                                     self.buf.emit(&[0x44, 0x89, 0xD1]);
                                     self.buf.emit(&[0x41, 0xD3, 0xEB]);
                                     // Reload value ptr into RDX (RCX is now CL
@@ -18106,25 +18632,32 @@ impl Compiler {
                                     // h = 0 (EAX) ; i = 0 (R8D).
                                     self.emit_xor_reg_self(RAX);
                                     self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D,R8D
-                                    // loop: CMP R8D,R11D ; JGE done
+                                                                        // loop: CMP R8D,R11D ; JGE done
                                     let loop_top = self.buf.pos();
                                     self.buf.emit(&[0x45, 0x39, 0xD8]); // CMP R8D,R11D
-                                    let loop_done =
-                                        self.emit_jcc_rel32_patch(0x8D); // JGE
-                                    // decode char into ECX: coder branch.
-                                    // TEST R10D,R10D ; JNZ utf16
+                                    let loop_done = self.emit_jcc_rel32_patch(0x8D); // JGE
+                                                                                     // decode char into ECX: coder branch.
+                                                                                     // TEST R10D,R10D ; JNZ utf16
                                     self.buf.emit(&[0x45, 0x85, 0xD2]);
                                     let utf16 = self.emit_jcc_rel32_patch(0x85);
                                     // LATIN1: MOVZX ECX, BYTE [RDX+R8*1+40]
                                     self.buf.emit(&[
-                                        0x42, 0x0F, 0xB6, 0x4C, 0x02,
+                                        0x42,
+                                        0x0F,
+                                        0xB6,
+                                        0x4C,
+                                        0x02,
                                         HEADER_SIZE as u8,
                                     ]);
                                     let dec_done = self.emit_jmp_rel32_patch();
                                     // UTF16: MOVZX ECX, WORD [RDX+R8*2+40]
                                     self.patch_rel32_to_here(utf16);
                                     self.buf.emit(&[
-                                        0x42, 0x0F, 0xB7, 0x4C, 0x42,
+                                        0x42,
+                                        0x0F,
+                                        0xB7,
+                                        0x4C,
+                                        0x42,
                                         HEADER_SIZE as u8,
                                     ]);
                                     self.patch_rel32_to_here(dec_done);
@@ -18135,14 +18668,11 @@ impl Compiler {
                                     self.buf.emit(&[0xC1, 0xE0, 0x05]); // SHL EAX,5
                                     self.buf.emit(&[0x44, 0x29, 0xC8]); // SUB EAX,R9D
                                     self.buf.emit(&[0x01, 0xC8]); // ADD EAX,ECX
-                                    // INC R8D ; JMP loop
+                                                                  // INC R8D ; JMP loop
                                     self.buf.emit(&[0x41, 0xFF, 0xC0]);
                                     let back = self.emit_jmp_rel32_patch();
-                                    let rel = loop_top as i32
-                                        - (back as i32 + 4);
-                                    self.buf
-                                        .try_patch_i32(back, rel)
-                                        .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                    let rel = loop_top as i32 - (back as i32 + 4);
+                                    self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                     self.patch_rel32_to_here(loop_done);
                                     self.patch_rel32_to_here(cached_done);
                                     // Result (EAX) is sign-extended on push.
@@ -18155,20 +18685,15 @@ impl Compiler {
                                     //   R11 = char_count
                                     //   R10 = coder
                                     // R9 = index.
-                                    self.load_slot_to_reg(
-                                        R9,
-                                        index_slot.unwrap(),
-                                    );
+                                    self.load_slot_to_reg(R9, index_slot.unwrap());
                                     // R11D = value.length (zero-extended) —
                                     // read BEFORE freeing RCX.
-                                    self.buf.emit(&[
-                                        0x44, 0x8B, 0x59,
-                                        ARRAY_LENGTH_OFFSET as u8,
-                                    ]); // MOV R11D,[RCX+12]
-                                    // R8 = value ptr (so CL can use RCX).
+                                    self.buf
+                                        .emit(&[0x44, 0x8B, 0x59, ARRAY_LENGTH_OFFSET as u8]); // MOV R11D,[RCX+12]
+                                                                                               // R8 = value ptr (so CL can use RCX).
                                     self.buf.emit(&[0x49, 0x89, 0xC8]); // MOV R8,RCX
-                                    // char_count = value.length >> coder.
-                                    // MOV ECX,R10D ; SHR R11D,CL
+                                                                        // char_count = value.length >> coder.
+                                                                        // MOV ECX,R10D ; SHR R11D,CL
                                     self.buf.emit(&[0x44, 0x89, 0xD1]);
                                     self.buf.emit(&[0x41, 0xD3, 0xEB]);
                                     // Bounds: (unsigned) index >= char_count
@@ -18182,14 +18707,22 @@ impl Compiler {
                                     let utf16 = self.emit_jcc_rel32_patch(0x85);
                                     // LATIN1: MOVZX EAX, BYTE [R8+R9*1+40]
                                     self.buf.emit(&[
-                                        0x43, 0x0F, 0xB6, 0x44, 0x08,
+                                        0x43,
+                                        0x0F,
+                                        0xB6,
+                                        0x44,
+                                        0x08,
                                         HEADER_SIZE as u8,
                                     ]);
                                     let dec_done = self.emit_jmp_rel32_patch();
                                     // UTF16: MOVZX EAX, WORD [R8+R9*2+40]
                                     self.patch_rel32_to_here(utf16);
                                     self.buf.emit(&[
-                                        0x43, 0x0F, 0xB7, 0x44, 0x48,
+                                        0x43,
+                                        0x0F,
+                                        0xB7,
+                                        0x44,
+                                        0x48,
                                         HEADER_SIZE as u8,
                                     ]);
                                     self.patch_rel32_to_here(dec_done);
@@ -18198,11 +18731,8 @@ impl Compiler {
                                 } else {
                                     // length()I (kind 0) / isEmpty()Z (kind 1).
                                     // EAX = value.length (zero-extended).
-                                    self.buf.emit(&[
-                                        0x8B, 0x41,
-                                        ARRAY_LENGTH_OFFSET as u8,
-                                    ]); // MOV EAX,[RCX+12]
-                                    // MOV ECX,R10D ; SHR EAX,CL  → char count.
+                                    self.buf.emit(&[0x8B, 0x41, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RCX+12]
+                                                                                             // MOV ECX,R10D ; SHR EAX,CL  → char count.
                                     self.buf.emit(&[0x44, 0x89, 0xD1]);
                                     self.buf.emit(&[0xD3, 0xE8]);
                                     if kind == 1 {
@@ -18252,8 +18782,7 @@ impl Compiler {
                         // No `CALL` on the inline path; every deopt edge re-runs
                         // the method in the interpreter (native `equals`).
                         if self.string_layout.is_some()
-                            && callee_entry
-                                == super::JitIntrinsic::StringEquals.as_entry()
+                            && callee_entry == super::JitIntrinsic::StringEquals.as_entry()
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
@@ -18289,14 +18818,12 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             // Null value array on either side → deopt.
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -18309,27 +18836,23 @@ impl Compiler {
                             self.emit_mov_r32_mem_disp32(
                                 RCX,
                                 RAX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // CMP ECX,[RDX+disp32]: 3B /r, ModRM
                             // mod=10(disp32) reg=ECX(001) r/m=RDX(010) = 0x8A.
                             self.buf.emit(&[0x3B, 0x8A]);
                             self.buf.emit(
-                                &(layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32)
+                                &(layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32)
                                     .to_le_bytes(),
                             );
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                             // value-array length mismatch → result 0.
                             // MOV ECX,[R8+12] ; CMP ECX,[R9+12]
-                            self.buf.emit(&[
-                                0x41, 0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8,
-                            ]);
-                            self.buf.emit(&[
-                                0x41, 0x3B, 0x49, ARRAY_LENGTH_OFFSET as u8,
-                            ]);
+                            self.buf
+                                .emit(&[0x41, 0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8]);
+                            self.buf
+                                .emit(&[0x41, 0x3B, 0x49, ARRAY_LENGTH_OFFSET as u8]);
                             let len_diff = self.emit_jcc_rel32_patch(0x85); // JNE
 
                             // Byte compare of ECX bytes from
@@ -18340,13 +18863,9 @@ impl Compiler {
                             self.buf.emit(&[0x56, 0x57]);
                             // RSI = R8 + HEADER ; RDI = R9 + HEADER
                             // LEA RSI,[R8+40]
-                            self.buf.emit(&[
-                                0x49, 0x8D, 0x70, HEADER_SIZE as u8,
-                            ]);
+                            self.buf.emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
                             // LEA RDI,[R9+40]
-                            self.buf.emit(&[
-                                0x49, 0x8D, 0x79, HEADER_SIZE as u8,
-                            ]);
+                            self.buf.emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
                             // RCX = length (ECX already holds it,
                             // zero-extended into RCX).
                             // REPE CMPSB  (F3 A6)
@@ -18393,8 +18912,7 @@ impl Compiler {
                         // difference at the first mismatch, else len1-len2.
                         // Identical to `native_string_compare_to`.
                         if self.string_layout.is_some()
-                            && callee_entry
-                                == super::JitIntrinsic::StringCompareTo.as_entry()
+                            && callee_entry == super::JitIntrinsic::StringCompareTo.as_entry()
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
@@ -18420,24 +18938,22 @@ impl Compiler {
                             self.load_slot_to_reg(RAX, this_slot);
                             self.emit_test_r64_r64(RAX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                            // RDX = other; null argument → deopt.
+                                                                        // RDX = other; null argument → deopt.
                             self.load_slot_to_reg(RDX, other_slot);
                             self.emit_test_r64_r64(RDX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                            // R8 = this.value, R9 = other.value; null → deopt.
+                                                                        // R8 = this.value, R9 = other.value; null → deopt.
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -18445,14 +18961,12 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             self.emit_movsxd_r64_mem_disp32(
                                 R11,
                                 RDX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
                             // --- past every deopt edge: save the callee-
@@ -18471,27 +18985,19 @@ impl Compiler {
                             self.emit_mov_r64_r64(R12, R10);
                             self.emit_mov_r64_r64(R13, R11);
                             // len1 = this.value.length >> coder1  → R14D.
-                            self.emit_mov_r32_mem_disp32(
-                                RAX,
-                                RSI,
-                                ARRAY_LENGTH_OFFSET as i32,
-                            );
+                            self.emit_mov_r32_mem_disp32(RAX, RSI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
-                            // len2 = other.value.length >> coder2 → R15D.
-                            self.emit_mov_r32_mem_disp32(
-                                RAX,
-                                RDI,
-                                ARRAY_LENGTH_OFFSET as i32,
-                            );
+                                                                   // len2 = other.value.length >> coder2 → R15D.
+                            self.emit_mov_r32_mem_disp32(RAX, RDI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R15, RAX); // MOV R15D,EAX
-                            // min_len = min(len1,len2) → EBX.
+                                                                   // min_len = min(len1,len2) → EBX.
                             self.emit_alu_r32_r32(0x89, RBX, R14); // MOV EBX,R14D
                             self.emit_alu_r32_r32(0x39, RBX, R15); // CMP EBX,R15D
-                            // CMOVG EBX,R15D (EBX > R15D ⇒ keep R15D as min).
+                                                                   // CMOVG EBX,R15D (EBX > R15D ⇒ keep R15D as min).
                             self.buf.emit(&[0x41, 0x0F, 0x4F, 0xDF]);
 
                             // i = 0 (R8D).
@@ -18510,10 +19016,8 @@ impl Compiler {
                             self.buf.emit(&[0x41, 0xFF, 0xC0]);
                             let back = self.emit_jmp_rel32_patch();
                             let rel = loop_top as i32 - (back as i32 + 4);
-                            self.buf
-                                .try_patch_i32(back, rel)
-                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-                            // loop_done: result = len1 - len2.
+                            self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                    // loop_done: result = len1 - len2.
                             self.patch_rel32_to_here(loop_done);
                             self.emit_alu_r32_r32(0x89, RAX, R14); // MOV EAX,R14D
                             self.emit_alu_r32_r32(0x29, RAX, R15); // SUB EAX,R15D
@@ -18524,7 +19028,7 @@ impl Compiler {
                             self.patch_rel32_to_here(cmp_join);
                             // Sign-extend the int result for the push ABI.
                             self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
-                            // POP R15,R14,R13,R12,RDI,RSI,RBX.
+                                                                // POP R15,R14,R13,R12,RDI,RSI,RBX.
                             self.buf.emit(&[0x41, 0x5F, 0x41, 0x5E]);
                             self.buf.emit(&[0x41, 0x5D, 0x41, 0x5C]);
                             self.buf.emit(&[0x5F, 0x5E, 0x5B]);
@@ -18547,9 +19051,7 @@ impl Compiler {
                         // receiver or a null backing `value` array. Uses only
                         // caller-saved registers, so no PUSH/POP is needed.
                         if self.string_layout.is_some()
-                            && callee_entry
-                                == super::JitIntrinsic::StringIndexOfChar
-                                    .as_entry()
+                            && callee_entry == super::JitIntrinsic::StringIndexOfChar.as_entry()
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
@@ -18563,12 +19065,11 @@ impl Compiler {
                             self.load_slot_to_reg(RAX, this_slot);
                             self.emit_test_r64_r64(RAX);
                             bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                            // R8 = this.value; null → deopt.
+                                                                        // R8 = this.value; null → deopt.
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -18576,8 +19077,7 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // R9D = needle = ch & 0xFFFF.
                             self.load_slot_to_reg(R9, ch_slot);
@@ -18585,15 +19085,11 @@ impl Compiler {
                             self.buf.emit(&[0x41, 0x81, 0xE1]);
                             self.buf.emit(&0xFFFFu32.to_le_bytes());
                             // len = this.value.length >> coder → R11D.
-                            self.emit_mov_r32_mem_disp32(
-                                RAX,
-                                R8,
-                                ARRAY_LENGTH_OFFSET as i32,
-                            );
+                            self.emit_mov_r32_mem_disp32(RAX, R8, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R10); // MOV ECX,R10D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R11, RAX); // MOV R11D,EAX
-                            // i = 0 (EDX).
+                                                                   // i = 0 (EDX).
                             self.emit_xor_reg_self(RDX);
                             let loop_top = self.buf.pos();
                             // CMP EDX,R11D ; JGE not_found.
@@ -18607,10 +19103,8 @@ impl Compiler {
                             self.buf.emit(&[0xFF, 0xC2]);
                             let back = self.emit_jmp_rel32_patch();
                             let rel = loop_top as i32 - (back as i32 + 4);
-                            self.buf
-                                .try_patch_i32(back, rel)
-                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-                            // found: result = i.
+                            self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                    // found: result = i.
                             self.patch_rel32_to_here(found);
                             self.emit_alu_r32_r32(0x89, RAX, RDX); // MOV EAX,EDX
                             let join = self.emit_jmp_rel32_patch();
@@ -18639,9 +19133,7 @@ impl Compiler {
                         // also deopts — the native re-run then returns -1,
                         // which is the same answer.
                         if self.string_layout.is_some()
-                            && callee_entry
-                                == super::JitIntrinsic::StringIndexOfStr
-                                    .as_entry()
+                            && callee_entry == super::JitIntrinsic::StringIndexOfStr.as_entry()
                         {
                             let layout = self.string_layout.unwrap();
                             self.flush_scratch_registers();
@@ -18666,16 +19158,14 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset
-                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -18683,14 +19173,12 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             self.emit_movsxd_r64_mem_disp32(
                                 R11,
                                 RDX,
-                                layout.coder_cell_offset
-                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
                             // PUSH RBX,RSI,RDI,R12,R13,R14,R15.
@@ -18704,31 +19192,22 @@ impl Compiler {
                             self.emit_mov_r64_r64(R12, R10);
                             self.emit_mov_r64_r64(R13, R11);
                             // hlen → R14D, nlen → R15D.
-                            self.emit_mov_r32_mem_disp32(
-                                RAX,
-                                RSI,
-                                ARRAY_LENGTH_OFFSET as i32,
-                            );
+                            self.emit_mov_r32_mem_disp32(RAX, RSI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
-                            self.emit_mov_r32_mem_disp32(
-                                RAX,
-                                RDI,
-                                ARRAY_LENGTH_OFFSET as i32,
-                            );
+                            self.emit_mov_r32_mem_disp32(RAX, RDI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R15, RAX); // MOV R15D,EAX
 
                             // empty needle (nlen == 0) → result 0.
                             self.buf.emit(&[0x45, 0x85, 0xFF]); // TEST R15D,R15D
-                            let needle_empty =
-                                self.emit_jcc_rel32_patch(0x84); // JZ
-                            // nlen > hlen → not_found.
+                            let needle_empty = self.emit_jcc_rel32_patch(0x84); // JZ
+                                                                                // nlen > hlen → not_found.
                             self.emit_alu_r32_r32(0x39, R15, R14); // CMP R15D,R14D
                             let too_long = self.emit_jcc_rel32_patch(0x8F); // JG
-                            // max_start = hlen - nlen → EBX (inclusive bound).
+                                                                            // max_start = hlen - nlen → EBX (inclusive bound).
                             self.emit_alu_r32_r32(0x89, RBX, R14); // MOV EBX,R14D
                             self.emit_alu_r32_r32(0x29, RBX, R15); // SUB EBX,R15D
 
@@ -18756,21 +19235,15 @@ impl Compiler {
                             // INC R9D ; JMP inner_top.
                             self.buf.emit(&[0x41, 0xFF, 0xC1]);
                             let inner_back = self.emit_jmp_rel32_patch();
-                            let rel =
-                                inner_top as i32 - (inner_back as i32 + 4);
-                            self.buf
-                                .try_patch_i32(inner_back, rel)
-                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-                            // inner_break: INC R8D ; JMP outer_top.
+                            let rel = inner_top as i32 - (inner_back as i32 + 4);
+                            self.buf.try_patch_i32(inner_back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                          // inner_break: INC R8D ; JMP outer_top.
                             self.patch_rel32_to_here(inner_break);
                             self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
                             let outer_back = self.emit_jmp_rel32_patch();
-                            let rel =
-                                outer_top as i32 - (outer_back as i32 + 4);
-                            self.buf
-                                .try_patch_i32(outer_back, rel)
-                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-                            // match_found: result = i (R8D).
+                            let rel = outer_top as i32 - (outer_back as i32 + 4);
+                            self.buf.try_patch_i32(outer_back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                          // match_found: result = i (R8D).
                             self.patch_rel32_to_here(match_found);
                             self.emit_alu_r32_r32(0x89, RAX, R8); // MOV EAX,R8D
                             let join = self.emit_jmp_rel32_patch();
@@ -18787,7 +19260,7 @@ impl Compiler {
                             self.patch_rel32_to_here(join);
                             self.patch_rel32_to_here(join2);
                             self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
-                            // POP R15,R14,R13,R12,RDI,RSI,RBX.
+                                                                // POP R15,R14,R13,R12,RDI,RSI,RBX.
                             self.buf.emit(&[0x41, 0x5F, 0x41, 0x5E]);
                             self.buf.emit(&[0x41, 0x5D, 0x41, 0x5C]);
                             self.buf.emit(&[0x5F, 0x5E, 0x5B]);
@@ -18843,14 +19316,14 @@ impl Compiler {
                             let crc32c_bytes = super::JitIntrinsic::Crc32cUpdateBytes.as_entry();
                             let crc32_byte = super::JitIntrinsic::Crc32UpdateByte.as_entry();
                             let crc32_bytes = super::JitIntrinsic::Crc32UpdateBytes.as_entry();
-                            let is_crc32c = callee_entry == crc32c_byte
-                                || callee_entry == crc32c_bytes;
-                            let is_crc32_ieee = callee_entry == crc32_byte
-                                || callee_entry == crc32_bytes;
-                            let is_byte_form = callee_entry == crc32c_byte
-                                || callee_entry == crc32_byte;
-                            let is_bytes_form = callee_entry == crc32c_bytes
-                                || callee_entry == crc32_bytes;
+                            let is_crc32c =
+                                callee_entry == crc32c_byte || callee_entry == crc32c_bytes;
+                            let is_crc32_ieee =
+                                callee_entry == crc32_byte || callee_entry == crc32_bytes;
+                            let is_byte_form =
+                                callee_entry == crc32c_byte || callee_entry == crc32_byte;
+                            let is_bytes_form =
+                                callee_entry == crc32c_bytes || callee_entry == crc32_bytes;
 
                             if is_crc32c || is_crc32_ieee {
                                 // The matcher only registers a CRC32 family
@@ -18874,10 +19347,8 @@ impl Compiler {
                                 // +FIELD_CELL_PAYLOAD32_OFFSET (see the
                                 // inline-getfield codegen for opcode 0xb4).
                                 let cell_off = HEADER_SIZE as i32;
-                                let tag_off =
-                                    cell_off + FIELD_CELL_TAG_OFFSET as i32;
-                                let pay_off =
-                                    cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+                                let tag_off = cell_off + FIELD_CELL_TAG_OFFSET as i32;
+                                let pay_off = cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
 
                                 self.flush_scratch_registers();
 
@@ -18943,16 +19414,13 @@ impl Compiler {
                                 // ObjectHeader+0 against the declared class.
                                 self.emit_load_local(RAX, s_recv);
                                 self.emit_test_r64_r64(RAX);
-                                bail_patches
-                                    .push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                                // CMP DWORD [RAX + 0], guard_class_id
-                                //   81 /7 ib? — use the imm32 form: 81 /7.
-                                //   ModRM 0x78 = mod00 reg=7(/7=CMP) rm=RAX.
+                                bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                                                                    // CMP DWORD [RAX + 0], guard_class_id
+                                                                                    //   81 /7 ib? — use the imm32 form: 81 /7.
+                                                                                    //   ModRM 0x78 = mod00 reg=7(/7=CMP) rm=RAX.
                                 self.buf.emit(&[0x81, 0x78, 0x00]);
-                                self.buf
-                                    .emit(&guard_class_id.to_le_bytes());
-                                bail_patches
-                                    .push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
                                 // --- load running crc → ECX ---
                                 // MOV ECX, DWORD [RAX + pay_off]. The slot
@@ -18970,12 +19438,9 @@ impl Compiler {
                                         // CRC32 ECX, DL — hardware Castagnoli
                                         // fold of one byte. F2 0F 38 F0 /r,
                                         // ModRM 0xCA = reg=ECX rm=EDX(=DL).
-                                        self.buf
-                                            .emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
+                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
                                     } else {
-                                        self.emit_crc32_ieee_fold_byte(
-                                            CRC32_IEEE_REVERSED_POLY,
-                                        );
+                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
                                     }
                                 } else {
                                     // --- update([BII)V: fold a range ---
@@ -18999,51 +19464,38 @@ impl Compiler {
                                     // R8 = array ptr; null-array → bail.
                                     self.emit_load_local(R8, s_a);
                                     self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
-                                    bail_patches.push(
-                                        self.emit_jcc_rel32_patch(0x84),
-                                    ); // JZ → null array
-                                    // RDX = off, sign-extended to 64-bit so
-                                    // the range arithmetic cannot overflow.
+                                    bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ → null array
+                                                                                        // RDX = off, sign-extended to 64-bit so
+                                                                                        // the range arithmetic cannot overflow.
                                     self.emit_load_local(RDX, s_b);
                                     self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX,EDX
-                                    // off < 0 ? TEST RDX,RDX; JS bail.
+                                                                        // off < 0 ? TEST RDX,RDX; JS bail.
                                     self.emit_test_r64_r64(RDX);
-                                    bail_patches.push(
-                                        self.emit_jcc_rel32_patch(0x88),
-                                    ); // JS
-                                    // R11 = len, sign-extended.
+                                    bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
+                                                                                        // R11 = len, sign-extended.
                                     self.emit_load_local(R11, s_c);
                                     self.buf.emit(&[0x4D, 0x63, 0xDB]); // MOVSXD R11,R11D
-                                    // len < 0 ? TEST R11,R11; JS bail.
+                                                                        // len < 0 ? TEST R11,R11; JS bail.
                                     self.buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11,R11
-                                    bail_patches.push(
-                                        self.emit_jcc_rel32_patch(0x88),
-                                    ); // JS
-                                    // R11 = off + len  (the end index).
+                                    bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
+                                                                                        // R11 = off + len  (the end index).
                                     self.buf.emit(&[0x49, 0x01, 0xD3]); // ADD R11,RDX
-                                    // RAX = arr.length (zero-extended 32-bit
-                                    // load → non-negative 64-bit value).
-                                    self.buf.emit(&[
-                                        0x41,
-                                        0x8B,
-                                        0x40,
-                                        ARRAY_LENGTH_OFFSET as u8,
-                                    ]); // MOV EAX,[R8+ARRAY_LENGTH_OFFSET]
-                                    // off + len > arr.length ? CMP R11,RAX;
-                                    // JG bail (signed >).
+                                                                        // RAX = arr.length (zero-extended 32-bit
+                                                                        // load → non-negative 64-bit value).
+                                    self.buf
+                                        .emit(&[0x41, 0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[R8+ARRAY_LENGTH_OFFSET]
+                                                                                               // off + len > arr.length ? CMP R11,RAX;
+                                                                                               // JG bail (signed >).
                                     self.buf.emit(&[0x49, 0x39, 0xC3]); // CMP R11,RAX
-                                    bail_patches.push(
-                                        self.emit_jcc_rel32_patch(0x8F),
-                                    ); // JG
-                                    // R9 = current index = off (RDX).
+                                    bail_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG
+                                                                                        // R9 = current index = off (RDX).
                                     self.buf.emit(&[0x49, 0x89, 0xD1]); // MOV R9,RDX
 
                                     // --- fold loop ---
                                     // .loop: CMP R9,R11 ; JGE .done
                                     let loop_label = self.buf.pos();
                                     self.buf.emit(&[0x4D, 0x39, 0xD9]); // CMP R9,R11
-                                    let done_patch =
-                                        self.emit_jcc_rel32_patch(0x8D); // JGE
+                                    let done_patch = self.emit_jcc_rel32_patch(0x8D); // JGE
                                     if is_crc32c {
                                         // EAX = byte = arr[R9].
                                         // MOVZX EAX, BYTE [R8 + R9 + HDR]
@@ -19061,9 +19513,7 @@ impl Compiler {
                                         // CRC32 ECX, AL — hardware Castagnoli
                                         // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
                                         // reg=ECX rm=EAX(=AL).
-                                        self.buf.emit(&[
-                                            0xF2, 0x0F, 0x38, 0xF0, 0xC8,
-                                        ]);
+                                        self.buf.emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xC8]);
                                     } else {
                                         // EDX = byte = arr[R9] — the IEEE
                                         // bit loop consumes the byte in EDX.
@@ -19077,20 +19527,15 @@ impl Compiler {
                                             0x08,
                                             HEADER_SIZE as u8,
                                         ]);
-                                        self.emit_crc32_ieee_fold_byte(
-                                            CRC32_IEEE_REVERSED_POLY,
-                                        );
+                                        self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
                                     }
                                     // INC R9 ; JMP .loop
                                     self.buf.emit(&[0x49, 0xFF, 0xC1]); // INC R9
                                     self.buf.emit_byte(0xE9); // JMP rel32
                                     {
                                         let here = self.buf.pos();
-                                        let rel = (loop_label as i64)
-                                            - (here as i64 + 4);
-                                        self.buf.emit(
-                                            &(rel as i32).to_le_bytes(),
-                                        );
+                                        let rel = (loop_label as i64) - (here as i64 + 4);
+                                        self.buf.emit(&(rel as i32).to_le_bytes());
                                     }
                                     // .done:
                                     self.patch_rel32_to_here(done_patch);
@@ -19105,9 +19550,7 @@ impl Compiler {
                                 // value_enum` in cratonvm-types). Keeps the
                                 // cell a well-formed Int even if a prior
                                 // write left a stale tag.
-                                self.emit_mov_dword_mem_disp32_imm32(
-                                    RAX, tag_off, 0,
-                                );
+                                self.emit_mov_dword_mem_disp32_imm32(RAX, tag_off, 0);
                                 // Payload word := ECX (running crc).
                                 // MOV DWORD [RAX + pay_off], ECX  (89 88 dd).
                                 self.buf.emit_byte(0x89);
@@ -19129,54 +19572,51 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: CRC32 =====
 
                         if !intrinsic_handled {
-                        // Direct call: pop receiver + params, call compiled entry
-                        // invokespecial has a receiver, so total args = callee_params + 1
-                        let n = callee_params + 1; // receiver + params
-                        let mut arg_slots = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            arg_slots.push(self.pop_stack());
-                        }
-                        arg_slots.reverse();
-
-                        // Round-8 wave-3 HIGH fix: stack-arg setup for
-                        // invokespecial/virtual direct calls whose
-                        // receiver+params exceed ARG_REGS.
-                        let total_sub = self.emit_stack_arg_setup(
-                            &arg_slots,
-                            callee_needs_ctx,
-                        );
-                        // Round-8 wave-3: defensive callee-saved spill
-                        // before any GC-triggering CALL.
-                        self.emit_pre_safepoint_spill();
-                        self.emit_call_absolute(callee_entry);
-                        // Stage A (precise oop maps, B-K fix) — a direct
-                        // invokespecial/virtual call to a compiled callee is a
-                        // GC-capable safepoint (the callee may allocate). Like
-                        // the self-recursive site above, it historically spilled
-                        // but recorded NO oop map (gap #1), so the precise path
-                        // could not remap this frame. Gated behind `precise_maps`
-                        // → byte-identical gate-OFF; gate-ON records the map and
-                        // the paired post-safepoint register reload.
-                        // Also under `shadow_enabled` (balance the shadow push/
-                        // reload across this direct call — see the self-recursive
-                        // site above).
-                        if self.precise_maps || self.shadow_enabled {
-                            self.emit_oop_map_for_safepoint();
-                        }
-                        self.emit_stack_arg_cleanup(total_sub);
-
-                        // A directly-called compiled callee that throws (or
-                        // deopts) returns the `i64::MIN` sentinel. Propagate
-                        // the deopt instead of running on with a bogus value.
-                        self.emit_post_invoke_exception_check();
-
-                        if ret_type != b'V' {
-                            if matches!(ret_type, b'D' | b'F') {
-                                self.push_from_rax_as_xmm0();
-                            } else {
-                                self.push_from_rax();
+                            // Direct call: pop receiver + params, call compiled entry
+                            // invokespecial has a receiver, so total args = callee_params + 1
+                            let n = callee_params + 1; // receiver + params
+                            let mut arg_slots = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                arg_slots.push(self.pop_stack());
                             }
-                        }
+                            arg_slots.reverse();
+
+                            // Round-8 wave-3 HIGH fix: stack-arg setup for
+                            // invokespecial/virtual direct calls whose
+                            // receiver+params exceed ARG_REGS.
+                            let total_sub = self.emit_stack_arg_setup(&arg_slots, callee_needs_ctx);
+                            // Round-8 wave-3: defensive callee-saved spill
+                            // before any GC-triggering CALL.
+                            self.emit_pre_safepoint_spill();
+                            self.emit_call_absolute(callee_entry);
+                            // Stage A (precise oop maps, B-K fix) — a direct
+                            // invokespecial/virtual call to a compiled callee is a
+                            // GC-capable safepoint (the callee may allocate). Like
+                            // the self-recursive site above, it historically spilled
+                            // but recorded NO oop map (gap #1), so the precise path
+                            // could not remap this frame. Gated behind `precise_maps`
+                            // → byte-identical gate-OFF; gate-ON records the map and
+                            // the paired post-safepoint register reload.
+                            // Also under `shadow_enabled` (balance the shadow push/
+                            // reload across this direct call — see the self-recursive
+                            // site above).
+                            if self.precise_maps || self.shadow_enabled {
+                                self.emit_oop_map_for_safepoint();
+                            }
+                            self.emit_stack_arg_cleanup(total_sub);
+
+                            // A directly-called compiled callee that throws (or
+                            // deopts) returns the `i64::MIN` sentinel. Propagate
+                            // the deopt instead of running on with a bogus value.
+                            self.emit_post_invoke_exception_check();
+
+                            if ret_type != b'V' {
+                                if matches!(ret_type, b'D' | b'F') {
+                                    self.push_from_rax_as_xmm0();
+                                } else {
+                                    self.push_from_rax();
+                                }
+                            }
                         } // end `if !intrinsic_handled` (plain direct call)
                     } else {
                         // Dispatch via helper (MIC-optimized for virtual/interface, plain for others)
@@ -19192,19 +19632,13 @@ impl Compiler {
                             let n = info_ref.num_jit_args;
 
                             // Check for MIC slot at this PC
-                            let mic_ptr = self
-                                .mic_slots_idx
-                                .get(&pc)
-                                .map(|&i| self.mic_slots[i].1);
+                            let mic_ptr = self.mic_slots_idx.get(&pc).map(|&i| self.mic_slots[i].1);
                             // Check for PIC slot at this PC. When both PIC
                             // and MIC are present (the adaptive recompiler
                             // promotes MIC → PIC and leaves the old MIC
                             // slot live as a fallback), PIC takes
                             // precedence: it caches a 3-entry superset.
-                            let pic_ptr = self
-                                .pic_slots_idx
-                                .get(&pc)
-                                .map(|&i| self.pic_slots[i].1);
+                            let pic_ptr = self.pic_slots_idx.get(&pc).map(|&i| self.pic_slots[i].1);
                             if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
@@ -19229,9 +19663,9 @@ impl Compiler {
                             let args_base_offset = pre_pop_spill;
                             if n > 0 {
                                 self.next_spill_offset = args_base_offset + (n as i32) * 8; // Cast: x86-64 immediate encoding
-                                // Store args in reverse offset order (same fix
-                                // as invokestatic): higher offsets → lower addresses,
-                                // so arg[0] at highest offset = lowest address.
+                                                                                            // Store args in reverse offset order (same fix
+                                                                                            // as invokestatic): higher offsets → lower addresses,
+                                                                                            // so arg[0] at highest offset = lowest address.
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.load_slot_to_reg(RAX, *slot);
@@ -19395,17 +19829,17 @@ impl Compiler {
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches.push((ic_imm64_off, 1)); // 1 = PIC
-                                // SECURITY FIX (V1) INVARIANT: R10 holds the
-                                // PIC slot base pointer from here until each
-                                // per-slot `MOV R11,[R10+disp]; CALL R11`
-                                // below. Code emitted in this window (receiver
-                                // load, NPE guard, class_id load, the per-slot
-                                // CMP/JNE cascade) must touch only RAX and R10
-                                // itself — it must NOT route through any helper
-                                // that clobbers R10 (e.g. emit_bounds_check,
-                                // SIMD lowering). The ABI marshalling below
-                                // targets ARG_REGS only (RCX/RDX/RSI/R8/R9/RDI
-                                // — never R10), so R10 stays the trusted base.
+                                                                         // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                                                         // PIC slot base pointer from here until each
+                                                                         // per-slot `MOV R11,[R10+disp]; CALL R11`
+                                                                         // below. Code emitted in this window (receiver
+                                                                         // load, NPE guard, class_id load, the per-slot
+                                                                         // CMP/JNE cascade) must touch only RAX and R10
+                                                                         // itself — it must NOT route through any helper
+                                                                         // that clobbers R10 (e.g. emit_bounds_check,
+                                                                         // SIMD lowering). The ABI marshalling below
+                                                                         // targets ARG_REGS only (RCX/RDX/RSI/R8/R9/RDI
+                                                                         // — never R10), so R10 stays the trusted base.
 
                                 // ---- Hoist callee ABI marshalling out of
                                 // the 3-way cascade. Previously each slot
@@ -19443,8 +19877,7 @@ impl Compiler {
                                 // per-slot CMP, so RAX is loaded last.
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 for j in 0..n {
-                                    let spill_off = args_base_offset
-                                        + ((n - 1 - j) as i32) * 8; // Cast: x86-64 immediate encoding
+                                    let spill_off = args_base_offset + ((n - 1 - j) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.emit_load_local(ARG_REGS[j + 1], spill_off);
                                 }
                                 // ARG_REGS[1] now holds the receiver
@@ -19479,9 +19912,17 @@ impl Compiler {
                                 // a proper NullPointerException.
                                 //   TEST recv_reg, recv_reg
                                 if recv_reg >= 8 {
-                                    self.buf.emit(&[0x4D, 0x85, 0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7)]);
+                                    self.buf.emit(&[
+                                        0x4D,
+                                        0x85,
+                                        0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7),
+                                    ]);
                                 } else {
-                                    self.buf.emit(&[0x48, 0x85, 0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7)]);
+                                    self.buf.emit(&[
+                                        0x48,
+                                        0x85,
+                                        0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7),
+                                    ]);
                                 }
                                 //   JZ rel32 → .miss (patched at miss_off)
                                 self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
@@ -19539,8 +19980,7 @@ impl Compiler {
                                 // Seeded with the receiver-null-check JZ
                                 // emitted above the cascade so it is patched
                                 // to the same shared `.miss` target.
-                                let mut miss_patches_rel32: Vec<usize> =
-                                    vec![pic_null_miss_patch];
+                                let mut miss_patches_rel32: Vec<usize> = vec![pic_null_miss_patch];
 
                                 for i in 0..3usize {
                                     slot_starts[i] = self.buf.pos();
@@ -19557,8 +19997,7 @@ impl Compiler {
                                         self.buf.emit(&[0x41, 0x3B, 0x02]);
                                     } else {
                                         // 4 bytes: REX.B + 3B /r + ModRM(01,000,010) + disp8.
-                                        self.buf
-                                            .emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
+                                        self.buf.emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
                                     }
 
                                     if i < 2 {
@@ -19593,8 +20032,7 @@ impl Compiler {
                                     //   modrm = mod(01) reg(/7=111) rm(010)
                                     //         = 0b01_111_010 = 0x7A
                                     //   + disp8 + imm8(0)
-                                    self.buf
-                                        .emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
+                                    self.buf.emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
 
                                     // JE rel32 → .miss (6 bytes:
                                     // 0x0F 0x84 + i32 disp).  CRIT-3:
@@ -19644,8 +20082,7 @@ impl Compiler {
                                         self.buf.emit(&[0x4D, 0x8B, 0x1A]);
                                     } else {
                                         // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
-                                        self.buf
-                                            .emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
+                                        self.buf.emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
                                     }
                                     // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                     self.buf.emit(&[0x41, 0xFF, 0xD3]);
@@ -19711,15 +20148,15 @@ impl Compiler {
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches.push((ic_imm64_off, 0)); // 0 = MIC
-                                // SECURITY FIX (V1) INVARIANT: R10 holds the
-                                // MIC slot base pointer from here until the
-                                // `MOV R11,[R10+8]; CALL R11` below. Every
-                                // instruction emitted in this window (receiver
-                                // load into RAX, NPE guard, class_id/needs-ctx
-                                // checks, and the ARG_REGS marshalling loop)
-                                // touches only RAX, R10, and ARG_REGS — never
-                                // R10 as a destination — so the call target
-                                // base cannot be perturbed before the CALL.
+                                                                         // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                                                         // MIC slot base pointer from here until the
+                                                                         // `MOV R11,[R10+8]; CALL R11` below. Every
+                                                                         // instruction emitted in this window (receiver
+                                                                         // load into RAX, NPE guard, class_id/needs-ctx
+                                                                         // checks, and the ARG_REGS marshalling loop)
+                                                                         // touches only RAX, R10, and ARG_REGS — never
+                                                                         // R10 as a destination — so the call target
+                                                                         // base cannot be perturbed before the CALL.
 
                                 // Load receiver pointer into RAX. Receiver is
                                 // arg_slots[0], spilled at the *highest* offset
@@ -19852,14 +20289,13 @@ impl Compiler {
                                 // RAX alone; the imm64-via-RAX fallback
                                 // would overwrite RAX anyway, but that
                                 // happens after we've already stored).
-                                let pic_arg: i64 = pic_ptr
-                                    .map(|p| p as *const _ as i64)
-                                    .unwrap_or(0); // Cast: function pointer for JIT call target
+                                let pic_arg: i64 =
+                                    pic_ptr.map(|p| p as *const _ as i64).unwrap_or(0); // Cast: function pointer for JIT call target
                                 #[cfg(target_os = "windows")]
                                 {
                                     // 5th arg at [RSP + 32]
                                     self.emit_mov_imm64(RAX, mic as *const _ as i64); // Cast: function pointer for JIT call target
-                                    // MOV [RSP + 32], RAX
+                                                                                      // MOV [RSP + 32], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x20]);
                                     // 6th arg at [RSP + 40]
@@ -19874,14 +20310,10 @@ impl Compiler {
                                     self.emit_mov_imm64(R8, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                     self.emit_mov_imm64(R9, pic_arg);
                                 }
-                                self.emit_call_absolute(
-                                    self.helpers.invoke_virtual_mic,
-                                );
+                                self.emit_call_absolute(self.helpers.invoke_virtual_mic);
                             } else {
                                 // Plain dispatch without MIC
-                                self.emit_call_absolute(
-                                    self.helpers.invoke_dispatch,
-                                );
+                                self.emit_call_absolute(self.helpers.invoke_dispatch);
                             }
 
                             // .done: patch the fast-path forward JMP(s).
@@ -19993,8 +20425,8 @@ impl Compiler {
                         // Scalar-replaced: zero-initialize field slots in the frame
                         self.emit_xor_reg_self(RAX);
                         for i in 0..sr_obj.num_fields {
-                            let field_off = sr_obj.field_base_offset
-                                + (i as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
+                            let field_off =
+                                sr_obj.field_base_offset + (i as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                             self.emit_store_local(field_off, RAX);
                             self.emit_store_local(field_off + 8, RAX);
                         }
@@ -20004,10 +20436,7 @@ impl Compiler {
                     } else {
                         self.flush_scratch_registers();
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let resolved = self
-                            .new_info_idx
-                            .get(&pc)
-                            .map(|&i| self.new_info[i]);
+                        let resolved = self.new_info_idx.get(&pc).map(|&i| self.new_info[i]);
                         let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) =
                             match resolved {
                                 Some(info) => info,
@@ -20062,11 +20491,7 @@ impl Compiler {
                             // so the conservative default `(true,true)`
                             // keeps the helper call in place for now.
                             let skip_helper = !has_prim_init && !has_finalizer;
-                            self.emit_inline_tlab_new(
-                                class_id_raw,
-                                num_fields,
-                                skip_helper,
-                            );
+                            self.emit_inline_tlab_new(class_id_raw, num_fields, skip_helper);
                         } else {
                             // Slow path: full helper-call dispatch. Used when
                             //   - the helper table is partial (tests),
@@ -20152,7 +20577,8 @@ impl Compiler {
                 0xa5 => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -20193,7 +20619,8 @@ impl Compiler {
                 0xa6 => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -20243,8 +20670,8 @@ impl Compiler {
                     self.load_slot_to_reg(ARG_REGS[1], obj_slot); // obj_ptr
                     self.emit_mov_imm64(ARG_REGS[2], name_ptr as i64); // class_name_ptr // Cast: JIT ABI convention
                     self.emit_mov_imm64(ARG_REGS[3], name_len as i64); // class_name_len // Cast: JIT ABI convention
-                    // Round-8 wave-3: defensive callee-saved spill
-                    // before any GC-triggering CALL.
+                                                                       // Round-8 wave-3: defensive callee-saved spill
+                                                                       // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.checkcast);
                     // T1.1.2 — checkcast may resolve the target class
@@ -20277,8 +20704,8 @@ impl Compiler {
                     self.load_slot_to_reg(ARG_REGS[1], obj_slot); // obj_ptr
                     self.emit_mov_imm64(ARG_REGS[2], name_ptr as i64); // class_name_ptr // Cast: JIT ABI convention
                     self.emit_mov_imm64(ARG_REGS[3], name_len as i64); // class_name_len // Cast: JIT ABI convention
-                    // Round-8 wave-3: defensive callee-saved spill
-                    // before any GC-triggering CALL.
+                                                                       // Round-8 wave-3: defensive callee-saved spill
+                                                                       // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.instanceof_check);
                     // T1.1.2 — instanceof may resolve the target class
@@ -20332,7 +20759,8 @@ impl Compiler {
                 0xc6 => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -20387,7 +20815,8 @@ impl Compiler {
                 0xc7 => {
                     self.flush_scratch_registers();
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
+                    let target_pc = match pc.checked_add_signed(offset as isize) {
+                        // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
@@ -20532,10 +20961,10 @@ impl Compiler {
             }
             // rel32 = target - (patch_offset + 4)
             let rel = target_native - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-            // `try_patch_i32` already sets the sticky `overflowed` flag and
-            // returns Err on an out-of-bounds offset. Honor the no-panic
-            // bail contract: drop the Err and let the driver's
-            // `if buf.overflowed() { return None; }` discard the method.
+                                                                 // `try_patch_i32` already sets the sticky `overflowed` flag and
+                                                                 // returns Err on an out-of-bounds offset. Honor the no-panic
+                                                                 // bail contract: drop the Err and let the driver's
+                                                                 // `if buf.overflowed() { return None; }` discard the method.
             if self.buf.try_patch_i32(patch_offset, rel).is_err() {
                 self.buf.mark_overflowed();
             }
@@ -20551,7 +20980,7 @@ impl Compiler {
                 return false; // unresolved table target — reject the method
             }
             let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
-            // See note above: bail via the overflowed flag, never panic.
+                                                         // See note above: bail via the overflowed flag, never panic.
             if self.buf.try_patch_i32(entry_offset, rel).is_err() {
                 self.buf.mark_overflowed();
             }
@@ -20563,7 +20992,7 @@ impl Compiler {
         for &patch_offset in &self.self_call_patches {
             // rel32 = entry - (patch_offset + 4)
             let rel = entry_offset as i32 - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-            // See `patch_branches`: bail via the overflowed flag, never panic.
+                                                                       // See `patch_branches`: bail via the overflowed flag, never panic.
             if self.buf.try_patch_i32(patch_offset, rel).is_err() {
                 self.buf.mark_overflowed();
             }
@@ -20889,46 +21318,50 @@ pub fn compile_with_param_slots(
     //   Body ≤20 bytecodes  → 4x unroll (3 extra copies)
     //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
     //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
-    let unroll_loops: Vec<(usize, usize, usize)> = if std::env::var_os("CRATONVM_DISABLE_UNROLL").is_some() {
-        Vec::new()
-    } else { loops
-        .iter()
-        .filter_map(|&(header, back_edge)| {
-            // Only unroll loops with goto back-edge (not conditional)
-            if code[back_edge] != 0xa7 {
-                return None;
-            }
-            let body_size = back_edge - header;
-            if body_size < 5 {
-                return None;
-            }
+    let unroll_loops: Vec<(usize, usize, usize)> =
+        if std::env::var_os("CRATONVM_DISABLE_UNROLL").is_some() {
+            Vec::new()
+        } else {
+            loops
+                .iter()
+                .filter_map(|&(header, back_edge)| {
+                    // Only unroll loops with goto back-edge (not conditional)
+                    if code[back_edge] != 0xa7 {
+                        return None;
+                    }
+                    let body_size = back_edge - header;
+                    if body_size < 5 {
+                        return None;
+                    }
 
-            // PGO path: use profiled trip count if available for this back-edge
-            if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
-                let extra_copies = pgo_factor - 1;
-                // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
-                if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
-                    return Some((header, back_edge, extra_copies));
-                }
-            }
+                    // PGO path: use profiled trip count if available for this back-edge
+                    if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
+                        let extra_copies = pgo_factor - 1;
+                        // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
+                        if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
+                            return Some((header, back_edge, extra_copies));
+                        }
+                    }
 
-            // Static heuristic fallback
-            let extra_copies = if body_size <= 20 {
-                3 // 4x unroll
-            } else if body_size <= 50 {
-                1 // 2x unroll (covers FP-heavy loops like N-Body advance)
-            } else {
-                return None;
-            };
-            Some((header, back_edge, extra_copies))
-        })
-        .collect() };
+                    // Static heuristic fallback
+                    let extra_copies = if body_size <= 20 {
+                        3 // 4x unroll
+                    } else if body_size <= 50 {
+                        1 // 2x unroll (covers FP-heavy loops like N-Body advance)
+                    } else {
+                        return None;
+                    };
+                    Some((header, back_edge, extra_copies))
+                })
+                .collect()
+        };
 
     // FP LICM: detect loop-invariant FP loads to hoist
     let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);
 
     // FP strength reduction: detect dmul-by-2.0 → dadd-self inside loops
-    let fp_strength_reduction_pcs = find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
+    let fp_strength_reduction_pcs =
+        find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
 
     // Register allocation: graph-coloring allocator for locals
     let alloc_result =
@@ -20948,8 +21381,7 @@ pub fn compile_with_param_slots(
     let non_escaping_new: std::collections::HashSet<usize> = if non_escaping_new.is_empty() {
         non_escaping_new
     } else {
-        let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> =
-            FxHashMap::default();
+        let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
         for &(ipc, info_ptr) in &invoke_info {
             // SAFETY: `info_ptr` comes from `invoke_info`, whose entries
             // are kept live by the caller for the whole compilation.
@@ -20978,7 +21410,12 @@ pub fn compile_with_param_slots(
         &non_escaping_new
     };
     let sr_plan = plan_scalar_replacement(
-        code, code_len, non_escaping_for_sr, &new_info, &invoke_info, scalar_base,
+        code,
+        code_len,
+        non_escaping_for_sr,
+        &new_info,
+        &invoke_info,
+        scalar_base,
     );
     let num_scalar_slots = sr_plan.total_slots;
 
@@ -21017,7 +21454,8 @@ pub fn compile_with_param_slots(
     compiler.invoke_info = invoke_info;
     compiler.direct_calls = direct_calls;
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
-        eprintln!("[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
+        eprintln!(
+            "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
             mic_slots.len(),
             mic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
         );
@@ -21035,7 +21473,8 @@ pub fn compile_with_param_slots(
     // first invocation; once the runtime helper populates a slot,
     // subsequent dispatches take the inline fast path.
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
-        eprintln!("[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
+        eprintln!(
+            "[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
             pic_slots.len(),
             pic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
         );
@@ -21063,8 +21502,7 @@ pub fn compile_with_param_slots(
     // T5.2.15 — element-wise SIMD detections.
     compiler.simd_element_wise_loops = simd_element_wise_loops;
     // T5.2.17 — loop unswitching candidates.
-    compiler.loop_unswitch_candidates =
-        detect_loop_unswitch_candidates(code, code_len, &loops);
+    compiler.loop_unswitch_candidates = detect_loop_unswitch_candidates(code, code_len, &loops);
 
     // MED-4 / Fix 3 — pre-build pc-indexed lookup maps for the hot
     // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)
@@ -21281,7 +21719,9 @@ pub fn compile_with_param_slots(
         && compiler.sp_id_slot_off != 0
         && !cm.compiled_via_osr
         && compiler.inline_sites.is_empty()
-        && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs);
+        && compiler
+            .safepoint_pcs
+            .is_subset(&compiler.mapped_safepoint_pcs);
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
     // the `top` watermark) for OSR-entered frames (follow-up §1). All 0 when the
@@ -21466,10 +21906,14 @@ mod tests {
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any dereference.
     unsafe extern "C" fn stub_getfield(obj_ptr: i64, field_index: i64) -> i64 {
-        if obj_ptr == 0 { return 0; }
+        if obj_ptr == 0 {
+            return 0;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return 0; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return 0;
+        } // Cast: x86-64 immediate encoding
         let ptr = base.add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
         let val: Value = std::ptr::read(ptr as *const Value); // Cast: address arithmetic
         match val {
@@ -21486,10 +21930,14 @@ mod tests {
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any write.
     unsafe extern "C" fn stub_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
-        if obj_ptr == 0 { return; }
+        if obj_ptr == 0 {
+            return;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return;
+        } // Cast: x86-64 immediate encoding
         let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
         std::ptr::write(ptr as *mut Value, Value::Int(val as i32)); // Cast: address arithmetic
     }
@@ -21497,10 +21945,14 @@ mod tests {
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any write.
     unsafe extern "C" fn stub_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
-        if obj_ptr == 0 { return; }
+        if obj_ptr == 0 {
+            return;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return;
+        } // Cast: x86-64 immediate encoding
         let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
         std::ptr::write(ptr as *mut Value, Value::Long(val)); // Cast: address arithmetic
     }
@@ -21508,33 +21960,52 @@ mod tests {
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any write.
     unsafe extern "C" fn stub_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
-        if obj_ptr == 0 { return; }
+        if obj_ptr == 0 {
+            return;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return;
+        } // Cast: x86-64 immediate encoding
         let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
-        std::ptr::write(ptr as *mut Value, Value::Float(f32::from_bits(val as u32))); // Cast: address arithmetic
+        std::ptr::write(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
+        // Cast: address arithmetic
     }
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any write.
     unsafe extern "C" fn stub_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
-        if obj_ptr == 0 { return; }
+        if obj_ptr == 0 {
+            return;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return;
+        } // Cast: x86-64 immediate encoding
         let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
-        std::ptr::write(ptr as *mut Value, Value::Double(f64::from_bits(val as u64))); // Cast: address arithmetic
+        std::ptr::write(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
+        // Cast: address arithmetic
     }
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any write.
     // val is either 0 (null) or a valid ObjectRef pointer from the managed heap.
-    unsafe extern "C" fn stub_putfield_object(_vm_ptr: i64, obj_ptr: i64, field_index: i64, val: i64) {
-        if obj_ptr == 0 { return; }
+    unsafe extern "C" fn stub_putfield_object(
+        _vm_ptr: i64,
+        obj_ptr: i64,
+        field_index: i64,
+        val: i64,
+    ) {
+        if obj_ptr == 0 {
+            return;
+        }
         let base = obj_ptr as *const u8; // Cast: address arithmetic
         let num_slots = read_num_slots(base);
-        if field_index < 0 || field_index as u32 >= num_slots { return; } // Cast: x86-64 immediate encoding
+        if field_index < 0 || field_index as u32 >= num_slots {
+            return;
+        } // Cast: x86-64 immediate encoding
         let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
         if val == 0 {
             std::ptr::write(ptr as *mut Value, Value::Object(None)); // Cast: address arithmetic
@@ -21827,13 +22298,22 @@ mod tests {
         // n=0: 0 <= 1, return 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, 0);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0]).expect("test JIT call") },
+            0
+        );
         // n=1: 1 <= 1, return 1
-        assert_eq!(unsafe { compiled.try_call(&[1]).expect("test JIT call") }, 1);
+        assert_eq!(
+            unsafe { compiled.try_call(&[1]).expect("test JIT call") },
+            1
+        );
         // n=5: 5 > 1, return 5+1=6
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 6);
+        assert_eq!(
+            unsafe { compiled.try_call(&[5]).expect("test JIT call") },
+            6
+        );
     }
 
     #[test]
@@ -21910,12 +22390,24 @@ mod tests {
         // fib(0) = 0, fib(1) = 1, fib(10) = 55, fib(20) = 6765
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, 0);
-        assert_eq!(unsafe { compiled.try_call(&[1]).expect("test JIT call") }, 1);
-        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, 55);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0]).expect("test JIT call") },
+            0
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[1]).expect("test JIT call") },
+            1
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[10]).expect("test JIT call") },
+            55
+        );
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[20]).expect("test JIT call") }, 6765);
+        assert_eq!(
+            unsafe { compiled.try_call(&[20]).expect("test JIT call") },
+            6765
+        );
     }
 
     #[test]
@@ -21954,7 +22446,11 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[100_000_000_000i64, 200_000_000_000i64]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[100_000_000_000i64, 200_000_000_000i64])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 300_000_000_000i64);
     }
 
@@ -22002,8 +22498,14 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 15);
-        assert_eq!(unsafe { compiled.try_call(&[-3]).expect("test JIT call") }, 7);
+        assert_eq!(
+            unsafe { compiled.try_call(&[5]).expect("test JIT call") },
+            15
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[-3]).expect("test JIT call") },
+            7
+        );
     }
 
     #[test]
@@ -22048,9 +22550,15 @@ mod tests {
         // 17 / 5 = 3, 17 % 5 = 2, total = 5
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[17, 5]).expect("test JIT call") }, 5);
+        assert_eq!(
+            unsafe { compiled.try_call(&[17, 5]).expect("test JIT call") },
+            5
+        );
         // -7 / 2 = -3, -7 % 2 = -1, total = -4
-        assert_eq!(unsafe { compiled.try_call(&[-7, 2]).expect("test JIT call") }, -4);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-7, 2]).expect("test JIT call") },
+            -4
+        );
     }
 
     #[test]
@@ -22324,8 +22832,8 @@ mod tests {
         )
         .unwrap();
         let input = 3.15f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 3.15f32); // Cast: JIT ABI convention
     }
@@ -22365,8 +22873,8 @@ mod tests {
         )
         .unwrap();
         let input = 2.719f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                               // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                               // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 2.719f64); // Cast: JIT ABI convention
     }
@@ -22406,8 +22914,8 @@ mod tests {
         )
         .unwrap();
         let input = 42.5f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[0, input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 42.5f32); // Cast: JIT ABI convention
     }
@@ -22448,15 +22956,27 @@ mod tests {
         // Positive value within byte range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[42]).expect("test JIT call") }, 42);
+        assert_eq!(
+            unsafe { compiled.try_call(&[42]).expect("test JIT call") },
+            42
+        );
         // Truncation: 0x1FF → (byte) = -1
-        assert_eq!(unsafe { compiled.try_call(&[0x1FF]).expect("test JIT call") }, -1);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0x1FF]).expect("test JIT call") },
+            -1
+        );
         // Truncation: 300 → (byte) = 44
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[300]).expect("test JIT call") }, 44);
+        assert_eq!(
+            unsafe { compiled.try_call(&[300]).expect("test JIT call") },
+            44
+        );
         // Negative: -128
-        assert_eq!(unsafe { compiled.try_call(&[-128]).expect("test JIT call") }, -128);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-128]).expect("test JIT call") },
+            -128
+        );
     }
 
     #[test]
@@ -22495,15 +23015,27 @@ mod tests {
         // Positive value within char range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[65]).expect("test JIT call") }, 65); // 'A'
-                                                         // 0xFFFF stays as 65535 (unsigned)
-        assert_eq!(unsafe { compiled.try_call(&[0xFFFF]).expect("test JIT call") }, 65535);
+        assert_eq!(
+            unsafe { compiled.try_call(&[65]).expect("test JIT call") },
+            65
+        ); // 'A'
+           // 0xFFFF stays as 65535 (unsigned)
+        assert_eq!(
+            unsafe { compiled.try_call(&[0xFFFF]).expect("test JIT call") },
+            65535
+        );
         // Truncation: 0x10041 → 0x0041 = 65
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[0x10041]).expect("test JIT call") }, 65);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0x10041]).expect("test JIT call") },
+            65
+        );
         // Negative: -1 → 0xFFFF = 65535
-        assert_eq!(unsafe { compiled.try_call(&[-1]).expect("test JIT call") }, 65535);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
+            65535
+        );
     }
 
     #[test]
@@ -22542,15 +23074,27 @@ mod tests {
         // Positive within short range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[1000]).expect("test JIT call") }, 1000);
+        assert_eq!(
+            unsafe { compiled.try_call(&[1000]).expect("test JIT call") },
+            1000
+        );
         // Truncation: 0x18000 → (short) = -32768
-        assert_eq!(unsafe { compiled.try_call(&[0x18000]).expect("test JIT call") }, -32768);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0x18000]).expect("test JIT call") },
+            -32768
+        );
         // 32767 stays
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[32767]).expect("test JIT call") }, 32767);
+        assert_eq!(
+            unsafe { compiled.try_call(&[32767]).expect("test JIT call") },
+            32767
+        );
         // -32768 stays
-        assert_eq!(unsafe { compiled.try_call(&[-32768]).expect("test JIT call") }, -32768);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-32768]).expect("test JIT call") },
+            -32768
+        );
     }
 
     #[test]
@@ -22628,8 +23172,8 @@ mod tests {
         )
         .unwrap();
         let input = (-3.5f32).to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                                // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                                // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), -3.5f32); // Cast: JIT ABI convention
     }
@@ -22641,15 +23185,31 @@ mod tests {
         let code: Vec<u8> = vec![0x1a, 0x1b, 0x5c, 0x60, 0x60, 0x60, 0xac, 0, 0];
         let code_len = 7;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
         // f(3, 5) = 2*3 + 2*5 = 16
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -22674,20 +23234,41 @@ mod tests {
         let code: Vec<u8> = vec![0x1a, 0x1b, 0x5f, 0x5f, 0x64, 0xac, 0, 0];
         let code_len = 6;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
         )
         .expect("swap must JIT-compile");
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") }, 7);
+        assert_eq!(
+            unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") },
+            7
+        );
         // SAFETY: same as above.
-        assert_eq!(unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") }, -10);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") },
+            -10
+        );
     }
 
     /// A SINGLE swap of two frame-resident values must actually swap them.
@@ -22702,18 +23283,36 @@ mod tests {
         let code: Vec<u8> = vec![0x08, 0x05, 0x5f, 0x64, 0xac, 0, 0];
         let code_len = 5;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
         )
         .expect("single swap must JIT-compile");
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, -3);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0]).expect("test JIT call") },
+            -3
+        );
     }
 
     /// After a swap, the spill cursor must not hand a later push a slot the
@@ -22727,18 +23326,36 @@ mod tests {
         let code: Vec<u8> = vec![0x08, 0x05, 0x5f, 0x04, 0x64, 0x64, 0xac, 0, 0];
         let code_len = 7;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
         )
         .expect("swap+push must JIT-compile");
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, -2);
+        assert_eq!(
+            unsafe { compiled.try_call(&[0]).expect("test JIT call") },
+            -2
+        );
     }
 
     /// Mixed register/frame swap (register-allocated local below a
@@ -22750,20 +23367,41 @@ mod tests {
         let code: Vec<u8> = vec![0x1a, 0x06, 0x5f, 0x64, 0xac, 0, 0];
         let code_len = 5;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
         )
         .expect("mixed swap must JIT-compile");
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, -7);
+        assert_eq!(
+            unsafe { compiled.try_call(&[10]).expect("test JIT call") },
+            -7
+        );
         // SAFETY: same as above.
-        assert_eq!(unsafe { compiled.try_call(&[-4]).expect("test JIT call") }, 7);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-4]).expect("test JIT call") },
+            7
+        );
     }
 
     /// if_icmp with a register-resident slot BELOW two frame-resident
@@ -22795,11 +23433,26 @@ mod tests {
         ];
         let code_len = 19;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
@@ -22808,9 +23461,15 @@ mod tests {
         // k+5 < k+3 is false for every k → always the 7 arm. The clobbered
         // compare read k itself as val1: k < k+3 is true → 9 arm.
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, 17);
+        assert_eq!(
+            unsafe { compiled.try_call(&[10]).expect("test JIT call") },
+            17
+        );
         // SAFETY: same as above.
-        assert_eq!(unsafe { compiled.try_call(&[-2]).expect("test JIT call") }, 5);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-2]).expect("test JIT call") },
+            5
+        );
     }
 
     /// Same shape for the one-operand ifXX family: [CalleeSaved, Frame]
@@ -22835,11 +23494,26 @@ mod tests {
         ];
         let code_len = 16;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
@@ -22848,9 +23522,15 @@ mod tests {
         // f(-1): k+3 = 2 > 0 → 7 arm → 6. The clobbered TEST read k = -1
         // (≤ 0) → 9 arm → 8.
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[-1]).expect("test JIT call") }, 6);
+        assert_eq!(
+            unsafe { compiled.try_call(&[-1]).expect("test JIT call") },
+            6
+        );
         // SAFETY: same as above.
-        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 12);
+        assert_eq!(
+            unsafe { compiled.try_call(&[5]).expect("test JIT call") },
+            12
+        );
     }
 
     #[test]
@@ -22867,11 +23547,26 @@ mod tests {
         let code: Vec<u8> = vec![0x1e, 0x5c, 0x61, 0xad, 0, 0];
         let code_len = 4;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout
@@ -22879,8 +23574,14 @@ mod tests {
         .expect("FORM-2 dup2 method must JIT-compile (not bail/reject)");
         // f(5) = 10, f(-7) = -14
         // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
-        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 10);
-        assert_eq!(unsafe { compiled.try_call(&[-7]).expect("test JIT call") }, -14);
+        assert_eq!(
+            unsafe { compiled.try_call(&[5]).expect("test JIT call") },
+            10
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[-7]).expect("test JIT call") },
+            -14
+        );
     }
 
     #[test]
@@ -22903,13 +23604,16 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            vec![(1, crate::JitDirectCall {
-                entry: crate::MATH_SQRT_INTRINSIC,
-                needs_context: false,
-                num_params: 1,
-                return_type: b'D',
-                guard_class_id: 0,
-            })],
+            vec![(
+                1,
+                crate::JitDirectCall {
+                    entry: crate::MATH_SQRT_INTRINSIC,
+                    needs_context: false,
+                    num_params: 1,
+                    return_type: b'D',
+                    guard_class_id: 0,
+                },
+            )],
             Vec::new(),
             Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
@@ -22924,16 +23628,17 @@ mod tests {
         .unwrap();
         // sqrt(4.0) == 2.0
         let input = 4.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 2.0f64); // Cast: JIT ABI convention
-        // sqrt(2.0) ≈ 1.4142135623730951
+                                                           // sqrt(2.0) ≈ 1.4142135623730951
         let input2 = 2.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result2 = unsafe { compiled.try_call(&[input2]).expect("test JIT call") };
-        assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14); // Cast: JIT ABI convention
+        assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14);
+        // Cast: JIT ABI convention
     }
 
     #[test]
@@ -22956,19 +23661,30 @@ mod tests {
             2,
             2,
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
-            vec![(2, crate::JitDirectCall {
-                entry: crate::MATH_MIN_INT_INTRINSIC,
-                needs_context: false,
-                num_params: 2,
-                return_type: b'I',
-                guard_class_id: 0,
-            })],
-            Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry: crate::MATH_MIN_INT_INTRINSIC,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: b'I',
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(), &test_helpers(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
@@ -22994,19 +23710,30 @@ mod tests {
             2,
             2,
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
-            vec![(2, crate::JitDirectCall {
-                entry: crate::MATH_MAX_INT_INTRINSIC,
-                needs_context: false,
-                num_params: 2,
-                return_type: b'I',
-                guard_class_id: 0,
-            })],
-            Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry: crate::MATH_MAX_INT_INTRINSIC,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: b'I',
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(), &test_helpers(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
@@ -23042,14 +23769,14 @@ mod tests {
     #[test]
     fn test_compile_user_written_min_idiom_cmov() {
         let code: Vec<u8> = vec![
-            0x1A,             // 0:  iload_0
-            0x1B,             // 1:  iload_1
+            0x1A, // 0:  iload_0
+            0x1B, // 1:  iload_1
             0xa2, 0x00, 0x07, // 2:  if_icmpge → PC 9
-            0x1A,             // 5:  iload_0   (fall-through: a < b → take a)
+            0x1A, // 5:  iload_0   (fall-through: a < b → take a)
             0xa7, 0x00, 0x04, // 6:  goto → PC 10
-            0x1B,             // 9:  iload_1   (taken: a >= b → take b)
-            0xac,             // 10: ireturn
-            0, 0,             // padding
+            0x1B, // 9:  iload_1   (taken: a >= b → take b)
+            0xac, // 10: ireturn
+            0, 0, // padding
         ];
         let code_len = 11;
 
@@ -23059,13 +23786,21 @@ mod tests {
             2,
             2,
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
             Vec::new(),
-            Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(), &test_helpers(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
@@ -23115,19 +23850,30 @@ mod tests {
             2, // num_params: 2 long args, one local slot each
             2, // max_locals
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
-            vec![(2, crate::JitDirectCall {
-                entry: crate::MATH_MIN_LONG_INTRINSIC,
-                needs_context: false,
-                num_params: 2,
-                return_type: b'J',
-                guard_class_id: 0,
-            })],
-            Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry: crate::MATH_MIN_LONG_INTRINSIC,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: b'J',
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(), &test_helpers(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
@@ -23143,7 +23889,11 @@ mod tests {
         assert_eq!(r2, 3, "Math.min(5L, 3L) must be 3 (was {r2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r3 = unsafe { compiled_min.try_call(&[-7i64, 4i64]).expect("test JIT call") };
+        let r3 = unsafe {
+            compiled_min
+                .try_call(&[-7i64, 4i64])
+                .expect("test JIT call")
+        };
         assert_eq!(r3, -7, "Math.min(-7L, 4L) must be -7 (was {r3})");
 
         // Math.max(long, long) variant
@@ -23153,19 +23903,30 @@ mod tests {
             2, // num_params: 2 long args, one local slot each
             2, // max_locals
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
-            vec![(2, crate::JitDirectCall {
-                entry: crate::MATH_MAX_LONG_INTRINSIC,
-                needs_context: false,
-                num_params: 2,
-                return_type: b'J',
-                guard_class_id: 0,
-            })],
-            Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry: crate::MATH_MAX_LONG_INTRINSIC,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: b'J',
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(), &test_helpers(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
@@ -23181,7 +23942,11 @@ mod tests {
         assert_eq!(m2, 5, "Math.max(5L, 3L) must be 5 (was {m2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m3 = unsafe { compiled_max.try_call(&[-7i64, 4i64]).expect("test JIT call") };
+        let m3 = unsafe {
+            compiled_max
+                .try_call(&[-7i64, 4i64])
+                .expect("test JIT call")
+        };
         assert_eq!(m3, 4, "Math.max(-7L, 4L) must be 4 (was {m3})");
     }
 
@@ -23220,8 +23985,8 @@ mod tests {
         )
         .unwrap();
         let input = std::f64::consts::PI.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                                           // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                                           // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), std::f64::consts::PI); // Cast: JIT ABI convention
     }
@@ -23301,8 +24066,8 @@ mod tests {
         .unwrap();
         let a = 3.5f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 2.25f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 5.75f32); // Cast: JIT ABI convention
     }
@@ -23339,8 +24104,8 @@ mod tests {
         .unwrap();
         let a = 10.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 7.0f32); // Cast: JIT ABI convention
 
@@ -23407,8 +24172,8 @@ mod tests {
         .unwrap();
         let a = 15.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 4.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 3.75f32); // Cast: JIT ABI convention
     }
@@ -23448,8 +24213,8 @@ mod tests {
         .unwrap();
         let a = 1.5f64.to_bits() as i64; // Cast: JIT ABI convention
         let b = 2.5f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 4.0f64); // Cast: JIT ABI convention
     }
@@ -23486,8 +24251,8 @@ mod tests {
         .unwrap();
         let a = 100.0f64.to_bits() as i64; // Cast: JIT ABI convention
         let b = 37.5f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                          // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                          // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 62.5f64); // Cast: JIT ABI convention
 
@@ -23521,8 +24286,8 @@ mod tests {
         .unwrap();
         let a = 6.0f64.to_bits() as i64; // Cast: JIT ABI convention
         let b = 7.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
 
@@ -23556,8 +24321,8 @@ mod tests {
         .unwrap();
         let a = 22.0f64.to_bits() as i64; // Cast: JIT ABI convention
         let b = 7.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         let expected = 22.0f64 / 7.0f64;
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
@@ -23595,14 +24360,14 @@ mod tests {
         )
         .unwrap();
         let input = 3.5f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), -3.5f32); // Cast: JIT ABI convention
-        // Negate negative
+                                                            // Negate negative
         let input = (-7.0f32).to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                                // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                                // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 7.0f32); // Cast: JIT ABI convention
 
@@ -23636,8 +24401,8 @@ mod tests {
         )
         .unwrap();
         let input = 42.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), -42.0f64); // Cast: JIT ABI convention
     }
@@ -23746,13 +24511,13 @@ mod tests {
         )
         .unwrap();
         let input = 3.7f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 3); // truncate toward zero
         let input = (-3.7f32).to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                                // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                                // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, -3);
 
@@ -23785,8 +24550,8 @@ mod tests {
         )
         .unwrap();
         let input = 1.5f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 1.5f64); // Cast: JIT ABI convention
 
@@ -23819,8 +24584,8 @@ mod tests {
         )
         .unwrap();
         let input = 9.99f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 9);
 
@@ -23853,8 +24618,8 @@ mod tests {
         )
         .unwrap();
         let input = 1.5f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 1.5f32); // Cast: JIT ABI convention
     }
@@ -23956,8 +24721,8 @@ mod tests {
         )
         .unwrap();
         let input = 42.9f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 42i64);
 
@@ -23990,8 +24755,8 @@ mod tests {
         )
         .unwrap();
         let input = 99.9f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                              // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                              // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 99i64);
     }
@@ -24031,31 +24796,46 @@ mod tests {
         // a > b → 1
         let a = 5.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            1
+        );
 
         // a == b → 0
         let a = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 0);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            0
+        );
 
         // a < b → -1
         let a = 1.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            -1
+        );
 
         // NaN → -1 (fcmpl)
         let nan = f32::NAN.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, -1);
-        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, -1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
+            -1
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
+            -1
+        );
     }
 
     #[test]
@@ -24092,22 +24872,34 @@ mod tests {
         // a > b → 1
         let a = 5.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            1
+        );
 
         // a < b → -1
         let a = 1.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            -1
+        );
 
         // NaN → 1 (fcmpg)
         let nan = f32::NAN.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, 1);
-        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, 1);
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
+            1
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
+            1
+        );
     }
 
     #[test]
@@ -24143,25 +24935,37 @@ mod tests {
 
         let a = 5.0f64.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            1
+        );
 
         let a = 3.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 0);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            0
+        );
 
         let a = 1.0f64.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[a, b]).expect("test JIT call") },
+            -1
+        );
 
         // NaN → -1 (dcmpl)
         let nan = f64::NAN.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, -1);
+                                             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        assert_eq!(
+            unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
+            -1
+        );
 
         // dcmpg: NaN → 1
         let dcmpg_code: Vec<u8> = vec![0x26, 0x27, 0x98, 0xac, 0, 0];
@@ -24193,8 +24997,14 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, 1);
-        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, 1);
+        assert_eq!(
+            unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") },
+            1
+        );
+        assert_eq!(
+            unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") },
+            1
+        );
     }
 
     #[test]
@@ -24232,8 +25042,8 @@ mod tests {
         .unwrap();
         let a = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 2.0f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+                                         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         // (3.0 + 2.0) * 3.0 = 15.0
         assert_eq!(f32::from_bits(result as u32), 15.0f32); // Cast: JIT ABI convention
@@ -24339,8 +25149,8 @@ mod tests {
         .unwrap();
 
         // Create a heap object with one Int field
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(42));
@@ -24348,14 +25158,22 @@ mod tests {
         // Call the JIT method: pass obj pointer as first arg
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 42);
 
         // Test with negative value
         heap.set_field(obj, 0, Value::Int(-123));
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, -123);
     }
 
@@ -24398,15 +25216,19 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
         heap.set_field(obj, 1, Value::Long(9_999_999_999i64));
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 9_999_999_999i64);
     }
 
@@ -24448,15 +25270,19 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Float(3.5f32));
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let result_f = f32::from_bits(result as u32); // Cast: JIT ABI convention
         assert!((result_f - 3.5f32).abs() < 0.001);
     }
@@ -24501,8 +25327,8 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(0));
@@ -24510,7 +25336,11 @@ mod tests {
         // Call: setX(obj, 99)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.try_call(&[obj.as_ptr() as i64, 99]).expect("test JIT call") }; // Cast: JIT ABI convention
+        unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 99])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
 
         // Verify the field was updated
         let val = heap.get_field(obj, 0);
@@ -24519,7 +25349,11 @@ mod tests {
         // Test with negative value
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.try_call(&[obj.as_ptr() as i64, -42]).expect("test JIT call") }; // Cast: JIT ABI convention
+        unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, -42])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
         assert_eq!(val, Value::Int(-42));
     }
@@ -24562,14 +25396,18 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.try_call(&[obj.as_ptr() as i64, 123_456_789_012i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 123_456_789_012i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
         assert_eq!(val, Value::Long(123_456_789_012i64));
     }
@@ -24615,8 +25453,8 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         let ref_obj = heap.alloc_object(ClassId::new(0), 1);
@@ -24627,7 +25465,8 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code with heap pointer; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
         unsafe {
-            compiled.call_with_heap(heap_ptr, &[obj.as_ptr() as i64, ref_obj.as_ptr() as i64]) // Cast: JIT ABI convention
+            compiled.call_with_heap(heap_ptr, &[obj.as_ptr() as i64, ref_obj.as_ptr() as i64])
+            // Cast: JIT ABI convention
         };
 
         // Verify the field was updated
@@ -24695,15 +25534,19 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(10));
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 11);
 
         // Verify the field is now 11
@@ -24713,7 +25556,11 @@ mod tests {
         // Call again — should return 12
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 12);
     }
 
@@ -24754,15 +25601,19 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Double(2.719));
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let result_d = f64::from_bits(result as u64); // Cast: JIT ABI convention
         assert!((result_d - 2.719).abs() < 0.0001);
     }
@@ -24805,8 +25656,8 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         let ref_obj = heap.alloc_object(ClassId::new(0), 1);
@@ -24814,14 +25665,22 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, ref_obj.as_ptr() as i64); // Cast: JIT ABI convention
 
         // Test null reference
         heap.set_field(obj, 0, Value::Object(None));
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 0);
     }
 
@@ -24865,15 +25724,19 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
 
         let float_bits = 1.5f32.to_bits() as i64; // Cast: JIT ABI convention
-        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
-        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.try_call(&[obj.as_ptr() as i64, float_bits]).expect("test JIT call") }; // Cast: JIT ABI convention
+                                                  // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+                                                  // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, float_bits])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 1);
         assert_eq!(val, Value::Float(1.5f32));
     }
@@ -24916,8 +25779,8 @@ mod tests {
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 4);
         heap.set_field(obj, 0, Value::Int(100));
@@ -24926,7 +25789,11 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 300); // reads field at index 2
     }
 
@@ -24938,11 +25805,7 @@ mod tests {
     // and confirm bit-identical results vs the helper.
 
     /// Compile `aload_0; getfield #1; <ret>` with the given field metadata.
-    fn compile_single_getfield(
-        ret_op: u8,
-        field_index: usize,
-        type_tag: u8,
-    ) -> CompiledMethod {
+    fn compile_single_getfield(ret_op: u8, field_index: usize, type_tag: u8) -> CompiledMethod {
         let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, ret_op, 0, 0];
         compile(
             &code,
@@ -24984,11 +25847,22 @@ mod tests {
         // Byte fields live in the cell as Value::Int(sign-extended).
         heap.set_field(obj, 0, Value::Int(-7));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
-        assert_eq!(r, -7, "inline byte getfield must sign-extend like the helper");
+        let r = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        };
+        assert_eq!(
+            r, -7,
+            "inline byte getfield must sign-extend like the helper"
+        );
         heap.set_field(obj, 0, Value::Int(127));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
+        let r = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        };
         assert_eq!(r, 127);
     }
 
@@ -25004,7 +25878,11 @@ mod tests {
         let target = heap.alloc_object(ClassId::new(1), 0);
         heap.set_field(obj, 0, Value::Object(Some(target)));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
+        let r = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        };
         assert_eq!(
             r,
             target.as_ptr() as i64,
@@ -25013,7 +25891,11 @@ mod tests {
         // Null reference field → 0.
         heap.set_field(obj, 0, Value::Object(None));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
+        let r = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        };
         assert_eq!(r, 0, "Object(None) field must read as 0");
     }
 
@@ -25029,8 +25911,15 @@ mod tests {
         let v = 0x7EDC_BA98_7654_3210_i64;
         heap.set_field(obj, 1, Value::Long(v));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
-        assert_eq!(r, v, "inline long getfield must load the full 64-bit payload");
+        let r = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64])
+                .expect("test JIT call")
+        };
+        assert_eq!(
+            r, v,
+            "inline long getfield must load the full 64-bit payload"
+        );
     }
 
     #[test]
@@ -25070,7 +25959,11 @@ mod tests {
             // SAFETY: obj is a live heap object with field index 0 in bounds.
             let helper = unsafe { stub_getfield(obj.as_ptr() as i64, 0) };
             // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-            let inline = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
+            let inline = unsafe {
+                compiled
+                    .try_call(&[obj.as_ptr() as i64])
+                    .expect("test JIT call")
+            };
             assert_eq!(
                 inline, helper,
                 "inline getfield diverged from helper for value {v}"
@@ -25246,9 +26139,9 @@ mod tests {
         assert!(is_jit_compatible(&code, code_len, "([[III)I"));
 
         // Create arrays: a = int[3][4], a[1] = {10, 20, 30, 40}
-        use cratonvm_types::ClassId;
-        use cratonvm_gc::heap::ArrayElementType;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
 
         let heap = GenerationalHeap::new();
 
@@ -25293,8 +26186,8 @@ mod tests {
 
         // Call: sum(a=outer, i=1, n=4) → should sum row[0..4] = 10+20+30+40 = 100
         let heap_ptr = &heap as *const _ as i64; // Cast: function pointer for JIT call target
-        // SAFETY: Calling JIT-compiled machine code with heap pointer; the CompiledMethod
-        // was produced from valid bytecode and the mmap region is executable.
+                                                 // SAFETY: Calling JIT-compiled machine code with heap pointer; the CompiledMethod
+                                                 // was produced from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.call_with_heap(heap_ptr, &[outer.as_ptr() as i64, 1, 4]) }; // Cast: JIT ABI convention
         assert_eq!(result, 100);
 
@@ -25479,7 +26372,10 @@ mod tests {
         let code_len = 16;
         let loops = detect_loops(&code, code_len);
         let hoists = find_arith_loop_hoists(&code, code_len, &loops);
-        assert!(hoists.is_empty(), "expr on a loop-modified local must not hoist");
+        assert!(
+            hoists.is_empty(),
+            "expr on a loop-modified local must not hoist"
+        );
     }
 
     #[test]
@@ -25871,9 +26767,13 @@ mod tests {
         use std::sync::Arc;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
-        // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
-        // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
+                                                         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
+                                                         // was produced from valid bytecode and the mmap region is executable.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[0])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 0);
     }
 
@@ -25925,9 +26825,13 @@ mod tests {
         use std::sync::Arc;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
-        // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
-        // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
+                                                         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
+                                                         // was produced from valid bytecode and the mmap region is executable.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[0])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 0);
     }
 
@@ -25938,10 +26842,10 @@ mod tests {
         // Bytecode: aload_0, iload_1, iaload, ireturn
         // needs_heap = false for inline array access, but we pass needs_heap=true
         // to test the bounds check with a real array.
-        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
         use std::sync::Arc;
 
         let code: Vec<u8> = vec![
@@ -25996,9 +26900,17 @@ mod tests {
         // In-bounds access should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr_ptr as i64, 0])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 10);
-        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 4]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr_ptr as i64, 4])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 50);
     }
 
@@ -26009,10 +26921,10 @@ mod tests {
     fn test_bounds_check_bastore_in_bounds() {
         // Method: void f(byte[] arr, int idx, int val) { arr[idx] = (byte)val; }
         // Bytecode: aload_0, iload_1, iload_2, bastore, return
-        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
         use std::sync::Arc;
 
         let code: Vec<u8> = vec![
@@ -26062,7 +26974,11 @@ mod tests {
         // In-bounds store should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42]).expect("test JIT call") }; // Cast: address arithmetic
+        unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42])
+                .expect("test JIT call")
+        }; // Cast: address arithmetic
         let val = shared.heap.get_array_element(arr, 0).unwrap();
         assert_eq!(val.as_int(), Some(42));
     }
@@ -26270,10 +27186,10 @@ mod tests {
         //  18: goto -14         ; back to 4
         //  21: iload_2          ; load s
         //  22: ireturn
-        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
         use std::sync::Arc;
 
         let code: Vec<u8> = vec![
@@ -26341,7 +27257,11 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 5]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr_ptr as i64, 5])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, 15); // 1+2+3+4+5
     }
 
@@ -26409,7 +27329,8 @@ mod tests {
         let code_len = 5;
 
         // Create a JitInvokeInfo for the invokevirtual at pc=1
-        let info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+        let info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
             method_name: "getValue",
             descriptor: "()I",
@@ -26462,7 +27383,8 @@ mod tests {
         ];
         let code_len = 7;
 
-        let info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+        let info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestInterface",
             method_name: "compute",
             descriptor: "()I",
@@ -26515,7 +27437,8 @@ mod tests {
         ];
         let code_len = 5;
 
-        let info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+        let info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
             method_name: "doSomething",
             descriptor: "()V",
@@ -26570,7 +27493,8 @@ mod tests {
         ];
         let code_len = 7;
 
-        let info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+        let info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
             method_name: "add",
             descriptor: "(II)I",
@@ -26773,9 +27697,11 @@ mod tests {
         // This means we've already accumulated s=0+1+2+3+4=10, and i=5
         // Remaining: 5+6+7+8+9 = 35, total = 10+35 = 45
         let jit_locals: [i64; 3] = [10, 10, 5]; // n=10, s=10, i=5
-        // SAFETY: Entering JIT-compiled code via OSR; the CompiledMethod was produced
-        // from valid bytecode, locals array is correctly sized, and the mmap region is executable.
-        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 4, /* thread_ptr */ 0) };
+                                                // SAFETY: Entering JIT-compiled code via OSR; the CompiledMethod was produced
+                                                // from valid bytecode, locals array is correctly sized, and the mmap region is executable.
+        let osr_result = unsafe {
+            compiled.osr_enter(0, &jit_locals, 4, /* thread_ptr */ 0)
+        };
         assert!(osr_result.is_some(), "OSR entry should succeed at PC=4");
         assert_eq!(osr_result.unwrap(), 45); // s=10 + 5+6+7+8+9 = 45
     }
@@ -26808,11 +27734,28 @@ mod tests {
         ];
         let code_len = 28;
         let compiled = compile(
-            &code, code_len, 2, 6, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(),
-            &test_helpers(), std::collections::HashSet::new(), HashMap::new(),
+            &code,
+            code_len,
+            2,
+            6,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
             None, // string_layout: Option<StringFieldLayout>
         )
         .unwrap();
@@ -26825,7 +27768,9 @@ mod tests {
         // Remaining sum 1000..1999 = 1499500; total = 1999000.
         // jit_locals layout: index 0=n, 1=(n high), 2=s, 3=(s high), 4=i, 5=(i high)
         let jit_locals: [i64; 6] = [2000, 0, 499500, 0, 1000, 0];
-        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 5, /* thread_ptr */ 0) };
+        let osr_result = unsafe {
+            compiled.osr_enter(0, &jit_locals, 5, /* thread_ptr */ 0)
+        };
         assert!(osr_result.is_some(), "OSR entry should succeed at PC=5");
         assert_eq!(osr_result.unwrap(), 1999000, "OSR long loop result");
     }
@@ -26948,17 +27893,9 @@ mod tests {
     fn test_detect_int_array_element_wise_mul() {
         // Same shape but imul (0x68)
         let code: Vec<u8> = vec![
-            0x03, 0x36, 0x04,
-            0x15, 0x04, 0x1D,
-            0xa2, 0x00, 0x14,
-            0x2A, 0x15, 0x04,
-            0x2B, 0x15, 0x04, 0x2e,
-            0x2C, 0x15, 0x04, 0x2e,
-            0x68, // imul
-            0x4F,
-            0x84, 0x04, 0x01,
-            0xa7, 0xff, 0xEA,
-            0xB1,
+            0x03, 0x36, 0x04, 0x15, 0x04, 0x1D, 0xa2, 0x00, 0x14, 0x2A, 0x15, 0x04, 0x2B, 0x15,
+            0x04, 0x2e, 0x2C, 0x15, 0x04, 0x2e, 0x68, // imul
+            0x4F, 0x84, 0x04, 0x01, 0xa7, 0xff, 0xEA, 0xB1,
         ];
         let code_len = code.len();
         let loops = detect_loops(&code, code_len);
@@ -26992,10 +27929,10 @@ mod tests {
             0x15, 0x04, // 13: iload 4
             0x2e, // 15: iaload
             0x2C, // 16: aload_2 (b)
-            0x15, 0x04, // 17: iload 4
-            0x2e, // 19: iaload
+            0x15, 0x04,    // 17: iload 4
+            0x2e,    // 19: iaload
             op_byte, // 20: iOP
-            0x4F, // 21: iastore
+            0x4F,    // 21: iastore
             0x84, 0x04, 0x01, // 22: iinc 4, 1
             0xa7, 0xff, 0xEA, // 25: goto -22 → 3
             0xB1, // 28: return
@@ -27112,14 +28049,14 @@ mod tests {
         // 16: goto -14 → 2        (3)  back-edge
         // 19: return              (1)
         let code: Vec<u8> = vec![
-            0x03, 0x3D,             // 0-1
+            0x03, 0x3D, // 0-1
             0x1C, 0x1B, 0xa2, 0x00, 0x0F, // 2-6
-            0x1A,                   // 7
-            0x99, 0x00, 0x05,       // 8-10
-            0x00, 0x00,             // 11-12
-            0x84, 0x02, 0x01,       // 13-15
-            0xa7, 0xff, 0xF2,       // 16-18
-            0xB1,                   // 19
+            0x1A, // 7
+            0x99, 0x00, 0x05, // 8-10
+            0x00, 0x00, // 11-12
+            0x84, 0x02, 0x01, // 13-15
+            0xa7, 0xff, 0xF2, // 16-18
+            0xB1, // 19
         ];
         let code_len = code.len();
         let loops = detect_loops(&code, code_len);
@@ -27155,16 +28092,16 @@ mod tests {
         // 18-20:  goto -16 → 2
         // 21:     return
         let code: Vec<u8> = vec![
-            0x03, 0x3D,             // 0-1
+            0x03, 0x3D, // 0-1
             0x1C, 0x1B, 0xa2, 0x00, 0x11, // 2-6
-            0x1A,                   // 7
-            0x99, 0x00, 0x05,       // 8-10
-            0x04,                   // 11: iconst_1
-            0x3B,                   // 12: istore_0 (writes local 0)
-            0x00, 0x00,             // 13-14: nop nop
-            0x84, 0x02, 0x01,       // 15-17: iinc 2,1
-            0xa7, 0xff, 0xF0,       // 18-20: goto -16 → 2
-            0xB1,                   // 21: return
+            0x1A, // 7
+            0x99, 0x00, 0x05, // 8-10
+            0x04, // 11: iconst_1
+            0x3B, // 12: istore_0 (writes local 0)
+            0x00, 0x00, // 13-14: nop nop
+            0x84, 0x02, 0x01, // 15-17: iinc 2,1
+            0xa7, 0xff, 0xF0, // 18-20: goto -16 → 2
+            0xB1, // 21: return
         ];
         let code_len = code.len();
         let loops = detect_loops(&code, code_len);
@@ -27189,7 +28126,7 @@ mod tests {
         code.extend_from_slice(&[0x1C, 0x1B, 0xa2, 0x00, 0x00]); // iload i,n,if_icmpge
         code.push(0x1A); // iload_0 (flag)
         code.extend_from_slice(&[0x99, 0x00, 0x03]); // ifeq
-        // Pad the body with nops so size > MAX_UNSWITCH_BYTECODES.
+                                                     // Pad the body with nops so size > MAX_UNSWITCH_BYTECODES.
         for _ in 0..(MAX_UNSWITCH_BYTECODES + 5) {
             code.push(0x00);
         }
@@ -27223,15 +28160,8 @@ mod tests {
         // 16: goto -14 → 2        (back-edge)
         // 19: return
         let code: Vec<u8> = vec![
-            0x03, 0x3D,
-            0x1C, 0x1B, 0xa2, 0x00, 0x0F,
-            0x1A,
-            0x99, 0x00, 0x05,
-            0x00, 0x00,
-            0x84, 0x02, 0x01,
-            0xa7, 0xff, 0xF2,
-            0xB1,
-            0, 0,
+            0x03, 0x3D, 0x1C, 0x1B, 0xa2, 0x00, 0x0F, 0x1A, 0x99, 0x00, 0x05, 0x00, 0x00, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xF2, 0xB1, 0, 0,
         ];
         let code_len = 20;
         (code, code_len)
@@ -27316,10 +28246,10 @@ mod tests {
         }
         let back_edge = code.len();
         code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc
-        // Real back-edge to the loop header. (Historical note: this was a
-        // hardcoded `goto -1`, landing on the iinc's last operand byte —
-        // not an instruction boundary. The unresolved patch was silently
-        // skipped before `patch_branches` learned to reject such targets.)
+                                                     // Real back-edge to the loop header. (Historical note: this was a
+                                                     // hardcoded `goto -1`, landing on the iinc's last operand byte —
+                                                     // not an instruction boundary. The unresolved patch was silently
+                                                     // skipped before `patch_branches` learned to reject such targets.)
         let goto_pc = code.len();
         let goto_off = (header as i32 - goto_pc as i32) as i16; // Cast: fits — tiny method
         code.push(0xa7);
@@ -27379,24 +28309,24 @@ mod tests {
         // Use a plain int reduction here (not the long-accumulator form
         // detect_int_array_sum already accepts).
         let code: Vec<u8> = vec![
-            0x03,             // 0: iconst_0
-            0x36, 0x02,       // 1: istore 2 (sum = 0)
-            0x03,             // 3: iconst_0
-            0x36, 0x03,       // 4: istore 3 (i = 0)
+            0x03, // 0: iconst_0
+            0x36, 0x02, // 1: istore 2 (sum = 0)
+            0x03, // 3: iconst_0
+            0x36, 0x03, // 4: istore 3 (i = 0)
             // header at PC=6
-            0x15, 0x03,       // 6: iload 3
-            0x1B,             // 8: iload_1 (n)
+            0x15, 0x03, // 6: iload 3
+            0x1B, // 8: iload_1 (n)
             0xa2, 0x00, 0x0D, // 9: if_icmpge +13 → 22
-            0x15, 0x02,       // 12: iload 2 (sum)
-            0x2A,             // 14: aload_0
-            0x15, 0x03,       // 15: iload 3
-            0x2e,             // 17: iaload
-            0x60,             // 18: iadd
-            0x36, 0x02,       // 19: istore 2
+            0x15, 0x02, // 12: iload 2 (sum)
+            0x2A, // 14: aload_0
+            0x15, 0x03, // 15: iload 3
+            0x2e, // 17: iaload
+            0x60, // 18: iadd
+            0x36, 0x02, // 19: istore 2
             0x84, 0x03, 0x01, // 21: iinc 3, 1
             0xa7, 0xff, 0xF1, // 24: goto -15 → 9? (doesn't matter for this test)
-            0x15, 0x02,       // 27: iload 2
-            0xac,             // 29: ireturn
+            0x15, 0x02, // 27: iload 2
+            0xac, // 29: ireturn
         ];
         let code_len = code.len();
         let loops = detect_loops(&code, code_len);
@@ -27422,10 +28352,10 @@ mod tests {
             return;
         }
 
-        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
         use std::sync::Arc;
 
         // Same bytecode as the pattern test above:
@@ -27492,7 +28422,11 @@ mod tests {
         let arr1_ptr = arr1.as_ptr();
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result1 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr1_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result1 = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr1_ptr as i64, 0])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result1, 0, "empty array sum should be 0");
 
         // Test 2: array of 3 elements (0 SIMD chunks, all scalar cleanup)
@@ -27506,7 +28440,11 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result2 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result2 = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result2, 300, "3 elements of 100 should sum to 300");
 
         // Test 3: array of exactly 8 elements (exactly 1 SIMD chunk, no cleanup)
@@ -27520,7 +28458,11 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result3 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result3 = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result3, 80, "8 elements of 10 should sum to 80");
 
         // Test 4: array of 20 elements (exercises both SIMD chunks and scalar cleanup)
@@ -27537,7 +28479,11 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result4 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result4 = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result4, 210, "sum of 1..=20 should be 210");
 
         // Test 5: large array (256 elements) to really exercise SIMD
@@ -27547,12 +28493,17 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Int, n5);
         let arr5_ptr = arr5.as_ptr();
         for i in 0..n5 {
-            let _ = shared.heap.set_array_element(arr5, i, Value::Int(i as i32)); // Cast: x86-64 immediate encoding
+            let _ = shared.heap.set_array_element(arr5, i, Value::Int(i as i32));
+            // Cast: x86-64 immediate encoding
         }
         // sum of 0..255 = 255*256/2 = 32640
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result5 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result5 = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result5, 32640, "sum of 0..=255 should be 32640");
     }
 
@@ -27562,8 +28513,8 @@ mod tests {
         // new pushes objectref; method returns it
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0xb0,             // 3: areturn
-            0, 0,             // padding
+            0xb0, // 3: areturn
+            0, 0, // padding
         ];
         let scan = jit_scan(&code, 4, "()Ljava/lang/Object;");
         assert!(scan.is_some(), "jit_scan should accept `new` opcode");
@@ -27577,10 +28528,10 @@ mod tests {
     fn test_jit_scan_accepts_anewarray_opcode() {
         // Bytecode: iconst_3, anewarray #1 (0xbd 0x00 0x01), areturn
         let code: Vec<u8> = vec![
-            0x06,             // 0: iconst_3 (length=3)
+            0x06, // 0: iconst_3 (length=3)
             0xbd, 0x00, 0x01, // 1: anewarray #1
-            0xb0,             // 4: areturn
-            0, 0,             // padding
+            0xb0, // 4: areturn
+            0, 0, // padding
         ];
         let scan = jit_scan(&code, 5, "()[Ljava/lang/Object;");
         assert!(scan.is_some(), "jit_scan should accept `anewarray` opcode");
@@ -27603,13 +28554,13 @@ mod tests {
         // `compile`, where the resolved descriptors are available.
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0x59,             // 3: dup
+            0x59, // 3: dup
             0xb7, 0x00, 0x02, // 4: invokespecial <init>
-            0x4c,             // 7: astore_1
-            0x2b,             // 8: aload_1
+            0x4c, // 7: astore_1
+            0x2b, // 8: aload_1
             0xb4, 0x00, 0x03, // 9: getfield #3
-            0xac,             // 12: ireturn
-            0, 0,             // padding
+            0xac, // 12: ireturn
+            0, 0, // padding
         ];
         let scan = jit_scan(&code, 13, "()I");
         assert!(scan.is_some(), "method should be jit-compatible");
@@ -27625,7 +28576,10 @@ mod tests {
         let mut trivial: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
         trivial.insert(
             4,
-            InvokeSpecialShape { arg_slots: 1, is_trivial_void_init: true },
+            InvokeSpecialShape {
+                arg_slots: 1,
+                is_trivial_void_init: true,
+            },
         );
         assert!(
             analyze_escapes(&code, 13, &trivial).contains(&0),
@@ -27638,7 +28592,10 @@ mod tests {
         let mut arg_init: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
         arg_init.insert(
             4,
-            InvokeSpecialShape { arg_slots: 2, is_trivial_void_init: false },
+            InvokeSpecialShape {
+                arg_slots: 2,
+                is_trivial_void_init: false,
+            },
         );
         assert!(
             !analyze_escapes(&code, 13, &arg_init).contains(&0),
@@ -27651,10 +28608,10 @@ mod tests {
         // Pattern: new; dup; invokespecial <init>; areturn — the object escapes
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0x59,             // 3: dup
+            0x59, // 3: dup
             0xb7, 0x00, 0x02, // 4: invokespecial <init>
-            0xb0,             // 7: areturn
-            0, 0,             // padding
+            0xb0, // 7: areturn
+            0, 0, // padding
         ];
         let scan = jit_scan(&code, 8, "()Ljava/lang/Object;");
         assert!(scan.is_some(), "method should be jit-compatible");
@@ -27740,7 +28697,11 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with a sentinel VM pointer.
         // The fake_new_object stub does not touch the pointer.
-        let result = unsafe { compiled.try_call_with_context(0xCAFE_F00D, &[]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call_with_context(0xCAFE_F00D, &[])
+                .expect("test JIT call")
+        };
         assert_eq!(
             result, 0xDEAD_BEEFi64,
             "inline TLAB cascade must fall through to slow-path fake_new_object \
@@ -27756,10 +28717,10 @@ mod tests {
         // new #1; astore_1; aload_1; areturn
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1  (cp_idx=1)
-            0x4c,             // 3: astore_1
-            0x2b,             // 4: aload_1
-            0xb0,             // 5: areturn
-            0, 0,             // padding
+            0x4c, // 3: astore_1
+            0x2b, // 4: aload_1
+            0xb0, // 5: areturn
+            0, 0, // padding
         ];
         let code_len = 6;
 
@@ -27792,7 +28753,10 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         );
-        assert!(compiled.is_some(), "Should compile method with `new` opcode");
+        assert!(
+            compiled.is_some(),
+            "Should compile method with `new` opcode"
+        );
 
         use crate::config::VmConfig;
         use crate::vm::SharedVm;
@@ -27802,9 +28766,17 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .unwrap()
+                .try_call_with_context(vm_ptr, &[])
+                .expect("test JIT call")
+        };
         // Result should be a non-zero pointer to the allocated object
-        assert_ne!(result, 0, "jit_new_object should return a valid object pointer");
+        assert_ne!(
+            result, 0,
+            "jit_new_object should return a valid object pointer"
+        );
     }
 
     #[cfg(feature = "vm-tests")]
@@ -27813,10 +28785,10 @@ mod tests {
         // Verify anewarray compiles and produces a valid reference array at runtime.
         // iconst_5; anewarray #1; areturn
         let code: Vec<u8> = vec![
-            0x08,             // 0: iconst_5 (length=5)
+            0x08, // 0: iconst_5 (length=5)
             0xbd, 0x00, 0x01, // 1: anewarray #1 (cp_idx=1)
-            0xb0,             // 4: areturn
-            0, 0,             // padding
+            0xb0, // 4: areturn
+            0, 0, // padding
         ];
         let code_len = 5;
 
@@ -27860,9 +28832,17 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .unwrap()
+                .try_call_with_context(vm_ptr, &[])
+                .expect("test JIT call")
+        };
         // Result should be non-zero (valid array pointer)
-        assert_ne!(result, 0, "jit_anewarray_object should return a valid array pointer");
+        assert_ne!(
+            result, 0,
+            "jit_anewarray_object should return a valid array pointer"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -27875,10 +28855,10 @@ mod tests {
         // Bytecode: aload_0, iload_1, putfield #1, return
         // This is the exact pattern that was previously skipped for <init>.
         let code: Vec<u8> = vec![
-            0x2a,             // 0: aload_0 (this)
-            0x1b,             // 1: iload_1 (x)
+            0x2a, // 0: aload_0 (this)
+            0x1b, // 1: iload_1 (x)
             0xb5, 0x00, 0x01, // 2: putfield #1
-            0xb1,             // 5: return (void)
+            0xb1, // 5: return (void)
             0, 0,
         ];
         let code_len = 6;
@@ -27886,8 +28866,8 @@ mod tests {
         let compiled = compile(
             &code,
             code_len,
-            2,  // param_slots: this + int x
-            2,  // max_locals
+            2, // param_slots: this + int x
+            2, // max_locals
             false,
             Vec::new(),
             field_info,
@@ -27908,10 +28888,13 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         );
-        assert!(compiled.is_some(), "Constructor with putfield should be JIT-compilable");
+        assert!(
+            compiled.is_some(),
+            "Constructor with putfield should be JIT-compilable"
+        );
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(0));
@@ -27919,9 +28902,18 @@ mod tests {
         // Call <init>(this, 42)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.unwrap().try_call(&[obj.as_ptr() as i64, 42]).expect("test JIT call") }; // Cast: JIT ABI convention
+        unsafe {
+            compiled
+                .unwrap()
+                .try_call(&[obj.as_ptr() as i64, 42])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
-        assert_eq!(val, Value::Int(42), "Constructor putfield should set field correctly");
+        assert_eq!(
+            val,
+            Value::Int(42),
+            "Constructor putfield should set field correctly"
+        );
     }
 
     #[test]
@@ -27929,25 +28921,25 @@ mod tests {
         // Simulates: <init>(int x, int y) { this.x = x; this.y = y; }
         // Bytecode: aload_0, iload_1, putfield #1, aload_0, iload_2, putfield #2, return
         let code: Vec<u8> = vec![
-            0x2a,             // 0: aload_0
-            0x1b,             // 1: iload_1
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
             0xb5, 0x00, 0x01, // 2: putfield #1
-            0x2a,             // 5: aload_0
-            0x1c,             // 6: iload_2
+            0x2a, // 5: aload_0
+            0x1c, // 6: iload_2
             0xb5, 0x00, 0x02, // 7: putfield #2
-            0xb1,             // 10: return
+            0xb1, // 10: return
             0, 0,
         ];
         let code_len = 11;
         let field_info = vec![
-            (2usize, 0usize, b'I'),  // putfield #1 at pc=2, field_index=0
-            (7usize, 1usize, b'I'),  // putfield #2 at pc=7, field_index=1
+            (2usize, 0usize, b'I'), // putfield #1 at pc=2, field_index=0
+            (7usize, 1usize, b'I'), // putfield #2 at pc=7, field_index=1
         ];
         let compiled = compile(
             &code,
             code_len,
-            3,  // param_slots: this + int x + int y
-            3,  // max_locals
+            3, // param_slots: this + int x + int y
+            3, // max_locals
             false,
             Vec::new(),
             field_info,
@@ -27970,8 +28962,8 @@ mod tests {
         );
         assert!(compiled.is_some(), "Multi-field constructor should compile");
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
         heap.set_field(obj, 0, Value::Int(0));
@@ -27980,7 +28972,12 @@ mod tests {
         // Call <init>(this, 10, 20)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.unwrap().try_call(&[obj.as_ptr() as i64, 10, 20]).expect("test JIT call") }; // Cast: JIT ABI convention
+        unsafe {
+            compiled
+                .unwrap()
+                .try_call(&[obj.as_ptr() as i64, 10, 20])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(heap.get_field(obj, 0), Value::Int(10));
         assert_eq!(heap.get_field(obj, 1), Value::Int(20));
     }
@@ -27991,18 +28988,18 @@ mod tests {
         // Lambda methods are static methods with captured args. This tests
         // that such methods are now JIT-compilable (previously skipped).
         let code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
-            0x04,             // 1: iconst_1
-            0x60,             // 2: iadd
-            0xac,             // 3: ireturn
+            0x1a, // 0: iload_0
+            0x04, // 1: iconst_1
+            0x60, // 2: iadd
+            0xac, // 3: ireturn
             0, 0,
         ];
         let code_len = 4;
         let compiled = compile(
             &code,
             code_len,
-            1,  // param_slots: int x
-            1,  // max_locals
+            1, // param_slots: int x
+            1, // max_locals
             false,
             Vec::new(),
             Vec::new(),
@@ -28023,7 +29020,10 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         );
-        assert!(compiled.is_some(), "Lambda-style method should be JIT-compilable");
+        assert!(
+            compiled.is_some(),
+            "Lambda-style method should be JIT-compilable"
+        );
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -28036,18 +29036,18 @@ mod tests {
         // Simulates: com.example.MyClass.add(int a, int b) -> int { return a + b; }
         // Tests that non-java/* user class methods are JIT-compiled.
         let code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
-            0x1b,             // 1: iload_1
-            0x60,             // 2: iadd
-            0xac,             // 3: ireturn
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x60, // 2: iadd
+            0xac, // 3: ireturn
             0, 0,
         ];
         let code_len = 4;
         let compiled = compile(
             &code,
             code_len,
-            2,  // param_slots: int a, int b
-            2,  // max_locals
+            2, // param_slots: int a, int b
+            2, // max_locals
             false,
             Vec::new(),
             Vec::new(),
@@ -28068,11 +29068,19 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         );
-        assert!(compiled.is_some(), "User class static method should be JIT-compilable");
+        assert!(
+            compiled.is_some(),
+            "User class static method should be JIT-compilable"
+        );
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().try_call(&[17, 25]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .unwrap()
+                .try_call(&[17, 25])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 42, "add(17, 25) should return 42");
     }
 
@@ -28094,16 +29102,16 @@ mod tests {
         // Simulates: lambda$forEach$0(Object captured, int idx) -> int
         // Returns idx (simplified — tests object + int arg passing)
         let code: Vec<u8> = vec![
-            0x1b,             // 0: iload_1 (idx is local 1, captured obj is local 0)
-            0xac,             // 1: ireturn
+            0x1b, // 0: iload_1 (idx is local 1, captured obj is local 0)
+            0xac, // 1: ireturn
             0, 0,
         ];
         let code_len = 2;
         let compiled = compile(
             &code,
             code_len,
-            2,  // param_slots: Object captured, int idx
-            2,  // max_locals
+            2, // param_slots: Object captured, int idx
+            2, // max_locals
             false,
             Vec::new(),
             Vec::new(),
@@ -28124,13 +29132,19 @@ mod tests {
             HashMap::new(),
             None, // string_layout
         );
-        assert!(compiled.is_some(), "Lambda with captured Object arg should compile");
+        assert!(
+            compiled.is_some(),
+            "Lambda with captured Object arg should compile"
+        );
 
         // Pass null as captured object (0), 99 as idx
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.unwrap().try_call(&[0, 99]).expect("test JIT call") };
-        assert_eq!(result, 99, "Lambda should correctly access second parameter");
+        assert_eq!(
+            result, 99,
+            "Lambda should correctly access second parameter"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -28165,22 +29179,41 @@ mod tests {
         ];
         let code_len = 8;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 5.0f64;
         let b = 3.0f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let expected = (a + b) * (a - b); // 8.0 * 2.0 = 16.0
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
     }
@@ -28201,22 +29234,41 @@ mod tests {
         ];
         let code_len = 8;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 5.0f32;
         let b = 3.0f32;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         let expected = (a + b) * (a - b);
         assert_eq!(f32::from_bits(result as u32), expected); // Cast: JIT ABI convention
     }
@@ -28248,16 +29300,31 @@ mod tests {
         ];
         let code_len = 12;
         let compiled = compile(
-            &code, code_len, 3, 3, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            3,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 2.0f64;
         let b = 3.0f64;
@@ -28265,11 +29332,13 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
-            compiled.try_call(&[
-                a.to_bits() as i64, // Cast: JIT ABI convention
-                b.to_bits() as i64, // Cast: JIT ABI convention
-                c.to_bits() as i64, // Cast: JIT ABI convention
-            ]).expect("test JIT call")
+            compiled
+                .try_call(&[
+                    a.to_bits() as i64, // Cast: JIT ABI convention
+                    b.to_bits() as i64, // Cast: JIT ABI convention
+                    c.to_bits() as i64, // Cast: JIT ABI convention
+                ])
+                .expect("test JIT call")
         };
         let expected = a * b + a * c + b * c; // 6 + 8 + 12 = 26
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
@@ -28285,11 +29354,24 @@ mod tests {
         let loops = detect_loops(&code, code_len);
         let alloc = crate::regalloc::allocate_registers(&code, code_len, 2, 1, &loops);
         // Both locals should have XMM assignments (not GPR)
-        assert!(alloc.assignments[0].is_none(), "FP local 0 should not have GPR");
-        assert!(alloc.assignments[1].is_none(), "FP local 1 should not have GPR");
+        assert!(
+            alloc.assignments[0].is_none(),
+            "FP local 0 should not have GPR"
+        );
+        assert!(
+            alloc.assignments[1].is_none(),
+            "FP local 1 should not have GPR"
+        );
         // At least one should get an XMM
-        let xmm_count = alloc.xmm_assignments.iter().filter(|a: &&Option<u8>| a.is_some()).count();
-        assert!(xmm_count > 0, "At least one FP local should get XMM register");
+        let xmm_count = alloc
+            .xmm_assignments
+            .iter()
+            .filter(|a: &&Option<u8>| a.is_some())
+            .count();
+        assert!(
+            xmm_count > 0,
+            "At least one FP local should get XMM register"
+        );
     }
 
     // --- 87.2: FP Loop Optimization ---
@@ -28299,16 +29381,16 @@ mod tests {
         // Loop: dload_0; dload_1; dadd; dstore_0; iinc 2 1; iload_2; iconst_5; if_icmplt -10; dload_0; dreturn
         // dload_1 is invariant (local 1 not modified), dload_0 is NOT (dstore_0 modifies it)
         let code: Vec<u8> = vec![
-            0x26,       // 0: dload_0  (modified — acc)
-            0x27,       // 1: dload_1  (invariant — constant)
-            0x63,       // 2: dadd
-            0x47,       // 3: dstore_0
+            0x26, // 0: dload_0  (modified — acc)
+            0x27, // 1: dload_1  (invariant — constant)
+            0x63, // 2: dadd
+            0x47, // 3: dstore_0
             0x84, 0x02, 0x01, // 4: iinc 2, 1
             0x15, 0x02, // 7: iload 2
-            0x08,       // 9: iconst_5
+            0x08, // 9: iconst_5
             0xa1, 0xFF, 0xF6, // 10: if_icmplt -10 → target=0
-            0x26,       // 13: dload_0
-            0xaf,       // 14: dreturn
+            0x26, // 13: dload_0
+            0xaf, // 14: dreturn
             0, 0,
         ];
         let code_len = 15;
@@ -28318,7 +29400,10 @@ mod tests {
         let hoists = find_fp_loop_hoists(&code, code_len, &loops);
         // dload_1 at PC=1 should be hoistable (local 1 is invariant)
         let hoisted_pcs: Vec<usize> = hoists.iter().map(|h| h.load_pc).collect();
-        assert!(hoisted_pcs.contains(&1), "dload_1 at PC=1 should be hoistable");
+        assert!(
+            hoisted_pcs.contains(&1),
+            "dload_1 at PC=1 should be hoistable"
+        );
         // dload_0 at PC=0 should NOT be hoistable (local 0 is modified by dstore_0)
         assert!(!hoisted_pcs.contains(&0), "dload_0 should not be hoistable");
     }
@@ -28338,16 +29423,16 @@ mod tests {
         // Simulated: ldc2_w at PC=5, dmul at PC=8
         let code: Vec<u8> = vec![
             0x15, 0x03, // 0: iload 3 (iv)
-            0x08,       // 2: iconst_5 (bound)
+            0x08, // 2: iconst_5 (bound)
             0xa2, 0x00, 0x0E, // 3: if_icmpge +14 → target=17
-            0x26,       // 6: dload_0 (value)
+            0x26, // 6: dload_0 (value)
             0x14, 0x00, 0x01, // 7: ldc2_w #1
-            0x6b,       // 10: dmul
-            0x47,       // 11: dstore_0
+            0x6b, // 10: dmul
+            0x47, // 11: dstore_0
             0x84, 0x03, 0x01, // 12: iinc 3, 1
             0xa7, 0xFF, 0xF1, // 15: goto -15 → target=0
-            0x26,       // 18: dload_0
-            0xaf,       // 19: dreturn
+            0x26, // 18: dload_0
+            0xaf, // 19: dreturn
             0, 0,
         ];
         let code_len = 20;
@@ -28358,24 +29443,27 @@ mod tests {
         let ldc2w_info = vec![(7usize, 2.0f64.to_bits() as i64)]; // Cast: JIT ABI convention
         let pcs = find_fp_strength_reductions(&code, code_len, &loops, &ldc2w_info);
         // dmul at PC=10 should be strength-reduced
-        assert!(pcs.contains(&10), "dmul at PC=10 should be strength-reduced");
+        assert!(
+            pcs.contains(&10),
+            "dmul at PC=10 should be strength-reduced"
+        );
     }
 
     #[test]
     fn p87_strength_reduction_ignores_non_2() {
         // Same pattern but ldc2_w loads 3.0 instead of 2.0
         let code: Vec<u8> = vec![
-            0x15, 0x03,       // 0: iload 3
-            0x08,             // 2: iconst_5
+            0x15, 0x03, // 0: iload 3
+            0x08, // 2: iconst_5
             0xa2, 0x00, 0x0E, // 3: if_icmpge +14
-            0x26,             // 6: dload_0
+            0x26, // 6: dload_0
             0x14, 0x00, 0x01, // 7: ldc2_w #1
-            0x6b,             // 10: dmul
-            0x47,             // 11: dstore_0
+            0x6b, // 10: dmul
+            0x47, // 11: dstore_0
             0x84, 0x03, 0x01, // 12: iinc 3, 1
             0xa7, 0xFF, 0xF0, // 15: goto -16
-            0x26,             // 18: dload_0
-            0xaf,             // 19: dreturn
+            0x26, // 18: dload_0
+            0xaf, // 19: dreturn
             0, 0,
         ];
         let code_len = 20;
@@ -28391,10 +29479,10 @@ mod tests {
         // double f(double x) { return x * 2.0; }
         // dload_0, ldc2_w #1 (2.0), dmul, dreturn
         let code: Vec<u8> = vec![
-            0x26,             // 0: dload_0
+            0x26, // 0: dload_0
             0x14, 0x00, 0x01, // 1: ldc2_w #1 (resolves to 2.0)
-            0x6b,             // 4: dmul
-            0xaf,             // 5: dreturn
+            0x6b, // 4: dmul
+            0xaf, // 5: dreturn
             0, 0,
         ];
         let code_len = 6;
@@ -28404,21 +29492,40 @@ mod tests {
         // Let's test without a loop first — dmul should still work normally.
         let ldc2w_info = vec![(1usize, 2.0f64.to_bits() as i64)]; // Cast: JIT ABI convention
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            ldc2w_info, HashMap::new(), HashMap::new(), &test_helpers(),
+            ldc2w_info,
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let x = 7.5f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[x.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[x.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), 15.0); // 7.5 * 2.0 = 15.0 // Cast: JIT ABI convention
     }
 
@@ -28429,19 +29536,19 @@ mod tests {
         // Pattern A: aload_1, iload_2, daload, dload_0, dadd, dstore_0, iinc 2 1, goto
         // Header: iload_2, iload_3, if_icmpge
         let code: Vec<u8> = vec![
-            0x1c,             // 0: iload_2 (iv)
-            0x1d,             // 1: iload_3 (bound)
+            0x1c, // 0: iload_2 (iv)
+            0x1d, // 1: iload_3 (bound)
             0xa2, 0x00, 0x0C, // 2: if_icmpge +12 → target=14
-            0x2b,             // 5: aload_1 (arr)
-            0x1c,             // 6: iload_2 (iv)
-            0x31,             // 7: daload
-            0x26,             // 8: dload_0 (sum)
-            0x63,             // 9: dadd
-            0x47,             // 10: dstore_0
+            0x2b, // 5: aload_1 (arr)
+            0x1c, // 6: iload_2 (iv)
+            0x31, // 7: daload
+            0x26, // 8: dload_0 (sum)
+            0x63, // 9: dadd
+            0x47, // 10: dstore_0
             0x84, 0x02, 0x01, // 11: iinc 2, 1
             0xa7, 0xFF, 0xF2, // 14: goto -14 → target=0
-            0x26,             // 17: dload_0
-            0xaf,             // 18: dreturn
+            0x26, // 17: dload_0
+            0xaf, // 18: dreturn
             0, 0,
         ];
         let code_len = 19;
@@ -28465,20 +29572,18 @@ mod tests {
     fn p87_detect_fp_array_sum_pattern_b() {
         // Pattern B: dload_0, aload_1, iload_2, daload, dadd, dstore_0, iinc 2 1, goto
         let code: Vec<u8> = vec![
-            0x1c,             // 0: iload_2 (iv)
-            0x1d,             // 1: iload_3 (bound)
+            0x1c, // 0: iload_2 (iv)
+            0x1d, // 1: iload_3 (bound)
             0xa2, 0x00, 0x0C, // 2: if_icmpge +12
-            0x26,             // 5: dload_0 (sum)
-            0x2b,             // 6: aload_1 (arr)
-            0x1c,             // 7: iload_2 (iv)
-            0x31,             // 8: daload
-            0x63,             // 9: dadd
-            0x47,             // 10: dstore_0
+            0x26, // 5: dload_0 (sum)
+            0x2b, // 6: aload_1 (arr)
+            0x1c, // 7: iload_2 (iv)
+            0x31, // 8: daload
+            0x63, // 9: dadd
+            0x47, // 10: dstore_0
             0x84, 0x02, 0x01, // 11: iinc 2, 1
             0xa7, 0xFF, 0xF2, // 14: goto -14
-            0x26,
-            0xaf,
-            0, 0,
+            0x26, 0xaf, 0, 0,
         ];
         let code_len = 19;
         let loops = detect_loops(&code, code_len);
@@ -28496,15 +29601,15 @@ mod tests {
         // Int array sum should NOT trigger FP detection
         // aload_1, iload_2, iaload (0x2e not 0x31), iload_0, iadd, istore_0, iinc...
         let code: Vec<u8> = vec![
-            0x1c,             // iload_2
-            0x1d,             // iload_3
+            0x1c, // iload_2
+            0x1d, // iload_3
             0xa2, 0x00, 0x0B, // if_icmpge
-            0x2b,             // aload_1
-            0x1c,             // iload_2
-            0x2e,             // iaload (NOT daload)
-            0x1a,             // iload_0
-            0x60,             // iadd
-            0x3b,             // istore_0
+            0x2b, // aload_1
+            0x1c, // iload_2
+            0x2e, // iaload (NOT daload)
+            0x1a, // iload_0
+            0x60, // iadd
+            0x3b, // istore_0
             0x84, 0x02, 0x01, // iinc 2, 1
             0xa7, 0xFF, 0xF3, // goto
             0x1a, 0xac, 0, 0,
@@ -28512,7 +29617,10 @@ mod tests {
         let code_len = 18;
         let loops = detect_loops(&code, code_len);
         let result = detect_fp_array_sum(&code, loops[0].0, loops[0].1, 2);
-        assert!(result.is_none(), "Int array sum should not trigger FP detection");
+        assert!(
+            result.is_none(),
+            "Int array sum should not trigger FP detection"
+        );
     }
 
     #[test]
@@ -28546,28 +29654,47 @@ mod tests {
         // double f(double a) { return a + a + a + a; }
         let code: Vec<u8> = vec![
             0x26, 0x26, 0x63, // dload_0, dload_0, dadd
-            0x26, 0x63,       // dload_0, dadd
-            0x26, 0x63,       // dload_0, dadd
-            0xaf,             // dreturn
+            0x26, 0x63, // dload_0, dadd
+            0x26, 0x63, // dload_0, dadd
+            0xaf, // dreturn
             0, 0,
         ];
         let code_len = 8;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = std::f64::consts::PI;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), a + a + a + a); // Cast: JIT ABI convention
     }
 
@@ -28576,27 +29703,46 @@ mod tests {
         // float f(float a) { return a * a * a; }
         let code: Vec<u8> = vec![
             0x22, 0x22, 0x6a, // fload_0, fload_0, fmul
-            0x22, 0x6a,       // fload_0, fmul
-            0xae,             // freturn
+            0x22, 0x6a, // fload_0, fmul
+            0xae, // freturn
             0, 0,
         ];
         let code_len = 6;
         let compiled = compile(
-            &code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 2.5f32;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(f32::from_bits(result as u32), a * a * a); // 15.625 // Cast: JIT ABI convention
     }
 
@@ -28606,28 +29752,47 @@ mod tests {
         // Tests non-commutative FP ops work correctly with XMM chaining
         let code: Vec<u8> = vec![
             0x26, 0x27, 0x6f, // dload_0, dload_1, ddiv
-            0x27, 0x6f,       // dload_1, ddiv
-            0xaf,             // dreturn
+            0x27, 0x6f, // dload_1, ddiv
+            0xaf, // dreturn
             0, 0,
         ];
         let code_len = 6;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 100.0f64;
         let b = 5.0f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), (a / b) / b); // 4.0 // Cast: JIT ABI convention
     }
 
@@ -28637,28 +29802,47 @@ mod tests {
         // dload_0, dload_1, dadd, d2i (0x8e), ireturn
         let code: Vec<u8> = vec![
             0x26, 0x27, 0x63, // dload_0, dload_1, dadd
-            0x8e,             // d2i
-            0xac,             // ireturn
+            0x8e, // d2i
+            0xac, // ireturn
             0, 0,
         ];
         let code_len = 5;
         let compiled = compile(
-            &code, code_len, 2, 2, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
-            Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
             None, // string_layout — not needed for this test
-        ).unwrap();
+        )
+        .unwrap();
 
         let a = 3.7f64;
         let b = 2.1f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
+        let result = unsafe {
+            compiled
+                .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
+                .expect("test JIT call")
+        }; // Cast: JIT ABI convention
         assert_eq!(result, (a + b) as i32 as i64); // 5 // Cast: JIT ABI convention
     }
 
@@ -28667,13 +29851,13 @@ mod tests {
         // Verify hoist detection for both float and double types
         // Loop with fload_0 (invariant) and dload_1 (invariant), fstore_2 modified
         let code: Vec<u8> = vec![
-            0x22,             // 0: fload_0 (float, invariant)
-            0x27,             // 1: dload_1 (double, invariant — this is wrong mix, but tests detection)
-            0x63,             // 2: dadd (type mismatch at runtime, but tests analysis)
-            0x47,             // 3: dstore_0 (this modifies 0, but doesn't affect 1)
+            0x22, // 0: fload_0 (float, invariant)
+            0x27, // 1: dload_1 (double, invariant — this is wrong mix, but tests detection)
+            0x63, // 2: dadd (type mismatch at runtime, but tests analysis)
+            0x47, // 3: dstore_0 (this modifies 0, but doesn't affect 1)
             0x84, 0x03, 0x01, // 4: iinc 3, 1
-            0x15, 0x03,       // 7: iload 3
-            0x08,             // 9: iconst_5
+            0x15, 0x03, // 7: iload 3
+            0x08, // 9: iconst_5
             0xa1, 0xFF, 0xF6, // 10: if_icmplt -10 → target=0
             0x26, 0xaf, 0, 0,
         ];
@@ -28683,9 +29867,16 @@ mod tests {
 
         // fload_0 at PC=0: local 0 IS modified (dstore_0 at PC=3) → NOT hoistable
         // dload_1 at PC=1: local 1 is NOT modified → hoistable
-        let hoisted_locals: Vec<(usize, bool)> = hoists.iter().map(|h| (h.local_idx, h.is_double)).collect();
-        assert!(hoisted_locals.contains(&(1, true)), "dload_1 should be hoistable");
-        assert!(!hoisted_locals.iter().any(|(l, _)| *l == 0), "local 0 should not be hoistable");
+        let hoisted_locals: Vec<(usize, bool)> =
+            hoists.iter().map(|h| (h.local_idx, h.is_double)).collect();
+        assert!(
+            hoisted_locals.contains(&(1, true)),
+            "dload_1 should be hoistable"
+        );
+        assert!(
+            !hoisted_locals.iter().any(|(l, _)| *l == 0),
+            "local 0 should not be hoistable"
+        );
     }
 
     #[test]
@@ -28718,15 +29909,15 @@ mod tests {
         // Pattern: new; dup; invokespecial <init>()V; astore_1; aload_1; iconst_1; putfield
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0x59,             // 3: dup
+            0x59, // 3: dup
             0xb7, 0x00, 0x02, // 4: invokespecial #2 <init>()V
-            0x4c,             // 7: astore_1
-            0x2b,             // 8: aload_1
-            0x04,             // 9: iconst_1
+            0x4c, // 7: astore_1
+            0x2b, // 8: aload_1
+            0x04, // 9: iconst_1
             0xb5, 0x00, 0x03, // 10: putfield #3
-            0x2b,             // 13: aload_1
+            0x2b, // 13: aload_1
             0xb4, 0x00, 0x03, // 14: getfield #3
-            0xac,             // 17: ireturn
+            0xac, // 17: ireturn
             0, 0,
         ];
         let code_len = 18;
@@ -28734,8 +29925,9 @@ mod tests {
         non_escaping.insert(0usize);
         // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
         let new_info = vec![(0usize, 1u32, 2usize, true, true)]; // 2 fields
-        // Create invoke_info for <init>()V at PC=4
-        let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+                                                                 // Create invoke_info for <init>()V at PC=4
+        let init_info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             method_name: Box::leak("<init>".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             descriptor: Box::leak("()V".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -28746,13 +29938,32 @@ mod tests {
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)]; // Cast: address arithmetic
         let scalar_base = 4; // some offset
 
-        let plan = plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, scalar_base);
+        let plan = plan_scalar_replacement(
+            &code,
+            code_len,
+            &non_escaping,
+            &new_info,
+            &invoke_info,
+            scalar_base,
+        );
 
-        assert!(plan.objects.contains_key(&0), "new at PC=0 should be scalar-replaced");
+        assert!(
+            plan.objects.contains_key(&0),
+            "new at PC=0 should be scalar-replaced"
+        );
         assert_eq!(plan.objects[&0].num_fields, 2);
-        assert!(plan.init_skips.contains(&4), "invokespecial at PC=4 should be skipped");
-        assert!(plan.field_ops.contains_key(&10), "putfield at PC=10 should be scalar");
-        assert!(plan.field_ops.contains_key(&14), "getfield at PC=14 should be scalar");
+        assert!(
+            plan.init_skips.contains(&4),
+            "invokespecial at PC=4 should be skipped"
+        );
+        assert!(
+            plan.field_ops.contains_key(&10),
+            "putfield at PC=10 should be scalar"
+        );
+        assert!(
+            plan.field_ops.contains_key(&14),
+            "getfield at PC=14 should be scalar"
+        );
         // Two heap fields × two 8-byte words per `Value` slot (`SLOT_SIZE` = 16).
         assert_eq!(plan.total_slots, 4);
     }
@@ -28762,9 +29973,9 @@ mod tests {
         // Pattern: new; dup; invokespecial; areturn — object escapes, should NOT be replaced
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0x59,             // 3: dup
+            0x59, // 3: dup
             0xb7, 0x00, 0x02, // 4: invokespecial <init>
-            0xb0,             // 7: areturn
+            0xb0, // 7: areturn
             0, 0,
         ];
         // NOT in non_escaping_new → should produce empty plan
@@ -28782,17 +29993,18 @@ mod tests {
         // invokespecial with non-()V descriptor should NOT be skipped
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
-            0x59,             // 3: dup
-            0x04,             // 4: iconst_1
+            0x59, // 3: dup
+            0x04, // 4: iconst_1
             0xb7, 0x00, 0x02, // 5: invokespecial <init>(I)V
-            0xac,             // 8: ireturn (dummy)
+            0xac, // 8: ireturn (dummy)
             0, 0,
         ];
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
         // CRIT-2 tuple shape: see compiler struct doc.
         let new_info = vec![(0usize, 1u32, 2usize, true, true)];
-        let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
+        let init_info = Box::leak(Box::new(JitInvokeInfo {
+            // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             method_name: Box::leak("<init>".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             descriptor: Box::leak("(I)V".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -28909,12 +30121,28 @@ mod tests {
 
     fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
         compile(
-            code, code_len, 1, 1, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
-            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
-            std::collections::HashSet::new(), HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
             None, // string_layout
         )
     }
@@ -28929,7 +30157,10 @@ mod tests {
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 10);
             assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 20);
             assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 30);
-            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
+                -1i64
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[3]).expect("test JIT call"), -1i64);
             assert_eq!(compiled.try_call(&[100]).expect("test JIT call"), -1i64);
         }
@@ -28945,10 +30176,17 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..10 {
-                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), ((i + 1) * 100) as i64, // Cast: JIT ABI convention
-                    "case {} failed", i);
+                assert_eq!(
+                    compiled.try_call(&[i as i64]).expect("test JIT call"),
+                    ((i + 1) * 100) as i64, // Cast: JIT ABI convention
+                    "case {} failed",
+                    i
+                );
             }
-            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -999i64); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
+                -999i64
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), -999i64);
             assert_eq!(compiled.try_call(&[1000]).expect("test JIT call"), -999i64);
         }
@@ -28980,12 +30218,21 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.try_call(&[-2i32 as i64]).expect("test JIT call"), 200); // Cast: JIT ABI convention
-            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), 201); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-2i32 as i64]).expect("test JIT call"),
+                200
+            ); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
+                201
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 202);
             assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 203);
             assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 204);
-            assert_eq!(compiled.try_call(&[-3i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-3i32 as i64]).expect("test JIT call"),
+                -1i64
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[3]).expect("test JIT call"), -1i64);
         }
     }
@@ -29024,8 +30271,16 @@ mod tests {
         // 10 sparse pairs triggers binary search (npairs > 6)
         // Values must fit in i16 for sipush encoding
         let pairs: Vec<(i32, i32)> = vec![
-            (5, 50), (10, 100), (20, 200), (50, 500), (100, 1000),
-            (200, 2000), (500, 5000), (1000, 10000), (2000, 20000), (5000, 30000),
+            (5, 50),
+            (10, 100),
+            (20, 200),
+            (50, 500),
+            (100, 1000),
+            (200, 2000),
+            (500, 5000),
+            (1000, 10000),
+            (2000, 20000),
+            (5000, 30000),
         ];
         let (code, code_len) = build_lookupswitch_bytecode(&pairs, -1);
         let compiled = compile_switch_method(&code, code_len).expect("compilation failed");
@@ -29033,8 +30288,13 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for &(key, val) in &pairs {
-                assert_eq!(compiled.try_call(&[key as i64]).expect("test JIT call"), val as i64, // Cast: JIT ABI convention
-                    "key {} should return {}", key, val);
+                assert_eq!(
+                    compiled.try_call(&[key as i64]).expect("test JIT call"),
+                    val as i64, // Cast: JIT ABI convention
+                    "key {} should return {}",
+                    key,
+                    val
+                );
             }
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), -1i64);
             assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), -1i64);
@@ -29047,7 +30307,14 @@ mod tests {
     fn s34_lookupswitch_negative_keys() {
         // 8 pairs with negatives → binary search
         let pairs: Vec<(i32, i32)> = vec![
-            (-100, 1), (-50, 2), (-10, 3), (0, 4), (10, 5), (50, 6), (100, 7), (1000, 8),
+            (-100, 1),
+            (-50, 2),
+            (-10, 3),
+            (0, 4),
+            (10, 5),
+            (50, 6),
+            (100, 7),
+            (1000, 8),
         ];
         let (code, code_len) = build_lookupswitch_bytecode(&pairs, -1);
         let compiled = compile_switch_method(&code, code_len).expect("compilation failed");
@@ -29055,9 +30322,15 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for &(key, val) in &pairs {
-                assert_eq!(compiled.try_call(&[key as i64]).expect("test JIT call"), val as i64); // Cast: JIT ABI convention
+                assert_eq!(
+                    compiled.try_call(&[key as i64]).expect("test JIT call"),
+                    val as i64
+                ); // Cast: JIT ABI convention
             }
-            assert_eq!(compiled.try_call(&[-200i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-200i32 as i64]).expect("test JIT call"),
+                -1i64
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[999]).expect("test JIT call"), -1i64);
         }
     }
@@ -29085,9 +30358,13 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..8 {
-                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), 77); // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), 77);
+                // Cast: JIT ABI convention
             }
-            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
+                -1i64
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[8]).expect("test JIT call"), -1i64);
         }
     }
@@ -29115,7 +30392,10 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..20 {
-                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), (i * 11) as i64); // Cast: JIT ABI convention
+                assert_eq!(
+                    compiled.try_call(&[i as i64]).expect("test JIT call"),
+                    (i * 11) as i64
+                ); // Cast: JIT ABI convention
             }
             assert_eq!(compiled.try_call(&[20]).expect("test JIT call"), -1i64);
         }
@@ -29139,9 +30419,18 @@ mod tests {
             num_params,
             max_locals,
             false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // pic_slots
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots
             HashMap::new(),
             HashMap::new(),
             &test_helpers(),
@@ -29188,19 +30477,19 @@ mod tests {
         // Caller bytecode: iload_0, invokestatic #1 (pc=1), ireturn
         // We place the inline site at pc=1 (the invokestatic).
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic #1
-            0xac,             // 4: ireturn
-            0, 0,             // padding
+            0xac, // 4: ireturn
+            0, 0, // padding
         ];
         let caller_len = 5;
 
         let callee = make_inline_site(
             &[0x1a, 0xac], // iload_0, ireturn
-            1,              // max_locals
-            1,              // num_args (one int param)
-            true,           // static
-            b'I',           // return type
+            1,             // max_locals
+            1,             // num_args (one int param)
+            true,          // static
+            b'I',          // return type
         );
 
         let mut sites = HashMap::new();
@@ -29214,7 +30503,10 @@ mod tests {
         unsafe {
             assert_eq!(compiled.try_call(&[42]).expect("test JIT call"), 42);
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
-            assert_eq!(compiled.try_call(&[-7i32 as i64]).expect("test JIT call"), -7); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
+                -7
+            ); // Cast: JIT ABI convention
         }
     }
 
@@ -29223,10 +30515,10 @@ mod tests {
         // Caller: int f(int a, int b) { return add(a, b); }
         // Callee: int add(int a, int b) { return a + b; }  → iload_0, iload_1, iadd, ireturn
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
-            0x1b,             // 1: iload_1
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
             0xb8, 0x00, 0x01, // 2: invokestatic #1
-            0xac,             // 5: ireturn
+            0xac, // 5: ireturn
             0, 0,
         ];
         let caller_len = 6;
@@ -29234,7 +30526,7 @@ mod tests {
         let callee = make_inline_site(
             &[0x1a, 0x1b, 0x60, 0xac], // iload_0, iload_1, iadd, ireturn
             2,
-            2,    // two params
+            2, // two params
             true,
             b'I',
         );
@@ -29249,7 +30541,12 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             assert_eq!(compiled.try_call(&[3, 4]).expect("test JIT call"), 7);
-            assert_eq!(compiled.try_call(&[100, -50i32 as i64]).expect("test JIT call"), 50); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled
+                    .try_call(&[100, -50i32 as i64])
+                    .expect("test JIT call"),
+                50
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[0, 0]).expect("test JIT call"), 0);
         }
     }
@@ -29260,7 +30557,7 @@ mod tests {
         // Callee: int five() { return 5; }  → iconst_5, ireturn
         let caller_code: Vec<u8> = vec![
             0xb8, 0x00, 0x01, // 0: invokestatic #1
-            0xac,             // 3: ireturn
+            0xac, // 3: ireturn
             0, 0,
         ];
         let caller_len = 4;
@@ -29268,7 +30565,7 @@ mod tests {
         let callee = make_inline_site(
             &[0x08, 0xac], // iconst_5, ireturn
             0,
-            0,    // no params
+            0, // no params
             true,
             b'I',
         );
@@ -29292,8 +30589,8 @@ mod tests {
         // Callee: void noop() { return; }
         let caller_code: Vec<u8> = vec![
             0xb8, 0x00, 0x01, // 0: invokestatic #1 (void)
-            0x1a,             // 3: iload_0
-            0xac,             // 4: ireturn
+            0x1a, // 3: iload_0
+            0xac, // 4: ireturn
             0, 0,
         ];
         let caller_len = 5;
@@ -29325,30 +30622,24 @@ mod tests {
         // Bytecode: iload_0, ifge +5, iload_0, ineg, ireturn, iload_0, ireturn
         //           0       1        4       5     6        7       8
         let callee_bc: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0x9c, 0x00, 0x06, // 1: ifge +6 → target=7
-            0x1a,             // 4: iload_0
-            0x74,             // 5: ineg
-            0xac,             // 6: ireturn
-            0x1a,             // 7: iload_0
-            0xac,             // 8: ireturn
+            0x1a, // 4: iload_0
+            0x74, // 5: ineg
+            0xac, // 6: ireturn
+            0x1a, // 7: iload_0
+            0xac, // 8: ireturn
         ];
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic #1
-            0xac,             // 4: ireturn
+            0xac, // 4: ireturn
             0, 0,
         ];
         let caller_len = 5;
 
-        let callee = make_inline_site(
-            &callee_bc,
-            1,
-            1,
-            true,
-            b'I',
-        );
+        let callee = make_inline_site(&callee_bc, 1, 1, true, b'I');
 
         let mut sites = HashMap::new();
         sites.insert(1, callee);
@@ -29360,7 +30651,10 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 5);
-            assert_eq!(compiled.try_call(&[-5i32 as i64]).expect("test JIT call"), 5); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-5i32 as i64]).expect("test JIT call"),
+                5
+            ); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
         }
     }
@@ -29372,19 +30666,19 @@ mod tests {
         // branch (if_icmplt) with two return arms and an EMPTY operand stack at
         // the merge — the provably-safe subset that 419a6f5 over-bailed.
         let callee_bc: Vec<u8> = vec![
-            0x1a,             // 0: iload_0 (a)
-            0x1b,             // 1: iload_1 (b)
+            0x1a, // 0: iload_0 (a)
+            0x1b, // 1: iload_1 (b)
             0xa1, 0x00, 0x05, // 2: if_icmplt +5 -> 7 (if a<b, return b)
-            0x1a,             // 5: iload_0 (a)
-            0xac,             // 6: ireturn
-            0x1b,             // 7: iload_1 (b)   <- branch target (empty stack)
-            0xac,             // 8: ireturn
+            0x1a, // 5: iload_0 (a)
+            0xac, // 6: ireturn
+            0x1b, // 7: iload_1 (b)   <- branch target (empty stack)
+            0xac, // 8: ireturn
         ];
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
-            0x1b,             // 1: iload_1
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
             0xb8, 0x00, 0x01, // 2: invokestatic #1
-            0xac,             // 5: ireturn
+            0xac, // 5: ireturn
             0, 0,
         ];
         let caller_len = 6;
@@ -29406,14 +30700,12 @@ mod tests {
     fn s31_inline_arithmetic_chain() {
         // Callee: int triple(int x) { return x + x + x; }
         // iload_0, iload_0, iadd, iload_0, iadd, ireturn
-        let callee_bc: Vec<u8> = vec![
-            0x1a, 0x1a, 0x60, 0x1a, 0x60, 0xac,
-        ];
+        let callee_bc: Vec<u8> = vec![0x1a, 0x1a, 0x60, 0x1a, 0x60, 0xac];
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic #1
-            0xac,             // 4: ireturn
+            0xac, // 4: ireturn
             0, 0,
         ];
         let caller_len = 5;
@@ -29431,7 +30723,10 @@ mod tests {
         unsafe {
             assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), 21);
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
-            assert_eq!(compiled.try_call(&[-3i32 as i64]).expect("test JIT call"), -9); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-3i32 as i64]).expect("test JIT call"),
+                -9
+            ); // Cast: JIT ABI convention
         }
     }
 
@@ -29441,20 +30736,12 @@ mod tests {
         // iinc 0,1 × 5, iload_0, ireturn
         let callee_bc: Vec<u8> = vec![
             0x84, 0x00, 0x01, // iinc local0, 1
-            0x84, 0x00, 0x01,
-            0x84, 0x00, 0x01,
-            0x84, 0x00, 0x01,
-            0x84, 0x00, 0x01,
-            0x1a,             // iload_0
-            0xac,             // ireturn
+            0x84, 0x00, 0x01, 0x84, 0x00, 0x01, 0x84, 0x00, 0x01, 0x84, 0x00, 0x01,
+            0x1a, // iload_0
+            0xac, // ireturn
         ];
 
-        let caller_code: Vec<u8> = vec![
-            0x1a,
-            0xb8, 0x00, 0x01,
-            0xac,
-            0, 0,
-        ];
+        let caller_code: Vec<u8> = vec![0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
         let caller_len = 5;
 
         let callee = make_inline_site(&callee_bc, 1, 1, true, b'I');
@@ -29477,23 +30764,23 @@ mod tests {
         // Callee: int swap_add(int a, int b) { int t = a; a = b; b = t; return a + b; }
         // iload_0, istore_2, iload_1, istore_0, iload_2, istore_1, iload_0, iload_1, iadd, ireturn
         let callee_bc: Vec<u8> = vec![
-            0x1a,       // 0: iload_0
-            0x3d,       // 1: istore_2 (local 2 = temp)
-            0x1b,       // 2: iload_1
-            0x3b,       // 3: istore_0
-            0x1c,       // 4: iload_2
-            0x3c,       // 5: istore_1
-            0x1a,       // 6: iload_0
-            0x1b,       // 7: iload_1
-            0x60,       // 8: iadd
-            0xac,       // 9: ireturn
+            0x1a, // 0: iload_0
+            0x3d, // 1: istore_2 (local 2 = temp)
+            0x1b, // 2: iload_1
+            0x3b, // 3: istore_0
+            0x1c, // 4: iload_2
+            0x3c, // 5: istore_1
+            0x1a, // 6: iload_0
+            0x1b, // 7: iload_1
+            0x60, // 8: iadd
+            0xac, // 9: ireturn
         ];
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
-            0x1b,             // 1: iload_1
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
             0xb8, 0x00, 0x01, // 2: invokestatic
-            0xac,             // 5: ireturn
+            0xac, // 5: ireturn
             0, 0,
         ];
         let caller_len = 6;
@@ -29519,15 +30806,15 @@ mod tests {
         // Callee has monitorenter (0xC2) which is unsupported — should bail out.
         // The caller should still compile (the invokestatic falls through to normal call path).
         let callee_bc: Vec<u8> = vec![
-            0x1a,       // iload_0
-            0xC2,       // monitorenter — unsupported in inline
-            0xb1,       // return
+            0x1a, // iload_0
+            0xC2, // monitorenter — unsupported in inline
+            0xb1, // return
         ];
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic — will try inline but bail
-            0xac,             // 4: ireturn
+            0xac, // 4: ireturn
             0, 0,
         ];
         let caller_len = 5;
@@ -29550,9 +30837,9 @@ mod tests {
         let callee_bc: Vec<u8> = vec![0x1a, 0x1a, 0x61, 0xac]; // iload_0, iload_0, ladd, ireturn
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic
-            0xac,             // 4: ireturn
+            0xac, // 4: ireturn
             0, 0,
         ];
         let caller_len = 5;
@@ -29568,7 +30855,10 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             assert_eq!(compiled.try_call(&[50]).expect("test JIT call"), 100);
-            assert_eq!(compiled.try_call(&[-7i32 as i64]).expect("test JIT call"), -14); // Cast: JIT ABI convention
+            assert_eq!(
+                compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
+                -14
+            ); // Cast: JIT ABI convention
         }
     }
 
@@ -29579,7 +30869,7 @@ mod tests {
 
         let caller_code: Vec<u8> = vec![
             0xb8, 0x00, 0x01, // 0: invokestatic
-            0xac,             // 3: ireturn
+            0xac, // 3: ireturn
             0, 0,
         ];
         let caller_len = 4;
@@ -29606,10 +30896,10 @@ mod tests {
         let callee_bc: Vec<u8> = vec![0x1a, 0x04, 0x60, 0xac];
 
         let caller_code: Vec<u8> = vec![
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0xb8, 0x00, 0x01, // 1: invokestatic #1 (first inc)
             0xb8, 0x00, 0x02, // 4: invokestatic #2 (second inc)
-            0xac,             // 7: ireturn
+            0xac, // 7: ireturn
             0, 0,
         ];
         let caller_len = 8;
@@ -29766,9 +31056,24 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.try_call(&[arr0.as_ptr() as i64]).expect("test JIT call"), 0);
-            assert_eq!(compiled.try_call(&[arr5.as_ptr() as i64]).expect("test JIT call"), 5);
-            assert_eq!(compiled.try_call(&[arr257.as_ptr() as i64]).expect("test JIT call"), 257);
+            assert_eq!(
+                compiled
+                    .try_call(&[arr0.as_ptr() as i64])
+                    .expect("test JIT call"),
+                0
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr5.as_ptr() as i64])
+                    .expect("test JIT call"),
+                5
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr257.as_ptr() as i64])
+                    .expect("test JIT call"),
+                257
+            );
         }
     }
 
@@ -29802,7 +31107,9 @@ mod tests {
                 // iaload sign-extends the 32-bit element to the 64-bit
                 // return register, so the expected value is `*v as i64`.
                 assert_eq!(
-                    compiled.try_call(&[arr.as_ptr() as i64, i as i64]).expect("test JIT call"),
+                    compiled
+                        .try_call(&[arr.as_ptr() as i64, i as i64])
+                        .expect("test JIT call"),
                     *v as i64,
                     "iaload mismatch at index {i}"
                 );
@@ -29837,10 +31144,30 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 127);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), -1);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), -128);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 3]).expect("test JIT call"), 1);
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 0])
+                    .expect("test JIT call"),
+                127
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 1])
+                    .expect("test JIT call"),
+                -1
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 2])
+                    .expect("test JIT call"),
+                -128
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 3])
+                    .expect("test JIT call"),
+                1
+            );
         }
     }
 
@@ -29869,9 +31196,24 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 65);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), 65535);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), 32768);
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 0])
+                    .expect("test JIT call"),
+                65
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 1])
+                    .expect("test JIT call"),
+                65535
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 2])
+                    .expect("test JIT call"),
+                32768
+            );
         }
     }
 
@@ -29900,9 +31242,24 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 32767);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), -1);
-            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), -32768);
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 0])
+                    .expect("test JIT call"),
+                32767
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 1])
+                    .expect("test JIT call"),
+                -1
+            );
+            assert_eq!(
+                compiled
+                    .try_call(&[arr.as_ptr() as i64, 2])
+                    .expect("test JIT call"),
+                -32768
+            );
         }
     }
 
@@ -29933,7 +31290,9 @@ mod tests {
         unsafe {
             for (i, v) in vals.iter().enumerate() {
                 assert_eq!(
-                    compiled.try_call(&[arr.as_ptr() as i64, i as i64]).expect("test JIT call"),
+                    compiled
+                        .try_call(&[arr.as_ptr() as i64, i as i64])
+                        .expect("test JIT call"),
                     *v,
                     "laload mismatch at index {i}"
                 );
@@ -29960,7 +31319,11 @@ mod tests {
         TEST_NPE_ACTION.with(|c| c.set(-1));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
-        assert_eq!(result, i64::MIN, "null arraylength must deopt with sentinel");
+        assert_eq!(
+            result,
+            i64::MIN,
+            "null arraylength must deopt with sentinel"
+        );
         assert!(
             TEST_NPE_HIT.with(|c| c.get()),
             "null arraylength must take the NPE deopt stub"
@@ -30060,7 +31423,11 @@ mod tests {
         // Index == length (just past the end).
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, 3]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[arr.as_ptr() as i64, 3])
+                .expect("test JIT call")
+        };
         assert_eq!(result, i64::MIN, "OOB iaload must deopt with sentinel");
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),
@@ -30071,7 +31438,11 @@ mod tests {
         // Negative index — unsigned compare catches it as huge.
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, -1]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[arr.as_ptr() as i64, -1])
+                .expect("test JIT call")
+        };
         assert_eq!(result, i64::MIN, "negative-index iaload must deopt");
         assert!(
             TEST_AIOOBE_HIT.with(|c| c.get()).is_some(),
@@ -30082,7 +31453,11 @@ mod tests {
         heap.set_array_element(arr, 2, Value::Int(99)).unwrap();
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[arr.as_ptr() as i64, 2])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 99);
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),
@@ -30175,16 +31550,29 @@ mod tests {
         let field_info: Vec<(usize, usize, u8)> = Vec::new();
 
         let compiled = compile(
-            &code, code_len, 2, 4, false,
-            Vec::new(), field_info, Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
+            &code,
+            code_len,
+            2,
+            4,
+            false,
+            Vec::new(),
+            field_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(), // pic_slots
             Vec::new(),
-            HashMap::new(), HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             &test_helpers(),
             std::collections::HashSet::new(),
-            HashMap::new(), None,
+            HashMap::new(),
+            None,
         )
         .unwrap();
 
@@ -30194,8 +31582,8 @@ mod tests {
         // so the helper rel32 is patched into 3 duplicated copies in
         // addition to the original. If any copy dispatched to the
         // wrong address the call would SIGSEGV before returning.
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(7));
@@ -30205,16 +31593,31 @@ mod tests {
         // copy is required to land on stub_getfield → return 7.
         // Expected sum: 7 * 8 = 56.
         // SAFETY: JIT-compiled code from valid bytecode.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64, 8]).expect("test JIT call") };
-        assert_eq!(result, 56, "getfield-in-loop unroll must dispatch correctly");
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 8])
+                .expect("test JIT call")
+        };
+        assert_eq!(
+            result, 56,
+            "getfield-in-loop unroll must dispatch correctly"
+        );
 
         // Smaller trip count: 7 * 3 = 21.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64, 3]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 3])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 21);
 
         // n = 0 → loop body never executes. Still must compile + run
         // (verifying the unrolled copies don't fault on cold entry).
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64, 0]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 0])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 0);
     }
 
@@ -30289,27 +31692,45 @@ mod tests {
         let field_info = vec![(13usize, 0usize, b'D')];
 
         let compiled = compile(
-            &code, code_len, 2, 6, false,
-            Vec::new(), field_info, Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
-            HashMap::new(), HashMap::new(),
+            &code,
+            code_len,
+            2,
+            6,
+            false,
+            Vec::new(),
+            field_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
             &test_helpers(),
             std::collections::HashSet::new(),
-            HashMap::new(), None,
+            HashMap::new(),
+            None,
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Double(2.5));
 
         // n=8, addend=2.5 → 20.0. Return is a double-bits-as-i64.
         // SAFETY: JIT-compiled code from valid bytecode.
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64, 8]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 8])
+                .expect("test JIT call")
+        };
         let result_f = f64::from_bits(result as u64); // Cast: JIT ABI convention
         assert!(
             (result_f - 20.0).abs() < 1e-9,
@@ -30320,7 +31741,11 @@ mod tests {
 
         // n=0 → 0.0 (cold loop body, copies never executed but must
         // still be valid code).
-        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64, 0]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[obj.as_ptr() as i64, 0])
+                .expect("test JIT call")
+        };
         let result_f = f64::from_bits(result as u64); // Cast: JIT ABI convention
         assert_eq!(result_f, 0.0);
     }
@@ -30359,8 +31784,7 @@ mod tests {
         //  22: iload_2
         //  23: ireturn
         let code: Vec<u8> = vec![
-            0x03, 0x3d, 0x03, 0x3e,
-            0x1d, // 4: iload_3
+            0x03, 0x3d, 0x03, 0x3e, 0x1d, // 4: iload_3
             0x1b, // 5: iload_1
             0xa2, 0x00, 0x10, // 6: if_icmpge +16 → 22
             0x1c, // 9
@@ -30417,16 +31841,29 @@ mod tests {
         // the per-clone path ran). The static unroller threshold is
         // body_size ≤ 20 → 3 extra copies.
         let compiled = compile(
-            &code, code_len, 2, 4, false,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
-            invoke_info, Vec::new(),
-            mic_slots, pic_slots,
-            Vec::new(), Vec::new(),
-            HashMap::new(), HashMap::new(),
+            &code,
+            code_len,
+            2,
+            4,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            invoke_info,
+            Vec::new(),
+            mic_slots,
+            pic_slots,
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
             &test_helpers(),
             std::collections::HashSet::new(),
-            HashMap::new(), None,
+            HashMap::new(),
+            None,
         );
 
         // Compilation should succeed: the body has a back-edge and
@@ -30525,25 +31962,37 @@ mod tests {
         ];
         let code_len = 31;
 
-        let field_info = vec![
-            (13usize, 0usize, b'I'),
-            (18usize, 0usize, b'I'),
-        ];
+        let field_info = vec![(13usize, 0usize, b'I'), (18usize, 0usize, b'I')];
 
         let compiled = compile(
-            &code, code_len, 3, 5, false,
-            Vec::new(), field_info, Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            HashMap::new(), HashMap::new(),
+            &code,
+            code_len,
+            3,
+            5,
+            false,
+            Vec::new(),
+            field_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
             &test_helpers(),
             std::collections::HashSet::new(),
-            HashMap::new(), None,
+            HashMap::new(),
+            None,
         )
         .unwrap();
 
-        use cratonvm_types::ClassId;
         use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
         let heap = GenerationalHeap::new();
         let a = heap.alloc_object(ClassId::new(0), 2);
         let b = heap.alloc_object(ClassId::new(0), 2);
@@ -30552,13 +32001,21 @@ mod tests {
 
         // n=10 → (3 + 5) * 10 = 80.
         // SAFETY: JIT-compiled code from valid bytecode.
-        let result = unsafe { compiled.try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 10]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 10])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 80, "two-helper-calls-per-body unroll failed");
 
         // n=4 (matches the 4x unroll factor exactly): one full
         // unrolled block, zero spillover. Exercises the case where
         // every copy + the original execute exactly once.
-        let result = unsafe { compiled.try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 4]).expect("test JIT call") };
+        let result = unsafe {
+            compiled
+                .try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 4])
+                .expect("test JIT call")
+        };
         assert_eq!(result, 32);
     }
 
@@ -30607,7 +32064,7 @@ mod tests {
         code.extend_from_slice(&0i32.to_be_bytes()); // default
         code.extend_from_slice(&i32::MIN.to_be_bytes()); // low
         code.extend_from_slice(&i32::MAX.to_be_bytes()); // high
-        // (no jump-table entries follow — the count guard must reject first)
+                                                         // (no jump-table entries follow — the count guard must reject first)
         let code_len = code.len();
         assert!(
             !try_compile_int_body(&code, code_len),

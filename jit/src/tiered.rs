@@ -572,7 +572,10 @@ impl TieredCompilationManager {
             };
 
             self.core.enqueue(task.clone());
-            self.core.stats.osr_compilations.fetch_add(1, Ordering::Relaxed);
+            self.core
+                .stats
+                .osr_compilations
+                .fetch_add(1, Ordering::Relaxed);
             return Some(task);
         }
         None
@@ -684,14 +687,21 @@ impl TieredCompilationManager {
 
         match tier {
             CompilationTier::C1 | CompilationTier::C1WithProfiling => {
-                self.core.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
+                self.core
+                    .stats
+                    .c1_compilations
+                    .fetch_add(1, Ordering::Relaxed);
             }
             CompilationTier::C2 => {
-                self.core.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
+                self.core
+                    .stats
+                    .c2_compilations
+                    .fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
-        self.core.stats
+        self.core
+            .stats
             .total_compile_time_ms
             .fetch_add(compile_time_ms, Ordering::Relaxed);
     }
@@ -712,7 +722,10 @@ impl TieredCompilationManager {
                 self.core.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.core.stats.deoptimizations.fetch_add(1, Ordering::Relaxed);
+        self.core
+            .stats
+            .deoptimizations
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Notify that C2 compilation bailed out (method too complex, etc.).
@@ -1669,7 +1682,8 @@ mod tests {
         let (tx, rx) = mpsc::channel::<(CompilationTier, std::thread::ThreadId)>();
         let bg = mgr
             .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
-                tx.send((task.target_tier, std::thread::current().id())).unwrap();
+                tx.send((task.target_tier, std::thread::current().id()))
+                    .unwrap();
                 7 // pretend the compile took 7ms
             }))
             .expect("worker should start");
@@ -1678,9 +1692,16 @@ mod tests {
 
         // Drive invocations on *this* (mutator) thread until the threshold
         // crossing enqueues a C1 task.
-        assert!(mgr.on_method_invocation(&key).is_none(), "1st invocation: below threshold");
+        assert!(
+            mgr.on_method_invocation(&key).is_none(),
+            "1st invocation: below threshold"
+        );
         let rec = mgr.on_method_invocation(&key);
-        assert_eq!(rec, Some(CompilationTier::C1), "threshold crossing enqueues C1");
+        assert_eq!(
+            rec,
+            Some(CompilationTier::C1),
+            "threshold crossing enqueues C1"
+        );
 
         // The worker should pick it up off-thread. Block on the channel (no sleep).
         let (compiled_tier, worker_thread) = rx
@@ -1728,7 +1749,9 @@ mod tests {
         // promotion) route to the optimizing pipeline.
         assert!(!tier_uses_optimized_backend(CompilationTier::Interpreter));
         assert!(!tier_uses_optimized_backend(CompilationTier::C1));
-        assert!(!tier_uses_optimized_backend(CompilationTier::C1WithProfiling));
+        assert!(!tier_uses_optimized_backend(
+            CompilationTier::C1WithProfiling
+        ));
         assert!(tier_uses_optimized_backend(CompilationTier::FullProfile));
         assert!(tier_uses_optimized_backend(CompilationTier::C2));
     }

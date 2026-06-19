@@ -367,7 +367,12 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // because the registry's insert is last-writer-wins, and this
     // implementation returns the boot-flagged layer the findModule path
     // expects.
-    registry.register(ml, "boot", "()Ljava/lang/ModuleLayer;", native_module_layer_boot);
+    registry.register(
+        ml,
+        "boot",
+        "()Ljava/lang/ModuleLayer;",
+        native_module_layer_boot,
+    );
     registry.register(
         ml,
         "findModule",
@@ -380,7 +385,12 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // which NPEs on our synthetic boot layer because we never populate that
     // field. Return an empty HashSet: Spring tolerates an empty module set
     // (classpath-jar resources still resolve through other code paths).
-    registry.register(ml, "modules", "()Ljava/util/Set;", native_module_layer_modules);
+    registry.register(
+        ml,
+        "modules",
+        "()Ljava/util/Set;",
+        native_module_layer_modules,
+    );
     // Spring 6/Boot 4's modulepath scanner actually invokes
     // `ModuleLayer.boot().configuration().modules()` (a `Set<ResolvedModule>`).
     // The JDK bytecode for `ModuleLayer.configuration()` reads `this.cf`,
@@ -404,8 +414,18 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
 
     let m = "java/lang/Module";
     registry.register(m, "getName", "()Ljava/lang/String;", native_module_get_name);
-    registry.register(m, "getPackages", "()Ljava/util/Set;", native_module_get_packages);
-    registry.register(m, "getLayer", "()Ljava/lang/ModuleLayer;", native_module_get_layer);
+    registry.register(
+        m,
+        "getPackages",
+        "()Ljava/util/Set;",
+        native_module_get_packages,
+    );
+    registry.register(
+        m,
+        "getLayer",
+        "()Ljava/lang/ModuleLayer;",
+        native_module_get_layer,
+    );
     // T19_H12_MODULE_GETCLASSLOADER — `java.lang.Module.getClassLoader()`.
     //
     // Per JDK 25 javadoc: "If this module is in the boot layer and is loaded
@@ -420,9 +440,12 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // a `HashSet` (the packages set) which produced
     // "NoSuchMethodError: java/util/HashSet.loadClass(Module, String)Class"
     // when downstream code tried to invoke `loadClass` on the result.
-    registry.register(m, "getClassLoader", "()Ljava/lang/ClassLoader;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    registry.register(
+        m,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // ── Round 63: WildFly `WildFlySecurityManager` <clinit> NPE ────────────
     //
@@ -545,9 +568,7 @@ mod tests {
     #[test]
     fn module_layer_boot_returns_non_null_layer() {
         let mut ctx = MockNativeContext::new();
-        let result = native_module_layer_boot(&mut ctx, &[])
-            .unwrap()
-            .unwrap();
+        let result = native_module_layer_boot(&mut ctx, &[]).unwrap().unwrap();
         match result {
             Value::Object(Some(_)) => {}
             other => panic!("expected non-null ModuleLayer, got {:?}", other),
@@ -581,7 +602,11 @@ mod tests {
         let args = [layer_v, Value::Object(None)];
         let err = native_module_layer_find_module(&mut ctx, &args).unwrap_err();
         let s = format!("{:?}", err);
-        assert!(s.contains("null") || s.contains("Null"), "expected NPE, got {}", s);
+        assert!(
+            s.contains("null") || s.contains("Null"),
+            "expected NPE, got {}",
+            s
+        );
     }
 
     #[test]
@@ -623,7 +648,11 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let err = native_module_get_packages(&mut ctx, &[Value::Object(None)]).unwrap_err();
         let s = format!("{:?}", err);
-        assert!(s.contains("null") || s.contains("Null"), "expected NPE, got {}", s);
+        assert!(
+            s.contains("null") || s.contains("Null"),
+            "expected NPE, got {}",
+            s
+        );
     }
 
     #[test]
@@ -686,7 +715,11 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_jboss_jdkspecific(&mut r);
         let cb = r
-            .find("java/lang/Module", "getClassLoader", "()Ljava/lang/ClassLoader;")
+            .find(
+                "java/lang/Module",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx);
@@ -695,8 +728,11 @@ mod tests {
             .unwrap()
             .unwrap();
         // Per JDK 25 spec: boot-layer modules with bootstrap loader return null.
-        assert!(matches!(result, Value::Object(None)),
-            "expected null ClassLoader for boot-layer module, got {:?}", result);
+        assert!(
+            matches!(result, Value::Object(None)),
+            "expected null ClassLoader for boot-layer module, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -707,7 +743,11 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_jboss_jdkspecific(&mut r);
         let cb = r
-            .find("java/lang/Module", "getClassLoader", "()Ljava/lang/ClassLoader;")
+            .find(
+                "java/lang/Module",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx);
@@ -715,7 +755,10 @@ mod tests {
         let module = build_module(&mut ctx, "java.base", layer);
         // Confirm slot 2 IS a HashSet (this is the bug condition).
         let pkgs = ctx.get_field(module, MODULE_SLOT_PACKAGES);
-        assert!(matches!(pkgs, Value::Object(Some(_))), "slot 2 should be a Set");
+        assert!(
+            matches!(pkgs, Value::Object(Some(_))),
+            "slot 2 should be a Set"
+        );
         // Native must NOT route through slot 2.
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()

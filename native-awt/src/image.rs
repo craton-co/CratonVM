@@ -165,12 +165,7 @@ impl BufferedImageData {
         assert!(
             in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
-            x,
-            y,
-            w,
-            h,
-            self.width,
-            self.height
+            x, y, w, h, self.width, self.height
         );
         let mut result = Vec::with_capacity((w as usize) * (h as usize));
         for row in y..y + h {
@@ -191,12 +186,7 @@ impl BufferedImageData {
         assert!(
             in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
-            x,
-            y,
-            w,
-            h,
-            self.width,
-            self.height
+            x, y, w, h, self.width, self.height
         );
         assert_eq!(
             pixels.len(),
@@ -208,8 +198,7 @@ impl BufferedImageData {
             (w as usize) * (h as usize)
         );
         for row in 0..h {
-            let dst_start =
-                ((y + row) as usize) * (self.width as usize) + (x as usize);
+            let dst_start = ((y + row) as usize) * (self.width as usize) + (x as usize);
             let src_start = (row as usize) * (w as usize);
             self.pixels[dst_start..dst_start + w as usize]
                 .copy_from_slice(&pixels[src_start..src_start + w as usize]);
@@ -430,12 +419,7 @@ impl ImageRegistry {
     /// Returns `None` if `width * height` overflows `usize` — the caller
     /// (a native method) should surface this as a Java `OutOfMemoryError`
     /// rather than panicking.
-    pub fn create(
-        &mut self,
-        width: u32,
-        height: u32,
-        image_type: ImageType,
-    ) -> Option<ImageId> {
+    pub fn create(&mut self, width: u32, height: u32, image_type: ImageType) -> Option<ImageId> {
         let data = BufferedImageData::try_new(width, height, image_type)?;
         let byte_len = Self::raster_bytes(&data);
         let id = self.next_id;

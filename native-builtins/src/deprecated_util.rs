@@ -54,7 +54,11 @@ fn is_leap(year: i32) -> bool {
 #[inline]
 fn days_in_month(year: i32, month: i32) -> i32 {
     const TABLE: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if month == 1 && is_leap(year) { 29 } else { TABLE[month as usize] }
+    if month == 1 && is_leap(year) {
+        29
+    } else {
+        TABLE[month as usize]
+    }
 }
 
 /// Convert (year, month, date, hrs, min, sec) to Unix epoch milliseconds.
@@ -89,21 +93,18 @@ pub(crate) fn date_fields_to_millis(
     // Add the remaining days (date is 1-based).
     days += (date - 1) as i64;
 
-    days * 86_400_000
-        + hrs as i64 * 3_600_000
-        + min as i64 * 60_000
-        + sec as i64 * 1_000
+    days * 86_400_000 + hrs as i64 * 3_600_000 + min as i64 * 60_000 + sec as i64 * 1_000
 }
 
 /// Decompose Unix epoch milliseconds into a [`DateParts`] struct.
 pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
     // Seconds / minutes / hours
     let sec_total = millis.div_euclid(1_000);
-    let sec       = sec_total.rem_euclid(60) as i32;
+    let sec = sec_total.rem_euclid(60) as i32;
     let min_total = sec_total.div_euclid(60);
-    let min       = min_total.rem_euclid(60) as i32;
-    let hr_total  = min_total.div_euclid(60);
-    let hrs       = hr_total.rem_euclid(24) as i32;
+    let min = min_total.rem_euclid(60) as i32;
+    let hr_total = min_total.div_euclid(60);
+    let hrs = hr_total.rem_euclid(24) as i32;
     let mut day_count = hr_total.div_euclid(24); // days since Unix epoch (may be negative)
 
     // Day of week: 1970-01-01 was a Thursday (= 4, with Sunday = 0).
@@ -147,7 +148,15 @@ pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
 
     let date = day_count as i32 + 1; // 1-based
 
-    DateParts { year, month, date, hrs, min, sec, day_of_week }
+    DateParts {
+        year,
+        month,
+        date,
+        hrs,
+        min,
+        sec,
+        day_of_week,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +166,7 @@ pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
 fn get_date_millis(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i64 {
     match ctx.get_field(this, 0) {
         Value::Long(v) => v,
-        Value::Int(v)  => v as i64,
+        Value::Int(v) => v as i64,
         _ => 0,
     }
 }
@@ -171,45 +180,84 @@ fn set_date_millis(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef, mil
 // ---------------------------------------------------------------------------
 
 fn native_date_init_iii(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
-    let year  = match args.get(1) { Some(Value::Int(v)) => *v, _ => 70 };
-    let month = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
-    let date  = match args.get(3) { Some(Value::Int(v)) => *v, _ => 1 };
+    let this = obj_arg(args, 0)?;
+    let year = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 70,
+    };
+    let month = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let date = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
     let millis = date_fields_to_millis(year + 1900, month, date, 0, 0, 0);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_init_iiiii(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
-    let year  = match args.get(1) { Some(Value::Int(v)) => *v, _ => 70 };
-    let month = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
-    let date  = match args.get(3) { Some(Value::Int(v)) => *v, _ => 1 };
-    let hrs   = match args.get(4) { Some(Value::Int(v)) => *v, _ => 0 };
-    let min   = match args.get(5) { Some(Value::Int(v)) => *v, _ => 0 };
+    let this = obj_arg(args, 0)?;
+    let year = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 70,
+    };
+    let month = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let date = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let hrs = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let min = match args.get(5) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
     let millis = date_fields_to_millis(year + 1900, month, date, hrs, min, 0);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_init_iiiiii(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
-    let year  = match args.get(1) { Some(Value::Int(v)) => *v, _ => 70 };
-    let month = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
-    let date  = match args.get(3) { Some(Value::Int(v)) => *v, _ => 1 };
-    let hrs   = match args.get(4) { Some(Value::Int(v)) => *v, _ => 0 };
-    let min   = match args.get(5) { Some(Value::Int(v)) => *v, _ => 0 };
-    let sec   = match args.get(6) { Some(Value::Int(v)) => *v, _ => 0 };
+    let this = obj_arg(args, 0)?;
+    let year = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 70,
+    };
+    let month = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let date = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let hrs = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let min = match args.get(5) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let sec = match args.get(6) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
     let millis = date_fields_to_millis(year + 1900, month, date, hrs, min, sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 /// Date(String) — deprecated; throws UnsupportedOperationException.
-fn native_date_init_string(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
+fn native_date_init_string(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Err(RuntimeError::UnsupportedOperationException {
         message: "Date(String) is deprecated and not supported".to_string(),
     }
@@ -271,55 +319,73 @@ fn native_date_get_timezone_offset(
 }
 
 fn native_date_set_year(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this     = obj_arg(args, 0)?;
-    let new_year = match args.get(1) { Some(Value::Int(v)) => *v, _ => 70 };
-    let p        = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis   = date_fields_to_millis(new_year + 1900, p.month, p.date, p.hrs, p.min, p.sec);
+    let this = obj_arg(args, 0)?;
+    let new_year = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 70,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(new_year + 1900, p.month, p.date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_set_month(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this      = obj_arg(args, 0)?;
-    let new_month = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-    let p         = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis    = date_fields_to_millis(p.year, new_month, p.date, p.hrs, p.min, p.sec);
+    let this = obj_arg(args, 0)?;
+    let new_month = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(p.year, new_month, p.date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_set_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this     = obj_arg(args, 0)?;
-    let new_date = match args.get(1) { Some(Value::Int(v)) => *v, _ => 1 };
-    let p        = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis   = date_fields_to_millis(p.year, p.month, new_date, p.hrs, p.min, p.sec);
+    let this = obj_arg(args, 0)?;
+    let new_date = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 1,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(p.year, p.month, new_date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_set_hours(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this      = obj_arg(args, 0)?;
-    let new_hours = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-    let p         = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis    = date_fields_to_millis(p.year, p.month, p.date, new_hours, p.min, p.sec);
+    let this = obj_arg(args, 0)?;
+    let new_hours = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(p.year, p.month, p.date, new_hours, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_set_minutes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this    = obj_arg(args, 0)?;
-    let new_min = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-    let p       = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis  = date_fields_to_millis(p.year, p.month, p.date, p.hrs, new_min, p.sec);
+    let this = obj_arg(args, 0)?;
+    let new_min = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(p.year, p.month, p.date, p.hrs, new_min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
 
 fn native_date_set_seconds(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this    = obj_arg(args, 0)?;
-    let new_sec = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-    let p       = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis  = date_fields_to_millis(p.year, p.month, p.date, p.hrs, p.min, new_sec);
+    let this = obj_arg(args, 0)?;
+    let new_sec = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let millis = date_fields_to_millis(p.year, p.month, p.date, p.hrs, p.min, new_sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -330,15 +396,21 @@ fn native_date_set_seconds(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 /// `<init>([BIII)V` — deprecated String constructor with hibyte argument.
 /// Each resulting char = (hibyte << 8) | (byte[offset+i] & 0xFF).
-fn native_string_init_hibyte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this      = obj_arg(args, 0)?;
-    let byte_arr  = obj_arg(args, 1)?;
-    let hibyte    = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
-    let offset    = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let count     = match args.get(4) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+fn native_string_init_hibyte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let byte_arr = obj_arg(args, 1)?;
+    let hibyte = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let offset = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let count = match args.get(4) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
 
     let arr_len = ctx.array_length(byte_arr);
     if offset + count > arr_len {
@@ -398,9 +470,9 @@ fn string_from_bytes_utf8(
     // spec allows a CharsetDecoder to throw, but the public ctor uses
     // `CodingErrorAction.REPLACE` by default so this branch is correct for
     // the unguarded probe path).
-    let text = std::str::from_utf8(bytes).map(|s| s.to_string()).unwrap_or_else(|_| {
-        String::from_utf8_lossy(bytes).into_owned()
-    });
+    let text = std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned());
     let str_obj = ctx.create_string(&text);
     // Mirror the JDK 25 compact-string layout that `create_java_string`
     // populates. Field 0 is the encoded byte[]; field 1 is `coder` (0=LATIN1,
@@ -439,10 +511,7 @@ fn string_from_bytes_with_charset(
 }
 
 /// `<init>([B)V` — `new String(byte[])`.
-fn native_string_init_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_string_init_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
     let len = ctx.array_length(arr);
@@ -495,8 +564,14 @@ fn native_string_init_bytes_off_len(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
-    let offset = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let count = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let count = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
@@ -547,8 +622,14 @@ fn native_string_init_bytes_off_len_charset_name(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
-    let offset = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let count = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let count = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
     let charset_obj = obj_arg(args, 4)?;
     let charset_name = ctx.read_string(charset_obj).unwrap_or_default();
     let arr_len = ctx.array_length(arr);
@@ -597,8 +678,14 @@ fn native_string_init_bytes_off_len_charset(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
-    let offset = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let count = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let count = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
     let cs_obj = obj_arg(args, 4)?;
     let charset_name = match ctx.get_field(cs_obj, crate::CHARSET_FIELD_NAME) {
         Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
@@ -629,13 +716,22 @@ fn native_string_get_bytes_deprecated(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this      = obj_arg(args, 0)?;
-    let src_begin = match args.get(1) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let src_end   = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let dst       = obj_arg(args, 3)?;
-    let dst_begin = match args.get(4) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let this = obj_arg(args, 0)?;
+    let src_begin = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let src_end = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let dst = obj_arg(args, 3)?;
+    let dst_begin = match args.get(4) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
 
-    let text  = ctx.read_string(this).unwrap_or_default();
+    let text = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = text.encode_utf16().collect();
 
     if src_end > chars.len() {
@@ -657,14 +753,14 @@ fn native_string_get_bytes_deprecated(
 // ---------------------------------------------------------------------------
 
 /// `isJavaLetter(C)Z` — deprecated alias for `Character.isJavaIdentifierStart`.
-fn native_char_is_java_letter(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c   = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-    let ch  = char::from_u32(c).unwrap_or('\0');
+fn native_char_is_java_letter(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = match args.first() {
+        Some(Value::Int(v)) => *v as u32,
+        _ => 0,
+    };
+    let ch = char::from_u32(c).unwrap_or('\0');
     // isJavaIdentifierStart: letter, _, $, or letter-number (Lu, Ll, Lt, Lm, Lo, Nl)
-    let ok  = ch.is_alphabetic() || ch == '_' || ch == '$';
+    let ok = ch.is_alphabetic() || ch == '_' || ch == '$';
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -673,18 +769,21 @@ fn native_char_is_java_letter_or_digit(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let c   = match args.first() { Some(Value::Int(v)) => *v as u32, _ => 0 };
-    let ch  = char::from_u32(c).unwrap_or('\0');
-    let ok  = ch.is_alphanumeric() || ch == '_' || ch == '$';
+    let c = match args.first() {
+        Some(Value::Int(v)) => *v as u32,
+        _ => 0,
+    };
+    let ch = char::from_u32(c).unwrap_or('\0');
+    let ok = ch.is_alphanumeric() || ch == '_' || ch == '$';
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
 /// `isSpace(C)Z` — deprecated; true for ASCII whitespace: SP HT LF FF CR.
-fn native_char_is_space(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let c  = match args.first() { Some(Value::Int(v)) => *v as u16, _ => 0 };
+fn native_char_is_space(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = match args.first() {
+        Some(Value::Int(v)) => *v as u16,
+        _ => 0,
+    };
     let ok = matches!(c, 0x20 | 0x09 | 0x0A | 0x0C | 0x0D);
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
@@ -694,14 +793,15 @@ fn native_char_is_space(
 // ---------------------------------------------------------------------------
 
 /// `save(Ljava/io/OutputStream;Ljava/lang/String;)V` — delegates to `store()`.
-fn native_properties_save(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_properties_save(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let mut store_args: Vec<Value> = Vec::with_capacity(2);
-    if args.len() > 1 { store_args.push(args[1]); }
-    if args.len() > 2 { store_args.push(args[2]); }
+    if args.len() > 1 {
+        store_args.push(args[1]);
+    }
+    if args.len() > 2 {
+        store_args.push(args[2]);
+    }
     ctx.invoke_virtual(
         this,
         "store",
@@ -769,7 +869,11 @@ fn collect_hashtable(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) 
             // key is always an object reference.
             let real_layout = matches!(ctx.get_field(node, 0), Value::Int(_));
             let v = if real_layout {
-                if want_keys { ctx.get_field(node, 1) } else { ctx.get_field(node, 2) }
+                if want_keys {
+                    ctx.get_field(node, 1)
+                } else {
+                    ctx.get_field(node, 2)
+                }
             } else if want_keys {
                 ctx.get_field(node, 0)
             } else {
@@ -822,10 +926,7 @@ fn make_hashtable_enumeration(
 }
 
 /// `elements()Ljava/util/Enumeration;` — snapshot of values.
-fn native_hashtable_elements(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_hashtable_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let values = collect_hashtable(ctx, this, false);
     // FIX: type marker 0 = values/elements snapshot.
@@ -833,10 +934,7 @@ fn native_hashtable_elements(
 }
 
 /// `keys()Ljava/util/Enumeration;` — snapshot of keys.
-fn native_hashtable_keys(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_hashtable_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let keys = collect_hashtable(ctx, this, true);
     // FIX: type marker 1 = keys snapshot.
@@ -850,12 +948,12 @@ fn native_hashtable_keys(
 /// `<init>(Ljava/lang/String;)V`
 ///   field 0 = String ref, field 1 = position (Int), field 2 = count (Int)
 fn native_sbis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this    = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let str_obj = obj_arg(args, 1)?;
-    let text    = ctx.read_string(str_obj).unwrap_or_default();
-    let len     = text.len() as i32;
+    let text = ctx.read_string(str_obj).unwrap_or_default();
+    let len = text.len() as i32;
     ctx.set_field(this, 0, Value::Object(Some(str_obj)));
-    ctx.set_field(this, 1, Value::Int(0));   // position
+    ctx.set_field(this, 1, Value::Int(0)); // position
     ctx.set_field(this, 2, Value::Int(len)); // count
     Ok(None)
 }
@@ -867,15 +965,21 @@ fn native_sbis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let pos   = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
-    let count = match ctx.get_field(this, 2) { Value::Int(v) => v as usize, _ => 0 };
+    let pos = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let count = match ctx.get_field(this, 2) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
 
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
     }
 
     let text = ctx.read_string(str_ref).unwrap_or_default();
-    let b    = text.as_bytes().get(pos).copied().unwrap_or(0) as i32;
+    let b = text.as_bytes().get(pos).copied().unwrap_or(0) as i32;
     ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
     Ok(Some(Value::Int(b)))
 }
@@ -883,24 +987,36 @@ fn native_sbis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// `read([BII)I`
 fn native_sbis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let buf  = obj_arg(args, 1)?;
-    let off  = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let len  = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let buf = obj_arg(args, 1)?;
+    let off = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
 
     let str_ref = match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let pos   = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
-    let count = match ctx.get_field(this, 2) { Value::Int(v) => v as usize, _ => 0 };
+    let pos = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let count = match ctx.get_field(this, 2) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
 
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
     }
 
-    let text    = ctx.read_string(str_ref).unwrap_or_default();
-    let bytes   = text.as_bytes();
-    let avail   = count - pos;
+    let text = ctx.read_string(str_ref).unwrap_or_default();
+    let bytes = text.as_bytes();
+    let avail = count - pos;
     let to_read = len.min(avail);
 
     for i in 0..to_read {
@@ -913,9 +1029,15 @@ fn native_sbis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 /// `available()I`
 fn native_sbis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
-    let pos   = match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 };
-    let count = match ctx.get_field(this, 2) { Value::Int(v) => v, _ => 0 };
+    let this = obj_arg(args, 0)?;
+    let pos = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let count = match ctx.get_field(this, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     Ok(Some(Value::Int((count - pos).max(0))))
 }
 
@@ -936,11 +1058,11 @@ fn native_sbis_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 ///   field 2 = saved line number for mark/reset (Int)
 ///   field 3 = pushback byte (Int, -1 = none)
 fn native_lnis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let inner = obj_arg(args, 1)?;
     ctx.set_field(this, 0, Value::Object(Some(inner)));
-    ctx.set_field(this, 1, Value::Int(0));  // line number
-    ctx.set_field(this, 2, Value::Int(0));  // saved line number
+    ctx.set_field(this, 1, Value::Int(0)); // line number
+    ctx.set_field(this, 2, Value::Int(0)); // saved line number
     ctx.set_field(this, 3, Value::Int(-1)); // pushback byte
     Ok(None)
 }
@@ -957,7 +1079,10 @@ fn lnis_read_one(
     };
 
     // Drain pushback first.
-    let pushback = match ctx.get_field(this, 3) { Value::Int(v) => v, _ => -1 };
+    let pushback = match ctx.get_field(this, 3) {
+        Value::Int(v) => v,
+        _ => -1,
+    };
     let b = if pushback >= 0 {
         ctx.set_field(this, 3, Value::Int(-1));
         pushback
@@ -968,7 +1093,9 @@ fn lnis_read_one(
         }
     };
 
-    if b == -1 { return Ok(-1); }
+    if b == -1 {
+        return Ok(-1);
+    }
 
     if b == b'\r' as i32 {
         // Peek at the next byte to handle \r\n.
@@ -976,7 +1103,10 @@ fn lnis_read_one(
             Some(Value::Int(v)) => v,
             _ => -1,
         };
-        let ln = match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 };
+        let ln = match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 1, Value::Int(ln + 1));
         if next != b'\n' as i32 && next != -1 {
             ctx.set_field(this, 3, Value::Int(next)); // push back non-LF
@@ -985,7 +1115,10 @@ fn lnis_read_one(
     }
 
     if b == b'\n' as i32 {
-        let ln = match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 };
+        let ln = match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         ctx.set_field(this, 1, Value::Int(ln + 1));
     }
     Ok(b)
@@ -1000,45 +1133,59 @@ fn native_lnis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// `read([BII)I`
 fn native_lnis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let buf  = obj_arg(args, 1)?;
-    let off  = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    let len  = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let buf = obj_arg(args, 1)?;
+    let off = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
 
-    if len == 0 { return Ok(Some(Value::Int(0))); }
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
 
     let mut count = 0i32;
     for i in 0..len {
         let b = lnis_read_one(ctx, this)?;
-        if b == -1 { break; }
+        if b == -1 {
+            break;
+        }
         ctx.set_array_element(buf, off + i, Value::Int(b));
         count += 1;
     }
-    if count == 0 { Ok(Some(Value::Int(-1))) } else { Ok(Some(Value::Int(count))) }
+    if count == 0 {
+        Ok(Some(Value::Int(-1)))
+    } else {
+        Ok(Some(Value::Int(count)))
+    }
 }
 
 /// `getLineNumber()I`
-fn native_lnis_get_line_number(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_lnis_get_line_number(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(match ctx.get_field(this, 1) { Value::Int(v) => Value::Int(v), _ => Value::Int(0) }))
+    Ok(Some(match ctx.get_field(this, 1) {
+        Value::Int(v) => Value::Int(v),
+        _ => Value::Int(0),
+    }))
 }
 
 /// `setLineNumber(I)V`
-fn native_lnis_set_line_number(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_lnis_set_line_number(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let n    = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+    let n = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
     ctx.set_field(this, 1, Value::Int(n));
     Ok(None)
 }
 
 /// `available()I` — delegates to the wrapped stream.
 fn native_lnis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let inner = match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(0))),
@@ -1048,8 +1195,11 @@ fn native_lnis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 /// `reset()V` — restores saved line number and delegates to wrapped stream.
 fn native_lnis_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this  = obj_arg(args, 0)?;
-    let saved = match ctx.get_field(this, 2) { Value::Int(v) => v, _ => 0 };
+    let this = obj_arg(args, 0)?;
+    let saved = match ctx.get_field(this, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     ctx.set_field(this, 1, Value::Int(saved));
     let inner = match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => o,
@@ -1068,52 +1218,190 @@ fn native_lnis_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn iso2_to_iso3(lang2: &str) -> &'static str {
     // Covers all 184 two-letter codes from ISO 639-1 → ISO 639-2/T.
     match lang2 {
-        "aa" => "aar", "ab" => "abk", "ae" => "ave", "af" => "afr",
-        "ak" => "aka", "am" => "amh", "an" => "arg", "ar" => "ara",
-        "as" => "asm", "av" => "ava", "ay" => "aym", "az" => "aze",
-        "ba" => "bak", "be" => "bel", "bg" => "bul", "bh" => "bih",
-        "bi" => "bis", "bm" => "bam", "bn" => "ben", "bo" => "bod",
-        "br" => "bre", "bs" => "bos", "ca" => "cat", "ce" => "che",
-        "ch" => "cha", "co" => "cos", "cr" => "cre", "cs" => "ces",
-        "cu" => "chu", "cv" => "chv", "cy" => "cym", "da" => "dan",
-        "de" => "deu", "dv" => "div", "dz" => "dzo", "ee" => "ewe",
-        "el" => "ell", "en" => "eng", "eo" => "epo", "es" => "spa",
-        "et" => "est", "eu" => "eus", "fa" => "fas", "ff" => "ful",
-        "fi" => "fin", "fj" => "fij", "fo" => "fao", "fr" => "fra",
-        "fy" => "fry", "ga" => "gle", "gd" => "gla", "gl" => "glg",
-        "gn" => "grn", "gu" => "guj", "gv" => "glv", "ha" => "hau",
-        "he" => "heb", "hi" => "hin", "ho" => "hmo", "hr" => "hrv",
-        "ht" => "hat", "hu" => "hun", "hy" => "hye", "hz" => "her",
-        "ia" => "ina", "id" => "ind", "ie" => "ile", "ig" => "ibo",
-        "ii" => "iii", "ik" => "ipk", "io" => "ido", "is" => "isl",
-        "it" => "ita", "iu" => "iku", "ja" => "jpn", "jv" => "jav",
-        "ka" => "kat", "kg" => "kon", "ki" => "kik", "kj" => "kua",
-        "kk" => "kaz", "kl" => "kal", "km" => "khm", "kn" => "kan",
-        "ko" => "kor", "kr" => "kau", "ks" => "kas", "ku" => "kur",
-        "kv" => "kom", "kw" => "cor", "ky" => "kir", "la" => "lat",
-        "lb" => "ltz", "lg" => "lug", "li" => "lim", "ln" => "lin",
-        "lo" => "lao", "lt" => "lit", "lu" => "lub", "lv" => "lav",
-        "mg" => "mlg", "mh" => "mah", "mi" => "mri", "mk" => "mkd",
-        "ml" => "mal", "mn" => "mon", "mr" => "mar", "ms" => "msa",
-        "mt" => "mlt", "my" => "mya", "na" => "nau", "nb" => "nob",
-        "nd" => "nde", "ne" => "nep", "ng" => "ndo", "nl" => "nld",
-        "nn" => "nno", "no" => "nor", "nr" => "nbl", "nv" => "nav",
-        "ny" => "nya", "oc" => "oci", "oj" => "oji", "om" => "orm",
-        "or" => "ori", "os" => "oss", "pa" => "pan", "pi" => "pli",
-        "pl" => "pol", "ps" => "pus", "pt" => "por", "qu" => "que",
-        "rm" => "roh", "rn" => "run", "ro" => "ron", "ru" => "rus",
-        "rw" => "kin", "sa" => "san", "sc" => "srd", "sd" => "snd",
-        "se" => "sme", "sg" => "sag", "si" => "sin", "sk" => "slk",
-        "sl" => "slv", "sm" => "smo", "sn" => "sna", "so" => "som",
-        "sq" => "sqi", "sr" => "srp", "ss" => "ssw", "st" => "sot",
-        "su" => "sun", "sv" => "swe", "sw" => "swa", "ta" => "tam",
-        "te" => "tel", "tg" => "tgk", "th" => "tha", "ti" => "tir",
-        "tk" => "tuk", "tl" => "tgl", "tn" => "tsn", "to" => "ton",
-        "tr" => "tur", "ts" => "tso", "tt" => "tat", "tw" => "twi",
-        "ty" => "tah", "ug" => "uig", "uk" => "ukr", "ur" => "urd",
-        "uz" => "uzb", "va" => "vol", "ve" => "ven", "vi" => "vie",
-        "vo" => "vol", "wa" => "wln", "wo" => "wol", "xh" => "xho",
-        "yi" => "yid", "yo" => "yor", "za" => "zha", "zh" => "zho",
+        "aa" => "aar",
+        "ab" => "abk",
+        "ae" => "ave",
+        "af" => "afr",
+        "ak" => "aka",
+        "am" => "amh",
+        "an" => "arg",
+        "ar" => "ara",
+        "as" => "asm",
+        "av" => "ava",
+        "ay" => "aym",
+        "az" => "aze",
+        "ba" => "bak",
+        "be" => "bel",
+        "bg" => "bul",
+        "bh" => "bih",
+        "bi" => "bis",
+        "bm" => "bam",
+        "bn" => "ben",
+        "bo" => "bod",
+        "br" => "bre",
+        "bs" => "bos",
+        "ca" => "cat",
+        "ce" => "che",
+        "ch" => "cha",
+        "co" => "cos",
+        "cr" => "cre",
+        "cs" => "ces",
+        "cu" => "chu",
+        "cv" => "chv",
+        "cy" => "cym",
+        "da" => "dan",
+        "de" => "deu",
+        "dv" => "div",
+        "dz" => "dzo",
+        "ee" => "ewe",
+        "el" => "ell",
+        "en" => "eng",
+        "eo" => "epo",
+        "es" => "spa",
+        "et" => "est",
+        "eu" => "eus",
+        "fa" => "fas",
+        "ff" => "ful",
+        "fi" => "fin",
+        "fj" => "fij",
+        "fo" => "fao",
+        "fr" => "fra",
+        "fy" => "fry",
+        "ga" => "gle",
+        "gd" => "gla",
+        "gl" => "glg",
+        "gn" => "grn",
+        "gu" => "guj",
+        "gv" => "glv",
+        "ha" => "hau",
+        "he" => "heb",
+        "hi" => "hin",
+        "ho" => "hmo",
+        "hr" => "hrv",
+        "ht" => "hat",
+        "hu" => "hun",
+        "hy" => "hye",
+        "hz" => "her",
+        "ia" => "ina",
+        "id" => "ind",
+        "ie" => "ile",
+        "ig" => "ibo",
+        "ii" => "iii",
+        "ik" => "ipk",
+        "io" => "ido",
+        "is" => "isl",
+        "it" => "ita",
+        "iu" => "iku",
+        "ja" => "jpn",
+        "jv" => "jav",
+        "ka" => "kat",
+        "kg" => "kon",
+        "ki" => "kik",
+        "kj" => "kua",
+        "kk" => "kaz",
+        "kl" => "kal",
+        "km" => "khm",
+        "kn" => "kan",
+        "ko" => "kor",
+        "kr" => "kau",
+        "ks" => "kas",
+        "ku" => "kur",
+        "kv" => "kom",
+        "kw" => "cor",
+        "ky" => "kir",
+        "la" => "lat",
+        "lb" => "ltz",
+        "lg" => "lug",
+        "li" => "lim",
+        "ln" => "lin",
+        "lo" => "lao",
+        "lt" => "lit",
+        "lu" => "lub",
+        "lv" => "lav",
+        "mg" => "mlg",
+        "mh" => "mah",
+        "mi" => "mri",
+        "mk" => "mkd",
+        "ml" => "mal",
+        "mn" => "mon",
+        "mr" => "mar",
+        "ms" => "msa",
+        "mt" => "mlt",
+        "my" => "mya",
+        "na" => "nau",
+        "nb" => "nob",
+        "nd" => "nde",
+        "ne" => "nep",
+        "ng" => "ndo",
+        "nl" => "nld",
+        "nn" => "nno",
+        "no" => "nor",
+        "nr" => "nbl",
+        "nv" => "nav",
+        "ny" => "nya",
+        "oc" => "oci",
+        "oj" => "oji",
+        "om" => "orm",
+        "or" => "ori",
+        "os" => "oss",
+        "pa" => "pan",
+        "pi" => "pli",
+        "pl" => "pol",
+        "ps" => "pus",
+        "pt" => "por",
+        "qu" => "que",
+        "rm" => "roh",
+        "rn" => "run",
+        "ro" => "ron",
+        "ru" => "rus",
+        "rw" => "kin",
+        "sa" => "san",
+        "sc" => "srd",
+        "sd" => "snd",
+        "se" => "sme",
+        "sg" => "sag",
+        "si" => "sin",
+        "sk" => "slk",
+        "sl" => "slv",
+        "sm" => "smo",
+        "sn" => "sna",
+        "so" => "som",
+        "sq" => "sqi",
+        "sr" => "srp",
+        "ss" => "ssw",
+        "st" => "sot",
+        "su" => "sun",
+        "sv" => "swe",
+        "sw" => "swa",
+        "ta" => "tam",
+        "te" => "tel",
+        "tg" => "tgk",
+        "th" => "tha",
+        "ti" => "tir",
+        "tk" => "tuk",
+        "tl" => "tgl",
+        "tn" => "tsn",
+        "to" => "ton",
+        "tr" => "tur",
+        "ts" => "tso",
+        "tt" => "tat",
+        "tw" => "twi",
+        "ty" => "tah",
+        "ug" => "uig",
+        "uk" => "ukr",
+        "ur" => "urd",
+        "uz" => "uzb",
+        "va" => "vol",
+        "ve" => "ven",
+        "vi" => "vie",
+        "vo" => "vol",
+        "wa" => "wln",
+        "wo" => "wol",
+        "xh" => "xho",
+        "yi" => "yid",
+        "yo" => "yor",
+        "za" => "zha",
+        "zh" => "zho",
         "zu" => "zul",
         _ => "",
     }
@@ -1157,31 +1445,46 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     let date = "java/util/Date";
 
     // T8.2.1 — Date constructors
-    r.register(date, "<init>", "(III)V",    native_date_init_iii);
-    r.register(date, "<init>", "(IIIII)V",  native_date_init_iiiii);
+    r.register(date, "<init>", "(III)V", native_date_init_iii);
+    r.register(date, "<init>", "(IIIII)V", native_date_init_iiiii);
     r.register(date, "<init>", "(IIIIII)V", native_date_init_iiiiii);
-    r.register(date, "<init>", "(Ljava/lang/String;)V", native_date_init_string);
+    r.register(
+        date,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_date_init_string,
+    );
 
     // T8.2.2 — Date getters
-    r.register(date, "getYear",           "()I", native_date_get_year);
-    r.register(date, "getMonth",          "()I", native_date_get_month);
-    r.register(date, "getDate",           "()I", native_date_get_date);
-    r.register(date, "getDay",            "()I", native_date_get_day);
-    r.register(date, "getHours",          "()I", native_date_get_hours);
-    r.register(date, "getMinutes",        "()I", native_date_get_minutes);
-    r.register(date, "getSeconds",        "()I", native_date_get_seconds);
-    r.register(date, "getTimezoneOffset", "()I", native_date_get_timezone_offset);
+    r.register(date, "getYear", "()I", native_date_get_year);
+    r.register(date, "getMonth", "()I", native_date_get_month);
+    r.register(date, "getDate", "()I", native_date_get_date);
+    r.register(date, "getDay", "()I", native_date_get_day);
+    r.register(date, "getHours", "()I", native_date_get_hours);
+    r.register(date, "getMinutes", "()I", native_date_get_minutes);
+    r.register(date, "getSeconds", "()I", native_date_get_seconds);
+    r.register(
+        date,
+        "getTimezoneOffset",
+        "()I",
+        native_date_get_timezone_offset,
+    );
 
     // T8.2.2 — Date setters
-    r.register(date, "setYear",    "(I)V", native_date_set_year);
-    r.register(date, "setMonth",   "(I)V", native_date_set_month);
-    r.register(date, "setDate",    "(I)V", native_date_set_date);
-    r.register(date, "setHours",   "(I)V", native_date_set_hours);
+    r.register(date, "setYear", "(I)V", native_date_set_year);
+    r.register(date, "setMonth", "(I)V", native_date_set_month);
+    r.register(date, "setDate", "(I)V", native_date_set_date);
+    r.register(date, "setHours", "(I)V", native_date_set_hours);
     r.register(date, "setMinutes", "(I)V", native_date_set_minutes);
     r.register(date, "setSeconds", "(I)V", native_date_set_seconds);
 
     // T8.2.3 — String(byte[], hibyte, offset, count)
-    r.register("java/lang/String", "<init>", "([BIII)V", native_string_init_hibyte);
+    r.register(
+        "java/lang/String",
+        "<init>",
+        "([BIII)V",
+        native_string_init_hibyte,
+    );
 
     // Cipher-probe support: byte[]→String constructors. The real-JDK bytecode
     // walks `Charset.defaultCharset()` → `sun/nio/cs/UTF_8.INSTANCE` and
@@ -1198,8 +1501,18 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     // and copies the resulting String's instance fields onto `this`. We
     // borrow `create_string`'s value/coder/hash/hashIsZero so the layout
     // matches the JDK 25 compact-string contract.
-    r.register("java/lang/String", "<init>", "([B)V", native_string_init_bytes);
-    r.register("java/lang/String", "<init>", "([BII)V", native_string_init_bytes_off_len);
+    r.register(
+        "java/lang/String",
+        "<init>",
+        "([B)V",
+        native_string_init_bytes,
+    );
+    r.register(
+        "java/lang/String",
+        "<init>",
+        "([BII)V",
+        native_string_init_bytes_off_len,
+    );
     // DF05: `new String(StringBuilder)`. The real JDK `String(AbstractStringBuilder,
     // Void)` ctor reads `byte[] val = asb.getValue()` and `Arrays.copyOfRange(val,...)`,
     // assuming the compact-string byte[] layout. CratonVM's synthetic StringBuilder
@@ -1240,13 +1553,23 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     );
 
     // T8.2.4 — String.getBytes(srcBegin, srcEnd, dst, dstBegin)
-    r.register("java/lang/String", "getBytes", "(II[BI)V", native_string_get_bytes_deprecated);
+    r.register(
+        "java/lang/String",
+        "getBytes",
+        "(II[BI)V",
+        native_string_get_bytes_deprecated,
+    );
 
     // T8.2.5 — Character deprecated statics
     let ch = "java/lang/Character";
-    r.register(ch, "isJavaLetter",        "(C)Z", native_char_is_java_letter);
-    r.register(ch, "isJavaLetterOrDigit", "(C)Z", native_char_is_java_letter_or_digit);
-    r.register(ch, "isSpace",             "(C)Z", native_char_is_space);
+    r.register(ch, "isJavaLetter", "(C)Z", native_char_is_java_letter);
+    r.register(
+        ch,
+        "isJavaLetterOrDigit",
+        "(C)Z",
+        native_char_is_java_letter_or_digit,
+    );
+    r.register(ch, "isSpace", "(C)Z", native_char_is_space);
 
     // T8.2.8 — Properties.save
     r.register(
@@ -1258,26 +1581,36 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
 
     // T8.2.9 — Hashtable enumeration
     let ht = "java/util/Hashtable";
-    r.register(ht, "elements", "()Ljava/util/Enumeration;", native_hashtable_elements);
-    r.register(ht, "keys",     "()Ljava/util/Enumeration;", native_hashtable_keys);
+    r.register(
+        ht,
+        "elements",
+        "()Ljava/util/Enumeration;",
+        native_hashtable_elements,
+    );
+    r.register(
+        ht,
+        "keys",
+        "()Ljava/util/Enumeration;",
+        native_hashtable_keys,
+    );
 
     // T8.2.10 — StringBufferInputStream
     let sbis = "java/io/StringBufferInputStream";
-    r.register(sbis, "<init>",    "(Ljava/lang/String;)V", native_sbis_init);
-    r.register(sbis, "read",      "()I",                   native_sbis_read);
-    r.register(sbis, "read",      "([BII)I",               native_sbis_read_buf);
-    r.register(sbis, "available", "()I",                   native_sbis_available);
-    r.register(sbis, "reset",     "()V",                   native_sbis_reset);
+    r.register(sbis, "<init>", "(Ljava/lang/String;)V", native_sbis_init);
+    r.register(sbis, "read", "()I", native_sbis_read);
+    r.register(sbis, "read", "([BII)I", native_sbis_read_buf);
+    r.register(sbis, "available", "()I", native_sbis_available);
+    r.register(sbis, "reset", "()V", native_sbis_reset);
 
     // T8.2.11 — LineNumberInputStream
     let lnis = "java/io/LineNumberInputStream";
-    r.register(lnis, "<init>",         "(Ljava/io/InputStream;)V", native_lnis_init);
-    r.register(lnis, "read",           "()I",                      native_lnis_read);
-    r.register(lnis, "read",           "([BII)I",                  native_lnis_read_buf);
-    r.register(lnis, "getLineNumber",  "()I",                      native_lnis_get_line_number);
-    r.register(lnis, "setLineNumber",  "(I)V",                     native_lnis_set_line_number);
-    r.register(lnis, "available",      "()I",                      native_lnis_available);
-    r.register(lnis, "reset",          "()V",                      native_lnis_reset);
+    r.register(lnis, "<init>", "(Ljava/io/InputStream;)V", native_lnis_init);
+    r.register(lnis, "read", "()I", native_lnis_read);
+    r.register(lnis, "read", "([BII)I", native_lnis_read_buf);
+    r.register(lnis, "getLineNumber", "()I", native_lnis_get_line_number);
+    r.register(lnis, "setLineNumber", "(I)V", native_lnis_set_line_number);
+    r.register(lnis, "available", "()I", native_lnis_available);
+    r.register(lnis, "reset", "()V", native_lnis_reset);
 
     // T8.2.12 — Locale.getISO3Language
     r.register(
@@ -1367,27 +1700,27 @@ mod tests {
     #[test]
     fn test_round_trip_date_parts() {
         let orig = (2023, 5, 15, 12, 30, 45);
-        let ms   = date_fields_to_millis(orig.0, orig.1, orig.2, orig.3, orig.4, orig.5);
-        let p    = millis_to_date_parts(ms);
-        assert_eq!(p.year,  orig.0);
+        let ms = date_fields_to_millis(orig.0, orig.1, orig.2, orig.3, orig.4, orig.5);
+        let p = millis_to_date_parts(ms);
+        assert_eq!(p.year, orig.0);
         assert_eq!(p.month, orig.1);
-        assert_eq!(p.date,  orig.2);
-        assert_eq!(p.hrs,   orig.3);
-        assert_eq!(p.min,   orig.4);
-        assert_eq!(p.sec,   orig.5);
+        assert_eq!(p.date, orig.2);
+        assert_eq!(p.hrs, orig.3);
+        assert_eq!(p.min, orig.4);
+        assert_eq!(p.sec, orig.5);
     }
 
     #[test]
     fn test_round_trip_pre_epoch() {
         // 1960-03-10 08:05:02
         let ms = date_fields_to_millis(1960, 2, 10, 8, 5, 2);
-        let p  = millis_to_date_parts(ms);
-        assert_eq!(p.year,  1960);
+        let p = millis_to_date_parts(ms);
+        assert_eq!(p.year, 1960);
         assert_eq!(p.month, 2);
-        assert_eq!(p.date,  10);
-        assert_eq!(p.hrs,   8);
-        assert_eq!(p.min,   5);
-        assert_eq!(p.sec,   2);
+        assert_eq!(p.date, 10);
+        assert_eq!(p.hrs, 8);
+        assert_eq!(p.min, 5);
+        assert_eq!(p.sec, 2);
     }
 
     // -------------------------------------------------------------------------
@@ -1401,8 +1734,17 @@ mod tests {
         let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         call_native(
-            &reg, &mut ctx, "java/util/Date", "<init>", "(III)V",
-            &[Value::Object(Some(date_obj)), Value::Int(70), Value::Int(0), Value::Int(1)],
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "<init>",
+            "(III)V",
+            &[
+                Value::Object(Some(date_obj)),
+                Value::Int(70),
+                Value::Int(0),
+                Value::Int(1),
+            ],
         )
         .unwrap();
 
@@ -1418,11 +1760,18 @@ mod tests {
 
         // year=70, month=0, day=1, hrs=1, min=0 → 1 hour
         call_native(
-            &reg, &mut ctx, "java/util/Date", "<init>", "(IIIII)V",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "<init>",
+            "(IIIII)V",
             &[
                 Value::Object(Some(date_obj)),
-                Value::Int(70), Value::Int(0), Value::Int(1),
-                Value::Int(1),  Value::Int(0),
+                Value::Int(70),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(1),
+                Value::Int(0),
             ],
         )
         .unwrap();
@@ -1438,11 +1787,19 @@ mod tests {
 
         // year=70, month=0, day=1, hrs=0, min=0, sec=30 → 30 s
         call_native(
-            &reg, &mut ctx, "java/util/Date", "<init>", "(IIIIII)V",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "<init>",
+            "(IIIIII)V",
             &[
                 Value::Object(Some(date_obj)),
-                Value::Int(70), Value::Int(0), Value::Int(1),
-                Value::Int(0),  Value::Int(0), Value::Int(30),
+                Value::Int(70),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(30),
             ],
         )
         .unwrap();
@@ -1455,13 +1812,20 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
-        let str_obj  = ctx.create_string("2000-01-01");
+        let str_obj = ctx.create_string("2000-01-01");
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "<init>", "(Ljava/lang/String;)V",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "<init>",
+            "(Ljava/lang/String;)V",
             &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
         );
-        assert!(res.is_err(), "Date(String) must throw UnsupportedOperationException");
+        assert!(
+            res.is_err(),
+            "Date(String) must throw UnsupportedOperationException"
+        );
         let msg = format!("{}", res.unwrap_err());
         assert!(
             msg.contains("UnsupportedOperationException") || msg.contains("deprecated"),
@@ -1473,10 +1837,17 @@ mod tests {
     // T8.2.2 — Date getters / setters
     // -------------------------------------------------------------------------
 
-    fn make_date_at(ctx: &mut MockNativeContext, year: i32, month: i32, date: i32,
-                    hrs: i32, min: i32, sec: i32) -> cratonvm_types::ObjectRef {
+    fn make_date_at(
+        ctx: &mut MockNativeContext,
+        year: i32,
+        month: i32,
+        date: i32,
+        hrs: i32,
+        min: i32,
+        sec: i32,
+    ) -> cratonvm_types::ObjectRef {
         let obj = alloc_concurrent_synthetic(ctx, "java/util/Date", 4);
-        let ms  = date_fields_to_millis(year, month, date, hrs, min, sec);
+        let ms = date_fields_to_millis(year, month, date, hrs, min, sec);
         set_date_millis(ctx, obj, ms);
         obj
     }
@@ -1488,7 +1859,11 @@ mod tests {
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "getYear", "()I",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getYear",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(100))); // 2000 - 1900
@@ -1501,7 +1876,11 @@ mod tests {
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "getMonth", "()I",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getMonth",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(5))); // June = 5
@@ -1514,7 +1893,11 @@ mod tests {
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "getDate", "()I",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getDate",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(15)));
@@ -1529,7 +1912,11 @@ mod tests {
         set_date_millis(&ctx, obj, 0);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "getDay", "()I",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getDay",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(4)));
@@ -1541,12 +1928,33 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        let h = call_native(&reg, &mut ctx, "java/util/Date", "getHours",   "()I",
-                            &[Value::Object(Some(obj))]).unwrap();
-        let m = call_native(&reg, &mut ctx, "java/util/Date", "getMinutes", "()I",
-                            &[Value::Object(Some(obj))]).unwrap();
-        let s = call_native(&reg, &mut ctx, "java/util/Date", "getSeconds", "()I",
-                            &[Value::Object(Some(obj))]).unwrap();
+        let h = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getHours",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
+        let m = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getMinutes",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
+        let s = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getSeconds",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(h, Some(Value::Int(12)));
         assert_eq!(m, Some(Value::Int(30)));
         assert_eq!(s, Some(Value::Int(45)));
@@ -1559,7 +1967,11 @@ mod tests {
         let obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Date", "getTimezoneOffset", "()I",
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getTimezoneOffset",
+            "()I",
             &[Value::Object(Some(obj))],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(0)));
@@ -1571,11 +1983,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setYear", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(120)]).unwrap(); // 2020
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setYear",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(120)],
+        )
+        .unwrap(); // 2020
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getYear", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getYear",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(120)));
     }
 
@@ -1585,11 +2011,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setMonth", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(11)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setMonth",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(11)],
+        )
+        .unwrap();
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getMonth", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getMonth",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(11)));
     }
 
@@ -1599,11 +2039,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setDate", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(20)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setDate",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(20)],
+        )
+        .unwrap();
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getDate", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getDate",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(20)));
     }
 
@@ -1613,11 +2067,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setHours", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(8)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setHours",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(8)],
+        )
+        .unwrap();
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getHours", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getHours",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(8)));
     }
 
@@ -1627,11 +2095,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setMinutes", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(59)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setMinutes",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(59)],
+        )
+        .unwrap();
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getMinutes", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getMinutes",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(59)));
     }
 
@@ -1641,11 +2123,25 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let obj = make_date_at(&mut ctx, 2000, 5, 15, 12, 30, 45);
 
-        call_native(&reg, &mut ctx, "java/util/Date", "setSeconds", "(I)V",
-                    &[Value::Object(Some(obj)), Value::Int(0)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "setSeconds",
+            "(I)V",
+            &[Value::Object(Some(obj)), Value::Int(0)],
+        )
+        .unwrap();
 
-        let res = call_native(&reg, &mut ctx, "java/util/Date", "getSeconds", "()I",
-                              &[Value::Object(Some(obj))]).unwrap();
+        let res = call_native(
+            &reg,
+            &mut ctx,
+            "java/util/Date",
+            "getSeconds",
+            "()I",
+            &[Value::Object(Some(obj))],
+        )
+        .unwrap();
         assert_eq!(res, Some(Value::Int(0)));
     }
 
@@ -1666,13 +2162,17 @@ mod tests {
 
         let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
         call_native(
-            &reg, &mut ctx, "java/lang/String", "<init>", "([BIII)V",
+            &reg,
+            &mut ctx,
+            "java/lang/String",
+            "<init>",
+            "([BIII)V",
             &[
                 Value::Object(Some(this)),
                 Value::Object(Some(arr)),
-                Value::Int(0),  // hibyte = 0
-                Value::Int(0),  // offset
-                Value::Int(3),  // count
+                Value::Int(0), // hibyte = 0
+                Value::Int(0), // offset
+                Value::Int(3), // count
             ],
         )
         .unwrap();
@@ -1692,13 +2192,17 @@ mod tests {
 
         let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
         call_native(
-            &reg, &mut ctx, "java/lang/String", "<init>", "([BIII)V",
+            &reg,
+            &mut ctx,
+            "java/lang/String",
+            "<init>",
+            "([BIII)V",
             &[
                 Value::Object(Some(this)),
                 Value::Object(Some(arr)),
-                Value::Int(1),  // hibyte
-                Value::Int(0),  // offset
-                Value::Int(1),  // count
+                Value::Int(1), // hibyte
+                Value::Int(0), // offset
+                Value::Int(1), // count
             ],
         )
         .unwrap();
@@ -1713,18 +2217,22 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
-        let arr  = ctx.new_array(ArrayElementType::Byte, 2);
+        let arr = ctx.new_array(ArrayElementType::Byte, 2);
         let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
 
         // offset=1, count=3 → overflow
         let res = call_native(
-            &reg, &mut ctx, "java/lang/String", "<init>", "([BIII)V",
+            &reg,
+            &mut ctx,
+            "java/lang/String",
+            "<init>",
+            "([BIII)V",
             &[
                 Value::Object(Some(this)),
                 Value::Object(Some(arr)),
                 Value::Int(0),
-                Value::Int(1),  // offset
-                Value::Int(3),  // count — 1+3=4 > 2
+                Value::Int(1), // offset
+                Value::Int(3), // count — 1+3=4 > 2
             ],
         );
         assert!(res.is_err(), "Expected ArrayIndexOutOfBoundsException");
@@ -1741,16 +2249,20 @@ mod tests {
 
         // Create a String object for "Hello"
         let str_obj = ctx.create_string("Hello");
-        let dst     = ctx.new_array(ArrayElementType::Byte, 5);
+        let dst = ctx.new_array(ArrayElementType::Byte, 5);
 
         call_native(
-            &reg, &mut ctx, "java/lang/String", "getBytes", "(II[BI)V",
+            &reg,
+            &mut ctx,
+            "java/lang/String",
+            "getBytes",
+            "(II[BI)V",
             &[
                 Value::Object(Some(str_obj)),
-                Value::Int(0),               // srcBegin
-                Value::Int(5),               // srcEnd
+                Value::Int(0), // srcBegin
+                Value::Int(5), // srcEnd
                 Value::Object(Some(dst)),
-                Value::Int(0),               // dstBegin
+                Value::Int(0), // dstBegin
             ],
         )
         .unwrap();
@@ -1777,21 +2289,33 @@ mod tests {
 
         // 'A' is a Java letter
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isJavaLetter", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isJavaLetter",
+            "(C)Z",
             &[Value::Int('A' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(1)));
 
         // '_' is a Java letter
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isJavaLetter", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isJavaLetter",
+            "(C)Z",
             &[Value::Int('_' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(1)));
 
         // '1' is not a Java letter (only letter, not digit, for isJavaLetter)
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isJavaLetter", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isJavaLetter",
+            "(C)Z",
             &[Value::Int('1' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(0)));
@@ -1803,13 +2327,21 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isJavaLetterOrDigit", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isJavaLetterOrDigit",
+            "(C)Z",
             &[Value::Int('5' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(1)));
 
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isJavaLetterOrDigit", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isJavaLetterOrDigit",
+            "(C)Z",
             &[Value::Int('+' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(0)));
@@ -1822,14 +2354,26 @@ mod tests {
 
         for &ws in &[' ', '\t', '\n', '\r', '\x0C'] {
             let res = call_native(
-                &reg, &mut ctx, "java/lang/Character", "isSpace", "(C)Z",
+                &reg,
+                &mut ctx,
+                "java/lang/Character",
+                "isSpace",
+                "(C)Z",
                 &[Value::Int(ws as i32)],
             );
-            assert_eq!(res.unwrap(), Some(Value::Int(1)), "Expected space for {ws:?}");
+            assert_eq!(
+                res.unwrap(),
+                Some(Value::Int(1)),
+                "Expected space for {ws:?}"
+            );
         }
 
         let res = call_native(
-            &reg, &mut ctx, "java/lang/Character", "isSpace", "(C)Z",
+            &reg,
+            &mut ctx,
+            "java/lang/Character",
+            "isSpace",
+            "(C)Z",
             &[Value::Int('x' as i32)],
         );
         assert_eq!(res.unwrap(), Some(Value::Int(0)));
@@ -1843,7 +2387,7 @@ mod tests {
     fn test_properties_save_delegates_to_store() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let props  = alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 0);
+        let props = alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 0);
         let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/OutputStream", 0);
         let header = ctx.create_string("# header");
 
@@ -1853,7 +2397,10 @@ mod tests {
         }
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Properties", "save",
+            &reg,
+            &mut ctx,
+            "java/util/Properties",
+            "save",
             "(Ljava/io/OutputStream;Ljava/lang/String;)V",
             &[
                 Value::Object(Some(props)),
@@ -1875,7 +2422,10 @@ mod tests {
         let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Hashtable", "elements",
+            &reg,
+            &mut ctx,
+            "java/util/Hashtable",
+            "elements",
             "()Ljava/util/Enumeration;",
             &[Value::Object(Some(ht))],
         );
@@ -1895,7 +2445,10 @@ mod tests {
         let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0);
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Hashtable", "keys",
+            &reg,
+            &mut ctx,
+            "java/util/Hashtable",
+            "keys",
             "()Ljava/util/Enumeration;",
             &[Value::Object(Some(ht))],
         );
@@ -1916,22 +2469,46 @@ mod tests {
     fn test_sbis_read_sequential() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream  = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("AB");
 
         call_native(
-            &reg, &mut ctx, "java/io/StringBufferInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "<init>",
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(stream)), Value::Object(Some(str_obj))],
         )
         .unwrap();
 
-        let r1 = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                             "read", "()I", &[Value::Object(Some(stream))]).unwrap();
-        let r2 = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                             "read", "()I", &[Value::Object(Some(stream))]).unwrap();
-        let r3 = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                             "read", "()I", &[Value::Object(Some(stream))]).unwrap();
+        let r1 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "read",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
+        let r2 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "read",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
+        let r3 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "read",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
 
         assert_eq!(r1, Some(Value::Int(b'A' as i32)));
         assert_eq!(r2, Some(Value::Int(b'B' as i32)));
@@ -1942,35 +2519,70 @@ mod tests {
     fn test_sbis_available_and_reset() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream  = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("XYZ");
 
         call_native(
-            &reg, &mut ctx, "java/io/StringBufferInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "<init>",
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(stream)), Value::Object(Some(str_obj))],
         )
         .unwrap();
 
-        let avail = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                                "available", "()I",
-                                &[Value::Object(Some(stream))]).unwrap();
+        let avail = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "available",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
         assert_eq!(avail, Some(Value::Int(3)));
 
         // Read one byte then check available drops to 2.
-        call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                    "read", "()I", &[Value::Object(Some(stream))]).unwrap();
-        let avail2 = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                                 "available", "()I",
-                                 &[Value::Object(Some(stream))]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "read",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
+        let avail2 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "available",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
         assert_eq!(avail2, Some(Value::Int(2)));
 
         // Reset → back to position 0
-        call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                    "reset", "()V", &[Value::Object(Some(stream))]).unwrap();
-        let avail3 = call_native(&reg, &mut ctx, "java/io/StringBufferInputStream",
-                                 "available", "()I",
-                                 &[Value::Object(Some(stream))]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "reset",
+            "()V",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
+        let avail3 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "available",
+            "()I",
+            &[Value::Object(Some(stream))],
+        )
+        .unwrap();
         assert_eq!(avail3, Some(Value::Int(3)));
     }
 
@@ -1978,19 +2590,26 @@ mod tests {
     fn test_sbis_bulk_read() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream  = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("Hello");
-        let buf     = ctx.new_array(ArrayElementType::Byte, 5);
+        let buf = ctx.new_array(ArrayElementType::Byte, 5);
 
         call_native(
-            &reg, &mut ctx, "java/io/StringBufferInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "<init>",
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(stream)), Value::Object(Some(str_obj))],
         )
         .unwrap();
 
         let n = call_native(
-            &reg, &mut ctx, "java/io/StringBufferInputStream", "read", "([BII)I",
+            &reg,
+            &mut ctx,
+            "java/io/StringBufferInputStream",
+            "read",
+            "([BII)I",
             &[
                 Value::Object(Some(stream)),
                 Value::Object(Some(buf)),
@@ -2020,7 +2639,10 @@ mod tests {
         let sbis = alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string(data);
         call_native(
-            reg, ctx, "java/io/StringBufferInputStream", "<init>",
+            reg,
+            ctx,
+            "java/io/StringBufferInputStream",
+            "<init>",
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(sbis)), Value::Object(Some(str_obj))],
         )
@@ -2028,7 +2650,10 @@ mod tests {
 
         let lnis = alloc_concurrent_synthetic(ctx, "java/io/LineNumberInputStream", 4);
         call_native(
-            reg, ctx, "java/io/LineNumberInputStream", "<init>",
+            reg,
+            ctx,
+            "java/io/LineNumberInputStream",
+            "<init>",
             "(Ljava/io/InputStream;)V",
             &[Value::Object(Some(lnis)), Value::Object(Some(sbis))],
         )
@@ -2045,24 +2670,45 @@ mod tests {
         let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
 
         call_native(
-            &reg, &mut ctx, "java/io/LineNumberInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "<init>",
             "(Ljava/io/InputStream;)V",
             &[Value::Object(Some(lnis)), Value::Object(Some(inner))],
         )
         .unwrap();
 
-        let n0 = call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                             "getLineNumber", "()I",
-                             &[Value::Object(Some(lnis))]).unwrap();
+        let n0 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "getLineNumber",
+            "()I",
+            &[Value::Object(Some(lnis))],
+        )
+        .unwrap();
         assert_eq!(n0, Some(Value::Int(0)));
 
-        call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                    "setLineNumber", "(I)V",
-                    &[Value::Object(Some(lnis)), Value::Int(42)]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "setLineNumber",
+            "(I)V",
+            &[Value::Object(Some(lnis)), Value::Int(42)],
+        )
+        .unwrap();
 
-        let n1 = call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                             "getLineNumber", "()I",
-                             &[Value::Object(Some(lnis))]).unwrap();
+        let n1 = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "getLineNumber",
+            "()I",
+            &[Value::Object(Some(lnis))],
+        )
+        .unwrap();
         assert_eq!(n1, Some(Value::Int(42)));
     }
 
@@ -2079,7 +2725,11 @@ mod tests {
         // we exercise only the EOF path here (no pre-armed result → returns -1).
         // The full line-count logic is exercised via the struct test below.
         let _r = call_native(
-            &reg, &mut ctx, "java/io/LineNumberInputStream", "read", "()I",
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "read",
+            "()I",
             &[Value::Object(Some(lnis))],
         )
         .unwrap();
@@ -2091,20 +2741,35 @@ mod tests {
     fn test_lnis_set_line_number_roundtrip() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis  = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
+        let lnis = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
         let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
         call_native(
-            &reg, &mut ctx, "java/io/LineNumberInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "<init>",
             "(Ljava/io/InputStream;)V",
             &[Value::Object(Some(lnis)), Value::Object(Some(inner))],
         )
         .unwrap();
-        call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                    "setLineNumber", "(I)V",
-                    &[Value::Object(Some(lnis)), Value::Int(99)]).unwrap();
-        let n = call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                            "getLineNumber", "()I",
-                            &[Value::Object(Some(lnis))]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "setLineNumber",
+            "(I)V",
+            &[Value::Object(Some(lnis)), Value::Int(99)],
+        )
+        .unwrap();
+        let n = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "getLineNumber",
+            "()I",
+            &[Value::Object(Some(lnis))],
+        )
+        .unwrap();
         assert_eq!(n, Some(Value::Int(99)));
     }
 
@@ -2113,10 +2778,13 @@ mod tests {
         // Manually set line number and saved line number fields, then call reset.
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis  = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
+        let lnis = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
         let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
         call_native(
-            &reg, &mut ctx, "java/io/LineNumberInputStream", "<init>",
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "<init>",
             "(Ljava/io/InputStream;)V",
             &[Value::Object(Some(lnis)), Value::Object(Some(inner))],
         )
@@ -2126,14 +2794,30 @@ mod tests {
         ctx.set_field(lnis, 1, Value::Int(5));
         ctx.set_field(lnis, 2, Value::Int(2)); // saved
 
-        call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                    "reset", "()V",
-                    &[Value::Object(Some(lnis))]).unwrap();
+        call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "reset",
+            "()V",
+            &[Value::Object(Some(lnis))],
+        )
+        .unwrap();
 
-        let n = call_native(&reg, &mut ctx, "java/io/LineNumberInputStream",
-                            "getLineNumber", "()I",
-                            &[Value::Object(Some(lnis))]).unwrap();
-        assert_eq!(n, Some(Value::Int(2)), "reset should restore saved line number");
+        let n = call_native(
+            &reg,
+            &mut ctx,
+            "java/io/LineNumberInputStream",
+            "getLineNumber",
+            "()I",
+            &[Value::Object(Some(lnis))],
+        )
+        .unwrap();
+        assert_eq!(
+            n,
+            Some(Value::Int(2)),
+            "reset should restore saved line number"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2145,11 +2829,14 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
-        let lang   = ctx.create_string("en");
+        let lang = ctx.create_string("en");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Locale", "getISO3Language",
+            &reg,
+            &mut ctx,
+            "java/util/Locale",
+            "getISO3Language",
             "()Ljava/lang/String;",
             &[Value::Object(Some(locale))],
         )
@@ -2166,11 +2853,14 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
-        let lang   = ctx.create_string("fr");
+        let lang = ctx.create_string("fr");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Locale", "getISO3Language",
+            &reg,
+            &mut ctx,
+            "java/util/Locale",
+            "getISO3Language",
             "()Ljava/lang/String;",
             &[Value::Object(Some(locale))],
         )
@@ -2187,11 +2877,14 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
-        let lang   = ctx.create_string("ja");
+        let lang = ctx.create_string("ja");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Locale", "getISO3Language",
+            &reg,
+            &mut ctx,
+            "java/util/Locale",
+            "getISO3Language",
             "()Ljava/lang/String;",
             &[Value::Object(Some(locale))],
         )
@@ -2208,11 +2901,14 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
-        let lang   = ctx.create_string("xx");
+        let lang = ctx.create_string("xx");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
         let res = call_native(
-            &reg, &mut ctx, "java/util/Locale", "getISO3Language",
+            &reg,
+            &mut ctx,
+            "java/util/Locale",
+            "getISO3Language",
             "()Ljava/lang/String;",
             &[Value::Object(Some(locale))],
         )

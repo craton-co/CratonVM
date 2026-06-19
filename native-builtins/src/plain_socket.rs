@@ -80,7 +80,10 @@ const SO_REUSEPORT: i32 = 0x0E;
 // ---------------------------------------------------------------------------
 
 fn ioex<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::IOException { message: msg.into() }.into()
+    RuntimeError::IOException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 /// Temporary diagnostic: `CRATONVM_DBG_NET=1` prints each PlainSocketImpl native
@@ -95,11 +98,17 @@ macro_rules! dbgplain {
 }
 
 fn iae<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::IllegalArgumentException { message: msg.into() }.into()
+    RuntimeError::IllegalArgumentException {
+        message: msg.into(),
+    }
+    .into()
 }
 
 fn npe<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::NullPointerException { message: Some(msg.into()) }.into()
+    RuntimeError::NullPointerException {
+        message: Some(msg.into()),
+    }
+    .into()
 }
 
 fn this_obj(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
@@ -145,7 +154,12 @@ struct SocketRegistry {
 
 fn registry() -> &'static RwLock<SocketRegistry> {
     static R: OnceLock<RwLock<SocketRegistry>> = OnceLock::new();
-    R.get_or_init(|| RwLock::new(SocketRegistry { next_id: 1, sockets: HashMap::new() }))
+    R.get_or_init(|| {
+        RwLock::new(SocketRegistry {
+            next_id: 1,
+            sockets: HashMap::new(),
+        })
+    })
 }
 
 pub(crate) fn register_socket(state: SocketState) -> i32 {
@@ -272,9 +286,12 @@ fn socket_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let domain = Domain::IPV4; // We default to IPv4; explicit IPv6 sockets go through the dual-stack path on Connect.
     let kind = if stream { Type::STREAM } else { Type::DGRAM };
-    let proto = if stream { Some(Protocol::TCP) } else { Some(Protocol::UDP) };
-    let sock = Socket::new(domain, kind, proto)
-        .map_err(|e| ioex(format!("socketCreate: {e}")))?;
+    let proto = if stream {
+        Some(Protocol::TCP)
+    } else {
+        Some(Protocol::UDP)
+    };
+    let sock = Socket::new(domain, kind, proto).map_err(|e| ioex(format!("socketCreate: {e}")))?;
     // Reasonable platform defaults — match HotSpot.
     let _ = sock.set_nonblocking(false);
     let state = SocketState {
@@ -334,8 +351,9 @@ fn socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         _ => 0,
     };
     let ip: std::net::IpAddr = match args.get(1) {
-        Some(Value::Object(Some(o))) => read_inet_addr(ctx, *o)
-            .unwrap_or(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        Some(Value::Object(Some(o))) => {
+            read_inet_addr(ctx, *o).unwrap_or(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        }
         _ => std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     };
     let sa = SocketAddr::new(ip, port as u16);
@@ -590,7 +608,11 @@ fn set_option(
             let ms = unbox_int(ctx, value).unwrap_or(0).max(0) as u32;
             s.so_timeout_ms = if ms == 0 { None } else { Some(ms) };
             // socket2's read_timeout is what controls blocking-read deadline.
-            let dur = if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) };
+            let dur = if ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ms as u64))
+            };
             s.socket
                 .set_read_timeout(dur)
                 .map_err(|e| ioex(format!("SO_TIMEOUT: {e}")))?;
@@ -649,16 +671,26 @@ fn socket_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn get_option(s: &mut SocketState, cmd: i32) -> MethodCallResult {
     let v: i32 = match cmd {
-        TCP_NODELAY => bool_int(s.socket.nodelay().map_err(|e| ioex(format!("TCP_NODELAY: {e}")))?),
-        SO_REUSEADDR => {
-            bool_int(s.socket.reuse_address().map_err(|e| ioex(format!("SO_REUSEADDR: {e}")))?)
-        }
-        SO_KEEPALIVE => {
-            bool_int(s.socket.keepalive().map_err(|e| ioex(format!("SO_KEEPALIVE: {e}")))?)
-        }
-        SO_BROADCAST => {
-            bool_int(s.socket.broadcast().map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?)
-        }
+        TCP_NODELAY => bool_int(
+            s.socket
+                .nodelay()
+                .map_err(|e| ioex(format!("TCP_NODELAY: {e}")))?,
+        ),
+        SO_REUSEADDR => bool_int(
+            s.socket
+                .reuse_address()
+                .map_err(|e| ioex(format!("SO_REUSEADDR: {e}")))?,
+        ),
+        SO_KEEPALIVE => bool_int(
+            s.socket
+                .keepalive()
+                .map_err(|e| ioex(format!("SO_KEEPALIVE: {e}")))?,
+        ),
+        SO_BROADCAST => bool_int(
+            s.socket
+                .broadcast()
+                .map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?,
+        ),
         SO_OOBINLINE => bool_int(
             s.socket
                 .out_of_band_inline()
@@ -672,7 +704,11 @@ fn get_option(s: &mut SocketState, cmd: i32) -> MethodCallResult {
             .socket
             .recv_buffer_size()
             .map_err(|e| ioex(format!("SO_RCVBUF: {e}")))? as i32,
-        SO_LINGER => match s.socket.linger().map_err(|e| ioex(format!("SO_LINGER: {e}")))? {
+        SO_LINGER => match s
+            .socket
+            .linger()
+            .map_err(|e| ioex(format!("SO_LINGER: {e}")))?
+        {
             Some(d) => d.as_secs() as i32,
             None => -1,
         },
@@ -684,10 +720,7 @@ fn get_option(s: &mut SocketState, cmd: i32) -> MethodCallResult {
             // HotSpot's socketGetOption(SO_BINDADDR) which writes the addr
             // through a side-effect parameter we don't model.
             match s.socket.local_addr() {
-                Ok(sa) => sa
-                    .as_socket()
-                    .map(|s| s.port() as i32)
-                    .unwrap_or(0),
+                Ok(sa) => sa.as_socket().map(|s| s.port() as i32).unwrap_or(0),
                 Err(_) => 0,
             }
         }
@@ -697,7 +730,11 @@ fn get_option(s: &mut SocketState, cmd: i32) -> MethodCallResult {
 }
 
 fn bool_int(b: bool) -> i32 {
-    if b { 1 } else { 0 }
+    if b {
+        1
+    } else {
+        0
+    }
 }
 
 fn unbox_bool(ctx: &dyn NativeContext, v: Value) -> Option<bool> {
@@ -807,7 +844,12 @@ fn register_impl_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
 
     r.register(fqn, "socketListen", "(I)V", socket_listen);
 
-    r.register(fqn, "socketAccept", "(Ljava/net/SocketImpl;)V", socket_accept);
+    r.register(
+        fqn,
+        "socketAccept",
+        "(Ljava/net/SocketImpl;)V",
+        socket_accept,
+    );
 
     r.register(fqn, "socketClose0", "(Z)V", socket_close0);
     r.register(fqn, "socketClose0", "()V", socket_close0);
@@ -828,7 +870,10 @@ fn register_impl_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
                 _ => return Err(iae("socketSetOption: missing cmd")),
             };
             let on = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
-            let value = args.get(3).copied().unwrap_or(Value::Int(if on { 1 } else { 0 }));
+            let value = args
+                .get(3)
+                .copied()
+                .unwrap_or(Value::Int(if on { 1 } else { 0 }));
             let effective = if let Value::Object(Some(_)) = value {
                 value
             } else {
@@ -903,7 +948,9 @@ pub fn register_plain_socket_real(r: &mut NativeMethodRegistry) {
     // touches in real-JDK; calling the wrong one would shadow the rich
     // surface in net_phase_e (forbidden file).
     r.register("java/net/Socket", "init", "()V", |_ctx, _args| Ok(None));
-    r.register("java/net/ServerSocket", "init", "()V", |_ctx, _args| Ok(None));
+    r.register("java/net/ServerSocket", "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
     r.set_category(__prev_cat);
 }
 
@@ -1043,7 +1090,9 @@ mod tests {
         let id = fresh_stream_socket();
         with_socket::<_, ()>(id, |s| {
             s.so_timeout_ms = Some(750);
-            s.socket.set_read_timeout(Some(Duration::from_millis(750))).unwrap();
+            s.socket
+                .set_read_timeout(Some(Duration::from_millis(750)))
+                .unwrap();
             Ok(())
         })
         .unwrap();

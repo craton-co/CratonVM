@@ -79,7 +79,7 @@
 //!   dependency.
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult};
+use std::sync::{LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ---------------------------------------------------------------------------
 // LockLevel

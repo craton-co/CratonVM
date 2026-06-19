@@ -83,14 +83,23 @@ impl VarHandleOrder {
         match name {
             "get" | "set" => VarHandleOrder::Plain,
             "getOpaque" | "setOpaque" => VarHandleOrder::Opaque,
-            "getAcquire" | "setRelease" | "compareAndExchangeAcquire"
-            | "compareAndExchangeRelease" | "weakCompareAndSetAcquire"
+            "getAcquire"
+            | "setRelease"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+            | "weakCompareAndSetAcquire"
             | "weakCompareAndSetRelease" => VarHandleOrder::AcquireRelease,
-            "getVolatile" | "setVolatile" | "compareAndSet" | "compareAndExchange"
-            | "weakCompareAndSet" | "weakCompareAndSetPlain" | "getAndSet"
-            | "getAndAdd" | "getAndBitwiseOr" | "getAndBitwiseAnd" | "getAndBitwiseXor" => {
-                VarHandleOrder::Volatile
-            }
+            "getVolatile"
+            | "setVolatile"
+            | "compareAndSet"
+            | "compareAndExchange"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "getAndSet"
+            | "getAndAdd"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseXor" => VarHandleOrder::Volatile,
             _ => VarHandleOrder::Plain,
         }
     }
@@ -231,7 +240,10 @@ mod tests {
 
     #[test]
     fn method_name_ordering_maps_correctly() {
-        assert_eq!(VarHandleOrder::from_method_name("get"), VarHandleOrder::Plain);
+        assert_eq!(
+            VarHandleOrder::from_method_name("get"),
+            VarHandleOrder::Plain
+        );
         assert_eq!(
             VarHandleOrder::from_method_name("getOpaque"),
             VarHandleOrder::Opaque
@@ -281,10 +293,7 @@ mod tests {
         assert_eq!(h.default_value(), Value::Long(0));
         let h = ResolvedVarHandle::new(VarHandleKind::InstanceField, "D");
         assert_eq!(h.default_value(), Value::Double(0.0));
-        let h = ResolvedVarHandle::new(
-            VarHandleKind::InstanceField,
-            "Ljava/lang/String;",
-        );
+        let h = ResolvedVarHandle::new(VarHandleKind::InstanceField, "Ljava/lang/String;");
         assert_eq!(h.default_value(), Value::Object(None));
     }
 
@@ -292,10 +301,7 @@ mod tests {
     fn cas_equality_handles_primitives_and_null() {
         assert!(values_equal_for_vh_cas(&Value::Int(42), &Value::Int(42)));
         assert!(!values_equal_for_vh_cas(&Value::Int(1), &Value::Int(2)));
-        assert!(values_equal_for_vh_cas(
-            &Value::Long(-1),
-            &Value::Long(-1)
-        ));
+        assert!(values_equal_for_vh_cas(&Value::Long(-1), &Value::Long(-1)));
         assert!(values_equal_for_vh_cas(
             &Value::Object(None),
             &Value::Object(None)

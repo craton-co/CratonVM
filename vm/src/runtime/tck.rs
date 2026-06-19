@@ -518,266 +518,1546 @@ impl TckRegistry {
         ));
 
         // --- java.lang (S46 additions) ---
-        self.register(TckTest::passing("lang.Object.hashCodeConsistent", TckCategory::Lang, "cratonvm/TckLang.java#obj_hashCode_consistent", vec!["object", "hashcode"]));
-        self.register(TckTest::passing("lang.Object.equalsIdentity", TckCategory::Lang, "cratonvm/TckLang.java#obj_equals_identity", vec!["object", "equals"]));
-        self.register(TckTest::passing("lang.Object.equalsDifferent", TckCategory::Lang, "cratonvm/TckLang.java#obj_equals_different", vec!["object", "equals"]));
-        self.register(TckTest::passing("lang.Object.getClass", TckCategory::Lang, "cratonvm/TckLang.java#obj_getClass", vec!["object", "getclass"]));
-        self.register(TckTest::passing("lang.Object.toString", TckCategory::Lang, "cratonvm/TckLang.java#obj_toString", vec!["object", "tostring"]));
-        self.register(TckTest::passing("lang.String.length", TckCategory::Lang, "cratonvm/TckLang.java#str_length", vec!["string", "length"]));
-        self.register(TckTest::passing("lang.String.charAt", TckCategory::Lang, "cratonvm/TckLang.java#str_charAt", vec!["string", "charat"]));
-        self.register(TckTest::passing("lang.String.equals", TckCategory::Lang, "cratonvm/TckLang.java#str_equals", vec!["string", "equals"]));
-        self.register(TckTest::passing("lang.String.compareTo", TckCategory::Lang, "cratonvm/TckLang.java#str_compareTo", vec!["string", "compare"]));
-        self.register(TckTest::passing("lang.String.substring", TckCategory::Lang, "cratonvm/TckLang.java#str_substring", vec!["string", "substring"]));
-        self.register(TckTest::passing("lang.String.indexOf", TckCategory::Lang, "cratonvm/TckLang.java#str_indexOf", vec!["string", "indexof"]));
-        self.register(TckTest::passing("lang.String.contains", TckCategory::Lang, "cratonvm/TckLang.java#str_contains", vec!["string", "contains"]));
-        self.register(TckTest::passing("lang.String.isEmpty", TckCategory::Lang, "cratonvm/TckLang.java#str_isEmpty", vec!["string", "empty"]));
-        self.register(TckTest::passing("lang.String.trim", TckCategory::Lang, "cratonvm/TckLang.java#str_trim", vec!["string", "trim"]));
-        self.register(TckTest::passing("lang.String.toLowerCase", TckCategory::Lang, "cratonvm/TckLang.java#str_toLowerCase", vec!["string", "case"]));
-        self.register(TckTest::passing("lang.String.toUpperCase", TckCategory::Lang, "cratonvm/TckLang.java#str_toUpperCase", vec!["string", "case"]));
-        self.register(TckTest::passing("lang.String.startsEndsWith", TckCategory::Lang, "cratonvm/TckLang.java#str_startsEndsWith", vec!["string", "prefix", "suffix"]));
-        self.register(TckTest::passing("lang.String.replace", TckCategory::Lang, "cratonvm/TckLang.java#str_replace", vec!["string", "replace"]));
-        self.register(TckTest::passing("lang.String.toCharArray", TckCategory::Lang, "cratonvm/TckLang.java#str_toCharArray", vec!["string", "chararray"]));
-        self.register(TckTest::passing("lang.String.valueOfInt", TckCategory::Lang, "cratonvm/TckLang.java#str_valueOf_int", vec!["string", "valueof"]));
-        self.register(TckTest::passing("lang.String.valueOfBool", TckCategory::Lang, "cratonvm/TckLang.java#str_valueOf_bool", vec!["string", "valueof"]));
-        self.register(TckTest::passing("lang.String.concatOp", TckCategory::Lang, "cratonvm/TckLang.java#str_concat_op", vec!["string", "concat"]));
-        self.register(TckTest::passing("lang.Integer.parseInt", TckCategory::Lang, "cratonvm/TckLang.java#int_parseInt", vec!["integer", "parseint"]));
-        self.register(TckTest::passing("lang.Integer.parseIntNeg", TckCategory::Lang, "cratonvm/TckLang.java#int_parseInt_neg", vec!["integer", "parseint"]));
-        self.register(TckTest::passing("lang.Integer.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#int_valueOf", vec!["integer", "valueof"]));
-        self.register(TckTest::passing("lang.Integer.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#int_toString", vec!["integer", "tostring"]));
-        self.register(TckTest::passing("lang.Integer.toHexString", TckCategory::Lang, "cratonvm/TckLang.java#int_toHexString", vec!["integer", "hex"]));
-        self.register(TckTest::passing("lang.Integer.constants", TckCategory::Lang, "cratonvm/TckLang.java#int_constants", vec!["integer", "constants"]));
-        self.register(TckTest::passing("lang.Integer.autoboxCache", TckCategory::Lang, "cratonvm/TckLang.java#int_autobox_cache", vec!["integer", "autobox", "cache"]));
-        self.register(TckTest::passing("lang.Integer.compareTo", TckCategory::Lang, "cratonvm/TckLang.java#int_compareTo", vec!["integer", "compare"]));
-        self.register(TckTest::passing("lang.Long.parseLong", TckCategory::Lang, "cratonvm/TckLang.java#long_parseLong", vec!["long", "parse"]));
-        self.register(TckTest::passing("lang.Long.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#long_valueOf", vec!["long", "valueof"]));
-        self.register(TckTest::passing("lang.Long.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#long_toString", vec!["long", "tostring"]));
-        self.register(TckTest::passing("lang.Long.maxValue", TckCategory::Lang, "cratonvm/TckLang.java#long_maxValue", vec!["long", "constants"]));
-        self.register(TckTest::passing("lang.Double.parseDouble", TckCategory::Lang, "cratonvm/TckLang.java#double_parseDouble", vec!["double", "parse"]));
-        self.register(TckTest::passing("lang.Double.isNaN", TckCategory::Lang, "cratonvm/TckLang.java#double_isNaN", vec!["double", "nan"]));
-        self.register(TckTest::passing("lang.Double.isInfinite", TckCategory::Lang, "cratonvm/TckLang.java#double_isInfinite", vec!["double", "infinity"]));
-        self.register(TckTest::passing("lang.Double.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#double_toString", vec!["double", "tostring"]));
-        self.register(TckTest::passing("lang.Double.bitsRoundtrip", TckCategory::Lang, "cratonvm/TckLang.java#double_bits_roundtrip", vec!["double", "bits"]));
-        self.register(TckTest::passing("lang.Float.parseFloat", TckCategory::Lang, "cratonvm/TckLang.java#float_parseFloat", vec!["float", "parse"]));
-        self.register(TckTest::passing("lang.Float.isNaN", TckCategory::Lang, "cratonvm/TckLang.java#float_isNaN", vec!["float", "nan"]));
-        self.register(TckTest::passing("lang.Float.bitsRoundtrip", TckCategory::Lang, "cratonvm/TckLang.java#float_bits_roundtrip", vec!["float", "bits"]));
-        self.register(TckTest::passing("lang.Boolean.parseBoolean", TckCategory::Lang, "cratonvm/TckLang.java#bool_parseBoolean", vec!["boolean", "parse"]));
-        self.register(TckTest::passing("lang.Boolean.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#bool_valueOf", vec!["boolean", "valueof"]));
-        self.register(TckTest::passing("lang.Boolean.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#bool_toString", vec!["boolean", "tostring"]));
-        self.register(TckTest::passing("lang.Byte.constants", TckCategory::Lang, "cratonvm/TckLang.java#byte_constants", vec!["byte", "constants"]));
-        self.register(TckTest::passing("lang.Byte.parseByte", TckCategory::Lang, "cratonvm/TckLang.java#byte_parseByte", vec!["byte", "parse"]));
-        self.register(TckTest::passing("lang.Short.constants", TckCategory::Lang, "cratonvm/TckLang.java#short_constants", vec!["short", "constants"]));
-        self.register(TckTest::passing("lang.Short.parseShort", TckCategory::Lang, "cratonvm/TckLang.java#short_parseShort", vec!["short", "parse"]));
-        self.register(TckTest::passing("lang.Character.isDigit", TckCategory::Lang, "cratonvm/TckLang.java#char_isDigit", vec!["character", "digit"]));
-        self.register(TckTest::passing("lang.Character.isLetter", TckCategory::Lang, "cratonvm/TckLang.java#char_isLetter", vec!["character", "letter"]));
-        self.register(TckTest::passing("lang.Character.case", TckCategory::Lang, "cratonvm/TckLang.java#char_case", vec!["character", "case"]));
-        self.register(TckTest::passing("lang.Character.convert", TckCategory::Lang, "cratonvm/TckLang.java#char_convert", vec!["character", "convert"]));
-        self.register(TckTest::passing("lang.Character.isWhitespace", TckCategory::Lang, "cratonvm/TckLang.java#char_isWhitespace", vec!["character", "whitespace"]));
-        self.register(TckTest::passing("lang.Math.abs", TckCategory::Lang, "cratonvm/TckLang.java#math_abs", vec!["math", "abs"]));
-        self.register(TckTest::passing("lang.Math.maxMin", TckCategory::Lang, "cratonvm/TckLang.java#math_maxMin", vec!["math", "max", "min"]));
-        self.register(TckTest::passing("lang.Math.sqrt", TckCategory::Lang, "cratonvm/TckLang.java#math_sqrt", vec!["math", "sqrt"]));
-        self.register(TckTest::passing("lang.Math.pow", TckCategory::Lang, "cratonvm/TckLang.java#math_pow", vec!["math", "pow"]));
-        self.register(TckTest::passing("lang.Math.floorCeil", TckCategory::Lang, "cratonvm/TckLang.java#math_floorCeil", vec!["math", "floor", "ceil"]));
-        self.register(TckTest::passing("lang.Math.round", TckCategory::Lang, "cratonvm/TckLang.java#math_round", vec!["math", "round"]));
-        self.register(TckTest::passing("lang.Math.constants", TckCategory::Lang, "cratonvm/TckLang.java#math_constants", vec!["math", "constants"]));
-        self.register(TckTest::passing("lang.Math.sinCos", TckCategory::Lang, "cratonvm/TckLang.java#math_sinCos", vec!["math", "trig"]));
-        self.register(TckTest::passing("lang.Math.logExp", TckCategory::Lang, "cratonvm/TckLang.java#math_logExp", vec!["math", "log", "exp"]));
-        self.register(TckTest::passing("lang.System.currentTimeMillis", TckCategory::Lang, "cratonvm/TckLang.java#sys_currentTimeMillis", vec!["system", "time"]));
-        self.register(TckTest::passing("lang.System.nanoTime", TckCategory::Lang, "cratonvm/TckLang.java#sys_nanoTime", vec!["system", "time"]));
-        self.register(TckTest::passing("lang.System.arraycopy", TckCategory::Lang, "cratonvm/TckLang.java#sys_arraycopy", vec!["system", "arraycopy"]));
-        self.register(TckTest::passing("lang.System.identityHashCode", TckCategory::Lang, "cratonvm/TckLang.java#sys_identityHashCode", vec!["system", "hashcode"]));
-        self.register(TckTest::passing("lang.StringBuilder.basic", TckCategory::Lang, "cratonvm/TckLang.java#sb_basic", vec!["stringbuilder", "basic"]));
-        self.register(TckTest::passing("lang.StringBuilder.appendInt", TckCategory::Lang, "cratonvm/TckLang.java#sb_appendInt", vec!["stringbuilder", "append"]));
-        self.register(TckTest::passing("lang.StringBuilder.chain", TckCategory::Lang, "cratonvm/TckLang.java#sb_chain", vec!["stringbuilder", "chain"]));
-        self.register(TckTest::passing("lang.StringBuilder.length", TckCategory::Lang, "cratonvm/TckLang.java#sb_length", vec!["stringbuilder", "length"]));
-        self.register(TckTest::passing("lang.StringBuilder.reverse", TckCategory::Lang, "cratonvm/TckLang.java#sb_reverse", vec!["stringbuilder", "reverse"]));
-        self.register(TckTest::passing("lang.StringBuilder.delete", TckCategory::Lang, "cratonvm/TckLang.java#sb_delete", vec!["stringbuilder", "delete"]));
-        self.register(TckTest::passing("lang.Exception.getMessage", TckCategory::Lang, "cratonvm/TckLang.java#exc_getMessage", vec!["exception", "message"]));
-        self.register(TckTest::passing("lang.Exception.getCause", TckCategory::Lang, "cratonvm/TckLang.java#exc_getCause", vec!["exception", "cause"]));
-        self.register(TckTest::passing("lang.Exception.tryCatch", TckCategory::Lang, "cratonvm/TckLang.java#exc_tryCatch", vec!["exception", "trycatch"]));
-        self.register(TckTest::passing("lang.Exception.hierarchy", TckCategory::Lang, "cratonvm/TckLang.java#exc_hierarchy", vec!["exception", "hierarchy"]));
-        self.register(TckTest::passing("lang.Exception.npeClass", TckCategory::Lang, "cratonvm/TckLang.java#exc_npe_class", vec!["exception", "npe"]));
-        self.register(TckTest::passing("lang.Exception.finally", TckCategory::Lang, "cratonvm/TckLang.java#exc_finally", vec!["exception", "finally"]));
-        self.register(TckTest::passing("lang.Class.getName", TckCategory::Lang, "cratonvm/TckLang.java#cls_getName", vec!["class", "name"]));
-        self.register(TckTest::passing("lang.Class.isInterface", TckCategory::Lang, "cratonvm/TckLang.java#cls_isInterface", vec!["class", "interface"]));
-        self.register(TckTest::passing("lang.Class.isPrimitive", TckCategory::Lang, "cratonvm/TckLang.java#cls_isPrimitive", vec!["class", "primitive"]));
-        self.register(TckTest::passing("lang.Class.isArray", TckCategory::Lang, "cratonvm/TckLang.java#cls_isArray", vec!["class", "array"]));
-        self.register(TckTest::passing("lang.Class.getSuperclass", TckCategory::Lang, "cratonvm/TckLang.java#cls_getSuperclass", vec!["class", "superclass"]));
-        self.register(TckTest::passing("lang.Runtime.availableProcessors", TckCategory::Lang, "cratonvm/TckLang.java#rt_availableProcessors", vec!["runtime", "processors"]));
-        self.register(TckTest::passing("lang.Runtime.memory", TckCategory::Lang, "cratonvm/TckLang.java#rt_memory", vec!["runtime", "memory"]));
-        self.register(TckTest::passing("lang.Thread.currentThread", TckCategory::Lang, "cratonvm/TckLang.java#thread_currentThread", vec!["thread", "current"]));
-        self.register(TckTest::passing("lang.Thread.isAlive", TckCategory::Lang, "cratonvm/TckLang.java#thread_isAlive", vec!["thread", "alive"]));
-        self.register(TckTest::passing("lang.Cast.intToLong", TckCategory::Lang, "cratonvm/TckLang.java#cast_int_to_long", vec!["cast", "widening"]));
-        self.register(TckTest::passing("lang.Cast.longToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_long_to_int", vec!["cast", "narrowing"]));
-        self.register(TckTest::passing("lang.Cast.intToFloat", TckCategory::Lang, "cratonvm/TckLang.java#cast_int_to_float", vec!["cast", "float"]));
-        self.register(TckTest::passing("lang.Cast.doubleToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_double_to_int", vec!["cast", "truncation"]));
-        self.register(TckTest::passing("lang.Cast.charToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_char_to_int", vec!["cast", "char"]));
-        self.register(TckTest::passing("lang.Autobox.int", TckCategory::Lang, "cratonvm/TckLang.java#autobox_int", vec!["autobox", "integer"]));
-        self.register(TckTest::passing("lang.Autobox.double", TckCategory::Lang, "cratonvm/TckLang.java#autobox_double", vec!["autobox", "double"]));
-        self.register(TckTest::passing("lang.Autobox.boolean", TckCategory::Lang, "cratonvm/TckLang.java#autobox_boolean", vec!["autobox", "boolean"]));
+        self.register(TckTest::passing(
+            "lang.Object.hashCodeConsistent",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#obj_hashCode_consistent",
+            vec!["object", "hashcode"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Object.equalsIdentity",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#obj_equals_identity",
+            vec!["object", "equals"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Object.equalsDifferent",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#obj_equals_different",
+            vec!["object", "equals"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Object.getClass",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#obj_getClass",
+            vec!["object", "getclass"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Object.toString",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#obj_toString",
+            vec!["object", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.length",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_length",
+            vec!["string", "length"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.charAt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_charAt",
+            vec!["string", "charat"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.equals",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_equals",
+            vec!["string", "equals"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.compareTo",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_compareTo",
+            vec!["string", "compare"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.substring",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_substring",
+            vec!["string", "substring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.indexOf",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_indexOf",
+            vec!["string", "indexof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.contains",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_contains",
+            vec!["string", "contains"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.isEmpty",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_isEmpty",
+            vec!["string", "empty"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.trim",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_trim",
+            vec!["string", "trim"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.toLowerCase",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_toLowerCase",
+            vec!["string", "case"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.toUpperCase",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_toUpperCase",
+            vec!["string", "case"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.startsEndsWith",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_startsEndsWith",
+            vec!["string", "prefix", "suffix"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.replace",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_replace",
+            vec!["string", "replace"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.toCharArray",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_toCharArray",
+            vec!["string", "chararray"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.valueOfInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_valueOf_int",
+            vec!["string", "valueof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.valueOfBool",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_valueOf_bool",
+            vec!["string", "valueof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.String.concatOp",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#str_concat_op",
+            vec!["string", "concat"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.parseInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_parseInt",
+            vec!["integer", "parseint"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.parseIntNeg",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_parseInt_neg",
+            vec!["integer", "parseint"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.valueOf",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_valueOf",
+            vec!["integer", "valueof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.toStringVal",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_toString",
+            vec!["integer", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.toHexString",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_toHexString",
+            vec!["integer", "hex"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.constants",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_constants",
+            vec!["integer", "constants"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.autoboxCache",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_autobox_cache",
+            vec!["integer", "autobox", "cache"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Integer.compareTo",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#int_compareTo",
+            vec!["integer", "compare"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Long.parseLong",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#long_parseLong",
+            vec!["long", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Long.valueOf",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#long_valueOf",
+            vec!["long", "valueof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Long.toStringVal",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#long_toString",
+            vec!["long", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Long.maxValue",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#long_maxValue",
+            vec!["long", "constants"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Double.parseDouble",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#double_parseDouble",
+            vec!["double", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Double.isNaN",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#double_isNaN",
+            vec!["double", "nan"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Double.isInfinite",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#double_isInfinite",
+            vec!["double", "infinity"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Double.toStringVal",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#double_toString",
+            vec!["double", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Double.bitsRoundtrip",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#double_bits_roundtrip",
+            vec!["double", "bits"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Float.parseFloat",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#float_parseFloat",
+            vec!["float", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Float.isNaN",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#float_isNaN",
+            vec!["float", "nan"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Float.bitsRoundtrip",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#float_bits_roundtrip",
+            vec!["float", "bits"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Boolean.parseBoolean",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#bool_parseBoolean",
+            vec!["boolean", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Boolean.valueOf",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#bool_valueOf",
+            vec!["boolean", "valueof"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Boolean.toStringVal",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#bool_toString",
+            vec!["boolean", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Byte.constants",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#byte_constants",
+            vec!["byte", "constants"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Byte.parseByte",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#byte_parseByte",
+            vec!["byte", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Short.constants",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#short_constants",
+            vec!["short", "constants"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Short.parseShort",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#short_parseShort",
+            vec!["short", "parse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Character.isDigit",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#char_isDigit",
+            vec!["character", "digit"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Character.isLetter",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#char_isLetter",
+            vec!["character", "letter"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Character.case",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#char_case",
+            vec!["character", "case"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Character.convert",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#char_convert",
+            vec!["character", "convert"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Character.isWhitespace",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#char_isWhitespace",
+            vec!["character", "whitespace"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.abs",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_abs",
+            vec!["math", "abs"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.maxMin",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_maxMin",
+            vec!["math", "max", "min"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.sqrt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_sqrt",
+            vec!["math", "sqrt"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.pow",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_pow",
+            vec!["math", "pow"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.floorCeil",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_floorCeil",
+            vec!["math", "floor", "ceil"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.round",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_round",
+            vec!["math", "round"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.constants",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_constants",
+            vec!["math", "constants"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.sinCos",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_sinCos",
+            vec!["math", "trig"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Math.logExp",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#math_logExp",
+            vec!["math", "log", "exp"],
+        ));
+        self.register(TckTest::passing(
+            "lang.System.currentTimeMillis",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sys_currentTimeMillis",
+            vec!["system", "time"],
+        ));
+        self.register(TckTest::passing(
+            "lang.System.nanoTime",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sys_nanoTime",
+            vec!["system", "time"],
+        ));
+        self.register(TckTest::passing(
+            "lang.System.arraycopy",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sys_arraycopy",
+            vec!["system", "arraycopy"],
+        ));
+        self.register(TckTest::passing(
+            "lang.System.identityHashCode",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sys_identityHashCode",
+            vec!["system", "hashcode"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.basic",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_basic",
+            vec!["stringbuilder", "basic"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.appendInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_appendInt",
+            vec!["stringbuilder", "append"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.chain",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_chain",
+            vec!["stringbuilder", "chain"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.length",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_length",
+            vec!["stringbuilder", "length"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.reverse",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_reverse",
+            vec!["stringbuilder", "reverse"],
+        ));
+        self.register(TckTest::passing(
+            "lang.StringBuilder.delete",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#sb_delete",
+            vec!["stringbuilder", "delete"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.getMessage",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_getMessage",
+            vec!["exception", "message"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.getCause",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_getCause",
+            vec!["exception", "cause"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.tryCatch",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_tryCatch",
+            vec!["exception", "trycatch"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.hierarchy",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_hierarchy",
+            vec!["exception", "hierarchy"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.npeClass",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_npe_class",
+            vec!["exception", "npe"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Exception.finally",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#exc_finally",
+            vec!["exception", "finally"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Class.getName",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cls_getName",
+            vec!["class", "name"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Class.isInterface",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cls_isInterface",
+            vec!["class", "interface"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Class.isPrimitive",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cls_isPrimitive",
+            vec!["class", "primitive"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Class.isArray",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cls_isArray",
+            vec!["class", "array"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Class.getSuperclass",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cls_getSuperclass",
+            vec!["class", "superclass"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Runtime.availableProcessors",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#rt_availableProcessors",
+            vec!["runtime", "processors"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Runtime.memory",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#rt_memory",
+            vec!["runtime", "memory"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Thread.currentThread",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#thread_currentThread",
+            vec!["thread", "current"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Thread.isAlive",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#thread_isAlive",
+            vec!["thread", "alive"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Cast.intToLong",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cast_int_to_long",
+            vec!["cast", "widening"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Cast.longToInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cast_long_to_int",
+            vec!["cast", "narrowing"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Cast.intToFloat",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cast_int_to_float",
+            vec!["cast", "float"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Cast.doubleToInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cast_double_to_int",
+            vec!["cast", "truncation"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Cast.charToInt",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#cast_char_to_int",
+            vec!["cast", "char"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Autobox.int",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#autobox_int",
+            vec!["autobox", "integer"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Autobox.double",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#autobox_double",
+            vec!["autobox", "double"],
+        ));
+        self.register(TckTest::passing(
+            "lang.Autobox.boolean",
+            TckCategory::Lang,
+            "cratonvm/TckLang.java#autobox_boolean",
+            vec!["autobox", "boolean"],
+        ));
 
         // --- java.util.concurrent (S49 additions) ---
-        self.register(TckTest::passing("concurrent.AtomicInt.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntCas", vec!["atomic", "cas"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.incrDecr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntIncrDecr", vec!["atomic", "increment"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.preIncrDecr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntPreIncrDecr", vec!["atomic", "increment"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.addOps", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntAddOps", vec!["atomic", "add"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntGetAndSet", vec!["atomic", "getandset"]));
-        self.register(TckTest::passing("concurrent.AtomicLong.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicLongBasic", vec!["atomic", "long"]));
-        self.register(TckTest::passing("concurrent.AtomicBoolean.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicBooleanCas", vec!["atomic", "boolean"]));
-        self.register(TckTest::passing("concurrent.AtomicBoolean.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicBooleanGetAndSet", vec!["atomic", "boolean"]));
-        self.register(TckTest::passing("concurrent.AtomicRef.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicRefCas", vec!["atomic", "reference"]));
-        self.register(TckTest::passing("concurrent.AtomicRef.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicRefGetAndSet", vec!["atomic", "reference"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.concurrentIncr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntConcurrentIncr", vec!["atomic", "threaded"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockBasic", vec!["lock", "reentrant"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.tryLock", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockTryLock", vec!["lock", "trylock"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.reentrant", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockReentrant", vec!["lock", "reentrant"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.condition", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockCondition", vec!["lock", "condition"]));
-        self.register(TckTest::passing("concurrent.ReadWriteLock.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReadWriteLockBasic", vec!["lock", "readwrite"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchBasic", vec!["latch", "countdown"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.getCount", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchGetCount", vec!["latch", "count"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.extraCountDown", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchExtraCountDown", vec!["latch", "extra"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.toString", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchToString", vec!["latch", "tostring"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.awaitTimeout", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchAwaitTimeout", vec!["latch", "timeout"]));
-        self.register(TckTest::passing("concurrent.Semaphore.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreBasic", vec!["semaphore", "basic"]));
-        self.register(TckTest::passing("concurrent.Semaphore.tryAcquire", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreTryAcquire", vec!["semaphore", "tryacquire"]));
-        self.register(TckTest::passing("concurrent.Semaphore.drain", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreDrain", vec!["semaphore", "drain"]));
-        self.register(TckTest::passing("concurrent.Semaphore.releaseAboveInit", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreReleaseAboveInit", vec!["semaphore", "release"]));
-        self.register(TckTest::passing("concurrent.Semaphore.acquireN", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreAcquireN", vec!["semaphore", "acquiren"]));
-        self.register(TckTest::passing("concurrent.Semaphore.isFair", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreIsFair", vec!["semaphore", "fairness"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.getParties", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierGetParties", vec!["barrier", "parties"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.isBroken", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierIsBroken", vec!["barrier", "broken"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.getNumberWaiting", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierGetNumberWaiting", vec!["barrier", "waiting"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.reset", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierReset", vec!["barrier", "reset"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putGet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapPutGet", vec!["chm", "putget"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsKey", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapContainsKey", vec!["chm", "contains"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.remove", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapRemove", vec!["chm", "remove"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putIfAbsent", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapPutIfAbsent", vec!["chm", "putifabsent"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.isEmpty", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapIsEmpty", vec!["chm", "empty"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.getOrDefault", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapGetOrDefault", vec!["chm", "default"]));
-        self.register(TckTest::passing("concurrent.COWAL.addGet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALAddGet", vec!["cowal", "addget"]));
-        self.register(TckTest::passing("concurrent.COWAL.contains", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALContains", vec!["cowal", "contains"]));
-        self.register(TckTest::passing("concurrent.COWAL.remove", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALRemove", vec!["cowal", "remove"]));
-        self.register(TckTest::passing("concurrent.COWAL.isEmpty", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALIsEmpty", vec!["cowal", "empty"]));
-        self.register(TckTest::passing("concurrent.LBQ.offerPoll", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueOfferPoll", vec!["lbq", "offerpoll"]));
-        self.register(TckTest::passing("concurrent.LBQ.putTake", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueuePutTake", vec!["lbq", "puttake"]));
-        self.register(TckTest::passing("concurrent.LBQ.peek", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueuePeek", vec!["lbq", "peek"]));
-        self.register(TckTest::passing("concurrent.LBQ.isEmptySize", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueIsEmptySize", vec!["lbq", "size"]));
-        self.register(TckTest::passing("concurrent.LBQ.capacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueCapacity", vec!["lbq", "capacity"]));
-        self.register(TckTest::passing("concurrent.ABQ.offerPoll", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueOfferPoll", vec!["abq", "offerpoll"]));
-        self.register(TckTest::passing("concurrent.ABQ.capacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueCapacity", vec!["abq", "capacity"]));
-        self.register(TckTest::passing("concurrent.ABQ.remainingCapacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueRemainingCapacity", vec!["abq", "remaining"]));
-        self.register(TckTest::passing("concurrent.CF.complete", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureComplete", vec!["cf", "complete"]));
-        self.register(TckTest::passing("concurrent.CF.completedFuture", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureCompletedFuture", vec!["cf", "factory"]));
-        self.register(TckTest::passing("concurrent.CF.thenApply", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureThenApply", vec!["cf", "thenapply"]));
-        self.register(TckTest::passing("concurrent.CF.thenAccept", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureThenAccept", vec!["cf", "thenaccept"]));
-        self.register(TckTest::passing("concurrent.CF.state", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureState", vec!["cf", "state"]));
-        self.register(TckTest::passing("concurrent.CF.cancel", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureCancel", vec!["cf", "cancel"]));
-        self.register(TckTest::passing("concurrent.CF.exceptionally", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureExceptionally", vec!["cf", "exceptionally"]));
-        self.register(TckTest::passing("concurrent.CF.isCompletedExceptionally", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureIsCompletedExceptionally", vec!["cf", "exceptional"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchThreaded", vec!["latch", "threaded"]));
-        self.register(TckTest::passing("concurrent.Semaphore.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreThreaded", vec!["semaphore", "threaded"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockThreaded", vec!["lock", "threaded"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapThreaded", vec!["chm", "threaded"]));
-        self.register(TckTest::passing("concurrent.LBQ.producerConsumer", TckCategory::Concurrent, "cratonvm/JucComplete.java#testBlockingQueueProducerConsumer", vec!["lbq", "threaded"]));
-        self.register(TckTest::passing("concurrent.COWAL.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALThreaded", vec!["cowal", "threaded"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.lazySet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntLazySet", vec!["atomic", "lazyset"]));
-        self.register(TckTest::passing("concurrent.AtomicLong.lazySet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicLongLazySet", vec!["atomic", "lazyset"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.replace", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapReplace", vec!["chm", "replace"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsValue", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapContainsValue", vec!["chm", "containsvalue"]));
-        self.register(TckTest::passing("concurrent.Synchronizer.composition", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSynchronizerComposition", vec!["synchronizer", "integration"]));
-        self.register(TckTest::passing("concurrent.LBQ.clear", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueClear", vec!["lbq", "clear"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.clear", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapClear", vec!["chm", "clear"]));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.cas",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntCas",
+            vec!["atomic", "cas"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.incrDecr",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntIncrDecr",
+            vec!["atomic", "increment"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.preIncrDecr",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntPreIncrDecr",
+            vec!["atomic", "increment"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.addOps",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntAddOps",
+            vec!["atomic", "add"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.getAndSet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntGetAndSet",
+            vec!["atomic", "getandset"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicLong.basic",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicLongBasic",
+            vec!["atomic", "long"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicBoolean.cas",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicBooleanCas",
+            vec!["atomic", "boolean"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicBoolean.getAndSet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicBooleanGetAndSet",
+            vec!["atomic", "boolean"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicRef.cas",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicRefCas",
+            vec!["atomic", "reference"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicRef.getAndSet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicRefGetAndSet",
+            vec!["atomic", "reference"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.concurrentIncr",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntConcurrentIncr",
+            vec!["atomic", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReentrantLock.basic",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReentrantLockBasic",
+            vec!["lock", "reentrant"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReentrantLock.tryLock",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReentrantLockTryLock",
+            vec!["lock", "trylock"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReentrantLock.reentrant",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReentrantLockReentrant",
+            vec!["lock", "reentrant"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReentrantLock.condition",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReentrantLockCondition",
+            vec!["lock", "condition"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReadWriteLock.basic",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReadWriteLockBasic",
+            vec!["lock", "readwrite"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.basic",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchBasic",
+            vec!["latch", "countdown"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.getCount",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchGetCount",
+            vec!["latch", "count"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.extraCountDown",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchExtraCountDown",
+            vec!["latch", "extra"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.toString",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchToString",
+            vec!["latch", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.awaitTimeout",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchAwaitTimeout",
+            vec!["latch", "timeout"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.basic",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreBasic",
+            vec!["semaphore", "basic"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.tryAcquire",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreTryAcquire",
+            vec!["semaphore", "tryacquire"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.drain",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreDrain",
+            vec!["semaphore", "drain"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.releaseAboveInit",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreReleaseAboveInit",
+            vec!["semaphore", "release"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.acquireN",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreAcquireN",
+            vec!["semaphore", "acquiren"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.isFair",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreIsFair",
+            vec!["semaphore", "fairness"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CyclicBarrier.getParties",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCyclicBarrierGetParties",
+            vec!["barrier", "parties"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CyclicBarrier.isBroken",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCyclicBarrierIsBroken",
+            vec!["barrier", "broken"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CyclicBarrier.getNumberWaiting",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCyclicBarrierGetNumberWaiting",
+            vec!["barrier", "waiting"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CyclicBarrier.reset",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCyclicBarrierReset",
+            vec!["barrier", "reset"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.putGet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapPutGet",
+            vec!["chm", "putget"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.containsKey",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapContainsKey",
+            vec!["chm", "contains"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.remove",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapRemove",
+            vec!["chm", "remove"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.putIfAbsent",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapPutIfAbsent",
+            vec!["chm", "putifabsent"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.isEmpty",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapIsEmpty",
+            vec!["chm", "empty"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.getOrDefault",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapGetOrDefault",
+            vec!["chm", "default"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.COWAL.addGet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCOWALAddGet",
+            vec!["cowal", "addget"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.COWAL.contains",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCOWALContains",
+            vec!["cowal", "contains"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.COWAL.remove",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCOWALRemove",
+            vec!["cowal", "remove"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.COWAL.isEmpty",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCOWALIsEmpty",
+            vec!["cowal", "empty"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.offerPoll",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueueOfferPoll",
+            vec!["lbq", "offerpoll"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.putTake",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueuePutTake",
+            vec!["lbq", "puttake"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.peek",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueuePeek",
+            vec!["lbq", "peek"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.isEmptySize",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueueIsEmptySize",
+            vec!["lbq", "size"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.capacity",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueueCapacity",
+            vec!["lbq", "capacity"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ABQ.offerPoll",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testArrayBlockingQueueOfferPoll",
+            vec!["abq", "offerpoll"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ABQ.capacity",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testArrayBlockingQueueCapacity",
+            vec!["abq", "capacity"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ABQ.remainingCapacity",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testArrayBlockingQueueRemainingCapacity",
+            vec!["abq", "remaining"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.complete",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureComplete",
+            vec!["cf", "complete"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.completedFuture",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureCompletedFuture",
+            vec!["cf", "factory"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.thenApply",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureThenApply",
+            vec!["cf", "thenapply"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.thenAccept",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureThenAccept",
+            vec!["cf", "thenaccept"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.state",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureState",
+            vec!["cf", "state"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.cancel",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureCancel",
+            vec!["cf", "cancel"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.exceptionally",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureExceptionally",
+            vec!["cf", "exceptionally"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CF.isCompletedExceptionally",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCompletableFutureIsCompletedExceptionally",
+            vec!["cf", "exceptional"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.CountDownLatch.threaded",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCountDownLatchThreaded",
+            vec!["latch", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Semaphore.threaded",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSemaphoreThreaded",
+            vec!["semaphore", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ReentrantLock.threaded",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testReentrantLockThreaded",
+            vec!["lock", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.threaded",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapThreaded",
+            vec!["chm", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.producerConsumer",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testBlockingQueueProducerConsumer",
+            vec!["lbq", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.COWAL.threaded",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testCOWALThreaded",
+            vec!["cowal", "threaded"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicInt.lazySet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicIntLazySet",
+            vec!["atomic", "lazyset"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.AtomicLong.lazySet",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testAtomicLongLazySet",
+            vec!["atomic", "lazyset"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.replace",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapReplace",
+            vec!["chm", "replace"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.containsValue",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapContainsValue",
+            vec!["chm", "containsvalue"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.Synchronizer.composition",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testSynchronizerComposition",
+            vec!["synchronizer", "integration"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.LBQ.clear",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testLinkedBlockingQueueClear",
+            vec!["lbq", "clear"],
+        ));
+        self.register(TckTest::passing(
+            "concurrent.ConcurrentHashMap.clear",
+            TckCategory::Concurrent,
+            "cratonvm/JucComplete.java#testConcurrentHashMapClear",
+            vec!["chm", "clear"],
+        ));
 
         // --- java.lang.reflect (S50 additions) ---
-        self.register(TckTest::passing("reflect.Class.forName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_forName", vec!["class", "forname"]));
-        self.register(TckTest::passing("reflect.Class.getName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getName", vec!["class", "name"]));
-        self.register(TckTest::passing("reflect.Class.getSimpleName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getSimpleName", vec!["class", "simplename"]));
-        self.register(TckTest::passing("reflect.Class.getSuperclass", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getSuperclass", vec!["class", "superclass"]));
-        self.register(TckTest::passing("reflect.Class.objectSuperclassNull", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_objectSuperclassNull", vec!["class", "superclass"]));
-        self.register(TckTest::passing("reflect.Class.isInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isInterface", vec!["class", "interface"]));
-        self.register(TckTest::passing("reflect.Class.isPrimitive", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isPrimitive", vec!["class", "primitive"]));
-        self.register(TckTest::passing("reflect.Class.isArray", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isArray", vec!["class", "array"]));
-        self.register(TckTest::passing("reflect.Class.isEnum", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isEnum", vec!["class", "enum"]));
-        self.register(TckTest::passing("reflect.Class.isAnnotation", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isAnnotation", vec!["class", "annotation"]));
-        self.register(TckTest::passing("reflect.Class.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getModifiers", vec!["class", "modifiers"]));
-        self.register(TckTest::passing("reflect.Class.isAssignableFrom", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isAssignableFrom", vec!["class", "assignable"]));
-        self.register(TckTest::passing("reflect.Class.isInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isInstance", vec!["class", "isinstance"]));
-        self.register(TckTest::passing("reflect.Class.getInterfaces", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getInterfaces", vec!["class", "interfaces"]));
-        self.register(TckTest::passing("reflect.Class.getComponentType", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getComponentType", vec!["class", "component"]));
-        self.register(TckTest::passing("reflect.Class.cast", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_cast", vec!["class", "cast"]));
-        self.register(TckTest::passing("reflect.Class.newInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_newInstance", vec!["class", "newinstance"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaredMethod", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaredMethod", vec!["method", "lookup"]));
-        self.register(TckTest::passing("reflect.Method.invokeInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokeInstance", vec!["method", "invoke"]));
-        self.register(TckTest::passing("reflect.Method.invokeStatic", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokeStatic", vec!["method", "invoke"]));
-        self.register(TckTest::passing("reflect.Method.invokePrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokePrivate", vec!["method", "invoke", "private"]));
-        self.register(TckTest::passing("reflect.Method.getReturnType", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getReturnType", vec!["method", "returntype"]));
-        self.register(TckTest::passing("reflect.Method.getParameterTypes", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getParameterTypes", vec!["method", "params"]));
-        self.register(TckTest::passing("reflect.Method.getParameterCount", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getParameterCount", vec!["method", "params"]));
-        self.register(TckTest::passing("reflect.Method.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getModifiers", vec!["method", "modifiers"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaringClass", vec!["method", "declaring"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaredMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaredMethods", vec!["method", "list"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaredField", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaredField", vec!["field", "lookup"]));
-        self.register(TckTest::passing("reflect.Field.get", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_get", vec!["field", "get"]));
-        self.register(TckTest::passing("reflect.Field.set", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_set", vec!["field", "set"]));
-        self.register(TckTest::passing("reflect.Field.getPrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getPrivate", vec!["field", "private"]));
-        self.register(TckTest::passing("reflect.Field.getInt", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getInt", vec!["field", "int"]));
-        self.register(TckTest::passing("reflect.Field.setInt", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_setInt", vec!["field", "int"]));
-        self.register(TckTest::passing("reflect.Field.getType", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getType", vec!["field", "type"]));
-        self.register(TckTest::passing("reflect.Field.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getModifiers", vec!["field", "modifiers"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaringClass", vec!["field", "declaring"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaredFields", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaredFields", vec!["field", "list"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructor", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaredConstructor", vec!["constructor", "lookup"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstanceNoArgs", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstanceNoArgs", vec!["constructor", "newinstance"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstanceWithArgs", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstanceWithArgs", vec!["constructor", "newinstance"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstancePrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstancePrivate", vec!["constructor", "private"]));
-        self.register(TckTest::passing("reflect.Constructor.getParameterTypes", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getParameterTypes", vec!["constructor", "params"]));
-        self.register(TckTest::passing("reflect.Constructor.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getModifiers", vec!["constructor", "modifiers"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaringClass", vec!["constructor", "declaring"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructors", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaredConstructors", vec!["constructor", "list"]));
-        self.register(TckTest::passing("reflect.Annotation.classPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classPresent", vec!["annotation", "class"]));
-        self.register(TckTest::passing("reflect.Annotation.classAbsent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classAbsent", vec!["annotation", "class"]));
-        self.register(TckTest::passing("reflect.Annotation.classValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classValue", vec!["annotation", "value"]));
-        self.register(TckTest::passing("reflect.Annotation.inherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_inherited", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.inheritedValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_inheritedValue", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.declaredExcludesInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_declaredExcludesInherited", vec!["annotation", "declared"]));
-        self.register(TckTest::passing("reflect.Annotation.getAnnotationsIncludesInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_getAnnotationsIncludesInherited", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.methodPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodPresent", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.methodValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodValue", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.methodDefault", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodDefault", vec!["annotation", "default"]));
-        self.register(TckTest::passing("reflect.Annotation.methodAbsent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodAbsent", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.fieldPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_fieldPresent", vec!["annotation", "field"]));
-        self.register(TckTest::passing("reflect.Annotation.fieldValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_fieldValue", vec!["annotation", "field"]));
-        self.register(TckTest::passing("reflect.Array.newInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_newInstance", vec!["array", "reflect"]));
-        self.register(TckTest::passing("reflect.Array.getLength", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getLength", vec!["array", "length"]));
-        self.register(TckTest::passing("reflect.Array.getSet", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getSet", vec!["array", "access"]));
-        self.register(TckTest::passing("reflect.Array.getObject", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getObject", vec!["array", "object"]));
-        self.register(TckTest::passing("reflect.Array.setObject", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_setObject", vec!["array", "object"]));
-        self.register(TckTest::passing("reflect.Array.newInstanceRef", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_newInstanceRef", vec!["array", "reference"]));
-        self.register(TckTest::passing("reflect.Proxy.create", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_create", vec!["proxy", "create"]));
-        self.register(TckTest::passing("reflect.Proxy.isProxyClass", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_isProxyClass", vec!["proxy", "check"]));
-        self.register(TckTest::passing("reflect.Proxy.getHandler", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_getHandler", vec!["proxy", "handler"]));
-        self.register(TckTest::passing("reflect.Proxy.objectMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_objectMethods", vec!["proxy", "object"]));
-        self.register(TckTest::passing("reflect.Modifier.isPublic", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isPublic", vec!["modifier", "public"]));
-        self.register(TckTest::passing("reflect.Modifier.isStatic", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isStatic", vec!["modifier", "static"]));
-        self.register(TckTest::passing("reflect.Modifier.isFinal", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isFinal", vec!["modifier", "final"]));
-        self.register(TckTest::passing("reflect.Modifier.isAbstract", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isAbstract", vec!["modifier", "abstract"]));
-        self.register(TckTest::passing("reflect.Modifier.isInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isInterface", vec!["modifier", "interface"]));
-        self.register(TckTest::passing("reflect.Modifier.isPrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isPrivate", vec!["modifier", "private"]));
-        self.register(TckTest::passing("reflect.Modifier.toString", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_toString", vec!["modifier", "tostring"]));
-        self.register(TckTest::passing("reflect.Hierarchy.isInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_isInstance", vec!["hierarchy", "isinstance"]));
-        self.register(TckTest::passing("reflect.Hierarchy.isAssignableFromInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_isAssignableFromInterface", vec!["hierarchy", "assignable"]));
-        self.register(TckTest::passing("reflect.Hierarchy.superclassChain", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_superclassChain", vec!["hierarchy", "chain"]));
-        self.register(TckTest::passing("reflect.Misc.invokeReturnBoxed", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_invokeReturnBoxed", vec!["method", "boxing"]));
-        self.register(TckTest::passing("reflect.Misc.multiFieldRead", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_multiFieldRead", vec!["field", "multiple"]));
-        self.register(TckTest::passing("reflect.Misc.ctorThenInvoke", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_ctorThenInvoke", vec!["constructor", "invoke"]));
-        self.register(TckTest::passing("reflect.Misc.getMethodInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getMethodInherited", vec!["method", "inherited"]));
-        self.register(TckTest::passing("reflect.Misc.noSuchField", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_noSuchField", vec!["field", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.noSuchMethod", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_noSuchMethod", vec!["method", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.invocationTargetException", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_invocationTargetException", vec!["method", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicFields", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicFields", vec!["field", "public"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicMethods", vec!["method", "public"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicConstructors", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicConstructors", vec!["constructor", "public"]));
-        self.register(TckTest::passing("reflect.Misc.primitiveClass", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_primitiveClass", vec!["class", "primitive"]));
-        self.register(TckTest::passing("reflect.Misc.voidClass", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_voidClass", vec!["class", "void"]));
+        self.register(TckTest::passing(
+            "reflect.Class.forName",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_forName",
+            vec!["class", "forname"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getName",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getName",
+            vec!["class", "name"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getSimpleName",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getSimpleName",
+            vec!["class", "simplename"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getSuperclass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getSuperclass",
+            vec!["class", "superclass"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.objectSuperclassNull",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_objectSuperclassNull",
+            vec!["class", "superclass"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isInterface",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isInterface",
+            vec!["class", "interface"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isPrimitive",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isPrimitive",
+            vec!["class", "primitive"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isArray",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isArray",
+            vec!["class", "array"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isEnum",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isEnum",
+            vec!["class", "enum"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isAnnotation",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isAnnotation",
+            vec!["class", "annotation"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getModifiers",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getModifiers",
+            vec!["class", "modifiers"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isAssignableFrom",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isAssignableFrom",
+            vec!["class", "assignable"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.isInstance",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_isInstance",
+            vec!["class", "isinstance"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getInterfaces",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getInterfaces",
+            vec!["class", "interfaces"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.getComponentType",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_getComponentType",
+            vec!["class", "component"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.cast",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_cast",
+            vec!["class", "cast"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Class.newInstance",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#cls_newInstance",
+            vec!["class", "newinstance"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getDeclaredMethod",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getDeclaredMethod",
+            vec!["method", "lookup"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.invokeInstance",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_invokeInstance",
+            vec!["method", "invoke"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.invokeStatic",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_invokeStatic",
+            vec!["method", "invoke"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.invokePrivate",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_invokePrivate",
+            vec!["method", "invoke", "private"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getReturnType",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getReturnType",
+            vec!["method", "returntype"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getParameterTypes",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getParameterTypes",
+            vec!["method", "params"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getParameterCount",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getParameterCount",
+            vec!["method", "params"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getModifiers",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getModifiers",
+            vec!["method", "modifiers"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getDeclaringClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getDeclaringClass",
+            vec!["method", "declaring"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Method.getDeclaredMethods",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#meth_getDeclaredMethods",
+            vec!["method", "list"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getDeclaredField",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getDeclaredField",
+            vec!["field", "lookup"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.get",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_get",
+            vec!["field", "get"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.set",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_set",
+            vec!["field", "set"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getPrivate",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getPrivate",
+            vec!["field", "private"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getInt",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getInt",
+            vec!["field", "int"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.setInt",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_setInt",
+            vec!["field", "int"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getType",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getType",
+            vec!["field", "type"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getModifiers",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getModifiers",
+            vec!["field", "modifiers"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getDeclaringClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getDeclaringClass",
+            vec!["field", "declaring"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Field.getDeclaredFields",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#fld_getDeclaredFields",
+            vec!["field", "list"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.getDeclaredConstructor",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_getDeclaredConstructor",
+            vec!["constructor", "lookup"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.newInstanceNoArgs",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_newInstanceNoArgs",
+            vec!["constructor", "newinstance"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.newInstanceWithArgs",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_newInstanceWithArgs",
+            vec!["constructor", "newinstance"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.newInstancePrivate",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_newInstancePrivate",
+            vec!["constructor", "private"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.getParameterTypes",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_getParameterTypes",
+            vec!["constructor", "params"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.getModifiers",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_getModifiers",
+            vec!["constructor", "modifiers"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.getDeclaringClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_getDeclaringClass",
+            vec!["constructor", "declaring"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Constructor.getDeclaredConstructors",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ctor_getDeclaredConstructors",
+            vec!["constructor", "list"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.classPresent",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_classPresent",
+            vec!["annotation", "class"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.classAbsent",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_classAbsent",
+            vec!["annotation", "class"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.classValue",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_classValue",
+            vec!["annotation", "value"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.inherited",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_inherited",
+            vec!["annotation", "inherited"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.inheritedValue",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_inheritedValue",
+            vec!["annotation", "inherited"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.declaredExcludesInherited",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_declaredExcludesInherited",
+            vec!["annotation", "declared"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.getAnnotationsIncludesInherited",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_getAnnotationsIncludesInherited",
+            vec!["annotation", "inherited"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.methodPresent",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_methodPresent",
+            vec!["annotation", "method"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.methodValue",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_methodValue",
+            vec!["annotation", "method"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.methodDefault",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_methodDefault",
+            vec!["annotation", "default"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.methodAbsent",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_methodAbsent",
+            vec!["annotation", "method"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.fieldPresent",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_fieldPresent",
+            vec!["annotation", "field"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Annotation.fieldValue",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#ann_fieldValue",
+            vec!["annotation", "field"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.newInstance",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_newInstance",
+            vec!["array", "reflect"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.getLength",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_getLength",
+            vec!["array", "length"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.getSet",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_getSet",
+            vec!["array", "access"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.getObject",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_getObject",
+            vec!["array", "object"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.setObject",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_setObject",
+            vec!["array", "object"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Array.newInstanceRef",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#arr_newInstanceRef",
+            vec!["array", "reference"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Proxy.create",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#proxy_create",
+            vec!["proxy", "create"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Proxy.isProxyClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#proxy_isProxyClass",
+            vec!["proxy", "check"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Proxy.getHandler",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#proxy_getHandler",
+            vec!["proxy", "handler"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Proxy.objectMethods",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#proxy_objectMethods",
+            vec!["proxy", "object"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isPublic",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isPublic",
+            vec!["modifier", "public"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isStatic",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isStatic",
+            vec!["modifier", "static"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isFinal",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isFinal",
+            vec!["modifier", "final"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isAbstract",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isAbstract",
+            vec!["modifier", "abstract"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isInterface",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isInterface",
+            vec!["modifier", "interface"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.isPrivate",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_isPrivate",
+            vec!["modifier", "private"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Modifier.toString",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#mod_toString",
+            vec!["modifier", "tostring"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Hierarchy.isInstance",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#hier_isInstance",
+            vec!["hierarchy", "isinstance"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Hierarchy.isAssignableFromInterface",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#hier_isAssignableFromInterface",
+            vec!["hierarchy", "assignable"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Hierarchy.superclassChain",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#hier_superclassChain",
+            vec!["hierarchy", "chain"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.invokeReturnBoxed",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_invokeReturnBoxed",
+            vec!["method", "boxing"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.multiFieldRead",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_multiFieldRead",
+            vec!["field", "multiple"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.ctorThenInvoke",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_ctorThenInvoke",
+            vec!["constructor", "invoke"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.getMethodInherited",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_getMethodInherited",
+            vec!["method", "inherited"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.noSuchField",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_noSuchField",
+            vec!["field", "exception"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.noSuchMethod",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_noSuchMethod",
+            vec!["method", "exception"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.invocationTargetException",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_invocationTargetException",
+            vec!["method", "exception"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.getPublicFields",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_getPublicFields",
+            vec!["field", "public"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.getPublicMethods",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_getPublicMethods",
+            vec!["method", "public"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.getPublicConstructors",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_getPublicConstructors",
+            vec!["constructor", "public"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.primitiveClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_primitiveClass",
+            vec!["class", "primitive"],
+        ));
+        self.register(TckTest::passing(
+            "reflect.Misc.voidClass",
+            TckCategory::Reflect,
+            "cratonvm/TckReflect.java#misc_voidClass",
+            vec!["class", "void"],
+        ));
 
         // --- java.io ---
         self.register(TckTest::passing(
@@ -1432,11 +2712,8 @@ impl TckRunReport {
             passed as f64 / denominator as f64
         };
 
-        let failures: Vec<TckTestResult> = results
-            .iter()
-            .filter(|r| r.is_failure())
-            .cloned()
-            .collect();
+        let failures: Vec<TckTestResult> =
+            results.iter().filter(|r| r.is_failure()).cloned().collect();
 
         TckRunReport {
             total,
@@ -1551,12 +2828,7 @@ impl<'a> TckExecutor<'a> {
     /// non-excluded tests are reported as Passed; excluded tests are Skipped.
     pub fn simulate_test(&self, test: &TckTest) -> TckTestResult {
         // Check exclusion list in config.
-        if self
-            .config
-            .exclusion_list
-            .iter()
-            .any(|n| n == &test.name)
-        {
+        if self.config.exclusion_list.iter().any(|n| n == &test.name) {
             return TckTestResult::skipped(
                 test.clone(),
                 "Test in executor exclusion list".to_string(),
@@ -1654,9 +2926,7 @@ impl CompatibilityChecker {
         if wrapped == i32::MIN {
             CheckResult::Pass
         } else {
-            CheckResult::Fail(format!(
-                "Expected i32::MAX + 1 == i32::MIN, got {wrapped}"
-            ))
+            CheckResult::Fail(format!("Expected i32::MAX + 1 == i32::MIN, got {wrapped}"))
         }
     }
 
@@ -1866,10 +3136,7 @@ impl CompatibilityChecker {
                 "path_resolve_semantics".to_string(),
                 self.check_path_resolve_semantics(),
             ),
-            (
-                "eof_semantics".to_string(),
-                self.check_eof_semantics(),
-            ),
+            ("eof_semantics".to_string(), self.check_eof_semantics()),
             (
                 "close_idempotent".to_string(),
                 self.check_close_idempotent(),
@@ -1934,13 +3201,7 @@ impl JepComplianceMatrix {
         m
     }
 
-    pub fn add(
-        &mut self,
-        jep: u32,
-        title: &str,
-        status: ComplianceStatus,
-        notes: &str,
-    ) {
+    pub fn add(&mut self, jep: u32, title: &str, status: ComplianceStatus, notes: &str) {
         self.entries.push(JepEntry {
             jep_number: jep,
             title: title.to_string(),
@@ -2011,14 +3272,24 @@ impl JepComplianceMatrix {
     }
 
     fn populate_jdk25(&mut self) {
-        self.add(502, "Stable Values", ComplianceStatus::Compliant, "Fully implemented");
+        self.add(
+            502,
+            "Stable Values",
+            ComplianceStatus::Compliant,
+            "Fully implemented",
+        );
         self.add(
             505,
             "Structured Concurrency",
             ComplianceStatus::Partial("Preview, state machine complete".to_string()),
             "Awaiting finalisation",
         );
-        self.add(506, "Scoped Values", ComplianceStatus::Compliant, "Fully implemented");
+        self.add(
+            506,
+            "Scoped Values",
+            ComplianceStatus::Compliant,
+            "Fully implemented",
+        );
         self.add(
             507,
             "Primitive Types in Patterns",
@@ -2031,12 +3302,42 @@ impl JepComplianceMatrix {
             ComplianceStatus::Partial("10th incubator, stubs only".to_string()),
             "SIMD intrinsics pending",
         );
-        self.add(510, "Key Derivation Functions", ComplianceStatus::Compliant, "KDF API complete");
-        self.add(511, "Module Import Declarations", ComplianceStatus::Compliant, "Module system updated");
-        self.add(512, "Compact Source Files", ComplianceStatus::Compliant, "Unnamed classes supported");
-        self.add(513, "Flexible Constructor Bodies", ComplianceStatus::Compliant, "Super() call relaxed");
-        self.add(519, "Compact Object Headers", ComplianceStatus::Compliant, "Header compression enabled");
-        self.add(484, "Class-File API", ComplianceStatus::Compliant, "Stable API, fully implemented");
+        self.add(
+            510,
+            "Key Derivation Functions",
+            ComplianceStatus::Compliant,
+            "KDF API complete",
+        );
+        self.add(
+            511,
+            "Module Import Declarations",
+            ComplianceStatus::Compliant,
+            "Module system updated",
+        );
+        self.add(
+            512,
+            "Compact Source Files",
+            ComplianceStatus::Compliant,
+            "Unnamed classes supported",
+        );
+        self.add(
+            513,
+            "Flexible Constructor Bodies",
+            ComplianceStatus::Compliant,
+            "Super() call relaxed",
+        );
+        self.add(
+            519,
+            "Compact Object Headers",
+            ComplianceStatus::Compliant,
+            "Header compression enabled",
+        );
+        self.add(
+            484,
+            "Class-File API",
+            ComplianceStatus::Compliant,
+            "Stable API, fully implemented",
+        );
         // Honest PQC self-report (no false-pass): CratonVM has no native lattice
         // crypto. ML-DSA keygen/keyfactory AND Signature sign/verify are routed to
         // the real JDK SUN provider (`sun.security.provider.ML_DSA_Impls$KPG*/$KF*/
@@ -2080,9 +3381,7 @@ pub enum JtregDirective {
         args: Vec<String>,
     },
     /// `@compile FileName.java`
-    Compile {
-        files: Vec<String>,
-    },
+    Compile { files: Vec<String> },
     /// `@summary description text`
     Summary(String),
     /// `@bug bug-id`
@@ -2090,9 +3389,7 @@ pub enum JtregDirective {
     /// `@library /path`
     Library(String),
     /// `@build ClassName`
-    Build {
-        classes: Vec<String>,
-    },
+    Build { classes: Vec<String> },
     /// `@requires expression` (e.g., `@requires vm.flavor == "server"`)
     Requires(String),
     /// `@ignore reason`
@@ -2187,9 +3484,7 @@ impl JtregTestDescriptor {
                         // Bare class name (no "main" keyword)
                         (JtregRunMode::Main, 0)
                     };
-                    let class_name = tokens.get(class_idx)
-                        .unwrap_or(&"")
-                        .to_string();
+                    let class_name = tokens.get(class_idx).unwrap_or(&"").to_string();
                     let args: Vec<String> = tokens[class_idx + 1..]
                         .iter()
                         .map(|s| s.to_string())
@@ -2202,35 +3497,37 @@ impl JtregTestDescriptor {
                     });
                 }
                 "@compile" => {
-                    let files: Vec<String> = rest.split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let files: Vec<String> =
+                        rest.split_whitespace().map(|s| s.to_string()).collect();
                     desc.compile_files.extend(files.clone());
                     desc.directives.push(JtregDirective::Compile { files });
                 }
                 "@summary" => {
                     desc.summary = Some(rest.to_string());
-                    desc.directives.push(JtregDirective::Summary(rest.to_string()));
+                    desc.directives
+                        .push(JtregDirective::Summary(rest.to_string()));
                 }
                 "@bug" => {
                     desc.directives.push(JtregDirective::Bug(rest.to_string()));
                 }
                 "@library" => {
-                    desc.directives.push(JtregDirective::Library(rest.to_string()));
+                    desc.directives
+                        .push(JtregDirective::Library(rest.to_string()));
                 }
                 "@build" => {
-                    let classes: Vec<String> = rest.split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let classes: Vec<String> =
+                        rest.split_whitespace().map(|s| s.to_string()).collect();
                     desc.directives.push(JtregDirective::Build { classes });
                 }
                 "@requires" => {
-                    desc.directives.push(JtregDirective::Requires(rest.to_string()));
+                    desc.directives
+                        .push(JtregDirective::Requires(rest.to_string()));
                 }
                 "@ignore" => {
                     desc.ignored = true;
                     desc.ignore_reason = Some(rest.to_string());
-                    desc.directives.push(JtregDirective::Ignore(rest.to_string()));
+                    desc.directives
+                        .push(JtregDirective::Ignore(rest.to_string()));
                 }
                 _ => {}
             }
@@ -2238,13 +3535,17 @@ impl JtregTestDescriptor {
 
         // Infer compile files and main class from source path if not specified
         if desc.compile_files.is_empty() {
-            let filename = source_path.rsplit('/').next()
+            let filename = source_path
+                .rsplit('/')
+                .next()
                 .or_else(|| source_path.rsplit('\\').next())
                 .unwrap_or(source_path);
             desc.compile_files.push(filename.to_string());
         }
         if desc.main_class.is_none() {
-            let filename = source_path.rsplit('/').next()
+            let filename = source_path
+                .rsplit('/')
+                .next()
                 .or_else(|| source_path.rsplit('\\').next())
                 .unwrap_or(source_path);
             if let Some(class) = filename.strip_suffix(".java") {
@@ -2288,14 +3589,22 @@ impl JtregTestResult {
         if self.is_pass() {
             format!("PASS: {}", self.descriptor.source_path)
         } else if self.is_compile_failure() {
-            format!("COMPILE_FAIL: {} — {}", self.descriptor.source_path,
-                    self.compile_error.as_deref().unwrap_or("unknown"))
+            format!(
+                "COMPILE_FAIL: {} — {}",
+                self.descriptor.source_path,
+                self.compile_error.as_deref().unwrap_or("unknown")
+            )
         } else if !self.output_matches {
-            format!("OUTPUT_MISMATCH: {} — expected {:?}, got {:?}",
-                    self.descriptor.source_path, self.expected_output, self.actual_output)
+            format!(
+                "OUTPUT_MISMATCH: {} — expected {:?}, got {:?}",
+                self.descriptor.source_path, self.expected_output, self.actual_output
+            )
         } else {
-            format!("FAIL: {} — {}", self.descriptor.source_path,
-                    self.error_message.as_deref().unwrap_or("unknown"))
+            format!(
+                "FAIL: {} — {}",
+                self.descriptor.source_path,
+                self.error_message.as_deref().unwrap_or("unknown")
+            )
         }
     }
 }
@@ -2384,15 +3693,19 @@ impl JtregRunner {
         };
 
         // Use the VM to execute
-        let config = crate::config::VmConfig::new()
-            .with_classpath(vec![self.classpath.clone()]);
+        let config = crate::config::VmConfig::new().with_classpath(vec![self.classpath.clone()]);
         let mut vm = crate::vm::Vm::new(config);
 
         // Invoke the main method
         let internal_name = class_name.replace('.', "/");
-        let result = vm.invoke(&internal_name, "main", "([Ljava/lang/String;)V", &[
-            crate::types::Value::Object(None), // null args array
-        ]);
+        let result = vm.invoke(
+            &internal_name,
+            "main",
+            "([Ljava/lang/String;)V",
+            &[
+                crate::types::Value::Object(None), // null args array
+            ],
+        );
 
         let output_lines: Vec<String> = vm.main_thread.printed_lines.clone();
 
@@ -2490,15 +3803,27 @@ impl JtregRunner {
     pub fn report(&self) -> JtregRunReport {
         let total = self.results.len();
         let passed = self.results.iter().filter(|r| r.is_pass()).count();
-        let compile_failures = self.results.iter().filter(|r| r.is_compile_failure()).count();
-        let output_mismatches = self.results.iter()
+        let compile_failures = self
+            .results
+            .iter()
+            .filter(|r| r.is_compile_failure())
+            .count();
+        let output_mismatches = self
+            .results
+            .iter()
             .filter(|r| r.compile_success && !r.output_matches)
             .count();
-        let runtime_errors = self.results.iter()
+        let runtime_errors = self
+            .results
+            .iter()
             .filter(|r| r.compile_success && !r.run_success && r.output_matches)
             .count();
 
-        let pass_rate = if total == 0 { 0.0 } else { passed as f64 / total as f64 };
+        let pass_rate = if total == 0 {
+            0.0
+        } else {
+            passed as f64 / total as f64
+        };
 
         JtregRunReport {
             total,
@@ -2527,8 +3852,12 @@ impl JtregRunReport {
         format!(
             "JTReg Results: {}/{} passed ({:.1}%)\n\
              Compile failures: {}, Output mismatches: {}, Runtime errors: {}",
-            self.passed, self.total, self.pass_rate * 100.0,
-            self.compile_failures, self.output_mismatches, self.runtime_errors,
+            self.passed,
+            self.total,
+            self.pass_rate * 100.0,
+            self.compile_failures,
+            self.output_mismatches,
+            self.runtime_errors,
         )
     }
 }
@@ -2558,12 +3887,7 @@ impl CoreLanguageTck {
 
     /// Run a single TCK test by invoking a static method that returns int.
     /// Returns 0 for pass (method returns expected value), non-zero for failure.
-    fn run_test_method(
-        &self,
-        class_name: &str,
-        method_name: &str,
-        expected: i32,
-    ) -> TckTestResult {
+    fn run_test_method(&self, class_name: &str, method_name: &str, expected: i32) -> TckTestResult {
         let test = TckTest::passing(
             &format!("{}.{}", class_name, method_name),
             TckCategory::Vm,
@@ -2576,8 +3900,7 @@ impl CoreLanguageTck {
         }
 
         let start = std::time::Instant::now();
-        let config = crate::config::VmConfig::new()
-            .with_classpath(vec![self.classpath.clone()]);
+        let config = crate::config::VmConfig::new().with_classpath(vec![self.classpath.clone()]);
         let mut vm = crate::vm::Vm::new(config);
 
         let result = vm.invoke(class_name, method_name, "()I", &[]);
@@ -2587,37 +3910,33 @@ impl CoreLanguageTck {
             Ok(Some(crate::types::Value::Int(val))) if val == expected => {
                 TckTestResult::passed(test, elapsed)
             }
-            Ok(Some(crate::types::Value::Int(val))) => {
-                TckTestResult {
-                    test,
-                    actual_result: TckActualResult::Failed(
-                        format!("Expected {}, got {}", expected, val)
-                    ),
-                    execution_time_ms: elapsed,
-                    error_message: Some(format!("Return value mismatch: {} != {}", val, expected)),
-                    stack_trace: None,
-                }
-            }
-            Ok(other) => {
-                TckTestResult {
-                    test,
-                    actual_result: TckActualResult::Error(
-                        format!("Unexpected return type: {:?}", other)
-                    ),
-                    execution_time_ms: elapsed,
-                    error_message: Some(format!("Unexpected return: {:?}", other)),
-                    stack_trace: None,
-                }
-            }
-            Err(e) => {
-                TckTestResult {
-                    test,
-                    actual_result: TckActualResult::Error(format!("{:?}", e)),
-                    execution_time_ms: elapsed,
-                    error_message: Some(format!("{:?}", e)),
-                    stack_trace: None,
-                }
-            }
+            Ok(Some(crate::types::Value::Int(val))) => TckTestResult {
+                test,
+                actual_result: TckActualResult::Failed(format!(
+                    "Expected {}, got {}",
+                    expected, val
+                )),
+                execution_time_ms: elapsed,
+                error_message: Some(format!("Return value mismatch: {} != {}", val, expected)),
+                stack_trace: None,
+            },
+            Ok(other) => TckTestResult {
+                test,
+                actual_result: TckActualResult::Error(format!(
+                    "Unexpected return type: {:?}",
+                    other
+                )),
+                execution_time_ms: elapsed,
+                error_message: Some(format!("Unexpected return: {:?}", other)),
+                stack_trace: None,
+            },
+            Err(e) => TckTestResult {
+                test,
+                actual_result: TckActualResult::Error(format!("{:?}", e)),
+                execution_time_ms: elapsed,
+                error_message: Some(format!("{:?}", e)),
+                stack_trace: None,
+            },
         }
     }
 
@@ -2642,223 +3961,423 @@ impl CoreLanguageTck {
         let start = std::time::Instant::now();
 
         // Chapter 4: Class File Format — test via our existing test classes
-        self.run_class_tests("cratonvm/TckClassFile", &[
-            ("testMagicNumber", 1),
-            ("testClassVersion", 1),
-            ("testConstantPool", 1),
-            ("testFieldAccess", 1),
-            ("testMethodAccess", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckClassFile",
+            &[
+                ("testMagicNumber", 1),
+                ("testClassVersion", 1),
+                ("testConstantPool", 1),
+                ("testFieldAccess", 1),
+                ("testMethodAccess", 1),
+            ],
+        );
 
         // Chapter 5: Loading, Linking, Initialization
-        self.run_class_tests("cratonvm/TckLoading", &[
-            ("testClassLoading", 1),
-            ("testStaticInit", 1),
-            ("testInterfaceInit", 1),
-            ("testArrayCreation", 1),
-            ("testInheritance", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckLoading",
+            &[
+                ("testClassLoading", 1),
+                ("testStaticInit", 1),
+                ("testInterfaceInit", 1),
+                ("testArrayCreation", 1),
+                ("testInheritance", 1),
+            ],
+        );
 
         // Chapter 6: Instruction Set
-        self.run_class_tests("cratonvm/TckInstructions", &[
-            ("testIntArithmetic", 1),
-            ("testLongArithmetic", 1),
-            ("testFloatArithmetic", 1),
-            ("testComparisons", 1),
-            ("testTableswitch", 1),
-            ("testLookupswitch", 1),
-            ("testFieldOps", 1),
-            ("testArrayOps", 1),
-            ("testInvokeVirtual", 1),
-            ("testInvokeStatic", 1),
-            ("testExceptionHandling", 1),
-            ("testCheckcast", 1),
-            ("testInstanceof", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckInstructions",
+            &[
+                ("testIntArithmetic", 1),
+                ("testLongArithmetic", 1),
+                ("testFloatArithmetic", 1),
+                ("testComparisons", 1),
+                ("testTableswitch", 1),
+                ("testLookupswitch", 1),
+                ("testFieldOps", 1),
+                ("testArrayOps", 1),
+                ("testInvokeVirtual", 1),
+                ("testInvokeStatic", 1),
+                ("testExceptionHandling", 1),
+                ("testCheckcast", 1),
+                ("testInstanceof", 1),
+            ],
+        );
 
         // Session 46: java.lang — TckLang (96 tests)
-        self.run_class_tests("cratonvm/TckLang", &[
-            ("obj_hashCode_consistent", 1), ("obj_equals_identity", 1),
-            ("obj_equals_different", 1), ("obj_getClass", 1), ("obj_toString", 1),
-            ("str_length", 1), ("str_charAt", 1), ("str_equals", 1),
-            ("str_compareTo", 1), ("str_substring", 1), ("str_indexOf", 1),
-            ("str_contains", 1), ("str_isEmpty", 1), ("str_trim", 1),
-            ("str_toLowerCase", 1), ("str_toUpperCase", 1), ("str_startsEndsWith", 1),
-            ("str_replace", 1), ("str_toCharArray", 1), ("str_valueOf_int", 1),
-            ("str_valueOf_bool", 1), ("str_concat_op", 1),
-            ("int_parseInt", 1), ("int_parseInt_neg", 1), ("int_valueOf", 1),
-            ("int_toString", 1), ("int_toHexString", 1), ("int_constants", 1),
-            ("int_autobox_cache", 1), ("int_compareTo", 1),
-            ("long_parseLong", 1), ("long_valueOf", 1), ("long_toString", 1),
-            ("long_maxValue", 1),
-            ("double_parseDouble", 1), ("double_isNaN", 1), ("double_isInfinite", 1),
-            ("double_toString", 1), ("double_bits_roundtrip", 1),
-            ("float_parseFloat", 1), ("float_isNaN", 1), ("float_bits_roundtrip", 1),
-            ("bool_parseBoolean", 1), ("bool_valueOf", 1), ("bool_toString", 1),
-            ("byte_constants", 1), ("byte_parseByte", 1),
-            ("short_constants", 1), ("short_parseShort", 1),
-            ("char_isDigit", 1), ("char_isLetter", 1), ("char_case", 1),
-            ("char_convert", 1), ("char_isWhitespace", 1),
-            ("math_abs", 1), ("math_maxMin", 1), ("math_sqrt", 1),
-            ("math_pow", 1), ("math_floorCeil", 1), ("math_round", 1),
-            ("math_constants", 1), ("math_sinCos", 1), ("math_logExp", 1),
-            ("sys_currentTimeMillis", 1), ("sys_nanoTime", 1),
-            ("sys_arraycopy", 1), ("sys_identityHashCode", 1),
-            ("sb_basic", 1), ("sb_appendInt", 1), ("sb_chain", 1),
-            ("sb_length", 1), ("sb_reverse", 1), ("sb_delete", 1),
-            ("exc_getMessage", 1), ("exc_getCause", 1), ("exc_tryCatch", 1),
-            ("exc_hierarchy", 1), ("exc_npe_class", 1), ("exc_finally", 1),
-            ("cls_getName", 1), ("cls_isInterface", 1), ("cls_isPrimitive", 1),
-            ("cls_isArray", 1), ("cls_getSuperclass", 1),
-            ("rt_availableProcessors", 1), ("rt_memory", 1),
-            ("thread_currentThread", 1), ("thread_isAlive", 1),
-            ("cast_int_to_long", 1), ("cast_long_to_int", 1),
-            ("cast_int_to_float", 1), ("cast_double_to_int", 1),
-            ("cast_char_to_int", 1),
-            ("autobox_int", 1), ("autobox_double", 1), ("autobox_boolean", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckLang",
+            &[
+                ("obj_hashCode_consistent", 1),
+                ("obj_equals_identity", 1),
+                ("obj_equals_different", 1),
+                ("obj_getClass", 1),
+                ("obj_toString", 1),
+                ("str_length", 1),
+                ("str_charAt", 1),
+                ("str_equals", 1),
+                ("str_compareTo", 1),
+                ("str_substring", 1),
+                ("str_indexOf", 1),
+                ("str_contains", 1),
+                ("str_isEmpty", 1),
+                ("str_trim", 1),
+                ("str_toLowerCase", 1),
+                ("str_toUpperCase", 1),
+                ("str_startsEndsWith", 1),
+                ("str_replace", 1),
+                ("str_toCharArray", 1),
+                ("str_valueOf_int", 1),
+                ("str_valueOf_bool", 1),
+                ("str_concat_op", 1),
+                ("int_parseInt", 1),
+                ("int_parseInt_neg", 1),
+                ("int_valueOf", 1),
+                ("int_toString", 1),
+                ("int_toHexString", 1),
+                ("int_constants", 1),
+                ("int_autobox_cache", 1),
+                ("int_compareTo", 1),
+                ("long_parseLong", 1),
+                ("long_valueOf", 1),
+                ("long_toString", 1),
+                ("long_maxValue", 1),
+                ("double_parseDouble", 1),
+                ("double_isNaN", 1),
+                ("double_isInfinite", 1),
+                ("double_toString", 1),
+                ("double_bits_roundtrip", 1),
+                ("float_parseFloat", 1),
+                ("float_isNaN", 1),
+                ("float_bits_roundtrip", 1),
+                ("bool_parseBoolean", 1),
+                ("bool_valueOf", 1),
+                ("bool_toString", 1),
+                ("byte_constants", 1),
+                ("byte_parseByte", 1),
+                ("short_constants", 1),
+                ("short_parseShort", 1),
+                ("char_isDigit", 1),
+                ("char_isLetter", 1),
+                ("char_case", 1),
+                ("char_convert", 1),
+                ("char_isWhitespace", 1),
+                ("math_abs", 1),
+                ("math_maxMin", 1),
+                ("math_sqrt", 1),
+                ("math_pow", 1),
+                ("math_floorCeil", 1),
+                ("math_round", 1),
+                ("math_constants", 1),
+                ("math_sinCos", 1),
+                ("math_logExp", 1),
+                ("sys_currentTimeMillis", 1),
+                ("sys_nanoTime", 1),
+                ("sys_arraycopy", 1),
+                ("sys_identityHashCode", 1),
+                ("sb_basic", 1),
+                ("sb_appendInt", 1),
+                ("sb_chain", 1),
+                ("sb_length", 1),
+                ("sb_reverse", 1),
+                ("sb_delete", 1),
+                ("exc_getMessage", 1),
+                ("exc_getCause", 1),
+                ("exc_tryCatch", 1),
+                ("exc_hierarchy", 1),
+                ("exc_npe_class", 1),
+                ("exc_finally", 1),
+                ("cls_getName", 1),
+                ("cls_isInterface", 1),
+                ("cls_isPrimitive", 1),
+                ("cls_isArray", 1),
+                ("cls_getSuperclass", 1),
+                ("rt_availableProcessors", 1),
+                ("rt_memory", 1),
+                ("thread_currentThread", 1),
+                ("thread_isAlive", 1),
+                ("cast_int_to_long", 1),
+                ("cast_long_to_int", 1),
+                ("cast_int_to_float", 1),
+                ("cast_double_to_int", 1),
+                ("cast_char_to_int", 1),
+                ("autobox_int", 1),
+                ("autobox_double", 1),
+                ("autobox_boolean", 1),
+            ],
+        );
 
         // Session 47: java.util — TckUtil (28 tests)
-        self.run_class_tests("cratonvm/TckUtil", &[
-            ("testArrayListBasic", 1), ("testArrayListMutations", 1),
-            ("testArrayListGrow", 1), ("testArrayListIterator", 1),
-            ("testArrayListInsert", 1), ("testArrayListLastIndexOf", 1),
-            ("testHashMapBasic", 1), ("testHashMapMutations", 1),
-            ("testHashMapIntegerKeys", 1), ("testHashMapGetOrDefault", 1),
-            ("testHashMapPutIfAbsent", 1), ("testHashSetBasic", 1),
-            ("testHashSetIterator", 1), ("testArraysSort", 1),
-            ("testArraysCopyOf", 1), ("testArraysAsList", 1),
-            ("testCollectionsEmptyList", 1), ("testCollectionsSingletonList", 1),
-            ("testCollectionsReverse", 1), ("testOptionalBasic", 1),
-            ("testOptionalOrElse", 1), ("testFrequencyMap", 1),
-            ("testDeduplication", 1), ("testHashMapKeySet", 1),
-            ("testArrayListCapacity", 1), ("testHashMapCapacity", 1),
-            ("testArrayListToArray", 1), ("testHashMapNullKey", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckUtil",
+            &[
+                ("testArrayListBasic", 1),
+                ("testArrayListMutations", 1),
+                ("testArrayListGrow", 1),
+                ("testArrayListIterator", 1),
+                ("testArrayListInsert", 1),
+                ("testArrayListLastIndexOf", 1),
+                ("testHashMapBasic", 1),
+                ("testHashMapMutations", 1),
+                ("testHashMapIntegerKeys", 1),
+                ("testHashMapGetOrDefault", 1),
+                ("testHashMapPutIfAbsent", 1),
+                ("testHashSetBasic", 1),
+                ("testHashSetIterator", 1),
+                ("testArraysSort", 1),
+                ("testArraysCopyOf", 1),
+                ("testArraysAsList", 1),
+                ("testCollectionsEmptyList", 1),
+                ("testCollectionsSingletonList", 1),
+                ("testCollectionsReverse", 1),
+                ("testOptionalBasic", 1),
+                ("testOptionalOrElse", 1),
+                ("testFrequencyMap", 1),
+                ("testDeduplication", 1),
+                ("testHashMapKeySet", 1),
+                ("testArrayListCapacity", 1),
+                ("testHashMapCapacity", 1),
+                ("testArrayListToArray", 1),
+                ("testHashMapNullKey", 1),
+            ],
+        );
 
         // Session 49: java.util.concurrent — JucComplete (70 tests)
-        self.run_class_tests("cratonvm/JucComplete", &[
-            ("testAtomicIntCas", 1), ("testAtomicIntIncrDecr", 1),
-            ("testAtomicIntPreIncrDecr", 1), ("testAtomicIntAddOps", 1),
-            ("testAtomicIntGetAndSet", 1), ("testAtomicLongBasic", 1),
-            ("testAtomicBooleanCas", 1), ("testAtomicBooleanGetAndSet", 1),
-            ("testAtomicRefCas", 1), ("testAtomicRefGetAndSet", 1),
-            ("testAtomicIntConcurrentIncr", 1),
-            ("testReentrantLockBasic", 1), ("testReentrantLockTryLock", 1),
-            ("testReentrantLockReentrant", 1), ("testReentrantLockCondition", 1),
-            ("testReadWriteLockBasic", 1),
-            ("testCountDownLatchBasic", 1), ("testCountDownLatchGetCount", 1),
-            ("testCountDownLatchExtraCountDown", 1), ("testCountDownLatchToString", 1),
-            ("testCountDownLatchAwaitTimeout", 1),
-            ("testSemaphoreBasic", 1), ("testSemaphoreTryAcquire", 1),
-            ("testSemaphoreDrain", 1), ("testSemaphoreReleaseAboveInit", 1),
-            ("testSemaphoreAcquireN", 1), ("testSemaphoreIsFair", 1),
-            ("testCyclicBarrierGetParties", 1), ("testCyclicBarrierIsBroken", 1),
-            ("testCyclicBarrierGetNumberWaiting", 1), ("testCyclicBarrierReset", 1),
-            ("testConcurrentHashMapPutGet", 1), ("testConcurrentHashMapContainsKey", 1),
-            ("testConcurrentHashMapRemove", 1), ("testConcurrentHashMapPutIfAbsent", 1),
-            ("testConcurrentHashMapIsEmpty", 1), ("testConcurrentHashMapGetOrDefault", 1),
-            ("testCOWALAddGet", 1), ("testCOWALContains", 1),
-            ("testCOWALRemove", 1), ("testCOWALIsEmpty", 1),
-            ("testLinkedBlockingQueueOfferPoll", 1), ("testLinkedBlockingQueuePutTake", 1),
-            ("testLinkedBlockingQueuePeek", 1), ("testLinkedBlockingQueueIsEmptySize", 1),
-            ("testLinkedBlockingQueueCapacity", 1),
-            ("testArrayBlockingQueueOfferPoll", 1), ("testArrayBlockingQueueCapacity", 1),
-            ("testArrayBlockingQueueRemainingCapacity", 1),
-            ("testCompletableFutureComplete", 1), ("testCompletableFutureCompletedFuture", 1),
-            ("testCompletableFutureThenApply", 1), ("testCompletableFutureThenAccept", 1),
-            ("testCompletableFutureState", 1), ("testCompletableFutureCancel", 1),
-            ("testCompletableFutureExceptionally", 1),
-            ("testCompletableFutureIsCompletedExceptionally", 1),
-            ("testCountDownLatchThreaded", 1), ("testSemaphoreThreaded", 1),
-            ("testReentrantLockThreaded", 1), ("testConcurrentHashMapThreaded", 1),
-            ("testBlockingQueueProducerConsumer", 1), ("testCOWALThreaded", 1),
-            ("testAtomicIntLazySet", 1), ("testAtomicLongLazySet", 1),
-            ("testConcurrentHashMapReplace", 1), ("testConcurrentHashMapContainsValue", 1),
-            ("testSynchronizerComposition", 1),
-            ("testLinkedBlockingQueueClear", 1), ("testConcurrentHashMapClear", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/JucComplete",
+            &[
+                ("testAtomicIntCas", 1),
+                ("testAtomicIntIncrDecr", 1),
+                ("testAtomicIntPreIncrDecr", 1),
+                ("testAtomicIntAddOps", 1),
+                ("testAtomicIntGetAndSet", 1),
+                ("testAtomicLongBasic", 1),
+                ("testAtomicBooleanCas", 1),
+                ("testAtomicBooleanGetAndSet", 1),
+                ("testAtomicRefCas", 1),
+                ("testAtomicRefGetAndSet", 1),
+                ("testAtomicIntConcurrentIncr", 1),
+                ("testReentrantLockBasic", 1),
+                ("testReentrantLockTryLock", 1),
+                ("testReentrantLockReentrant", 1),
+                ("testReentrantLockCondition", 1),
+                ("testReadWriteLockBasic", 1),
+                ("testCountDownLatchBasic", 1),
+                ("testCountDownLatchGetCount", 1),
+                ("testCountDownLatchExtraCountDown", 1),
+                ("testCountDownLatchToString", 1),
+                ("testCountDownLatchAwaitTimeout", 1),
+                ("testSemaphoreBasic", 1),
+                ("testSemaphoreTryAcquire", 1),
+                ("testSemaphoreDrain", 1),
+                ("testSemaphoreReleaseAboveInit", 1),
+                ("testSemaphoreAcquireN", 1),
+                ("testSemaphoreIsFair", 1),
+                ("testCyclicBarrierGetParties", 1),
+                ("testCyclicBarrierIsBroken", 1),
+                ("testCyclicBarrierGetNumberWaiting", 1),
+                ("testCyclicBarrierReset", 1),
+                ("testConcurrentHashMapPutGet", 1),
+                ("testConcurrentHashMapContainsKey", 1),
+                ("testConcurrentHashMapRemove", 1),
+                ("testConcurrentHashMapPutIfAbsent", 1),
+                ("testConcurrentHashMapIsEmpty", 1),
+                ("testConcurrentHashMapGetOrDefault", 1),
+                ("testCOWALAddGet", 1),
+                ("testCOWALContains", 1),
+                ("testCOWALRemove", 1),
+                ("testCOWALIsEmpty", 1),
+                ("testLinkedBlockingQueueOfferPoll", 1),
+                ("testLinkedBlockingQueuePutTake", 1),
+                ("testLinkedBlockingQueuePeek", 1),
+                ("testLinkedBlockingQueueIsEmptySize", 1),
+                ("testLinkedBlockingQueueCapacity", 1),
+                ("testArrayBlockingQueueOfferPoll", 1),
+                ("testArrayBlockingQueueCapacity", 1),
+                ("testArrayBlockingQueueRemainingCapacity", 1),
+                ("testCompletableFutureComplete", 1),
+                ("testCompletableFutureCompletedFuture", 1),
+                ("testCompletableFutureThenApply", 1),
+                ("testCompletableFutureThenAccept", 1),
+                ("testCompletableFutureState", 1),
+                ("testCompletableFutureCancel", 1),
+                ("testCompletableFutureExceptionally", 1),
+                ("testCompletableFutureIsCompletedExceptionally", 1),
+                ("testCountDownLatchThreaded", 1),
+                ("testSemaphoreThreaded", 1),
+                ("testReentrantLockThreaded", 1),
+                ("testConcurrentHashMapThreaded", 1),
+                ("testBlockingQueueProducerConsumer", 1),
+                ("testCOWALThreaded", 1),
+                ("testAtomicIntLazySet", 1),
+                ("testAtomicLongLazySet", 1),
+                ("testConcurrentHashMapReplace", 1),
+                ("testConcurrentHashMapContainsValue", 1),
+                ("testSynchronizerComposition", 1),
+                ("testLinkedBlockingQueueClear", 1),
+                ("testConcurrentHashMapClear", 1),
+            ],
+        );
 
         // Session 50: java.lang.reflect — TckReflect (93 tests)
-        self.run_class_tests("cratonvm/TckReflect", &[
-            ("cls_forName", 1), ("cls_getName", 1), ("cls_getSimpleName", 1),
-            ("cls_getSuperclass", 1), ("cls_objectSuperclassNull", 1),
-            ("cls_isInterface", 1), ("cls_isPrimitive", 1), ("cls_isArray", 1),
-            ("cls_isEnum", 1), ("cls_isAnnotation", 1), ("cls_getModifiers", 1),
-            ("cls_isAssignableFrom", 1), ("cls_isInstance", 1),
-            ("cls_getInterfaces", 1), ("cls_getComponentType", 1),
-            ("cls_cast", 1), ("cls_newInstance", 1),
-            ("meth_getDeclaredMethod", 1), ("meth_invokeInstance", 1),
-            ("meth_invokeStatic", 1), ("meth_invokePrivate", 1),
-            ("meth_getReturnType", 1), ("meth_getParameterTypes", 1),
-            ("meth_getParameterCount", 1), ("meth_getModifiers", 1),
-            ("meth_getDeclaringClass", 1), ("meth_getDeclaredMethods", 1),
-            ("fld_getDeclaredField", 1), ("fld_get", 1), ("fld_set", 1),
-            ("fld_getPrivate", 1), ("fld_getInt", 1), ("fld_setInt", 1),
-            ("fld_getType", 1), ("fld_getModifiers", 1),
-            ("fld_getDeclaringClass", 1), ("fld_getDeclaredFields", 1),
-            ("ctor_getDeclaredConstructor", 1), ("ctor_newInstanceNoArgs", 1),
-            ("ctor_newInstanceWithArgs", 1), ("ctor_newInstancePrivate", 1),
-            ("ctor_getParameterTypes", 1), ("ctor_getModifiers", 1),
-            ("ctor_getDeclaringClass", 1), ("ctor_getDeclaredConstructors", 1),
-            ("ann_classPresent", 1), ("ann_classAbsent", 1), ("ann_classValue", 1),
-            ("ann_inherited", 1), ("ann_inheritedValue", 1),
-            ("ann_declaredExcludesInherited", 1), ("ann_getAnnotationsIncludesInherited", 1),
-            ("ann_methodPresent", 1), ("ann_methodValue", 1),
-            ("ann_methodDefault", 1), ("ann_methodAbsent", 1),
-            ("ann_fieldPresent", 1), ("ann_fieldValue", 1),
-            ("arr_newInstance", 1), ("arr_getLength", 1), ("arr_getSet", 1),
-            ("arr_getObject", 1), ("arr_setObject", 1), ("arr_newInstanceRef", 1),
-            ("proxy_create", 1), ("proxy_isProxyClass", 1),
-            ("proxy_getHandler", 1), ("proxy_objectMethods", 1),
-            ("mod_isPublic", 1), ("mod_isStatic", 1), ("mod_isFinal", 1),
-            ("mod_isAbstract", 1), ("mod_isInterface", 1),
-            ("mod_isPrivate", 1), ("mod_toString", 1),
-            ("hier_isInstance", 1), ("hier_isAssignableFromInterface", 1),
-            ("hier_superclassChain", 1),
-            ("misc_invokeReturnBoxed", 1), ("misc_multiFieldRead", 1),
-            ("misc_ctorThenInvoke", 1), ("misc_getMethodInherited", 1),
-            ("misc_noSuchField", 1), ("misc_noSuchMethod", 1),
-            ("misc_invocationTargetException", 1), ("misc_getPublicFields", 1),
-            ("misc_getPublicMethods", 1), ("misc_getPublicConstructors", 1),
-            ("misc_primitiveClass", 1), ("misc_voidClass", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckReflect",
+            &[
+                ("cls_forName", 1),
+                ("cls_getName", 1),
+                ("cls_getSimpleName", 1),
+                ("cls_getSuperclass", 1),
+                ("cls_objectSuperclassNull", 1),
+                ("cls_isInterface", 1),
+                ("cls_isPrimitive", 1),
+                ("cls_isArray", 1),
+                ("cls_isEnum", 1),
+                ("cls_isAnnotation", 1),
+                ("cls_getModifiers", 1),
+                ("cls_isAssignableFrom", 1),
+                ("cls_isInstance", 1),
+                ("cls_getInterfaces", 1),
+                ("cls_getComponentType", 1),
+                ("cls_cast", 1),
+                ("cls_newInstance", 1),
+                ("meth_getDeclaredMethod", 1),
+                ("meth_invokeInstance", 1),
+                ("meth_invokeStatic", 1),
+                ("meth_invokePrivate", 1),
+                ("meth_getReturnType", 1),
+                ("meth_getParameterTypes", 1),
+                ("meth_getParameterCount", 1),
+                ("meth_getModifiers", 1),
+                ("meth_getDeclaringClass", 1),
+                ("meth_getDeclaredMethods", 1),
+                ("fld_getDeclaredField", 1),
+                ("fld_get", 1),
+                ("fld_set", 1),
+                ("fld_getPrivate", 1),
+                ("fld_getInt", 1),
+                ("fld_setInt", 1),
+                ("fld_getType", 1),
+                ("fld_getModifiers", 1),
+                ("fld_getDeclaringClass", 1),
+                ("fld_getDeclaredFields", 1),
+                ("ctor_getDeclaredConstructor", 1),
+                ("ctor_newInstanceNoArgs", 1),
+                ("ctor_newInstanceWithArgs", 1),
+                ("ctor_newInstancePrivate", 1),
+                ("ctor_getParameterTypes", 1),
+                ("ctor_getModifiers", 1),
+                ("ctor_getDeclaringClass", 1),
+                ("ctor_getDeclaredConstructors", 1),
+                ("ann_classPresent", 1),
+                ("ann_classAbsent", 1),
+                ("ann_classValue", 1),
+                ("ann_inherited", 1),
+                ("ann_inheritedValue", 1),
+                ("ann_declaredExcludesInherited", 1),
+                ("ann_getAnnotationsIncludesInherited", 1),
+                ("ann_methodPresent", 1),
+                ("ann_methodValue", 1),
+                ("ann_methodDefault", 1),
+                ("ann_methodAbsent", 1),
+                ("ann_fieldPresent", 1),
+                ("ann_fieldValue", 1),
+                ("arr_newInstance", 1),
+                ("arr_getLength", 1),
+                ("arr_getSet", 1),
+                ("arr_getObject", 1),
+                ("arr_setObject", 1),
+                ("arr_newInstanceRef", 1),
+                ("proxy_create", 1),
+                ("proxy_isProxyClass", 1),
+                ("proxy_getHandler", 1),
+                ("proxy_objectMethods", 1),
+                ("mod_isPublic", 1),
+                ("mod_isStatic", 1),
+                ("mod_isFinal", 1),
+                ("mod_isAbstract", 1),
+                ("mod_isInterface", 1),
+                ("mod_isPrivate", 1),
+                ("mod_toString", 1),
+                ("hier_isInstance", 1),
+                ("hier_isAssignableFromInterface", 1),
+                ("hier_superclassChain", 1),
+                ("misc_invokeReturnBoxed", 1),
+                ("misc_multiFieldRead", 1),
+                ("misc_ctorThenInvoke", 1),
+                ("misc_getMethodInherited", 1),
+                ("misc_noSuchField", 1),
+                ("misc_noSuchMethod", 1),
+                ("misc_invocationTargetException", 1),
+                ("misc_getPublicFields", 1),
+                ("misc_getPublicMethods", 1),
+                ("misc_getPublicConstructors", 1),
+                ("misc_primitiveClass", 1),
+                ("misc_voidClass", 1),
+            ],
+        );
 
         // Session 48: java.io / java.nio — TckIo (48 tests)
-        self.run_class_tests("cratonvm/TckIo", &[
-            // File operations
-            ("file_createDeleteExists", 1), ("file_isFileIsDirectory", 1),
-            ("file_mkdir", 1), ("file_length", 1),
-            ("file_absolutePath", 1), ("file_canReadWrite", 1),
-            // FileOutputStream / FileInputStream
-            ("fos_writeSingleByte", 1), ("fos_writeBulk", 1),
-            ("fos_appendMode", 1), ("fis_readEof", 1),
-            ("fis_available", 1), ("fis_skip", 1), ("fis_closeIdempotent", 1),
-            // ByteArrayStreams
-            ("baos_basic", 1), ("baos_size", 1), ("baos_reset", 1),
-            ("bais_readAll", 1), ("bais_available", 1), ("bais_skip", 1),
-            ("baos_toString", 1),
-            // StringReader / StringWriter
-            ("sw_basic", 1), ("sr_readChar", 1),
-            // ByteBuffer
-            ("bb_allocateCapacity", 1), ("bb_putGetFlip", 1),
-            ("bb_putGetAbsolute", 1), ("bb_wrap", 1),
-            ("bb_clearRewind", 1), ("bb_markReset", 1),
-            ("bb_putGetInt", 1), ("bb_putGetLong", 1),
-            ("bb_putGetShort", 1), ("bb_putGetFloat", 1),
-            ("bb_putGetDouble", 1), ("bb_putGetChar", 1),
-            ("bb_hasArray", 1), ("bb_array", 1),
-            ("bb_remaining", 1), ("bb_compact", 1),
-            ("bb_slice", 1), ("bb_duplicate", 1),
-            // CharBuffer
-            ("cb_allocatePutGet", 1), ("cb_wrapCharSequence", 1),
-            // IntBuffer / LongBuffer
-            ("ib_allocatePutGet", 1), ("ib_wrapArray", 1),
-            ("lb_allocatePutGet", 1),
-            // End-to-end
-            ("e2e_writeReadRoundtrip", 1), ("e2e_byteBufferToArray", 1),
-            ("e2e_baosToInputStream", 1),
-        ]);
+        self.run_class_tests(
+            "cratonvm/TckIo",
+            &[
+                // File operations
+                ("file_createDeleteExists", 1),
+                ("file_isFileIsDirectory", 1),
+                ("file_mkdir", 1),
+                ("file_length", 1),
+                ("file_absolutePath", 1),
+                ("file_canReadWrite", 1),
+                // FileOutputStream / FileInputStream
+                ("fos_writeSingleByte", 1),
+                ("fos_writeBulk", 1),
+                ("fos_appendMode", 1),
+                ("fis_readEof", 1),
+                ("fis_available", 1),
+                ("fis_skip", 1),
+                ("fis_closeIdempotent", 1),
+                // ByteArrayStreams
+                ("baos_basic", 1),
+                ("baos_size", 1),
+                ("baos_reset", 1),
+                ("bais_readAll", 1),
+                ("bais_available", 1),
+                ("bais_skip", 1),
+                ("baos_toString", 1),
+                // StringReader / StringWriter
+                ("sw_basic", 1),
+                ("sr_readChar", 1),
+                // ByteBuffer
+                ("bb_allocateCapacity", 1),
+                ("bb_putGetFlip", 1),
+                ("bb_putGetAbsolute", 1),
+                ("bb_wrap", 1),
+                ("bb_clearRewind", 1),
+                ("bb_markReset", 1),
+                ("bb_putGetInt", 1),
+                ("bb_putGetLong", 1),
+                ("bb_putGetShort", 1),
+                ("bb_putGetFloat", 1),
+                ("bb_putGetDouble", 1),
+                ("bb_putGetChar", 1),
+                ("bb_hasArray", 1),
+                ("bb_array", 1),
+                ("bb_remaining", 1),
+                ("bb_compact", 1),
+                ("bb_slice", 1),
+                ("bb_duplicate", 1),
+                // CharBuffer
+                ("cb_allocatePutGet", 1),
+                ("cb_wrapCharSequence", 1),
+                // IntBuffer / LongBuffer
+                ("ib_allocatePutGet", 1),
+                ("ib_wrapArray", 1),
+                ("lb_allocatePutGet", 1),
+                // End-to-end
+                ("e2e_writeReadRoundtrip", 1),
+                ("e2e_byteBufferToArray", 1),
+                ("e2e_baosToInputStream", 1),
+            ],
+        );
 
         let elapsed = start.elapsed().as_millis() as u64;
         TckRunReport::build(self.results.clone(), elapsed)
@@ -2866,7 +4385,9 @@ impl CoreLanguageTck {
 
     /// Get the pass rate of all tests run so far.
     pub fn pass_rate(&self) -> f64 {
-        if self.results.is_empty() { return 0.0; }
+        if self.results.is_empty() {
+            return 0.0;
+        }
         let passed = self.results.iter().filter(|r| r.is_pass()).count();
         passed as f64 / self.results.len() as f64
     }
@@ -2879,7 +4400,11 @@ impl CoreLanguageTck {
         let skipped = self.results.iter().filter(|r| r.is_skipped()).count();
         format!(
             "Core Language TCK: {}/{} passed ({:.1}%), {} failed, {} skipped",
-            passed, total, self.pass_rate() * 100.0, failed, skipped,
+            passed,
+            total,
+            self.pass_rate() * 100.0,
+            failed,
+            skipped,
         )
     }
 }
@@ -2907,7 +4432,9 @@ pub enum IoConformanceResult {
 
 impl IoNioConformanceSuite {
     pub fn new() -> Self {
-        Self { results: Vec::new() }
+        Self {
+            results: Vec::new(),
+        }
     }
 
     /// Run all conformance checks and return the collected results.
@@ -2930,7 +4457,9 @@ impl IoNioConformanceSuite {
 
     /// Return (pass_count, total_count).
     pub fn summary(&self) -> (usize, usize) {
-        let pass = self.results.iter()
+        let pass = self
+            .results
+            .iter()
             .filter(|(_, r)| *r == IoConformanceResult::Pass)
             .count();
         (pass, self.results.len())
@@ -2939,8 +4468,15 @@ impl IoNioConformanceSuite {
     /// Format a human-readable summary.
     pub fn format_summary(&self) -> String {
         let (pass, total) = self.summary();
-        let rate = if total == 0 { 0.0 } else { pass as f64 / total as f64 * 100.0 };
-        format!("I/O & NIO Conformance: {}/{} passed ({:.1}%)", pass, total, rate)
+        let rate = if total == 0 {
+            0.0
+        } else {
+            pass as f64 / total as f64 * 100.0
+        };
+        format!(
+            "I/O & NIO Conformance: {}/{} passed ({:.1}%)",
+            pass, total, rate
+        )
     }
 
     fn record(&mut self, name: &str, result: IoConformanceResult) {
@@ -2975,8 +4511,13 @@ impl IoNioConformanceSuite {
 
     fn check_nio_buffer_types(&mut self) {
         let buffer_types = [
-            "ByteBuffer", "CharBuffer", "ShortBuffer", "IntBuffer",
-            "LongBuffer", "FloatBuffer", "DoubleBuffer",
+            "ByteBuffer",
+            "CharBuffer",
+            "ShortBuffer",
+            "IntBuffer",
+            "LongBuffer",
+            "FloatBuffer",
+            "DoubleBuffer",
         ];
         for bt in &buffer_types {
             self.record(
@@ -2984,8 +4525,14 @@ impl IoNioConformanceSuite {
                 IoConformanceResult::Pass,
             );
         }
-        self.record("nio.buffer.HeapByteBuffer_extends_ByteBuffer", IoConformanceResult::Pass);
-        self.record("nio.buffer.HeapCharBuffer_extends_CharBuffer", IoConformanceResult::Pass);
+        self.record(
+            "nio.buffer.HeapByteBuffer_extends_ByteBuffer",
+            IoConformanceResult::Pass,
+        );
+        self.record(
+            "nio.buffer.HeapCharBuffer_extends_CharBuffer",
+            IoConformanceResult::Pass,
+        );
     }
 
     fn check_data_stream_encoding(&mut self) {
@@ -2993,102 +4540,181 @@ impl IoNioConformanceSuite {
         let be = val.to_be_bytes();
         self.record(
             "io.data_stream.writeInt_big_endian",
-            if be == [1, 2, 3, 4] { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("got {:?}", be)) },
+            if be == [1, 2, 3, 4] {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("got {:?}", be))
+            },
         );
 
         let lval: i64 = 0x0102030405060708;
         let lbe = lval.to_be_bytes();
         self.record(
             "io.data_stream.writeLong_big_endian",
-            if lbe == [1, 2, 3, 4, 5, 6, 7, 8] { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("got {:?}", lbe)) },
+            if lbe == [1, 2, 3, 4, 5, 6, 7, 8] {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("got {:?}", lbe))
+            },
         );
 
         let sval: i16 = 0x0102;
         let sbe = sval.to_be_bytes();
         self.record(
             "io.data_stream.writeShort_big_endian",
-            if sbe == [1, 2] { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("got {:?}", sbe)) },
+            if sbe == [1, 2] {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("got {:?}", sbe))
+            },
         );
 
         let fval: f32 = 3.14;
         let fback = f32::from_bits(fval.to_bits());
         self.record(
             "io.data_stream.writeFloat_bits_round_trip",
-            if fback == fval { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("{} != {}", fback, fval)) },
+            if fback == fval {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{} != {}", fback, fval))
+            },
         );
 
         let dval: f64 = 2.71828;
         let dback = f64::from_bits(dval.to_bits());
         self.record(
             "io.data_stream.writeDouble_bits_round_trip",
-            if dback == dval { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("{} != {}", dback, dval)) },
+            if dback == dval {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{} != {}", dback, dval))
+            },
         );
 
         // Modified UTF-8: null byte must be encoded as 0xC0, 0x80
-        self.record("io.data_stream.modified_utf8_null_encoding", IoConformanceResult::Pass);
+        self.record(
+            "io.data_stream.modified_utf8_null_encoding",
+            IoConformanceResult::Pass,
+        );
     }
 
     fn check_file_operations(&mut self) {
-        let unique = format!("cratonvm_s48_conformance_{:?}.tmp", std::thread::current().id());
+        let unique = format!(
+            "cratonvm_s48_conformance_{:?}.tmp",
+            std::thread::current().id()
+        );
         let tmp = std::env::temp_dir().join(unique);
         let _ = std::fs::remove_file(&tmp); // clean up any leftover from a prior run
         let write_ok = std::fs::write(&tmp, b"hello").is_ok();
-        self.record("io.file.create_and_write",
-            if write_ok { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("write failed".to_string()) });
+        self.record(
+            "io.file.create_and_write",
+            if write_ok {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("write failed".to_string())
+            },
+        );
 
-        self.record("io.file.exists_after_create",
-            if tmp.exists() { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("doesn't exist".to_string()) });
+        self.record(
+            "io.file.exists_after_create",
+            if tmp.exists() {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("doesn't exist".to_string())
+            },
+        );
 
-        self.record("io.file.is_file",
-            if tmp.is_file() { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("not a file".to_string()) });
+        self.record(
+            "io.file.is_file",
+            if tmp.is_file() {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("not a file".to_string())
+            },
+        );
 
         let len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        self.record("io.file.length_correct",
-            if len == 5 { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("len={}", len)) });
+        self.record(
+            "io.file.length_correct",
+            if len == 5 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("len={}", len))
+            },
+        );
 
         let read_back = std::fs::read(&tmp).unwrap_or_default();
-        self.record("io.file.read_matches_write",
-            if read_back == b"hello" { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("mismatch".to_string()) });
+        self.record(
+            "io.file.read_matches_write",
+            if read_back == b"hello" {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("mismatch".to_string())
+            },
+        );
 
-        let append_ok = std::fs::OpenOptions::new().append(true).open(&tmp)
-            .and_then(|mut f| { use std::io::Write; f.write_all(b" world") }).is_ok();
-        self.record("io.file.append_mode",
+        let append_ok = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(b" world")
+            })
+            .is_ok();
+        self.record(
+            "io.file.append_mode",
             if append_ok && std::fs::read(&tmp).unwrap_or_default() == b"hello world" {
                 IoConformanceResult::Pass
-            } else { IoConformanceResult::Fail("append failed".to_string()) });
+            } else {
+                IoConformanceResult::Fail("append failed".to_string())
+            },
+        );
 
         let delete_ok = std::fs::remove_file(&tmp).is_ok();
-        self.record("io.file.delete",
-            if delete_ok { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("delete failed".to_string()) });
+        self.record(
+            "io.file.delete",
+            if delete_ok {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("delete failed".to_string())
+            },
+        );
 
-        self.record("io.file.not_exists_after_delete",
-            if !tmp.exists() { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("still exists".to_string()) });
+        self.record(
+            "io.file.not_exists_after_delete",
+            if !tmp.exists() {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("still exists".to_string())
+            },
+        );
 
-        let tmpdir = std::env::temp_dir().join(format!("cratonvm_s48_dir_{:?}", std::thread::current().id()));
+        let tmpdir = std::env::temp_dir().join(format!(
+            "cratonvm_s48_dir_{:?}",
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&tmpdir);
         let mkdir_ok = std::fs::create_dir(&tmpdir).is_ok();
-        self.record("io.file.mkdir",
-            if mkdir_ok { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("mkdir failed".to_string()) });
+        self.record(
+            "io.file.mkdir",
+            if mkdir_ok {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("mkdir failed".to_string())
+            },
+        );
 
         let _ = std::fs::write(tmpdir.join("a.txt"), b"a");
         let _ = std::fs::write(tmpdir.join("b.txt"), b"b");
         let listing = std::fs::read_dir(&tmpdir).map(|rd| rd.count()).unwrap_or(0);
-        self.record("io.file.list_files",
-            if listing >= 2 { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("got {}", listing)) });
+        self.record(
+            "io.file.list_files",
+            if listing >= 2 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("got {}", listing))
+            },
+        );
         let _ = std::fs::remove_dir_all(&tmpdir);
     }
 
@@ -3096,20 +4722,56 @@ impl IoNioConformanceSuite {
         let cap: usize = 10;
         let pos: usize = 0;
         let lim: usize = cap;
-        self.record("nio.buffer.allocate_initial_position",
-            if pos == 0 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", pos)) });
-        self.record("nio.buffer.allocate_initial_limit",
-            if lim == cap { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", lim)) });
-        self.record("nio.buffer.allocate_initial_capacity",
-            if cap == 10 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", cap)) });
+        self.record(
+            "nio.buffer.allocate_initial_position",
+            if pos == 0 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", pos))
+            },
+        );
+        self.record(
+            "nio.buffer.allocate_initial_limit",
+            if lim == cap {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", lim))
+            },
+        );
+        self.record(
+            "nio.buffer.allocate_initial_capacity",
+            if cap == 10 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", cap))
+            },
+        );
 
         let pos_after_put: usize = 3;
-        self.record("nio.buffer.position_after_put",
-            if pos_after_put == 3 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", pos_after_put)) });
-        self.record("nio.buffer.invariant_pos_le_limit",
-            if pos_after_put <= lim { IoConformanceResult::Pass } else { IoConformanceResult::Fail("violated".to_string()) });
-        self.record("nio.buffer.invariant_limit_le_capacity",
-            if lim <= cap { IoConformanceResult::Pass } else { IoConformanceResult::Fail("violated".to_string()) });
+        self.record(
+            "nio.buffer.position_after_put",
+            if pos_after_put == 3 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", pos_after_put))
+            },
+        );
+        self.record(
+            "nio.buffer.invariant_pos_le_limit",
+            if pos_after_put <= lim {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("violated".to_string())
+            },
+        );
+        self.record(
+            "nio.buffer.invariant_limit_le_capacity",
+            if lim <= cap {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("violated".to_string())
+            },
+        );
     }
 
     fn check_buffer_flip_clear_rewind(&mut self) {
@@ -3117,24 +4779,56 @@ impl IoNioConformanceSuite {
         let cap: usize = 10;
         let flip_limit = old_pos;
         let flip_pos: usize = 0;
-        self.record("nio.buffer.flip_sets_limit_to_position",
-            if flip_limit == 5 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", flip_limit)) });
-        self.record("nio.buffer.flip_sets_position_to_zero",
-            if flip_pos == 0 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", flip_pos)) });
+        self.record(
+            "nio.buffer.flip_sets_limit_to_position",
+            if flip_limit == 5 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", flip_limit))
+            },
+        );
+        self.record(
+            "nio.buffer.flip_sets_position_to_zero",
+            if flip_pos == 0 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", flip_pos))
+            },
+        );
 
         let clear_pos: usize = 0;
         let clear_limit = cap;
-        self.record("nio.buffer.clear_resets_position",
-            if clear_pos == 0 { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", clear_pos)) });
-        self.record("nio.buffer.clear_sets_limit_to_capacity",
-            if clear_limit == cap { IoConformanceResult::Pass } else { IoConformanceResult::Fail(format!("{}", clear_limit)) });
-        self.record("nio.buffer.rewind_sets_position_to_zero", IoConformanceResult::Pass);
+        self.record(
+            "nio.buffer.clear_resets_position",
+            if clear_pos == 0 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", clear_pos))
+            },
+        );
+        self.record(
+            "nio.buffer.clear_sets_limit_to_capacity",
+            if clear_limit == cap {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{}", clear_limit))
+            },
+        );
+        self.record(
+            "nio.buffer.rewind_sets_position_to_zero",
+            IoConformanceResult::Pass,
+        );
     }
 
     fn check_typed_buffer_element_sizes(&mut self) {
         let cases: &[(&str, usize)] = &[
-            ("ByteBuffer", 1), ("CharBuffer", 2), ("ShortBuffer", 2),
-            ("IntBuffer", 4), ("FloatBuffer", 4), ("LongBuffer", 8), ("DoubleBuffer", 8),
+            ("ByteBuffer", 1),
+            ("CharBuffer", 2),
+            ("ShortBuffer", 2),
+            ("IntBuffer", 4),
+            ("FloatBuffer", 4),
+            ("LongBuffer", 8),
+            ("DoubleBuffer", 8),
         ];
         for &(name, expected) in cases {
             let actual = match name {
@@ -3147,42 +4841,82 @@ impl IoNioConformanceSuite {
                 "DoubleBuffer" => std::mem::size_of::<f64>(),
                 _ => 0,
             };
-            self.record(&format!("nio.buffer.{}_element_size", name),
-                if actual == expected { IoConformanceResult::Pass }
-                else { IoConformanceResult::Fail(format!("expected {}, got {}", expected, actual)) });
+            self.record(
+                &format!("nio.buffer.{}_element_size", name),
+                if actual == expected {
+                    IoConformanceResult::Pass
+                } else {
+                    IoConformanceResult::Fail(format!("expected {}, got {}", expected, actual))
+                },
+            );
         }
     }
 
     fn check_path_operations(&mut self) {
         let p = std::path::Path::new("/foo/bar/baz.txt");
-        self.record("nio.path.getFileName",
+        self.record(
+            "nio.path.getFileName",
             if p.file_name().and_then(|n| n.to_str()) == Some("baz.txt") {
                 IoConformanceResult::Pass
-            } else { IoConformanceResult::Fail("wrong filename".to_string()) });
-        self.record("nio.path.getParent",
-            if p.parent().is_some() { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("no parent".to_string()) });
-        self.record("nio.path.isAbsolute",
-            if p.is_absolute() || cfg!(windows) { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("not absolute".to_string()) });
+            } else {
+                IoConformanceResult::Fail("wrong filename".to_string())
+            },
+        );
+        self.record(
+            "nio.path.getParent",
+            if p.parent().is_some() {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("no parent".to_string())
+            },
+        );
+        self.record(
+            "nio.path.isAbsolute",
+            if p.is_absolute() || cfg!(windows) {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("not absolute".to_string())
+            },
+        );
         let resolved = std::path::Path::new("/base").join("child");
-        self.record("nio.path.resolve_relative",
-            if resolved.ends_with("child") { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("{:?}", resolved)) });
+        self.record(
+            "nio.path.resolve_relative",
+            if resolved.ends_with("child") {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("{:?}", resolved))
+            },
+        );
         let dotty = std::path::Path::new("/a/b/../c");
-        self.record("nio.path.normalize_dotdot",
-            if dotty.components().count() >= 3 { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail("component count".to_string()) });
+        self.record(
+            "nio.path.normalize_dotdot",
+            if dotty.components().count() >= 3 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail("component count".to_string())
+            },
+        );
     }
 
     fn check_channel_operations(&mut self) {
-        self.record("nio.channel.initial_position_zero", IoConformanceResult::Pass);
-        let tmp = std::env::temp_dir().join(format!("cratonvm_s48_chan_{:?}.tmp", std::thread::current().id()));
+        self.record(
+            "nio.channel.initial_position_zero",
+            IoConformanceResult::Pass,
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "cratonvm_s48_chan_{:?}.tmp",
+            std::thread::current().id()
+        ));
         let _ = std::fs::write(&tmp, b"abcdef");
         let len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        self.record("nio.channel.size_matches_file_length",
-            if len == 6 { IoConformanceResult::Pass }
-            else { IoConformanceResult::Fail(format!("len={}", len)) });
+        self.record(
+            "nio.channel.size_matches_file_length",
+            if len == 6 {
+                IoConformanceResult::Pass
+            } else {
+                IoConformanceResult::Fail(format!("len={}", len))
+            },
+        );
         self.record("nio.channel.supports_read_write", IoConformanceResult::Pass);
         self.record("nio.channel.force_flushes", IoConformanceResult::Pass);
         let _ = std::fs::remove_file(&tmp);
@@ -3197,22 +4931,42 @@ impl IoNioConformanceSuite {
     }
 
     fn check_stream_chaining(&mut self) {
-        self.record("io.chain.BufferedReader_InputStreamReader_FileInputStream", IoConformanceResult::Pass);
-        self.record("io.chain.DataInputStream_BufferedInputStream_FileInputStream", IoConformanceResult::Pass);
-        self.record("io.chain.BufferedWriter_OutputStreamWriter_FileOutputStream", IoConformanceResult::Pass);
-        self.record("io.chain.DataOutputStream_BufferedOutputStream_FileOutputStream", IoConformanceResult::Pass);
+        self.record(
+            "io.chain.BufferedReader_InputStreamReader_FileInputStream",
+            IoConformanceResult::Pass,
+        );
+        self.record(
+            "io.chain.DataInputStream_BufferedInputStream_FileInputStream",
+            IoConformanceResult::Pass,
+        );
+        self.record(
+            "io.chain.BufferedWriter_OutputStreamWriter_FileOutputStream",
+            IoConformanceResult::Pass,
+        );
+        self.record(
+            "io.chain.DataOutputStream_BufferedOutputStream_FileOutputStream",
+            IoConformanceResult::Pass,
+        );
     }
 
     fn check_scanner_conformance(&mut self) {
-        self.record("io.scanner.default_delimiter_whitespace", IoConformanceResult::Pass);
+        self.record(
+            "io.scanner.default_delimiter_whitespace",
+            IoConformanceResult::Pass,
+        );
         self.record("io.scanner.nextInt_decimal", IoConformanceResult::Pass);
         self.record("io.scanner.hasNext_false_at_eof", IoConformanceResult::Pass);
-        self.record("io.scanner.useDelimiter_changes_pattern", IoConformanceResult::Pass);
+        self.record(
+            "io.scanner.useDelimiter_changes_pattern",
+            IoConformanceResult::Pass,
+        );
     }
 }
 
 impl Default for IoNioConformanceSuite {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3804,7 +5558,10 @@ mod tests {
     #[test]
     fn test_compliance_status_label() {
         assert_eq!(ComplianceStatus::Compliant.label(), "COMPLIANT");
-        assert_eq!(ComplianceStatus::Partial("x".to_string()).label(), "PARTIAL");
+        assert_eq!(
+            ComplianceStatus::Partial("x".to_string()).label(),
+            "PARTIAL"
+        );
         assert_eq!(
             ComplianceStatus::NotCompliant("x".to_string()).label(),
             "NOT_COMPLIANT"
@@ -3832,16 +5589,22 @@ mod tests {
         let r = TckRegistry::with_standard_tests();
         let io_tests = r.find_by_category(TckCategory::IO);
         // 3 original + 30 S48 additions = 33
-        assert!(io_tests.len() >= 33,
-            "Expected >=33 IO tests, got {}", io_tests.len());
+        assert!(
+            io_tests.len() >= 33,
+            "Expected >=33 IO tests, got {}",
+            io_tests.len()
+        );
     }
 
     #[test]
     fn s48_registry_has_nio_tests() {
         let r = TckRegistry::with_standard_tests();
         let nio_tests = r.find_by_category(TckCategory::Nio);
-        assert!(nio_tests.len() >= 25,
-            "Expected >=25 NIO tests, got {}", nio_tests.len());
+        assert!(
+            nio_tests.len() >= 25,
+            "Expected >=25 NIO tests, got {}",
+            nio_tests.len()
+        );
     }
 
     #[test]
@@ -3849,13 +5612,19 @@ mod tests {
         let r = TckRegistry::with_standard_tests();
         // File tests should have "file" tag
         let file_tests = r.find_by_tag("file");
-        assert!(file_tests.len() >= 6,
-            "Expected >=6 file-tagged tests, got {}", file_tests.len());
+        assert!(
+            file_tests.len() >= 6,
+            "Expected >=6 file-tagged tests, got {}",
+            file_tests.len()
+        );
 
         // Buffer tests should have "nio" tag
         let nio_tagged = r.find_by_tag("nio");
-        assert!(nio_tagged.len() >= 20,
-            "Expected >=20 nio-tagged tests, got {}", nio_tagged.len());
+        assert!(
+            nio_tagged.len() >= 20,
+            "Expected >=20 nio-tagged tests, got {}",
+            nio_tagged.len()
+        );
     }
 
     #[test]
@@ -3872,11 +5641,19 @@ mod tests {
     #[test]
     fn s48_io_stream_tests_registered() {
         let r = TckRegistry::with_standard_tests();
-        assert!(r.find_by_name("io.FileInputStream.readSingleByte").is_some());
+        assert!(r
+            .find_by_name("io.FileInputStream.readSingleByte")
+            .is_some());
         assert!(r.find_by_name("io.FileInputStream.readBulk").is_some());
-        assert!(r.find_by_name("io.FileInputStream.availableAndSkip").is_some());
-        assert!(r.find_by_name("io.FileInputStream.closeIdempotent").is_some());
-        assert!(r.find_by_name("io.FileOutputStream.writeSingleByte").is_some());
+        assert!(r
+            .find_by_name("io.FileInputStream.availableAndSkip")
+            .is_some());
+        assert!(r
+            .find_by_name("io.FileInputStream.closeIdempotent")
+            .is_some());
+        assert!(r
+            .find_by_name("io.FileOutputStream.writeSingleByte")
+            .is_some());
         assert!(r.find_by_name("io.FileOutputStream.writeBulk").is_some());
         assert!(r.find_by_name("io.FileOutputStream.appendMode").is_some());
     }
@@ -3892,7 +5669,9 @@ mod tests {
     #[test]
     fn s48_io_data_stream_tests_registered() {
         let r = TckRegistry::with_standard_tests();
-        assert!(r.find_by_name("io.DataOutputStream.writePrimitives").is_some());
+        assert!(r
+            .find_by_name("io.DataOutputStream.writePrimitives")
+            .is_some());
         assert!(r.find_by_name("io.DataInputStream.readUTF").is_some());
     }
 
@@ -3908,9 +5687,13 @@ mod tests {
     #[test]
     fn s48_io_special_tests_registered() {
         let r = TckRegistry::with_standard_tests();
-        assert!(r.find_by_name("io.RandomAccessFile.seekReadWrite").is_some());
+        assert!(r
+            .find_by_name("io.RandomAccessFile.seekReadWrite")
+            .is_some());
         assert!(r.find_by_name("io.PipedStreams.producerConsumer").is_some());
-        assert!(r.find_by_name("io.InputStreamReader.charsetDecoding").is_some());
+        assert!(r
+            .find_by_name("io.InputStreamReader.charsetDecoding")
+            .is_some());
         assert!(r.find_by_name("io.LineNumberReader.lineTracking").is_some());
     }
 
@@ -3932,7 +5715,9 @@ mod tests {
     #[test]
     fn s48_nio_bytebuffer_tests_registered() {
         let r = TckRegistry::with_standard_tests();
-        assert!(r.find_by_name("nio.ByteBuffer.allocateAndCapacity").is_some());
+        assert!(r
+            .find_by_name("nio.ByteBuffer.allocateAndCapacity")
+            .is_some());
         assert!(r.find_by_name("nio.ByteBuffer.putGetFlip").is_some());
         assert!(r.find_by_name("nio.ByteBuffer.wrapArray").is_some());
         assert!(r.find_by_name("nio.ByteBuffer.markReset").is_some());
@@ -3951,7 +5736,9 @@ mod tests {
         assert!(r.find_by_name("nio.LongBuffer.allocateAndAccess").is_some());
         assert!(r.find_by_name("nio.FloatBuffer.putGetCompare").is_some());
         assert!(r.find_by_name("nio.DoubleBuffer.wrapAndSlice").is_some());
-        assert!(r.find_by_name("nio.ShortBuffer.positionLimitFlip").is_some());
+        assert!(r
+            .find_by_name("nio.ShortBuffer.positionLimitFlip")
+            .is_some());
         assert!(r.find_by_name("nio.Buffer.invariants").is_some());
     }
 
@@ -3968,8 +5755,12 @@ mod tests {
     fn s48_nio_files_path_tests_registered() {
         let r = TckRegistry::with_standard_tests();
         assert!(r.find_by_name("nio.files.Path.resolveNormalize").is_some());
-        assert!(r.find_by_name("nio.files.Files.createDeleteExists").is_some());
-        assert!(r.find_by_name("nio.files.Files.readWriteAllBytes").is_some());
+        assert!(r
+            .find_by_name("nio.files.Files.createDeleteExists")
+            .is_some());
+        assert!(r
+            .find_by_name("nio.files.Files.readWriteAllBytes")
+            .is_some());
         assert!(r.find_by_name("nio.files.Files.walkCopyMove").is_some());
     }
 
@@ -3977,15 +5768,20 @@ mod tests {
     fn s48_nio_selector_datagram_tests_registered() {
         let r = TckRegistry::with_standard_tests();
         assert!(r.find_by_name("nio.Selector.openAndClose").is_some());
-        assert!(r.find_by_name("nio.DatagramChannel.openBindClose").is_some());
+        assert!(r
+            .find_by_name("nio.DatagramChannel.openBindClose")
+            .is_some());
     }
 
     #[test]
     fn s48_total_test_count_increased() {
         let r = TckRegistry::with_standard_tests();
         // 30 original + 30 IO + 25 NIO = 85+
-        assert!(r.count() >= 85,
-            "Expected >=85 total tests, got {}", r.count());
+        assert!(
+            r.count() >= 85,
+            "Expected >=85 total tests, got {}",
+            r.count()
+        );
     }
 
     #[test]
@@ -3994,7 +5790,10 @@ mod tests {
         let mut executor = TckExecutor::new(&r);
         let report = executor.run_category(TckCategory::IO);
         assert!(report.total >= 33);
-        assert_eq!(report.pass_rate, 1.0, "All IO tests should pass in simulation");
+        assert_eq!(
+            report.pass_rate, 1.0,
+            "All IO tests should pass in simulation"
+        );
     }
 
     #[test]
@@ -4003,7 +5802,10 @@ mod tests {
         let mut executor = TckExecutor::new(&r);
         let report = executor.run_category(TckCategory::Nio);
         assert!(report.total >= 25);
-        assert_eq!(report.pass_rate, 1.0, "All NIO tests should pass in simulation");
+        assert_eq!(
+            report.pass_rate, 1.0,
+            "All NIO tests should pass in simulation"
+        );
     }
 
     #[test]
@@ -4029,11 +5831,17 @@ mod tests {
         let checker = CompatibilityChecker::new();
         let results = checker.run_all_checks();
         // 7 original + 8 S48 = 15
-        assert_eq!(results.len(), 15,
-            "Expected 15 checks, got {}", results.len());
-        let pass_count = results.iter().filter(|(_, r)| *r == CheckResult::Pass).count();
-        assert!(pass_count >= 13,
-            "Expected >=13 passes, got {}", pass_count);
+        assert_eq!(
+            results.len(),
+            15,
+            "Expected 15 checks, got {}",
+            results.len()
+        );
+        let pass_count = results
+            .iter()
+            .filter(|(_, r)| *r == CheckResult::Pass)
+            .count();
+        assert!(pass_count >= 13, "Expected >=13 passes, got {}", pass_count);
     }
 
     // --- IoNioConformanceSuite tests ---
@@ -4044,7 +5852,11 @@ mod tests {
         let results = suite.run_all();
         assert!(!results.is_empty());
         let (pass, total) = suite.summary();
-        assert!(total >= 70, "Expected >=70 conformance checks, got {}", total);
+        assert!(
+            total >= 70,
+            "Expected >=70 conformance checks, got {}",
+            total
+        );
         assert_eq!(pass, total, "All conformance checks should pass");
     }
 
@@ -4061,14 +5873,23 @@ mod tests {
     fn s48_conformance_io_hierarchy_checks() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let hierarchy_checks: Vec<_> = suite.results.iter()
+        let hierarchy_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.hierarchy"))
             .collect();
-        assert!(hierarchy_checks.len() >= 15,
-            "Expected >=15 hierarchy checks, got {}", hierarchy_checks.len());
+        assert!(
+            hierarchy_checks.len() >= 15,
+            "Expected >=15 hierarchy checks, got {}",
+            hierarchy_checks.len()
+        );
         for (name, result) in &hierarchy_checks {
-            assert_eq!(*result, IoConformanceResult::Pass,
-                "Hierarchy check {} should pass", name);
+            assert_eq!(
+                *result,
+                IoConformanceResult::Pass,
+                "Hierarchy check {} should pass",
+                name
+            );
         }
     }
 
@@ -4076,25 +5897,39 @@ mod tests {
     fn s48_conformance_nio_buffer_checks() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let buffer_checks: Vec<_> = suite.results.iter()
+        let buffer_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("nio.buffer"))
             .collect();
-        assert!(buffer_checks.len() >= 20,
-            "Expected >=20 buffer checks, got {}", buffer_checks.len());
+        assert!(
+            buffer_checks.len() >= 20,
+            "Expected >=20 buffer checks, got {}",
+            buffer_checks.len()
+        );
     }
 
     #[test]
     fn s48_conformance_data_stream_encoding() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let encoding_checks: Vec<_> = suite.results.iter()
+        let encoding_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.data_stream"))
             .collect();
-        assert!(encoding_checks.len() >= 6,
-            "Expected >=6 encoding checks, got {}", encoding_checks.len());
+        assert!(
+            encoding_checks.len() >= 6,
+            "Expected >=6 encoding checks, got {}",
+            encoding_checks.len()
+        );
         for (name, result) in &encoding_checks {
-            assert_eq!(*result, IoConformanceResult::Pass,
-                "Encoding check {} should pass", name);
+            assert_eq!(
+                *result,
+                IoConformanceResult::Pass,
+                "Encoding check {} should pass",
+                name
+            );
         }
     }
 
@@ -4102,14 +5937,23 @@ mod tests {
     fn s48_conformance_file_operations() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let file_checks: Vec<_> = suite.results.iter()
+        let file_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.file"))
             .collect();
-        assert!(file_checks.len() >= 10,
-            "Expected >=10 file operation checks, got {}", file_checks.len());
+        assert!(
+            file_checks.len() >= 10,
+            "Expected >=10 file operation checks, got {}",
+            file_checks.len()
+        );
         for (name, result) in &file_checks {
-            assert_eq!(*result, IoConformanceResult::Pass,
-                "File check {} should pass", name);
+            assert_eq!(
+                *result,
+                IoConformanceResult::Pass,
+                "File check {} should pass",
+                name
+            );
         }
     }
 
@@ -4117,29 +5961,41 @@ mod tests {
     fn s48_conformance_path_operations() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let path_checks: Vec<_> = suite.results.iter()
+        let path_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("nio.path"))
             .collect();
-        assert!(path_checks.len() >= 5,
-            "Expected >=5 path checks, got {}", path_checks.len());
+        assert!(
+            path_checks.len() >= 5,
+            "Expected >=5 path checks, got {}",
+            path_checks.len()
+        );
     }
 
     #[test]
     fn s48_conformance_channel_operations() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let channel_checks: Vec<_> = suite.results.iter()
+        let channel_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("nio.channel"))
             .collect();
-        assert!(channel_checks.len() >= 4,
-            "Expected >=4 channel checks, got {}", channel_checks.len());
+        assert!(
+            channel_checks.len() >= 4,
+            "Expected >=4 channel checks, got {}",
+            channel_checks.len()
+        );
     }
 
     #[test]
     fn s48_conformance_fd_semantics() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let fd_checks: Vec<_> = suite.results.iter()
+        let fd_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.fd"))
             .collect();
         assert_eq!(fd_checks.len(), 5);
@@ -4149,7 +6005,9 @@ mod tests {
     fn s48_conformance_stream_chaining() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let chain_checks: Vec<_> = suite.results.iter()
+        let chain_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.chain"))
             .collect();
         assert_eq!(chain_checks.len(), 4);
@@ -4159,7 +6017,9 @@ mod tests {
     fn s48_conformance_scanner() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let scanner_checks: Vec<_> = suite.results.iter()
+        let scanner_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.starts_with("io.scanner"))
             .collect();
         assert_eq!(scanner_checks.len(), 4);
@@ -4169,13 +6029,19 @@ mod tests {
     fn s48_conformance_typed_buffer_element_sizes() {
         let mut suite = IoNioConformanceSuite::new();
         suite.run_all();
-        let size_checks: Vec<_> = suite.results.iter()
+        let size_checks: Vec<_> = suite
+            .results
+            .iter()
             .filter(|(name, _)| name.contains("element_size"))
             .collect();
         assert_eq!(size_checks.len(), 7);
         for (name, result) in &size_checks {
-            assert_eq!(*result, IoConformanceResult::Pass,
-                "{} element size should be correct", name);
+            assert_eq!(
+                *result,
+                IoConformanceResult::Pass,
+                "{} element size should be correct",
+                name
+            );
         }
     }
 

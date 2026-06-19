@@ -129,7 +129,8 @@ fn wp6_5_finish_construction_population_resolution_pins_coexist() {
     let init_descriptor = "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
                            Ljava/lang/String;Ljava/util/List;Ljava/util/Map;)V";
     assert!(
-        r.find("java/security/Provider$Service", "<init>", init_descriptor).is_some(),
+        r.find("java/security/Provider$Service", "<init>", init_descriptor)
+            .is_some(),
         "Provider$Service.<init> shim (session 101) must remain registered"
     );
 
@@ -157,11 +158,17 @@ fn wp6_5_finish_construction_population_resolution_pins_coexist() {
 
     // Inner-class clinit no-ops still alive (session 101 housekeeping).
     assert!(
-        r.find("java/security/Provider$ServiceKey", "<clinit>", "()V").is_some(),
+        r.find("java/security/Provider$ServiceKey", "<clinit>", "()V")
+            .is_some(),
         "Provider$ServiceKey.<clinit> no-op must remain"
     );
     assert!(
-        r.find("java/security/Provider$EngineDescription", "<clinit>", "()V").is_some(),
+        r.find(
+            "java/security/Provider$EngineDescription",
+            "<clinit>",
+            "()V"
+        )
+        .is_some(),
         "Provider$EngineDescription.<clinit> no-op must remain"
     );
 }

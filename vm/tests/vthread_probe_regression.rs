@@ -57,7 +57,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -86,10 +90,7 @@ fn ensure_probes_compiled() -> bool {
         return false;
     }
     let mut cmd = Command::new("javac");
-    cmd.arg("--release")
-        .arg("21")
-        .arg("-d")
-        .arg(&classes);
+    cmd.arg("--release").arg("21").arg("-d").arg(&classes);
     for src in &sources {
         cmd.arg(src);
     }
@@ -266,8 +267,9 @@ fn vthread_probe_10000_all_increment() {
         );
     }
     assert!(
-        combined.contains("\nOK\n") || combined.trim_end().ends_with("OK") ||
-            combined.contains("\nOK\r\n"),
+        combined.contains("\nOK\n")
+            || combined.trim_end().ends_with("OK")
+            || combined.contains("\nOK\r\n"),
         "VthreadProbe printed counted=10000 but never reached final 'OK' \
          marker — exit raced the println? Output:\n{combined}"
     );

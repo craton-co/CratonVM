@@ -20,7 +20,9 @@ use std::collections::{HashMap, HashSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE, array_data_size};
+use crate::heap::{
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+};
 use crate::mark_bitmap::MarkBitmap;
 
 // ---------------------------------------------------------------------------
@@ -223,7 +225,10 @@ impl RegionHeap {
     pub fn new(total_capacity: usize, region_size: usize) -> Self {
         let region_size = region_size.max(MIN_REGION_SIZE);
         let num_regions = total_capacity / region_size;
-        assert!(num_regions > 0, "capacity must accommodate at least one region");
+        assert!(
+            num_regions > 0,
+            "capacity must accommodate at least one region"
+        );
 
         let actual_capacity = num_regions * region_size;
         let data = vec![0u8; actual_capacity];
@@ -466,9 +471,10 @@ impl RegionHeap {
     /// `source_addr`. If the reference crosses region boundaries, record it
     /// in the target region's remembered set.
     pub fn write_barrier(&mut self, source_addr: usize, target_addr: usize) {
-        if let (Some(src_idx), Some(tgt_idx)) =
-            (self.region_index_for(source_addr), self.region_index_for(target_addr))
-        {
+        if let (Some(src_idx), Some(tgt_idx)) = (
+            self.region_index_for(source_addr),
+            self.region_index_for(target_addr),
+        ) {
             if src_idx != tgt_idx {
                 self.regions[tgt_idx].rset.add_reference(src_idx);
             }
@@ -486,7 +492,9 @@ impl RegionHeap {
         self.regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
+            .filter(|(_, r)| {
+                r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -625,8 +633,8 @@ impl RegionHeap {
                             // 2) Copy the header as the last step so any
                             //    concurrent reader of `dest_ptr` either
                             //    sees zeroed bytes (allocation zero-init
-                                //  performed by `bump_alloc_in`) or the
-                                //  finished header — never a torn one.
+                            //  performed by `bump_alloc_in`) or the
+                            //  finished header — never a torn one.
                             //    `*ObjectHeader` is `#[repr(C)]` with a
                             //    forwarding_ptr field at a fixed offset;
                             //    a plain struct copy is atomic-enough for
@@ -926,11 +934,7 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
 }
 
 /// Update reference fields in an object using the forwarding map.
-fn update_object_refs(
-    obj_addr: usize,
-    header: &ObjectHeader,
-    forwarding: &HashMap<usize, usize>,
-) {
+fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashMap<usize, usize>) {
     let data_start = obj_addr + HEADER_SIZE;
 
     if header.kind == ObjectKind::Array {
@@ -1061,7 +1065,10 @@ mod tests {
         let base = heap.base_addr();
         assert_eq!(heap.region_index_for(base), Some(0));
         assert_eq!(heap.region_index_for(base + SMALL_REGION), Some(1));
-        assert_eq!(heap.region_index_for(base + SMALL_REGION * 7 + 100), Some(7));
+        assert_eq!(
+            heap.region_index_for(base + SMALL_REGION * 7 + 100),
+            Some(7)
+        );
         assert_eq!(heap.region_index_for(base + HEAP_SIZE), None);
         assert_eq!(heap.region_index_for(0), None);
     }

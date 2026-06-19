@@ -400,9 +400,7 @@ fn native_fc_transfer_to0(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // loop if both refuse. Other errors propagate.
     #[cfg(target_os = "linux")]
     {
-        if let Some(n) =
-            transfer_via_copy_file_range(ctx, src_fd, position, count, dst_fd)?
-        {
+        if let Some(n) = transfer_via_copy_file_range(ctx, src_fd, position, count, dst_fd)? {
             return Ok(Some(Value::Long(n)));
         }
         if let Some(n) = transfer_via_sendfile(ctx, src_fd, position, count, dst_fd)? {
@@ -542,9 +540,7 @@ fn transfer_via_copy_file_range(
                     return Ok(Some(IOSTATUS_INTERRUPTED));
                 }
                 _ => {
-                    return Err(io_error(format!(
-                        "transferTo0: copy_file_range: {err}"
-                    )));
+                    return Err(io_error(format!("transferTo0: copy_file_range: {err}")));
                 }
             }
         }
@@ -732,8 +728,18 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/UnixFileDispatcherImpl",
     ] {
         // map0 has two shapes across JDK history.
-        r.register(cls, "map0", "(Ljava/io/FileDescriptor;IJJZ)J", native_fc_map0);
-        r.register(cls, "map0", "(Ljava/io/FileDescriptor;IJJ)J", native_fc_map0);
+        r.register(
+            cls,
+            "map0",
+            "(Ljava/io/FileDescriptor;IJJZ)J",
+            native_fc_map0,
+        );
+        r.register(
+            cls,
+            "map0",
+            "(Ljava/io/FileDescriptor;IJJ)J",
+            native_fc_map0,
+        );
         r.register(cls, "unmap0", "(JJ)I", native_fc_unmap0);
         r.register(
             cls,
@@ -747,11 +753,21 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J",
             native_fc_transfer_to0,
         );
-        r.register(cls, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+        r.register(
+            cls,
+            "maxDirectTransferSize0",
+            "()I",
+            native_fc_max_direct_transfer_size0,
+        );
         // force0 — fsync. Canonical real implementation lives here
         // (was a silent no-op stub in `nio_native.rs`, which lost
         // data on crash for callers of `FileChannel.force`).
-        r.register(cls, "force0", "(Ljava/io/FileDescriptor;Z)I", native_fc_force0);
+        r.register(
+            cls,
+            "force0",
+            "(Ljava/io/FileDescriptor;Z)I",
+            native_fc_force0,
+        );
     }
 
     // --- legacy FileChannelImpl surface (older JDKs / fallback). The
@@ -762,7 +778,12 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0);
     r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
     r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
-    r.register(fci, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+    r.register(
+        fci,
+        "maxDirectTransferSize0",
+        "()I",
+        native_fc_max_direct_transfer_size0,
+    );
     // sun/nio/ch/FileKey.init — the file-identity triple used by FileLockTable.
     // A missing native here is an UnsatisfiedLinkError on the FIRST file-backed
     // DB open (H2 `SingleFileStore.lockFileChannel` -> `FileChannelImpl.tryLock`
