@@ -32,6 +32,15 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
     socket/NIO) — the lone still-open ES-suite defect (re-verified 2026-06-18). Its three former siblings
     are resolved on `dev` and their docs removed as stale: **ES-HANG-01** (Lucene JIT livelock; fixed by
     `1cd0ab26`), **ES-FAIL-03** (`catch (LinkageError)` now honored), **ES-FAIL-04** (`ArrayListSubList.toArray(T[])` added).
+14. **Spring-suite 2026-06-19 sweep** — two new CV-unique bugs **FIXED on dev** this session:
+    [**Unsafe off-heap DirectBuffer**](springsuite-0619-unsafe-offheap-directbuffer.md) (single-element
+    `Unsafe.get/putX(long)` rejected real `DirectByteBuffer` pointers as "not in any live arena" →
+    off-heap `DataBuffer` broken) and [**getBeanClassName bean-filter**](springsuite-0619-getbeanclassname-bean-filter.md)
+    (loaded-set-only loadability check hid lazily-loadable beans → null bean → "Target object must not
+    be null", ~100+ failures). OPEN candidates from the same sweep (NOT yet triaged) are tracked in
+    [**springsuite-0619-open-candidates**](springsuite-0619-open-candidates.md): `ReactiveAdapterRegistry$MutinyRegistrar`
+    NCDFE (~40), XML "Unexpected failure during bean definition parsing" (~19), "Unnamed bean definition" (~35),
+    spring-jdbc mass-TIMEOUT (~25, needs isolation re-verify), scheduler `StringIndexOutOfBounds` (2).
 
 FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
 JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed
