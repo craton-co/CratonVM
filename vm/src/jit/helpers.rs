@@ -3486,7 +3486,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 // and JIT compiler; no raw pointer dereferences occur within this function itself.
 unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usize, bool)> {
     use crate::runtime::interpreter::try_jit_compile_callee;
-    try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor)
+    // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+    try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3838,6 +3839,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 &class_name,
                 info.method_name,
                 info.descriptor,
+                // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+                true,
             )
         };
         // BUG-H: as in the cache-miss branch below, do not publish a direct
@@ -3953,6 +3956,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             &class_name,
             info.method_name,
             info.descriptor,
+            // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+            true,
         )
     };
     let (entry_ptr, needs_ctx) = match compile_res {

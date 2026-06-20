@@ -3864,6 +3864,15 @@ pub fn jit_bail_shortcircuits() -> u64 {
 /// round-7 fix (bug 1): wraps the inner pipeline so we can record a
 /// permanent bail when the backend returns None.  See the bail-list
 /// notes above.
+///
+/// wire-tiered-manager Step 3 — the trailing `optimize` flag selects the
+/// backend per call: `true` (every historical caller) runs the optimizing IR
+/// pipeline (the C2-equivalent tier); `false` skips IR lowering / escape
+/// analysis / scheduling and routes straight to the single-pass `x64::compile`
+/// backend — the fast, low-latency **C1** tier. The tiered manager's background
+/// compile worker derives the flag from the task's target tier via
+/// [`tiered::tier_uses_optimized_backend`], turning what used to be an advisory
+/// hint into real backend routing.
 #[allow(clippy::type_complexity)]
 pub fn try_compile(
     cached: &CachedBytecodeMethod,
@@ -3894,6 +3903,10 @@ pub fn try_compile(
     // (resolver absent, or it returns `None` for a given site) makes the
     // CRC32 intrinsic at that site bail to normal dispatch.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
+    // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
+    // function doc above.
+    optimize: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -3929,6 +3942,7 @@ pub fn try_compile(
         inline_resolver,
         string_layout_resolver,
         cp_invoke_class_id_resolver,
+        optimize,
         &mut backend_attempted,
     );
 
@@ -4015,6 +4029,22 @@ pub fn try_compile(
     result
 }
 
+// Test-only telemetry for wire-tiered-manager Step 3: how many times the
+// optimizing IR-lowering pipeline produced the final compiled body **on the
+// current thread**. The per-call-toggle test reads this to prove
+// `optimize=false` (the C1 tier) skips the IR path while `optimize=true` (C2)
+// takes it.
+//
+// A `thread_local!` rather than a global atomic so the count is isolated
+// per-test: `try_compile` runs the whole pipeline synchronously on the caller's
+// thread, and the cargo harness runs each `#[test]` on its own thread, so a
+// concurrently-running compile test cannot perturb this thread's count.
+// `#[cfg(test)]` so production codegen carries no extra work on the hot path.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static IR_LOWER_COMPILES: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -4034,6 +4064,10 @@ fn try_compile_inner(
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
     // Maps an invoke* CP index to its declared class id — see `try_compile`.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // wire-tiered-manager Step 3: when `false`, the optimizing IR pipeline is
+    // skipped entirely and compilation falls through to the single-pass
+    // `x64::compile` backend (the fast C1 tier). See `try_compile`.
+    optimize: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4172,7 +4206,17 @@ fn try_compile_inner(
     // `boolean eq(long, long)` truncated the second long parameter — read
     // from the never-populated `locals[2]` slot — and panicked with a
     // `u32::MAX` slot index; bc-java InterleaveTest failed 2/4 under JIT.)
-    if ir::ir_compatible(&scan) && !method_uses_category2(code, code_len, &cached.method_descriptor)
+    // wire-tiered-manager Step 3: `optimize == false` is the C1 (fast) tier —
+    // skip the whole optimizing IR pipeline (build → optimize → escape analysis
+    // → schedule → lower) and fall through to the single-pass `x64::compile`
+    // backend below. The single-pass backend is the existing, well-tested
+    // fallback (it already serves every category-2 / non-`ir_compatible`
+    // method), so routing more methods to it is a throughput trade-off, never a
+    // correctness risk. C2 (`optimize == true`, every non-tiered caller)
+    // keeps the historical IR-first behaviour.
+    if optimize
+        && ir::ir_compatible(&scan)
+        && !method_uses_category2(code, code_len, &cached.method_descriptor)
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -4222,6 +4266,12 @@ fn try_compile_inner(
                 if let Some(compiled) =
                     ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
                 {
+                    // wire-tiered-manager Step 3 telemetry (test-only): records
+                    // that the optimizing IR path — not the single-pass C1
+                    // backend — produced this body, so the per-call toggle test
+                    // can prove `optimize=false` skips it.
+                    #[cfg(test)]
+                    IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
                     return Some(compiled);
                 }
             } // end else (IR-lowering path)
@@ -5177,6 +5227,74 @@ pub fn return_type(descriptor: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── wire-tiered-manager Step 3: per-call C1/C2 backend toggle ──────────
+    //
+    // `optimize=true` (C2) must take the optimizing IR pipeline; `optimize=false`
+    // (the fast C1 tier) must skip it and route to the single-pass `x64::compile`
+    // backend. Proven via the thread-local `IR_LOWER_COMPILES` counter, which the
+    // IR-lowering success path bumps. The counter is thread-local and each cargo
+    // `#[test]` runs on its own thread, so parallel compile tests can't perturb it.
+    #[test]
+    fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
+        use std::sync::Arc;
+
+        // `static int add(int a, int b) { return a + b; }`
+        //   iload_0 (0x1a); iload_1 (0x1b); iadd (0x60); ireturn (0xac)
+        // Pure int arithmetic → ir_compatible, no category-2, no branch/call/field.
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Add"),
+            method_name: Arc::from("add"),
+            method_descriptor: Arc::from("(II)I"),
+            source_file: None,
+            code: Arc::from([0x1a, 0x1b, 0x60, 0xac].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
+        // `#[repr(C)]`, so an all-zero bit pattern is valid (no niches/padding).
+        // `add` references no runtime helper, and the test never executes the
+        // generated machine code, so the null helper addresses are never called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+
+        // C2 — optimize=true → optimizing IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let c2 = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, true,
+        );
+        let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
+        assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
+        assert_eq!(
+            c2_used_ir, 1,
+            "optimize=true (C2) must route `add` through the IR pipeline"
+        );
+
+        // C1 — optimize=false → single-pass x64 backend, IR pipeline skipped.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let c1 = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, false,
+        );
+        let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
+        assert!(
+            c1.is_some(),
+            "optimize=false (C1) must still compile `add` via the single-pass backend"
+        );
+        assert_eq!(
+            c1_used_ir, 0,
+            "optimize=false (C1) must NOT take the IR pipeline"
+        );
+
+        // Both tiers produced runnable native code.
+        assert!(!c1.unwrap().code_bytes().is_empty());
+        assert!(!c2.unwrap().code_bytes().is_empty());
+    }
 
     // ── Stage A.4 (precise oop maps) — param oop mask ──────────────
     //
