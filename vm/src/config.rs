@@ -190,10 +190,12 @@ pub struct VmConfig {
     /// HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` (JEP 358). When
     /// `true`, the interpreter routes the *non-invoke* null-deref opcodes
     /// (getfield/putfield/arraylength/array-access/monitor/athrow) through the
-    /// JEP-358 `Cannot ... because "<expr>" is null` helper. Defaults to `false`
-    /// here (HotSpot's own default is `true`) until a differential compliance
-    /// run clears the message-string change; the increment-1 invoke-site
-    /// message is unconditionally on regardless of this flag. The
+    /// JEP-358 `Cannot ... because "<expr>" is null` helper. Defaults to `true`
+    /// here, matching HotSpot's own default, now that the differential
+    /// compliance run confirmed the messages are byte-identical to HotSpot's
+    /// `getExtendedNPEMessage` (see `docs/feature-designs/jep358-helpful-npe.md`,
+    /// Increment 5). Pass `-XX:-ShowCodeDetailsInExceptionMessages` to opt out;
+    /// the increment-1 invoke-site message is unconditionally on regardless. The
     /// `CRATONVM_HELPFUL_NPE_OPCODES` env var, when set, overrides this flag.
     /// See [`crate::runtime::env_cache::helpful_npe_opcodes`].
     pub show_code_details_in_exception_messages: bool,
@@ -348,7 +350,9 @@ impl Default for VmConfig {
             heap_dump_on_oom: false,
             heap_dump_path: None,
             use_container_support: true,
-            show_code_details_in_exception_messages: false,
+            // JEP 358: default ON to match HotSpot (messages verified
+            // byte-identical). Opt out via -XX:-ShowCodeDetailsInExceptionMessages.
+            show_code_details_in_exception_messages: true,
             xlog_spec: None,
             jvmti_agent_options: Vec::new(),
             #[cfg(feature = "gpu-offload")]
