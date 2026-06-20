@@ -178,3 +178,37 @@ that no `wakeup()` can interrupt.
 
 - `Thread.getState()` fix: commit `16d23e7b`.
 - ES-HANG-02 residuals + selector/connect work: [ES-HANG-02-residuals-handoff.md](ES-HANG-02-residuals-handoff.md).
+
+## UPDATE 2026-06-20 — captured leaked-thread stack (no longer empty) + ThreadLeakControl artifacts
+
+While fixing the ES-HANG-02 residual-2 GC bugs (branch `fix/es-restclient-gc-safety`) the leaked-thread
+stack DID print (the earlier "empty stack" note no longer holds for this case). At
+`RestClientSingleHostIntegTests` SUITE teardown, ~10% of `-Xmx1g` runs leak ONE thread, `state=RUNNABLE`
+(not parked in `WSAPoll` — it is busy in the WRITE path, so `interrupt()` can't stop it):
+
+```
+Thread[id=…, name=elasticsearch-rest-client-N-thread-M, state=RUNNABLE, group=TGRP-…]
+   at org.apache.http.impl.nio.reactor.IOSessionImpl.toString
+   at org.apache.http.impl.nio.conn.LoggingIOSession$LoggingByteChannel.write
+   at org.apache.http.impl.nio.reactor.SessionOutputBufferImpl.flush
+   at org.apache.http.impl.nio.DefaultNHttpClientConnection.produceOutput
+   at org.apache.http.impl.nio.client.InternalIODispatch.onOutputReady
+   at org.apache.http.impl.nio.reactor.BaseIOReactor.writable
+   at org.apache.http.impl.nio.reactor.AbstractIOReactor.processEvent(s)
+   at org.apache.http.impl.nio.reactor.AbstractIOReactor.execute
+```
+
+So at least one leak variant is NOT a missed `WSAPoll` wakeup — the worker is **busy-spinning in
+`produceOutput` → channel write**, i.e. the selector keeps reporting the channel WRITABLE (or the write
+keeps returning 0 / never errors) on a connection whose peer (the synthetic `Connection: close` server) has
+already closed, so the reactor never makes progress and never returns to `select()` to observe shutdown.
+Likely root: a non-blocking `SocketChannel.write` to a half-closed/reset loopback peer returns `0`
+(WouldBlock) instead of an error, and/or the selector reports persistent OP_WRITE readiness for it. Look at
+`native-io` write + `nio_selector.rs` OP_WRITE readiness for a peer-closed socket.
+
+**Downstream artifacts (NOT separate bugs):** once a thread leaks, randomizedtesting's
+`ThreadLeakControl.formatThreadStacks(Map)` runs to build the `ThreadLeakError` message and hits a CratonVM
+`NoSuchMethodError "java/lang/StringBuilder.flush()V"` (a stale/misresolved receiver inside the framework's
+formatter), and `RandomizedContext.randomnesses` / `Thread.group`-null NPEs appear while it inspects the
+leaked thread. These only fire *because* a thread leaked — fixing the leak removes them. (The
+NoSuchMethodError caller was localized with the new caller-frame field on the VM's NoSuchMethodError warning.)
