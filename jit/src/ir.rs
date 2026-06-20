@@ -486,13 +486,15 @@ pub struct IrBuilder {
     /// `invokespecial` whose pc is NOT here makes `build` bail.
     trivial_init_pcs: HashSet<usize>,
     /// Gap B: resolved `invokestatic` call sites the builder lowers into an
-    /// `Op::Call`. `pc → (info_ptr, num_args, returns_value)` where `info_ptr`
-    /// is the address of a leaked `JitInvokeInfo` (the dispatch helper's 2nd
-    /// argument), `num_args` the JVM arg-slot count, and `returns_value` whether
-    /// the call yields a result to push. Set by [`Self::set_invoke_info`]; only
-    /// populated for oop-free methods (so no object reference is live across the
-    /// call → GC-safe without an oop map). An `invokestatic` pc NOT here bails.
-    invoke_info: HashMap<usize, (usize, usize, bool)>,
+    /// `Op::Call`. `pc → (info_ptr, num_args, ret_type)` where `info_ptr` is the
+    /// address of a leaked `JitInvokeInfo` (the dispatch helper's 2nd argument),
+    /// `num_args` the JVM arg-slot count, and `ret_type` the JVM return-type byte
+    /// (`V` → no value; `L`/`[` → a reference result, typed `IrType::Ref`; any
+    /// int-category byte → `IrType::Int`). Set by [`Self::set_invoke_info`]. The
+    /// caller (`lib.rs`) restricts which methods get this (inc 22: oops may be
+    /// live across the call — found by the conservative GC scan of the spilled
+    /// frame, sound because GC is non-moving while a JIT frame is active).
+    invoke_info: HashMap<usize, (usize, usize, u8)>,
 }
 
 impl IrBuilder {
@@ -559,11 +561,10 @@ impl IrBuilder {
     }
 
     /// Gap B: supply the resolved `invokestatic` call sites (`pc → (info_ptr,
-    /// num_args, returns_value)`) the builder lowers into `Op::Call`. Must be
-    /// called before [`Self::build`]; an `invokestatic` pc not present bails the
-    /// build to single-pass. The caller (`lib.rs`) only populates this for
-    /// oop-free methods so a call never has a live object reference across it.
-    pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, bool)>) {
+    /// num_args, ret_type)`) the builder lowers into `Op::Call`. Must be called
+    /// before [`Self::build`]; an `invokestatic` pc not present bails the build
+    /// to single-pass. `ret_type` is the JVM return-type byte (see the field doc).
+    pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, u8)>) {
         self.invoke_info = info;
     }
 
@@ -1296,7 +1297,7 @@ impl IrBuilder {
                 // ever live across the call → GC-safe without an oop map. A pc
                 // not in `invoke_info` bails to single-pass.
                 0xb8 => {
-                    let (info_ptr, num_args, returns_value) = match self.invoke_info.get(&pc) {
+                    let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return None,
                     };
@@ -1315,10 +1316,13 @@ impl IrBuilder {
                     // memory token and BECOMES the new one (serialising every
                     // prior memory op before it and every later one after). The
                     // same node also carries the return value (like `Op::Load`).
-                    let ty = if returns_value {
-                        IrType::Int
-                    } else {
-                        IrType::Void
+                    // Result type from the descriptor: `V` → no value; `L`/`[` →
+                    // a reference result (`IrType::Ref`); else int-category.
+                    let returns_value = ret_type != b'V';
+                    let ty = match ret_type {
+                        b'V' => IrType::Void,
+                        b'L' | b'[' => IrType::Ref,
+                        _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
                     self.mem = call;

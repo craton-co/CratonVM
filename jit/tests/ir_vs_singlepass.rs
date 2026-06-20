@@ -1092,3 +1092,51 @@ fn ir_vs_singlepass_invokestatic_exception_sentinel() {
         "a throwing callee (i64::MIN) must bail and return the sentinel"
     );
 }
+
+#[test]
+fn ir_vs_singlepass_invokestatic_reference_arg() {
+    // inc 22: a REFERENCE argument is marshalled as its raw pointer. The method
+    // takes an object + an int and passes both to a static call; the stub reads
+    // field 0 off the object pointer and returns `o.x + n`, proving the pointer
+    // is marshalled intact (not truncated/swapped) and the int arg follows it.
+    //   static int f(Corpus o, int n) { return g(o, n); }
+    //   aload_0; iload_1; invokestatic #2; ireturn
+    unsafe extern "C" fn ref_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "ref_dispatch expects (object, int)");
+        let p = args_ptr as *const i64;
+        let obj = *p; // arg0 = the object pointer (a reference)
+        let n = *p.add(1) as i32 as i64; // arg1 = int
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET; // field 0 int payload
+        let x = std::ptr::read_unaligned((obj as *const u8).add(off) as *const i32) as i64;
+        x + n
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = ref_dispatch as *const () as usize;
+    let code = vec![0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(Lpkg/Corpus;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(Lpkg/Corpus;I)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of reference-arg invokestatic method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (xval, n) in [(5i32, 7i64), (-3, 2), (0, 0), (i32::MAX, 1)] {
+        let obj = make_object(&[xval]);
+        let args = [obj.as_ptr() as i64, n];
+        // SAFETY: `obj` is a live, correctly-laid-out synthetic object; its
+        // address is arg0 (a reference), `n` is arg1; the stub only reads field 0.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("call x={xval},n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            xval as i64 + n,
+            "reference-arg marshalling for x={xval}, n={n}"
+        );
+        drop(obj);
+    }
+}

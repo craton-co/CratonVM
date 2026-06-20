@@ -4342,25 +4342,24 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
-        // Gap B: invokestatic → `Op::Call`. Only when the IR-call gate is on AND
-        // the method is provably OOP-FREE — no getfield/putfield (a ref
-        // receiver), no getstatic/putstatic, no `new`, no array allocation, all
-        // parameters primitive, and every invoke an `invokestatic` with int-only
-        // args + an int/void return. Then NO object reference is ever live in the
-        // frame, so a GC at the call (a safepoint) has no roots to find here —
-        // GC-safe without an oop map (which the IR lowerer does not emit). The
-        // leaked `JitInvokeInfo` boxes/strings are attached to the returned
+        // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
+        // is on AND the method has no `new`/array allocation (a surviving `New`
+        // would need the allocation path the lowerer lacks; array ops bail the
+        // builder anyway) AND every invoke is an `invokestatic` whose descriptor
+        // is GPR-marshallable (int/reference args + int/void/reference return —
+        // no long/float/double). Reference params, reference args, int field
+        // ops, and reference returns ARE allowed: any oop live across the call
+        // sits in a spilled frame slot, which the conservative GC root scan of
+        // the IR frame finds — sound because the GC is non-moving while a JIT
+        // frame is active (so a pinned pointer is never relocated). The leaked
+        // `JitInvokeInfo` boxes/strings are attached to the returned
         // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
         let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
         let mut ir_call_strings: Vec<Box<str>> = Vec::new();
         if ir_emit_calls && !scan.invoke_ops.is_empty() {
             if let Some(resolver) = cp_invoke_resolver {
-                let oop_free = scan.field_ops.is_empty()
-                    && scan.static_field_ops.is_empty()
-                    && scan.new_ops.is_empty()
-                    && scan.anewarray_ops.is_empty()
-                    && !descriptor_has_ref_params(&cached.method_descriptor);
-                if oop_free {
+                let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+                if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
@@ -4378,15 +4377,13 @@ fn try_compile_inner(
                                 break;
                             }
                         };
-                        let num_args = match static_call_int_shape(&desc) {
-                            Some(n) => n,
+                        let (num_args, ret) = match static_call_shape(&desc) {
+                            Some(t) => t,
                             None => {
                                 all_emittable = false;
                                 break;
                             }
                         };
-                        let ret = return_type(&desc);
-                        let returns_value = ret != b'V';
                         let class_box: Box<str> = cn.into_boxed_str();
                         let method_box: Box<str> = mn.into_boxed_str();
                         let desc_box: Box<str> = desc.into_boxed_str();
@@ -4406,7 +4403,7 @@ fn try_compile_inner(
                         });
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
-                        info_map.insert(pc, (info_ptr, num_args, returns_value));
+                        info_map.insert(pc, (info_ptr, num_args, ret));
                     }
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -5360,32 +5357,21 @@ pub fn count_param_slots(descriptor: &str) -> usize {
     slots
 }
 
-/// Gap B: true iff the method descriptor has any reference (`L…`/`[…`)
-/// parameter. An oop-free method (no ref params, no field/static/new/array
-/// ops) holds no object reference at any point, so an `Op::Call` (a GC
-/// safepoint) needs no oop map — the soundness precondition for emitting
-/// `invokestatic` on the IR path (the lowerer emits no oop maps).
-pub fn descriptor_has_ref_params(descriptor: &str) -> bool {
-    let bytes = descriptor.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'(' {
-        return false;
-    }
-    let mut i = 1;
-    while i < bytes.len() && bytes[i] != b')' {
-        match bytes[i] {
-            b'L' | b'[' => return true,
-            _ => i += 1,
-        }
-    }
-    false
-}
-
-/// Gap B: classify a static-call descriptor for the int-only `Op::Call` slice.
-/// Returns `Some(num_args)` iff EVERY parameter is an int-category single-slot
-/// type (`I`/`Z`/`B`/`C`/`S`) AND the return is int-category or `void` — i.e.
-/// no `long`/`float`/`double` (category-2 / XMM register), and no reference
-/// (oop). `None` disqualifies the call, keeping the method on single-pass.
-pub fn static_call_int_shape(descriptor: &str) -> Option<usize> {
+/// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.
+/// Returns `Some((num_args, ret_type))` iff EVERY parameter is a single-slot
+/// value the marshaller can pass as one i64 — an int-category primitive
+/// (`I`/`Z`/`B`/`C`/`S`) OR a reference (`L…`/`[…`, passed as the raw pointer) —
+/// and the return is int-category, `void`, or a reference. `None` for any
+/// `long`/`float`/`double` parameter or return (category-2 / XMM register, not
+/// handled by the int/pointer-only GPR marshalling), keeping the method on
+/// single-pass.
+///
+/// Reference args/returns are GC-sound across the call: while a JIT frame is
+/// active the GC is non-moving (`gc_quiescence`), and the conservative root
+/// scan of the IR spill frame finds (and pins) any pointer in a slot — so a
+/// reference live across the call is neither relocated nor reclaimed, with no
+/// precise oop map required (inc 22 — see `activate-ir-optimizer.md`).
+pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
     let bytes = descriptor.as_bytes();
     if bytes.is_empty() || bytes[0] != b'(' {
         return None;
@@ -5398,14 +5384,38 @@ pub fn static_call_int_shape(descriptor: &str) -> Option<usize> {
                 num_args += 1;
                 i += 1;
             }
-            // long / float / double (category-2 or XMM) or reference → not the
-            // int-only shape this slice handles.
+            b'L' => {
+                num_args += 1;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1; // skip ';'
+            }
+            b'[' => {
+                num_args += 1;
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'L' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < bytes.len() {
+                    i += 1; // primitive array element type
+                }
+            }
+            // long / float / double — category-2 / XMM, not handled.
             _ => return None,
         }
     }
     let ret = return_type(descriptor);
     match ret {
-        b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' => Some(num_args),
+        b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' | b'L' | b'[' => Some((num_args, ret)),
+        // J / D / F return — not handled.
         _ => None,
     }
 }
