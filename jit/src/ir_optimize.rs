@@ -753,15 +753,21 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
 //
 // LOOP MODEL (Sea-of-Nodes):
 //
-//   A loop header is an `Op::Region` node whose inputs are
-//   `[ctrl_entry, ctrl_backedge, …]` (see `ir.rs` `activate_loop_header`).
-//   The *loop body* is the set of control nodes reachable from the Region
-//   along control edges without leaving through the Region again, up to and
-//   including the node that closes the back-edge (input slot >= 1 of the
-//   Region).  A value is *loop-variant* if it is a `Phi` anchored at this
-//   Region (the loop-carried / induction values) or transitively depends on
-//   one; everything else (params, constants, and pure expressions over
-//   non-variant inputs) is *loop-invariant*.
+//   A loop header is an `Op::Region` node (hand-built / EA-bridge loops) OR an
+//   `Op::Merge` node with a back-edge — the shape the production bytecode→IR
+//   builder emits for a javac loop. Its control inputs are an entry predecessor
+//   and one (or more) back-edges; for a `Region` the order is fixed
+//   `[ctrl_entry, ctrl_backedge, …]` (`ir.rs` `activate_loop_header`), but for a
+//   `Merge` header the slot order is NOT fixed, so `loop_headers` classifies
+//   entry vs back-edge structurally (a back-edge is control-reachable forward
+//   from the header itself; the remaining input is the pre-header).
+//   The *loop body* is the set of control nodes reachable from the header
+//   along control edges without leaving through the entry predecessor, up to
+//   and including the node(s) that close the back-edge.  A value is
+//   *loop-variant* if it is a `Phi` anchored at this header (the loop-carried /
+//   induction values) or transitively depends on one; everything else (params,
+//   constants, and pure expressions over non-variant inputs) is
+//   *loop-invariant*.
 //
 // SOUNDNESS MODEL (deliberately conservative — a hoist that changes
 // observable behaviour is a miscompile):
@@ -792,24 +798,64 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
 //     hoisted when the body contains no barrier (so no observable ordering
 //     relative to a side effect exists to violate).
 //   * Irreducible / multi-entry loops are excluded: we only treat a `Region`
-//     with at least 2 control inputs (one entry, one back-edge) as a loop,
-//     and we require the entry predecessor (`inputs[0]`) to be outside the
-//     body (the hoist target / pre-header anchor).
+//     or back-edge `Merge` with at least 2 control inputs (exactly one entry,
+//     one or more back-edges) as a loop, and we require the entry predecessor
+//     (classified structurally, not by slot) to be outside the body (the hoist
+//     target / pre-header anchor).
 //
 // This pass is monotone in observable behaviour (it only re-anchors invariant
 // pure nodes — already-floating — and rewrites a hoisted load's control /
 // memory inputs to the pre-header) and is idempotent, so re-running it finds
 // no new work.
 
-/// Identify the `Op::Region` (loop-header) nodes in the graph.
-fn loop_regions(graph: &Graph) -> Vec<NodeId> {
-    graph
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.op == Op::Region && n.inputs.len() >= 2)
-        .map(|(i, _)| i as NodeId)
-        .collect()
+/// Identify loop headers with their loop-entry predecessor and back-edge(s).
+///
+/// A header is an `Op::Region` (hand-built / EA-bridge loops) OR an `Op::Merge`
+/// with a back-edge — the shape the production bytecode→IR builder emits for a
+/// javac loop. Of a header's control inputs, the back-edge(s) are control-
+/// reachable *forward* from the header itself (`forward_control_closure`), and
+/// the remaining input is the pre-header / loop entry. Resolving entry vs
+/// back-edge structurally — rather than assuming the entry sits at input slot 0
+/// — is what lets LICM fire on `Merge` headers, whose slot order the builder
+/// does not fix (mirrors the unroll pass's loop discovery).
+///
+/// Only reducible single-entry loops are returned: exactly one pre-header and
+/// at least one back-edge. Returns `(header, entry_pred, back_ctrls)`.
+fn loop_headers(graph: &Graph) -> Vec<(NodeId, NodeId, Vec<NodeId>)> {
+    let users = build_users(graph);
+    let mut out = Vec::new();
+    for id in 0..graph.nodes.len() as NodeId {
+        if !matches!(graph.nodes[id as usize].op, Op::Region | Op::Merge) {
+            continue;
+        }
+        let inputs: Vec<NodeId> = graph.nodes[id as usize]
+            .inputs
+            .iter()
+            .copied()
+            .filter(|&c| c != NO_NODE)
+            .collect();
+        if inputs.len() < 2 {
+            continue;
+        }
+        let reach = forward_control_closure(graph, &users, id);
+        let mut back_ctrls = Vec::new();
+        let mut entry_preds = Vec::new();
+        for &c in &inputs {
+            if reach.contains(&c) {
+                back_ctrls.push(c);
+            } else {
+                entry_preds.push(c);
+            }
+        }
+        // Reducible single-entry loop: one pre-header, ≥1 back-edge. A nested
+        // inner header whose entry is itself control-reachable (both inputs in
+        // `reach`) yields zero pre-headers and is skipped — safe, just not
+        // optimized (same limitation as the unroll pass).
+        if entry_preds.len() == 1 && !back_ctrls.is_empty() {
+            out.push((id, entry_preds[0], back_ctrls));
+        }
+    }
+    out
 }
 
 /// Compute the set of nodes that belong to the loop whose header is `region`.
@@ -824,7 +870,12 @@ fn loop_regions(graph: &Graph) -> Vec<NodeId> {
 /// forward-from-header reachability over-approximates the body safely: an
 /// over-large body only *loses* hoisting opportunities (more nodes look
 /// variant), never produces an unsound hoist.
-fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
+fn loop_body(
+    graph: &Graph,
+    region: NodeId,
+    entry_pred: NodeId,
+    back_ctrls: &[NodeId],
+) -> FxHashSet<NodeId> {
     // Control nodes whose nearest enclosing loop header is `region`. We seed
     // with `region` itself and walk *users* (forward control flow) — but the
     // arena stores inputs, not users, so build a users map once.
@@ -837,25 +888,19 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
         }
     }
 
-    // Back-edge control node(s): the region's predecessors other than the
-    // entry edge (`inputs[0]`). For a reducible loop these are the control
-    // nodes that close the loop.
-    let entry_pred = graph.nodes[region as usize]
-        .inputs
-        .first()
-        .copied()
-        .unwrap_or(NO_NODE);
-    let back_ctrls: Vec<NodeId> = graph.nodes[region as usize]
-        .inputs
-        .iter()
-        .skip(1)
-        .copied()
-        .filter(|&c| c != NO_NODE)
-        .collect();
+    // `entry_pred` (the pre-header control) and `back_ctrls` (the back-edge
+    // control nodes) are classified structurally by the caller (`loop_headers`),
+    // so this works for `Merge` headers whose slot order is not fixed.
 
     // (1) Forward control set: control nodes reachable from `region` along
     // control / projection successor edges, without leaving through the entry
-    // predecessor or a *different* loop header.
+    // predecessor. We intentionally DO NOT stop at nested loop headers: an
+    // over-large forward set is trimmed back to the natural loop by the
+    // backward intersection in (2), so any nested-loop control (and its
+    // barriers — stores/calls) stays inside the body. This is the SAFE
+    // direction: an over-large body only loses hoists, never enables an unsound
+    // one, whereas under-approximating could hide a nested-loop store from the
+    // barrier check.
     let mut forward: FxHashSet<NodeId> = FxHashSet::default();
     forward.insert(region);
     let mut work = vec![region];
@@ -865,9 +910,6 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
                 continue;
             }
             let op = &graph.nodes[u as usize].op;
-            if matches!(op, Op::Region) && u != region {
-                continue; // don't recurse into another loop header
-            }
             if op.is_control() && !matches!(op, Op::Return) {
                 if forward.insert(u) {
                     work.push(u);
@@ -884,7 +926,7 @@ fn loop_body(graph: &Graph, region: NodeId) -> FxHashSet<NodeId> {
     // precisely excludes the loop-exit projection and all post-loop code.
     let mut body: FxHashSet<NodeId> = FxHashSet::default();
     body.insert(region);
-    let mut back: Vec<NodeId> = back_ctrls.clone();
+    let mut back: Vec<NodeId> = back_ctrls.to_vec();
     while let Some(cur) = back.pop() {
         if cur == NO_NODE || cur == region || body.contains(&cur) {
             continue;
@@ -990,31 +1032,40 @@ fn loop_has_memory_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
 /// Run loop-invariant code motion. Returns `true` if it changed the graph.
 ///
 /// See the module-level soundness model. Hoists invariant loads out of each
-/// natural loop (`Op::Region` header) into the loop pre-header (the region's
+/// natural loop — `Op::Region` *or* a javac back-edge `Op::Merge` header (see
+/// `loop_headers`) — into the loop pre-header (the structurally-classified
 /// entry-predecessor control), provided the loop body has no memory barrier
 /// that could clobber the load. Pure invariant nodes already float in
 /// Sea-of-Nodes, so no placement change is needed for them — but recognising
 /// them lets the trailing GVN pass dedup loop-entry vs loop-body copies.
 fn licm(graph: &mut Graph) -> bool {
-    let regions = loop_regions(graph);
-    if regions.is_empty() {
-        return false;
-    }
-    let mut changed = false;
+    // Normalize the single-input `Op::Merge` control pass-throughs the builder
+    // wraps around branch projections, so a javac loop header and its back-edge
+    // sit adjacent to their If/Proj (mirrors the unroll pass). Without this,
+    // real `Merge`-header loops are not recognised. Idempotent — a no-op when
+    // unroll already ran it (or on hand-built `Region` graphs with no trivial
+    // merges). Fold any structural change into `changed` so `optimize()` runs
+    // its trailing GVN/DCE cleanup.
+    let live_before = graph.live_count();
+    collapse_trivial_merges(graph);
+    let mut changed = graph.live_count() != live_before;
 
-    for region in regions {
-        // Re-validate: the region may have been killed by an earlier hoist's
+    let headers = loop_headers(graph);
+    if headers.is_empty() {
+        return changed;
+    }
+
+    for (region, entry_pred, back_ctrls) in headers {
+        // Re-validate: the header may have been killed by an earlier hoist's
         // cleanup in this same loop set (defensive).
-        if graph.nodes[region as usize].op != Op::Region {
+        if !matches!(graph.nodes[region as usize].op, Op::Region | Op::Merge) {
             continue;
         }
-        let body = loop_body(graph, region);
-        // The pre-header is the control feeding the region's entry edge.
-        let preheader = graph.nodes[region as usize]
-            .inputs
-            .first()
-            .copied()
-            .unwrap_or(NO_NODE);
+        let body = loop_body(graph, region, entry_pred, &back_ctrls);
+        // The pre-header is the classified loop-entry predecessor — NOT
+        // necessarily input slot 0, since a `Merge` header may carry the
+        // back-edge at either slot.
+        let preheader = entry_pred;
         if preheader == NO_NODE || body.contains(&preheader) {
             // No identifiable pre-header outside the loop → cannot hoist.
             continue;
@@ -2841,6 +2892,13 @@ mod tests {
     /// The caller adds the node under test (an invariant or variant load)
     /// pinned into the body via a control input, then runs `licm`.
     fn loop_probe() -> (Graph, NodeId, NodeId, NodeId) {
+        loop_probe_header(Op::Region)
+    }
+
+    /// As [`loop_probe`] but with a caller-chosen header op (`Op::Region` for
+    /// the hand-built shape, `Op::Merge` for the real javac loop shape). The
+    /// header's inputs are `[entry_pred=c0, back_edge_ctrl]`.
+    fn loop_probe_header(header: Op) -> (Graph, NodeId, NodeId, NodeId) {
         let mut g = Graph {
             nodes: Vec::new(),
             entry: 0,
@@ -2851,8 +2909,8 @@ mod tests {
         g.entry = start;
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None); // preheader ctrl
         let _m0 = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
-        // Region: [entry_pred=c0, back_edge_ctrl] — fill back-edge below.
-        let region = g.add(Op::Region, IrType::Control, vec![c0], None);
+        // Header: [entry_pred=c0, back_edge_ctrl] — fill back-edge below.
+        let region = g.add(header, IrType::Control, vec![c0], None);
         let init = g.add(Op::Const(0), IrType::Int, vec![], None);
         // Induction phi (loop-carried): [region, init, back_val]. back_val
         // filled after the increment exists.
@@ -3065,6 +3123,71 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "the load must stay in the loop when the body has a barrier"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_invariant_load_merge_header() {
+        // The production bytecode→IR builder emits javac loops with an
+        // `Op::Merge` header (not `Op::Region`). LICM must recognise it and
+        // hoist an invariant load just the same.
+        let (mut g, region, preheader, _iv) = loop_probe_header(Op::Merge);
+        let mem = 2;
+        let base = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let off = g.add(Op::Const(4), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, base, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(
+            changed,
+            "an invariant load in a barrier-free Merge-header loop must hoist"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control input must be re-anchored to the pre-header"
+        );
+    }
+
+    #[test]
+    fn test_licm_merge_header_classifies_entry_regardless_of_slot_order() {
+        // A `Merge` header does not fix entry vs back-edge slot order. With the
+        // back-edge moved to slot 0 and the entry to slot 1, LICM must still
+        // classify the pre-header structurally (by control-reachability) and
+        // hoist to the real entry — never to the back-edge at slot 0.
+        let (mut g, region, preheader, _iv) = loop_probe_header(Op::Merge);
+        // Swap the header's control inputs: [c0, back] -> [back, c0].
+        g.nodes[region as usize].inputs.swap(0, 1);
+        assert_ne!(
+            g.nodes[region as usize].inputs[0], preheader,
+            "precondition: the entry predecessor is no longer at input slot 0"
+        );
+        let mem = 2;
+        let base = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let off = g.add(Op::Const(4), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, base, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(changed, "the invariant load must still hoist");
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the load must re-anchor to the structurally-classified entry (c0), \
+             not to whatever sits at input slot 0 (the back-edge)"
         );
     }
 

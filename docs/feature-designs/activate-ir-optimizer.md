@@ -342,6 +342,59 @@ Status: **landed** on `dev`. A precision improvement to the DSE overwrite phase
 *non-aliasing* in-loop store drive LICM hoisting (Front 2.2), and array-element
 overwrite DSE (still gated on a real array `Store` operand layout).
 
+## Increment 5 (LICM fires on javac `Merge`-header loops) landed
+
+Status: **landed** on `dev`, behind the existing default-OFF `CRATONVM_JIT_LICM`
+soak flag. Closes the increment-2/3 follow-up "make LICM fire on `Merge`
+headers": until now LICM only recognised `Op::Region` loop headers (the
+hand-built / EA-bridge shape), so it **never fired on real code** — the
+production bytecode→IR builder emits javac loops as a back-edge `Op::Merge`
+(the same shape the unroll pass already handles).
+
+**What landed** (`jit/src/ir_optimize.rs`):
+
+- **Generalised loop discovery (`loop_headers`)** replaces the
+  `Region`-only `loop_regions`. A header is an `Op::Region` *or* a back-edge
+  `Op::Merge`; of its control inputs, the back-edge(s) are control-reachable
+  forward from the header itself (`forward_control_closure`) and the remaining
+  input is the pre-header. Resolving entry vs back-edge **structurally** — not by
+  assuming the entry sits at input slot 0 — is essential because the builder does
+  not fix a `Merge` header's slot order (mirrors the unroll pass's discovery).
+  Only reducible single-entry loops (exactly one pre-header) are returned.
+- **`licm` now runs `collapse_trivial_merges` first** (the same normalisation
+  unroll uses, folding the single-input `Merge` control pass-throughs the builder
+  wraps around branch projections) so real loop headers/back-edges are
+  recognisable, and uses the **classified** entry-predecessor as the pre-header.
+- **`loop_body` takes the classified `(entry_pred, back_ctrls)`** and its forward
+  control walk no longer stops at nested headers: an over-large forward set is
+  trimmed back to the natural loop by the backward-reachability intersection, so
+  a nested loop's control (and its barriers) stays *inside* the body. This is the
+  safe direction — over-approximating the body only loses hoists, whereas
+  under-approximating could hide a nested-loop store from the barrier check.
+  (Net: also tightens the pre-existing nested-`Region` handling.)
+
+**Soundness**: unchanged hoist criteria — only an `Op::Load` whose base and
+address are loop-invariant, in a body with **no** memory barrier, is re-anchored
+to the pre-header. The new code only changes which loops are *discovered* and how
+entry/back-edge are identified; misclassification is prevented by the same
+forward-reachability test the validated unroll pass uses.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_invariant_load_merge_header` — an invariant load in a
+  barrier-free `Merge`-header loop is hoisted to the pre-header.
+- `test_licm_merge_header_classifies_entry_regardless_of_slot_order` — with the
+  back-edge moved to input slot 0, LICM still hoists to the structurally-resolved
+  entry (never the back-edge), proving slot-order independence.
+- All four pre-existing `Region`-header LICM tests still pass.
+
+**Boundary**: like the increment-1/2/4 escape/DSE work, LICM's load *hoisting*
+only fires once the IR builder emits `Op::Load` (it currently bails on
+field/array load opcodes, so production IR has no loads to hoist yet). What this
+increment delivers now is correct **loop recognition** on the real `Merge`-header
+shape — the prerequisite for every loop optimisation on real code, and already
+proven to reach the IR path live by the unroll pass (increment 3). A general
+alias oracle (hoist past a non-aliasing in-loop store) remains future work.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
