@@ -5,15 +5,13 @@
 > **H1** JAXB class-load storm is fixed on `dev` (`1db07c35`/`25c42e13`); **H2** ByteBuddy `MethodGraph`
 > JoinedSubclass bootstrap completes in ~16s `--nojit` (no stall); **H3** JTA/socket = an `accept()`
 > deadlock, fixed on branch `fix/hib-jta-xa-loopback`. See the per-cluster docs (now in `docs/internal/`).
-> **H4 re-checked 2026-06-20 — STILL HANGS, and re-attributed: it is NOT a JSON-function bug.** Run via the
-> JUnit launcher (`function.json.JsonArrayUnnestTest`, with `hibernate-community-dialects` added to the cp),
-> the 120s watchdog pins the main thread in the **HQL/ANTLR parser** —
-> `HqlParser.selectStatement → selectClause → selectionList → selection → selectExpression` — called from
-> `JsonArrayUnnestTest.lambda$testUnnestOrdinality$0` (a test *query*, not bootstrap, not JSON-function
-> rendering). All 6 watchdog samples show the same 5 frames ⇒ an HQL-parser infinite-loop-or-severe-slowness.
-> Same area as the deferred ANTLR deep-recursion / interpreter-throughput cluster (cf. bug C
-> `springrepos-extension-hang-jit-throughput-and-deep-recursion` and the "instance methods don't tier-up"
-> note). 🔴 **OPEN** (deeper, separate from the resolved H1–H3).
+> **H4 re-checked & root-caused 2026-06-20 — STILL OPEN, but NOT a JSON-function bug and NOT a loop.** It is
+> the **HQL/ANTLR parser's cold full-context prediction running interpreted** (~1000× HotSpot): a multi-item
+> select HQL takes 12.7s/52s/>600s to *parse* (1/2/3 items), terminating; warm re-parse of the same shape is
+> 649ms (DFA cache works); `--nojit` ≈ JIT-on and `-Xmx8g` doesn't help (the deeply-recursive ANTLR ATN-sim
+> hot loop is never JIT-compiled — no OSR). Full root-cause + minimal repro:
+> [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). 🔴 OPEN
+> (deferred JIT-throughput cluster; mitigation = run the suite in one shared JVM to amortize warmup).
 > The real Hibernate JUnit launcher works on CratonVM —
 > `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
 > non-reproducing transient — see
@@ -62,18 +60,19 @@ Same family as the JTA crash cluster. See (now in `docs/internal/`)
 **Classes:** `connections.ThreadLocalCurrentSessionTest` (and the `connections`/`transaction` crash classes
 that hang rather than crash depending on which JTA platform/socket path is hit).
 
-## Cluster H4 — HQL/ANTLR parser hang in `testUnnestOrdinality` (🔴 OPEN — re-attributed, NOT JSON)
-`function.json.JsonArrayUnnestTest` — re-checked 2026-06-20 on current `dev` via the JUnit launcher
-(needs `hibernate-community-dialects` on the cp — `DialectFeatureChecks` statically references `TiDBDialect`;
-without it the container fails fast with `NoClassDefFoundError`, which is a harness artifact, not the bug).
-With the dialect on the cp it **hangs (rc=124)**. The 120s watchdog pins the main thread in the HQL parser
-(`HqlParser.selectExpression` ← `selection` ← `selectionList` ← `selectClause` ← `selectStatement`), driven
-from `JsonArrayUnnestTest.lambda$testUnnestOrdinality$0` — i.e. parsing a **test HQL query**, not bootstrap,
-not the 4 JSON SIGSEGV classes (those are fixed) and not JSON-function SQL rendering. All 6 watchdog samples
-catch the same 5 parser frames ⇒ an HQL-parser infinite-loop or severe interpreter slowness. This is the
-**deferred ANTLR deep-recursion / interpreter-throughput cluster** (cf.
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
-and the "instance methods don't invocation-tier-up" perf note), **not** a JSON defect.
+## Cluster H4 — HQL/ANTLR parser cold-prediction throughput (🔴 OPEN — fully root-caused, NOT JSON)
+`function.json.JsonArrayUnnestTest` — re-checked & **root-caused 2026-06-20** on current `dev`. Not a JSON
+defect, not bootstrap, **not a loop, not a broken cache, not GC-bound**. It's the **HQL/ANTLR parser's cold
+full-context prediction running interpreted** (~1000× HotSpot): `em.createQuery` for a multi-item-select HQL
+takes 12.7s (1 item) / 52–58s (2 items) / >600s (3 items) to *parse*, terminating (the 2-item case completes
+at 52s). Re-parsing the same *shape* with a different entity drops to 649ms (ANTLR's DFA cache works); a
+fork-per-class suite re-pays the cold cost per class → >600s "hang". `--nojit` ≈ JIT-on and `-Xmx8g` doesn't
+help — the JIT never compiles the deeply-recursive ANTLR ATN-simulation hot loop (no OSR for on-stack
+recursive methods). **Full characterization + minimal repro:**
+[hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). Deferred
+JIT-throughput cluster (cf.
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
+**Mitigation:** run the suite in a single shared JVM (amortizes the per-shape DFA warmup).
 
 ## Environmental (NOT a CV-only bug)
 `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — **HotSpot also HANGs** on this class
@@ -87,5 +86,5 @@ and the "instance methods don't invocation-tier-up" perf note), **not** a JSON d
 | H1 JAXB class-load storm | class-loading rescan storm (NOT `retainAll`) | ✅ **fixed on dev** (`1db07c35`/`25c42e13`) |
 | H2 ByteBuddy `MethodGraph` | bootstrap proxy gen | ✅ **does-not-reproduce** — JoinedSubclass boots ~16s `--nojit` |
 | H3 JTA / socket | `accept()` deadlock (NOT loopback-pairing) | ✅ **fixed** on branch `fix/hib-jta-xa-loopback` (`e0426050`) |
-| H4 `JsonArrayUnnestTest` | HQL/ANTLR parser hang in `testUnnestOrdinality` (NOT JSON) | 🔴 **OPEN** — re-confirmed 2026-06-20; deferred parser-throughput/deep-recursion cluster |
+| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [own doc](hql-antlr-parser-cold-prediction-throughput.md) |
 | DefaultCatalogAndSchema | environmental (HS hangs too) | — excluded |
