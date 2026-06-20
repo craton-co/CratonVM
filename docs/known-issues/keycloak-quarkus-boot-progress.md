@@ -363,12 +363,32 @@ VM's real file layer).
   null in the connection path.
 - **JIT-neutral.** Booting with JIT ENABLED neither crashes nor unblocks — it hits the same
   Hibernate/connection wall. So the wall is the **DB connection itself**, not interpreter speed.
-- **Bottom line / strategy.** The real unlock is producing a working `java.sql.Connection` from the
-  real Agroal pool — either (a) make CratonVM's H2 path (`apps_h2.rs`/`jdbc.rs`, or H2→SQLite) serve
-  the real pool's `Driver.connect`/connection-factory, or (b) force the concrete
-  `io.agroal.pool.DataSource.getConnection` to the `agroal_pool.rs` shim. Then Keycloak's Liquibase
-  schema migrations + real SQL run on that connection — itself a substantial sub-effort. Genuinely
-  multi-session; the boot is otherwise within a few steps of binding HTTP.
+- **No invoke-NPE in the connection path.** `CRATONVM_DBG_NPE_STACK` shows no null-receiver invoke
+  in the H2/Agroal/Connection path — the connection is a **silent null return** (the real
+  `org.h2.Driver.connect(url)` / real Agroal pool returns null without an obvious single deref gap),
+  not a one-line bug like Gaps 4–7.
+- **Available backends (mapped).** CratonVM has (1) a real **`rusqlite`-backed JDBC surface**
+  (`phases_late.rs::jdbc_registry` + `DriverManager.getConnection`/`java.sql.Connection`/`Statement`/
+  `PreparedStatement`/`ResultSet` natives, with a passing round-trip test), mapping `jdbc:h2:mem` →
+  `jdbc:sqlite::memory:`; and (2) partial **real-H2-engine** support (`apps_h2.rs` `TableFilter`
+  overrides). The real Agroal pool calls `org.h2.Driver.connect` (real H2 engine) with a `jdbc:h2:`
+  URL and is wired to NEITHER → null.
+
+**Why this is a genuine multi-session subsystem (not a one-line fix), and why no shim was landed:**
+- Routing `org.h2.Driver.connect` → the rusqlite surface gives a *non-null* connection cheaply, BUT
+  it's a **dead end for Keycloak**: the connection would report SQLite, and Keycloak validates its DB
+  type + runs **Liquibase H2-dialect DDL** (≈100 tables) that SQLite can't execute. So a SQLite-route
+  "close" would fake a connection and then break on the real schema — the forbidden papering-over
+  pattern. Not landed.
+- The **principled close** is making the real `org.h2.Driver.connect(url)` (real H2 engine bytecode)
+  produce a working `JdbcConnection` under CratonVM, then Keycloak's Liquibase schema + JPA run on
+  real H2. That's the H2 database engine running under the VM — a large, multi-gap effort on its own
+  (the `apps_h2.rs` H2-engine path is the seed).
+- **Recommended next-session start:** trace the real `org.h2.Driver.connect` execution (add Rust
+  tracing at H2 `Engine`/`Session`/`JdbcConnection.<init>`, or step the H2 bytecode) to find the first
+  concrete gap where it returns null/fails; also confirm whether the Agroal datasource **bean** is
+  non-null (rule out a CDI-injection null vs an H2-engine null). Decide strategy: real-H2-under-CratonVM
+  vs. an alternative Keycloak-supported DB path. The boot is otherwise within a few steps of binding HTTP.
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
