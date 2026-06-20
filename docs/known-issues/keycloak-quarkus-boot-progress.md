@@ -543,6 +543,30 @@ VM's real file layer).
 > `STRICT` (so it doesn't abort on the benign conservative condition first), then inspect the
 > zeroed-header report. **Do NOT implement the cross-thread stack scan — it is redundant.**
 >
+> **DECISIVE REFUTATION (2026-06-20) — Gap 9 is NOT a missed GC root at all (register-resident
+> hypothesis REFUTED).** I implemented `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` (jit/src/x64.rs):
+> blind-spill the FULL 14-GPR file (rax,rcx,rdx,rbx,rsi,rdi,r8–r15) to reserved frame slots at every
+> GC-capable safepoint — the maximal A2-class register-spill (caller-saved + arg + rax + callee-saved).
+> **Confirmed engaged** by `CRATONVM_DBG_JIT_DISASM`: `AllocProbe.run` emits all 14 `mov [rbp-…],reg`
+> stores immediately before the `new` call. **GC-correct:** bintrees18 == 68332206 (golden) with the
+> flag on, identical perf (38.6 s vs 38.8 s). **Yet the Keycloak boot STILL wedges** at the same
+> point. Since the conservative scan covers that spill region and the spill captures *every* register,
+> a missed register-resident root is impossible — and the four other levers also failed:
+> `CRATONVM_JIT_SAFEPOINT_REG_SPILL=1` (callee-saved), `CRATONVM_SHADOW_STACK` (operand-stack register
+> oops), `CRATONVM_DBG_FULLSTACK_SCAN` (collector's whole stack), `CRATONVM_GC_VERIFY_STALE` (0
+> parked-interpreter-local zeroed-header hits). **Five independent root-coverage mechanisms fail ⇒ the
+> wedge is NOT a dropped GC root** (not interpreter-local, not operand-stack/callee-saved/caller-saved/
+> arg/rax-register, not collector-stack). The `cross_thread_jit_gap` warning is a CONSERVATIVE red
+> herring (it fires on any multi-thread-in-JIT-under-STW, regardless of an actual drop). **New
+> hypotheses (root-drop ruled out):** (a) a **JIT miscompile** → the JPA-startup worker spins in
+> wrong control flow; (b) a **concurrency deadlock/livelock** (a VM lock/future/AQS that never
+> releases); (c) a **native-call hang** (the worker stuck in a Rust native). Next decisive
+> discriminator: a `--nojit` boot with a long deadline — if it progresses past the wedge (just slow),
+> it's a JIT miscompile; if it also wedges, it's concurrency/native. Also: pin the worker's native
+> wait-site (it's undumpable by the Java-frame watchdog). The `=all` spill is retained as a
+> GC-validated, default-off diagnostic lever (not a fix for this bug). **Net: stop chasing GC roots
+> for Gap 9.**
+>
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
 > entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
