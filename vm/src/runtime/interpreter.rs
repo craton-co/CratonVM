@@ -17197,10 +17197,12 @@ fn try_jit_upgrade_with_gate(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
-    // activate-ir-optimizer (scalar-new soak): elidable-`<init>` resolver, gated
-    // default-OFF behind CRATONVM_JIT_SCALAR_NEW. When off, `None` is passed and
-    // `new` scalar replacement stays disabled (the IR builder bails on `new`).
-    let scalar_new_on = std::env::var_os("CRATONVM_JIT_SCALAR_NEW").is_some();
+    // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
+    // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
+    // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
+    // is the opt-out safety net — when off, `None` is passed and the IR builder
+    // bails on `new`, restoring the single-pass backend for allocation methods.
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
     let elidable_init_resolver = |cp_idx: u16| -> bool {
         let cm = shared.class_manager.read();
         resolve_jit_elidable_init(&cm, class_id, cp_idx)
@@ -17478,8 +17480,10 @@ fn try_jit_upgrade_with_gate(
                 let cm = shared.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
-            // Elidable-`<init>` resolver (scalar-new soak), gated default-OFF.
-            let c_scalar_new_on = std::env::var_os("CRATONVM_JIT_SCALAR_NEW").is_some();
+            // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+            // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+            let c_scalar_new_on =
+                std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
             let c_elidable_init_resolver = |cp_idx: u16| -> bool {
                 let cm = shared.class_manager.read();
                 resolve_jit_elidable_init(&cm, callee_cid, cp_idx)
@@ -18137,8 +18141,9 @@ fn try_jit_compile_callee_slow(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
-    // Elidable-`<init>` resolver (scalar-new soak), gated default-OFF.
-    let scalar_new_on = std::env::var_os("CRATONVM_JIT_SCALAR_NEW").is_some();
+    // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+    // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
     let elidable_init_resolver = |cp_idx: u16| -> bool {
         let cm = shared.class_manager.read();
         resolve_jit_elidable_init(&cm, cid, cp_idx)

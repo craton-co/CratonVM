@@ -582,6 +582,33 @@ fn ir_vs_singlepass_getfield_simple() {
 }
 
 #[test]
+fn ir_vs_singlepass_getfield_via_astore_local() {
+    // static int get(Corpus o) { Corpus p = o; return p.x; }
+    // Round-trips the receiver ref through a LOCAL via `astore`/`aload` — the
+    // shape real javac emits for an object local. The IR builder had no `astore`
+    // handler, so any method storing a ref to a local bailed to single-pass;
+    // this proves the now-lowered `astore`/`aload` round-trip executes
+    // identically (IR == single-pass == host) on the int-field path.
+    //   aload_0; astore_1; aload_1; getfield #2; ireturn
+    //   2a 4c 2b b4 00 02 ac
+    let resolver = |cp: u16| if cp == 2 { Some((0, b'I')) } else { None };
+    check_field(
+        "getfield_via_astore",
+        "(Lpkg/Corpus;)I",
+        vec![0x2a, 0x4c, 0x2b, 0xb4, 0x00, 0x02, 0xac],
+        2, // local 0 = receiver param, local 1 = p
+        &resolver,
+        &[
+            (vec![5], 5),
+            (vec![-7], -7),
+            (vec![0], 0),
+            (vec![i32::MIN], i32::MIN),
+            (vec![i32::MAX], i32::MAX),
+        ],
+    );
+}
+
+#[test]
 fn ir_vs_singlepass_getfield_two_fields_sum() {
     // static int sum(Corpus o) { return o.x + o.y; }   (fields 0,1 = int)
     //   aload_0; getfield #2; aload_0; getfield #3; iadd; ireturn

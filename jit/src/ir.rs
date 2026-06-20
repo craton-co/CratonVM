@@ -922,6 +922,26 @@ impl IrBuilder {
                     self.push(self.locals[idx]);
                     pc += 1;
                 }
+                // astore — store an object reference into a local. Same
+                // node-graph mechanics as istore: a reference is just a NodeId
+                // slot in the abstract locals array (mirrors the `aload`
+                // comment above). Real javac stores a `new` object into a local
+                // (`new; dup; invokespecial; astore_N`), so without this the IR
+                // builder bails on every allocation method and scalar
+                // replacement never fires on production bytecode.
+                0x3a => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
+                }
+                // astore_0..3
+                0x4b..=0x4e => {
+                    let idx = (op - 0x4b) as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 1;
+                }
                 // istore
                 0x36 => {
                     let idx = code[pc + 1] as usize;
@@ -1588,13 +1608,14 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0x88
             | 0x91..=0x93
             | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => {
                 pc += 1;
             }
             // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 => {
+            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => {
                 pc += 2;
             }
             // 3-byte opcodes
@@ -1676,11 +1697,12 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0x88
             | 0x91..=0x93
             | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
             // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 => pc += 2,
+            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => pc += 2,
             // 3-byte opcodes
             0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xbb => pc += 3,
             _ => pc += 1,
