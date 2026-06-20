@@ -3132,25 +3132,99 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+/// `MethodHandles.identity(Class type)` — a *functional* shim returning an
+/// `MH_KIND_IDENTITY` handle of type `(type)type` that returns its argument.
+///
+/// Promoted to the real-JDK essentials path + `check_override`-allow-listed
+/// for the same reason as `constant`: in real-JDK mode the genuine
+/// `MethodHandles.identity` bytecode yields a real
+/// `MethodHandleImpl$IntrinsicMethodHandle` (and, via its primitive paths, a
+/// `BoundMethodHandle` species), a real handle the `MH_KIND_*` shims cannot
+/// read — so `identity().invoke()` / `.bindTo()` fail (OOB field reads on
+/// slots 16–19). Groovy's `IndyInterface` and any `SwitchPoint`/dispatch chain
+/// that threads values through `identity` needs this.
+pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "identity",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let ty = match args.first() {
+                Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
+                _ => DESC_OBJECT.to_string(),
+            };
+            let desc = format!("({ty}){ty}");
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
+/// `VolatileCallSite`) — a *functional* shim returning an
+/// `MH_KIND_DYNAMIC_INVOKER` handle bound to the call site. On invocation it
+/// reads the site's current `target` and delegates to it.
+///
+/// Promoted to the real-JDK essentials path + `check_override`-allow-listed
+/// because the real `CallSite.makeDynamicInvoker` does
+/// `getTargetHandle().bindArgumentL(0, this)` — a `BoundMethodHandle`
+/// construction that hangs on CratonVM (no real species machinery).
+/// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this shim
+/// every `new SwitchPoint()` — and therefore Apache Groovy's
+/// `IndyInterface.<clinit>` at runtime — hangs.
+pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for cs in [
+        "java/lang/invoke/MutableCallSite",
+        "java/lang/invoke/VolatileCallSite",
+    ] {
+        r.register(
+            cs,
+            "dynamicInvoker",
+            "()Ljava/lang/invoke/MethodHandle;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                // Derive the invoker's descriptor from the current target so
+                // `mh.type()` / arity checks see the right shape; default to a
+                // nullary Object-returning type when the target is unreadable.
+                let desc = callsite_target_desc(ctx, this)
+                    .unwrap_or_else(|| format!("(){DESC_OBJECT}"));
+                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER);
+                ctx.set_field(handle, MH_BOUND, Value::Object(Some(this)));
+                Ok(Some(Value::Object(Some(handle))))
+            },
+        );
+    }
+    r.set_category(__prev_cat);
+}
+
+/// Read a call site's current target MethodHandle descriptor (real
+/// `CallSite.target` field, falling back to the synthetic CallSite model's
+/// slot 0), for stamping a dynamic-invoker handle's descriptor.
+fn callsite_target_desc(ctx: &mut dyn NativeContext, callsite: ObjectRef) -> Option<String> {
+    let target = match ctx.get_field_by_name(callsite, "target") {
+        Value::Object(Some(t)) => t,
+        _ => match ctx.get_field(callsite, 0) {
+            Value::Object(Some(t)) => t,
+            _ => return None,
+        },
+    };
+    mh_read_desc(ctx, target)
+}
+
 pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
     register_array_element_accessor_bridges(r);
-    // Functional `constant` shim (shared with the real-JDK essentials path).
+    // Functional `constant`/`identity` shims (shared with the real-JDK
+    // essentials path).
     register_method_handles_constant_bridge(r);
-    r.register(
-        mh,
-        "identity",
-        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+    register_method_handles_identity_bridge(r);
     r.register(
         mh,
         "dropArguments",
@@ -3574,6 +3648,26 @@ pub(crate) const MH_KIND_RECORD_DESER: i32 = 11;
 /// breaks EVERY Groovy `invokedynamic` call site. Shimming `constant`
 /// keeps that init off the real species path entirely.
 pub(crate) const MH_KIND_CONSTANT: i32 = 12;
+/// Identity method handle produced by `MethodHandles.identity(type)` — a
+/// handle of type `(type)type` that returns its single argument unchanged.
+/// `MH_DESC` is `(<type>)<type>`. After `bindTo(x)` the argument is captured
+/// in `MH_BOUND`, so the dispatch arm returns that. In real-JDK mode
+/// `identity` runs genuine JDK bytecode that yields a
+/// `MethodHandleImpl$IntrinsicMethodHandle` (and for some types a
+/// `BoundMethodHandle` species) — a real handle whose layout the `MH_KIND_*`
+/// shims cannot read (slots 16–19 out of bounds), so `identity().invoke()` /
+/// `.bindTo()` fail. Shimming keeps it inside the synthetic model.
+pub(crate) const MH_KIND_IDENTITY: i32 = 13;
+/// Dynamic-invoker handle produced by `CallSite.dynamicInvoker()`
+/// (concrete on `MutableCallSite`/`VolatileCallSite`). `MH_BOUND` holds the
+/// call site; on invocation the dispatch arm reads the site's CURRENT
+/// `target` and delegates to it. This shim exists to avoid the real
+/// `CallSite.makeDynamicInvoker` → `MethodHandle.bindArgumentL` →
+/// `BoundMethodHandle` species path, which hangs on CratonVM.
+/// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this every
+/// `new SwitchPoint()` (and therefore Groovy's `IndyInterface.<clinit>`)
+/// hangs.
+pub(crate) const MH_KIND_DYNAMIC_INVOKER: i32 = 14;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -4362,6 +4456,35 @@ pub(crate) fn mh_dispatch(
                 _ => bound,
             };
             Ok(Some(v))
+        }
+        MH_KIND_IDENTITY => {
+            // identity(type): return the single incoming argument unchanged.
+            // After `bindTo(x)` the argument is pre-captured in MH_BOUND.
+            let v = match bound {
+                Value::Object(Some(_)) => bound,
+                _ => extra_args.first().copied().unwrap_or(Value::Object(None)),
+            };
+            Ok(Some(v))
+        }
+        MH_KIND_DYNAMIC_INVOKER => {
+            // CallSite.dynamicInvoker(): delegate to the call site's CURRENT
+            // target. MH_BOUND holds the call site; read its `target` field
+            // (real CallSite layout) — falling back to the synthetic CallSite
+            // model's slot 0 — and dispatch with the incoming args. Avoids the
+            // real `makeDynamicInvoker` → `bindArgumentL` → BoundMethodHandle
+            // species path (which hangs).
+            let callsite = match bound {
+                Value::Object(Some(cs)) => cs,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target = match ctx.get_field_by_name(callsite, "target") {
+                Value::Object(Some(t)) => t,
+                _ => match ctx.get_field(callsite, 0) {
+                    Value::Object(Some(t)) => t,
+                    _ => return Ok(Some(Value::Object(None))),
+                },
+            };
+            mh_dispatch(ctx, target, extra_args)
         }
         _ => {
             // Virtual: first extra_arg is receiver (unless bound)

@@ -10569,7 +10569,24 @@ fn invoke_on_class_shared_inner(
                                 // (`register_method_handles_constant_bridge`) ahead of
                                 // the broken bytecode.
                                 | "constant"
+                                // METHODHANDLES.IDENTITY: concrete static factory
+                                // whose JDK bytecode yields a real
+                                // `IntrinsicMethodHandle`/`BoundMethodHandle` species
+                                // the `MH_KIND_*` shims can't read (OOB field reads).
+                                // Pin the functional `MH_KIND_IDENTITY` native.
+                                | "identity"
                             ))
+                        // CALLSITE.DYNAMICINVOKER: `MutableCallSite`/
+                        // `VolatileCallSite.dynamicInvoker()` — the real
+                        // `makeDynamicInvoker` does `bindArgumentL` (BoundMethodHandle
+                        // construction) which HANGS on CratonVM. `SwitchPoint.<init>`
+                        // calls it, so every `new SwitchPoint()` (Groovy
+                        // `IndyInterface.<clinit>`) hangs. Pin the functional
+                        // `MH_KIND_DYNAMIC_INVOKER` native that delegates to the call
+                        // site's current target.
+                        || ((class_name == "java/lang/invoke/MutableCallSite"
+                            || class_name == "java/lang/invoke/VolatileCallSite")
+                            && method_name == "dynamicInvoker")
                         // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
                         // calls `ObjectStreamClass$RecordSupport.deserializationCtr`
                         // (concrete bytecode) to get a record-rebuild MethodHandle

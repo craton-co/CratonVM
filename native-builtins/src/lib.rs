@@ -9889,6 +9889,24 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // `vm/src/vm/vm_exec.rs` makes the native win at the call site.
     crate::lang_invoke::register_method_handles_constant_bridge(registry);
 
+    // METHODHANDLES.IDENTITY (real-JDK mode): like `constant`, the genuine
+    // `MethodHandles.identity` bytecode yields a real
+    // `MethodHandleImpl$IntrinsicMethodHandle` (and a `BoundMethodHandle`
+    // species for primitives) the `MH_KIND_*` shims can't read — so
+    // `identity().invoke()`/`.bindTo()` fail. Pin the functional
+    // `MH_KIND_IDENTITY` shim (allow-listed in vm_exec.rs).
+    crate::lang_invoke::register_method_handles_identity_bridge(registry);
+
+    // CALLSITE.DYNAMICINVOKER (real-JDK mode): `CallSite.makeDynamicInvoker`
+    // does `getTargetHandle().bindArgumentL(0, this)` — a `BoundMethodHandle`
+    // construction that HANGS on CratonVM (no real species machinery).
+    // `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so every
+    // `new SwitchPoint()` (hence Groovy's `IndyInterface.<clinit>` at runtime)
+    // hangs without this. Pin the functional `MH_KIND_DYNAMIC_INVOKER` shim on
+    // `MutableCallSite`/`VolatileCallSite` (allow-listed in vm_exec.rs); it
+    // delegates to the call site's current target.
+    crate::lang_invoke::register_callsite_dynamic_invoker_bridge(registry);
+
     // RECORD DESERIALIZATION (real-JDK mode): `ObjectInputStream.readRecord`
     // rebuilds a serialized record by invoking the `MethodHandle` returned by
     // `ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`,

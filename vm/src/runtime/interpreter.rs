@@ -15325,6 +15325,45 @@ fn populate_invoke_cache(
         return;
     };
 
+    // Native-shadow check keyed on the *declaring* class, honored regardless
+    // of whether the resolved method is `native` or has a (shadowed) bytecode
+    // body. The early CP-class lookup above keys on the symbolic-ref class —
+    // which, for an inherited method invoked through a super-class symbolic ref
+    // (e.g. Groovy's `GroovyClassLoader.loadClass(String,Z,Z,Z)` calling
+    // `super.loadClass(String,Z)`, whose CP ref names `URLClassLoader`/
+    // `SecureClassLoader`, not `java.lang.ClassLoader`) — misses the native
+    // registered on the declaring class `ClassLoader` (`cl_real_load_class`).
+    // Without this, the first call serves the native (slow path) but every
+    // cached call runs the real `ClassLoader`/`BuiltinClassLoader` delegation
+    // bytecode the VM can't satisfy → spurious `ClassNotFoundException`
+    // (e.g. `groovy.grape.GrabAnnotationTransformation` during Groovy's global
+    // AST-transform scan, breaking every Groovy compile). Re-applies the
+    // 92b7bd80 fix (the original `if method.is_native()`-only gate below was
+    // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
+    {
+        let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find(declaring_name, &method_name, &descriptor)
+        {
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+            drop(cm);
+            let target = CachedInvokeTarget::Native {
+                callback,
+                num_params: num_params as u16,
+                gate,
+            };
+            shared
+                .shared_resolution
+                .insert_promoted_invoke(promoted_key, target.clone());
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, is_special, target);
+            return;
+        }
+    }
+
     if method.is_native() {
         // Already handled above, but the method might be native in a superclass
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
