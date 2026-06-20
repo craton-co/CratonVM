@@ -155,12 +155,18 @@ struct Args {
     #[arg(long = "XX:AuditMissingNatives")]
     audit_missing_natives: bool,
 
-    /// HotSpot `-XX:+ShowCodeDetailsInExceptionMessages` (JEP 358): route the
+    /// HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` (JEP 358): route the
     /// non-invoke null-deref opcodes (getfield/putfield/arraylength/array
     /// access/monitor/athrow) through the helpful-NPE message helper. Default
-    /// off here pending the message-string compliance soak.
-    #[arg(long = "XX:ShowCodeDetailsInExceptionMessages")]
-    show_code_details_in_exception_messages: bool,
+    /// **on**, matching HotSpot (messages verified byte-identical). Tri-state:
+    /// absent → use the `VmConfig` default (on); the `-XX:+`/`-XX:-` JDK
+    /// spellings are rewritten to `=true`/`=false` (see `rewrite_jvm_args`).
+    #[arg(
+        long = "XX:ShowCodeDetailsInExceptionMessages",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    show_code_details_in_exception_messages: Option<bool>,
 
     /// NEW-10: dump the missing-natives audit log to the given JSON file
     /// on VM shutdown. Implies `--XX:AuditMissingNatives`. The output
@@ -915,12 +921,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // Default is off; nothing to emit.
             i += 1;
         }
-        // `-XX:+ShowCodeDetailsInExceptionMessages` -> the clap toggle.
-        // `-XX:-...` -> drop (default off here, pending the compliance soak).
+        // `-XX:+ShowCodeDetailsInExceptionMessages` -> the clap toggle (on);
+        // `-XX:-...` -> the explicit `=false` form (the default is now on, so
+        // opting out must be representable, not merely "absent").
         else if a == "-XX:+ShowCodeDetailsInExceptionMessages" {
-            out.push("--XX:ShowCodeDetailsInExceptionMessages".into());
+            out.push("--XX:ShowCodeDetailsInExceptionMessages=true".into());
             i += 1;
         } else if a == "-XX:-ShowCodeDetailsInExceptionMessages" {
+            out.push("--XX:ShowCodeDetailsInExceptionMessages=false".into());
             i += 1;
         }
         // `-XX:-UseContainerSupport` -> `--XX:-UseContainerSupport`
@@ -1250,8 +1258,10 @@ fn run() -> Result<()> {
     // first read, before Vm::new(config) runs any bytecode (same OnceLock
     // timing rationale as --nojit above). CRATONVM_HELPFUL_NPE_OPCODES, if set,
     // still overrides it.
+    // Tri-state: an absent flag resolves to the default-on (matching
+    // `VmConfig::default`); `-XX:-...` (→ `=false`) opts out.
     cratonvm_vm::runtime::env_cache::set_show_code_details_in_exception_messages(
-        args.show_code_details_in_exception_messages,
+        args.show_code_details_in_exception_messages.unwrap_or(true),
     );
 
     // GPU handlers — only compiled when the `gpu` Cargo feature is on.
@@ -1699,8 +1709,11 @@ fn run() -> Result<()> {
 
     // -XX:±ShowCodeDetailsInExceptionMessages — record on the VmConfig too, so
     // the resolved config reflects the flag (env_cache was already set from
-    // `args` above for the interpreter gate).
-    config.show_code_details_in_exception_messages = args.show_code_details_in_exception_messages;
+    // `args` above for the interpreter gate). Absent → keep the default-on
+    // `VmConfig` value; an explicit flag (`=true`/`=false`) overrides it.
+    config.show_code_details_in_exception_messages = args
+        .show_code_details_in_exception_messages
+        .unwrap_or(config.show_code_details_in_exception_messages);
 
     // JDWP debug server
     if let Some(port) = args.jdwp_port {
@@ -4124,7 +4137,7 @@ mod tests {
 
     #[test]
     fn hotspot_xx_show_code_details_toggle() {
-        // `-XX:+ShowCodeDetailsInExceptionMessages` -> clap long form.
+        // `-XX:+ShowCodeDetailsInExceptionMessages` -> the explicit `=true` form.
         let out = normalize_java_launcher_argv(argv(&[
             "java",
             "-XX:+ShowCodeDetailsInExceptionMessages",
@@ -4132,15 +4145,27 @@ mod tests {
         ]));
         assert_eq!(
             out,
-            argv(&["java", "--XX:ShowCodeDetailsInExceptionMessages", "Main"])
+            argv(&[
+                "java",
+                "--XX:ShowCodeDetailsInExceptionMessages=true",
+                "Main"
+            ])
         );
-        // Disabled form drops the flag (default is off here).
+        // Disabled form -> the explicit `=false` form (the default is now on,
+        // so opting out must be representable, not merely dropped).
         let out = normalize_java_launcher_argv(argv(&[
             "java",
             "-XX:-ShowCodeDetailsInExceptionMessages",
             "Main",
         ]));
-        assert_eq!(out, argv(&["java", "Main"]));
+        assert_eq!(
+            out,
+            argv(&[
+                "java",
+                "--XX:ShowCodeDetailsInExceptionMessages=false",
+                "Main"
+            ])
+        );
     }
 
     #[test]

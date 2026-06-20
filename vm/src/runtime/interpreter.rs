@@ -11907,6 +11907,21 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
         }
         None
     }
+
+    /// Whether the trapping method is `static` — drives slot-0 naming
+    /// (`<local0>` in a static method vs `this` in an instance method). Looked
+    /// up from the method's access flags; a method we can't resolve defaults to
+    /// instance (legacy `this` spelling), matching the trait default.
+    fn is_static_method(&self) -> bool {
+        let cm = self.shared.class_manager.read_recursive();
+        let Some(class) = cm.get_class(self.class_id) else {
+            return false;
+        };
+        match class.find_method(self.method_name, self.method_descriptor) {
+            Some(method) => method.is_static(),
+            None => false,
+        }
+    }
 }
 
 /// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
@@ -11940,7 +11955,7 @@ fn helpful_npe_invoke_message(
         method_descriptor: &m_desc,
     };
     let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
-    helpful_npe::combine(&action, expr.as_deref())
+    helpful_npe::combine(&action, expr.as_ref())
 }
 
 /// JEP 358 increment 2 — synthesize the HotSpot-style extended message for a
@@ -12000,7 +12015,7 @@ fn helpful_npe_opcode_message_parts(
         method_descriptor,
     };
     let expr = helpful_npe::null_expr_at_depth(code, trap_bci, depth_below_top, &resolver);
-    helpful_npe::combine_opt(action, expr.as_deref())
+    helpful_npe::combine_opt(action, expr.as_ref())
 }
 
 /// Variant of `execute_invoke` that knows whether the source bytecode was

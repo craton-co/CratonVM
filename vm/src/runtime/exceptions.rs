@@ -81,6 +81,14 @@ pub mod helpful_npe {
         fn local_name(&self, _slot: u16, _bci: usize) -> Option<String> {
             None
         }
+        /// Whether the **trapping** method is `static`. In a static method local
+        /// slot 0 is an ordinary local (HotSpot prints `<local0>`); only in an
+        /// instance method is slot 0 the `this` receiver. Defaults to `false`
+        /// (instance) to preserve the legacy `this` spelling for resolvers that
+        /// don't model it.
+        fn is_static_method(&self) -> bool {
+            false
+        }
     }
 
     /// Convert an internal class name (`java/lang/String`, `[I`,
@@ -117,13 +125,64 @@ pub mod helpful_npe {
         out
     }
 
-    /// Render a single field-descriptor token (`I`, `Ljava/lang/String;`,
-    /// `[I`) as an external type name. Used for the parameter list of an
-    /// invoke action.
-    fn field_descriptor_external(token: &str) -> String {
-        // `class_external` already understands array dims + the `L...;` form;
-        // a bare primitive token (`I`) maps through its array branch too.
-        class_external(token)
+    /// Shorten the two classes HotSpot prints unqualified in JEP 358 messages:
+    /// `java.lang.String` → `String` and `java.lang.Object` → `Object` (verified
+    /// against the JDK 25 `getExtendedNPEMessage` output — every *other*
+    /// `java.lang` type, e.g. `Integer`, `StringBuilder`, stays fully
+    /// qualified). Only an exact whole-name (modulo trailing `[]`) match is
+    /// shortened, so `java.lang.StringBuilder` is never touched.
+    fn shorten_jlang(external: &str) -> String {
+        let mut base = external;
+        let mut dims = 0usize;
+        while let Some(b) = base.strip_suffix("[]") {
+            base = b;
+            dims += 1;
+        }
+        let short = match base {
+            "java.lang.String" => "String",
+            "java.lang.Object" => "Object",
+            _ => base,
+        };
+        let mut out = short.to_string();
+        for _ in 0..dims {
+            out.push_str("[]");
+        }
+        out
+    }
+
+    /// Render an invoke/field **owner** class the way HotSpot does in the NPE
+    /// message: the internal name with `/` → `.`, leaving array owners in
+    /// descriptor form (`[I`, `[Ljava.lang.String;` — *not* the `int[]` external
+    /// form used for parameters), and shortening only `String`/`Object`.
+    pub fn render_owner(internal: &str) -> String {
+        match internal {
+            "java/lang/String" => "String".to_string(),
+            "java/lang/Object" => "Object".to_string(),
+            _ => internal.replace('/', "."),
+        }
+    }
+
+    /// Render a single method **parameter** descriptor token (`I`,
+    /// `Ljava/lang/String;`, `[Ljava/lang/Object;`) the way HotSpot prints it in
+    /// the message: the *external* type form (`int`, `String`, `Object[]`,
+    /// `java.lang.CharSequence`) — note params use `int[]`/`Object[]` while the
+    /// owner uses `[I`. `String`/`Object` are shortened.
+    fn render_param(token: &str) -> String {
+        shorten_jlang(&class_external(token))
+    }
+
+    /// Render `Owner.name(param, …)` — the method form HotSpot quotes in both
+    /// the action half (`Cannot invoke "Owner.name(…)"`) and the
+    /// "return value of" expression half. The owner uses [`render_owner`], the
+    /// parameters [`render_param`].
+    fn render_method(owner_internal: &str, name: &str, descriptor: &str) -> String {
+        let owner = render_owner(owner_internal);
+        let params = param_tokens(descriptor)
+            .iter()
+            .map(|t| render_param(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{owner}.{name}({params})")
     }
 
     /// Split a method descriptor's parameter list into descriptor tokens.
@@ -158,13 +217,7 @@ pub mod helpful_npe {
     /// The "action" half for an invoke whose receiver was null, e.g.
     /// `Cannot invoke "java.util.List.get(int)"`.
     pub fn action_invoke(owner_internal: &str, name: &str, descriptor: &str) -> String {
-        let owner = class_external(owner_internal);
-        let params = param_tokens(descriptor)
-            .iter()
-            .map(|t| field_descriptor_external(t))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Cannot invoke \"{owner}.{name}({params})\"")
+        format!("Cannot invoke \"{}\"", render_method(owner_internal, name, descriptor))
     }
 
     // -- Increment 2: action halves for the remaining null-deref opcodes -----
@@ -234,36 +287,66 @@ pub mod helpful_npe {
                 ArrayElemKind::Long => "long",
                 ArrayElemKind::Float => "float",
                 ArrayElemKind::Double => "double",
-                ArrayElemKind::Byte => "byte",
+                // `baload`/`bastore` are the bytecodes for *both* `byte[]` and
+                // `boolean[]`; the array is null so the opcode can't tell them
+                // apart. HotSpot prints the combined spelling "byte/boolean
+                // array" for either, so both element kinds map to it here.
+                ArrayElemKind::Byte | ArrayElemKind::Boolean => "byte/boolean",
                 ArrayElemKind::Char => "char",
                 ArrayElemKind::Short => "short",
-                ArrayElemKind::Boolean => "boolean",
                 ArrayElemKind::Object => "object",
             }
         }
     }
 
-    /// Combine an action half with an optional null-expression half into the
-    /// final JEP 358 message. When the expression is unknown we emit the
-    /// action-only form (`"<action> because the return value ... is null"` is
-    /// never fabricated).
-    pub fn combine(action: &str, expr: Option<&str>) -> String {
-        match expr {
-            Some(e) => format!("{action} because \"{e}\" is null"),
-            None => format!("{action} because the receiver is null"),
+    /// A reconstructed null sub-expression. `text` is the **inline** rendering
+    /// used when this producer is a sub-part of a larger expression — e.g. the
+    /// receiver of a `.field` access (`Owner.m().next`) or the array of an
+    /// `arr[idx]`. `is_invoke` flags an invoke *result*, which only changes the
+    /// **top-level** rendering: HotSpot prints a directly-null invoke result as
+    /// `the return value of "Owner.m()"` (no surrounding quotes) but renders the
+    /// same invoke inline as `Owner.m()` when it is a sub-receiver.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Producer {
+        pub text: String,
+        pub is_invoke: bool,
+    }
+
+    impl Producer {
+        fn expr(text: String) -> Self {
+            Producer { text, is_invoke: false }
+        }
+        fn invoke(text: String) -> Self {
+            Producer { text, is_invoke: true }
+        }
+        /// The `because <…> is null` middle, as HotSpot renders it at the top
+        /// level: a plain expression is quoted; an invoke result is phrased as
+        /// `the return value of "<method>"`.
+        fn render_clause(&self) -> String {
+            if self.is_invoke {
+                format!("the return value of \"{}\"", self.text)
+            } else {
+                format!("\"{}\"", self.text)
+            }
         }
     }
 
-    /// Like [`combine`] but emits the *action-only* string when the
-    /// expression can't be classified (HotSpot omits the `because` clause
-    /// rather than fabricating "the receiver"). Used by the increment-2
-    /// opcode sites (getfield / array / monitor / athrow), whose null operand
-    /// isn't always a "receiver".
-    pub fn combine_opt(action: &str, expr: Option<&str>) -> String {
+    /// Combine an action half with an optional reconstructed null expression
+    /// into the final JEP 358 message. When the expression is unknown we emit
+    /// the **action-only** form — HotSpot omits the `because` clause rather than
+    /// fabricating one (it never prints "because the receiver is null").
+    pub fn combine(action: &str, expr: Option<&Producer>) -> String {
         match expr {
-            Some(e) => format!("{action} because \"{e}\" is null"),
+            Some(p) => format!("{action} because {} is null", p.render_clause()),
             None => action.to_string(),
         }
+    }
+
+    /// Retained spelling of [`combine`] (identical behavior) for the increment-2
+    /// opcode sites (getfield / array / monitor / athrow). Both now emit the
+    /// action-only string when the expression can't be classified.
+    pub fn combine_opt(action: &str, expr: Option<&Producer>) -> String {
+        combine(action, expr)
     }
 
     // -- Step 6 (partial): action-only messages for JIT-originated NPEs ------
@@ -361,7 +444,11 @@ pub mod helpful_npe {
     /// straight-line walk covers the overwhelmingly common "load receiver then
     /// invoke" shape. Any opcode whose stack effect we don't model, or any
     /// backward branch target landing inside the prefix, makes us bail.
-    fn simulate_to(code: &[u8], target_bci: usize) -> Option<Vec<Slot>> {
+    fn simulate_to(
+        code: &[u8],
+        target_bci: usize,
+        resolver: &dyn CpResolver,
+    ) -> Option<Vec<Slot>> {
         let mut stack: Vec<Slot> = Vec::new();
         let mut pc = 0usize;
         let mut guard = 0u32;
@@ -379,7 +466,7 @@ pub mod helpful_npe {
                 return None; // pathological method — bail rather than spin
             }
             let (instr, next) = Instruction::decode(code, pc).ok()?;
-            apply_stack_effect(&mut stack, &instr, pc)?;
+            apply_stack_effect(&mut stack, &instr, pc, resolver)?;
             if next <= pc {
                 return None; // non-progress guard
             }
@@ -388,11 +475,30 @@ pub mod helpful_npe {
         None
     }
 
+    /// Number of operand-stack slots a method's parameters and return value
+    /// occupy in CratonVM's *one-entry-per-value* operand model (a `long`/
+    /// `double` is a single entry here — cf. `count_method_params`, which counts
+    /// `J`/`D` as one). Returns `(param_count, return_slots)` where
+    /// `return_slots` is `0` for a `void` method, else `1`.
+    fn method_slot_counts(descriptor: &str) -> (usize, usize) {
+        let params = param_tokens(descriptor).len();
+        let ret = descriptor
+            .rfind(')')
+            .and_then(|i| descriptor.as_bytes().get(i + 1).copied());
+        let ret_slots = if ret == Some(b'V') { 0 } else { 1 };
+        (params, ret_slots)
+    }
+
     /// Apply `instr`'s operand-stack effect to `stack`, tagging any pushed
     /// slot with `bci`. Returns `None` for an opcode we don't model (caller
     /// bails). Only the subset that can appear before a receiver push needs to
     /// be precise; categories we can't reason about conservatively abort.
-    fn apply_stack_effect(stack: &mut Vec<Slot>, instr: &Instruction, bci: usize) -> Option<()> {
+    fn apply_stack_effect(
+        stack: &mut Vec<Slot>,
+        instr: &Instruction,
+        bci: usize,
+        resolver: &dyn CpResolver,
+    ) -> Option<()> {
         use Instruction::*;
         // pop `n`, then push `pushes` fresh slots produced at `bci`.
         macro_rules! shape {
@@ -440,17 +546,44 @@ pub mod helpful_npe {
             Pop => {
                 stack.pop()?;
             }
-            // Invokes: pop args (+ receiver for non-static), push return (if
-            // non-void). We don't need byte-exact cat-2 accounting for the
-            // common receiver-load shape; model 1 slot per param + receiver.
-            Invokevirtual(_) | Invokespecial(_) | Invokeinterface { .. } => {
-                // descriptor unknown here without the CP; the only invokes the
-                // analysis needs to *step over* before the trapping one are
-                // rare in the straight-line receiver-load shape. Bail to stay
-                // conservative rather than mis-account args.
-                return None;
+            // Stores pop their value (cat-2 is one entry in this model). These
+            // are extremely common in the prefix — `Type x = null; … x.deref()`
+            // emits `astore`/`istore` between the producing const/load and the
+            // trapping use — so modelling them is what lets the analysis name a
+            // local at all. A store has no operand we need to track (the next
+            // `*load` of that slot re-supplies the producer bci), so push none.
+            Istore(_) | Lstore(_) | Fstore(_) | Dstore(_) | Astore(_) => shape!(1, 0),
+            // Invokes — model the real stack effect so a null operand produced
+            // *by* an invoke (`getNull().foo()`) and any operand pushed before
+            // one can still be reconstructed. The descriptor (from the CP via
+            // `resolver`) gives the param count + void-ness; receiver is popped
+            // for the non-static forms. The pushed return slot is tagged with
+            // this invoke's bci so `describe_producer` can render
+            // `the return value of "Owner.m()"`.
+            Invokevirtual(idx) | Invokespecial(idx) => {
+                let CpRef::Method { descriptor, .. } = resolver.method_ref(*idx)? else {
+                    return None;
+                };
+                let (params, ret) = method_slot_counts(&descriptor);
+                shape!(params + 1, ret);
             }
-            Invokestatic(_) | Invokedynamic(_) => return None,
+            Invokeinterface { index, .. } => {
+                let CpRef::Method { descriptor, .. } = resolver.method_ref(*index)? else {
+                    return None;
+                };
+                let (params, ret) = method_slot_counts(&descriptor);
+                shape!(params + 1, ret);
+            }
+            Invokestatic(idx) => {
+                let CpRef::Method { descriptor, .. } = resolver.method_ref(*idx)? else {
+                    return None;
+                };
+                let (params, ret) = method_slot_counts(&descriptor);
+                shape!(params, ret);
+            }
+            // invokedynamic's CP entry isn't a plain method ref the resolver
+            // can size; bail rather than mis-account the call-site arity.
+            Invokedynamic(_) => return None,
             // Anything else (arithmetic, branches, stores, dup variants,
             // switches, returns, athrow, monitor, etc.): we don't model it —
             // bail so we never emit a wrong expression.
@@ -459,47 +592,69 @@ pub mod helpful_npe {
         Some(())
     }
 
+    /// Render the local-variable slot `slot` (live at `bci`) the way HotSpot
+    /// names it: the `LocalVariableTable` source name when present, else `this`
+    /// for slot 0 of an **instance** method, else the synthetic `<localN>`.
+    fn render_local(resolver: &dyn CpResolver, slot: u16, bci: usize) -> String {
+        if let Some(name) = resolver.local_name(slot, bci) {
+            return name;
+        }
+        if slot == 0 && !resolver.is_static_method() {
+            "this".to_string()
+        } else {
+            format!("<local{slot}>")
+        }
+    }
+
     /// Describe the source expression pushed by the instruction at
-    /// `producer_bci`, recursing (bounded) through getfield receivers.
+    /// `producer_bci`, recursing (bounded) through getfield receivers, array
+    /// elements, casts and invoke results. Returns a [`Producer`] whose `text`
+    /// is the inline rendering and whose `is_invoke` flag drives the top-level
+    /// `the return value of "…"` phrasing.
     fn describe_producer(
         code: &[u8],
         producer_bci: usize,
         resolver: &dyn CpResolver,
         depth: u32,
-    ) -> Option<String> {
+    ) -> Option<Producer> {
         if depth > MAX_EXPR_DEPTH {
             return None;
         }
         let (instr, _) = Instruction::decode(code, producer_bci).ok()?;
         match instr {
+            // Reference local / `this`.
             Instruction::Aload(slot) => {
-                if slot == 0 {
-                    // aload_0 in an instance method is `this`.
-                    Some(
-                        resolver
-                            .local_name(0, producer_bci)
-                            .unwrap_or_else(|| "this".to_string()),
-                    )
-                } else {
-                    Some(
-                        resolver
-                            .local_name(slot, producer_bci)
-                            .unwrap_or_else(|| format!("<local{slot}>")),
-                    )
-                }
+                Some(Producer::expr(render_local(resolver, slot, producer_bci)))
             }
+            // Integer locals/constants — only reached as an *array index*
+            // sub-expression (`arr[i]`, `arr[3]`). `iload_0` is never `this`
+            // (that is `aload_0`), so no instance-receiver special-casing.
+            Instruction::Iload(slot) => Some(Producer::expr(
+                resolver
+                    .local_name(slot, producer_bci)
+                    .unwrap_or_else(|| format!("<local{slot}>")),
+            )),
+            Instruction::IconstM1 => Some(Producer::expr("-1".to_string())),
+            Instruction::Iconst0 => Some(Producer::expr("0".to_string())),
+            Instruction::Iconst1 => Some(Producer::expr("1".to_string())),
+            Instruction::Iconst2 => Some(Producer::expr("2".to_string())),
+            Instruction::Iconst3 => Some(Producer::expr("3".to_string())),
+            Instruction::Iconst4 => Some(Producer::expr("4".to_string())),
+            Instruction::Iconst5 => Some(Producer::expr("5".to_string())),
+            Instruction::Bipush(b) => Some(Producer::expr(b.to_string())),
+            Instruction::Sipush(s) => Some(Producer::expr(s.to_string())),
             Instruction::Getfield(idx) => {
                 let CpRef::Field { name, .. } = resolver.field_ref(idx)? else {
                     return None;
                 };
                 // Recurse on the receiver pushed just before this getfield.
-                let recv = simulate_to(code, producer_bci)
+                let recv = simulate_to(code, producer_bci, resolver)
                     .and_then(|stack| stack.last().copied())
                     .and_then(|s| s.producer_bci)
                     .and_then(|b| describe_producer(code, b, resolver, depth + 1));
                 match recv {
-                    Some(r) => Some(format!("{r}.{name}")),
-                    None => Some(name),
+                    Some(r) => Some(Producer::expr(format!("{}.{name}", r.text))),
+                    None => Some(Producer::expr(name)),
                 }
             }
             Instruction::Getstatic(idx) => {
@@ -510,25 +665,63 @@ pub mod helpful_npe {
                 else {
                     return None;
                 };
-                Some(format!("{}.{name}", class_external(&owner_internal)))
+                Some(Producer::expr(format!(
+                    "{}.{name}",
+                    render_owner(&owner_internal)
+                )))
             }
             Instruction::Aaload => {
-                // `<arr>[...]`; recurse on the array operand (two slots down:
-                // array then index were pushed before the aaload).
-                let stack = simulate_to(code, producer_bci)?;
+                // `<arr>[<idx>]`; recurse on both the array operand (two slots
+                // down) and the index (one slot down). HotSpot reconstructs the
+                // index too (`a[0]`, `a[i]`, `a[Owner.f]`); if either operand
+                // can't be classified we bail to the action-only message rather
+                // than fabricate a partial `a[...]`.
+                let stack = simulate_to(code, producer_bci, resolver)?;
                 let arr_slot = stack.len().checked_sub(2)?;
+                let idx_slot = stack.len().checked_sub(1)?;
                 let arr = stack
                     .get(arr_slot)
                     .and_then(|s| s.producer_bci)
-                    .and_then(|b| describe_producer(code, b, resolver, depth + 1));
-                match arr {
-                    Some(a) => Some(format!("{a}[...]")),
-                    None => None,
-                }
+                    .and_then(|b| describe_producer(code, b, resolver, depth + 1))?;
+                let index = stack
+                    .get(idx_slot)
+                    .and_then(|s| s.producer_bci)
+                    .and_then(|b| describe_producer(code, b, resolver, depth + 1))?;
+                Some(Producer::expr(format!("{}[{}]", arr.text, index.text)))
             }
-            Instruction::AconstNull => Some("null".to_string()),
+            // A checkcast is transparent to the expression: `((String) o)` is
+            // named after `o`. Recurse on the value being cast.
+            Instruction::Checkcast(_) => {
+                let val = simulate_to(code, producer_bci, resolver)?
+                    .last()
+                    .copied()
+                    .and_then(|s| s.producer_bci)?;
+                describe_producer(code, val, resolver, depth + 1)
+            }
+            // An invoke result: `Owner.m(params)`. Flagged `is_invoke` so the
+            // top level renders it as `the return value of "…"` while a nested
+            // use (sub-receiver) renders the inline `Owner.m().field` form.
+            Instruction::Invokevirtual(idx) | Instruction::Invokespecial(idx) => {
+                invoke_producer(idx, resolver)
+            }
+            Instruction::Invokestatic(idx) => invoke_producer(idx, resolver),
+            Instruction::Invokeinterface { index, .. } => invoke_producer(index, resolver),
+            Instruction::AconstNull => Some(Producer::expr("null".to_string())),
             _ => None,
         }
+    }
+
+    /// Build the [`Producer`] for an invoke result at CP index `idx`.
+    fn invoke_producer(idx: u16, resolver: &dyn CpResolver) -> Option<Producer> {
+        let CpRef::Method {
+            owner_internal,
+            name,
+            descriptor,
+        } = resolver.method_ref(idx)?
+        else {
+            return None;
+        };
+        Some(Producer::invoke(render_method(&owner_internal, &name, &descriptor)))
     }
 
     /// Reconstruct the null-receiver expression for the invoke at
@@ -540,7 +733,7 @@ pub mod helpful_npe {
         invoke_bci: usize,
         num_params: usize,
         resolver: &dyn CpResolver,
-    ) -> Option<String> {
+    ) -> Option<Producer> {
         // The receiver sits `num_params` slots below the top of the operand
         // stack as it stood just before the invoke.
         null_expr_at_depth(code, invoke_bci, num_params, resolver)
@@ -562,8 +755,8 @@ pub mod helpful_npe {
         trap_bci: usize,
         depth_below_top: usize,
         resolver: &dyn CpResolver,
-    ) -> Option<String> {
-        let stack = simulate_to(code, trap_bci)?;
+    ) -> Option<Producer> {
+        let stack = simulate_to(code, trap_bci, resolver)?;
         let idx = stack.len().checked_sub(depth_below_top + 1)?;
         let producer = stack.get(idx)?.producer_bci?;
         describe_producer(code, producer, resolver, 0)
@@ -1560,7 +1753,7 @@ mod tests {
 
 #[cfg(test)]
 mod helpful_npe_tests {
-    use super::helpful_npe::{self, CpRef, CpResolver};
+    use super::helpful_npe::{self, CpRef, CpResolver, Producer};
     use std::collections::HashMap;
 
     /// Map-backed resolver: cp-index -> CpRef, mirroring what the live
@@ -1570,10 +1763,12 @@ mod helpful_npe_tests {
     /// When a slot is present the resolver returns that real name (as the
     /// live `CpPoolResolver` does from the `LocalVariableTable` attribute);
     /// when absent the analysis falls back to the synthetic `<localN>` form.
+    /// `is_static` mirrors the trapping method's access flag (slot-0 naming).
     struct MockResolver {
         fields: HashMap<u16, CpRef>,
         methods: HashMap<u16, CpRef>,
         locals: HashMap<u16, String>,
+        is_static: bool,
     }
 
     impl MockResolver {
@@ -1582,7 +1777,13 @@ mod helpful_npe_tests {
                 fields,
                 methods,
                 locals: HashMap::new(),
+                is_static: false,
             }
+        }
+        fn new_static(fields: HashMap<u16, CpRef>, methods: HashMap<u16, CpRef>) -> Self {
+            let mut r = Self::new(fields, methods);
+            r.is_static = true;
+            r
         }
     }
 
@@ -1596,6 +1797,15 @@ mod helpful_npe_tests {
         fn local_name(&self, slot: u16, _bci: usize) -> Option<String> {
             self.locals.get(&slot).cloned()
         }
+        fn is_static_method(&self) -> bool {
+            self.is_static
+        }
+    }
+
+    /// The inline `text` of a reconstructed producer (ignoring the
+    /// `is_invoke` flag), for terse `Some("…")` assertions.
+    fn text(p: &Option<Producer>) -> Option<&str> {
+        p.as_ref().map(|x| x.text.as_str())
     }
 
     // Opcode bytes (JVMS §6).
@@ -1604,13 +1814,31 @@ mod helpful_npe_tests {
     const GETFIELD: u8 = 0xb4;
     const GETSTATIC: u8 = 0xb2;
     const INVOKEVIRTUAL: u8 = 0xb6;
+    const INVOKESTATIC: u8 = 0xb8;
+    const CHECKCAST: u8 = 0xc0;
+    const AALOAD: u8 = 0x32;
+    const ICONST_2: u8 = 0x05;
 
     fn u16_be(x: u16) -> [u8; 2] {
         x.to_be_bytes()
     }
 
-    /// External-name formatting matches the JEP 358 dotted form, including
-    /// array spelling.
+    fn method(owner: &str, name: &str, desc: &str) -> CpRef {
+        CpRef::Method {
+            owner_internal: owner.to_string(),
+            name: name.to_string(),
+            descriptor: desc.to_string(),
+        }
+    }
+    fn field(owner: &str, name: &str) -> CpRef {
+        CpRef::Field {
+            owner_internal: owner.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// External-name formatting (used for parameter rendering) matches the
+    /// JEP 358 dotted form, including array spelling.
     #[test]
     fn class_external_formats() {
         assert_eq!(
@@ -1624,16 +1852,70 @@ mod helpful_npe_tests {
         );
     }
 
-    /// The action half names owner + method + dotted parameter types.
+    /// The invoke **owner** rendering (verified against JDK 25): descriptor
+    /// form for arrays (`[I`, not `int[]`), dotted otherwise, and only
+    /// `String`/`Object` shortened.
+    #[test]
+    fn render_owner_matches_hotspot() {
+        assert_eq!(helpful_npe::render_owner("java/lang/String"), "String");
+        assert_eq!(helpful_npe::render_owner("java/lang/Object"), "Object");
+        assert_eq!(
+            helpful_npe::render_owner("java/lang/Integer"),
+            "java.lang.Integer"
+        );
+        assert_eq!(helpful_npe::render_owner("java/util/List"), "java.util.List");
+        assert_eq!(helpful_npe::render_owner("NpeProbe$Node"), "NpeProbe$Node");
+        // Array owners keep descriptor form (clone() on an array).
+        assert_eq!(helpful_npe::render_owner("[I"), "[I");
+        assert_eq!(
+            helpful_npe::render_owner("[Ljava/lang/String;"),
+            "[Ljava.lang.String;"
+        );
+    }
+
+    /// The action half names owner + method + parameter types, with
+    /// `String`/`Object` shortened in *both* the owner and the params
+    /// (matches `java.lang.String.length` → `String.length`, and
+    /// `(Object)`/`(String)` params shortened too).
     #[test]
     fn action_invoke_shape() {
         assert_eq!(
             helpful_npe::action_invoke("java/lang/String", "length", "()I"),
-            "Cannot invoke \"java.lang.String.length()\""
+            "Cannot invoke \"String.length()\""
         );
         assert_eq!(
             helpful_npe::action_invoke("java/util/List", "get", "(I)Ljava/lang/Object;"),
             "Cannot invoke \"java.util.List.get(int)\""
+        );
+        // String/Object params shortened; CharSequence stays qualified.
+        assert_eq!(
+            helpful_npe::action_invoke(
+                "java/util/Map",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            "Cannot invoke \"java.util.Map.put(Object, Object)\""
+        );
+        assert_eq!(
+            helpful_npe::action_invoke(
+                "java/lang/String",
+                "contains",
+                "(Ljava/lang/CharSequence;)Z"
+            ),
+            "Cannot invoke \"String.contains(java.lang.CharSequence)\""
+        );
+        // Array param uses external form (Object[]), array owner stays [I.
+        assert_eq!(
+            helpful_npe::action_invoke("[I", "clone", "()Ljava/lang/Object;"),
+            "Cannot invoke \"[I.clone()\""
+        );
+        assert_eq!(
+            helpful_npe::action_invoke(
+                "java/util/List",
+                "toArray",
+                "([Ljava/lang/Object;)[Ljava/lang/Object;"
+            ),
+            "Cannot invoke \"java.util.List.toArray(Object[])\""
         );
     }
 
@@ -1650,28 +1932,15 @@ mod helpful_npe_tests {
         code.extend_from_slice(&u16_be(2));
 
         let mut fields = HashMap::new();
-        fields.insert(
-            1u16,
-            CpRef::Field {
-                owner_internal: "Node".to_string(),
-                name: "next".to_string(),
-            },
-        );
+        fields.insert(1u16, field("Node", "next"));
         let mut methods = HashMap::new();
-        methods.insert(
-            2u16,
-            CpRef::Method {
-                owner_internal: "Node".to_string(),
-                name: "value".to_string(),
-                descriptor: "()I".to_string(),
-            },
-        );
+        methods.insert(2u16, method("Node", "value", "()I"));
         let resolver = MockResolver::new(fields, methods);
 
         let action = helpful_npe::action_invoke("Node", "value", "()I");
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("this.next"));
-        let msg = helpful_npe::combine(&action, expr.as_deref());
+        assert_eq!(text(&expr), Some("this.next"));
+        let msg = helpful_npe::combine(&action, expr.as_ref());
         assert_eq!(
             msg,
             "Cannot invoke \"Node.value()\" because \"this.next\" is null"
@@ -1690,30 +1959,17 @@ mod helpful_npe_tests {
         code.extend_from_slice(&u16_be(2));
 
         let mut fields = HashMap::new();
-        fields.insert(
-            1u16,
-            CpRef::Field {
-                owner_internal: "Box".to_string(),
-                name: "contents".to_string(),
-            },
-        );
+        fields.insert(1u16, field("Box", "contents"));
         let mut methods = HashMap::new();
-        methods.insert(
-            2u16,
-            CpRef::Method {
-                owner_internal: "java/lang/String".to_string(),
-                name: "length".to_string(),
-                descriptor: "()I".to_string(),
-            },
-        );
+        methods.insert(2u16, method("java/lang/String", "length", "()I"));
         let resolver = MockResolver::new(fields, methods);
 
         let action = helpful_npe::action_invoke("java/lang/String", "length", "()I");
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
-        let msg = helpful_npe::combine(&action, expr.as_deref());
+        let msg = helpful_npe::combine(&action, expr.as_ref());
         assert_eq!(
             msg,
-            "Cannot invoke \"java.lang.String.length()\" because \"<local1>.contents\" is null"
+            "Cannot invoke \"String.length()\" because \"<local1>.contents\" is null"
         );
     }
 
@@ -1724,17 +1980,10 @@ mod helpful_npe_tests {
         let code = vec![ALOAD_1, INVOKEVIRTUAL, 0x00, 0x02];
         let invoke_bci = 1;
         let mut methods = HashMap::new();
-        methods.insert(
-            2u16,
-            CpRef::Method {
-                owner_internal: "java/lang/String".to_string(),
-                name: "trim".to_string(),
-                descriptor: "()Ljava/lang/String;".to_string(),
-            },
-        );
+        methods.insert(2u16, method("java/lang/String", "trim", "()Ljava/lang/String;"));
         let resolver = MockResolver::new(HashMap::new(), methods);
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(text(&expr), Some("<local1>"));
     }
 
     /// GETSTATIC receiver: `getstatic #1 (Sys.out); invokevirtual #2`.
@@ -1747,25 +1996,137 @@ mod helpful_npe_tests {
         code.extend_from_slice(&u16_be(2));
 
         let mut fields = HashMap::new();
-        fields.insert(
-            1u16,
-            CpRef::Field {
-                owner_internal: "java/lang/System".to_string(),
-                name: "out".to_string(),
-            },
-        );
+        fields.insert(1u16, field("java/lang/System", "out"));
         let mut methods = HashMap::new();
-        methods.insert(
-            2u16,
-            CpRef::Method {
-                owner_internal: "java/io/PrintStream".to_string(),
-                name: "println".to_string(),
-                descriptor: "()V".to_string(),
-            },
-        );
+        methods.insert(2u16, method("java/io/PrintStream", "println", "()V"));
         let resolver = MockResolver::new(fields, methods);
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("java.lang.System.out"));
+        assert_eq!(text(&expr), Some("java.lang.System.out"));
+    }
+
+    /// In a **static** method, slot 0 is an ordinary local — HotSpot prints
+    /// `<local0>`, not `this`. `aload_0; arraylength`.
+    #[test]
+    fn static_method_slot0_is_local0() {
+        let code = vec![ALOAD_0, ARRAYLENGTH];
+        let resolver = MockResolver::new_static(HashMap::new(), HashMap::new());
+        let expr = helpful_npe::null_expr_at_depth(&code, 1, 0, &resolver);
+        assert_eq!(text(&expr), Some("<local0>"));
+
+        // The same bytecode in an instance method names slot 0 `this`.
+        let instance = MockResolver::new(HashMap::new(), HashMap::new());
+        let expr2 = helpful_npe::null_expr_at_depth(&code, 1, 0, &instance);
+        assert_eq!(text(&expr2), Some("this"));
+    }
+
+    /// A store between the producer and the trapping use must not defeat the
+    /// analysis — the store-free hand-written tests missed this, but every real
+    /// `Type x = null; … x.deref()` emits `astore` before the `aload`.
+    /// `aconst_null; astore_0; aload_0; getfield #1 (Node.x)`.
+    #[test]
+    fn store_then_load_reconstructs_local() {
+        const ACONST_NULL: u8 = 0x01;
+        const ASTORE_0: u8 = 0x4b;
+        let mut code = vec![ACONST_NULL, ASTORE_0, ALOAD_0, GETFIELD];
+        code.extend_from_slice(&u16_be(1));
+        let trap_bci = 3;
+        let mut fields = HashMap::new();
+        fields.insert(1u16, field("Node", "x"));
+        let resolver = MockResolver::new_static(fields, HashMap::new());
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(text(&expr), Some("<local0>"));
+    }
+
+    /// A null **invoke result** used directly as a receiver renders as
+    /// `the return value of "Owner.m()"` (note: not quoted as a whole).
+    /// `invokestatic #1 (P.getNull()); invokevirtual #2`. (The parameter-list
+    /// rendering inside the "return value of" form is covered end-to-end by the
+    /// `Edge3` integration probe — `getNullArg(int, String)` — which needs the
+    /// real arg-pushing bytecode a hand-written synthetic can't easily supply.)
+    #[test]
+    fn return_value_producer() {
+        let mut code = vec![INVOKESTATIC];
+        code.extend_from_slice(&u16_be(1));
+        let invoke_bci = code.len();
+        code.push(INVOKEVIRTUAL);
+        code.extend_from_slice(&u16_be(2));
+
+        let mut methods = HashMap::new();
+        methods.insert(1u16, method("P", "getNull", "()Ljava/lang/String;"));
+        methods.insert(2u16, method("java/lang/String", "length", "()I"));
+        let resolver = MockResolver::new(HashMap::new(), methods);
+
+        let action = helpful_npe::action_invoke("java/lang/String", "length", "()I");
+        let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
+        assert!(expr.as_ref().unwrap().is_invoke);
+        assert_eq!(text(&expr), Some("P.getNull()"));
+        assert_eq!(
+            helpful_npe::combine(&action, expr.as_ref()),
+            "Cannot invoke \"String.length()\" because the return value of \"P.getNull()\" is null"
+        );
+    }
+
+    /// A non-null invoke result whose **field** is null renders the invoke
+    /// inline (`Owner.m().field`), not as "the return value of".
+    /// `invokestatic #1 (P.getN()); getfield #4 (P.next); invokevirtual #2`.
+    #[test]
+    fn nested_return_value_subreceiver() {
+        let mut code = vec![INVOKESTATIC];
+        code.extend_from_slice(&u16_be(1));
+        code.push(GETFIELD);
+        code.extend_from_slice(&u16_be(4));
+        let invoke_bci = code.len();
+        code.push(INVOKEVIRTUAL);
+        code.extend_from_slice(&u16_be(2));
+
+        let mut fields = HashMap::new();
+        fields.insert(4u16, field("P", "next"));
+        let mut methods = HashMap::new();
+        methods.insert(1u16, method("P", "getN", "()LP;"));
+        methods.insert(2u16, method("java/lang/Object", "toString", "()Ljava/lang/String;"));
+        let resolver = MockResolver::new(fields, methods);
+
+        let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
+        assert!(!expr.as_ref().unwrap().is_invoke);
+        assert_eq!(text(&expr), Some("P.getN().next"));
+    }
+
+    /// A `checkcast` is transparent: `((String) o)` is named after `o`.
+    /// `aload_1; checkcast #3; invokevirtual #2`.
+    #[test]
+    fn checkcast_is_transparent() {
+        let mut code = vec![ALOAD_1, CHECKCAST];
+        code.extend_from_slice(&u16_be(3));
+        let invoke_bci = code.len();
+        code.push(INVOKEVIRTUAL);
+        code.extend_from_slice(&u16_be(2));
+
+        let mut methods = HashMap::new();
+        methods.insert(2u16, method("java/lang/String", "length", "()I"));
+        let resolver = MockResolver::new(HashMap::new(), methods);
+        let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
+        assert_eq!(text(&expr), Some("<local1>"));
+    }
+
+    /// `aaload` reconstructs the index sub-expression: `getstatic #1 (P.sarr);
+    /// iconst_2; aaload; invokevirtual #2` → array element `P.sarr[2]`.
+    #[test]
+    fn aaload_index_reconstruction() {
+        let mut code = vec![GETSTATIC];
+        code.extend_from_slice(&u16_be(1));
+        code.push(ICONST_2);
+        code.push(AALOAD);
+        let invoke_bci = code.len();
+        code.push(INVOKEVIRTUAL);
+        code.extend_from_slice(&u16_be(2));
+
+        let mut fields = HashMap::new();
+        fields.insert(1u16, field("P", "sarr"));
+        let mut methods = HashMap::new();
+        methods.insert(2u16, method("java/lang/String", "length", "()I"));
+        let resolver = MockResolver::new(fields, methods);
+        let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
+        assert_eq!(text(&expr), Some("P.sarr[2]"));
     }
 
     // -- Increment 2: action halves + new-opcode expression shapes ----------
@@ -1778,7 +2139,9 @@ mod helpful_npe_tests {
     const ICONST_0: u8 = 0x03;
     const ICONST_1: u8 = 0x04;
 
-    /// The increment-2 action halves match the exact HotSpot wording.
+    /// The increment-2 action halves match the exact HotSpot wording. Note
+    /// `baload`/`bastore` (byte *and* boolean arrays share the opcode) spell
+    /// the element type "byte/boolean".
     #[test]
     fn increment2_action_shapes() {
         use helpful_npe::ArrayElemKind;
@@ -1804,7 +2167,11 @@ mod helpful_npe_tests {
         );
         assert_eq!(
             helpful_npe::action_array_store(ArrayElemKind::Byte),
-            "Cannot store to byte array"
+            "Cannot store to byte/boolean array"
+        );
+        assert_eq!(
+            helpful_npe::action_array_load(ArrayElemKind::Boolean),
+            "Cannot load from byte/boolean array"
         );
         assert_eq!(
             helpful_npe::action_monitor(),
@@ -1814,7 +2181,7 @@ mod helpful_npe_tests {
     }
 
     /// `combine_opt` emits the action-only string (no fabricated `because`)
-    /// when the expression can't be classified.
+    /// when the expression can't be classified, and the full clause otherwise.
     #[test]
     fn combine_opt_action_only_when_unknown() {
         let action = helpful_npe::action_array_length();
@@ -1822,9 +2189,13 @@ mod helpful_npe_tests {
             helpful_npe::combine_opt(&action, None),
             "Cannot read the array length"
         );
+        // A real reconstructed expression yields the full clause.
+        let code = vec![ALOAD_1, ARRAYLENGTH];
+        let resolver = MockResolver::new(HashMap::new(), HashMap::new());
+        let expr = helpful_npe::null_expr_at_depth(&code, 1, 0, &resolver);
         assert_eq!(
-            helpful_npe::combine_opt(&action, Some("a")),
-            "Cannot read the array length because \"a\" is null"
+            helpful_npe::combine_opt(&action, expr.as_ref()),
+            "Cannot read the array length because \"<local1>\" is null"
         );
     }
 
@@ -1842,28 +2213,16 @@ mod helpful_npe_tests {
         code.extend_from_slice(&u16_be(2));
 
         let mut fields = HashMap::new();
-        fields.insert(
-            1u16,
-            CpRef::Field {
-                owner_internal: "Node".to_string(),
-                name: "next".to_string(),
-            },
-        );
-        fields.insert(
-            2u16,
-            CpRef::Field {
-                owner_internal: "Node".to_string(),
-                name: "value".to_string(),
-            },
-        );
+        fields.insert(1u16, field("Node", "next"));
+        fields.insert(2u16, field("Node", "value"));
         let resolver = MockResolver::new(fields, HashMap::new());
 
         // The trapping getfield reads field "value"; its receiver (depth 0)
         // is `this.next`.
         let action = helpful_npe::action_read_field("value");
         let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("this.next"));
-        let msg = helpful_npe::combine_opt(&action, expr.as_deref());
+        assert_eq!(text(&expr), Some("this.next"));
+        let msg = helpful_npe::combine_opt(&action, expr.as_ref());
         assert_eq!(
             msg,
             "Cannot read field \"value\" because \"this.next\" is null"
@@ -1879,9 +2238,9 @@ mod helpful_npe_tests {
         let resolver = MockResolver::new(HashMap::new(), HashMap::new());
         let action = helpful_npe::action_array_length();
         let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(text(&expr), Some("<local1>"));
         assert_eq!(
-            helpful_npe::combine_opt(&action, expr.as_deref()),
+            helpful_npe::combine_opt(&action, expr.as_ref()),
             "Cannot read the array length because \"<local1>\" is null"
         );
     }
@@ -1897,9 +2256,9 @@ mod helpful_npe_tests {
         let resolver = MockResolver::new(HashMap::new(), HashMap::new());
         let action = helpful_npe::action_array_store(helpful_npe::ArrayElemKind::Int);
         let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 2, &resolver);
-        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(text(&expr), Some("<local1>"));
         assert_eq!(
-            helpful_npe::combine_opt(&action, expr.as_deref()),
+            helpful_npe::combine_opt(&action, expr.as_ref()),
             "Cannot store to int array because \"<local1>\" is null"
         );
     }
@@ -1913,9 +2272,9 @@ mod helpful_npe_tests {
         let resolver = MockResolver::new(HashMap::new(), HashMap::new());
         let action = helpful_npe::action_monitor();
         let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(text(&expr), Some("<local1>"));
         assert_eq!(
-            helpful_npe::combine_opt(&action, expr.as_deref()),
+            helpful_npe::combine_opt(&action, expr.as_ref()),
             "Cannot enter synchronized block because \"<local1>\" is null"
         );
     }
@@ -1931,16 +2290,16 @@ mod helpful_npe_tests {
         resolver.locals.insert(3u16, "items".to_string());
         let action = helpful_npe::action_array_length();
         let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
-        assert_eq!(expr.as_deref(), Some("items"));
+        assert_eq!(text(&expr), Some("items"));
         assert_eq!(
-            helpful_npe::combine_opt(&action, expr.as_deref()),
+            helpful_npe::combine_opt(&action, expr.as_ref()),
             "Cannot read the array length because \"items\" is null"
         );
 
         // Without the LVT entry the same bytecode falls back to <local3>.
         let bare = MockResolver::new(HashMap::new(), HashMap::new());
         let expr_bare = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &bare);
-        assert_eq!(expr_bare.as_deref(), Some("<local3>"));
+        assert_eq!(text(&expr_bare), Some("<local3>"));
     }
 
     /// Step 6 (partial): the JIT-NPE action codes map to the exact HotSpot
@@ -1963,7 +2322,7 @@ mod helpful_npe_tests {
         );
         assert_eq!(
             helpful_npe::jit_action_message(ALOAD_BYTE).as_deref(),
-            Some("Cannot load from byte array")
+            Some("Cannot load from byte/boolean array")
         );
         assert_eq!(
             helpful_npe::jit_action_message(ASTORE_INT).as_deref(),
@@ -1975,7 +2334,7 @@ mod helpful_npe_tests {
         );
         assert_eq!(
             helpful_npe::jit_action_message(ASTORE_BYTE).as_deref(),
-            Some("Cannot store to byte array")
+            Some("Cannot store to byte/boolean array")
         );
         // Inline-codegen path extension (JEP-358 follow-up): the remaining
         // primitive element kinds the inline null-check stubs now name.
