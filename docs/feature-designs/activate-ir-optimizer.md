@@ -576,23 +576,52 @@ two trailing `0x00` bytes** — `jit::try_compile` strips them (`code.len() - 2`
 an unpadded corpus method silently drops its last two opcodes and emits without a
 `ret`. The harness pads accordingly.
 
-**Next (step 3 prerequisite)**: fix the IR multi-return / conditional-early-return
-lowering, then relax the gate behind a `CRATONVM_JIT_IR_*` soak flag with this
-harness as the gate.
+## Increment 11 (step 1 residual — IR multi-return / conditional-early-return fix) landed
+
+Status: **landed** on `dev`. Fixes the miscompile increment 10's harness caught,
+clearing the step-3 blocker.
+
+**Root cause** (two parts): the IR builder emits one `Op::Return` terminator per
+`ireturn`, but `graph.exit` records only the *last* one (each `ireturn`
+overwrites it, `jit/src/ir.rs`). `eliminate_dead_nodes` (`jit/src/ir_optimize.rs`)
+then rooted DCE **solely from `graph.exit`**, so every *other* return path — its
+control, its value, and the `If`'s opposite projection — was marked unreachable
+and deleted. The conditional collapsed into a single-successor `If` that always
+took the surviving (last) return, so `if (a<0) return -1; return 1;` returned `1`
+for every input.
+
+**Fix**: `eliminate_dead_nodes` now seeds its worklist from **every** `Op::Return`
+node, not just `graph.exit` (with a `graph.exit` fallback if a graph somehow has
+none). Every return is an observable program exit and must be a DCE root. This is
+strictly corrective — single-return methods are unchanged (their only return *is*
+`graph.exit`), and genuinely-dead nodes (reachable from no return) are still
+removed. The `ireturn` builder comment now documents that `graph.exit` is "an
+exit", not the sole exit.
+
+**Tests**:
+- `jit/src/ir_optimize.rs::test_dce_keeps_all_return_paths` — a two-`Return`
+  graph keeps both return paths through DCE (the first one survives even though
+  `graph.exit` points at the second).
+- `jit/tests/ir_vs_singlepass.rs` — the formerly-`#[ignore]`d divergence test is
+  un-ignored and now passes, joined by `two_branch_three_returns` (`sgn3`) and
+  `abs_early_return` (a computed early return). IR == single-pass == host for all.
+
+**Unblocks step 3**: the IR gate may now be relaxed onto conditional-early-return
+methods (behind a `CRATONVM_JIT_IR_*` soak flag), gated by this harness.
 
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
-   ⚠ Partially done: the SIGSEGV is fixed for single-return branchy *expressions*,
-   but increment 10's harness proved **conditional early returns (multiple
-   `ireturn` points) are still miscompiled** — a prerequisite for step 3.
+   ✅ Done: the SIGSEGV fix covered single-return branchy *expressions*, and
+   increment 11 fixed the **conditional-early-return (multiple `ireturn` points)**
+   miscompile increment 10's harness caught (DCE now roots from all returns).
 2. **Differential self-check harness** — ✅ **Done (increment 10)**:
    `jit/tests/ir_vs_singlepass.rs` compiles a corpus through both backends via
    the `optimize` toggle, executes both, and asserts equal results. Already
-   caught the multi-return miscompile above.
+   caught (and now regression-guards) the multi-return miscompile.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
-   soak flag (Front 1.2). **BLOCKED** on the step-1 multi-return fix; the harness
-   (step 2) is now the gate.
+   soak flag (Front 1.2). **UNBLOCKED** (increment 11); the harness (step 2) is
+   the gate. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the

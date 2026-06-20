@@ -200,25 +200,16 @@ fn ir_vs_singlepass_poly() {
     );
 }
 
-/// KNOWN IR DIVERGENCE (found by this harness) — the IR pipeline miscompiles a
-/// method with a **conditional early return** (more than one `ireturn` point).
-///
-/// `int sgn2(int a) { if (a<0) return -1; return 1; }`: the single-pass backend
-/// returns the correct `-1` for `a<0`, but the IR pipeline drops the conditional
-/// branch and always takes the fall-through return (`1`). The matching loop case
-/// (`ir_vs_singlepass_sum_loop`, which branches but has a single exit) compiles
-/// correctly, so the fault is specific to multiple return points, not branching.
-///
-/// This is exactly the class of latent miscompile the harness exists to gate:
-/// the IR gate must NOT be relaxed onto early-return methods until this is fixed
-/// (it currently only reaches the IR path for the shapes that pass above).
-/// `#[ignore]` keeps CI green while the bug is tracked; run with
-/// `cargo test -p cratonvm-jit --test ir_vs_singlepass -- --ignored` to confirm
-/// it still reproduces. Remove `#[ignore]` once the IR multi-return lowering is
-/// fixed.
+// ── Multiple return points (conditional early return) ──────────────────
+//
+// These were the harness's first catch: the IR pipeline used to root DCE only
+// from `graph.exit` (the LAST `Op::Return`, since each `ireturn` overwrites it),
+// deleting every other return path and collapsing the conditional into a
+// single-successor branch that always took the surviving return. Fixed by
+// rooting `eliminate_dead_nodes` from ALL `Op::Return` nodes (ir_optimize.rs).
+
 #[test]
-#[ignore = "IR miscompiles conditional early-return (multiple ireturn points) — tracked follow-up"]
-fn ir_vs_singlepass_conditional_early_return_known_divergence() {
+fn ir_vs_singlepass_conditional_early_return() {
     // int sgn2(int a) { if (a<0) return -1; return 1; }   (one branch, two returns)
     check(
         "sgn2",
@@ -230,7 +221,60 @@ fn ir_vs_singlepass_conditional_early_return_known_divergence() {
         ],
         1,
         1,
-        &[(vec![-5], -1), (vec![0], 1), (vec![7], 1)],
+        &[
+            (vec![-5], -1),
+            (vec![0], 1),
+            (vec![7], 1),
+            (vec![i32::MIN as i64], -1),
+            (vec![i32::MAX as i64], 1),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_two_branch_three_returns() {
+    // int sgn3(int a) { if (a<0) return -1; if (a>0) return 1; return 0; }
+    check(
+        "sgn3",
+        "(I)I",
+        vec![
+            0x1a, 0x9c, 0x00, 0x05, // iload_0; ifge +5 → 6
+            0x02, 0xac, // iconst_m1; ireturn
+            0x1a, 0x9e, 0x00, 0x05, // iload_0; ifle +5 → 12
+            0x04, 0xac, // iconst_1; ireturn
+            0x03, 0xac, // iconst_0; ireturn
+        ],
+        1,
+        1,
+        &[
+            (vec![-5], -1),
+            (vec![0], 0),
+            (vec![7], 1),
+            (vec![i32::MIN as i64], -1),
+            (vec![i32::MAX as i64], 1),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_abs_early_return() {
+    // int abs(int a) { if (a<0) return -a; return a; }   (computed early return)
+    check(
+        "abs",
+        "(I)I",
+        vec![
+            0x1a, 0x9c, 0x00, 0x06, // iload_0; ifge +6 → 7
+            0x1a, 0x74, 0xac, // iload_0; ineg; ireturn
+            0x1a, 0xac, // iload_0; ireturn
+        ],
+        1,
+        1,
+        &[
+            (vec![-5], 5),
+            (vec![0], 0),
+            (vec![7], 7),
+            (vec![-100], 100),
+        ],
     );
 }
 

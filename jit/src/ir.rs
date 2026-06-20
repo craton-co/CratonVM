@@ -1142,6 +1142,15 @@ impl IrBuilder {
                 }
 
                 // ireturn
+                //
+                // A method may have several `return` statements, so this builds
+                // one `Op::Return` terminator per `ireturn`. `graph.exit` records
+                // only the LAST one (each `ireturn` overwrites it) — it is an
+                // "an exit" marker, NOT the sole exit. Consumers that need every
+                // exit must enumerate all `Op::Return` nodes: the scheduler does
+                // (it blocks every control node), and `eliminate_dead_nodes`
+                // roots from ALL returns (rooting only from `graph.exit` would
+                // delete the other return paths — see its comment).
                 0xac => {
                     let val = self.pop();
                     let ret =
