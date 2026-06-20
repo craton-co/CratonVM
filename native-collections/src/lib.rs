@@ -429,6 +429,45 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
 }
 
+/// GC-SAFETY helper: pin every object-typed `Value` in `vals` so a subsequent
+/// allocating call cannot relocate/collect them while they sit in a bare Rust
+/// `Vec`. Returns the base handle for [`NativeContext::unpin_native_roots`]
+/// (`usize::MAX` if nothing was pinned) and a per-index handle vector
+/// (`usize::MAX` for non-object slots) for [`read_value_slice`]. Pair every call
+/// with `unpin_native_roots(base)` once the refs are safely stored.
+fn pin_value_slice(ctx: &mut dyn NativeContext, vals: &[Value]) -> (usize, Vec<usize>) {
+    let mut base = usize::MAX;
+    let handles = vals
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => {
+                let h = ctx.pin_native_root(*o);
+                if base == usize::MAX {
+                    base = h;
+                }
+                h
+            }
+            _ => usize::MAX,
+        })
+        .collect();
+    (base, handles)
+}
+
+/// Read back the (post-GC, forwarded) refs for a slice pinned with
+/// [`pin_value_slice`]. Non-object slots are returned verbatim.
+fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) -> Vec<Value> {
+    handles
+        .iter()
+        .zip(orig)
+        .map(|(&h, v)| match v {
+            Value::Object(Some(o)) if h != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(h, *o)))
+            }
+            _ => *v,
+        })
+        .collect()
+}
+
 /// Allocate a hash-map bucket table of `cap` entries, **capping the eager
 /// allocation to what the heap can hold**, and return `(table, actual_cap)`.
 ///
@@ -8902,9 +8941,19 @@ fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) {
         Some(s) => s,
         None => return,
     };
+    // GC-SAFETY: `drain_spliterator_to_array` drives the source spliterator,
+    // which for a `StackWalker` walk allocates heavily (one `StackFrameInfo` +
+    // `StackTraceElement` + strings per frame) and can trigger a moving GC that
+    // relocates `stream`. Writing the result back through the stale `stream`
+    // reference corrupts the heap (zeroed `ClassId(0)` headers / wild
+    // `Object.toArray` dispatch) — the `ByteArrayMappingTests` SIGSEGV. Pin
+    // `stream` across the drain and read the forwarded reference back.
+    let stream_pin = ctx.pin_native_root(stream);
     let arr = drain_spliterator_to_array(ctx, spl);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
     ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+    ctx.unpin_native_roots(stream_pin);
 }
 
 /// Create a Stream from a slice of values.
@@ -9297,41 +9346,53 @@ fn stream_elements(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY: `materialize_lazy_stream` (and the `toArray()` fallback below)
+    // allocate / drive an allocating spliterator drain that can relocate
+    // `stream`. Every subsequent use of `stream` here (class lookup, field read,
+    // toArray dispatch) must see the forwarded reference, or we read a zeroed
+    // header and mis-dispatch (`Object.toArray()` / empty stream). Pin it.
+    let stream_pin = ctx.pin_native_root(stream);
     // Lazy streams (from `StreamSupport.stream(realSpliterator, false)`) hold
     // their source spliterator in slot 2 with no element array yet — drain it
     // now so EVERY non-forEach op sees the full element list. (`forEach` handles
     // the lazy case itself, driving the spliterator one element at a time.)
     materialize_lazy_stream(ctx, stream);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     // For our synthetic Stream object, field 0 holds an Object[] of elements.
     // But some streams are real JDK ReferencePipeline instances (returned by
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if is_synthetic_stream(&class_name) {
+    // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
+    let result: Result<Vec<Value>, MethodCallFailed> = if is_synthetic_stream(&class_name) {
         // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
         // ops onto slot 3 while sharing the upstream SOURCE array (slot 0). Apply
         // the chain here so every eager terminal/op sees the fully-transformed
         // elements. Gate-off (default) never has a chain, so this is inert.
         if lazy_streams_enabled() && stream_has_chain(ctx, stream) {
-            return stream_apply_chain_full(ctx, stream);
-        }
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-            let len = ctx.array_length(arr);
-            return Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect());
-        }
-        return Ok(Vec::new());
-    }
-    // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
-    // materialize via the object toArray. (Real PRIMITIVE pipelines don't reach
-    // here — `Arrays.stream(int[])` / `IntStream.of(...)` are intercepted to
-    // produce synthetic primitive streams; see register_essential_natives.)
-    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[])? {
-        Some(Value::Object(Some(arr))) => {
+            stream_apply_chain_full(ctx, stream)
+        } else if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
             Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+        } else {
+            Ok(Vec::new())
         }
-        _ => Ok(Vec::new()),
-    }
+    } else {
+        // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
+        // materialize via the object toArray. (Real PRIMITIVE pipelines don't
+        // reach here — `Arrays.stream(int[])` / `IntStream.of(...)` are
+        // intercepted to produce synthetic primitive streams.)
+        match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(arr)))) => {
+                let len = ctx.array_length(arr);
+                Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+            }
+            Ok(_) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    };
+    ctx.unpin_native_roots(stream_pin);
+    result
 }
 
 /// True for CratonVM's synthetic Stream / IntStream / LongStream / DoubleStream
@@ -9959,14 +10020,28 @@ fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     let elements = stream_elements_mut(ctx, this)?;
-    let arr = alloc_ref_array(ctx, elements.len());
+    let n = elements.len();
+    // GC-SAFETY: `elements` are bare refs; `alloc_ref_array` / `alloc_synthetic`
+    // below can trigger a moving GC that relocates them and `arr`. Pin every
+    // element (and then `arr`) and read each back before storing, or the
+    // spliterator ends up backed by stale/zeroed slots.
+    let (base, handles) = pin_value_slice(ctx, &elements);
+    let arr = alloc_ref_array(ctx, n);
+    let arr_pin = ctx.pin_native_root(arr);
+    let elements = read_value_slice(ctx, &handles, &elements);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     for (i, v) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
     let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
-    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    // Element pins (if any) precede `arr_pin`; release the whole batch from the
+    // earliest handle.
+    let unpin_from = if base != usize::MAX { base } else { arr_pin };
+    ctx.unpin_native_roots(unpin_from);
     Ok(Some(Value::Object(Some(spl))))
 }
 

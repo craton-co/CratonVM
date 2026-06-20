@@ -464,6 +464,18 @@ pub struct IrBuilder {
     /// pc is absent — or whose tag is not int-category — makes `build` bail
     /// (`None` → single-pass), the existing safety net.
     field_info: HashMap<usize, (usize, u8)>,
+    /// Resolved allocation layout for `new`, keyed by bytecode pc:
+    /// `pc → (class_id, num_fields)`. Set by [`Self::set_new_info`]; only the
+    /// allocations the caller admits (non-escaping-eligible: no primitive field
+    /// initialisers, no finalizer) are present. A `new` whose pc is absent
+    /// makes `build` bail (`None` → single-pass).
+    new_info: HashMap<usize, (u32, usize)>,
+    /// Bytecode pcs of `invokespecial` calls to a trivial no-arg void
+    /// constructor (`<init>()V`) that may be **elided** (the receiver is a
+    /// fresh, non-escaping object whose fields are zero-initialised and set by
+    /// the visible `putfield`s). Set by [`Self::set_trivial_init_pcs`]. An
+    /// `invokespecial` whose pc is NOT here makes `build` bail.
+    trivial_init_pcs: HashSet<usize>,
 }
 
 impl IrBuilder {
@@ -502,6 +514,8 @@ impl IrBuilder {
             loop_headers: HashSet::new(),
             loop_phis: HashMap::new(),
             field_info: HashMap::new(),
+            new_info: HashMap::new(),
+            trivial_init_pcs: HashSet::new(),
         }
     }
 
@@ -511,6 +525,19 @@ impl IrBuilder {
     /// entries make the corresponding `getfield` bail to single-pass.
     pub fn set_field_info(&mut self, info: HashMap<usize, (usize, u8)>) {
         self.field_info = info;
+    }
+
+    /// Supply the allocation layout (`pc → (class_id, num_fields)`) and the set
+    /// of elidable trivial-`<init>` pcs the builder uses to lower `new` into an
+    /// `Op::New` (for escape-analysis scalar replacement). Must be called before
+    /// [`Self::build`]; an absent `new`/`invokespecial` pc bails to single-pass.
+    pub fn set_new_info(
+        &mut self,
+        new_info: HashMap<usize, (u32, usize)>,
+        trivial_init_pcs: HashSet<usize>,
+    ) {
+        self.new_info = new_info;
+        self.trivial_init_pcs = trivial_init_pcs;
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -895,6 +922,26 @@ impl IrBuilder {
                     self.push(self.locals[idx]);
                     pc += 1;
                 }
+                // astore — store an object reference into a local. Same
+                // node-graph mechanics as istore: a reference is just a NodeId
+                // slot in the abstract locals array (mirrors the `aload`
+                // comment above). Real javac stores a `new` object into a local
+                // (`new; dup; invokespecial; astore_N`), so without this the IR
+                // builder bails on every allocation method and scalar
+                // replacement never fires on production bytecode.
+                0x3a => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
+                }
+                // astore_0..3
+                0x4b..=0x4e => {
+                    let idx = (op - 0x4b) as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 1;
+                }
                 // istore
                 0x36 => {
                     let idx = code[pc + 1] as usize;
@@ -1161,6 +1208,59 @@ impl IrBuilder {
                         Some(pc),
                     );
                     self.mem = store;
+                    pc += 3;
+                }
+                // new — allocate an object as an `Op::New`. Emitted so escape
+                // analysis can scalar-replace it when it does not escape (no
+                // heap allocation, fields become SSA values). The lowerer has
+                // no allocation path, so an `Op::New` that SURVIVES escape
+                // analysis (escaping) makes the whole compile bail to
+                // single-pass — enforced by the caller after `optimize`.
+                0xbb => {
+                    let (class_id, num_fields) = match self.new_info.get(&pc) {
+                        Some(&ci) => ci,
+                        None => return None,
+                    };
+                    let newobj = self.graph.add(
+                        Op::New {
+                            class_id,
+                            num_fields,
+                        },
+                        IrType::Ref,
+                        vec![self.ctrl, self.mem],
+                        Some(pc),
+                    );
+                    self.push(newobj);
+                    pc += 3;
+                }
+                // invokespecial — only a trivial `<init>()V` on a fresh object
+                // is handled, by ELISION: pop the receiver (the `dup`'d new
+                // object) and emit nothing. Sound only because the caller
+                // admits the pc to `trivial_init_pcs` exclusively when the
+                // object is a non-escaping `new` whose class has no primitive
+                // field initialisers (its fields are zero-initialised and set
+                // by the visible `putfield`s — the constructor adds nothing the
+                // scalar-replaced slots don't already model). Any other
+                // `invokespecial` bails to single-pass.
+                0xb7 => {
+                    if !self.trivial_init_pcs.contains(&pc) {
+                        return None;
+                    }
+                    // Defence in depth: only elide when the receiver (top of
+                    // stack for a no-arg `<init>`) is a fresh `Op::New` we
+                    // emitted. Eliding a `<init>` whose receiver is `this` or a
+                    // parameter would skip a real superclass constructor (and
+                    // hide any escape it performs).
+                    let recv = self.peek();
+                    let recv_is_new = recv != NO_NODE
+                        && matches!(
+                            self.graph.nodes.get(recv as usize).map(|n| &n.op),
+                            Some(Op::New { .. })
+                        );
+                    if !recv_is_new {
+                        return None;
+                    }
+                    self.pop();
                     pc += 3;
                 }
                 // dup
@@ -1508,17 +1608,18 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0x88
             | 0x91..=0x93
             | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => {
                 pc += 1;
             }
             // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 => {
+            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => {
                 pc += 2;
             }
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 => {
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xbb => {
                 pc += 3;
             }
             _ => {
@@ -1596,13 +1697,14 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0x88
             | 0x91..=0x93
             | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
             // 2-byte opcodes
-            0x10 | 0x15 | 0x19 | 0x36 => pc += 2,
+            0x10 | 0x15 | 0x19 | 0x36 | 0x3a => pc += 2,
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 => pc += 3,
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xbb => pc += 3,
             _ => pc += 1,
         }
     }

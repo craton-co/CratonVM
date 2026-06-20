@@ -837,25 +837,267 @@ kills the New/Store/Load and redirects the return to the stored `Const(42)`;
 scalar-replaced (the kafka bug-25 escape rule is preserved). jit lib 798/798,
 field harness 20/20.
 
-**Remaining for the `new` scalar-replacement slice** (clearly scoped, NOT done):
-1. **Builder emits `Op::New`** (0xbb) with `class_id`/`num_fields` from
-   `cp_new_resolver` (thread it like `field_info`), plus `dup` (already handled).
-2. **`<init>` elision** — the soundness crux. `new Foo()` is `new; dup;
-   invokespecial Foo.<init>`. Single-pass treats **any** `()V` `<init>` as
-   trivial (`is_trivial_void_init`, `x64.rs`) and elides it, but a `()V`
-   constructor can still initialise fields (`Foo(){ x = 5; }`), which eliding
-   would silently drop — a real miscompile risk. Do NOT replicate the
-   `()V`-is-trivial assumption blindly; gate elision on a provably-effect-free
-   `<init>` (investigate `cp_new_resolver`'s `has_primitive_init` flag, or only
-   admit objects whose every read field is dominated by a visible `putfield`).
-3. **Gate**: after EA, if any live `Op::New` survives (escaping), bail to
-   single-pass — the IR lowerer has no allocation path yet.
-4. **Harness**: a non-escaping `new` scalar-replaces to pure-int code (no alloc,
-   no helper), so the existing dummy-helper differential validates it directly.
-5. **Then `Op::Call`** for real `invoke*` (needs the lowerer to gain
-   `JitRuntimeHelpers` access for the dispatch/alloc helper calls, plus VM-level
-   differential validation per `wire-tiered-manager` — the jit-crate stub harness
-   cannot faithfully validate dispatch).
+**Remaining for the `new` scalar-replacement slice**: see increment 17 (the
+mechanism) below.
+
+## Increment 17 (Front 3 — `Op::New` emission + scalar-replacement mechanism) landed
+
+Status: **landed** on `dev`; **inert in production** (not yet wired — see the
+soundness analysis). The IR builder can now lower `new` to `Op::New` and the EA
+scalar-replaces a non-escaping allocation end-to-end, but the production caller
+does not yet feed the builder the allocation metadata, because eliding a
+constructor soundly needs a signal that does not yet exist.
+
+**What landed** (`jit/src/ir.rs`, `jit/src/lib.rs`):
+- The builder gained `set_new_info(pc → (class_id, num_fields), trivial_init_pcs)`.
+  `new` (0xbb) emits `Op::New { class_id, num_fields }` (inputs `[ctrl, mem]`);
+  `invokespecial` (0xb7) is **elided** iff its pc is in `trivial_init_pcs` AND
+  the receiver on the abstract stack is a fresh `Op::New` we emitted (defence in
+  depth — eliding a `<init>` on `this`/a parameter would skip a real superclass
+  constructor and hide any escape it performs). Any other `invokespecial`, or a
+  `new`/`<init>` without resolved metadata, bails to single-pass. `0xbb`/`0xb7`
+  added to both length walkers.
+- **Surviving-New gate** (`lib.rs`): after escape analysis, if any `Op::New`/
+  `Op::NewArray` is still live (it escaped → was not scalar-replaced), bail to
+  single-pass — the lowerer has no allocation path, so emitting nothing for it
+  would leave a garbage object reference. (Scalar-replaced News are `Op::Dead`.)
+
+**Tests**: `ir_new_scalar_replaces_end_to_end` drives the whole path from
+bytecode (`Foo o = new Foo(); o.x = 42; return o.x`): the builder emits the New
++ elides the `<init>`, `optimize` + EA + `apply_ea_to_ir` scalar-replace it, and
+the return resolves to `Const(42)` with no live New. `ir_new_bails_on_init_of_
+nonfresh_receiver` proves a `super.<init>()` on `this` bails. jit lib 800/800,
+field harness 20/20 (no regression; the gate is inert with no News emitted).
+
+**The `<init>`-soundness analysis (why production wiring is DEFERRED).** Eliding
+`new Foo(); dup; invokespecial Foo.<init>` is sound only if `Foo.<init>` is
+provably **effect-free and does not escape its receiver**. Three hazards, none
+visible from the call site:
+1. **Field initialisers** — `Foo(){ x = 5; }` is a `()V` `<init>` that sets a
+   field; eliding it leaves the scalar slot at the zero default. (For int fields
+   the builder only admits a `new` whose `has_primitive_init == false`, i.e. no
+   non-zero primitive initialiser — but that is a *future* wiring constraint, and
+   reference-field initialisers are irrelevant only because a non-escaping object's
+   unread ref fields are dead.)
+2. **Escape inside the constructor** — `Foo(){ GLOBAL.add(this); }` escapes the
+   object *through the elided body*, which the caller's EA cannot see, so it would
+   wrongly scalar-replace a live, escaped object (the kafka bug-25 class). The
+   surviving-New gate does **not** catch this (the escape is hidden in the elided
+   `<init>`).
+3. **Arbitrary side effects** — a `()V` `<init>` may call other methods / do I/O.
+
+Single-pass treats **any** `()V` `<init>` as trivial (`is_trivial_void_init`,
+`x64.rs`) — an approximation that holds for its targeted patterns but is not
+provably sound. The only `<init>` provably safe to elide from the descriptor/name
+alone is `java/lang/Object.<init>()V` (empty), which scalar-replaces nothing
+useful (no fields). **A sound *and* useful production policy needs either (a) a
+VM-side "trivial constructor" signal — `<init>` only calls `super.<init>()` and
+does zero/default field stores, no escape, no other call — added to
+`cp_new_resolver`, or (b) constructor inlining so the `<init>` body's effects
+become visible IR.** Until one lands, `set_new_info` stays unwired in production
+(the mechanism is proven and ready; activating it on an unsound policy would
+reintroduce exactly the miscompile class this project guards against).
+
+**Next**: the VM-side trivial-constructor signal (smallest sound unlock) OR
+`Op::Call` for real `invoke*` (needs the lowerer to gain `JitRuntimeHelpers`
+access + VM-level differential validation per `wire-tiered-manager`).
+
+## Increment 18 (Front 3 — `apply_ea_to_ir` zero-default for an un-stored field) landed
+
+Status: **landed** on `dev`. A soundness prerequisite for activating scalar
+replacement. `find_scalar_replacements` records `field_values[idx] = None` for a
+field that is **loaded but never stored** (the design intent — "use the object's
+zero default", per `escape_analysis.rs::test_uninitialized_field_returns_none`),
+but `apply_ea_to_ir` only redirected a load when `field_values` was `Some` and
+then killed the load **unconditionally** — so a load of an un-stored field was
+marked `Dead` with **no replacement**, leaving its consumers reading a dead node.
+Fix: when `field_values[idx]` is `None`, materialise a `Const(0)` (the correct
+default for a zero-initialised object's int field) and redirect the load to it.
+Sound only when the object is genuinely zero-initialised — which the eventual
+production caller must enforce (only admit allocations whose constructor sets no
+non-zero field). Test: `ea_unstored_field_load_resolves_to_zero_default`. jit lib
+801/801, field harness 20/20.
+
+## The VM-side trivial-constructor signal — actionable plan (the next sound unlock)
+
+The `Op::New` mechanism (inc 17) + the EA bridge (inc 16) + the zero-default fix
+(inc 18) are all in place; production scalar replacement is one signal away. The
+signal must answer: *is it sound to elide `new C(); dup; invokespecial C.<init>()V`
+and zero-initialise the scalar slots?*
+
+**Do NOT reuse `classify_init_complexity`** (`vm/src/jit/skip_list.rs`). Its
+`Trivial` means "no putfield/putstatic/monitor/invokedynamic" — sound for
+JIT-*compiling* the `<init>`, but it **admits regular calls** (`invokevirtual`/
+`invokestatic`/…). A `()V` ctor `C(){ register(this); }` is `Trivial` by that
+classifier yet escapes the receiver — eliding it would scalar-replace a live,
+escaped object (the surviving-New gate can't see the escape; it's hidden in the
+elided body).
+
+**Sound + simple + useful definition** — an *elidable construction*:
+`C.<init>()V`'s body is exactly `aload_0; invokespecial java/lang/Object.<init>()V;
+return` (bytes `2a b7 XX XX b1`, with `XX XX` resolving to `Object.<init>()V`).
+That is the default empty constructor of a direct `Object` subclass — no field
+stores (object stays zero-initialised → the inc-18 zero-default is correct), no
+escape of `this`, no side effects. Covers the common POJO/data-class case
+(`class Point { int x, y; }`). (A later refinement can recurse the super chain to
+admit non-`Object` supers whose `<init>` is itself elidable.)
+
+**Wiring** (cross-crate; production-activating → needs a soak):
+1. **VM**: an `is_elidable_construction(class_id) -> bool` in
+   `vm/src/runtime/interpreter.rs` near `resolve_jit_new_site` (it has CP +
+   hierarchy access) that checks the `<init>()V` body shape + resolves the
+   `invokespecial` target to `Object.<init>()V`.
+2. **Thread it** as a 5th field of the `cp_new_resolver` tuple
+   (`(class_id, num_fields, has_prim_init, has_finalizer, is_elidable)`) — the
+   least-disruptive option (one closure signature, ~3 call sites: interpreter.rs,
+   tiered.rs, the lib.rs consumer + the harness/in-crate test pass dummies).
+3. **lib.rs** (IR branch): build `new_info` from `scan.new_ops` (all news), and
+   `trivial_init_pcs` by linking each `new` (pc P, `is_elidable`) to the
+   `invokespecial <init>` that consumes its receiver — the canonical
+   `new@P; dup; invokespecial@P+? ` pair (match by the invoke immediately
+   following the new+dup, or resolve the invoke's class == the new's class).
+   Call `builder.set_new_info(new_info, trivial_init_pcs)`.
+4. **Gate behind a default-OFF soak flag** (e.g. `CRATONVM_JIT_SCALAR_NEW`, like
+   `CRATONVM_JIT_LICM`) so it lands inert and the production flip waits on a
+   **bt18 (== 68332206) + gauntlet soak** — it changes production scalar
+   replacement, the kafka-bug-25-sensitive area.
+5. **Validation**: the differential harness already validates scalar replacement
+   (a non-escaping `new` folds to pure-int → IR == single-pass == host); add a
+   `new`-bearing case once the resolver is wired. The surviving-New gate (inc 17)
+   + the zero-default (inc 18) + the receiver-is-New check (inc 17) are the
+   safety net.
+
+## Increment 19 (Front 3 — VM-side trivial-constructor signal wired, soak-gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_SCALAR_NEW`**.
+Production scalar replacement of `new` is now fully wired end-to-end (VM analysis →
+resolver → `lib.rs` → builder → EA), but stays inert until the soak flag is set,
+because flipping it on changes production scalar replacement (the
+kafka-bug-25-sensitive area) and must clear a bt18 + gauntlet soak first.
+
+**What landed**
+- **VM** (`vm/src/runtime/interpreter.rs`): `is_elidable_construction(cm,
+  class_id)` — true iff the class's `<init>()V` body is exactly `aload_0;
+  invokespecial java/lang/Object.<init>()V; return` (the empty default
+  constructor of a direct `Object` subclass: no field initialiser → object stays
+  zero-initialised, no escape of `this`, no side effect). `resolve_jit_elidable_
+  init(cm, holder, invoke_cp_idx)` resolves an `invokespecial` methodref and
+  applies that check. Deliberately stricter than `classify_init_complexity`'s
+  `Trivial` (which admits calls that can escape the receiver — unsound to elide).
+- **JIT** (`jit/src/lib.rs`): a new `try_compile` parameter
+  `cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>`. When supplied, the
+  IR branch builds `new_info` (from `cp_new_resolver`) + `trivial_init_pcs` (the
+  `invokespecial` pcs the resolver marks elidable) and calls
+  `builder.set_new_info`. `None` (the default) leaves it off — the builder bails
+  on `new`/`invokespecial`, single-pass as before.
+- **VM call sites**: each of the three `try_compile` sites builds the elidable
+  resolver and passes it **only when `CRATONVM_JIT_SCALAR_NEW` is set**, else
+  `None`. So production is inert by default.
+
+**Tests**: `scalar_new_wiring_routes_through_ir_only_with_resolver` (a
+`new Foo(); o.x=42; return o.x` method routes through the IR pipeline —
+`IR_LOWER_COMPILES==1` — only with the resolver; without it, counter stays 0).
+jit lib 802/802, field harness 20/20, `cratonvm-vm` builds clean. (Combined with
+the inc-17 end-to-end builder test proving the graph folds to `Const(42)` and the
+inc-18 zero-default, the path is covered down to the machine-code level.)
+
+**To soak / flip on** (the remaining production-validation step):
+1. Run with `CRATONVM_JIT_SCALAR_NEW=1` on the app gauntlet (kafka / spring /
+   tomcat / hibernate suites) + `bt18` (must stay `== 68332206`; bintrees' own
+   `TreeNode(left,right)` ctor is arg-bearing so NOT elidable → bt18 only checks
+   the flag-on path doesn't regress, it doesn't exercise scalar-new). A targeted
+   probe (`new`-heavy default-ctor POJOs, non-escaping) exercises the new path —
+   compare its output to HotSpot.
+2. Watch for the kafka-bug-25 class: an object that escapes via an elided
+   constructor body. The `Object.<init>`-only restriction makes the elided body
+   provably empty, so this is structurally excluded — but the soak is the proof.
+3. Once clean, default the flag on (or remove it) and re-run the gauntlet +
+   bt10/14/16/18 checksums, per step 8.
+
+**Next refinements** (after the flag flips clean):
+- Recurse the super chain in `is_elidable_construction` to admit non-`Object`
+  supers whose `<init>` is itself elidable (covers deeper hierarchies).
+- `Op::Call` for real `invoke*` — the remaining big lever (lowerer needs
+  `JitRuntimeHelpers` access + VM-level differential validation per
+  `wire-tiered-manager`).
+
+## Increment 20 (Front 3 — `astore` gap fixed + `new` scalar replacement default-ON) landed
+
+Status: **landed** on `dev`. Closes Gap A of the scalar-new handoff, but the
+headline is a **latent-bug fix**: `new` scalar replacement (inc 17–19) was
+**completely inert on real bytecode** — it never fired once outside the unit
+tests — and the soak that was supposed to prove it (inc 19's "POJO probe ==
+HotSpot") was **vacuous**: a non-escaping POJO produces the same result whether
+or not it is scalar-replaced, so "== HotSpot" passed while the optimization did
+nothing.
+
+**Root cause (the `astore` gap).** The IR builder (`jit/src/ir.rs`) lowered
+`aload`/`aload_0..3` (read a reference local) but had **no `astore` handler**.
+Real javac compiles `Foo o = new Foo()` as `new; dup; invokespecial <init>;
+astore_N` — it stores the fresh object into a local. With no `astore` arm, the
+builder hit its `_ => return None` catch-all on *every* allocation method and
+bailed to single-pass — so `Op::New` was emitted, the `<init>` elided, but the
+method never reached escape analysis. The inc-17 end-to-end unit test passed
+only because it hand-builds bytecode that keeps the ref on the *stack* via `dup`
+(`new; dup; invokespecial; dup; …`), never exercising `astore`. **Lesson: a
+"== reference output" probe cannot validate an optimization whose presence is
+output-invariant; assert the optimization *fired* (here via a
+`CRATONVM_DBG_SCALAR_NEW` live-fire diagnostic), not just that the result
+matches.**
+
+**What landed**
+- **`jit/src/ir.rs`** — the builder now lowers `astore` (0x3a) and
+  `astore_0..3` (0x4b..=0x4e), mirroring `istore` exactly (a reference is just a
+  `NodeId` slot in the abstract locals array, per the existing `aload` comment).
+  Both bytecode length walkers (`find_branch_targets`, `find_loop_headers`) list
+  `0x4b..=0x4e` (1-byte) and `0x3a` (2-byte). This widens the IR path generally
+  (it also un-bails the already-default-on int `getfield`/`putfield` path when a
+  ref base arrives via a local), not just scalar-new.
+- **`vm/src/runtime/interpreter.rs`** — `CRATONVM_JIT_SCALAR_NEW` flipped from
+  opt-in to **default-ON** at all three `try_compile` sites
+  (`std::env::var(..).map_or(true, |v| v != "0")`); `CRATONVM_JIT_SCALAR_NEW=0`
+  is the opt-out safety net (restores single-pass for `new`-bearing methods). The
+  noisy debugging `is_elidable_construction` print was removed.
+- **`jit/src/lib.rs`** — a focused `CRATONVM_DBG_SCALAR_NEW` diagnostic: for an
+  allocation method it reports `scalar-replaced N/M alloc(s)` (proves the path is
+  non-vacuously exercised) and flags an allocation method that bailed the IR
+  builder (the signal that surfaced this very gap).
+
+**Soundness of the widening**: `astore` itself is a trivial slot assignment; the
+builder still bails (`None` → single-pass) on any opcode it can't lower, so the
+newly-admitted methods are exactly those whose every op is already validated
+(int arithmetic/branches/loops + int `getfield`/`putfield` + elidable-`new`).
+The escape rules (Return→GlobalEscape, Call-arg→ArgEscape, store-value→bail) and
+the surviving-`New` gate are unchanged.
+
+**Tests**
+- `jit/src/lib.rs::ir_new_scalar_replaces_through_astore_local` — the inc-17
+  end-to-end fold, but through an `astore`/`aload` local (the real javac shape):
+  `new Foo(); o.x=42; return o.x` folds to `Const(42)`. This is the regression
+  guard the inc-17 dup-only test could not be.
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_getfield_via_astore_local` —
+  an `astore`/`aload` round-trip on the int-field path executes identically
+  (IR == single-pass == host).
+
+**Validation** (worktree `CratonVM-irnew`, branch `feat/ir-scalar-new-flip`,
+binary `cratonvm-irnew.exe`):
+- jit lib 803/803, differential harness 21/21; `cratonvm-vm` builds clean; clippy
+  neutral (the 10 pre-existing jit clippy errors are all in `deopt.rs`/`x64.rs`,
+  none in the changed files).
+- bt10/14/16/18 == HotSpot (`135854 / 3222190 / 14985902 / 68332206`) with the
+  flag default-ON **and** with `CRATONVM_JIT_SCALAR_NEW=0`; no timing regression
+  (a controlled bt16 A/B vs the old dev binary was within noise — the new
+  binary, opt-out, and old dev binary all ~6.9 s).
+- `scratch/scalarnew/ScalarNew.java` (pure-int POJO probe: straight-line,
+  loop, conditional-alloc, escaping-via-return) == HotSpot, **and** the
+  `CRATONVM_DBG_SCALAR_NEW` diagnostic confirms `oneShot`/`sumPoints`/`sumBoxes`
+  scalar-replace `1/1`, while the escaping helper correctly bails. (Pure-int is
+  mandatory: a `long` accumulator makes the whole method category-2 →
+  single-pass, which is what made the *original* probe vacuous twice over.)
+
+**Next**: recurse the super chain in `is_elidable_construction` (deeper
+hierarchies than direct-`Object` POJOs); `Op::Call` for real `invoke*`
+(Gap B — the remaining big lever).
 
 ## Implementation steps (ordered)
 

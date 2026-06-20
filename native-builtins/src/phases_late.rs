@@ -17914,21 +17914,48 @@ fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
 ) -> cratonvm_types::ObjectRef {
-    let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
-    let cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
-    let meth_str = ctx.create_string(&entry.method_name);
-    let file_str = match &entry.source_file {
-        Some(f) => Value::Object(Some(ctx.create_string(f))),
-        None => Value::Object(None),
+    // GC-SAFETY (see `lang_stackwalker::populate_sfi`): allocate every object
+    // under a pin first, then read each back through its pin before the
+    // (allocation-free) field writes. Holding the freshly-allocated `sf` and
+    // strings in bare locals across the subsequent `create_string` calls is a
+    // use-after-move/free under the moving collector.
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
+    let base = ctx.pin_native_root(sf);
+    let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
+    let h_cls = ctx.pin_native_root(cls_str);
+    let mut meth_str = ctx.create_string(&entry.method_name);
+    let h_meth = ctx.pin_native_root(meth_str);
+    let (mut file_str, h_file) = match &entry.source_file {
+        Some(f) => {
+            let s = ctx.create_string(f);
+            let h = ctx.pin_native_root(s);
+            (Some(s), Some(h))
+        }
+        None => (None, None),
     };
     // Preserve the '/' form for declaring-class resolution via class_id_by_name.
-    let decl_internal = ctx.create_string(&entry.class_name);
+    let mut decl_internal = ctx.create_string(&entry.class_name);
+    let h_decl = ctx.pin_native_root(decl_internal);
+
+    sf = ctx.read_native_pin(base, sf);
+    cls_str = ctx.read_native_pin(h_cls, cls_str);
+    meth_str = ctx.read_native_pin(h_meth, meth_str);
+    if let (Some(s), Some(h)) = (file_str, h_file) {
+        file_str = Some(ctx.read_native_pin(h, s));
+    }
+    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
+
     ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(sf, 2, file_str);
+    ctx.set_field(
+        sf,
+        2,
+        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
+    );
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
+    ctx.unpin_native_roots(base);
     sf
 }
 
@@ -17937,12 +17964,20 @@ fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let trace = ctx.capture_stack_trace(0); // key 0 = temporary
     let frame_count = trace.len();
     let arr = ctx.new_ref_array(ClassId::new(0), frame_count);
+    // GC-SAFETY: `populate_stack_frame` allocates, so pin `arr` (which also
+    // keeps its already-stored StackFrame elements reachable) and re-read the
+    // forwarded reference before each `set_array_element`.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, entry) in trace.iter().enumerate() {
         let sf = populate_stack_frame(ctx, entry);
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
     }
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
 
     // Apply the Function argument to the stream: function.apply(stream)
     let function = match args.get(1) {

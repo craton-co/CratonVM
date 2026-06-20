@@ -16837,6 +16837,85 @@ fn resolve_jit_new_site(
     Some((target_id.as_u32(), num_fields, has_prim_init, has_finalizer))
 }
 
+/// Whether constructing `class_id` via its no-arg constructor is *elidable* for
+/// JIT escape-analysis scalar replacement — i.e. `new C(); dup; invokespecial
+/// C.<init>()V` may be replaced by a zero-initialised scalar object with no call.
+///
+/// SOUND only for the empty default constructor of a direct `java/lang/Object`
+/// subclass: `C.<init>()V`'s body is exactly `aload_0; invokespecial
+/// java/lang/Object.<init>()V; return` (bytes `2a b7 hi lo b1`). That guarantees
+/// the constructor (a) writes NO field (the object stays zero-initialised, so the
+/// scalar slots' zero defaults are correct), (b) does NOT escape its receiver,
+/// and (c) has NO other side effect (the only call is the empty `Object.<init>`).
+///
+/// This is deliberately narrower than `classify_init_complexity`'s `Trivial`,
+/// which admits arbitrary calls (e.g. `register(this)`) that escape the receiver
+/// — unsound to elide. (A future refinement may recurse the super chain to admit
+/// non-`Object` supers whose `<init>` is itself elidable.)
+fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: ClassId) -> bool {
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    let Some(init) = class.find_method("<init>", "()V") else {
+        return false;
+    };
+    let Some(code) = init.code() else {
+        return false;
+    };
+    let bc = &code.code;
+    // aload_0 (0x2a); invokespecial (0xb7) hi lo; return (0xb1) — exactly 5 bytes.
+    if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {
+        return false;
+    }
+    let mref_idx = ((bc[2] as u16) << 8) | bc[3] as u16;
+    let cp = &class.constant_pool;
+    let nat_idx = match cp.get(mref_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) => {
+            if cp.get_class_name(*class_index) != Some("java/lang/Object") {
+                return false;
+            }
+            *name_and_type_index
+        }
+        _ => return false,
+    };
+    matches!(cp.get_name_and_type(nat_idx), Some(("<init>", "()V")))
+}
+
+/// Shared body for the JIT `cp_elidable_init_resolver` closures: given the
+/// holder class `holder_cid` and an `invokespecial` constant-pool index, return
+/// `true` iff it targets a no-arg `<init>()V` whose construction is elidable for
+/// scalar replacement (see [`is_elidable_construction`]).
+fn resolve_jit_elidable_init(
+    cm: &crate::classloading::ClassManager,
+    holder_cid: ClassId,
+    cp_idx: u16,
+) -> bool {
+    let Some(holder) = cm.get_class(holder_cid) else {
+        return false;
+    };
+    let cp = &holder.constant_pool;
+    let (class_index, nat_index) = match cp.get(cp_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => return false,
+    };
+    if !matches!(cp.get_name_and_type(nat_index), Some(("<init>", "()V"))) {
+        return false;
+    }
+    let Some(target_name) = cp.get_class_name(class_index) else {
+        return false;
+    };
+    let Some(target_id) = cm.find_class_by_name(target_name) else {
+        return false;
+    };
+    is_elidable_construction(cm, target_id)
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -17118,6 +17197,16 @@ fn try_jit_upgrade_with_gate(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
+    // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
+    // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
+    // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
+    // is the opt-out safety net — when off, `None` is passed and the IR builder
+    // bails on `new`, restoring the single-pass backend for allocation methods.
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let elidable_init_resolver = |cp_idx: u16| -> bool {
+        let cm = shared.class_manager.read();
+        resolve_jit_elidable_init(&cm, class_id, cp_idx)
+    };
     // invoke class-id resolver: maps an invoke* CP index to the class id of
     // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
     // call-site intrinsics for the receiver class-id guard.
@@ -17391,6 +17480,14 @@ fn try_jit_upgrade_with_gate(
                 let cm = shared.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
+            // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+            // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+            let c_scalar_new_on =
+                std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+            let c_elidable_init_resolver = |cp_idx: u16| -> bool {
+                let cm = shared.class_manager.read();
+                resolve_jit_elidable_init(&cm, callee_cid, cp_idx)
+            };
             // invoke class-id resolver for the callee's constant pool — maps
             // an invoke* CP index to its declared class id, for the CRC32/
             // CRC32C `update` receiver class-id guard.
@@ -17465,6 +17562,11 @@ fn try_jit_upgrade_with_gate(
                 // loaded yet.
                 Some(&c_string_layout_resolver),
                 Some(&c_invoke_class_id_resolver),
+                if c_scalar_new_on {
+                    Some(&c_elidable_init_resolver)
+                } else {
+                    None
+                },
                 // Early-compile path is the optimized (C2-equivalent) tier — the
                 // tiered C1 routing only flows through the background worker.
                 true,
@@ -17564,6 +17666,11 @@ fn try_jit_upgrade_with_gate(
         // (bug-03). Mirrors the already-wired `try_jit_compile_callee_slow` path.
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        if scalar_new_on {
+            Some(&elidable_init_resolver)
+        } else {
+            None
+        },
         // Inline mutator compile path is the optimized (C2-equivalent) tier.
         true,
     )?;
@@ -18034,6 +18141,13 @@ fn try_jit_compile_callee_slow(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
+    // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+    // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let elidable_init_resolver = |cp_idx: u16| -> bool {
+        let cm = shared.class_manager.read();
+        resolve_jit_elidable_init(&cm, cid, cp_idx)
+    };
     // invoke class-id resolver — maps an invoke* CP index to its declared
     // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.
     let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
@@ -18116,6 +18230,11 @@ fn try_jit_compile_callee_slow(
         Some(&inline_resolver),
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        if scalar_new_on {
+            Some(&elidable_init_resolver)
+        } else {
+            None
+        },
         // wire-tiered-manager Step 3: `optimize` selects the backend per call.
         // Inline JIT-dispatch callers pass `true` (optimized C2); the background
         // tiered worker passes the C1/C2 value derived from the task's tier.

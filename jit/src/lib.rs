@@ -3767,18 +3767,33 @@ fn apply_ea_to_ir(
                 },
             };
 
-            if ea_field_idx < info.field_values.len() {
-                if let Some(ea_val) = info.field_values[ea_field_idx] {
-                    if let Some(&ir_val) = reverse_map.get(&ea_val) {
-                        // Redirect: replace all references to ir_load with ir_val
-                        // across the entire IR graph.
-                        let load_id = ir_load;
-                        for node in ir_graph.nodes.iter_mut() {
-                            for inp in node.inputs.iter_mut() {
-                                if *inp == load_id {
-                                    *inp = ir_val;
-                                }
-                            }
+            // The value the load resolves to: the stored field value, or — when
+            // the field was never stored (`field_values[idx] == None`) — the
+            // freshly-allocated object's zero default. WITHOUT the latter, a
+            // load of an un-stored field was killed below with NO replacement,
+            // leaving its consumers reading a dead node (a miscompile that was
+            // latent only because scalar replacement does not yet fire on
+            // production IR). A `Const(0)` is the correct default for a
+            // zero-initialised object's int field. (Soundness depends on the
+            // object being genuinely zero-initialised — the caller must only
+            // admit allocations whose constructor sets no non-zero field.)
+            let replacement: Option<ir::NodeId> = if ea_field_idx < info.field_values.len() {
+                match info.field_values[ea_field_idx] {
+                    Some(ea_val) => reverse_map.get(&ea_val).copied(),
+                    None => Some(ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None)),
+                }
+            } else {
+                None
+            };
+
+            if let Some(ir_val) = replacement {
+                // Redirect: replace all references to ir_load with ir_val
+                // across the entire IR graph.
+                let load_id = ir_load;
+                for node in ir_graph.nodes.iter_mut() {
+                    for inp in node.inputs.iter_mut() {
+                        if *inp == load_id {
+                            *inp = ir_val;
                         }
                     }
                 }
@@ -3944,6 +3959,16 @@ pub fn try_compile(
     // (resolver absent, or it returns `None` for a given site) makes the
     // CRC32 intrinsic at that site bail to normal dispatch.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // activate-ir-optimizer (scalar-new wiring): given an `invokespecial`
+    // constant-pool index, returns `true` iff it targets a constructor whose
+    // *construction* is elidable for escape-analysis scalar replacement — a
+    // no-arg `<init>()V` of a direct `java/lang/Object` subclass whose body is
+    // exactly `aload_0; invokespecial Object.<init>()V; return` (no field
+    // initialiser, no escape, no side effect). `None` (the production default
+    // unless the soak flag is set) leaves scalar-replacement of `new` OFF: the
+    // IR builder bails on every `invokespecial`, so allocation-bearing methods
+    // take the single-pass backend exactly as before.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
     // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
     // function doc above.
@@ -3983,6 +4008,7 @@ pub fn try_compile(
         inline_resolver,
         string_layout_resolver,
         cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
         optimize,
         &mut backend_attempted,
     );
@@ -4105,6 +4131,9 @@ fn try_compile_inner(
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
     // Maps an invoke* CP index to its declared class id — see `try_compile`.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // Elidable-`<init>` resolver for scalar-replacement of `new` — see
+    // `try_compile`. `None` keeps `new` scalar replacement off.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: when `false`, the optimizing IR pipeline is
     // skipped entirely and compilation falls through to the single-pass
     // `x64::compile` backend (the fast C1 tier). See `try_compile`.
@@ -4278,7 +4307,48 @@ fn try_compile_inner(
                 builder.set_field_info(fm);
             }
         }
-        if let Some(mut graph) = builder.build(code, code_len) {
+        // Scalar replacement of `new`: only when the elidable-`<init>` resolver
+        // is supplied (the production soak flag is on, or a test wires it
+        // directly) do we feed the builder the allocation layout for every `new`
+        // and the pcs of elidable `<init>()V` invokespecials. Without it, the
+        // builder bails on `new`/`invokespecial`, so allocation-bearing methods
+        // stay on the single-pass backend exactly as before (inert default).
+        if let (Some(elidable_resolver), Some(new_resolver)) =
+            (cp_elidable_init_resolver, cp_new_resolver)
+        {
+            if !scan.new_ops.is_empty() {
+                let mut new_info_map =
+                    std::collections::HashMap::with_capacity(scan.new_ops.len());
+                for &(pc, cp_idx) in &scan.new_ops {
+                    if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
+                        new_info_map.insert(pc, (class_id, num_fields));
+                    }
+                }
+                let mut trivial_init_pcs = std::collections::HashSet::new();
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if opcode == 0xb7 && elidable_resolver(cp_idx) {
+                        trivial_init_pcs.insert(pc);
+                    }
+                }
+                builder.set_new_info(new_info_map, trivial_init_pcs);
+            }
+        }
+        let built = builder.build(code, code_len);
+        // Soak diagnostic (CRATONVM_DBG_SCALAR_NEW): an allocation-bearing method
+        // that bailed the IR builder went single-pass, so `new` scalar
+        // replacement could not fire on it — the signal that the IR builder is
+        // missing an opcode the method uses (this is how the `astore` gap, which
+        // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        if built.is_none()
+            && !scan.new_ops.is_empty()
+            && std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
+        {
+            eprintln!(
+                "[cratonvm-scalarnew] IR builder bailed (single-pass) for allocation method {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+        if let Some(mut graph) = built {
             // History: the IR backend used to miscompile a *pure* (call-free)
             // method containing a conditional branch / φ merge — a tiny leaf
             // predicate like `static boolean f(int m){ return (m & K) != 0; }`
@@ -4312,23 +4382,60 @@ fn try_compile_inner(
                 {
                     let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                    // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
+                    // allocation-bearing method, report how many of its `new`s
+                    // escape analysis scalar-replaced. This proves the path is
+                    // actually exercised on real bytecode (a non-vacuous soak):
+                    // `scalar_replaceable < ir_news` means some `new` escaped and
+                    // the method will bail to single-pass via the surviving-New
+                    // gate below.
+                    if std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                        let ir_news = graph
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
+                            })
+                            .count();
+                        if ir_news > 0 {
+                            eprintln!(
+                                "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                ea_result.scalar_replaceable.len(),
+                                ir_news,
+                            );
+                        }
+                    }
                     if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
                     {
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
                     }
                 }
 
-                let schedule = ir_schedule::schedule(&graph);
-                if let Some(compiled) =
-                    ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
-                {
-                    // wire-tiered-manager Step 3 telemetry (test-only): records
-                    // that the optimizing IR path — not the single-pass C1
-                    // backend — produced this body, so the per-call toggle test
-                    // can prove `optimize=false` skips it.
-                    #[cfg(test)]
-                    IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
-                    return Some(compiled);
+                // An `Op::New` that SURVIVED escape analysis (it escaped, so it
+                // was not scalar-replaced) has no IR lowering — `ir_lower` has
+                // no allocation path and would emit nothing for it, leaving a
+                // garbage object reference. Bail to single-pass rather than
+                // miscompile. (Scalar-replaced News are already `Op::Dead`.)
+                let has_live_new = graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
+                if !has_live_new {
+                    let schedule = ir_schedule::schedule(&graph);
+                    if let Some(compiled) =
+                        ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
+                    {
+                        // wire-tiered-manager Step 3 telemetry (test-only):
+                        // records that the optimizing IR path — not the
+                        // single-pass C1 backend — produced this body, so the
+                        // per-call toggle test can prove `optimize=false` skips it.
+                        #[cfg(test)]
+                        IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
+                        return Some(compiled);
+                    }
                 }
             } // end else (IR-lowering path)
         }
@@ -5322,7 +5429,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, true,
+            None, None, true,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5335,7 +5442,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, false,
+            None, None, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5413,6 +5520,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
@@ -5429,7 +5537,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, true,
+            None, None, true,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -5549,6 +5657,336 @@ mod tests {
         assert!(
             result.scalar_replaceable.is_empty(),
             "an escaping New must not be scalar-replaceable"
+        );
+    }
+
+    // A non-escaping New whose field is LOADED but never STORED is scalar-
+    // replaced, and the load of that field must resolve to the zero default
+    // (`Const(0)`) of the freshly-allocated object — NOT be killed without a
+    // replacement (the latent `apply_ea_to_ir` bug). Soundness rests on the
+    // object being zero-initialised (the caller only admits allocations whose
+    // constructor sets no non-zero field).
+    #[test]
+    fn ea_unstored_field_load_resolves_to_zero_default() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let off1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off0, val],
+            None,
+        );
+        // Load field 1 — never stored.
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off1],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "a non-escaping new is scalar-replaceable even with an un-stored field"
+        );
+        apply_ea_to_ir(&mut g, &id_map, &result);
+        assert!(
+            !g.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is scalar-replaced away"
+        );
+        let ret_node = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret_node.inputs[1];
+        assert_eq!(
+            g.nodes[retval as usize].op,
+            Op::Const(0),
+            "the un-stored field's load must resolve to the zero default"
+        );
+    }
+
+    // ── Op::New emission + scalar replacement, end-to-end via the builder ──
+    //
+    // The builder lowers `new` to `Op::New` and elides a trivial `<init>` on a
+    // fresh object; escape analysis then scalar-replaces the non-escaping
+    // allocation (no heap alloc, the field load becomes the stored value). This
+    // drives the FULL path (build -> optimize -> EA -> apply) from bytecode.
+    #[test]
+    fn ir_new_scalar_replaces_end_to_end() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — trivial, elided)
+        //   7: dup               59
+        //   8: bipush 42         10 2a
+        //  10: putfield #3       b5 00 03
+        //  13: getfield #3       b4 00 03
+        //  16: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03, 0xb4,
+            0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(10usize, (0usize, b'I')); // putfield field 0
+        fi.insert(13usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder.build(&code, 17).expect("IR build");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load must resolve to the stored value (42)"
+        );
+    }
+
+    // REGRESSION (astore gap): the same scalar-replacement end-to-end, but the
+    // fresh object is round-tripped through a LOCAL via `astore`/`aload` — the
+    // shape REAL javac emits (`new; dup; invokespecial; astore_N; aload_N; …`).
+    // The `ir_new_scalar_replaces_end_to_end` test above keeps the ref on the
+    // stack via `dup`, so it never exercised `astore` — and the builder had NO
+    // `astore` handler, so EVERY production allocation method bailed to
+    // single-pass and `new` scalar replacement NEVER fired live (inc 17/19's
+    // "== HotSpot" probe was vacuous: it matches whether or not SR fires). With
+    // `astore` lowered, this folds to `Const(42)` exactly like the dup form.
+    #[test]
+    fn ir_new_scalar_replaces_through_astore_local() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }  (javac shape)
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — elided)
+        //   7: astore_0          4b
+        //   8: aload_0           2a
+        //   9: bipush 42         10 2a
+        //  11: putfield #3       b5 00 03
+        //  14: aload_0           2a
+        //  15: getfield #3       b4 00 03
+        //  18: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x4b, 0x2a, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+            0x2a, 0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(11usize, (0usize, b'I')); // putfield field 0
+        fi.insert(15usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder
+            .build(&code, 19)
+            .expect("IR build must succeed with astore lowered");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the astore-local non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load (via astore/aload local) must resolve to the stored value (42)"
+        );
+    }
+
+    // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on
+    // `this`) must NOT be elided — the builder bails even if the pc is admitted.
+    #[test]
+    fn ir_new_bails_on_init_of_nonfresh_receiver() {
+        use crate::ir::IrBuilder;
+        use std::collections::{HashMap, HashSet};
+        // aload_0; invokespecial #2; return  — `super.<init>()` on `this`.
+        //   0: aload_0           2a
+        //   1: invokespecial #2  b7 00 02
+        //   4: return            b1
+        let code = [0x2a, 0xb7, 0x00, 0x02, 0xb1, 0x00, 0x00];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(1usize); // admit pc 1 — but receiver is `this`, not a New
+        builder.set_new_info(HashMap::new(), init_pcs);
+        assert!(
+            builder.build(&code, 5).is_none(),
+            "eliding a <init> on a non-fresh receiver must bail to single-pass"
+        );
+    }
+
+    // activate-ir-optimizer (scalar-new wiring): a `new`-bearing method whose
+    // construction is elidable routes through the IR pipeline (scalar-replaced)
+    // ONLY when the elidable-`<init>` resolver is supplied — the production soak
+    // gate. Without it the builder bails on the `invokespecial`, keeping `new`
+    // scalar replacement off by default.
+    #[test]
+    fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
+        use std::sync::Arc;
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Mk"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("()I"),
+            source_file: None,
+            code: Arc::from(
+                [
+                    0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+                    0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+                ]
+                .as_slice(),
+            ),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 8,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        };
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
+            if cp == 1 {
+                Some((7, 1, false, false))
+            } else {
+                None
+            }
+        };
+        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+            if cp == 3 {
+                Some((0, b'I'))
+            } else {
+                None
+            }
+        };
+        let elidable = |cp: u16| -> bool { cp == 2 };
+
+        // With the elidable resolver → the IR pipeline scalar-replaces the new.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let r = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            Some(&elidable),
+            true,
+        );
+        assert!(r.is_some(), "an elidable `new` method must compile via IR");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "the elidable `new` method must route through the IR pipeline"
+        );
+
+        // Without it → the builder bails on the `invokespecial` → not the IR path.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _ = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without the elidable resolver, `new` must NOT take the IR pipeline"
         );
     }
 
