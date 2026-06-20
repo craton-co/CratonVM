@@ -1,8 +1,25 @@
 # HIB-DEV-03 — JAXB XML mapping hangs in `AbstractCollection.retainAll` (`ClassInfoImpl.findGetterSetterProperties`)
 
 **Severity:** High — `rc=124` at the 600s census timeout; the class never completes.
-**Status:** 🟡 PARTIAL (audit 2026-06-19) — the dominant **class-load rescan-storm** layer is **FIXED**: known-absent synthetic-stub upgrades are now memoized (`1db07c35`, default-on; `class_manager.rs` `synthetic_upgrade_absent`; 250-JAR put loop 20,120ms → 132ms, now classpath-independent). Residual **OPEN**: the broader JAXB/ByteBuddy `MethodGraph` bootstrap throughput and the deeper JTA/socket wedge underneath remain (see [STATUS-remaining-gaps](STATUS-remaining-gaps-2026-06-18.md) #13). The original `retainAll`/collection framing was refuted in-doc (standalone `LinkedHashMap.keySet().retainAll(...)` is fully correct under GC); live `cdb` showed the time is in **class loading** (`native_map_put → alloc_object → ensure_synthetic_class → ClassPath::find_class → ZipArchive::by_name`). Handoff.
-**Mode:** Interpreter (JIT-off census).
+**Status:** ✅ **RESOLVED / does-not-reproduce (re-verified 2026-06-20).**
+  - The dominant **class-load rescan-storm** layer is **FIXED on `dev`** (`1db07c35` + `25c42e13`, default-on;
+    `class_manager.rs` `synthetic_upgrade_absent`; 250-JAR put loop 20,120ms → 132ms, classpath-independent).
+    The fixed-half write-up already lives alongside this doc at
+    [`hibernate-jaxb-classload-synthetic-stub-rescan-storm.md`](hibernate-jaxb-classload-synthetic-stub-rescan-storm.md).
+  - The residual **ByteBuddy `MethodGraph` bootstrap-throughput hang does NOT reproduce on current `dev`.**
+    A programmatic JOINED-inheritance bootstrap (`_hibrepro/HibJoined`: `Animal`←`Mammal`←`Dog`, which forces a
+    `JoinedSubclassEntityPersister` + ByteBuddy `MethodGraph$Compiler$Default.doAnalyze` proxy-factory build —
+    the exact path the census stalled in) **completes in ~16s under `--nojit`** (census mode) and ~17s JIT-on,
+    persist+query OK — well under the 600s timeout. With the class-load storm fixed, ByteBuddy completes.
+  - The deeper **JTA/socket wedge** referenced here is **also resolved** — see
+    [hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
+    (Layer 2 = an `accept()` deadlock, fixed on branch `fix/hib-jta-xa-loopback`).
+  - **Caveat:** the *original* JAXB-XML-mapping repro classes (`Ejb3XmlElementCollectionTest`, …) could not be
+    re-run via JUnit because of a **separate, newly-found** blocker — the `@Jpa`/`@ExtendWith` *meta-annotation*
+    `ParameterResolver` is not applied (annotation-synthesis family, NOT JAXB/socket). That gates the whole
+    Hibernate JUnit suite; the JAXB/ByteBuddy *bootstrap* path itself was exercised directly (above) and does
+    not hang. The original `retainAll`/collection framing was refuted in-doc.
+**Mode:** Interpreter (JIT-off census) — re-verified JIT-on **and** `--nojit`.
 **HotSpot (JDK 25):** affected classes **PASS** (quickly).
 
 ## ⚠️ Update — re-diagnosis (original `retainAll` hypothesis refuted)

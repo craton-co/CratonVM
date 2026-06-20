@@ -2323,11 +2323,25 @@ fn re2_accept_into(
         }
         result
     } else {
-        let mut reg = s2_registry().lock();
-        let listener = reg
-            .listeners
-            .get_mut(&listener_id)
-            .ok_or_else(|| ioex("ServerSocket: listener fd missing"))?;
+        // Clone the listener handle out under a SHORT lock, then release the
+        // s2_registry lock BEFORE the blocking accept(). Holding the global
+        // registry lock across a blocking accept() deadlocks every other
+        // synthetic-socket operation process-wide: Narayana's
+        // TransactionStatusManager Listener thread (no SO_TIMEOUT set, so it
+        // takes this branch) blocks here in accept() while the main thread's
+        // SocketProcessId bind (s2_alloc_listener -> s2_registry().lock()) waits
+        // for the same lock forever — the Hibernate JTA default-mode hang.
+        // try_clone() yields an independent handle to the same listening socket,
+        // so the original stays registered and the lock is free during accept().
+        let listener = {
+            let reg = s2_registry().lock();
+            reg.listeners
+                .get(&listener_id)
+                .ok_or_else(|| ioex("ServerSocket: listener fd missing"))?
+                .try_clone()
+                .map_err(|e| ioex(format!("ServerSocket.accept: try_clone failed: {e}")))?
+        };
+        let _ = listener.set_nonblocking(false);
         listener.accept()
     };
     let (stream, peer) =
@@ -2348,7 +2362,7 @@ fn re2_accept_into(
 }
 
 fn re2_bind_listener(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     this: ObjectRef,
     host: &str,
     port: i32,
@@ -2369,6 +2383,17 @@ fn re2_bind_listener(
         s.closed = 0;
         s.listener_id = listener_id;
     });
+    // Publish the actual bound port to the cross-crate identity-keyed registry. The
+    // re2 side-table above is private to native-builtins, but the last-registered (and
+    // therefore winning) `getLocalPort` native lives in the sibling native-io crate
+    // (socket_channel `ss_wrapper_local_port`) and shadows ALL ServerSocket dispatch.
+    // It cannot see our side-table, and an int written to object field 0 does NOT
+    // round-trip (the real ServerSocket layout's low slots are reference-typed). The
+    // shared native-api table (keyed by GC-stable identity hash) is the channel that
+    // lets that winner return the real ephemeral port instead of 0 — without which
+    // `new ServerSocket(0).getLocalPort()` is 0 and any connect-to-advertised-port
+    // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
+    cratonvm_native_api::server_socket_ports::record(ctx.identity_hash_code(this), actual_port);
     Ok(None)
 }
 

@@ -13,6 +13,7 @@ pub mod init_level;
 pub mod intrinsic;
 pub mod native_ring;
 pub mod registry;
+pub mod server_socket_ports;
 
 /// Lightweight `NativeContext` mock available to tests and to other
 /// workspace crates that opt in via the `test-mock` feature.

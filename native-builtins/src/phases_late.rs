@@ -45698,23 +45698,30 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        // Block-accept via the s2_registry. Take the listener out, accept on it, put it back.
-        let stream = {
-            let mut reg = s2_registry().lock();
-            let listener =
-                reg.listeners
-                    .get(&listener_id)
-                    .ok_or_else(|| RuntimeError::IOException {
-                        message: "Listener not found".into(),
-                    })?;
-            match listener.accept() {
-                Ok((stream, _addr)) => stream,
-                Err(e) => {
-                    return Err(RuntimeError::IOException {
-                        message: format!("accept failed: {}", e),
-                    }
-                    .into())
+        // Clone the listener handle out under a SHORT lock, then release the
+        // s2_registry lock BEFORE the blocking accept() — holding it across a
+        // blocking accept() deadlocks every other synthetic-socket op
+        // process-wide (see the matching fix in net_phase_e::re2_accept_into).
+        let listener = {
+            let reg = s2_registry().lock();
+            reg.listeners
+                .get(&listener_id)
+                .ok_or_else(|| RuntimeError::IOException {
+                    message: "Listener not found".into(),
+                })?
+                .try_clone()
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("accept try_clone: {e}"),
+                })?
+        };
+        let _ = listener.set_nonblocking(false);
+        let stream = match listener.accept() {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("accept failed: {}", e),
                 }
+                .into())
             }
         };
         let stream_id = s2_alloc_stream(stream);
