@@ -10,8 +10,18 @@
 | **CratonVM** | FAIL — `IllegalArgumentException: Unsafe.putByte: address 0x… is not in any live arena` (+ `ArrayIndexOutOfBoundsException`) |
 | **HotSpot JDK 25** | OK (PooledDataBufferTests 10/10) |
 | **CratonVM HEAD** | found `c4536b94`; **FIXED on dev `3b16e985`+** (this session) |
-| **Status** | **FIXED** on dev — single-element `Unsafe.get/putX(long)` fall through to real pointers |
+| **Status** | ✅ **FULLY RESOLVED** (re-verified 2026-06-20, dev `697134f8`) — bug-A AND the bug-A2 residual both pass now: `PooledDataBufferTests` **10/10**, `LeakAwareDataBufferFactoryTests` **2/2**, `DefaultDataBufferTests` **1/1**. Archived here. |
 | **Suggested owner** | done (landed on dev) |
+
+> **RE-VERIFY 2026-06-20** (build `cratonvm-spring0620` off dev `697134f8`, JDK 25, via the
+> JUnit-Platform `KRun` harness): `core.io.buffer.PooledDataBufferTests` now passes **10/10**
+> (the bug-A2 `retainAndRelease()`/`tooManyReleases()` `ArrayIndexOutOfBoundsException` is **gone**),
+> `LeakAwareDataBufferFactoryTests` **2/2**, `DefaultDataBufferTests` **1/1**. Note: running these
+> classes at all first required the separate `ReferencePipeline.toArray(IntFunction)` recursion fix
+> (commit `8795b88d`) — without it the JUnit launcher `StackOverflowError`'d before any DataBuffer
+> test executed. With both fixes in place bug-A2 no longer reproduces, so this doc (bug-A + A2) is
+> moved to the fixed-suite archive. (`DataBufferUtilsTests` still TIMEOUTs — a separate
+> heavy-reactive issue, not off-heap addressing.)
 
 > **FIX (landed):** the 8 single-element `Unsafe.{get,put}{Byte,Short,Int,Long}` at-address
 > natives in `native-builtins/src/unsafe_natives.rs` now fall through to a raw real-memory

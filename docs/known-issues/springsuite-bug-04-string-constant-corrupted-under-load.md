@@ -6,9 +6,15 @@
 | **Affected** | any String constant live across heavy batched execution (observed: KRun's `"OK"`/`"FAIL"` literals) |
 | **CratonVM** | a `String` literal reads back as a `java.lang.Object` instance (`toString()` = `java.lang.Object@<hash>`) |
 | **HotSpot JDK 25** | n/a (string identity stable) |
-| **CratonVM HEAD** | `8e8e47d9` (suite run) |
-| **Status** | 🟡 PARTIAL (audit 2026-06-19) — Family-A manifestation of [[spring-bug-10-junit-platform-execution-loaderr]]; the cure (precise shadow-stack roots) exists **only behind `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1`** (default-OFF). Under **default** flags this still reproduces (a `String` literal reads back as `Object`); NOT a crash here |
-| **Suggested owner** | handoff / GC-focused (architectural, deferred) |
+| **CratonVM HEAD** | `8e8e47d9` (original suite run) |
+| **Status** | 🟡 **OPEN / needs batch re-verify** (2026-06-20). **Not observed** on dev `697134f8` in the 2026-06-20 per-class + small-batch runs (status fields are clean `OK`/`FAIL`, no `java.lang.Object@…`). Family-A precise-maps are default-on now, and the `ReferencePipeline.toArray(IntFunction)` self-recursion that destabilised the JUnit launcher under load is fixed (`8795b88d`). A large single-JVM batch is still needed to confirm it no longer reproduces before this can be archived. |
+| **Suggested owner** | GC-focused; confirm via a big batch, then archive |
+
+> **2026-06-20 note.** The original repro relied on the old `KRun` harness corrupting its own
+> `"OK"`/`"FAIL"` literals across a heavy batch JVM on binary `8e8e47d9`. On dev `697134f8`
+> (build `cratonvm-spring0620`) the recreated `KRun` reports clean `status=` fields across all
+> 2026-06-20 runs to date. Because the corruption is load-dependent it must be re-checked with a
+> large single-JVM batch (the per-class runs below do **not** build the required GC pressure).
 
 ## Symptom
 In the batched suite run, ~6 classes recorded a `status` field of `java.lang.Object@<hash>` instead of
