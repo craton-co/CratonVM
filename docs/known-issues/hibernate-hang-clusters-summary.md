@@ -5,7 +5,14 @@
 > **H1** JAXB class-load storm is fixed on `dev` (`1db07c35`/`25c42e13`); **H2** ByteBuddy `MethodGraph`
 > JoinedSubclass bootstrap completes in ~16s `--nojit` (no stall); **H3** JTA/socket = an `accept()`
 > deadlock, fixed on branch `fix/hib-jta-xa-loopback`. See the per-cluster docs (now in `docs/internal/`).
-> H4 (JSON unnest) was not re-checked. The real Hibernate JUnit launcher works on CratonVM —
+> **H4 re-checked & root-caused 2026-06-20 — STILL OPEN, but NOT a JSON-function bug and NOT a loop.** It is
+> the **HQL/ANTLR parser's cold full-context prediction running interpreted** (~1000× HotSpot): a multi-item
+> select HQL takes 12.7s/52s/>600s to *parse* (1/2/3 items), terminating; warm re-parse of the same shape is
+> 649ms (DFA cache works); `--nojit` ≈ JIT-on and `-Xmx8g` doesn't help (the deeply-recursive ANTLR ATN-sim
+> hot loop is never JIT-compiled — no OSR). Full root-cause + minimal repro:
+> [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). 🔴 OPEN
+> (deferred JIT-throughput cluster; mitigation = run the suite in one shared JVM to amortize warmup).
+> The real Hibernate JUnit launcher works on CratonVM —
 > `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
 > non-reproducing transient — see
 > [`../internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)).
@@ -53,9 +60,19 @@ Same family as the JTA crash cluster. See (now in `docs/internal/`)
 **Classes:** `connections.ThreadLocalCurrentSessionTest` (and the `connections`/`transaction` crash classes
 that hang rather than crash depending on which JTA platform/socket path is hit).
 
-## Cluster H4 — JSON function (post-fix slow / unnest) — likely tied to JSON work
-`function.json.JsonArrayUnnestTest` — JSON-function family (the 4 JSON SIGSEGV classes are fixed this run;
-this one timed out rather than crashing). Re-check after the `al_state` fix.
+## Cluster H4 — HQL/ANTLR parser cold-prediction throughput (🔴 OPEN — fully root-caused, NOT JSON)
+`function.json.JsonArrayUnnestTest` — re-checked & **root-caused 2026-06-20** on current `dev`. Not a JSON
+defect, not bootstrap, **not a loop, not a broken cache, not GC-bound**. It's the **HQL/ANTLR parser's cold
+full-context prediction running interpreted** (~1000× HotSpot): `em.createQuery` for a multi-item-select HQL
+takes 12.7s (1 item) / 52–58s (2 items) / >600s (3 items) to *parse*, terminating (the 2-item case completes
+at 52s). Re-parsing the same *shape* with a different entity drops to 649ms (ANTLR's DFA cache works); a
+fork-per-class suite re-pays the cold cost per class → >600s "hang". `--nojit` ≈ JIT-on and `-Xmx8g` doesn't
+help — the JIT never compiles the deeply-recursive ANTLR ATN-simulation hot loop (no OSR for on-stack
+recursive methods). **Full characterization + minimal repro:**
+[hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). Deferred
+JIT-throughput cluster (cf.
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
+**Mitigation:** run the suite in a single shared JVM (amortizes the per-shape DFA warmup).
 
 ## Environmental (NOT a CV-only bug)
 `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — **HotSpot also HANGs** on this class
@@ -69,5 +86,5 @@ this one timed out rather than crashing). Re-check after the `al_state` fix.
 | H1 JAXB class-load storm | class-loading rescan storm (NOT `retainAll`) | ✅ **fixed on dev** (`1db07c35`/`25c42e13`) |
 | H2 ByteBuddy `MethodGraph` | bootstrap proxy gen | ✅ **does-not-reproduce** — JoinedSubclass boots ~16s `--nojit` |
 | H3 JTA / socket | `accept()` deadlock (NOT loopback-pairing) | ✅ **fixed** on branch `fix/hib-jta-xa-loopback` (`e0426050`) |
-| H4 JSON unnest | likely interpreter-slow | ⚪ not re-checked |
+| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [own doc](hql-antlr-parser-cold-prediction-throughput.md) |
 | DefaultCatalogAndSchema | environmental (HS hangs too) | — excluded |
