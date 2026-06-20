@@ -1099,6 +1099,87 @@ binary `cratonvm-irnew.exe`):
 hierarchies than direct-`Object` POJOs); `Op::Call` for real `invoke*`
 (Gap B — the remaining big lever).
 
+## Increment 21 (Gap B — `Op::Call` for int `invokestatic`, gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_CALL`**. The
+remaining big lever — the IR builder emits a real method call. This first slice
+covers **`invokestatic` with int-only args + an int/void return, in an oop-free
+method**, dispatched through the existing `jit_invoke_dispatch` helper (the same
+ABI single-pass uses). It lands inert (gated off) + validated; flipping it on is
+a soak follow-up (like inc 19→20 for scalar-new).
+
+**The GC-safety insight that scopes the slice.** The IR path was GC-safe only
+because it had **no calls and no real allocations → no safepoints → GC never
+runs mid-method**, so the lowerer needs no oop maps (it has none). A call is a
+safepoint (GC can run in the callee), so any object reference live across it
+would need a GC root map. Rather than build oop maps, this slice restricts to a
+**provably oop-free method**: no getfield/putfield (a ref receiver), no
+getstatic/putstatic, no `new`, no array allocation, all parameters primitive,
+and every invoke an int-only `invokestatic`. Then *no* object reference exists in
+the frame at all, so a GC at the call has no roots here to find — sound without
+an oop map. (Virtual/special/interface dispatch — inline caches — and
+oop-across-call GC maps are the follow-ups.)
+
+**What landed**
+- **`jit/src/ir.rs`** — `Op::Call { info_ptr }` carries the leaked
+  `JitInvokeInfo` address. The builder lowers `invokestatic` (0xb8) to `Op::Call`
+  (inputs `[ctrl, mem, args…]`), pops the args, pushes the result for a non-void
+  call, and threads the memory token (a call is a hard barrier — it consumes the
+  prior token and becomes the new one, like `Op::Load`/`Store`). `0xb8` added to
+  both length walkers. `set_invoke_info(pc → (info_ptr, num_args, returns_value))`
+  is the wiring hook; an `invokestatic` pc not present bails to single-pass.
+- **`jit/src/ir_lower.rs`** — the lowerer gained `JitRuntimeHelpers` access and an
+  `Op::Call` arm that marshals the Java args into a frame staging region, sets the
+  four helper register args `(vm_ptr, info_ptr, args_ptr, num_args)`, `CALL`s
+  `invoke_dispatch`, and emits the `i64::MIN` exception sentinel check (`JE` →
+  a shared bail stub that returns the sentinel so the VM takes the pending
+  exception — the single-pass protocol). A method with an `Op::Call` is
+  `needs_context`: the prologue takes the VM pointer in ABI[0] and shifts the
+  Java params; `cm.needs_context` + `cm.has_dispatch` are set (the latter makes
+  the VM wrap the call in `set_jit_thread` + `catch_unwind` and drain the pending
+  exception). Bails (single-pass) if `1 + num_params` exceeds the ABI registers.
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_calls`. When on,
+  the IR branch checks the oop-free gate (`descriptor_has_ref_params` +
+  `static_call_int_shape` + empty field/static/new/array scans), builds the leaked
+  `JitInvokeInfo` boxes for the invokestatic sites, calls `set_invoke_info`, and
+  attaches the boxes/strings to the returned `CompiledMethod` (so the baked
+  `info_ptr`s outlive the code) + sets `has_dispatch`. `CRATONVM_DBG_IR_CALL`
+  reports the emitted-call count per method.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_calls` from `CRATONVM_JIT_IR_CALL` (default-OFF). No other VM change
+  needed: the cache already populates `needs_heap` from `compiled.needs_heap()`,
+  so an `Op::Call` method is correctly invoked via `try_call_with_context`.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — a real stub `invoke_dispatch` (the handoff's
+  "direct static call" option) lets the IR-emitted call actually RUN:
+  `invokestatic_two_int_args` (order/count/value-sensitive marshalling +
+  `needs_context`), `invokestatic_three_args_and_arith` (3 args, result feeds
+  arithmetic), `invokestatic_exception_sentinel` (`i64::MIN` → bail).
+- `jit/src/lib.rs::ir_call_wiring_routes_through_ir_only_with_flag` — proves the
+  IR path FIRES (`IR_LOWER_COMPILES==1`) only with `ir_emit_calls`, and bails
+  (==0) without it. This guards against a **vacuous** validation: single-pass
+  ALSO dispatches `invokestatic` correctly, so result-equality alone (the harness)
+  would not prove the IR path ran — the inc-20 "vacuous soak" lesson applied.
+
+**Validation**: jit lib 804/804, differential harness 24/24, `cratonvm-vm` builds
+clean. Live probe `scratch/ircall/IrCall.java` (a hot oop-free method with three
+int `invokestatic` calls in a loop) == HotSpot (`23762906400000`) with the gate
+OFF **and** ON, and `CRATONVM_DBG_IR_CALL` confirms it emits 3 `Op::Call`s (the
+path fires). bt10/14/18 == HotSpot gate-OFF and gate-ON; 4 bench programs
+(`FieldCheck`/`IntegrationTest`/`GenPair`/`Benchmark`) == HotSpot gate-ON.
+
+**To soak / flip on** (the remaining production-validation step, like inc 19→20):
+1. Run `CRATONVM_JIT_IR_CALL=1` on the app gauntlet (kafka/spring/tomcat/
+   hibernate) + bt10/14/16/18, watching for any dispatch/exception/GC divergence.
+2. Flip the default (or remove the gate) once clean.
+
+**Next refinements** (after the flag flips clean):
+- `invokespecial` of a statically-resolved target (a second oop-free direct call).
+- Long/float/double args + return (category-2 / XMM marshalling).
+- Oop-across-call support via real GC oop maps (lifts the oop-free restriction).
+- Virtual/special/interface dispatch via inline caches (the bug-24-sensitive area).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.

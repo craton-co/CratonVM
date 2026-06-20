@@ -213,8 +213,17 @@ pub enum Op {
 
     // ── Method calls ─────────────────────────────────────────────────
     /// Method call.  Inputs: `[ctrl, mem, args…]`.
-    /// Produces (ctrl, mem, retval) via Proj nodes.
-    Call,
+    ///
+    /// The node is BOTH the new memory token (a call is a hard memory barrier
+    /// — it consumes the prior token and produces a new one) AND, for a
+    /// non-void call, the return value (in `node_slot`, like `Op::Load`).
+    /// `info_ptr` is the address of a leaked `JitInvokeInfo` (kept alive by the
+    /// `CompiledMethod`'s `_jit_invoke_infos`) baked into the dispatch call as
+    /// the helper's `info_ptr` argument. Only emitted for `invokestatic`
+    /// (Gap B slice) in an oop-free method — see `ir_lower`'s `Op::Call` arm.
+    Call {
+        info_ptr: usize,
+    },
 
     // ── Speculation guard (real-frame-deopt) ─────────────────────────
     /// Speculative guard. Inputs: `[ctrl, cond]`. If `cond` is zero at
@@ -476,6 +485,14 @@ pub struct IrBuilder {
     /// the visible `putfield`s). Set by [`Self::set_trivial_init_pcs`]. An
     /// `invokespecial` whose pc is NOT here makes `build` bail.
     trivial_init_pcs: HashSet<usize>,
+    /// Gap B: resolved `invokestatic` call sites the builder lowers into an
+    /// `Op::Call`. `pc → (info_ptr, num_args, returns_value)` where `info_ptr`
+    /// is the address of a leaked `JitInvokeInfo` (the dispatch helper's 2nd
+    /// argument), `num_args` the JVM arg-slot count, and `returns_value` whether
+    /// the call yields a result to push. Set by [`Self::set_invoke_info`]; only
+    /// populated for oop-free methods (so no object reference is live across the
+    /// call → GC-safe without an oop map). An `invokestatic` pc NOT here bails.
+    invoke_info: HashMap<usize, (usize, usize, bool)>,
 }
 
 impl IrBuilder {
@@ -516,6 +533,7 @@ impl IrBuilder {
             field_info: HashMap::new(),
             new_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
+            invoke_info: HashMap::new(),
         }
     }
 
@@ -538,6 +556,15 @@ impl IrBuilder {
     ) {
         self.new_info = new_info;
         self.trivial_init_pcs = trivial_init_pcs;
+    }
+
+    /// Gap B: supply the resolved `invokestatic` call sites (`pc → (info_ptr,
+    /// num_args, returns_value)`) the builder lowers into `Op::Call`. Must be
+    /// called before [`Self::build`]; an `invokestatic` pc not present bails the
+    /// build to single-pass. The caller (`lib.rs`) only populates this for
+    /// oop-free methods so a call never has a live object reference across it.
+    pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, bool)>) {
+        self.invoke_info = info;
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -1263,6 +1290,43 @@ impl IrBuilder {
                     self.pop();
                     pc += 3;
                 }
+                // invokestatic — lower a resolved static call to `Op::Call`
+                // (Gap B). Only emitted for an oop-free method (the caller
+                // populates `invoke_info` only then), so no object reference is
+                // ever live across the call → GC-safe without an oop map. A pc
+                // not in `invoke_info` bails to single-pass.
+                0xb8 => {
+                    let (info_ptr, num_args, returns_value) = match self.invoke_info.get(&pc) {
+                        Some(&t) => t,
+                        None => return None,
+                    };
+                    // Pop args (deepest-first on the abstract stack) and restore
+                    // source order so inputs are [ctrl, mem, arg0, arg1, …].
+                    let mut args = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        args.push(self.pop());
+                    }
+                    args.reverse();
+                    let mut inputs = Vec::with_capacity(2 + num_args);
+                    inputs.push(self.ctrl);
+                    inputs.push(self.mem);
+                    inputs.extend(args);
+                    // A call is a hard memory barrier: it consumes the current
+                    // memory token and BECOMES the new one (serialising every
+                    // prior memory op before it and every later one after). The
+                    // same node also carries the return value (like `Op::Load`).
+                    let ty = if returns_value {
+                        IrType::Int
+                    } else {
+                        IrType::Void
+                    };
+                    let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                    self.mem = call;
+                    if returns_value {
+                        self.push(call);
+                    }
+                    pc += 3;
+                }
                 // dup
                 0x59 => {
                     let top = self.peek();
@@ -1619,7 +1683,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
                 pc += 2;
             }
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xbb => {
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => {
                 pc += 3;
             }
             _ => {
@@ -1704,7 +1768,7 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             // 2-byte opcodes
             0x10 | 0x15 | 0x19 | 0x36 | 0x3a => pc += 2,
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xbb => pc += 3,
+            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb7 | 0xb8 | 0xbb => pc += 3,
             _ => pc += 1,
         }
     }
@@ -1894,7 +1958,11 @@ mod tests {
             .iter()
             .find(|n| matches!(n.op, Op::Load(_)))
             .unwrap();
-        assert_eq!(load.inputs.len(), 4, "Load inputs = [ctrl, mem, base, offset]");
+        assert_eq!(
+            load.inputs.len(),
+            4,
+            "Load inputs = [ctrl, mem, base, offset]"
+        );
         assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
         assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
     }

@@ -17570,6 +17570,8 @@ fn try_jit_upgrade_with_gate(
                 // Early-compile path is the optimized (C2-equivalent) tier — the
                 // tiered C1 routing only flows through the background worker.
                 true,
+                // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
+                std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17673,6 +17675,8 @@ fn try_jit_upgrade_with_gate(
         },
         // Inline mutator compile path is the optimized (C2-equivalent) tier.
         true,
+        // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
+        std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18239,6 +18243,8 @@ fn try_jit_compile_callee_slow(
         // Inline JIT-dispatch callers pass `true` (optimized C2); the background
         // tiered worker passes the C1/C2 value derived from the task's tier.
         optimize,
+        // Gap B: int-only invokestatic → Op::Call, gated default-OFF.
+        std::env::var_os("CRATONVM_JIT_IR_CALL").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(

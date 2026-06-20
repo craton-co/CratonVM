@@ -3705,7 +3705,7 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         ir::Op::NewArray { element_type } => EaOp::NewArray {
             element_type: *element_type,
         },
-        ir::Op::Call => EaOp::Call,
+        ir::Op::Call { .. } => EaOp::Call,
         ir::Op::ArrayLength => EaOp::ArrayLength,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
@@ -3973,6 +3973,12 @@ pub fn try_compile(
     // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
     // function doc above.
     optimize: bool,
+    // Gap B (activate-ir-optimizer): `true` lets the IR builder lower an
+    // int-only `invokestatic` in an oop-free method to `Op::Call` (dispatched
+    // via `invoke_dispatch`). `false` (the default) keeps every invoke on
+    // single-pass. Gated default-OFF behind `CRATONVM_JIT_IR_CALL` at the VM
+    // call sites until it soaks.
+    ir_emit_calls: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -4010,6 +4016,7 @@ pub fn try_compile(
         cp_invoke_class_id_resolver,
         cp_elidable_init_resolver,
         optimize,
+        ir_emit_calls,
         &mut backend_attempted,
     );
 
@@ -4138,6 +4145,9 @@ fn try_compile_inner(
     // skipped entirely and compilation falls through to the single-pass
     // `x64::compile` backend (the fast C1 tier). See `try_compile`.
     optimize: bool,
+    // Gap B: enable lowering of int-only `invokestatic` in oop-free methods to
+    // `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_calls: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4317,8 +4327,7 @@ fn try_compile_inner(
             (cp_elidable_init_resolver, cp_new_resolver)
         {
             if !scan.new_ops.is_empty() {
-                let mut new_info_map =
-                    std::collections::HashMap::with_capacity(scan.new_ops.len());
+                let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
                 for &(pc, cp_idx) in &scan.new_ops {
                     if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
                         new_info_map.insert(pc, (class_id, num_fields));
@@ -4331,6 +4340,93 @@ fn try_compile_inner(
                     }
                 }
                 builder.set_new_info(new_info_map, trivial_init_pcs);
+            }
+        }
+        // Gap B: invokestatic → `Op::Call`. Only when the IR-call gate is on AND
+        // the method is provably OOP-FREE — no getfield/putfield (a ref
+        // receiver), no getstatic/putstatic, no `new`, no array allocation, all
+        // parameters primitive, and every invoke an `invokestatic` with int-only
+        // args + an int/void return. Then NO object reference is ever live in the
+        // frame, so a GC at the call (a safepoint) has no roots to find here —
+        // GC-safe without an oop map (which the IR lowerer does not emit). The
+        // leaked `JitInvokeInfo` boxes/strings are attached to the returned
+        // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
+        let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
+        let mut ir_call_strings: Vec<Box<str>> = Vec::new();
+        if ir_emit_calls && !scan.invoke_ops.is_empty() {
+            if let Some(resolver) = cp_invoke_resolver {
+                let oop_free = scan.field_ops.is_empty()
+                    && scan.static_field_ops.is_empty()
+                    && scan.new_ops.is_empty()
+                    && scan.anewarray_ops.is_empty()
+                    && !descriptor_has_ref_params(&cached.method_descriptor);
+                if oop_free {
+                    let mut info_map = std::collections::HashMap::new();
+                    let mut all_emittable = true;
+                    for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                        // Only invokestatic (0xb8); any other invoke kind keeps
+                        // the whole method on single-pass (the builder bails on
+                        // an invoke with no `invoke_info` entry).
+                        if opcode != 0xb8 {
+                            all_emittable = false;
+                            break;
+                        }
+                        let (cn, mn, desc) = match resolver(cp_idx) {
+                            Some(t) => t,
+                            None => {
+                                all_emittable = false;
+                                break;
+                            }
+                        };
+                        let num_args = match static_call_int_shape(&desc) {
+                            Some(n) => n,
+                            None => {
+                                all_emittable = false;
+                                break;
+                            }
+                        };
+                        let ret = return_type(&desc);
+                        let returns_value = ret != b'V';
+                        let class_box: Box<str> = cn.into_boxed_str();
+                        let method_box: Box<str> = mn.into_boxed_str();
+                        let desc_box: Box<str> = desc.into_boxed_str();
+                        let class_ref = &*class_box as *const str;
+                        let method_ref = &*method_box as *const str;
+                        let desc_ref = &*desc_box as *const str;
+                        ir_call_strings.push(class_box);
+                        ir_call_strings.push(method_box);
+                        ir_call_strings.push(desc_box);
+                        let info = Box::new(JitInvokeInfo {
+                            class_name: unsafe { &*class_ref },
+                            method_name: unsafe { &*method_ref },
+                            descriptor: unsafe { &*desc_ref },
+                            num_jit_args: num_args,
+                            return_type: ret,
+                            invoke_kind: 3, // invokestatic
+                        });
+                        let info_ptr = &*info as *const JitInvokeInfo as usize;
+                        ir_call_infos.push(info);
+                        info_map.insert(pc, (info_ptr, num_args, returns_value));
+                    }
+                    if all_emittable && !info_map.is_empty() {
+                        if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                            eprintln!(
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invokestatic Op::Call(s)",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                info_map.len(),
+                            );
+                        }
+                        builder.set_invoke_info(info_map);
+                    } else {
+                        // A non-emittable invoke is present → leave `invoke_info`
+                        // unset (the builder bails on every invoke → single-pass)
+                        // and drop the now-unreferenced boxes/strings.
+                        ir_call_infos.clear();
+                        ir_call_strings.clear();
+                    }
+                }
             }
         }
         let built = builder.build(code, code_len);
@@ -4425,9 +4521,25 @@ fn try_compile_inner(
                     .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
                 if !has_live_new {
                     let schedule = ir_schedule::schedule(&graph);
-                    if let Some(compiled) =
-                        ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
-                    {
+                    if let Some(mut compiled) = ir_lower::lower(
+                        &graph,
+                        &schedule,
+                        num_params,
+                        cached.max_locals as usize,
+                        helpers,
+                    ) {
+                        // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
+                        // so the `info_ptr`s baked into each `Op::Call` stay valid
+                        // for the code's lifetime, and mark the method as using
+                        // dispatch so the VM wraps the call in `set_jit_thread` +
+                        // `catch_unwind` and drains the pending exception (the
+                        // `lower` step already set `needs_context`). When no call
+                        // was emitted both Vecs are empty → no behaviour change.
+                        if !ir_call_infos.is_empty() {
+                            compiled._jit_invoke_infos = ir_call_infos;
+                            compiled._jit_strings = ir_call_strings;
+                            compiled.has_dispatch = true;
+                        }
                         // wire-tiered-manager Step 3 telemetry (test-only):
                         // records that the optimizing IR path — not the
                         // single-pass C1 backend — produced this body, so the
@@ -5248,6 +5360,56 @@ pub fn count_param_slots(descriptor: &str) -> usize {
     slots
 }
 
+/// Gap B: true iff the method descriptor has any reference (`L…`/`[…`)
+/// parameter. An oop-free method (no ref params, no field/static/new/array
+/// ops) holds no object reference at any point, so an `Op::Call` (a GC
+/// safepoint) needs no oop map — the soundness precondition for emitting
+/// `invokestatic` on the IR path (the lowerer emits no oop maps).
+pub fn descriptor_has_ref_params(descriptor: &str) -> bool {
+    let bytes = descriptor.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'L' | b'[' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Gap B: classify a static-call descriptor for the int-only `Op::Call` slice.
+/// Returns `Some(num_args)` iff EVERY parameter is an int-category single-slot
+/// type (`I`/`Z`/`B`/`C`/`S`) AND the return is int-category or `void` — i.e.
+/// no `long`/`float`/`double` (category-2 / XMM register), and no reference
+/// (oop). `None` disqualifies the call, keeping the method on single-pass.
+pub fn static_call_int_shape(descriptor: &str) -> Option<usize> {
+    let bytes = descriptor.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return None;
+    }
+    let mut i = 1;
+    let mut num_args = 0usize;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => {
+                num_args += 1;
+                i += 1;
+            }
+            // long / float / double (category-2 or XMM) or reference → not the
+            // int-only shape this slice handles.
+            _ => return None,
+        }
+    }
+    let ret = return_type(descriptor);
+    match ret {
+        b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' => Some(num_args),
+        _ => None,
+    }
+}
+
 /// JVM-spec param slot count: longs and doubles take 2 slots each (per
 /// JVMS §2.6.1), unlike `count_param_slots` which counts each parameter
 /// as exactly one slot (matching our compact ABI representation where
@@ -5429,7 +5591,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true,
+            None, None, true, false,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5442,7 +5604,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, false,
+            None, None, false, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5522,6 +5684,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -5537,7 +5700,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, None, true,
+            None, None, true, false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -5955,6 +6118,7 @@ mod tests {
             None,
             Some(&elidable),
             true,
+            false,
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -5982,11 +6146,115 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without the elidable resolver, `new` must NOT take the IR pipeline"
+        );
+    }
+
+    // ── activate-ir-optimizer Gap B: int invokestatic → Op::Call routing ──
+    //
+    // A method whose only invoke is an int-only `invokestatic` in an oop-free
+    // body must route through the IR pipeline ONLY when `ir_emit_calls` is on
+    // (the production gate). This guards against a *vacuous* validation: the
+    // integration harness proves the executed result is correct, but single-pass
+    // ALSO dispatches `invokestatic` correctly, so result-equality alone would
+    // not prove the IR path fired. `IR_LOWER_COMPILES` proves it does (==1 with
+    // the flag) and does not (==0 without — the builder bails on the invoke).
+    #[test]
+    fn ir_call_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(int a, int b) { return g(a, b); }`
+        //   iload_0; iload_1; invokestatic #2; ireturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Caller"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(II)I"),
+            source_file: None,
+            code: Arc::from([0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes the body), so the baked `invoke_dispatch` is not called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let invoke_resolver = |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+            } else {
+                None
+            }
+        };
+
+        // ir_emit_calls = true → invokestatic lowers to Op::Call → IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true, // optimize
+            true, // ir_emit_calls
+        );
+        assert!(
+            with.is_some(),
+            "int invokestatic must compile with ir_emit_calls"
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "int invokestatic must route through the IR pipeline when ir_emit_calls is on"
+        );
+        assert!(
+            with.as_ref().unwrap().needs_context(),
+            "an Op::Call method must be needs_context"
+        );
+
+        // ir_emit_calls = false → builder bails on the invoke → single-pass.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,  // optimize
+            false, // ir_emit_calls OFF
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_calls, invokestatic must NOT take the IR pipeline"
         );
     }
 

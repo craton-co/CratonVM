@@ -1748,18 +1748,20 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // it (control, value, and the `If`'s opposite projection), collapsing the
     // conditional into a single-successor branch that always takes the surviving
     // return. Every Return is an observable program exit and must be a root.
-    // Seed from every `Op::Return` AND every `Op::Store`. A store is an
-    // observable side effect whose result (a memory token) may be consumed by
-    // no one — a pure-write `o.x = v; return v;` returns the value, not the
-    // store, so the store node is unreachable from any Return. Rooting it (and,
-    // transitively, the memory chain it depends on) keeps the write from being
-    // deleted. Strictly additive: a store already removed by DSE is `Op::Dead`
-    // and not matched, and a live store always has an observable effect.
+    // Seed from every `Op::Return`, every `Op::Store`, AND every `Op::Call`. A
+    // store or call is an observable side effect whose result (a memory token /
+    // return value) may be consumed by no one — a pure-write `o.x = v; return
+    // v;` returns the value, not the store; a void static call
+    // (`Foo.sideEffect(); return;`) has no value consumer at all — so the node
+    // is unreachable from any Return. Rooting it (and, transitively, the memory
+    // chain it depends on, including its argument values) keeps the effect from
+    // being deleted. Strictly additive: a store removed by DSE is `Op::Dead` and
+    // not matched, and a live store/call always has an observable effect.
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| matches!(n.op, Op::Return | Op::Store(_)))
+        .filter(|(_, n)| matches!(n.op, Op::Return | Op::Store(_) | Op::Call { .. }))
         .map(|(id, _)| id as NodeId)
         .collect();
     if worklist.is_empty() {
@@ -2199,7 +2201,7 @@ fn unroll(graph: &mut Graph) -> bool {
             if matches!(
                 op,
                 Op::Store(_)
-                    | Op::Call
+                    | Op::Call { .. }
                     | Op::New { .. }
                     | Op::NewArray { .. }
                     | Op::ArrayLength
