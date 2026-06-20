@@ -355,6 +355,14 @@ pub fn update_all_roots(
     //      after a moving GC so cached annotation instances stay live.
     cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(pointer_map);
 
+    // 19d. Synthetic `com.sun.net.httpserver` server registry handler refs
+    //      (`native-builtins/src/net_phase_e.rs`). Scanned as roots in `roots.rs`;
+    //      re-point the stored `HttpHandler` ObjectRefs to their relocated
+    //      addresses after a moving GC so the per-request dispatcher invokes the
+    //      live handler instead of a vacated from-space slot (else
+    //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
+    cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(pointer_map);
+
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
     //     Thread.join / LockSupport.park / ReferenceQueue.remove) are

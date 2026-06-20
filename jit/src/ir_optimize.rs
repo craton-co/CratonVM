@@ -1740,7 +1740,24 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     }
 
     let mut reachable: FxHashSet<NodeId> = FxHashSet::default();
-    let mut worklist = vec![graph.exit];
+    // Seed the worklist with EVERY `Op::Return`, not just `graph.exit`. A method
+    // with multiple `return` statements (e.g. `if (c) return A; return B;`)
+    // builds several `Op::Return` terminators, but `graph.exit` records only the
+    // last one — each `ireturn` overwrites it in the builder. Rooting DCE solely
+    // from `graph.exit` would mark every OTHER return path unreachable and delete
+    // it (control, value, and the `If`'s opposite projection), collapsing the
+    // conditional into a single-successor branch that always takes the surviving
+    // return. Every Return is an observable program exit and must be a root.
+    let mut worklist: Vec<NodeId> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| matches!(n.op, Op::Return))
+        .map(|(id, _)| id as NodeId)
+        .collect();
+    if worklist.is_empty() {
+        worklist.push(graph.exit);
+    }
 
     // real-frame-deopt (#5): safepoint snapshots are NOT seeded as DCE roots.
     // The builder records a snapshot at *every* bytecode boundary, so pinning
@@ -2770,6 +2787,48 @@ mod tests {
         let start = g.add(Op::Start, IrType::Void, vec![], None);
         g.entry = start;
         g
+    }
+
+    #[test]
+    fn test_dce_keeps_all_return_paths() {
+        // `if (a < 0) return -1; return 1;` — two `Op::Return` terminators. The
+        // builder records only the LAST in `graph.exit`, but DCE must keep BOTH
+        // return paths (regression for the conditional-early-return miscompile:
+        // rooting only from `graph.exit` deleted the `return -1` branch and
+        // collapsed the `If` into a single-successor that always returned 1).
+        let mut g = probe_graph();
+        let a = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cmp = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![a, zero], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![g.entry, cmp], None);
+        let t = g.add(Op::Proj(0), IrType::Control, vec![if_node], None);
+        let f = g.add(Op::Proj(1), IrType::Control, vec![if_node], None);
+        let neg1 = g.add(Op::Const(-1), IrType::Int, vec![], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let ret_t = g.add(Op::Return, IrType::Void, vec![t, neg1], None);
+        let ret_f = g.add(Op::Return, IrType::Void, vec![f, one], None);
+        // The builder overwrites `exit` with each return → only the last one.
+        g.exit = ret_f;
+
+        eliminate_dead_nodes(&mut g);
+
+        assert_ne!(
+            g.nodes[ret_t as usize].op,
+            Op::Dead,
+            "the first (graph.exit-excluded) return must survive DCE"
+        );
+        assert_ne!(g.nodes[ret_f as usize].op, Op::Dead);
+        assert_ne!(
+            g.nodes[t as usize].op,
+            Op::Dead,
+            "the true projection feeding the first return must survive"
+        );
+        assert_ne!(g.nodes[f as usize].op, Op::Dead);
+        assert_ne!(
+            g.nodes[neg1 as usize].op,
+            Op::Dead,
+            "the -1 value of the first return must survive"
+        );
     }
 
     #[test]

@@ -538,13 +538,154 @@ increment-8 points-to resolver already understands `{A, B}` for the alias check.
 regardless of in-loop stores to *other* fields of the same object (a field-
 sensitive refinement of the alias oracle).
 
+## Increment 10 (step 2 — IR-vs-single-pass differential self-check harness) landed
+
+Status: **landed** on `dev`. This is the ordered **step 2** ("differential
+self-check harness, required before any gate relaxation"), built now because the
+per-call `optimize` toggle (Step 3 of wire-tiered-manager) makes it directly
+expressible.
+
+**What landed** (`jit/tests/ir_vs_singlepass.rs`, + `cratonvm-types` added to the
+jit crate's `[dev-dependencies]`): a corpus of pure-integer methods is compiled
+through BOTH backends — `try_compile(.., optimize=true)` (optimizing IR pipeline)
+and `optimize=false` (single-pass `x64`) — then **executed** via `try_call` and
+asserted to return identical results, plus a host-computed correctness anchor.
+The two backends are independent code generators for the same bytecode; any
+divergence is a miscompile, and the gate must not be relaxed onto a method shape
+until they agree on it.
+
+Three corpus shapes pass (IR == single-pass == host): `add` (straight-line
+arithmetic), `poly` (multi-op `a*a - 2*a + 1`), and `sum` (a counted loop with a
+single exit).
+
+**The harness immediately found a real IR miscompile.** A method with a
+*conditional early return* (more than one `ireturn` point) — `int sgn2(int a) {
+if (a<0) return -1; return 1; }` — is mislowered by the IR pipeline: for `a<0` it
+drops the conditional branch and returns the fall-through value (`1`) instead of
+`-1`; the single-pass backend is correct. The `sum` loop (which branches but has
+a single exit) compiles fine, so the fault is specific to multiple return points,
+NOT branching. This is captured as the `#[ignore]`d
+`ir_vs_singlepass_conditional_early_return_known_divergence` test (run with
+`-- --ignored` to reproduce). **It is a hard blocker for step 3**: the IR gate
+must not be relaxed onto conditional-early-return methods until the multi-return
+lowering is fixed. (Note: the φ/branch SIGSEGV fix proved single-return branchy
+*expressions* like `(m & K) != 0`; multi-`return` control flow was not covered.)
+
+**Gotcha recorded**: `CachedBytecodeMethod.code` is the bytecode **padded with
+two trailing `0x00` bytes** — `jit::try_compile` strips them (`code.len() - 2`);
+an unpadded corpus method silently drops its last two opcodes and emits without a
+`ret`. The harness pads accordingly.
+
+## Increment 11 (step 1 residual — IR multi-return / conditional-early-return fix) landed
+
+Status: **landed** on `dev`. Fixes the miscompile increment 10's harness caught,
+clearing the step-3 blocker.
+
+**Root cause** (two parts): the IR builder emits one `Op::Return` terminator per
+`ireturn`, but `graph.exit` records only the *last* one (each `ireturn`
+overwrites it, `jit/src/ir.rs`). `eliminate_dead_nodes` (`jit/src/ir_optimize.rs`)
+then rooted DCE **solely from `graph.exit`**, so every *other* return path — its
+control, its value, and the `If`'s opposite projection — was marked unreachable
+and deleted. The conditional collapsed into a single-successor `If` that always
+took the surviving (last) return, so `if (a<0) return -1; return 1;` returned `1`
+for every input.
+
+**Fix**: `eliminate_dead_nodes` now seeds its worklist from **every** `Op::Return`
+node, not just `graph.exit` (with a `graph.exit` fallback if a graph somehow has
+none). Every return is an observable program exit and must be a DCE root. This is
+strictly corrective — single-return methods are unchanged (their only return *is*
+`graph.exit`), and genuinely-dead nodes (reachable from no return) are still
+removed. The `ireturn` builder comment now documents that `graph.exit` is "an
+exit", not the sole exit.
+
+**Tests**:
+- `jit/src/ir_optimize.rs::test_dce_keeps_all_return_paths` — a two-`Return`
+  graph keeps both return paths through DCE (the first one survives even though
+  `graph.exit` points at the second).
+- `jit/tests/ir_vs_singlepass.rs` — the formerly-`#[ignore]`d divergence test is
+  un-ignored and now passes, joined by `two_branch_three_returns` (`sgn3`) and
+  `abs_early_return` (a computed early return). IR == single-pass == host for all.
+
+**Unblocks step 3**: the IR gate may now be relaxed onto conditional-early-return
+methods (behind a `CRATONVM_JIT_IR_*` soak flag), gated by this harness.
+
+## Increment 12 (step 3 — IR gate relaxation: i2b / i2c / i2s) landed
+
+Status: **landed** on `dev`. First slice of step 3 (relax the IR gate), validated
+by the increment-10 harness.
+
+The IR builder previously **bailed** (`build()` → `None` → fell to single-pass)
+on the int-truncation conversions `i2b` (0x91), `i2c` (0x92), `i2s` (0x93), so
+any byte/char/short-truncating int method never reached the optimizing IR path.
+They now lower (`jit/src/ir.rs`), decomposed to existing ops — no new IR node or
+lowering needed:
+
+- `i2b` → `(x << 24) >> 24` (32-bit `SHL`/`SAR EAX`; the arithmetic shift
+  sign-extends the low byte),
+- `i2s` → `(x << 16) >> 16`,
+- `i2c` → `x & 0xFFFF` (char is unsigned 16-bit).
+
+The two bytecode length walkers (`find_branch_targets`, the loop-header walk)
+list `0x91..=0x93` explicitly (they were already 1-byte via the default arm).
+
+**Tests** (`jit/tests/ir_vs_singlepass.rs`): `i2b`, `i2c`, `i2s`, and
+`i2b_chained` (`(byte)a + 1000`, proving the truncated value feeds a following
+int op correctly). IR == single-pass == host across sign/zero-extension edge
+cases (e.g. `i2b(128) = -128`, `i2c(-1) = 65535`, `i2s(32768) = -32768`). jit lib
+790/790, harness 10/10.
+
+**Why this scope**: the harness executes the compiled code with *dummy* runtime
+helpers, so it can only validate helper-free shapes (pure arithmetic / branches /
+loops / conversions). Relaxing the gate further onto methods with `invoke*` /
+field / array ops needs (a) the IR builder to *emit* those ops (it bails today —
+which is also why the DSE/escape/LICM passes are still latent) and (b) the
+harness to supply real helpers or move to VM-level differential validation. Those
+are the next step-3 slices.
+
+## Increment 13 (step 3 — IR gate relaxation: tableswitch / lookupswitch) landed
+
+Status: **landed** on `dev`. Second slice of step 3, harness-validated.
+
+The IR builder bailed on `tableswitch` (0xaa) / `lookupswitch` (0xab) — so int
+`switch` methods (state machines, dispatch) never reached the optimizing IR path.
+They now lower as a **CMP-equality chain** (the same shape the single-pass
+backend emits): each case becomes `if (key == match) goto target`, the unmatched
+edge falls through to the next comparison, and the final unmatched edge goes to
+the default. This reuses the existing `If`/`Cmp`/merge machinery — no dedicated
+multi-way node or new lowering.
+
+Implementation (`jit/src/ir.rs`):
+- A shared `parse_switch` helper parses either table (4-byte padding, signed
+  offsets relative to the opcode pc) and returns `(len, default_target, cases)`,
+  reusing the single-pass `checked_tableswitch_count` / `checked_lookupswitch_
+  npairs` caps and validating every target is in range (else `None` → bail).
+- The build loop's `0xaa | 0xab` arm pops the key and emits the comparison chain.
+- Both bytecode length walkers (`find_branch_targets`, `find_loop_headers`) use
+  `parse_switch` to register every case + default target (a backward target is a
+  loop header) and to advance the pc by the variable instruction length — without
+  this they would mis-parse the switch table as opcodes.
+
+**Tests** (`jit/tests/ir_vs_singlepass.rs`): `tableswitch` (dense 0..2 + default)
+and `lookupswitch` (sparse keys 10/20 + default), each checked on hits and
+out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
-2. **Differential self-check harness**: IR-lowered vs single-pass result
-   equality on a method corpus; required before any gate relaxation.
+   ✅ Done: the SIGSEGV fix covered single-return branchy *expressions*, and
+   increment 11 fixed the **conditional-early-return (multiple `ireturn` points)**
+   miscompile increment 10's harness caught (DCE now roots from all returns).
+2. **Differential self-check harness** — ✅ **Done (increment 10)**:
+   `jit/tests/ir_vs_singlepass.rs` compiles a corpus through both backends via
+   the `optimize` toggle, executes both, and asserts equal results. Already
+   caught (and now regression-guards) the multi-return miscompile.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
-   soak flag (Front 1.2).
+   soak flag (Front 1.2). **In progress**: branch-free / branchy / early-return /
+   loop int methods all take the IR path and pass the harness; increment 12 added
+   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`.
+   **Remaining**: methods with `invoke*` / field / array ops — the builder bails
+   on those today, so this needs builder emission of those ops + a real-helper
+   (or VM-level) differential harness. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the
