@@ -1,93 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! S-SB: Spring ApplicationStartup bootstrap.
+//! S-SB: Spring partial-bootstrap app-compatibility natives.
 //!
-//! ⚠ INTENTIONAL APP-COMPATIBILITY SHIM — NOT a faithful implementation. ⚠
+//! The Spring startup-metrics no-op shim that this module was originally named
+//! for (a process-global no-op `ApplicationStartup` / `StartupStep` pair) has
+//! been REMOVED (real-cdi-bean-container Step 3). Spring's real
+//! `org.springframework.core.metrics` bytecode now runs unconditionally:
+//!   - `ApplicationStartup.DEFAULT` is a non-constant `static final` on an
+//!     *interface*; the interpreter lazily runs the interface `<clinit>` on the
+//!     first `getstatic` (JVMS §5.5 / §5.4.3.2) — pinned by
+//!     `vm/tests/iface_static_final_init.rs`.
+//!   - The nested `ApplicationStartup.<clinit>` → `new DefaultApplicationStartup`
+//!     → `DefaultApplicationStartup.<clinit>` → `new DefaultStartupStep` →
+//!     `new DefaultTags` chain runs to completion on its own — pinned by
+//!     `vm/tests/nested_clinit_startup.rs`. (The chain used to be bypassed only
+//!     because the no-op `getApplicationStartup` native shadowed the real
+//!     `getstatic DEFAULT` getter and the `<clinit>` was swallowed + backfilled;
+//!     both the shadow and the backfill are gone.)
+//!   Validated 10/10 == HotSpot on the Spring Boot functional battery
+//!   (`apps/spring-boot/cratonvm-suite`). The former
+//!   `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out and the `real_spring_startup()`
+//!   gate no longer exist.
 //!
-//! This module installs a process-global *no-op* `ApplicationStartup` /
-//! `StartupStep` pair so that Spring Boot can boot on CratonVM's partial
-//! bootstrap.  It does NOT implement the real Spring startup-metrics subsystem
-//! (`org.springframework.core.metrics`): every `start()` / `tag()` / `end()`
-//! call is silently discarded.  That is deliberate, and safe, because the
-//! startup-metrics API is purely observability — Spring Boot's lifecycle does
-//! not depend on the recorded steps for correctness.  Apps that *read back*
-//! recorded startup steps (a `BufferingApplicationStartup` + actuator
-//! `startup` endpoint, or a custom `ApplicationStartup` exporter) will see an
-//! empty / inert timeline; that is the documented limitation of this shim.
-//!
-//! Why the shim exists (the underlying VM bugs it works around):
-//!   Spring Boot's `AbstractApplicationContext` has an instance field:
-//!     `private ApplicationStartup applicationStartup = ApplicationStartup.DEFAULT;`
-//!   `ApplicationStartup.DEFAULT` is a `static final` field on an interface; its
-//!   value is set in `ApplicationStartup.<clinit>` as
-//!   `new DefaultApplicationStartup()`.
-//!
-//!   There were historically TWO distinct gaps stacked here:
-//!     (1) GENERAL — a non-constant `static final` field on an *interface* must
-//!         be initialised by running that interface's `<clinit>` lazily on the
-//!         first `getstatic` that reads it (JVMS §5.5 / §5.4.3.2). This general
-//!         interface-static-final init path is verified working in the
-//!         interpreter (the `getstatic` opcode calls
-//!         `ensure_class_initialized_shared(field.declaring_class_id)` and
-//!         `initialize_class_shared` runs `<clinit>` regardless of interface
-//!         status), pinned by the framework-independent regression test
-//!         `vm/tests/iface_static_final_init.rs` (real-cdi-bean-container
-//!         increment 1). The pure-observability warning that announced this
-//!         gap's workaround has been RETIRED accordingly.
-//!     (2) NESTED CONCRETE CLASS — `DefaultApplicationStartup.<clinit>` (which
-//!         itself creates a `DefaultStartupStep` singleton) still NPEs in
-//!         CratonVM's partial bootstrap; the error is swallowed and the
-//!         `DEFAULT` field is then backfilled by `post_clinit_fixup`. THIS gap
-//!         is what the remaining functional natives below (and the
-//!         `post_clinit_fixup` carrier write) continue to cover. Without them,
-//!         every `AbstractApplicationContext` would have `applicationStartup =
-//!         null` and the very first `getApplicationStartup().start(name)` would
-//!         crash with "Cannot invoke start on null", aborting Spring Boot
-//!         before its context can refresh. A loud failure here would abort
-//!         every Spring Boot application, so we deliberately keep the no-op
-//!         behavior (see the no-stubs policy carve-out for app-enabling shims).
-//!
-//! THE REMAINING REAL FIX (so this shim can eventually be deleted):
-//!   Make `DefaultApplicationStartup.<clinit>` succeed under CratonVM's
-//!   bootstrap so the real `ApplicationStartup` subsystem runs.  That requires
-//!   getting the static initializer's `DefaultStartupStep` singleton creation
-//!   to complete without NPE — i.e. fixing whichever underlying VM/bootstrap
-//!   gap currently makes that nested `<clinit>` throw.  Once that works, the
-//!   `getApplicationStartup`/`start`/`tag`/`end` natives below (and the
-//!   `post_clinit_fixup` carrier write) become unnecessary and should be
-//!   removed.
-//!
-//! REAL PATH IS NOW THE DEFAULT (real-cdi-bean-container increment 3, Step 2 →
-//! default flip): the real chain runs by DEFAULT. The startup-metrics no-op
-//! natives below (`getApplicationStartup`/`start`/`tag`/`end`/`getName`/`getId`/
-//!   `getParentId`/`getTags`) are NOT registered (see `register`), the matching
-//!   `check_override` force arms in `vm/src/vm/vm_exec.rs` are suppressed, and
-//!   `vm/src/vm/vm_util.rs` drops `ApplicationStartup` from the lenient
-//!   `<clinit>`-swallow allowlist + skips its `post_clinit_fixup` arm — so the
-//!   real `ApplicationStartup.<clinit>` → `new DefaultApplicationStartup` →
-//!   `DefaultApplicationStartup.<clinit>` → `new DefaultStartupStep` →
-//!   `new DefaultTags` chain runs to completion. Validated 10/10 == HotSpot on
-//!   the Spring Boot functional battery (`apps/spring-boot/cratonvm-suite`).
-//!   The disassembly shows that chain is trivial bytecode; the only reason it
-//!   used to fail was that the no-op `getApplicationStartup` native shadowed the
-//!   real `getstatic DEFAULT` getter (so the chain was never triggered) and the
-//!   nested-JAR `<clinit>` was swallowed + backfilled. Opt OUT to the legacy
-//!   shim with `CRATONVM_SYNTHETIC_SPRING_STARTUP=1` (kept as a fat-jar/nested-
-//!   JAR fallback). The environment / bean-factory / property-source natives in
-//!   this module cover SEPARATE partial-bootstrap gaps and remain registered
-//!   regardless.
-//!
-//! Fix strategy (the shim's moving parts):
-//! 1. Native override for `getApplicationStartup()` in `AbstractApplicationContext`
-//!    that returns a process-global no-op `ApplicationStartup` singleton if the
-//!    field is null (or always, since the bytecode is just a field read anyway).
-//! 2. Native overrides for `DefaultApplicationStartup.start(String)` →
-//!    returns a global no-op `StartupStep`.
-//! 3. Native overrides for `StartupStep.tag(String,String)`,
-//!    `tag(String,Supplier)`, `end()` etc. → all no-ops.
-//! 4. `post_clinit_fixup` (in vm_util.rs) sets `ApplicationStartup.DEFAULT`
-//!    to the same singleton so GETSTATIC paths also get a non-null value.
+//! What remains here are natives for SEPARATE Spring partial-bootstrap gaps that
+//! are NOT startup-metrics:
+//!   - `AbstractApplicationContext.getEnvironment()` / `createEnvironment()` and
+//!     the `MutablePropertySources` re-implementations (per-context environment);
+//!   - `GenericApplicationContext.getBeanFactory()` lazy `DefaultListableBeanFactory`
+//!     + `BeanPostProcessorCacheAwareList` repair;
+//!   - `StandardConfigDataLocationResolver` / Spring Cloud decrypt null-safe shims
+//!     and a handful of other bean-class / config-data accessors.
+//! These cover real gaps elsewhere in the bootstrap and are documented inline.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
@@ -95,141 +39,16 @@ use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
-/// Whether the real Spring `org.springframework.core.metrics` startup-metrics
-/// bytecode runs (now the DEFAULT) instead of the no-op `ApplicationStartup` /
-/// `StartupStep` natives below.
-///
-/// real-cdi-bean-container increment 3 (Step 2 → default flip). When this is
-/// `true` (the default) the startup-metrics no-op natives below are NOT
-/// registered, so Spring's real `DefaultApplicationStartup` / `DefaultStartupStep`
-/// bytecode runs (its `<clinit>` chain is allowed to complete — see the matching
-/// guards in `vm/src/vm/vm_util.rs` and `vm/src/vm/vm_exec.rs`). Opt out to the
-/// legacy shim with `CRATONVM_SYNTHETIC_SPRING_STARTUP=1`; the historical
-/// `CRATONVM_REAL_SPRING_STARTUP` opt-in is still accepted (now redundant) and
-/// wins if both are set. Must stay in lockstep with the canonical accessor
-/// `cratonvm_vm::runtime::env_cache::real_spring_startup` (this crate cannot
-/// depend on `vm`). The environment / bean-factory / property-source natives in
-/// this module cover *separate* partial-bootstrap gaps and are always
-/// registered. Cached once for the process lifetime.
-fn real_spring_startup() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let synthetic = std::env::var_os("CRATONVM_SYNTHETIC_SPRING_STARTUP").is_some();
-        let force_real = std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some();
-        force_real || !synthetic
-    })
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Singleton no-op ApplicationStartup object
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn noop_startup() -> &'static Mutex<Option<ObjectRef>> {
-    static S: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(None))
-}
-
-fn noop_step() -> &'static Mutex<Option<ObjectRef>> {
-    static S: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(None))
-}
-
-/// Get-or-create the global no-op `ApplicationStartup` singleton.
-/// Uses `DefaultApplicationStartup` as the carrier class so virtual dispatch
-/// on `start(String)` hits our registered native override.
-///
-/// NOTE (real-cdi-bean-container increment 1): the previous debug-gated
-/// `warn_shim_first_use()` first-use warning has been RETIRED. It announced the
-/// shim as a workaround for the "static-final on an interface not initialised"
-/// gap — but that general interpreter path is now verified working and pinned
-/// by `vm/tests/iface_static_final_init.rs`. This singleton remains only to
-/// cover the separate `DefaultApplicationStartup.<clinit>` NPE (the nested
-/// concrete-class init failure), so the stale workaround banner is gone.
-pub fn get_noop_startup(ctx: &mut dyn NativeContext) -> ObjectRef {
-    if let Some(obj) = *noop_startup().lock() {
-        return obj;
-    }
-    // 8 slots — conservative over-allocation for DefaultApplicationStartup's
-    // real-JDK field count (it's a simple class with very few fields).
-    let obj = crate::alloc_concurrent_synthetic(
-        ctx,
-        "org/springframework/core/metrics/DefaultApplicationStartup",
-        8,
-    );
-    *noop_startup().lock() = Some(obj);
-    obj
-}
-
-/// Get-or-create the global no-op `StartupStep` singleton.
-pub fn get_noop_step(ctx: &mut dyn NativeContext) -> ObjectRef {
-    if let Some(obj) = *noop_step().lock() {
-        return obj;
-    }
-    // DefaultApplicationStartup$DefaultStartupStep in Spring Framework 5.3.x
-    // (used by Spring Boot 2.7.x).  If not found, fall back to allocating a
-    // bare java/lang/Object — the methods are all overridden natively anyway.
-    let obj = crate::alloc_concurrent_synthetic(
-        ctx,
-        "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep",
-        16,
-    );
-    *noop_step().lock() = Some(obj);
-    obj
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Native method implementations
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn get_application_startup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(get_noop_startup(ctx)))))
-}
-
-fn startup_start(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(get_noop_step(ctx)))))
-}
-
-fn step_tag_sv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // tag(String key, String value) → this StartupStep
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-}
-
-fn step_tag_ssup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // tag(String key, Supplier<String> value) → this StartupStep
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-}
-
-fn step_end(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
-
-fn step_get_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(ctx.create_string("")))))
-}
-
-fn step_get_id(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Long(0)))
-}
-
-fn step_get_parent_id(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
-}
-
-fn step_get_tags(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Empty `ArrayList` — match real-JDK field slots (modCount may occupy slot 0).
-    let data_slot = ctx
-        .resolve_field_index("java/util/ArrayList", "elementData")
-        .unwrap_or(0);
-    let size_slot = ctx
-        .resolve_field_index("java/util/ArrayList", "size")
-        .unwrap_or(1);
-    let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    ctx.set_field(list, data_slot, Value::Object(Some(arr)));
-    ctx.set_field(list, size_slot, Value::Int(0));
-    Ok(Some(Value::Object(Some(list))))
-}
+// NOTE (real-cdi-bean-container Step 3): the Spring startup-metrics no-op shim
+// — the `ApplicationStartup` / `StartupStep` singletons, their no-op natives
+// (`getApplicationStartup` / `start` / `tag` / `end` / `getName` / `getId` /
+// `getParentId` / `getTags`), and the `real_spring_startup()` opt-out gate — has
+// been REMOVED. Spring's real `org.springframework.core.metrics` bytecode now
+// runs unconditionally (validated 10/10 == HotSpot on the Spring Boot functional
+// battery; pinned by `vm/tests/nested_clinit_startup.rs` +
+// `vm/tests/iface_static_final_init.rs`). The environment / bean-factory /
+// property-source / config-data natives below cover SEPARATE partial-bootstrap
+// gaps and remain registered.
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Environment fix — AbstractApplicationContext.getEnvironment() must not return null.
@@ -1143,81 +962,16 @@ fn cache_get_configuration_property_names(
 // ──────────────────────────────────────────────────────────────────────────────
 
 const ABSTRACT_CTX: &str = "org/springframework/context/support/AbstractApplicationContext";
-const DEF_STARTUP: &str = "org/springframework/core/metrics/DefaultApplicationStartup";
-const DEF_STEP: &str =
-    "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep";
-const STARTUP_IFACE: &str = "org/springframework/core/metrics/ApplicationStartup";
-const STEP_IFACE: &str = "org/springframework/core/metrics/StartupStep";
 
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
 
-    // ── Startup-metrics no-op shim (legacy fallback — opt-out only) ──────────
-    // real-cdi-bean-container increment 3 (Step 2 → default flip): the
-    // `ApplicationStartup` / `StartupStep` no-op natives are the part of this
-    // shim that covered the `DefaultApplicationStartup.<clinit>` NPE. By DEFAULT
-    // we DON'T register them, so the real Spring `org.springframework.core.metrics`
-    // bytecode runs (the `<clinit>` chain is allowed to complete by the matching
-    // guards in `vm_util.rs` / `vm_exec.rs`). They are registered only under the
-    // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out (kept as a fat-jar fallback).
-    if !real_spring_startup() {
-        // AbstractApplicationContext.getApplicationStartup() — always return the
-        // global no-op singleton so applicationStartup null can never crash.
-        registry.register(
-            ABSTRACT_CTX,
-            "getApplicationStartup",
-            "()Lorg/springframework/core/metrics/ApplicationStartup;",
-            get_application_startup,
-        );
-
-        // DefaultApplicationStartup.start(String) → no-op step
-        registry.register(
-            DEF_STARTUP,
-            "start",
-            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            startup_start,
-        );
-        // Also register on the interface class so invokevirtual on an interface
-        // receiver still finds a native.
-        registry.register(
-            STARTUP_IFACE,
-            "start",
-            "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            startup_start,
-        );
-
-        // DefaultStartupStep methods
-        for step_class in &[DEF_STEP, STEP_IFACE] {
-            registry.register(
-                step_class,
-                "tag",
-                "(Ljava/lang/String;Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-                step_tag_sv,
-            );
-            registry.register(
-                step_class,
-                "tag",
-                "(Ljava/lang/String;Ljava/util/function/Supplier;)Lorg/springframework/core/metrics/StartupStep;",
-                step_tag_ssup,
-            );
-            registry.register(step_class, "end", "()V", step_end);
-            registry.register(step_class, "getName", "()Ljava/lang/String;", step_get_name);
-            registry.register(step_class, "getId", "()J", step_get_id);
-            registry.register(
-                step_class,
-                "getParentId",
-                "()Ljava/lang/Long;",
-                step_get_parent_id,
-            );
-            registry.register(
-                step_class,
-                "getTags",
-                "()Ljava/lang/Iterable;",
-                step_get_tags,
-            );
-        }
-    }
+    // (real-cdi-bean-container Step 3) The Spring startup-metrics no-op natives
+    // (`getApplicationStartup` / `start` / `tag` / `end` / …) are gone — the real
+    // `org.springframework.core.metrics` bytecode runs unconditionally. Only the
+    // SEPARATE environment / bean-factory / property-source / config-data natives
+    // below are registered now.
 
     // ── Environment fix ────────────────────────────────────────────────────
     // AbstractApplicationContext.getEnvironment() and createEnvironment()
@@ -2913,25 +2667,6 @@ mod tests {
         // empty registry without panic. Equivalent to lib.rs's wiring path.
         let mut r = NativeMethodRegistry::new();
         register(&mut r);
-    }
-
-    #[test]
-    fn application_startup_intercepts_registered() {
-        let r = build_registry();
-        assert!(r
-            .find(
-                ABSTRACT_CTX,
-                "getApplicationStartup",
-                "()Lorg/springframework/core/metrics/ApplicationStartup;",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                DEF_STARTUP,
-                "start",
-                "(Ljava/lang/String;)Lorg/springframework/core/metrics/StartupStep;",
-            )
-            .is_some());
     }
 
     #[test]

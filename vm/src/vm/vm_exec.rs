@@ -9761,27 +9761,9 @@ fn invoke_on_class_shared_inner(
                             && matches!(method_name, "start" | "initialize"))
                         || (class_name == "org/apache/catalina/startup/Tomcat"
                             && method_name == "start")
-                        // Spring Framework AbstractApplicationContext.getApplicationStartup() —
-                        // the real JDK bytecode reads `this.applicationStartup` which may be
-                        // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
-                        // classloading). Force the native that returns a no-op synthetic object.
-                        //
-                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
-                        // by DEFAULT the no-op natives are not registered and the real
-                        // `ApplicationStartup.DEFAULT` `<clinit>` runs, so do NOT
-                        // force-shadow the real getter. Only the
-                        // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out re-enables this arm.
-                        || (!crate::runtime::env_cache::real_spring_startup()
-                            && matches!(
-                                class_name,
-                                "org/springframework/context/support/AbstractApplicationContext"
-                                | "org/springframework/context/support/GenericApplicationContext"
-                                | "org/springframework/context/annotation/AnnotationConfigApplicationContext"
-                                | "org/springframework/web/context/support/GenericWebApplicationContext"
-                                | "org/springframework/boot/web/servlet/context/AnnotationConfigServletWebServerApplicationContext"
-                                | "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext"
-                            )
-                            && method_name == "getApplicationStartup")
+                        // (real-cdi-bean-container Step 3) The getApplicationStartup()
+                        // force-override is removed: the real
+                        // `ApplicationStartup.DEFAULT` getter now always runs.
                         // Spring `obtainFreshBeanFactory` calls `getBeanFactory()` on the
                         // concrete context class. The bytecode is a trivial `getfield`
                         // so `check_override` is normally false and our native in
@@ -9805,25 +9787,9 @@ fn invoke_on_class_shared_inner(
                                 "()Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;"
                                     | "()Lorg/springframework/beans/factory/support/DefaultListableBeanFactory;"
                             ))
-                        // Spring Framework StartupStep methods — ApplicationStartup.start(String)
-                        // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
-                        // which may not be loadable from nested JARs.
-                        //
-                        // real-cdi-bean-container increment 3 (Step 2 → default flip):
-                        // by DEFAULT the no-op startup-metrics natives are not
-                        // registered and the real `DefaultApplicationStartup` /
-                        // `DefaultStartupStep` bytecode runs, so do NOT force-shadow
-                        // those methods. Only the `CRATONVM_SYNTHETIC_SPRING_STARTUP`
-                        // opt-out re-enables this arm.
-                        || (!crate::runtime::env_cache::real_spring_startup()
-                            && matches!(
-                                class_name,
-                                "org/springframework/core/metrics/ApplicationStartup"
-                                | "org/springframework/core/metrics/DefaultApplicationStartup"
-                                | "org/springframework/core/metrics/StartupStep"
-                                | "org/springframework/core/metrics/DefaultApplicationStartup$DefaultStartupStep"
-                            )
-                            && matches!(method_name, "start" | "tag" | "end" | "getName" | "getTags"))
+                        // (real-cdi-bean-container Step 3) The StartupStep
+                        // start/tag/end force-overrides are removed: the real
+                        // `DefaultStartupStep` bytecode now always runs.
                         // Spring Boot eureka-server / letsgo-main / sportme hang in
                         // `jdk/internal/loader/AbstractClassLoaderValue.putIfAbsent`
                         // (pc=29) because the JDK's bytecode drives
