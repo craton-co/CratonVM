@@ -9490,6 +9490,21 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         native_stream_for_each,
     );
     r.register(c, "count", "()J", native_stream_count);
+    // keycloak-16 Part B: chain-aware `iterator()`. The phases_late / streams.rs
+    // `iterator()` natives read the backing array (slot 0) DIRECTLY, which under a
+    // deferred lazy chain returns the RAW source (un-filtered/un-mapped) — e.g.
+    // `filter(nonNull).iterator()` leaks nulls (broke Spring Boot's
+    // `IndexedElementsBinder` → `ConfigurationPropertyName.chop()` NPE during
+    // `spring.config.name` binding). native-collections registers after
+    // native-builtins (last-writer-wins), so this override wins; it materialises
+    // via the chain-aware `stream_elements` before iterating.
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_stream_iterator);
+    r.register(
+        "java/util/stream/BaseStream",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_stream_iterator,
+    );
     r.register(
         c,
         "toArray",
@@ -10384,6 +10399,34 @@ fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let elements = stream_elements(ctx, this)?;
     Ok(Some(Value::Long(elements.len() as i64)))
+}
+
+/// Chain-aware `Stream.iterator()` / `BaseStream.iterator()`: materialise via
+/// `stream_elements` (which applies any deferred lazy op-chain) and hand back a
+/// `ServiceLoader$Itr` (slot 0 = array, slot 1 = cursor; its hasNext/next natives
+/// are registered in streams.rs). Replaces the field-0-raw iterator that bypassed
+/// the chain. Non-synthetic / real pipelines flow through `stream_elements`'s
+/// `toArray` path, so this is correct for those too.
+fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let itr = alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+            ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            ctx.set_field(itr, 1, Value::Int(0));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    };
+    let elements = stream_elements(ctx, this)?;
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    let itr = alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
 }
 
 fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
