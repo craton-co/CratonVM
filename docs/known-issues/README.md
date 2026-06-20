@@ -283,7 +283,7 @@ Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cra
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 
-- [hibernate-wrong-result-assertion-failures.md](hibernate-wrong-result-assertion-failures.md) — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff).
+- [hibernate-wrong-result-assertion-failures.md](../internal/fixed-suite-bugs/hibernate-wrong-result-assertion-failures.md) — cluster of CV-only wrong-result assertion FAILs (UniqueConstraintBatching 1-vs-0, DetachedBag true-vs-false, EntityGraphBatchSize, immutable+converter deser, …); each likely a separate root cause. 🔴 open (handoff).
 
 ## Consolidation log
 
