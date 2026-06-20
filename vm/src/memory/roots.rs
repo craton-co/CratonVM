@@ -394,6 +394,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     in `gc.rs` (`gc_update_annotation_proxy_refs`).
     cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(&mut roots);
 
+    //     Synthetic `com.sun.net.httpserver` server registry: each registered
+    //     `HttpHandler` ObjectRef lives only in a native map (no Java-heap edge
+    //     once the test drops the returned HttpContext), so a moving young GC
+    //     would otherwise reclaim/relocate it and the per-request dispatcher
+    //     would invoke a stale receiver (NoSuchMethodError java/lang/Object.handle).
+    //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
+    cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
+
     roots
 }
 

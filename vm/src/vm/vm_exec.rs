@@ -11164,6 +11164,17 @@ fn invoke_on_class_shared_inner(
                 }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),
+                    caller = thread
+                        .frames
+                        .last()
+                        .map(|f| format!(
+                            "{}.{}{} @pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        ))
+                        .unwrap_or_default(),
                     "NoSuchMethodError"
                 );
                 // Optional operator diagnostic: at the terminal not-found point
