@@ -313,10 +313,35 @@ DEBUG [org.hibernate.orm.jdbc.lob] HHH10010002: Disabling contextual LOB creatio
 ```
 The process then spins (CPU climbing, log frozen) in the interpreter — Keycloak's
 `start-dev` embedded **H2 + Agroal** datasource isn't producing a real
-`java.sql.Connection` (JDBC URL/driver "undefined/unknown"). Next frontier: the
-JDBC/Agroal/H2 dev-datasource subsystem (cf. `agroal_pool.rs` shim + real
-`java.sql` + the H2 driver bytecode, backed by the VM's real file/socket layers).
-Likely multi-session.
+`java.sql.Connection` (JDBC URL/driver "undefined/unknown").
+
+**Investigation (2026-06-20), for the next session:**
+- CratonVM HAS an Agroal shim (`native-builtins/src/agroal_pool.rs`): its
+  `AgroalDataSource.getConnection()` native returns a synthetic `org/h2/jdbc/JdbcConnection`
+  (mapping `jdbc:h2:mem:*` → an in-process SQLite backend), and defaults a missing URL
+  to `jdbc:h2:mem:agroal-default`. So if Hibernate reached *that* native it would get a
+  non-null connection. It does NOT — the connection Hibernate sees is null. The native is
+  registered on the `io/agroal/api/AgroalDataSource` **interface**; Quarkus's runtime
+  datasource bean is the real `io.agroal.pool.DataSource` impl (created by the Agroal
+  recorder), so `getConnection()` virtual-dispatches to the **real** Agroal pool bytecode
+  (or a Quarkus `ConnectionProvider` holding a null datasource), bypassing the shim.
+- Behaviour is **nondeterministic**: one run tears down the Hibernate bootstrap registry
+  (`Stop region factory`, `destroying bootstrap registry` → persistence-unit build failed),
+  another spins with CPU climbing and the log frozen. Either way HTTP never binds.
+- `RUST_LOG` does not enable the `agroal_pool`/`jdbc`/`apps_h2` native targets (CratonVM's
+  tracing setup ignores those), so trace those another way (add `tracing` at register/native
+  sites, or `CRATONVM_DBG_*`).
+
+**Next-session plan:** pin the exact datasource object class + the `getConnection` call
+path (real `io.agroal.pool.DataSource` vs the shim vs a null `QuarkusConnectionProvider`
+datasource), then EITHER (a) route Keycloak's datasource through the working
+`agroal_pool.rs` shim (force-override on the concrete impl / connection provider), OR
+(b) make the real Agroal + H2 (or H2→SQLite) connection path work end-to-end. Then handle
+Hibernate schema generation for Keycloak's ~100 entities (slow under `--nojit`; consider
+enabling JIT). Also separately determine whether the "spin" is a tight loop (a real bug) or
+just slow interpreted Hibernate metadata work. This is a large, multi-session DB subsystem
+(`agroal_pool.rs` / `jdbc.rs` / `apps_h2.rs` + real `java.sql` + the H2 driver, backed by the
+VM's real file layer).
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
