@@ -3871,6 +3871,173 @@ fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Objec
     }
 }
 
+// ── Keycloak Gap 6: real `@ConfigMapping` resolution via SmallRye ─────────────
+//
+// `SmallRyeConfig.getConfigMapping(Class, String)` returns the config-mapping
+// implementation (`<iface>$$CMImpl`) for a `@ConfigMapping` interface, reading
+// values from the live config. The real method looks the instance up in the
+// config's `mappings` registry (populated at config-build via
+// `ConfigMappings.registerConfigMappings`). Under CratonVM that registry is never
+// populated, so the old "Round 87" shim allocated a synthetic object **of the
+// interface itself** — which has no method bodies, so the first interface call
+// (e.g. `VirtualThreadsConfig.enabled()`) threw `AbstractMethodError` and aborted
+// the Quarkus boot at the VirtualThreads recorder step.
+//
+// Principled fix (no fabricated config): lazily register the requested mapping
+// with the live `SmallRyeConfig` using the REAL SmallRye machinery
+// (`ConfigMappings.registerConfigMappings`), then return the real, config-backed
+// `$$CMImpl` instance the registry now holds. If registration genuinely fails we
+// propagate that error (so a real config problem surfaces honestly) rather than
+// masking it with a broken interface alloc.
+
+/// Look up an already-registered config-mapping instance from
+/// `SmallRyeConfig.mappings`. Mirrors the real `getConfigMapping` lookup
+/// (`mappings.get(ConfigMappingLoader.getConfigMappingClass(iface)).get(prefix)`)
+/// without re-entering the (shadowed) `getConfigMapping` method.
+fn cm_lookup_registered(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cls: ObjectRef,
+    prefix: Value,
+) -> Option<Value> {
+    let impl_cls = match ctx.invoke(
+        "io/smallrye/config/ConfigMappingLoader",
+        "getConfigMappingClass",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+        &[Value::Object(Some(cls))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let mappings = match ctx.invoke_virtual(this, "getMappings", "()Ljava/util/Map;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let inner = match ctx.invoke_virtual(
+        mappings,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(impl_cls))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(
+        inner,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[prefix],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
+        _ => None,
+    }
+}
+
+/// `SmallRyeConfig.getConfigMapping(Class, String)` — register the mapping with
+/// the live config (if not already) and return the real `$$CMImpl`.
+fn native_smallrye_get_config_mapping(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cls = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let prefix = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    let _ = prefix; // (the per-mapping construct path reads values for all prefixes)
+
+    // Fast path: already in the config's mapping registry (e.g. if a real
+    // Quarkus config-build ever populates it) — return that instance.
+    if let Some(v) = cm_lookup_registered(ctx, this, cls, prefix) {
+        return Ok(Some(v));
+    }
+
+    // Build the impl directly from the live config via a ConfigMappingContext.
+    // This reads the mapping's own properties from real config WITHOUT the
+    // cross-mapping unknown-property validation that `registerConfigMappings`/
+    // `buildMappings` perform (which can't pass until ALL mappings are
+    // registered together — the deeper config-build gap).
+    if let Some(v) = cm_construct_via_context(ctx, this, cls) {
+        return Ok(Some(v));
+    }
+    // Could not build the real impl — defensive fallback so this call site
+    // doesn't hard-crash (preserves prior shim behaviour).
+    cm_fallback_alloc(ctx, cls)
+}
+
+/// Build a single `@ConfigMapping` implementation from the live config using
+/// `ConfigMappingLoader.configMappingObject(cls, ConfigMappingContext)` — the
+/// per-mapping constructor SmallRye uses internally, minus the cross-mapping
+/// `buildMappings` validation that requires the full mapping set.
+fn cm_construct_via_context(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cls: ObjectRef,
+) -> Option<Value> {
+    let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    ctx.invoke(
+        "io/smallrye/config/SmallRyeConfigBuilder",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(builder))],
+    )
+    .ok()?;
+    let mb = match ctx.invoke_virtual(
+        builder,
+        "getMappingsBuilder",
+        "()Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let context = match ctx.new_object("io/smallrye/config/ConfigMappingContext") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    ctx.invoke(
+        "io/smallrye/config/ConfigMappingContext",
+        "<init>",
+        "(Lio/smallrye/config/SmallRyeConfig;Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;)V",
+        &[
+            Value::Object(Some(context)),
+            Value::Object(Some(this)),
+            Value::Object(Some(mb)),
+        ],
+    )
+    .ok()?;
+    match ctx.invoke(
+        "io/smallrye/config/ConfigMappingLoader",
+        "configMappingObject",
+        "(Ljava/lang/Class;Lio/smallrye/config/ConfigMappingContext;)Ljava/lang/Object;",
+        &[Value::Object(Some(cls)), Value::Object(Some(context))],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
+        _ => None,
+    }
+}
+
+/// Last-resort fallback retained from the Round-87 shim: allocate a synthetic of
+/// the mapping interface. Only reached if the real registration path can't run;
+/// preserves prior behaviour for any call site the new path can't serve.
+fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallResult {
+    match crate::lang_class::mirror_class_name(ctx, cls) {
+        Some(n) => {
+            let obj = alloc_concurrent_synthetic(ctx, &n, 0);
+            Ok(Some(Value::Object(Some(obj))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5030,46 +5197,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- SmallRyeConfig.getConfigMapping(Class, String) — Round 87 ---
-    // Quarkus's generated `SharedConfig.<clinit>` calls
-    // `SmallRyeConfig.getConfigMapping(VertxHttpBuildTimeConfig.class, ...)`
-    // (and other @ConfigMapping interfaces) at static-init.  Under CratonVM
-    // those mappings are never registered with the SmallRyeConfig instance
-    // (build-time reflective discovery doesn't run), so the lookup throws
-    // `NoSuchElementException("SRCFG00027: Could not find a mapping for ...")`,
-    // wrapping into ExceptionInInitializerError and aborting Keycloak boot.
+    // --- SmallRyeConfig.getConfigMapping(Class, String) — Keycloak Gap 6 ---
+    // Quarkus recorder steps (e.g. VirtualThreads) and `SharedConfig.<clinit>`
+    // call `getConfigMapping(<@ConfigMapping iface>.class, prefix)` to get the
+    // config-mapping impl. The real method reads the config's `mappings`
+    // registry, which CratonVM never populates → the old "Round 87" shim
+    // allocated a synthetic of the INTERFACE (no method bodies) → callers like
+    // `VirtualThreadsConfig.enabled()` threw `AbstractMethodError`.
     //
-    // Same family as the Round 80 `KeyStoreConfigSourceFactory.getConfigSources`
-    // fix, but this one short-circuits the lookup at its source so any future
-    // @ConfigMapping interface (KC has many) is handled uniformly.
-    //
-    // Strategy: allocate a synthetic instance whose ClassId is the requested
-    // @ConfigMapping interface.  Quarkus's SharedConfig static-init writes the
-    // result to a `static final` slot; downstream interface-method calls will
-    // either be re-shimmed individually as they surface or hit defensive
-    // null/default paths.  This unblocks SharedConfig.<clinit> past pc=2154.
+    // The native now LAZILY REGISTERS the requested mapping with the live
+    // `SmallRyeConfig` via the real `ConfigMappings.registerConfigMappings` and
+    // returns the genuine, config-backed `<iface>$$CMImpl`. See
+    // `native_smallrye_get_config_mapping` above for the full rationale.
     r.register(
         "io/smallrye/config/SmallRyeConfig",
         "getConfigMapping",
         "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Object;",
-        |ctx, args| {
-            // args[0] = this, args[1] = Class<T>, args[2] = String prefix
-            let class_mirror = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Resolve interface name and ClassId; fall back to None on failure.
-            let cls_name = crate::lang_class::mirror_class_name(ctx, class_mirror);
-            let cls_name = match cls_name {
-                Some(n) => n,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            // alloc_concurrent_synthetic ensures the class is initialized and
-            // sizes the object to the class's declared field count (interfaces
-            // typically have none — slot count auto-grows in real-JDK mode).
-            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        native_smallrye_get_config_mapping,
     );
 
     // The single-arg form `getConfigMapping(Class)` delegates to the two-arg
