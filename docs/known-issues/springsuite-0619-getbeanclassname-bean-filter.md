@@ -9,9 +9,19 @@
 | **Failing test(s)** | every method that instantiates the affected bean (e.g. `LookupMethodTests` 0/7) |
 | **CratonVM** | FAIL — `IllegalArgumentException: Target object must not be null` |
 | **HotSpot JDK 25** | OK (LookupMethodTests 7/7; instance is `…AbstractBean$$SpringCGLIB$$0`) |
-| **CratonVM HEAD** | found `c4536b94`; **FIXED on dev `3b16e985`+** (this session) |
-| **Status** | **FIXED** on dev — bean-filter now probes the classpath, not the loaded-set |
-| **Suggested owner** | done (landed on dev) |
+| **CratonVM HEAD** | found `c4536b94`; primary **FIXED on dev `3b16e985`+** |
+| **Status** | 🟡 **PARTIAL** — primary bean-filter is FIXED (kept in active tracker per convention because **bug-B2 is OPEN**). |
+| **Suggested owner** | bug-B2 = CGLIB method-injection (open) |
+
+> **RE-VERIFY 2026-06-20** (build `cratonvm-spring0620` off dev `697134f8`, JDK 25):
+> the primary bean-filter fix holds — **no** `[bean-filter] hiding bean class …` warning for
+> `LookupMethodTests`. But **bug-B2 is confirmed OPEN**: `LookupMethodTests` **0/7**,
+> `LookupAnnotationTests` **0/10**, `FactoryBeanTests` **4/6** — every lookup-method bean still
+> fails with `BeanCreationException: … Target object must not be null` because CratonVM's CGLIB
+> **method-injection** enhancer makes a null instance instead of HotSpot's
+> `…AbstractBean$$SpringCGLIB$$0`. The bean class is correctly resolved (filter fixed); the
+> enhanced *subclass instantiation* is the remaining defect. Kept here (not archived) because the
+> user-visible symptom is still OPEN — see the bug-B2 note below.
 
 > **FIX (landed):** both loaded-set-only bean filters in
 > `native-builtins/src/spring_startup_bootstrap.rs` — the `getBeanClassName()` override

@@ -9578,14 +9578,27 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
         native_stream_to_array_gen,
     );
-    // Same override on ReferencePipeline so real-JDK code that dispatches
-    // virtual on the concrete class also hits us.
-    r.register(
-        "java/util/stream/ReferencePipeline",
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-        native_stream_to_array_gen,
-    );
+    // NOTE: we deliberately do NOT override `toArray(IntFunction)` on the
+    // concrete `java/util/stream/ReferencePipeline` class.
+    //
+    // A *real* JDK `ReferencePipeline`'s no-arg `toArray()` (real bytecode,
+    // `ReferencePipeline.java:658`) is `return toArray(Object[]::new)` — it
+    // delegates to the generator overload. `stream_elements()` materialises a
+    // real (non-synthetic) pipeline by calling that no-arg `toArray()` via
+    // `invoke_virtual`. If we shadow the generator overload with
+    // `native_stream_to_array_gen` (which itself calls `stream_elements`), the
+    // two bounce forever:
+    //   stream_elements → toArray() [real bytecode] → toArray(IntFunction)
+    //     [our native] → stream_elements → toArray() → …  ⇒ StackOverflowError.
+    // This was the open `MergedAnnotations.stream()` / bug-06 fam6 "~2 GB OOM"
+    // and it blocked the entire JUnit-Platform Spring suite (the launcher's
+    // TestPlan build calls `Stream.collect`/`toArray` on real pipelines).
+    //
+    // Synthetic CratonVM streams have class name `java/util/stream/Stream`, so
+    // their `toArray(IntFunction)` is still served by the interface-level
+    // registration above (the Kafka `Utils.enumOptions` typed-array case).
+    // Real pipelines run the real JDK `toArray(IntFunction)` bytecode, which is
+    // exactly what `stream_elements`' real-pipeline branch already relies on.
     // close() — BaseStream.close is abstract; synthetic Stream objects
     // (class `java/util/stream/Stream`) dispatch directly to the abstract
     // interface declaration and throw AbstractMethodError. Register a
