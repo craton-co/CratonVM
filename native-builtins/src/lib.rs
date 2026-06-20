@@ -39320,6 +39320,40 @@ static PROXY_CLASS_CACHE: parking_lot::RwLock<
 /// than via `Class.getName()`.
 static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// proxy-real-classfile increment 7 — per-loader dynamic-module sequence number
+/// backing the generated proxy package `jdk/proxyN/$ProxyM`, mirroring HotSpot's
+/// per-loader dynamic `jdk.proxyN` module (one module per class loader, `N`
+/// assigned in first-encounter order starting at 1; `$ProxyM` keeps using the
+/// global [`PROXY_CLASS_COUNTER`]). Public-interface proxies of the SAME loader
+/// share one `jdk/proxyN` package, exactly like the JDK's `ProxyBuilder`.
+static PROXY_MODULE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<u32, u32>>> =
+    parking_lot::RwLock::new(None);
+
+/// Module sequence number for `loader_id`'s generated proxies (the `N` in
+/// `jdk/proxyN`), assigned in first-encounter order starting at 1. Same loader →
+/// same number, so all of that loader's public-interface proxies land in one
+/// `jdk/proxyN` package — matching HotSpot's per-loader dynamic module.
+fn proxy_module_number(loader_id: u32) -> u32 {
+    {
+        let guard = PROXY_LOADER_MODULES.read();
+        if let Some(map) = guard.as_ref() {
+            if let Some(&n) = map.get(&loader_id) {
+                return n;
+            }
+        }
+    }
+    let mut guard = PROXY_LOADER_MODULES.write();
+    let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+    // Re-check under the write lock — another thread may have assigned it.
+    if let Some(&n) = map.get(&loader_id) {
+        return n;
+    }
+    let n = PROXY_MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    map.insert(loader_id, n);
+    n
+}
+
 /// Public accessor exposing the most-recently-created proxy's interfaces
 /// array as a raw pointer for the WP2.5 white-box test. Derives from the
 /// GC-tracked cell in `lang_class` (bug nb-lib-gckeys §2) — returns the
@@ -39362,6 +39396,21 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
     registry.register(p, "newProxyInstance",
         "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;",
         native_proxy_new_instance);
+    // proxy-real-classfile increment 7 — deprecated `Proxy.getProxyClass(loader,
+    // ifaces)`. The real JDK body routes the dynamic-module machinery
+    // (`ProxyBuilder.getDynamicModule` → `Module.defineModule0`) the synthetic
+    // proxy model can't satisfy → `InternalError: Proxy is not supported until
+    // module system is fully initialized`. Force this native (companion entry in
+    // `interpreter::force_native_over_real_jdk_bytecode`); it returns the same
+    // generated `$ProxyN` class `newProxyInstance` would build, so
+    // `pc.getConstructor(InvocationHandler.class).newInstance(h)` round-trips on
+    // CratonVM's own proxy machinery.
+    registry.register(
+        p,
+        "getProxyClass",
+        "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;",
+        native_proxy_get_proxy_class,
+    );
     // WP2.5: helper for the proxy-instance class so callers can read
     // the interfaces back from the proxy itself rather than walking
     // the side-table. Registered on the synthetic class name.
@@ -39684,6 +39733,51 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
     Ok(Some(Value::Object(Some(proxy))))
+}
+
+/// proxy-real-classfile increment 7 — `Proxy.getProxyClass(ClassLoader,
+/// Class[])` (deprecated). Returns the generated `$ProxyN` `Class` for the given
+/// interface set via the same `define_or_get_proxy_class` machinery
+/// `newProxyInstance` uses (so it shares the per-(loader, iface-set) cache).
+/// Force-dispatched over the real JDK bytecode (see
+/// `interpreter::force_native_over_real_jdk_bytecode`), which otherwise throws
+/// `InternalError: Proxy is not supported until module system is fully
+/// initialized`.
+///
+/// Args (static method): `[0]` ClassLoader, `[1]` `Class[]` interfaces.
+fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Walk the Class[] into iface ClassIds (same as `native_proxy_new_instance`).
+    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(1).cloned() {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    iface_cids.push(cid);
+                }
+            }
+        }
+    }
+    // Per-loader namespace = the loader instance's identity hash (bootstrap/null
+    // → 0), matching `native_proxy_new_instance` so both share the cache entry.
+    let loader_namespace: u32 = match args.first() {
+        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        _ => 0,
+    };
+    match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
+        ProxyClassOutcome::Real(cid) => {
+            let mirror = ctx.get_class_mirror(cid);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        // Degrade (gate off) / Failed → the JDK raises IllegalArgumentException
+        // for an unbuildable proxy class; mirror that rather than returning a
+        // bogus Class.
+        _ => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Proxy.getProxyClass: cannot generate a proxy class for the given interfaces"
+                .to_string(),
+        }
+        .into()),
+    }
 }
 
 /// WP2.5 v3 — INVOKESTATIC target embedded in every generated `$ProxyN`
@@ -40242,7 +40336,7 @@ fn define_or_get_proxy_class(
     // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
     // only when an interface ClassId fails to resolve to a name (a
     // genuinely unloadable interface) — see its doc.
-    let (gen_name, spec) = match build_proxy_spec_for(ctx, &sorted) {
+    let (gen_name, spec) = match build_proxy_spec_for(ctx, loader_id, &sorted) {
         Some(v) => v,
         None => {
             if dbg {
@@ -40379,6 +40473,7 @@ pub(crate) fn resolve_serialized_proxy_class(
 /// `None` if any ClassId fails to resolve to a name.
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
+    loader_id: u32,
     sorted_ifaces: &[cratonvm_types::ClassId],
 ) -> Option<(String, cratonvm_classloading::proxy_gen::ProxyClassSpec)> {
     use cratonvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
@@ -40409,7 +40504,13 @@ fn build_proxy_spec_for(
     //   * If any proxied interface is non-public, the proxy must live in that
     //     interface's package (matches the JDK; yields `$ProxyN` in the default
     //     package for a package-private interface, exactly like HotSpot).
-    //   * Otherwise all interfaces are public → use `com/sun/proxy`.
+    //   * Otherwise all interfaces are public → use HotSpot-25's per-loader
+    //     dynamic module package `jdk/proxyN` (was `com/sun/proxy`, a pre-JDK-9
+    //     name). `jdk/proxyN` is NOT a prohibited package (only `jdk/internal/*`
+    //     is — see `class_manager::is_prohibited_package_name`) and matches every
+    //     `jdk/`-prefixed platform gate identically to the old `com/sun/` name,
+    //     so the rename is behaviour-preserving while making `Class.getName()`
+    //     match HotSpot (e.g. `jdk.proxy1.$Proxy0`).
     let non_public_pkg = sorted_ifaces.iter().find_map(|cid| {
         if ctx.class_access_flags(*cid) & ACC_PUBLIC == 0 {
             let name = ctx.class_name_of_id(*cid)?;
@@ -40425,7 +40526,7 @@ fn build_proxy_spec_for(
     let gen_class_name = match non_public_pkg {
         Some(pkg) if pkg.is_empty() => format!("$Proxy{n}"),
         Some(pkg) => format!("{pkg}/$Proxy{n}"),
-        None => format!("com/sun/proxy/$Proxy{n}"),
+        None => format!("jdk/proxy{}/$Proxy{n}", proxy_module_number(loader_id)),
     };
 
     // BFS over interface inheritance. Collect public, non-static,

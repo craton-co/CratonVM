@@ -14198,6 +14198,18 @@ fn force_native_over_real_jdk_bytecode(
                 "invokeDefault",
                 "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
             )
+            // proxy-real-classfile increment 7: deprecated `Proxy.getProxyClass`.
+            // The real JDK body routes the dynamic-module machinery
+            // (`ProxyBuilder.getDynamicModule` → `Module.defineModule0`) the
+            // synthetic proxy model can't satisfy → `InternalError: Proxy is not
+            // supported until module system is fully initialized`. Force the
+            // registered native (native-builtins `native_proxy_get_proxy_class`),
+            // which returns the generated `$ProxyN` class directly.
+            | (
+                "java/lang/reflect/Proxy",
+                "getProxyClass",
+                "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(

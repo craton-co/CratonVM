@@ -545,19 +545,91 @@ debug binary `cratonvm-proxyfin.exe`, harness `scratch/proxysoak/`:
   `ProxyEdge` default outputs **byte-identical to the pre-change baseline** — the
   fixes touch only the default-method dispatch and the undeclared-throw path.
 
-### Still remaining (unchanged; do not block the `real_proxy_super` flip)
+### Still remaining (addressed in Increment 7 below)
 
-The other orthogonal gaps from Increment 4/5 are untouched and still diverge
-equally in both modes:
-
-- **`Proxy.getProxyClass(loader, ifaces)`** (deprecated) → `InternalError: Proxy is
-  not supported until module system is fully initialized` (gap #2). Tractable via
-  the existing `define_or_get_proxy_class` machinery; deferred (deprecated API, and
-  it would still leave the naming gap below in `ProxyEdge`).
+- **`Proxy.getProxyClass(loader, ifaces)`** (deprecated) → `InternalError` (gap #2).
 - **Generated proxy package naming** `com.sun.proxy.$ProxyN` vs HotSpot-25's
-  per-loader `jdk.proxyN.$ProxyM` (gap #3, cosmetic). The current `com/sun/proxy`
-  name is load-bearing for the prohibited-package-name fix (3a) and the
-  serialization wiring of Increments 1/3, so a rename is deliberately deferred.
+  per-loader `jdk.proxyN.$ProxyM` (gap #3).
 
 The `real_proxy_super()` default flip remains gated on the real-app proxy suites
 per Increment 5 — unaffected by this increment.
+
+## Increment 7 — `Proxy.getProxyClass` + HotSpot-25 proxy naming (gaps #2 and #3)
+
+Closes the two orthogonal gaps Increment 6 deferred. Both apply on the canonical
+default path and under `CRATONVM_REAL_PROXY_SUPER=1`.
+
+### 1. `Proxy.getProxyClass(ClassLoader, Class[])` (gap #2)
+
+The deprecated factory ran the real JDK body, which routes
+`ProxyBuilder.getDynamicModule` → `Module.defineModule0` (unsupported by the
+synthetic proxy model) → `InternalError: Proxy is not supported until module
+system is fully initialized`. Force a native
+(`native_proxy_get_proxy_class`, companion entry in
+`interpreter::force_native_over_real_jdk_bytecode`) that returns the generated
+`$ProxyN` `Class` via the **same** `define_or_get_proxy_class` machinery — and
+cache entry — `newProxyInstance` uses (per-loader namespace from the loader's
+identity hash). A `Degrade`/`Failed` outcome surfaces as the JDK's
+`IllegalArgumentException` rather than a bogus `Class`.
+
+**Reflective construction (the harder half).** `getProxyClass`'s point is
+`pc.getConstructor(InvocationHandler.class).newInstance(h)`. HotSpot's proxy has a
+1-arg `<init>(InvocationHandler)`; the real-super generated proxy already does
+(Increment 4), but the **synthetic-super** proxy's canonical ctor is the 2-arg
+`<init>(InvocationHandler, Class[])`, so `getConstructor(InvocationHandler.class)`
+would `NoSuchMethodException`. `proxy_gen::emit_proxy_classfile` now ALSO emits a
+JDK-shape 1-arg `<init>(InvocationHandler)` for the synthetic super
+(`emit_synthetic_one_arg_ctor`), delegating to the 2-arg super with a null
+interfaces array (`super(handler, null)`); straight-line, no `StackMapTable`,
+additive (the 2-arg ctor is retained for existing paths). `newProxyInstance`
+itself bypasses the ctor (alloc + field writes), so only reflective / `new`-based
+construction is affected. Test: `emits_synthetic_super_with_both_ctors`.
+
+### 2. Generated proxy naming `jdk/proxyN/$ProxyM` (gap #3)
+
+`build_proxy_spec_for`'s all-public-interface branch now names the class
+`jdk/proxy{N}/$Proxy{M}` (was the pre-JDK-9 `com/sun/proxy/$ProxyN`), matching
+HotSpot-25. `M` is the global `PROXY_CLASS_COUNTER`; `N` is a per-loader
+dynamic-module sequence number (`proxy_module_number`, assigned in
+first-encounter order starting at 1 — so all of one loader's public-interface
+proxies share a `jdk/proxyN` package, exactly like the JDK's per-loader dynamic
+`jdk.proxyN` module). Verified safe:
+- `jdk/proxyN` is **not** a prohibited package — only `jdk/internal/*` is
+  (`class_manager::is_prohibited_package_name`), so `define_class_full` accepts it.
+- Every platform gate that matched the old `com/sun/` prefix
+  (`is_standard_jdk_namespace`, `looks_like_jdk_package`, `class_is_bootstrap_trusted`)
+  matches `jdk/` identically, so treatment is unchanged; and the proxy is
+  app-loader-defined so `class_is_bootstrap_trusted` is false regardless.
+- The `$ProxyN` name is never serialized (OOS writes the proxy's *interface*
+  names; `resolveProxyClass` rebuilds from those), so proxy serialization is
+  unaffected — `ProxySer` still matches HotSpot.
+- The non-public-interface branch (proxy lives in the interface's package) is
+  unchanged.
+
+### Validation
+
+Full three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=1`), fresh
+debug binary, 7 programs:
+
+- **`CRATONVM_REAL_PROXY_SUPER=1`: 0 divergences — all 7 programs byte-identical
+  to HotSpot** (`ProxyIdentity`, `ProxyDispatch`, `ProxySer`, `LoggingProxy`,
+  `ProxyEdge`, `ProxyInstOf`, `DefaultMethodProxy`). The naming gap is gone in both
+  modes; `ProxyEdge` (`getProxyClass.isProxy=true`, `ctorProxy.base=ctorB`) confirms
+  `getProxyClass` + reflective construction work end-to-end.
+- **Default path: only `ProxyIdentity` / `ProxyInstOf` diverge, on
+  `getSuperclass()` = `Proxy$Instance` (vs `Proxy`) and `instanceof Proxy` = false** —
+  i.e. *exactly* the synthetic-vs-real super behaviour the `CRATONVM_REAL_PROXY_SUPER`
+  gate controls. No `getProxyClass` / naming divergence remains. `ProxyDispatch` /
+  `DefaultMethodProxy` / `ProxySer` / `LoggingProxy` / `ProxyEdge` all match in both
+  modes (no regression).
+- Tests: classloading `proxy_gen`, native-builtins `proxy`, vm `wp2_5_proxy` (see
+  commit).
+
+### What's left
+
+The **only** remaining proxy divergence is the synthetic→real super default
+(`getSuperclass`/`instanceof Proxy`), reachable today via `CRATONVM_REAL_PROXY_SUPER=1`
+where the full soak is now green. Flipping it to default stays gated on the real-app
+proxy suites (Keycloak/Quarkus ArC, Hibernate JdbcSpies) per Increment 5 — a behaviour
+change for every proxy-using app, not a code gap. Once that soak is green, the flip
+(then `Proxy$Instance` shim deletion, design §3 step 7) is the last step.
