@@ -7467,6 +7467,50 @@ pub(crate) fn annotation_proxy_invoke_shared(
     if method_name == "asMap" {
         return annotation_proxy_as_map(shared, thread, proxy, args);
     }
+    // Annotation equality is symmetric, but our native `AnnotationProxy` equals
+    // can only introspect OUR own proxies. When the argument is a *foreign*
+    // annotation of the same type — e.g. a Spring `MergedAnnotation.synthesize()`
+    // JDK proxy — the pure-Rust path rejects it (wrong class) and returns false,
+    // breaking `a.equals(b) == b.equals(a)`. Delegate to the foreign side's
+    // `equals` (which compares member-by-member via our accessors, exactly as
+    // JDK's `AnnotationInvocationHandler.equals` does). The result is a boolean,
+    // so there is no GC-stale-reference hazard across the nested invocation.
+    if method_name == "equals" {
+        if let Some(other_val @ Value::Object(Some(other))) = args.first().copied() {
+            if other != proxy
+                && shared.heap.kind_of(other) == crate::memory::heap::ObjectKind::Object
+                && !class_name_is(shared, other, "java/lang/annotation/AnnotationProxy")
+            {
+                let other_cid = shared.heap.class_id_of(other);
+                let proxy_desc = annotation_proxy_type_descriptor(shared, proxy);
+                let ann_cid = proxy_desc
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .and_then(|n| shared.class_manager.read().get_loaded_class_id(n));
+                let same_annotation_type = ann_cid
+                    .is_some_and(|ac| shared.class_manager.read().is_subclass_of(other_cid, ac));
+                if same_annotation_type {
+                    let other_cname = shared
+                        .class_manager
+                        .read()
+                        .get_class(other_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    return invoke_or_native(
+                        shared,
+                        thread,
+                        &other_cname,
+                        "equals",
+                        "(Ljava/lang/Object;)Z",
+                        &[other_val, Value::Object(Some(proxy))],
+                    );
+                }
+                // A foreign object that is not an instance of our annotation
+                // type is never equal to this annotation.
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+    }
     annotation_proxy_dispatch_impl(shared, proxy, method_name, args)
 }
 
