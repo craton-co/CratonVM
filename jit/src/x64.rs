@@ -1982,6 +1982,33 @@ fn safepoint_reg_spill_nostore() -> bool {
     })
 }
 
+/// Keycloak Gap 9 (register-resident root, A2 class) — `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`
+/// blind-spills EVERY allocatable GPR (not just the callee-saved set) at each
+/// GC-capable safepoint. The callee-saved-only spill (`=1`) leaves a live oop
+/// held in a *caller-saved* / argument / RAX register at an invoke safepoint
+/// invisible to the conservative root scan; spilling the full GPR file closes
+/// that residual class. Fully conservative (the scanner re-validates each slot
+/// via `heap.is_object_address`) and sound under the non-moving young sweep that
+/// `gc_quiescence` forces while any thread is in JIT (no relocation → an
+/// over-spilled non-oop bit pattern can only over-retain, never corrupt).
+fn safepoint_reg_spill_all() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_JIT_SAFEPOINT_REG_SPILL")
+            .map(|v| v.eq_ignore_ascii_case("all"))
+            .unwrap_or(false)
+    })
+}
+
+/// The full set of allocatable GPRs spilled at safepoints under the `=all` gate
+/// (every integer register except RSP/RBP, which are the stack/frame pointers
+/// and never hold a Java reference). Order is fixed so the reserved frame-slot
+/// layout is deterministic.
+const ALL_SPILL_GPRS: [u8; 14] = [
+    RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
+];
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -5940,6 +5967,11 @@ struct Compiler {
     /// Gated `CRATONVM_JIT_SAFEPOINT_REG_SPILL`; off → byte-identical default
     /// path (no slots reserved, no stores).
     safepoint_reg_spill: bool,
+    /// Keycloak Gap 9 (`CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`): spill the FULL
+    /// GPR file ([`ALL_SPILL_GPRS`]) at each safepoint rather than only the used
+    /// callee-saved set, closing the caller-saved/argument/RAX register-resident
+    /// oop gap. Implies `safepoint_reg_spill`.
+    safepoint_reg_spill_all: bool,
     /// Diagnostic control (`CRATONVM_JIT_SAFEPOINT_REG_SPILL=nostore`): reserve
     /// the spill slots (so the frame layout matches the spilling build) but emit
     /// NO stores — isolates the effect of the stores from the effect of the
@@ -6126,6 +6158,7 @@ impl Compiler {
         // conservative root scan can see register-only oops. The slot count =
         // `alloc_used_regs.len()`, reserved in `total` below.
         let safepoint_reg_spill = safepoint_reg_spill_enabled();
+        let safepoint_reg_spill_all = safepoint_reg_spill_all();
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Shadow stack reserves TWO frame slots: the cached thread pointer and
         // a saved `top` watermark (restored in the epilogue to unwind any
@@ -6217,7 +6250,10 @@ impl Compiler {
         // safepoint's CURRENT live values for the GC root scan). Sits above the
         // shadow space / stack-arg region (those are nearest RSP), so it never
         // overlaps the helper-call shadow space or the 6th stack-arg slot.
-        let reg_spill_size = if safepoint_reg_spill {
+        let reg_spill_size = if safepoint_reg_spill_all {
+            // Gap 9: one slot per GPR in the full file (caller- + callee-saved).
+            ALL_SPILL_GPRS.len() as i32 * 8
+        } else if safepoint_reg_spill {
             callee_saved_size
         } else {
             0
@@ -6346,6 +6382,7 @@ impl Compiler {
             precise_maps,
             sp_id_slot_off,
             safepoint_reg_spill,
+            safepoint_reg_spill_all,
             safepoint_reg_spill_nostore,
             reg_spill_base,
             safepoint_pcs: FxHashSet::default(),
@@ -6758,10 +6795,24 @@ impl Compiler {
         // the slots but skips the stores (frame-perturbation A/B control).
         if self.safepoint_reg_spill && !self.safepoint_reg_spill_nostore && self.reg_spill_base != 0
         {
-            for i in 0..self.alloc_used_regs.len() {
-                let reg = self.alloc_used_regs[i];
-                let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
-                self.emit_store_local(off, reg);
+            // Gap 9 (`=all`): spill the FULL GPR file so a live oop in a
+            // caller-saved / argument / RAX register (e.g. an invoke receiver
+            // staged in an ARG reg, which the callee-saved-only spill misses) is
+            // visible to the conservative root scan. `emit_store_local(off, reg)`
+            // only reads `reg` (a plain `mov [rbp-off], reg`), so spilling the
+            // arg registers here does not perturb the pending call's arguments.
+            // Default path is unchanged (`=1` → callee-saved only).
+            if self.safepoint_reg_spill_all {
+                for (i, &reg) in ALL_SPILL_GPRS.iter().enumerate() {
+                    let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                    self.emit_store_local(off, reg);
+                }
+            } else {
+                for i in 0..self.alloc_used_regs.len() {
+                    let reg = self.alloc_used_regs[i];
+                    let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                    self.emit_store_local(off, reg);
+                }
             }
         }
         // Stage 3 — record WHICH safepoint is active by storing the current

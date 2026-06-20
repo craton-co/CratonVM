@@ -1,6 +1,21 @@
 # Keycloak 26.6.3 (Quarkus) boot under CratonVM — progress & gap chain
 
-**Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). **Gaps 6 & 7 (@ConfigMapping) FIXED** (commits `bec91280`, `4ce68fd9`): `getConfigMapping` now builds the real `<iface>$$CMImpl` from live config via SmallRye `configMappingObject` **with default values applied** (mirrors `mapConfiguration`: `withMapping` + merge `getDefaultValues`) — no fabrication. **This unblocked the whole config cluster, ArC bean creation, and Keycloak's real startup.** The boot now runs through `Arc.initialize()` + CDI bean creation, Keycloak provider init, and Hibernate ORM/JPA, reaching the server-running lifecycle (`ApplicationLifecycleManager.waitForExit`). Current **OPEN** frontier: **Gap 8** — Keycloak's `start-dev` embedded H2/Agroal datasource yields **no `java.sql.Connection`** (Hibernate logs `Database JDBC URL [undefined/unknown]`, `connection was null`) and the interpreter spins. **Seven gaps fixed; the real ArC CDI container runs; HTTP not yet bound (DB layer is the wall).**
+**Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). **Gaps 6 & 7 (@ConfigMapping) FIXED** (commits `bec91280`, `4ce68fd9`): `getConfigMapping` now builds the real `<iface>$$CMImpl` from live config via SmallRye `configMappingObject` **with default values applied** (mirrors `mapConfiguration`: `withMapping` + merge `getDefaultValues`) — no fabrication. **This unblocked the whole config cluster, ArC bean creation, and Keycloak's real startup.** The boot now runs through `Arc.initialize()` + CDI bean creation, Keycloak provider init, and Hibernate ORM/JPA, reaching the server-running lifecycle (`ApplicationLifecycleManager.waitForExit`). **Seven gaps fixed; the real ArC CDI container runs.**
+
+> **UPDATE (2026-06-20, branch `fix/keycloak-gap8-datasource`, synced with `dev`):** **Gap 8 (Agroal
+> datasource) is RESOLVED** behind the `CRATONVM_REAL_AGROAL` gate — it was NOT an H2-engine gap
+> (the real `org.h2.Driver` works) but a shim-vs-real-bytecode collision: the `agroal_pool.rs` shim's
+> `AgroalDataSourceConfigurationSupplier.get()` returned a bare-interface config → real
+> `DataSourceProvider`/`io.agroal.pool.DataSource` bytecode hit `AbstractMethodError` on
+> `dataSourceImplementation()`. With the gate the real Agroal pool runs over the real H2 driver and
+> (under JIT) the boot advances **past the entire DB layer** into RESTEasy Reactive deployment. The
+> **new frontier is Gap 9** — a *nondeterministic* wedge of the Quarkus "JPA Startup Thread" in Rust
+> native code, root-caused to the tracked **multi-thread-in-JIT-under-STW GC root-scanning gap**
+> (`cross_thread_jit_gap_hits` in `cratonvm_vm::jit::conservative_roots`), i.e. a STW GC dropping a
+> live JIT root held by a peer thread — the precise-JIT-stack-maps program's work, NOT a Keycloak
+> bug. Plus raw throughput (~15× HotSpot). See Gap 8/9 below. This branch is merged up to `dev`
+> (53 commits, incl. the `5085b137` "forward monitor + native roots on safepoint-resume" GC fix and
+> the ES GC root-cause wave) to validate Gap 9 against the latest GC root-safety code.
 
 Goal: reach and validate the **real Quarkus ArC** CDI path (`CRATONVM_REAL_ARC`,
 the `quarkus_arc.rs` shim's replacement). ArC's `Arc.initialize()` runs **late**
@@ -342,6 +357,249 @@ enabling JIT). Also separately determine whether the "spin" is a tight loop (a r
 just slow interpreted Hibernate metadata work. This is a large, multi-session DB subsystem
 (`agroal_pool.rs` / `jdbc.rs` / `apps_h2.rs` + real `java.sql` + the H2 driver, backed by the
 VM's real file layer).
+
+**Deep-dive follow-up (2026-06-20, continued):**
+- **Path confirmed REAL, shim bypassed.** `io.quarkus.agroal.runtime.DataSources.createDataSource`
+  does `new io.agroal.pool.DataSource(config, listeners)` (bci 432/476) — the real Agroal pool
+  impl. So `getConnection()` virtual-dispatches to real Agroal bytecode → its `ConnectionFactory`
+  → the real JDBC driver. The `agroal_pool.rs` shim (registered on the `io/agroal/api/AgroalDataSource`
+  **interface**) is never reached. To use the shim, force-override on the concrete
+  `io/agroal/pool/DataSource` (or shim the JDBC `Driver.connect`/`DriverManager.getConnection` the
+  real pool calls).
+- **The boot is FURTHER than "DB layer."** When Hibernate proceeds past the null connection (it
+  builds metadata on the explicit `H2Dialect`, so the null connection is non-fatal *for bootstrap*),
+  the boot advances into **RESTEasy Reactive deployment** — `ApplicationImpl.<clinit>` pc≈750 →
+  `ResteasyReactiveProcessor$setupDeployment.deploy_41` → `RuntimeDeploymentManager.deploy` →
+  `buildResourceMethod` → loading endpoint-invoker classes via `RunnerClassLoader`/`JarFileReference`
+  (nested-JAR). That's very close to the HTTP bind.
+- **Nondeterministic.** Some runs proceed to RESTEasy as above; others, after the null connection,
+  tear down the Hibernate bootstrap (`Stop region factory` / `Clear region references`) and then
+  hang/spin. No exception is printed (logging gap 5b). The variance points at a timing-dependent
+  null in the connection path.
+- **JIT-neutral.** Booting with JIT ENABLED neither crashes nor unblocks — it hits the same
+  Hibernate/connection wall. So the wall is the **DB connection itself**, not interpreter speed.
+- **No invoke-NPE in the connection path.** `CRATONVM_DBG_NPE_STACK` shows no null-receiver invoke
+  in the H2/Agroal/Connection path — the connection is a **silent null return** (the real
+  `org.h2.Driver.connect(url)` / real Agroal pool returns null without an obvious single deref gap),
+  not a one-line bug like Gaps 4–7.
+- **Available backends (mapped).** CratonVM has (1) a real **`rusqlite`-backed JDBC surface**
+  (`phases_late.rs::jdbc_registry` + `DriverManager.getConnection`/`java.sql.Connection`/`Statement`/
+  `PreparedStatement`/`ResultSet` natives, with a passing round-trip test), mapping `jdbc:h2:mem` →
+  `jdbc:sqlite::memory:`; and (2) partial **real-H2-engine** support (`apps_h2.rs` `TableFilter`
+  overrides). The real Agroal pool calls `org.h2.Driver.connect` (real H2 engine) with a `jdbc:h2:`
+  URL and is wired to NEITHER → null.
+
+**Why this is a genuine multi-session subsystem (not a one-line fix), and why no shim was landed:**
+- Routing `org.h2.Driver.connect` → the rusqlite surface gives a *non-null* connection cheaply, BUT
+  it's a **dead end for Keycloak**: the connection would report SQLite, and Keycloak validates its DB
+  type + runs **Liquibase H2-dialect DDL** (≈100 tables) that SQLite can't execute. So a SQLite-route
+  "close" would fake a connection and then break on the real schema — the forbidden papering-over
+  pattern. Not landed.
+- The **principled close** is making the real `org.h2.Driver.connect(url)` (real H2 engine bytecode)
+  produce a working `JdbcConnection` under CratonVM, then Keycloak's Liquibase schema + JPA run on
+  real H2. That's the H2 database engine running under the VM — a large, multi-gap effort on its own
+  (the `apps_h2.rs` H2-engine path is the seed).
+- **Recommended next-session start:** trace the real `org.h2.Driver.connect` execution (add Rust
+  tracing at H2 `Engine`/`Session`/`JdbcConnection.<init>`, or step the H2 bytecode) to find the first
+  concrete gap where it returns null/fails; also confirm whether the Agroal datasource **bean** is
+  non-null (rule out a CDI-injection null vs an H2-engine null). Decide strategy: real-H2-under-CratonVM
+  vs. an alternative Keycloak-supported DB path. The boot is otherwise within a few steps of binding HTTP.
+
+> **UPDATE (2026-06-20, branch `fix/keycloak-gap8-datasource`) — the "real H2 engine"
+> framing above is REFUTED; the real blocker was the Agroal shim, now fixed behind a gate.**
+> Isolated repros (real `com.h2database.h2-2.4.240.jar`, no full boot) prove the **real
+> `org.h2.Driver` already works under CratonVM byte-identically to HotSpot**: connect, DDL,
+> sequences, `MERGE`, `DatabaseMetaData` (URL / driver name / product / `2.4.240` version —
+> NOT "undefined/unknown"), and multiple file-mode connections to the same DB. So Gap 8 is
+> **not** an H2-engine gap and does **not** need "the H2 database engine running under the VM".
+> The only H2-engine gaps found are in the **`AUTO_SERVER=TRUE`** path (which Keycloak's
+> dev-file URL does NOT use): a now-fixed `Properties.store` bug (below) and a residual H2 TCP
+> auto-server bind issue — both out of scope for Keycloak.
+>
+> **Real blocker (deterministic, isolated via `KcAgroal` over the real `io.agroal.agroal-pool-3.0.1.jar`):**
+> the `native-builtins/src/agroal_pool.rs` **shim** intercepts
+> `AgroalDataSourceConfigurationSupplier.get()` and returns a synthetic object whose runtime
+> class is the bare **interface** `io/agroal/api/configuration/AgroalDataSourceConfiguration`
+> (no method bodies). Quarkus/Keycloak run the **real** container bytecode
+> (`DataSources.createDataSource` → `new io.agroal.pool.DataSource(supplier.get(), …)` and
+> `AgroalDataSource.from` → `DataSourceProvider.getDataSource`), which does
+> `invokeinterface config.dataSourceImplementation()` and hits the abstract method →
+> `AbstractMethodError: … dataSourceImplementation() … has no Code attribute`. This is the exact
+> shim-vs-real-bytecode collision the design doc's risk section predicted, NOT a silent H2 null.
+> (The earlier "silent null / undefined-unknown" Hibernate `HHH10001005` line is the *normal*
+> lazy-datasource bootstrap introspection — HotSpot logs the same — not the failure.)
+>
+> **Fix (real-cdi-bean-container, Step 2 gate):** `CRATONVM_REAL_AGROAL=1` suppresses the
+> Agroal shim registration (`native-builtins/src/lib.rs` — gated at the `register_agroal_natives`
+> call site via `real_agroal()`), so the real `io.agroal.pool.*` bytecode runs over the working
+> real `org.h2.Driver`. **Validated:** `KcAgroal` reaches `== DONE OK ==` in isolation (real
+> `io.agroal.pool.DataSource`, real `getConnection()`, DDL + pool reuse), and the **real Keycloak
+> boot with `CRATONVM_REAL_AGROAL=1` no longer throws the `AbstractMethodError`** — it advances
+> through truststore init, Hibernate ORM, the `keycloak-default` persistence unit, and Hibernate
+> Validator, and the main thread reaches `ApplicationLifecycleManager.waitForExit` (real AQS
+> `ConditionObject.awaitUninterruptibly` + ForkJoinPool — the concurrency the design doc feared
+> WORKS). Gate is currently **opt-in**; flip to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`)
+> once the boot is fully green (see next frontier), per the "validate the suite before flipping" rule.
+>
+> **New frontier (Gap 9) — throughput, not a hard blocker.** With the gate ON, `--nojit` stalls
+> at 150s right after `Hibernate Validator` (no JPA-Startup-Thread / Liquibase output); the
+> single worker thread was undumpable (in Rust native). That looked like a hang, but it was
+> **slowness**: with **JIT enabled** and a 300s deadline the same boot blows *past* the entire DB
+> layer — through the JPA Startup Thread, the real Agroal datasource connect, Hibernate
+> SessionFactory + Liquibase — and reaches **RESTEasy Reactive deployment**
+> (`ApplicationImpl.<clinit>` pc≈790 → `ResteasyReactiveProcessor$setupDeployment.deploy_41` →
+> `RuntimeDeploymentManager.deploy` → `createDeployment`, plus generated-serializer class loading
+> via `RunnerClassLoader`/`JarFileReference.consumeSharedJarFile`). The main thread is **actively
+> running** there (the watchdog dump shows main at varying stack depths 16→44, not a fixed
+> wait-site), and the "**1425 threads dumped**" banner is the known watchdog re-dump artifact (every
+> entry is `name="main"`), NOT a thread explosion. So the Agroal fix unblocks Gap 8 in substance —
+> the DB layer completes — and the remaining wall is that the boot is **~15×+ slower than HotSpot's
+> 21 s** (HotSpot reaches `Listening on http://localhost:8080`). RESTEasy deployment is the *last*
+> phase before HTTP bind. Confirmed against the HotSpot oracle: HotSpot's boot logs the SAME benign
+> `HHH10001005 … connection was null / undefined-unknown / Database version 2.4.240 / Stop region
+> factory` block, then a dedicated **"JPA Startup Thread"** does `Started datasource <default>
+> connected to jdbc:h2:file:…keycloakdb;NON_KEYWORDS=VALUE;DB_CLOSE_ON_EXIT=FALSE;DB_CLOSE_DELAY=0`
+> → SessionFactory → Vert.x/Netty → `Listening` (21 s). Next-session start: (a) run the JIT boot
+> with a longer deadline / at `--log-level=info` (the default boot emits 31 k TRACE/DEBUG lines —
+> the logging itself is a large tax) to confirm it reaches `Listening`; (b) profile the slow phases
+> (JIT tier-up coverage of the Hibernate/RESTEasy hot loops; the `NestedPropertyMappingInterceptor`
+> config-resolution recursion seen on the hot stack; the per-class `RunnerClassLoader` jar reads).
+> Once it reaches `Listening`, flip the Agroal gate to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`).
+>
+> **CORRECTION / refinement — Gap 9 is BOTH throughput AND a nondeterministic native stall.** A
+> third run (JIT, 580s deadline) did NOT match the lucky 300s run: it stalled again right after
+> `Hibernate Validator` with only 3 threads (main + `Thread-1` daemon + `Timer`), main parked in
+> `waitForExit`, `Thread-1` (the JPA Startup Thread) **stuck in Rust native** (undumpable). So the
+> boot is **nondeterministic**: sometimes it progresses past the DB layer into RESTEasy deployment
+> (proving the Agroal fix works end to end), other times the JPA Startup Thread wedges in native
+> before `Started datasource` while main parks prematurely in `waitForExit` (the persistence unit
+> never completes, no HTTP bind). That premature-park + native-stuck-worker pattern smells like a
+> concurrency / GC-vs-parked-thread race (cf. the FJP root-reclaim and ES reactor-worker entries),
+> NOT pure slowness. **Concrete evidence:** the stalling run logged
+> `cratonvm_vm::jit::conservative_roots: scan_active_jit_frames: another thread holds live JIT
+> frames while this thread's JIT chain is empty … the documented multi-thread-in-JIT-under-STW gap …
+> cross_thread_jit_gap_hits=1/2`. I.e. a stop-the-world GC fired while `Thread-1` (the JPA Startup
+> Thread) was executing JIT'd code with live roots the cross-thread root scanner could not see —
+> covered only by a possibly-stale `root_snapshot`. A dropped live root → freed-then-used object →
+> the worker wedges. This is the SAME tracked GC×JIT precise-roots gap as the
+> precise-JIT-stack-maps / FJP-root-reclaim / ReflRepro-A2 work (register-resident / cross-thread
+> JIT roots under STW), surfacing here because the boot is the first multi-threaded-JIT app to drive
+> it under real GC pressure. NOTE: `--Xmx 6g` does NOT avoid it (tested) — a larger *max* heap does
+> not reduce *young-gen* STW frequency, and the gap fires during young collections; so heap size is
+> not the lever here (unlike the ES `6g→0` case, which was a different GC behaviour). The warning is
+> conditional ("a stale snapshot *would* drop a live root"): it fires on essentially every run, but
+> the boot only *wedges* on the runs where a root is actually dropped — matching the observed
+> nondeterminism (same binary: one run reaches RESTEasy, others wedge at the JPA Startup Thread).
+> The real fixes are the tracked precise-roots ones: `CRATONVM_SHADOW_STACK` precise JIT roots and
+> the cross-thread STW JIT-root-scan follow-up (`CRATONVM_STRICT_JIT_ROOTS=1` makes the gap fatal,
+> useful to force/locate a drop). This is squarely the precise-JIT-stack-maps program's work. (`--log-level=info` did not take effect — the boot still emitted TRACE/DEBUG —
+> so the logging-tax hypothesis for the slowness is still untested; set the level via `keycloak.conf`
+> / `quarkus.log.level` next time.) Net: the **deterministic** Gap-8 Agroal blocker is fixed and the
+> DB layer is reachable; the remaining Gap-9 frontier is (1) a nondeterministic JPA-Startup-Thread
+> native stall (get its wait-site — it is the single highest-value next step) and (2) raw throughput.
+> Do NOT flip the Agroal gate to default-on until the boot reaches `Listening` reliably.
+>
+> **CONFIRMED after syncing to `dev` (53 commits) + testing the precise-roots opt-in.** The branch
+> was merged up to `dev` — including `5085b137 fix(gc): forward monitor + native roots on
+> safepoint-resume path` and the ES GC root-cause wave — and rebuilt. The Gap-9 wedge **still
+> reproduces** (boot wedges at the JPA Startup Thread, `cross_thread_jit_gap` fires twice), so dev's
+> current GC root-safety fixes do NOT close it. **`CRATONVM_SHADOW_STACK=1` also wedges** — and the
+> code shows why: the cross-thread STW collector (`thread_registry::collect_all_root_snapshots`)
+> reads ONLY each thread's *deposited* `root_snapshot`; it does no cross-thread stack scan, and
+> `CRATONVM_SHADOW_STACK` only changes how a thread scans *its own* (thread-local) roots — it does
+> not address the *staleness* of a peer's deposited snapshot. `wait_for_all` is cooperative (threads
+> arrive via `arrive_and_wait`), and the interpreter safepoint (interpreter.rs:1750) + GC initiator
+> (`maybe_gc_forced`, :618) both `update_root_snapshot` before parking — so the residual drop is a
+> subtle path where a JIT worker's deposited snapshot is stale at the moment a peer's STW collector
+> reads it. **The fix is a real cross-thread STW JIT-root scan**: at the safepoint, capture each
+> parked worker's `(JIT spill range / SP, stack_high)` and have the collector walk it directly. A
+> *conservative* peer-stack scan is provably sound here (GC is forced non-moving while any thread is
+> in JIT — over-rooting can only retain, never corrupt), but it is still a GC-core change that must
+> be validated against the precise-JIT GC oracle (bintrees18=68332206, pool 18/18). **Ownership:**
+> this is the precise-JIT-stack-maps program's tracked follow-up (worktree `CratonVM-pjsm` /
+> `feat/shadow-stack-followups`, whose §4 multi-thread work is partially done) — it should land there
+> and reach `dev`, NOT as a drive-by in this datasource branch. Once it lands, re-run this boot; the
+> Agroal gate can then flip to default-on.
+>
+> **MAJOR REFINEMENT (2026-06-20, deeper code read + `CRATONVM_STRICT_JIT_ROOTS` boot) — a
+> cross-thread STACK scan is REDUNDANT; the real drop is REGISTER-RESIDENT.** Reading the park path:
+> `safepoint_check` (interpreter.rs:1742-1750) already calls `invalidate_scan_cache_for_gc()` (which
+> bumps the JIT-boundary gen → forces a *fresh* scan) and then `update_root_snapshot`, whose
+> `scan_active_jit_frames` conservatively scans `[scanner_sp, entry_sp]` for **every** JIT entry —
+> i.e. the parked peer's **entire JIT stack region**, fresh, into its deposited `root_snapshot`. Both
+> park paths (`safepoint_check`; the blocking-native `deposit_root_snapshot`) go through this. So the
+> collector, via `collect_all_root_snapshots`, **already has every parked peer's JIT *stack* roots.**
+> A collector-side conservative `[park_sp, stack_high]` re-scan would cover the *same* stack range
+> (plus interpreter frames already covered) → **provably redundant; it cannot fix the wedge.** A
+> `CRATONVM_GC_VERIFY_STALE=1 CRATONVM_STRICT_JIT_ROOTS=1` boot confirmed the *condition* (panic on
+> `Thread-1`, an `InnocuousThread` acting as GC collector, `GLOBAL_JIT_DEPTH=3` — genuinely
+> concurrent multi-thread JIT) but the deposit covers those stack roots. Therefore the residual
+> dropped root is **REGISTER-RESIDENT** — a live oop held in a register (not spilled to the stack) at
+> the GC safepoint, which **no** stack scan (deposit-side or collector-side) can see. This is exactly
+> the `reference_reflrepro_a2_register_root` class. **Correct fix = JIT codegen, not a scan:** spill
+> every live-oop GPR (incl. caller-saved / `rax`) across safepoints, OR emit precise oop maps that
+> record register locations (`CRATONVM_PRECISE_JIT_MAPS` path). This is the precise-JIT-stack-maps
+> program's core remaining work. Diagnostic to pin the exact oop: `CRATONVM_GC_VERIFY_STALE=1` WITHOUT
+> `STRICT` (so it doesn't abort on the benign conservative condition first), then inspect the
+> zeroed-header report. **Do NOT implement the cross-thread stack scan — it is redundant.**
+>
+> **DECISIVE REFUTATION (2026-06-20) — Gap 9 is NOT a missed GC root at all (register-resident
+> hypothesis REFUTED).** I implemented `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` (jit/src/x64.rs):
+> blind-spill the FULL 14-GPR file (rax,rcx,rdx,rbx,rsi,rdi,r8–r15) to reserved frame slots at every
+> GC-capable safepoint — the maximal A2-class register-spill (caller-saved + arg + rax + callee-saved).
+> **Confirmed engaged** by `CRATONVM_DBG_JIT_DISASM`: `AllocProbe.run` emits all 14 `mov [rbp-…],reg`
+> stores immediately before the `new` call. **GC-correct:** bintrees18 == 68332206 (golden) with the
+> flag on, identical perf (38.6 s vs 38.8 s). **Yet the Keycloak boot STILL wedges** at the same
+> point. Since the conservative scan covers that spill region and the spill captures *every* register,
+> a missed register-resident root is impossible — and the four other levers also failed:
+> `CRATONVM_JIT_SAFEPOINT_REG_SPILL=1` (callee-saved), `CRATONVM_SHADOW_STACK` (operand-stack register
+> oops), `CRATONVM_DBG_FULLSTACK_SCAN` (collector's whole stack), `CRATONVM_GC_VERIFY_STALE` (0
+> parked-interpreter-local zeroed-header hits). **Five independent root-coverage mechanisms fail ⇒ the
+> wedge is NOT a dropped GC root** (not interpreter-local, not operand-stack/callee-saved/caller-saved/
+> arg/rax-register, not collector-stack). The `cross_thread_jit_gap` warning is a CONSERVATIVE red
+> herring (it fires on any multi-thread-in-JIT-under-STW, regardless of an actual drop). **New
+> hypotheses (root-drop ruled out):** (a) a **JIT miscompile** → the JPA-startup worker spins in
+> wrong control flow; (b) a **concurrency deadlock/livelock** (a VM lock/future/AQS that never
+> releases); (c) a **native-call hang** (the worker stuck in a Rust native). Next decisive
+> discriminator: a `--nojit` boot with a long deadline — if it progresses past the wedge (just slow),
+> it's a JIT miscompile; if it also wedges, it's concurrency/native. Also: pin the worker's native
+> wait-site (it's undumpable by the Java-frame watchdog). The `=all` spill is retained as a
+> GC-validated, default-off diagnostic lever (not a fix for this bug). **Net: stop chasing GC roots
+> for Gap 9.**
+>
+> **LOCALIZATION via `cdb` + sleep tracing (2026-06-20) — it is a Rust-internal `std::thread::sleep`
+> poll-loop, NOT a Java-level wait, NOT JIT.** Confirmed `--nojit` wedges identically with the SAME
+> signature (main parked in `waitForExit`; the wedged worker undumpable by the Java-frame watchdog),
+> so JIT-miscompile is ruled out too. Attached `cdb` (Win10 debugger) to the live hung process
+> (`CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` so it doesn't self-abort): the wedged OS thread `"Thread-1"`
+> is in `std::thread::sleep` ← `std::sys::thread::windows::sleep` ← `CreateWaitableTimerExW` (a
+> *Rust* sleep, deep under interpreter/JIT frames); a separate `"main-vm"` OS thread is blocked in
+> `ntdll!ZwReadFile` (a synchronous handle read); OS `"main"` is in `NtWaitForSingleObject` (the
+> `waitForExit` park). Added a gated `CRATONVM_DBG_SLEEP_TRACE` (`native-builtins/src/lang_system.rs`)
+> that dumps the Java caller chain at `Thread.sleep`/`sleepNanos`/`join(timeout)` — it fired **0**
+> times during the wedge, proving the worker's sleep is NOT `java.lang.Thread.sleep`/`join` (and the
+> object monitor uses a real `parking_lot::Condvar`, not sleep-poll). So the loop is a *VM-internal*
+> Rust sleep-retry whose exact site is still unpinned because the release build (`strip=debuginfo`,
+> `debug=false`) leaves `cdb` resolving every private frame to `socket_addr::impl$6::fmt+<offset>`
+> (garbage). HotSpot oracle: after Hibernate Validator, the JPA Startup Thread does `Started
+> datasource` → SessionFactory, then *main* runs a burst of `JtaTransactionWrapper` commits
+> ("Non-HTTP task" — Keycloak DB bootstrap) → `Listening`. On CratonVM the log freezes right at
+> Hibernate Validator (none of that happens) and main reaches `waitForExit` without binding HTTP.
+> **Next-session unblock (highest leverage):** rebuild with full symbols (`[profile.release]
+> debug=2, strip="none"`) and re-attach `cdb` → real function names for `Thread-1`'s sleep-loop AND
+> `main-vm`'s `ZwReadFile` (use `!handle @rcx f` on `main-vm` to identify the file/socket it blocks
+> on — likely the actual wedge, with `Thread-1` merely polling for its result). Then fix that
+> primitive. This is a deep, nondeterministic concurrency/startup bug; the originally-assumed
+> register-resident-root cause is DISPROVEN.
+>
+> **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
+> (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
+> entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
+> (key=0) but not real-JDK nodes (hash=0, key=1, so field 0 is the int hash). Rewrote `store` to
+> use the layout-aware `map_collect_entries` (the collector behind `entrySet()`/`toString()`) +
+> JDK `saveConvert` escaping + the real `#`-prefixed comment format; fixed `props_collect_keys`
+> likewise. Affects every `Properties.store` consumer; surfaced here because H2's `AUTO_SERVER`
+> `FileLock` does a save→load→equals watchdog that an entry-less file fails ("Concurrent update").
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →

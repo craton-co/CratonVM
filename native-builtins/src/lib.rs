@@ -2005,7 +2005,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     apps_h2::register_h2_table_filter_prepare(registry);
 
     // T19.8: Agroal (Quarkus) + IronJacamar (WildFly) JDBC pool natives.
-    agroal_pool::register_agroal_natives(registry);
+    // real-cdi-bean-container (Keycloak Gap 8): under `CRATONVM_REAL_AGROAL`
+    // the shim is suppressed so the real `io.agroal.pool.*` container bytecode
+    // runs over the real `org.h2.Driver`. The shim's interface-typed config
+    // object otherwise collides with the real `DataSourceProvider` bytecode
+    // (AbstractMethodError on `dataSourceImplementation()`). See `real_agroal`.
+    if !real_agroal() {
+        agroal_pool::register_agroal_natives(registry);
+    }
     ironjacamar_pool::register_ironjacamar_natives(registry);
     // T19.10: Infinispan local-mode cache (DefaultCacheManager + Cache).
     infinispan_local::register_infinispan_natives(registry);
@@ -40245,6 +40252,29 @@ pub fn real_proxy_super() -> bool {
         // Unset (the default): real `java.lang.reflect.Proxy` super.
         Err(_) => true,
     }
+}
+
+/// real-cdi-bean-container — Agroal datasource shim gate (Keycloak Gap 8).
+///
+/// When ON, the `agroal_pool.rs` native shim is **not** registered, so
+/// Quarkus/Keycloak run the **real** `io.agroal.pool.DataSource` /
+/// `ConnectionPool` / `AgroalDataSourceConfigurationSupplier` bytecode over the
+/// (working) real `org.h2.Driver`. The shim's
+/// `AgroalDataSourceConfigurationSupplier.get()` native returns a synthetic
+/// object typed as the bare interface `AgroalDataSourceConfiguration` (no
+/// method bodies); the real downstream `DataSourceProvider.getDataSource`
+/// bytecode then does `invokeinterface config.dataSourceImplementation()` and
+/// hits the abstract method → `AbstractMethodError`. So the shim and the real
+/// container bytecode are mutually exclusive on this path.
+///
+/// Currently **opt-in** (`CRATONVM_REAL_AGROAL=1`), default = the legacy shim,
+/// while the real pool's concurrency (housekeeping executor + AQS synchronizer)
+/// is being validated. Once the real path is green by default this flips to
+/// opt-out (`CRATONVM_SYNTHETIC_AGROAL`), mirroring the AQS / Spring-startup
+/// precedents.
+pub fn real_agroal() -> bool {
+    std::env::var_os("CRATONVM_REAL_AGROAL").is_some()
+        && std::env::var_os("CRATONVM_SYNTHETIC_AGROAL").is_none()
 }
 
 /// The internal name of the super class generated `$ProxyN` proxies extend,
