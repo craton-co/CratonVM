@@ -7,14 +7,16 @@
 | **CratonVM** | a `String` literal reads back as a `java.lang.Object` instance (`toString()` = `java.lang.Object@<hash>`) |
 | **HotSpot JDK 25** | n/a (string identity stable) |
 | **CratonVM HEAD** | `8e8e47d9` (original suite run) |
-| **Status** | 🟡 **OPEN / needs batch re-verify** (2026-06-20). **Not observed** on dev `697134f8` in the 2026-06-20 per-class + small-batch runs (status fields are clean `OK`/`FAIL`, no `java.lang.Object@…`). Family-A precise-maps are default-on now, and the `ReferencePipeline.toArray(IntFunction)` self-recursion that destabilised the JUnit launcher under load is fixed (`8795b88d`). A large single-JVM batch is still needed to confirm it no longer reproduces before this can be archived. |
-| **Suggested owner** | GC-focused; confirm via a big batch, then archive |
+| **Status** | 🟢 **NOT REPRODUCED 2026-06-20 (likely resolved — watch)**. A **45-class single-JVM batch** on dev (`cratonvm-spring0620-dev`, merged dev `2a721c59`) ran **clean**: 0 `status=java.lang.Object@…`, all 45 `status=OK`, `rc=0`. Family-A precise-maps are default-on, and the `ReferencePipeline.toArray(IntFunction)` self-recursion that destabilised the JUnit launcher under load is fixed (`8795b88d`). Kept (not archived) only because the *original* repro used spring-context/validation classes — a larger cross-module batch should confirm before archival. |
+| **Suggested owner** | GC-focused; one cross-module batch to confirm, then archive |
 
-> **2026-06-20 note.** The original repro relied on the old `KRun` harness corrupting its own
-> `"OK"`/`"FAIL"` literals across a heavy batch JVM on binary `8e8e47d9`. On dev `697134f8`
-> (build `cratonvm-spring0620`) the recreated `KRun` reports clean `status=` fields across all
-> 2026-06-20 runs to date. Because the corruption is load-dependent it must be re-checked with a
-> large single-JVM batch (the per-class runs below do **not** build the required GC pressure).
+> **2026-06-20 batch re-verify.** The original repro relied on the old `KRun` harness corrupting
+> its own `"OK"`/`"FAIL"` literals across a heavy batch JVM on binary `8e8e47d9`. On the merged dev
+> build the recreated `KRun` runs a **45-class single-JVM spring-core batch** (accumulated GC
+> pressure) with **zero** corrupted `status` fields — all clean `OK`. Per-class runs throughout
+> 2026-06-20 are likewise clean. The corruption is load-dependent, so a still-larger cross-module
+> batch (spring-context + validation, where it was first seen) is the remaining check before this
+> doc is archived to `docs/internal/fixed-suite-bugs/`.
 
 ## Symptom
 In the batched suite run, ~6 classes recorded a `status` field of `java.lang.Object@<hash>` instead of
