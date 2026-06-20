@@ -3767,18 +3767,33 @@ fn apply_ea_to_ir(
                 },
             };
 
-            if ea_field_idx < info.field_values.len() {
-                if let Some(ea_val) = info.field_values[ea_field_idx] {
-                    if let Some(&ir_val) = reverse_map.get(&ea_val) {
-                        // Redirect: replace all references to ir_load with ir_val
-                        // across the entire IR graph.
-                        let load_id = ir_load;
-                        for node in ir_graph.nodes.iter_mut() {
-                            for inp in node.inputs.iter_mut() {
-                                if *inp == load_id {
-                                    *inp = ir_val;
-                                }
-                            }
+            // The value the load resolves to: the stored field value, or — when
+            // the field was never stored (`field_values[idx] == None`) — the
+            // freshly-allocated object's zero default. WITHOUT the latter, a
+            // load of an un-stored field was killed below with NO replacement,
+            // leaving its consumers reading a dead node (a miscompile that was
+            // latent only because scalar replacement does not yet fire on
+            // production IR). A `Const(0)` is the correct default for a
+            // zero-initialised object's int field. (Soundness depends on the
+            // object being genuinely zero-initialised — the caller must only
+            // admit allocations whose constructor sets no non-zero field.)
+            let replacement: Option<ir::NodeId> = if ea_field_idx < info.field_values.len() {
+                match info.field_values[ea_field_idx] {
+                    Some(ea_val) => reverse_map.get(&ea_val).copied(),
+                    None => Some(ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None)),
+                }
+            } else {
+                None
+            };
+
+            if let Some(ir_val) = replacement {
+                // Redirect: replace all references to ir_load with ir_val
+                // across the entire IR graph.
+                let load_id = ir_load;
+                for node in ir_graph.nodes.iter_mut() {
+                    for inp in node.inputs.iter_mut() {
+                        if *inp == load_id {
+                            *inp = ir_val;
                         }
                     }
                 }
@@ -5560,6 +5575,77 @@ mod tests {
         assert!(
             result.scalar_replaceable.is_empty(),
             "an escaping New must not be scalar-replaceable"
+        );
+    }
+
+    // A non-escaping New whose field is LOADED but never STORED is scalar-
+    // replaced, and the load of that field must resolve to the zero default
+    // (`Const(0)`) of the freshly-allocated object — NOT be killed without a
+    // replacement (the latent `apply_ea_to_ir` bug). Soundness rests on the
+    // object being zero-initialised (the caller only admits allocations whose
+    // constructor sets no non-zero field).
+    #[test]
+    fn ea_unstored_field_load_resolves_to_zero_default() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let off1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off0, val],
+            None,
+        );
+        // Load field 1 — never stored.
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off1],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "a non-escaping new is scalar-replaceable even with an un-stored field"
+        );
+        apply_ea_to_ir(&mut g, &id_map, &result);
+        assert!(
+            !g.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is scalar-replaced away"
+        );
+        let ret_node = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret_node.inputs[1];
+        assert_eq!(
+            g.nodes[retval as usize].op,
+            Op::Const(0),
+            "the un-stored field's load must resolve to the zero default"
         );
     }
 
