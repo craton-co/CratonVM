@@ -5,7 +5,16 @@
 > **H1** JAXB class-load storm is fixed on `dev` (`1db07c35`/`25c42e13`); **H2** ByteBuddy `MethodGraph`
 > JoinedSubclass bootstrap completes in ~16s `--nojit` (no stall); **H3** JTA/socket = an `accept()`
 > deadlock, fixed on branch `fix/hib-jta-xa-loopback`. See the per-cluster docs (now in `docs/internal/`).
-> H4 (JSON unnest) was not re-checked. The real Hibernate JUnit launcher works on CratonVM —
+> **H4 re-checked 2026-06-20 — STILL HANGS, and re-attributed: it is NOT a JSON-function bug.** Run via the
+> JUnit launcher (`function.json.JsonArrayUnnestTest`, with `hibernate-community-dialects` added to the cp),
+> the 120s watchdog pins the main thread in the **HQL/ANTLR parser** —
+> `HqlParser.selectStatement → selectClause → selectionList → selection → selectExpression` — called from
+> `JsonArrayUnnestTest.lambda$testUnnestOrdinality$0` (a test *query*, not bootstrap, not JSON-function
+> rendering). All 6 watchdog samples show the same 5 frames ⇒ an HQL-parser infinite-loop-or-severe-slowness.
+> Same area as the deferred ANTLR deep-recursion / interpreter-throughput cluster (cf. bug C
+> `springrepos-extension-hang-jit-throughput-and-deep-recursion` and the "instance methods don't tier-up"
+> note). 🔴 **OPEN** (deeper, separate from the resolved H1–H3).
+> The real Hibernate JUnit launcher works on CratonVM —
 > `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
 > non-reproducing transient — see
 > [`../internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)).
@@ -53,9 +62,18 @@ Same family as the JTA crash cluster. See (now in `docs/internal/`)
 **Classes:** `connections.ThreadLocalCurrentSessionTest` (and the `connections`/`transaction` crash classes
 that hang rather than crash depending on which JTA platform/socket path is hit).
 
-## Cluster H4 — JSON function (post-fix slow / unnest) — likely tied to JSON work
-`function.json.JsonArrayUnnestTest` — JSON-function family (the 4 JSON SIGSEGV classes are fixed this run;
-this one timed out rather than crashing). Re-check after the `al_state` fix.
+## Cluster H4 — HQL/ANTLR parser hang in `testUnnestOrdinality` (🔴 OPEN — re-attributed, NOT JSON)
+`function.json.JsonArrayUnnestTest` — re-checked 2026-06-20 on current `dev` via the JUnit launcher
+(needs `hibernate-community-dialects` on the cp — `DialectFeatureChecks` statically references `TiDBDialect`;
+without it the container fails fast with `NoClassDefFoundError`, which is a harness artifact, not the bug).
+With the dialect on the cp it **hangs (rc=124)**. The 120s watchdog pins the main thread in the HQL parser
+(`HqlParser.selectExpression` ← `selection` ← `selectionList` ← `selectClause` ← `selectStatement`), driven
+from `JsonArrayUnnestTest.lambda$testUnnestOrdinality$0` — i.e. parsing a **test HQL query**, not bootstrap,
+not the 4 JSON SIGSEGV classes (those are fixed) and not JSON-function SQL rendering. All 6 watchdog samples
+catch the same 5 parser frames ⇒ an HQL-parser infinite-loop or severe interpreter slowness. This is the
+**deferred ANTLR deep-recursion / interpreter-throughput cluster** (cf.
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)
+and the "instance methods don't invocation-tier-up" perf note), **not** a JSON defect.
 
 ## Environmental (NOT a CV-only bug)
 `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` — **HotSpot also HANGs** on this class
@@ -69,5 +87,5 @@ this one timed out rather than crashing). Re-check after the `al_state` fix.
 | H1 JAXB class-load storm | class-loading rescan storm (NOT `retainAll`) | ✅ **fixed on dev** (`1db07c35`/`25c42e13`) |
 | H2 ByteBuddy `MethodGraph` | bootstrap proxy gen | ✅ **does-not-reproduce** — JoinedSubclass boots ~16s `--nojit` |
 | H3 JTA / socket | `accept()` deadlock (NOT loopback-pairing) | ✅ **fixed** on branch `fix/hib-jta-xa-loopback` (`e0426050`) |
-| H4 JSON unnest | likely interpreter-slow | ⚪ not re-checked |
+| H4 `JsonArrayUnnestTest` | HQL/ANTLR parser hang in `testUnnestOrdinality` (NOT JSON) | 🔴 **OPEN** — re-confirmed 2026-06-20; deferred parser-throughput/deep-recursion cluster |
 | DefaultCatalogAndSchema | environmental (HS hangs too) | — excluded |
