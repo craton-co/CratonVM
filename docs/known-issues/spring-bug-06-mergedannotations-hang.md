@@ -28,13 +28,26 @@
 > and the cached path are NEVER reached. So the inherited `ReferencePipeline.toArray()` frame resolves its
 > own constant-pool method-ref against the WRONG class (the receiver subclass `IntPipeline$1`, not the
 > declaring class `ReferencePipeline`) → `toArray()`→`toArray()` forever. Normal inherited calls use the
-> fast/cached path (CP-correct), which masks this; it surfaces only for the slow/uncached inherited
-> dispatch on a receiver whose runtime class ≠ the inherited method's declaring class.
+> fast/cached path, which masks this; it surfaces only for the slow/uncached inherited dispatch on a
+> receiver whose runtime class ≠ the inherited method's declaring class.
 >
-> **Same bug as [[bug06-fam6-annotation-synthesis-mergedannotation]]'s "~2 GB OOM".** OPEN — fix is in the
-> slow inherited-method dispatch (frame constant-pool class), a core path; needs careful work + full
-> regression. A safer interim mitigation: prevent the stream-factory natives (`OptionalInt.stream`,
-> `mapToObj`) from promoting to real JDK bytecode so the chain stays on the working synthetic-stub path.
+> **UPDATE 2 (2026-06-20, deeper trace — the "wrong-CP-class" guess above is DISPROVEN):** Instrumented
+> `execute_invoke_kind` confirms the running `ReferencePipeline.toArray()` frame's `class_id` IS
+> `ReferencePipeline` (correct) and its `invokevirtual #219` resolves to `ReferencePipeline.toArray(IntFunction)`
+> (correct, `javap`-verified). EVERY overload-resolution layer is descriptor-correct: CP resolution,
+> `Class::find_method` (name+desc), `find_method_recursive` (name+desc), `Vtable::lookup_slot` (verifies
+> name+desc), and the intrinsic table (no `toArray` entry). So the hang is **NOT a dispatch / overload-resolution
+> bug.** The no-arg `toArray()` self-recursion happens DESPITE correct resolution — the real
+> `toArray(IntFunction)` body, when evaluated over a **synthetic-stub-sourced `IntPipeline$1`** (its upstream
+> is the `OptionalInt.stream()`/`mapToObj` interface-classed stub), re-enters no-arg `toArray()` through a
+> native (`evaluateToArrayNode`/`Node.asArray`/`spliterator` on the stub) instead of draining elements. The
+> recursion is therefore in the **synthetic stream pipeline evaluation**, not the interpreter dispatch.
+>
+> **Same bug as [[bug06-fam6-annotation-synthesis-mergedannotation]]'s "~2 GB OOM".** OPEN. Recommended fix
+> direction (safer, verifiable with `spring-suite/probe/ISn.java`): keep the stream chain on the synthetic-stub
+> path — prevent the stream-factory natives (`OptionalInt.stream`, `IntStream.mapToObj`, …) from being bypassed
+> by the native→bytecode promotion (force-native), so a real `ReferencePipeline.toArray()` never runs over a
+> stub-sourced pipeline. (`ISt.java` = `mapToObj().toArray()` looped 3000× completes on the stub path.)
 
 | | |
 |---|---|
