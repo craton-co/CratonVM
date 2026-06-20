@@ -117,19 +117,21 @@ pub fn intrinsics_disabled() -> bool {
 /// the HotSpot-style `Cannot <action> because "<expr>" is null` message
 /// instead of their older ad-hoc null-NPE text.
 ///
-/// DEFAULT-OFF: routing these opcodes through the JEP 358 helper changes the
-/// user-visible NPE message string for every one of them (the single most
-/// common is `getfield`), and some test suites assert the current ad-hoc
-/// wording. Keeping it behind an explicit opt-in means the default path is
-/// byte-for-byte unchanged and can't regress while the new shape is rolled
-/// out. The increment-1 invoke-site message is unconditionally on (it shipped
-/// already) and is unaffected by this flag. Semantics match `disable_jit()`:
-/// empty or `"0"` is off, anything else is on.
-/// Process-global override set once at VM init from the parsed
+/// DEFAULT-ON (Increment 5): the differential compliance run confirmed these
+/// messages are byte-identical to HotSpot's `getExtendedNPEMessage`, so the
+/// `vm-cli` launcher now resolves an absent flag to **on** (matching HotSpot)
+/// and calls [`set_show_code_details_in_exception_messages`] accordingly. The
+/// increment-1 invoke-site message is unconditionally on (it shipped already)
+/// and is unaffected by this flag. The `CRATONVM_HELPFUL_NPE_OPCODES` env var
+/// (empty/`"0"` off, anything else on) still overrides everything.
+///
+/// Process-global, set once at VM init from the parsed
 /// `-XX:±ShowCodeDetailsInExceptionMessages` flag (see
-/// [`set_show_code_details_in_exception_messages`]). `-1` = unset (use the
-/// built-in default), `0` = off, `1` = on. The `CRATONVM_HELPFUL_NPE_OPCODES`
-/// env var, when present, takes precedence over this.
+/// [`set_show_code_details_in_exception_messages`]). `-1` = `set()` never
+/// called, `0` = off, `1` = on. The `-1` sentinel reads as **off** so a host
+/// that embeds the VM without wiring the flag (and the in-process Rust test
+/// harness, which never calls `set()`) keeps the legacy strings; the CLI always
+/// calls `set()` with the resolved value, so app runs get the on default.
 static SHOW_CODE_DETAILS: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 /// Apply the HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` VM flag. Called
@@ -152,9 +154,10 @@ pub fn helpful_npe_opcodes() -> bool {
     if let Some(b) = env {
         return b;
     }
-    // Otherwise honor `-XX:±ShowCodeDetailsInExceptionMessages`; an unset
-    // override falls back to the built-in default (off, pending the compliance
-    // soak — HotSpot's own default is on).
+    // Otherwise honor `-XX:±ShowCodeDetailsInExceptionMessages`. The CLI
+    // resolves an absent flag to the on default and calls `set()`, so `== 1`
+    // here yields the HotSpot-matching default for app runs; the `-1` sentinel
+    // (set() never called) stays off for embedders/tests that don't wire it.
     SHOW_CODE_DETAILS.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 

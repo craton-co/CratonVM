@@ -25,6 +25,10 @@ vm-tests = []
 
 [dev-dependencies]
 cratonvm-gc = { path = "../gc", version = "0.3.0" }
+# Used by the ir_vs_singlepass differential harness to build CachedBytecodeMethod
+# (its declaring_class_id is a cratonvm_types::ClassId). `cratonvm-types` is also
+# a normal dependency, but integration tests only see dev-dependencies directly.
+cratonvm-types = { path = "../types", version = "0.3.0" }
 
 [lints]
 workspace = true

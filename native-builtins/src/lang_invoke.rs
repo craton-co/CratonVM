@@ -3091,35 +3091,290 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+/// `MethodHandles.constant(Class type, Object value)` — a *functional*
+/// shim that returns an `MH_KIND_CONSTANT` handle which, when invoked,
+/// yields the captured `value`.
+///
+/// Promoted to the real-JDK essentials path (see `register_builtins`) — and
+/// allow-listed in `vm/src/vm/vm_exec.rs`'s `check_override` gate — because
+/// the genuine JDK `MethodHandles.constant` bytecode runs the runtime
+/// `BoundMethodHandle` *species* generator (`ClassSpecializer`), which the
+/// VM's `MH_KIND_*` shim model does not implement. That path NPEs at
+/// `ClassSpecializer.generateConcreteSpeciesCode` (the generated species
+/// class came back without working species-data linkage), wrapped as
+/// `ExceptionInInitializerError` for `BoundMethodHandle`. `SwitchPoint.<clinit>`
+/// builds two constant handles (`K_true`/`K_false`), and Apache Groovy's
+/// `IndyInterface.<clinit>` initializes a `SwitchPoint` before any script
+/// runs — so without this shim every Groovy `invokedynamic` site is dead.
+/// This mirrors the existing `register_array_element_accessor_bridges`
+/// pattern (another concrete `MethodHandles` static factory whose JDK
+/// bytecode CratonVM cannot execute).
+pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "constant",
+        "(Ljava/lang/Class;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            // arg0 = return type (Class mirror); arg1 = the (boxed) value.
+            let ret_desc = match args.first() {
+                Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
+                _ => DESC_OBJECT.to_string(),
+            };
+            let desc = format!("(){ret_desc}");
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT);
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(handle, MH_BOUND, value);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `MethodHandles.identity(Class type)` — a *functional* shim returning an
+/// `MH_KIND_IDENTITY` handle of type `(type)type` that returns its argument.
+///
+/// Promoted to the real-JDK essentials path + `check_override`-allow-listed
+/// for the same reason as `constant`: in real-JDK mode the genuine
+/// `MethodHandles.identity` bytecode yields a real
+/// `MethodHandleImpl$IntrinsicMethodHandle` (and, via its primitive paths, a
+/// `BoundMethodHandle` species), a real handle the `MH_KIND_*` shims cannot
+/// read — so `identity().invoke()` / `.bindTo()` fail (OOB field reads on
+/// slots 16–19). Groovy's `IndyInterface` and any `SwitchPoint`/dispatch chain
+/// that threads values through `identity` needs this.
+pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "identity",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let ty = match args.first() {
+                Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
+                _ => DESC_OBJECT.to_string(),
+            };
+            let desc = format!("({ty}){ty}");
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
+/// `VolatileCallSite`) — a *functional* shim returning an
+/// `MH_KIND_DYNAMIC_INVOKER` handle bound to the call site. On invocation it
+/// reads the site's current `target` and delegates to it.
+///
+/// Promoted to the real-JDK essentials path + `check_override`-allow-listed
+/// because the real `CallSite.makeDynamicInvoker` does
+/// `getTargetHandle().bindArgumentL(0, this)` — a `BoundMethodHandle`
+/// construction that hangs on CratonVM (no real species machinery).
+/// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this shim
+/// every `new SwitchPoint()` — and therefore Apache Groovy's
+/// `IndyInterface.<clinit>` at runtime — hangs.
+pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for cs in [
+        "java/lang/invoke/MutableCallSite",
+        "java/lang/invoke/VolatileCallSite",
+    ] {
+        r.register(
+            cs,
+            "dynamicInvoker",
+            "()Ljava/lang/invoke/MethodHandle;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                // Derive the invoker's descriptor from the current target so
+                // `mh.type()` / arity checks see the right shape; default to a
+                // nullary Object-returning type when the target is unreadable.
+                let desc = callsite_target_desc(ctx, this)
+                    .unwrap_or_else(|| format!("(){DESC_OBJECT}"));
+                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER);
+                ctx.set_field(handle, MH_BOUND, Value::Object(Some(this)));
+                Ok(Some(Value::Object(Some(handle))))
+            },
+        );
+    }
+    r.set_category(__prev_cat);
+}
+
+/// Functional `MethodHandles.insertArguments` / `MethodHandle.asCollector`
+/// plus the `CallSite`-construction natives Apache Groovy's `IndyInterface`
+/// fallback relies on (`CallSite.makeUninitializedCallSite`,
+/// `MutableCallSite.setTarget`). Promoted to the real-JDK essentials path +
+/// `check_override`-allow-listed.
+///
+/// Why these are needed in real-JDK mode:
+/// * `insertArguments` was a no-op synthetic stub (it dropped the bound
+///   values); in real-JDK boot the genuine bytecode builds a
+///   `BoundMethodHandle` species the VM can't run.  Groovy binds the call
+///   site + dispatch metadata into its fallback handle via `insertArguments`.
+/// * `asCollector` is unimplemented (real bytecode → species); Groovy uses
+///   `asCollector(Object[].class, n)` to gather the call site's spread args.
+/// * `new MutableCallSite(MethodType)` (Groovy's `CacheableCallSite`) runs
+///   `CallSite.makeUninitializedCallSite`, which NPEs on CratonVM because
+///   `MethodTypeForm.methodHandles` (a lazy cache array) is null. Shim it to
+///   a typed inert placeholder (the caller `setTarget`s a real target before
+///   the site is ever invoked).
+/// * `MutableCallSite.setTarget`'s real `checkTargetChange` compares the new
+///   target's `MethodType` to the site's; synthetic `MethodType`s don't
+///   `equals()` the JDK forms → `WrongMethodTypeException`. Shim it to store
+///   the target field directly (dispatch ignores types anyway).
+pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // MethodHandles.insertArguments(target, pos, values[]) → MH_KIND_INSERT
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "insertArguments",
+        "(Ljava/lang/invoke/MethodHandle;I[Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            // STATIC method: args[0]=target MH, args[1]=int pos, args[2]=values[].
+            let target = match args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            };
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            let values = args.get(2).copied().unwrap_or(Value::Object(None));
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, values);
+            ctx.set_field(wrapper, 2, Value::Int(pos));
+            let desc = mh_read_desc(ctx, target).unwrap_or_default();
+            let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
+        },
+    );
+
+    // MethodHandle.asCollector(arrayType, count) → MH_KIND_COLLECT
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asCollector",
+        "(Ljava/lang/Class;I)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let target = obj_arg(args, 0)?;
+            let count = match args.get(2) {
+                Some(Value::Int(c)) => *c,
+                _ => 0,
+            };
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, Value::Int(count));
+            let desc = mh_read_desc(ctx, target).unwrap_or_default();
+            let adapter = alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
+        },
+    );
+
+    // MethodHandle.asSpreader(arrayType, count) → MH_KIND_SPREAD
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asSpreader",
+        "(Ljava/lang/Class;I)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let target = obj_arg(args, 0)?;
+            let count = match args.get(2) {
+                Some(Value::Int(c)) => *c,
+                _ => 0,
+            };
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, Value::Int(count));
+            let desc = mh_read_desc(ctx, target).unwrap_or_default();
+            let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
+        },
+    );
+
+    // MethodHandles.explicitCastArguments(target, newType) → passthrough that
+    // stamps the new type (mirrors the `asType` shim). The real bytecode runs
+    // strict `explicitCastArgumentsChecks` that rejects synthetic handles whose
+    // MethodType doesn't match the JDK form (WrongMethodTypeException). STATIC:
+    // args[0]=target MH, args[1]=newType.
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "explicitCastArguments",
+        "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            if let (Some(Value::Object(Some(t))), Some(Value::Object(Some(mt)))) =
+                (args.first(), args.get(1))
+            {
+                ctx.set_field_by_name(*t, "type", Value::Object(Some(*mt)));
+            }
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        },
+    );
+
+    // CallSite.makeUninitializedCallSite(MethodType) → typed inert placeholder.
+    // Instance method: args[0] = this(CallSite), args[1] = MethodType.
+    r.register(
+        "java/lang/invoke/CallSite",
+        "makeUninitializedCallSite",
+        "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let handle = alloc_method_handle(ctx, "", "uninit", "", MH_KIND_CONSTANT);
+            if let Some(Value::Object(Some(mt))) = args.get(1) {
+                ctx.set_field_by_name(handle, "type", Value::Object(Some(*mt)));
+            }
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+
+    // MutableCallSite/VolatileCallSite.setTarget(MethodHandle) → store the
+    // `target` field directly, skipping the real `checkTargetChange` type
+    // comparison (synthetic MethodTypes don't equal JDK forms).
+    for cs in [
+        "java/lang/invoke/MutableCallSite",
+        "java/lang/invoke/VolatileCallSite",
+    ] {
+        r.register(cs, "setTarget", "(Ljava/lang/invoke/MethodHandle;)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let new_target = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "target", new_target);
+            Ok(None)
+        });
+    }
+
+    r.set_category(__prev_cat);
+}
+
+/// Read a call site's current target MethodHandle descriptor (real
+/// `CallSite.target` field, falling back to the synthetic CallSite model's
+/// slot 0), for stamping a dynamic-invoker handle's descriptor.
+fn callsite_target_desc(ctx: &mut dyn NativeContext, callsite: ObjectRef) -> Option<String> {
+    let target = match ctx.get_field_by_name(callsite, "target") {
+        Value::Object(Some(t)) => t,
+        _ => match ctx.get_field(callsite, 0) {
+            Value::Object(Some(t)) => t,
+            _ => return None,
+        },
+    };
+    mh_read_desc(ctx, target)
+}
+
 pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
     register_array_element_accessor_bridges(r);
-    r.register(
-        mh,
-        "identity",
-        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        mh,
-        "constant",
-        "(Ljava/lang/Class;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+    // Functional `constant`/`identity` shims (shared with the real-JDK
+    // essentials path).
+    register_method_handles_constant_bridge(r);
+    register_method_handles_identity_bridge(r);
+    // Functional `insertArguments`/`asCollector` + CallSite-construction
+    // natives (shared with the real-JDK essentials path).
+    register_method_handle_combinator_extras_bridge(r);
     r.register(
         mh,
         "dropArguments",
@@ -3128,12 +3383,6 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
             // Return the original method handle (simplified)
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
-    );
-    r.register(
-        mh,
-        "insertArguments",
-        "(Ljava/lang/invoke/MethodHandle;I[Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
     r.register(
         mh,
@@ -3526,6 +3775,68 @@ pub(crate) const MH_KIND_LAMBDA_FACTORY: i32 = 10;
 /// synthetic MethodHandles cannot execute (see
 /// `register_array_element_accessor_bridges`).
 pub(crate) const MH_KIND_RECORD_DESER: i32 = 11;
+/// Constant method handle produced by `MethodHandles.constant(type, value)`.
+/// A nullary handle that ignores all arguments and returns a captured value.
+/// `MH_BOUND` holds the (boxed) constant; `MH_DESC` is `()<type>` so the
+/// dispatch arm can coerce the boxed value to a primitive return type.
+///
+/// CratonVM needs this because in real-JDK mode `MethodHandles.constant`
+/// runs genuine JDK bytecode (`MethodHandleImpl.makeConstantReturning` →
+/// `LambdaForm.createConstantForm` → `BoundMethodHandle.<clinit>` →
+/// `ClassSpecializer` runtime *species* class generation). The VM models
+/// method handles with these `MH_KIND_*` shims instead of the real
+/// `BoundMethodHandle`/`LambdaForm` machinery, so that bytecode path dies
+/// generating a species class. `SwitchPoint.<clinit>` is the first thing
+/// Apache Groovy's `IndyInterface.<clinit>` triggers (it builds `K_true`/
+/// `K_false` via `MethodHandles.constant(boolean.class, …)`), so the failure
+/// breaks EVERY Groovy `invokedynamic` call site. Shimming `constant`
+/// keeps that init off the real species path entirely.
+pub(crate) const MH_KIND_CONSTANT: i32 = 12;
+/// Identity method handle produced by `MethodHandles.identity(type)` — a
+/// handle of type `(type)type` that returns its single argument unchanged.
+/// `MH_DESC` is `(<type>)<type>`. After `bindTo(x)` the argument is captured
+/// in `MH_BOUND`, so the dispatch arm returns that. In real-JDK mode
+/// `identity` runs genuine JDK bytecode that yields a
+/// `MethodHandleImpl$IntrinsicMethodHandle` (and for some types a
+/// `BoundMethodHandle` species) — a real handle whose layout the `MH_KIND_*`
+/// shims cannot read (slots 16–19 out of bounds), so `identity().invoke()` /
+/// `.bindTo()` fail. Shimming keeps it inside the synthetic model.
+pub(crate) const MH_KIND_IDENTITY: i32 = 13;
+/// Dynamic-invoker handle produced by `CallSite.dynamicInvoker()`
+/// (concrete on `MutableCallSite`/`VolatileCallSite`). `MH_BOUND` holds the
+/// call site; on invocation the dispatch arm reads the site's CURRENT
+/// `target` and delegates to it. This shim exists to avoid the real
+/// `CallSite.makeDynamicInvoker` → `MethodHandle.bindArgumentL` →
+/// `BoundMethodHandle` species path, which hangs on CratonVM.
+/// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this every
+/// `new SwitchPoint()` (and therefore Groovy's `IndyInterface.<clinit>`)
+/// hangs.
+pub(crate) const MH_KIND_DYNAMIC_INVOKER: i32 = 14;
+/// Argument-insertion adapter produced by `MethodHandles.insertArguments(
+/// target, pos, values…)`. `MH_BOUND` holds a 3-field wrapper:
+/// field 0 = target MH, field 1 = the bound `Object[] values`, field 2 = pos.
+/// On invocation the bound values are spliced into the incoming args at `pos`
+/// and the target is dispatched. In real-JDK mode the genuine
+/// `insertArguments` builds a `BoundMethodHandle` species (unimplemented), and
+/// the old synthetic stub silently dropped the bound values — both wrong for
+/// Groovy, whose `IndyInterface` fallback binds the call site / metadata into
+/// its dispatch handle via `insertArguments`.
+pub(crate) const MH_KIND_INSERT: i32 = 15;
+/// Argument-collector adapter produced by `MethodHandle.asCollector(
+/// arrayType, count)`. `MH_BOUND` holds a 2-field wrapper: field 0 = target
+/// MH, field 1 = `count`. On invocation the trailing `count` arguments are
+/// collected into a fresh `Object[]` and appended to the leading args before
+/// the target is dispatched. Groovy's `IndyInterface` fallback uses
+/// `asCollector(Object[].class, paramCount)` to turn the call site's spread
+/// arguments into the `Object[]` its `selectMethod`/`make` dispatcher expects.
+pub(crate) const MH_KIND_COLLECT: i32 = 16;
+/// Argument-spreader adapter produced by `MethodHandle.asSpreader(arrayType,
+/// count)` — the inverse of `asCollector`. `MH_BOUND` holds a 2-field wrapper
+/// (field 0 = target MH, field 1 = count). On invocation the trailing array
+/// argument is spread into its elements before the target is dispatched.
+/// Groovy's `IndyInterface` dispatch chains use `asSpreader` to turn an
+/// `Object[]` back into positional arguments for the resolved method.
+pub(crate) const MH_KIND_SPREAD: i32 = 17;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -3978,8 +4289,34 @@ pub(crate) fn mh_dispatch(
 
     match kind {
         MH_KIND_STATIC => {
-            // Static: extra_args are the full argument list
-            ctx.invoke(&class, &name, &desc, extra_args)
+            // Static: extra_args are the full argument list. Unbox boxed
+            // wrappers against the target's primitive param types. Adapter
+            // kinds (insertArguments/asCollector/guardWithTest/permute/drop)
+            // re-enter `mh_dispatch` DIRECTLY, bypassing the signature-
+            // polymorphic invoke shim's `adapt_invoke_args` — so a bound boxed
+            // `Integer`/`Boolean` would otherwise reach a primitive param as a
+            // raw pointer. Groovy's `IndyInterface.make` binds `callType` as a
+            // boxed `Integer` via `insertArguments` into `selectMethod(...,
+            // int callType, ...)`; without unboxing here, `callType` is garbage
+            // → `ArrayIndexOutOfBoundsException` on `CALL_TYPE_VALUES[callType]`
+            // in `Selector.getSelector`. (`adapt_invoke_args` is a no-op for
+            // already-correctly-typed args, so the direct `invoke` path that
+            // already adapts is unaffected.)
+            //
+            // Honor a bound first argument: `staticHandle.bindTo(x)` keeps
+            // MH_KIND_STATIC but captures `x` in MH_BOUND (the first param), so
+            // prepend it to the incoming args before dispatch.
+            let full: Vec<Value> = match bound {
+                Value::Object(Some(_)) => {
+                    let mut v = Vec::with_capacity(extra_args.len() + 1);
+                    v.push(bound);
+                    v.extend_from_slice(extra_args);
+                    v
+                }
+                _ => extra_args.to_vec(),
+            };
+            let adapted = adapt_invoke_args(ctx, &full, &desc);
+            ctx.invoke(&class, &name, &desc, &adapted)
         }
         MH_KIND_CONSTRUCTOR => {
             // Constructor: allocate new object then call <init>
@@ -4295,6 +4632,148 @@ pub(crate) fn mh_dispatch(
             // [primValues:byte[], objValues:Object[]] as passed by
             // `ObjectInputStream.readRecord`. Reflectively rebuild the record.
             record_deser_dispatch(ctx, mh, extra_args)
+        }
+        MH_KIND_CONSTANT => {
+            // constant(type, value): nullary handle that ignores its arguments
+            // and returns the captured value held in MH_BOUND. When the handle's
+            // return type is a primitive, unbox the captured wrapper so an
+            // `invokeExact()Z`/`()I`/… observes the raw value (and so the GUARD
+            // arm's `Int(v) => v != 0` boolean test stays correct). For a
+            // reference return type the captured object passes through unchanged;
+            // the signature-polymorphic return adapter re-boxes if the call site
+            // wants `Object`.
+            let ret = return_type_desc(&desc);
+            let v = match ret {
+                "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" => match bound {
+                    Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
+                    other => other,
+                },
+                _ => bound,
+            };
+            Ok(Some(v))
+        }
+        MH_KIND_IDENTITY => {
+            // identity(type): return the single incoming argument unchanged.
+            // After `bindTo(x)` the argument is pre-captured in MH_BOUND.
+            let v = match bound {
+                Value::Object(Some(_)) => bound,
+                _ => extra_args.first().copied().unwrap_or(Value::Object(None)),
+            };
+            Ok(Some(v))
+        }
+        MH_KIND_DYNAMIC_INVOKER => {
+            // CallSite.dynamicInvoker(): delegate to the call site's CURRENT
+            // target. MH_BOUND holds the call site; read its `target` field
+            // (real CallSite layout) — falling back to the synthetic CallSite
+            // model's slot 0 — and dispatch with the incoming args. Avoids the
+            // real `makeDynamicInvoker` → `bindArgumentL` → BoundMethodHandle
+            // species path (which hangs).
+            let callsite = match bound {
+                Value::Object(Some(cs)) => cs,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target = match ctx.get_field_by_name(callsite, "target") {
+                Value::Object(Some(t)) => t,
+                _ => match ctx.get_field(callsite, 0) {
+                    Value::Object(Some(t)) => t,
+                    _ => return Ok(Some(Value::Object(None))),
+                },
+            };
+            mh_dispatch(ctx, target, extra_args)
+        }
+        MH_KIND_INSERT => {
+            // insertArguments(target, pos, values): splice the pre-bound
+            // `values` into the incoming args at `pos`, then dispatch target.
+            let wrapper = match bound {
+                Value::Object(Some(w)) => w,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target = match ctx.get_field(wrapper, 0) {
+                Value::Object(Some(t)) => t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let values = ctx.get_field(wrapper, 1);
+            let pos = match ctx.get_field(wrapper, 2) {
+                Value::Int(p) => (p as usize).min(extra_args.len()),
+                _ => 0,
+            };
+            let mut full: Vec<Value> = Vec::with_capacity(extra_args.len() + 4);
+            full.extend_from_slice(&extra_args[..pos]);
+            if let Value::Object(Some(arr)) = values {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    full.push(ctx.get_array_element(arr, i));
+                }
+            }
+            full.extend_from_slice(&extra_args[pos..]);
+            mh_dispatch(ctx, target, &full)
+        }
+        MH_KIND_COLLECT => {
+            // asCollector(arrayType, count): collect the trailing `count`
+            // incoming args into a fresh Object[] and append to the leading
+            // args, then dispatch target (whose last param is that array).
+            let wrapper = match bound {
+                Value::Object(Some(w)) => w,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target = match ctx.get_field(wrapper, 0) {
+                Value::Object(Some(t)) => t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let count = match ctx.get_field(wrapper, 1) {
+                Value::Int(c) => (c as usize).min(extra_args.len()),
+                _ => 0,
+            };
+            let leading = extra_args.len() - count;
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+            for i in 0..count {
+                // Box primitive values into their wrappers — the collector
+                // gathers into an `Object[]`. The indy call site passes raw
+                // primitives (Groovy's `3 * 2` is `invoke(II)Object`), and the
+                // real JDK boxes them via the trailing `asType`; our `asType`
+                // shim is a passthrough, so box here. Without this, `selectMethod`
+                // receives raw `int`s in its `Object[] args` and Groovy's
+                // `args[0].getClass()` (Selector.setGuards) dereferences a raw
+                // int as an object → NPE.
+                let v = extra_args[leading + i];
+                let boxed = match v {
+                    Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
+                    Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
+                    Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
+                    Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
+                    other => other,
+                };
+                ctx.set_array_element(arr, i, boxed);
+            }
+            let mut full: Vec<Value> = Vec::with_capacity(leading + 1);
+            full.extend_from_slice(&extra_args[..leading]);
+            full.push(Value::Object(Some(arr)));
+            mh_dispatch(ctx, target, &full)
+        }
+        MH_KIND_SPREAD => {
+            // asSpreader(arrayType, count): the trailing argument is an array;
+            // spread its elements into positional args, then dispatch target.
+            let wrapper = match bound {
+                Value::Object(Some(w)) => w,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let target = match ctx.get_field(wrapper, 0) {
+                Value::Object(Some(t)) => t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if extra_args.is_empty() {
+                return mh_dispatch(ctx, target, extra_args);
+            }
+            let last = extra_args.len() - 1;
+            let mut full: Vec<Value> = Vec::with_capacity(last + 4);
+            full.extend_from_slice(&extra_args[..last]);
+            if let Value::Object(Some(arr)) = extra_args[last] {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    full.push(ctx.get_array_element(arr, i));
+                }
+            }
+            mh_dispatch(ctx, target, &full)
         }
         _ => {
             // Virtual: first extra_arg is receiver (unless bound)
@@ -4772,40 +5251,16 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let extra = &args[1..];
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            // Verify argument count matches descriptor
-            if !desc.is_empty() {
-                let expected_params = count_descriptor_params(&desc);
-                let kind = match ctx.get_field(this, MH_KIND) {
-                    Value::Int(k) => k,
-                    _ => MH_KIND_VIRTUAL,
-                };
-                // Virtual/special methods need a receiver arg in addition to params
-                let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
-                let expected_count = if needs_receiver {
-                    expected_params + 1
-                } else {
-                    expected_params
-                };
-                // Check for bound receiver (reduces expected by 1)
-                let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
-                let final_expected = if has_bound && needs_receiver {
-                    expected_count - 1
-                } else {
-                    expected_count
-                };
-                if extra.len() != final_expected {
-                    // WrongMethodTypeException — arity mismatch
-                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                        cratonvm_types::error::VmError::Internal {
-                            message: format!(
-                                "WrongMethodTypeException: expected {} args, got {}",
-                                final_expected,
-                                extra.len()
-                            ),
-                        },
-                    ));
-                }
-            }
+            // NOTE: a strict invokeExact arity check (throwing
+            // WrongMethodTypeException) cannot be enforced on CratonVM's
+            // synthetic `MH_KIND_*` model — adapters (insertArguments /
+            // asCollector / asSpreader / dropArguments / guardWithTest) keep
+            // their inner target's descriptor, so the apparent arity often
+            // differs from the real call-site arity. Throwing here aborted the
+            // VM mid-dispatch (Groovy's `IndyInterface` invokes its dispatch
+            // chains via invokeExact: "internal error: WrongMethodTypeException:
+            // expected 2 args, got 1"). Fall through to `mh_dispatch`, whose
+            // kind-specific arms splice/gather/forward the actual arguments.
             let kind = match ctx.get_field(this, MH_KIND) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,

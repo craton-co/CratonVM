@@ -1800,6 +1800,27 @@ pub(crate) fn apply_pointer_map_to_thread(
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
+        // Forward the synchronized-method monitor object too. A `synchronized`
+        // method records the object it locked on entry in `monitor_on_exit` and
+        // releases it on frame-pop. If a *cross-thread* moving GC relocated that
+        // object while this thread was parked at the STW safepoint barrier
+        // (`arrive_and_wait` in the safepoint-poll path), a stale
+        // `monitor_on_exit` makes the implicit `monitorexit` target the old
+        // address — surfacing as "thread does not own the monitor" (observed as
+        // an intermittent IllegalMonitorStateException in the ES RestClient
+        // `org/elasticsearch/client/Cancellable$RequestCancellable.
+        // runIfNotCancelled`, whose `synchronized` body allocates heavily under
+        // `-Xmx1g` GC pressure). The GC-initiator (`update_all_roots` in
+        // memory/gc.rs) and the native-blocked-thread wake path
+        // (`check_post_block_gc` in vm/vm_exec.rs) already forward it; this
+        // non-initiator safepoint-resume path was the missing third site. Keep
+        // it consistent with the relocated object, identically to those two.
+        if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
@@ -1822,9 +1843,99 @@ pub(crate) fn apply_pointer_map_to_thread(
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
+    // Native-held per-thread roots. A thread running native code that pinned
+    // ObjectRefs across allocations (`pin_native_root`, e.g. the synthetic
+    // HttpServer dispatcher holding the handler + exchange across exchange-build
+    // allocations) can be parked at THIS safepoint barrier when another thread's
+    // moving GC relocates those objects. The GC-initiator path
+    // (`update_all_roots`) and the native-blocked wake path
+    // (`check_post_block_gc`) already forward these; this non-initiator
+    // safepoint-resume path must too, or `read_native_pin` hands back a stale
+    // address (surfaced as the `java/lang/Object.handle` NoSuchMethodError
+    // storm). Forward the same set those two siblings do.
+    for obj_ref in &mut thread.native_pin_roots {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    if let Some(ref mut obj_ref) = thread.native_pending_return {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    for (_key_id, key_ref, val) in &mut thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        update_value_ref(val, pointer_map);
+    }
+    if let Some(ref mut obj_ref) = thread.pending_async_exception {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
     // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
     // across the relocation we just applied, in lockstep with the frames above.
     remap_rs_cache_after_gc(thread, pointer_map, heap);
+
+    // DIAG (CRATONVM_GC_VERIFY_STALE=1): after a NON-INITIATOR thread resumes
+    // from the STW barrier and applies the pointer map, walk its own frames and
+    // flag any Object slot whose header is ZEROED (class_id=0 && num_slots=0).
+    // A zeroed header means the object was NOT copied by the collector (a missed
+    // marking root — its ref was absent from this thread's deposited snapshot,
+    // e.g. a lost operand-stack tag), then young-from was reset over it. This is
+    // the per-PARKED-THREAD analogue of `verify_no_stale_refs` (which only
+    // checks the GC initiator) — it localizes the missed-root that surfaces as
+    // the teardown "all-zero header" corruption / reactor-thread leak.
+    // Cache the gate so the OFF path (the default) is a single relaxed load, not
+    // a per-parked-thread-per-GC environment lookup.
+    fn gc_verify_stale_enabled() -> bool {
+        use std::sync::OnceLock;
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1"))
+    }
+    if gc_verify_stale_enabled() {
+        use cratonvm_types::ObjectHeader;
+        let tname = thread.thread_id.0;
+        for (fi, frame) in thread.frames.iter().enumerate() {
+            let cn = frame.class_name();
+            let mn = frame.method_name();
+            for li in 0..frame.locals_len() {
+                if let crate::types::Value::Object(Some(o)) = frame.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if a != 0 {
+                        let h = unsafe { &*(a as *const ObjectHeader) };
+                        if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                            eprintln!(
+                                "POST-GC ZERO-HEADER PARKED tid={} frame[{}] {}.{} local[{}] pc={} addr=0x{:x}",
+                                tname, fi, cn, mn, li, frame.pc, a
+                            );
+                        }
+                    }
+                }
+            }
+            let mut stk = Vec::new();
+            frame.stack.scan_object_refs(&mut stk, heap);
+            for o in stk {
+                let a = o.as_ptr() as usize;
+                if a != 0 {
+                    let h = unsafe { &*(a as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                        eprintln!(
+                            "POST-GC ZERO-HEADER PARKED-STACK tid={} frame[{}] {}.{} pc={} addr=0x{:x}",
+                            tname, fi, cn, mn, frame.pc, a
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Keep the `update_root_snapshot` frozen-frame cache (`rs_cache`) valid across
@@ -11907,6 +12018,21 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
         }
         None
     }
+
+    /// Whether the trapping method is `static` — drives slot-0 naming
+    /// (`<local0>` in a static method vs `this` in an instance method). Looked
+    /// up from the method's access flags; a method we can't resolve defaults to
+    /// instance (legacy `this` spelling), matching the trait default.
+    fn is_static_method(&self) -> bool {
+        let cm = self.shared.class_manager.read_recursive();
+        let Some(class) = cm.get_class(self.class_id) else {
+            return false;
+        };
+        match class.find_method(self.method_name, self.method_descriptor) {
+            Some(method) => method.is_static(),
+            None => false,
+        }
+    }
 }
 
 /// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
@@ -11940,7 +12066,7 @@ fn helpful_npe_invoke_message(
         method_descriptor: &m_desc,
     };
     let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
-    helpful_npe::combine(&action, expr.as_deref())
+    helpful_npe::combine(&action, expr.as_ref())
 }
 
 /// JEP 358 increment 2 — synthesize the HotSpot-style extended message for a
@@ -12000,7 +12126,7 @@ fn helpful_npe_opcode_message_parts(
         method_descriptor,
     };
     let expr = helpful_npe::null_expr_at_depth(code, trap_bci, depth_below_top, &resolver);
-    helpful_npe::combine_opt(action, expr.as_deref())
+    helpful_npe::combine_opt(action, expr.as_ref())
 }
 
 /// Variant of `execute_invoke` that knows whether the source bytecode was
@@ -15315,6 +15441,45 @@ fn populate_invoke_cache(
         return;
     };
 
+    // Native-shadow check keyed on the *declaring* class, honored regardless
+    // of whether the resolved method is `native` or has a (shadowed) bytecode
+    // body. The early CP-class lookup above keys on the symbolic-ref class —
+    // which, for an inherited method invoked through a super-class symbolic ref
+    // (e.g. Groovy's `GroovyClassLoader.loadClass(String,Z,Z,Z)` calling
+    // `super.loadClass(String,Z)`, whose CP ref names `URLClassLoader`/
+    // `SecureClassLoader`, not `java.lang.ClassLoader`) — misses the native
+    // registered on the declaring class `ClassLoader` (`cl_real_load_class`).
+    // Without this, the first call serves the native (slow path) but every
+    // cached call runs the real `ClassLoader`/`BuiltinClassLoader` delegation
+    // bytecode the VM can't satisfy → spurious `ClassNotFoundException`
+    // (e.g. `groovy.grape.GrabAnnotationTransformation` during Groovy's global
+    // AST-transform scan, breaking every Groovy compile). Re-applies the
+    // 92b7bd80 fix (the original `if method.is_native()`-only gate below was
+    // restored by the `cd396a04` "Merge branch 'main' into dev" merge).
+    {
+        let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find(declaring_name, &method_name, &descriptor)
+        {
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+            drop(cm);
+            let target = CachedInvokeTarget::Native {
+                callback,
+                num_params: num_params as u16,
+                gate,
+            };
+            shared
+                .shared_resolution
+                .insert_promoted_invoke(promoted_key, target.clone());
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, is_special, target);
+            return;
+        }
+    }
+
     if method.is_native() {
         // Already handled above, but the method might be native in a superclass
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
@@ -16176,7 +16341,8 @@ fn try_osr(
                 pending_callee_compiles
             {
                 if let Some((entry, needs_ctx)) =
-                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc)
+                    // Eager direct-call callee compile — optimized (C2) tier.
+                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc, true)
                 {
                     direct_calls2.push((
                         ipc,
@@ -17299,6 +17465,9 @@ fn try_jit_upgrade_with_gate(
                 // loaded yet.
                 Some(&c_string_layout_resolver),
                 Some(&c_invoke_class_id_resolver),
+                // Early-compile path is the optimized (C2-equivalent) tier — the
+                // tiered C1 routing only flows through the background worker.
+                true,
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17395,6 +17564,8 @@ fn try_jit_upgrade_with_gate(
         // (bug-03). Mirrors the already-wired `try_jit_compile_callee_slow` path.
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        // Inline mutator compile path is the optimized (C2-equivalent) tier.
+        true,
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -17541,11 +17712,22 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
 /// Compile a callee method by name, storing it in the JIT cache.
 /// Called from `jit_invoke_dispatch` when a callee becomes hot.
 /// Returns (entry_ptr, needs_context) on success.
+///
+/// wire-tiered-manager Step 3 — `optimize` selects the backend: inline
+/// JIT-dispatch callers pass `true` (the optimizing C2-equivalent backend, the
+/// historical behaviour); the background tiered compile worker passes the
+/// C1/C2 value derived from the task's target tier
+/// ([`crate::jit::tiered::tier_uses_optimized_backend`]). `false` routes to the
+/// fast single-pass C1 backend. NOTE: the JIT-cache probe below returns any
+/// already-published body regardless of `optimize`, so a method is compiled at
+/// whatever tier reaches it *first* — there is no C1→C2 re-compile/supersede yet
+/// (that needs safe code-cache replacement; tracked as a follow-up).
 pub fn try_jit_compile_callee(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    optimize: bool,
 ) -> Option<(usize, bool)> {
     use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
@@ -17586,6 +17768,7 @@ pub fn try_jit_compile_callee(
         class_name,
         method_name,
         descriptor,
+        optimize,
         &mut cache_negative,
     );
     match res {
@@ -17641,6 +17824,10 @@ fn try_jit_compile_callee_slow(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    // wire-tiered-manager Step 3: `false` compiles this method with the fast
+    // single-pass C1 backend (no IR pipeline); `true` uses the optimizing C2
+    // backend. Threaded into `jit::try_compile`'s trailing flag.
+    optimize: bool,
     cache_negative: &mut bool,
 ) -> Option<(usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
@@ -17929,6 +18116,10 @@ fn try_jit_compile_callee_slow(
         Some(&inline_resolver),
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        // wire-tiered-manager Step 3: `optimize` selects the backend per call.
+        // Inline JIT-dispatch callers pass `true` (optimized C2); the background
+        // tiered worker passes the C1/C2 value derived from the task's tier.
+        optimize,
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -18050,13 +18241,22 @@ fn try_jit_compile_callee_slow(
 /// `jit_cache` fast-path (interpreter.rs ~14366) upgrades the call site to
 /// `Jit` on the next mutator invocation once the entry is present.
 ///
-/// Step 3 (C1/C2 routing): the target tier selects the intended backend via
-/// [`crate::jit::tiered::tier_uses_optimized_backend`]. The VM's current
-/// `try_compile` chooses single-pass vs. optimized by process-global env flags
-/// rather than a per-call switch, so both tiers presently funnel into
-/// `try_jit_compile_callee` and the C1 (no-opt) routing is a documented STUB —
-/// the `optimized` hint is computed and logged but a per-call no-opt toggle
-/// through `try_compile` is follow-up work.
+/// Step 3 (C1/C2 routing) — NOW REAL: the target tier selects the backend via
+/// [`crate::jit::tiered::tier_uses_optimized_backend`], and that boolean is
+/// threaded through `try_jit_compile_callee` into `jit::try_compile`'s trailing
+/// `optimize` flag. `C2`/`FullProfile` → the optimizing IR pipeline; `C1`/
+/// `C1WithProfiling` → the fast single-pass `x64::compile` backend (no IR
+/// lowering / escape analysis / scheduling). This replaces the former advisory-
+/// only hint (which compiled both tiers identically).
+///
+/// Boundary (follow-ups): the JIT-cache probe in `try_jit_compile_callee`
+/// returns any already-published body regardless of tier, so a method is
+/// compiled at whatever tier reaches it first — there is no C1→C2 supersede /
+/// re-compile yet (that needs safe code-cache replacement; cf. the bug-24 baked-
+/// pointer UAF risk). The single-pass backend still runs its own internal escape
+/// analysis; disabling x64-internal passes for an even-leaner C1 is a separate
+/// step. Both are out of scope for this routing increment and gated default-off
+/// behind `CRATONVM_BG_COMPILE` regardless.
 ///
 /// Returns the wall-clock compile time in milliseconds for the tiered stats.
 /// A compile miss / bail (native shadow, skip-listed, backend bail, or a dropped
@@ -18116,6 +18316,10 @@ fn background_compile_task(
         &task.method_key.class_name,
         &task.method_key.method_name,
         &task.method_key.descriptor,
+        // wire-tiered-manager Step 3: C1 (no-opt single-pass) vs C2 (optimizing
+        // pipeline), selected by the task's target tier. This is the real
+        // backend routing that replaces the former advisory-only hint.
+        optimized,
     );
     start.elapsed().as_millis() as u64
 }

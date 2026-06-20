@@ -384,12 +384,12 @@ pub type CompileFn = Box<dyn Fn(&CompilationTask) -> u64 + Send + 'static>;
 ///
 /// The *codegen* half lives VM-side (the `cratonvm-jit` crate cannot reference
 /// `SharedVm` or the interpreter's compile entry points), so the VM-supplied
-/// [`CompileFn`] consumes this hint to pick its compile strategy. The current
-/// VM backend (`jit::try_compile`) selects single-pass vs. optimized by
-/// process-global env flags rather than a per-call switch, so the C1 routing is
-/// presently a *stub* — both tiers funnel into the same entry point and this
-/// hint is advisory until a per-call no-opt toggle is threaded through
-/// `try_compile` (tracked as wire-tiered-manager Step 3 follow-up).
+/// [`CompileFn`] consumes this to pick its compile strategy. As of
+/// wire-tiered-manager Step 3 this drives **real backend routing**, not an
+/// advisory hint: `background_compile_task` threads the returned boolean into
+/// `jit::try_compile`'s trailing `optimize` flag — `true` runs the optimizing
+/// IR pipeline, `false` skips it and routes to the single-pass `x64::compile`
+/// (C1) backend.
 #[inline]
 pub fn tier_uses_optimized_backend(tier: CompilationTier) -> bool {
     matches!(tier, CompilationTier::C2 | CompilationTier::FullProfile)

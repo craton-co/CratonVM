@@ -28,10 +28,15 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
 10. **Hibernate JTA** (Narayana XA completion + synthetic-socket loopback) — **two docs consolidated into one** (open layers).
 11. **Hibernate JAXB/ByteBuddy bootstrap slow** (class-loading/`MethodGraph` throughput; open).
 12. **Hibernate deserialized-`SessionFactory`-null** (`SessionFactoryRegistry` reconnect; open).
-13. **[ES-HANG-02](ES-HANG-02-restclient-integ-http-server.md)** (RestClient embedded-HTTP-server hang;
-    socket/NIO) — the lone still-open ES-suite defect (re-verified 2026-06-18). Its three former siblings
-    are resolved on `dev` and their docs removed as stale: **ES-HANG-01** (Lucene JIT livelock; fixed by
-    `1cd0ab26`), **ES-FAIL-03** (`catch (LinkageError)` now honored), **ES-FAIL-04** (`ArrayListSubList.toArray(T[])` added).
+13. **ES-HANG-02 — ✅ RESOLVED 2026-06-20** (`fix/es-restclient-gc-safety`; docs moved to
+    [`docs/internal/elasticsearch-suite/`](../internal/elasticsearch-suite/)). The RestClient
+    embedded-HTTP-server hang AND both residuals are fixed: residual 1 (real non-blocking connect) +
+    residual 2 — which was **NOT throughput** (the prior handoff's theory) but **three GC-correctness bugs**:
+    a safepoint-resume monitor/native-root remap gap (`IllegalMonitorStateException`), an unrooted synthetic
+    `com.sun.net.httpserver` handler ref (`NoSuchMethodError java/lang/Object.handle` storm), and
+    per-request native read-alloc-use staleness. Both ES RestClient suites are green at `-Xmx1g` with
+    `CRATONVM_ROOTSNAP_CACHE=0` (single-host 22/22, multi-host 4/4) — see the two new GC defects #15/#16.
+    Former siblings also resolved: **ES-HANG-01** (`1cd0ab26`), **ES-FAIL-03**, **ES-FAIL-04**.
 14. **Spring-suite 2026-06-19 sweep** — two new CV-unique bugs **FIXED on dev** this session:
     [**Unsafe off-heap DirectBuffer**](springsuite-0619-unsafe-offheap-directbuffer.md) (single-element
     `Unsafe.get/putX(long)` rejected real `DirectByteBuffer` pointers as "not in any live arena" →
@@ -41,6 +46,18 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
     [**springsuite-0619-open-candidates**](springsuite-0619-open-candidates.md): `ReactiveAdapterRegistry$MutinyRegistrar`
     NCDFE (~40), XML "Unexpected failure during bean definition parsing" (~19), "Unnamed bean definition" (~35),
     spring-jdbc mass-TIMEOUT (~25, needs isolation re-verify), scheduler `StringIndexOutOfBounds` (2).
+15. **[GC: moving-collector lost-tag missed root](gc-moving-interpreter-lost-tag-missed-root.md)** — 🔴 **OPEN**
+    (benign in practice). Under `-Xmx1g` GC pressure the **moving** young collector zeroes a live object
+    whose only reference is a frame slot tagged non-`Object` at the marking snapshot ("all-zero header" /
+    `Stale pointer … StringBuilder.flush`). Localized **deterministically** to `RandomizedRunner.invoke
+    local[3]` by a new gated `CRATONVM_GC_VERIFY_STALE` per-parked-thread verifier. Same *class* as the
+    Family-A "lost-tag interpreter local" (A4) but on the `--nojit` moving path.
+16. **[GC: rs_cache-presence reactor-shutdown timing race](gc-rscache-reactor-shutdown-timing-race.md)** —
+    🔴 **OPEN** (workaround validated). The ES RestClient reactor-worker `ThreadLeakError` at
+    `restClient.close()`: GC-frequency-driven and `rs_cache`-PRESENCE-triggered (a latent
+    GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
+    rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
+    global default). Supersedes [reactor-worker-thread-leak-at-shutdown.md](reactor-worker-thread-leak-at-shutdown.md).
 
 FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
 JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed

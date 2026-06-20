@@ -1,6 +1,64 @@
 # ES-HANG-02 residuals — handoff (`testAsyncRequests` multi-host + `testManyAsyncRequests` throughput)
 
-**Status:** Residual 1 **FIXED**; residual 2 **substantially improved** (was 0% → now ~90%, borderline at the
+## RESOLUTION (2026-06-20, branch `fix/es-restclient-gc-safety`)
+
+**Residual 2 was NOT a throughput problem.** `testManyAsyncRequests` already passed at `-Xmx1g`; the
+single-host suite's flakiness (and the rare `testManyAsyncRequests` miss) was dominated by three
+**GC-correctness bugs** that fire only under `-Xmx1g` moving-GC pressure (the suite was already 5/5 green at
+`-Xmx6g`). All three are now fixed; the single-host suite went from **~50% → ~90% green** at `-Xmx1g`
+(10/11 in a focused run), multi-host stayed **4/4**, and `testManyAsyncRequests`/auth/`testHeaders` pass when
+no thread leaks.
+
+1. **`IllegalMonitorStateException` ("thread does not own the monitor")** — `apply_pointer_map_to_thread`
+   (the non-initiator STW-barrier resume path) did not forward `frame.monitor_on_exit` (nor `native_pin_roots`
+   / `scoped_values` / `pending_async_exception`), unlike its siblings `update_all_roots` and
+   `check_post_block_gc`. A thread in the `synchronized` `Cancellable$RequestCancellable.runIfNotCancelled`,
+   parked at a barrier while the locked object moved, resumed with a stale monitor and threw on frame-pop.
+   *(commit `fix(gc): forward monitor + native roots on safepoint-resume path`)*
+2. **`NoSuchMethodError java/lang/Object.handle` storm** — the synthetic `com.sun.net.httpserver` handler
+   ObjectRefs live only in the native `ServerState.handlers` map; unrooted/unremapped, a GC move made every
+   dispatch invoke a stale receiver. Added `gc_scan_re10_handler_roots` + `gc_update_re10_handler_refs`.
+3. **Body/header-path staleness** — `re10_dispatch_pending` / `re10_build_headers` / `re10_read_headers` and
+   `getRequestBody`/`getResponseBody`/`ResponseBody.write` held/used ObjectRefs across VM allocations; now
+   pinned via `pin_native_root`/`read_native_pin`. `getRequestBody`'s stale `ByteArrayInputStream.buf` made
+   the handler throw before `sendResponseHeaders`, surfacing as auth `expected:<403> but was:<200>`.
+   *(commits 2–3 above; storm + body-path fixed together.)*
+
+**Remaining flakiness (~10%) is the SEPARATE, known-open
+[`reactor-worker-thread-leak-at-shutdown`](reactor-worker-thread-leak-at-shutdown.md).** A zombie Apache IO
+reactor thread (e.g. `elasticsearch-rest-client-N-thread-M`, `state=RUNNABLE`, busy-spinning in
+`DefaultNHttpClientConnection.produceOutput` → `SessionOutputBufferImpl.flush` → socket write) does not
+terminate on `restClient.close()`, so randomizedtesting raises a SUITE-scope `ThreadLeakError` (the
+`ThreadLeakControl.formatThreadStacks` `StringBuilder.flush` `NoSuchMethodError` and the
+`RandomizedContext.randomnesses`/`Thread.group` NPEs are downstream artifacts of formatting that leaked
+thread, not separate bugs). **It is NOT a socket-write bug** (a real `TcpStream` write errors on a closed
+peer) — it is **GC-frequency-driven** (`-Xmx6g` = 0 leaks; `-Xmx1g` ≈ 15–25%) and **`rs_cache`-presence-
+triggered**: it exposes a latent GC-STW-vs-reactor-shutdown timing race. Full analysis +
+the deterministically-localized separate lost-tag corruption (`RandomizedRunner.invoke local[3]`) in
+[`reactor-worker-thread-leak-at-shutdown.md`](reactor-worker-thread-leak-at-shutdown.md) (UPDATE 2026-06-20 #2).
+
+### Recommended ES-suite run config — both RestClient suites GREEN at -Xmx1g
+
+Combine the residual-2 GC fixes above with **`CRATONVM_ROOTSNAP_CACHE=0`** (disables only the frozen-frame
+root-snapshot *optimization* — correctness is unchanged; it just shifts snapshot timing so the reactor-leak
+race does not fire). Validated at `-Xmx1g`:
+* `RestClientSingleHostIntegTests` — **22/22 green** (≥16 consecutive, 0 `ThreadLeakError`).
+* `RestClientMultipleHostsIntegTests` — **4/4 green** (no regression).
+
+This is a SUITE-level setting (do NOT flip the global default — the cache is load-bearing for deep-stack
+native-heavy app-gauntlet workloads, so a global off could regress their throughput/timeouts). Run:
+```bash
+CRATONVM_ROOTSNAP_CACHE=0 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 \
+  cratonvm.exe --nojit -Xmx1g org.junit.runner.JUnitCore \
+  org.elasticsearch.client.RestClientSingleHostIntegTests
+```
+The underlying GC-timing race (and the benign lost-tag) remain open for a root fix; the env var is the
+reliable workaround until then.
+
+---
+
+**Status (original handoff, superseded by the RESOLUTION above):** Residual 1 **FIXED**; residual 2
+**substantially improved** (was 0% → now ~90%, borderline at the
 10 s latch). The ES-HANG-02 **hang is fixed** on `dev` (see
 [ES-HANG-02-restclient-integ-http-server.md](ES-HANG-02-restclient-integ-http-server.md)); both classes now
 run.

@@ -1,7 +1,16 @@
 # BUG-06-FAM6 — annotation synthesis (`@AliasFor`/`MergedAnnotation`/`MirrorSets`) value mismatches + a ~2 GB OOM
 
+> **UPDATE 2026-06-20 (branch `fix/bug06-fam6-repeatable-merge`, off dev `be787d86`, rebased onto `5ed6d942`):**
+> Three root causes found and FIXED (interpreter, verified == HotSpot JDK 25). `AnnotationUtilsTests` **67→72/72**, `MergedAnnotationsTests` **165→172/178**, `RepeatableContainersTests` 17/17, `AnnotatedElementUtilsTests` 82/82 (no regression).
+> 1. **`@Repeatable` (the dominant value-mismatch family, NOT #2 as written below):** `native_class_get_annotations_by_type` only unwrapped the container `if matching.is_empty()` AND never followed `@Inherited`. So `@Foo("A") @FooContainer({@Foo("B"),@Foo("C")})` → `[A]` not `[A,B,C]`, and inherited repeatables → `[]`. Rewrote as JDK `getDirectlyAndIndirectlyPresent` (direct+container merge, declaration order) + `@Inherited` superclass walk; split a no-walk `getDeclaredAnnotationsByType` variant.
+> 2. **annotation `hashCode`:** native proxy hashed `Class`/`Enum` members by NAME; JDK uses IDENTITY hash (neither overrides `Object.hashCode`). Disagreed with Spring's synthesized JDK-proxy → equal-but-different-hashCode. → identity. Fixes `hashCodeForSynthesizedAnnotations`.
+> 3. **annotation `equals` asymmetry:** native `annotation_proxy_equals` rejected any non-`AnnotationProxy` arg, so `nativeProxy.equals(springSynth)`=false while reverse=true. Added symmetric delegation to `other.equals(proxy)` for a foreign instance of the same type. Fixes `equalsForSynthesizedAnnotations`.
+>
+> **The "~2 GB OOM" is NOT an allocation bug.** Under JIT, `AnnotationUtilsTests` infinite-recurses `java.util.stream.ReferencePipeline.toArray()` → itself (`invokevirtual toArray(IntFunction)` at pc6 mis-dispatches to no-arg `toArray()`), driven by a GC-guard'd OOB stream slot-probe. JIT-ONLY; interpreter is clean. This is the SAME JIT codegen bug as [[spring-bug-06-mergedannotations-hang]]. Separate from synthesis; OPEN. `CRATONVM_REAL_ANNOTATIONS=1` is NOT a workaround — it breaks JUnit discovery (found=0).
+> **Remaining `MergedAnnotationsTests` fails (6):** all in the hierarchy/search-traversal subsystem (bridge method, interface-on-method, enclosing-class predicates, custom annotation filter) — the enclosing-class reflection primitives themselves are conformant — plus `synthesizedAnnotationShouldReuseJdkProxyClass` (needs `getAnnotation` to return a real `$ProxyN`, i.e. real-annotations mode default-on; architectural).
+
 **Severity:** Medium — CV-unique assertion mismatches in Spring's annotation subsystem (`core.annotation` 23 + `context.annotation` 20); one class aborts with an OOM.
-**Status:** 🔴 OPEN — raw annotation reading is conformant; residuals live in **Spring's synthesis layer** and reproduce only in the full Spring stack. Handoff.
+**Status:** 🟡 PARTIAL — synthesis value-mismatch + equals/hashCode root causes FIXED (see UPDATE above); residual = JIT toArray recursion (== spring-bug-06) + hierarchy-search traversal. Handoff.
 **Mode:** Interpreter (JIT-off).
 **HotSpot (JDK 25):** all pass (`AnnotationUtilsTests` 72/72).
 **Origin:** family 6 of the bug-06 census; the long-standing annotation cluster `[[spring-bug-01]]`.

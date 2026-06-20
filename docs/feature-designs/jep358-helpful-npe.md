@@ -1,5 +1,61 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 5 landed (2026-06-19) — differential compliance pass + default
+> flip to HotSpot parity.** A 41-case lambda-free probe (`scratch/npeprobe/`)
+> covering every null-deref opcode and every expression-reconstruction shape was
+> diffed against JDK 25 `getExtendedNPEMessage`, **both with and without debug
+> info**; CratonVM is now **byte-identical** to HotSpot on all 41 in both modes.
+> The interpreter path (steps 1–5) is complete; the default is flipped on.
+> Six compliance gaps were found and fixed (all in `exceptions.rs::helpful_npe`
+> + the `CpResolver`), none of which the hand-written store-free unit tests had
+> exercised:
+> - **Owner rendering.** Invoke owner uses descriptor-with-dots (`[I`,
+>   `java.lang.Integer`), *not* the `int[]` external form; only `java.lang.String`
+>   → `String` and `java.lang.Object` → `Object` are shortened (every other
+>   `java.lang` type stays qualified). New `render_owner`; `action_invoke` now
+>   builds via `render_method`.
+> - **Parameter rendering.** Params use the external form (`Object[]`, `int`,
+>   `java.lang.CharSequence`) but with `String`/`Object` shortened (`render_param`
+>   → `shorten_jlang`).
+> - **Static-method slot 0.** In a `static` method slot 0 is `<local0>`, not
+>   `this`; the `CpResolver` gained `is_static_method()` (looked up from the
+>   trapping method's access flags) and `render_local` honors it.
+> - **`byte/boolean array`.** `baload`/`bastore` (shared by `byte[]` and
+>   `boolean[]`) spell the element type `byte/boolean`, not `byte`.
+> - **`aaload` index reconstruction.** `arr[idx]` now reconstructs the real
+>   index sub-expression (`a[0]`, `a[i]`, `a[Owner.f]`) instead of the
+>   fabricated `a[...]`; falls back to action-only if the index can't be named.
+> - **Invoke-result + checkcast producers.** A directly-null invoke result reads
+>   `the return value of "Owner.m(params)"`; nested it renders inline
+>   (`Owner.m().field`). A `checkcast` is transparent (`((String) o)` → `o`).
+>   This needed `simulate_to`/`apply_stack_effect` to (a) thread the resolver so
+>   it can size invoke args from the descriptor, and (b) model **stores**
+>   (`astore`/`istore`/…) — the single most important fix, since every
+>   `Type x = null; … x.deref()` emits a store the linear simulation previously
+>   bailed on, which is why locals never got a `because` clause before.
+> - **No "because the receiver is null".** `combine` now emits action-only when
+>   the expression is unknown (HotSpot never prints that phrase). The expression
+>   reconstruction returns a `Producer { text, is_invoke }` instead of a bare
+>   `String` so the top-level `the return value of "…"` phrasing and quoting are
+>   correct.
+>
+> The linear-from-bci-0 simulation stays conservative: any branch or unmodeled
+> opcode before the trap bails to the (valid) action-only HotSpot shape, so it is
+> never *wrong*, only sometimes less detailed than HotSpot on complex methods.
+>
+> **Default flip.** `VmConfig.show_code_details_in_exception_messages` now
+> defaults `true` (matching HotSpot). The `vm-cli` flag is tri-state
+> (`Option<bool>`): absent → the on default; the JDK `-XX:+`/`-XX:-` spellings
+> rewrite to `=true`/`=false`. The `env_cache` `-1` sentinel (set() never called)
+> still reads off, so the in-process Rust test harness and un-wired embedders
+> keep the legacy strings; only CLI app runs get the on default. Opt out per-run
+> with `-XX:-ShowCodeDetailsInExceptionMessages` (or `CRATONVM_HELPFUL_NPE_OPCODES=0`).
+> Step 6 (JIT-NPE field/invoke names) remains gated on `real-frame-deopt.md`.
+> A pre-existing, *separate* bug surfaced during probing: some intrinsified
+> receivers (`String.charAt`/`substring`, certain lambda/`Callable` dispatch)
+> skip the null check entirely (no NPE thrown) — orthogonal to message
+> construction, tracked separately.
+
 > **Increment 4 follow-up landed — inline-codegen null-check path.** Step 6's
 > *first* "Still not done" item (the x64 inline null-check stubs carried no
 > action code) is now done; the deopt-overlapping half (field/invoke names) is
