@@ -1800,6 +1800,27 @@ pub(crate) fn apply_pointer_map_to_thread(
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
+        // Forward the synchronized-method monitor object too. A `synchronized`
+        // method records the object it locked on entry in `monitor_on_exit` and
+        // releases it on frame-pop. If a *cross-thread* moving GC relocated that
+        // object while this thread was parked at the STW safepoint barrier
+        // (`arrive_and_wait` in the safepoint-poll path), a stale
+        // `monitor_on_exit` makes the implicit `monitorexit` target the old
+        // address — surfacing as "thread does not own the monitor" (observed as
+        // an intermittent IllegalMonitorStateException in the ES RestClient
+        // `org/elasticsearch/client/Cancellable$RequestCancellable.
+        // runIfNotCancelled`, whose `synchronized` body allocates heavily under
+        // `-Xmx1g` GC pressure). The GC-initiator (`update_all_roots` in
+        // memory/gc.rs) and the native-blocked-thread wake path
+        // (`check_post_block_gc` in vm/vm_exec.rs) already forward it; this
+        // non-initiator safepoint-resume path was the missing third site. Keep
+        // it consistent with the relocated object, identically to those two.
+        if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
@@ -1819,6 +1840,43 @@ pub(crate) fn apply_pointer_map_to_thread(
         let old_addr = obj_ref.as_ptr() as usize; // Cast: GC object pointer to address
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
             // SAFETY: new_addr was produced by pointer_map and points at a valid object header within the heap arena.
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    // Native-held per-thread roots. A thread running native code that pinned
+    // ObjectRefs across allocations (`pin_native_root`, e.g. the synthetic
+    // HttpServer dispatcher holding the handler + exchange across exchange-build
+    // allocations) can be parked at THIS safepoint barrier when another thread's
+    // moving GC relocates those objects. The GC-initiator path
+    // (`update_all_roots`) and the native-blocked wake path
+    // (`check_post_block_gc`) already forward these; this non-initiator
+    // safepoint-resume path must too, or `read_native_pin` hands back a stale
+    // address (surfaced as the `java/lang/Object.handle` NoSuchMethodError
+    // storm). Forward the same set those two siblings do.
+    for obj_ref in &mut thread.native_pin_roots {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    if let Some(ref mut obj_ref) = thread.native_pending_return {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    for (_key_id, key_ref, val) in &mut thread.scoped_values {
+        if let Some(obj_ref) = key_ref {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        update_value_ref(val, pointer_map);
+    }
+    if let Some(ref mut obj_ref) = thread.pending_async_exception {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
