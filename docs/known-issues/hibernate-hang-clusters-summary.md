@@ -5,9 +5,10 @@
 > **H1** JAXB class-load storm is fixed on `dev` (`1db07c35`/`25c42e13`); **H2** ByteBuddy `MethodGraph`
 > JoinedSubclass bootstrap completes in ~16s `--nojit` (no stall); **H3** JTA/socket = an `accept()`
 > deadlock, fixed on branch `fix/hib-jta-xa-loopback`. See the per-cluster docs (now in `docs/internal/`).
-> H4 (JSON unnest) was not re-checked. The original JUnit repro *classes* still can't run via the launcher
-> due to a separate `@ExtendWith` meta-annotation gap — see
-> [`../known-issues/junit5-extendwith-meta-annotation-parameterresolver.md`](../known-issues/junit5-extendwith-meta-annotation-parameterresolver.md).
+> H4 (JSON unnest) was not re-checked. The real Hibernate JUnit launcher works on CratonVM —
+> `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
+> non-reproducing transient — see
+> [`../internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)).
 
 Census mode: fork-per-class, JIT-off, 600s per-class timeout. All classes below **PASS on HotSpot**
 (JDK 25). Hangs are grouped by **confirmed** root cause (watchdog main-thread dump) or **inferred** (same

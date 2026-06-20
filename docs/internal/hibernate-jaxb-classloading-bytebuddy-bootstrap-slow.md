@@ -14,11 +14,12 @@
   - The deeper **JTA/socket wedge** referenced here is **also resolved** — see
     [hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
     (Layer 2 = an `accept()` deadlock, fixed on branch `fix/hib-jta-xa-loopback`).
-  - **Caveat:** the *original* JAXB-XML-mapping repro classes (`Ejb3XmlElementCollectionTest`, …) could not be
-    re-run via JUnit because of a **separate, newly-found** blocker — the `@Jpa`/`@ExtendWith` *meta-annotation*
-    `ParameterResolver` is not applied (annotation-synthesis family, NOT JAXB/socket). That gates the whole
-    Hibernate JUnit suite; the JAXB/ByteBuddy *bootstrap* path itself was exercised directly (above) and does
-    not hang. The original `retainAll`/collection framing was refuted in-doc.
+  - **Note:** the JAXB/ByteBuddy *bootstrap* path was exercised directly (above) and does not hang. The real
+    Hibernate JUnit launcher also works on CratonVM — `JtaCustomAfterCompletionTest` passes end-to-end (the
+    earlier `@ExtendWith` "blocker" was a misdiagnosed non-reproducing transient; see
+    [`junit5-extendwith-meta-annotation-parameterresolver.md`](junit5-extendwith-meta-annotation-parameterresolver.md)),
+    so the original JAXB-XML repro classes (`Ejb3XmlElementCollectionTest`, …) can be re-run if needed. The
+    original `retainAll`/collection framing was refuted in-doc.
 **Mode:** Interpreter (JIT-off census) — re-verified JIT-on **and** `--nojit`.
 **HotSpot (JDK 25):** affected classes **PASS** (quickly).
 
