@@ -269,17 +269,18 @@ truncate cycle now passes in default (synthetic-socket) mode.
 **fixed on dev** (`1db07c35`/`25c42e13`). The residual ByteBuddy `MethodGraph` bootstrap hang **does not
 reproduce**: a programmatic JOINED-inheritance bootstrap (forcing `JoinedSubclassEntityPersister` +
 `MethodGraph$Compiler$Default.doAnalyze`) completes in ~16s `--nojit` (census mode), well under the 600s
-timeout. The original `retainAll` framing was refuted. Caveat: the original JAXB-XML *JUnit* repro classes
-can't be re-run via the launcher because of a separate `@ExtendWith` meta-annotation gap (next entry).
+timeout. The original `retainAll` framing was refuted.
 
-## Standalone — JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver` (🔴 OPEN, new)
+## Standalone — JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver` — ⚠️ MISDIAGNOSED (does-not-reproduce)
 
-[junit5-extendwith-meta-annotation-parameterresolver.md](junit5-extendwith-meta-annotation-parameterresolver.md)
-— found 2026-06-20 while running the Hibernate JUnit suite. A composed/meta annotation that carries
-`@ExtendWith(...)` (e.g. Hibernate's `@Jpa`) does not register its extensions → `No ParameterResolver
-registered for [EntityManagerFactoryScope]`. Annotation-synthesis family (the meta-present `@Repeatable`
-`@ExtendWith` arm; direct-element merge is already on dev). Blocks running the real Hibernate JUnit suite
-end-to-end; subsystems were validated by programmatic bootstrap instead.
+[docs/internal/junit5-extendwith-meta-annotation-parameterresolver.md](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)
+— first flagged 2026-06-20 as a composed-`@ExtendWith` discovery gap (`No ParameterResolver registered for
+[EntityManagerFactoryScope]`), then **corrected**: it is **not** a meta-annotation bug. `AnnoProbe` shows
+annotation discovery is byte-identical to HotSpot on CratonVM (`findRepeatableAnnotations`=10,
+`getAnnotationsByType`=3, container unwrap all correct), and the real `JtaCustomAfterCompletionTest` **passes
+5/5 via the JUnit launcher** — including default (synthetic-socket) mode with the Layer-2 fix. The single
+early failure was a non-reproducing transient; if it recurs it belongs to the open Family-A reflection-under-GC
+race, not annotation synthesis. So the **real Hibernate JTA JUnit test now runs end-to-end on CratonVM**.
 
 ## Standalone — Hibernate deserialized SessionFactory is null
 
