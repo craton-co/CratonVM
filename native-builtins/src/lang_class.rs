@@ -8583,98 +8583,151 @@ pub(crate) fn native_class_is_annotation(
     Ok(Some(Value::Int(if (flags & 0x2000) != 0 { 1 } else { 0 })))
 }
 
-/// Class.getAnnotationsByType(Class) / getDeclaredAnnotationsByType(Class)
-pub(crate) fn native_class_get_annotations_by_type(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let ann_class_mirror = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let ann_class_id = match mirror_class_id(ctx, ann_class_mirror) {
-        Some(id) => id,
-        None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let ann_class_name = match ctx.class_name_of_id(ann_class_id) {
-        Some(n) => n,
-        None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
-            return Ok(Some(Value::Object(Some(empty))));
-        }
-    };
-    let target_desc = format!("L{};", ann_class_name);
-    let annotations = ctx.class_annotations(class_id);
+/// JDK `AnnotationSupport.getDirectlyAndIndirectlyPresent` for a single class's
+/// annotation set: the directly-present `target` annotation (if any) PLUS the
+/// repeated annotations carried inside its `@Repeatable` container, ordered by
+/// declaration position. When the container is declared *before* the direct
+/// annotation, the contained annotations come first (matching HotSpot's
+/// `containerBeforeContainee` ordering).
+///
+/// Returns the matching `AnnotationData` clones, ready to be turned into proxies.
+fn directly_and_indirectly_present(
+    annotations: &[cratonvm_native_api::AnnotationData],
+    target_desc: &str,
+    container_desc: Option<&str>,
+) -> Vec<cratonvm_native_api::AnnotationData> {
+    use cratonvm_native_api::AnnotationElementValue as AEV;
 
-    // Collect directly-matching annotations
-    let mut matching: Vec<_> = annotations
+    // Directly present: at most one per type in a well-formed class file.
+    let direct_pos = annotations
         .iter()
-        .filter(|a| a.type_descriptor == target_desc)
-        .cloned()
-        .collect();
+        .position(|a| a.type_descriptor == target_desc);
 
-    // @Repeatable container unwrapping: if no direct matches, look for the
-    // container annotation. The annotation type (ann_class_id) should itself
-    // have a @Repeatable annotation whose value() is the container class.
-    // We check the annotation type's own annotations for @Repeatable.
-    if matching.is_empty() {
-        let ann_type_annotations = ctx.class_annotations(ann_class_id);
-        let repeatable_desc = "Ljava/lang/annotation/Repeatable;";
-        if let Some(repeatable_ann) = ann_type_annotations
+    // Indirectly present: the container's `value()` array, filtered to `target`.
+    let mut indirect: Vec<cratonvm_native_api::AnnotationData> = Vec::new();
+    let mut container_pos: Option<usize> = None;
+    if let Some(cdesc) = container_desc {
+        if let Some(cpos) = annotations
             .iter()
-            .find(|a| a.type_descriptor == repeatable_desc)
+            .position(|a| a.type_descriptor == cdesc)
         {
-            // The @Repeatable annotation has a single element "value" which is a Class
-            // descriptor for the container annotation type.
-            if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
-                repeatable_ann
-                    .elements
-                    .iter()
-                    .find(|(name, _)| name == "value")
+            container_pos = Some(cpos);
+            if let Some((_, AEV::Array(elems))) = annotations[cpos]
+                .elements
+                .iter()
+                .find(|(name, _)| name == "value")
             {
-                // Find the container annotation on the target class
-                for ann in &annotations {
-                    if ann.type_descriptor == *container_desc {
-                        // The container's value() element is an Array of nested annotations
-                        if let Some((
-                            _,
-                            cratonvm_native_api::AnnotationElementValue::Array(elems),
-                        )) = ann.elements.iter().find(|(name, _)| name == "value")
-                        {
-                            for elem in elems {
-                                if let cratonvm_native_api::AnnotationElementValue::Annotation(
-                                    nested,
-                                ) = elem
-                                {
-                                    if nested.type_descriptor == target_desc {
-                                        matching.push(nested.clone());
-                                    }
-                                }
-                            }
+                for elem in elems {
+                    if let AEV::Annotation(nested) = elem {
+                        if nested.type_descriptor == target_desc {
+                            indirect.push(nested.clone());
                         }
                     }
                 }
             }
+        }
+    }
+
+    match direct_pos {
+        None => indirect,
+        Some(dpos) => {
+            let direct_ann = annotations[dpos].clone();
+            // Container declared before the direct annotation ⇒ contained first.
+            let container_first = container_pos.map_or(false, |cpos| cpos < dpos);
+            if container_first {
+                indirect.push(direct_ann);
+                indirect
+            } else {
+                let mut result = Vec::with_capacity(indirect.len() + 1);
+                result.push(direct_ann);
+                result.extend(indirect);
+                result
+            }
+        }
+    }
+}
+
+/// If the annotation type `ann_class_id` is `@Repeatable`, return the type
+/// descriptor of its container annotation (read from `@Repeatable`'s `value()`).
+fn repeatable_container_desc(
+    ctx: &mut dyn NativeContext,
+    ann_class_id: ClassId,
+) -> Option<String> {
+    use cratonvm_native_api::AnnotationElementValue as AEV;
+    let ann_type_annotations = ctx.class_annotations(ann_class_id);
+    let repeatable = ann_type_annotations
+        .iter()
+        .find(|a| a.type_descriptor == "Ljava/lang/annotation/Repeatable;")?;
+    repeatable.elements.iter().find_map(|(name, v)| match v {
+        AEV::Class(desc) if name == "value" => Some(desc.clone()),
+        _ => None,
+    })
+}
+
+/// Shared implementation of `Class.getAnnotationsByType` (`inherit = true`:
+/// follow the `@Inherited` superclass chain when nothing is present locally)
+/// and `Class.getDeclaredAnnotationsByType` (`inherit = false`).
+///
+/// Both merge the directly-present annotation with the contents of its
+/// `@Repeatable` container — see [`directly_and_indirectly_present`]. The prior
+/// implementation only unwrapped the container when there was NO direct match,
+/// so `@Foo("A") @FooContainer({@Foo("B"),@Foo("C")})` returned just `[A]`
+/// instead of `[A, B, C]`; and it never followed the `@Inherited` chain, so a
+/// repeatable annotation declared on a superclass returned `[]`.
+fn class_annotations_by_type_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    inherit: bool,
+) -> MethodCallResult {
+    let empty = |ctx: &mut dyn NativeContext| {
+        let arr = ctx.new_ref_array(ClassId::new(0), 0);
+        Ok(Some(Value::Object(Some(arr))))
+    };
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return empty(ctx),
+    };
+    let ann_class_mirror = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return empty(ctx),
+    };
+    let class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => return empty(ctx),
+    };
+    let ann_class_id = match mirror_class_id(ctx, ann_class_mirror) {
+        Some(id) => id,
+        None => return empty(ctx),
+    };
+    let ann_class_name = match ctx.class_name_of_id(ann_class_id) {
+        Some(n) => n,
+        None => return empty(ctx),
+    };
+    let target_desc = format!("L{};", ann_class_name);
+    let container_desc = repeatable_container_desc(ctx, ann_class_id);
+
+    let this_annotations = ctx.class_annotations(class_id);
+    let mut matching = directly_and_indirectly_present(
+        &this_annotations,
+        &target_desc,
+        container_desc.as_deref(),
+    );
+
+    // `getAnnotationsByType` follows the @Inherited chain when (and only when)
+    // nothing is directly/indirectly present on this class.
+    if matching.is_empty() && inherit && is_inherited_annotation(ctx, &target_desc) {
+        let mut current = ctx.superclass_of(class_id);
+        while let Some(super_id) = current {
+            let super_anns = ctx.class_annotations(super_id);
+            matching = directly_and_indirectly_present(
+                &super_anns,
+                &target_desc,
+                container_desc.as_deref(),
+            );
+            if !matching.is_empty() {
+                break;
+            }
+            current = ctx.superclass_of(super_id);
         }
     }
 
@@ -8683,6 +8736,24 @@ pub(crate) fn native_class_get_annotations_by_type(
         create_annotation_proxy(ctx, &matching[i])
     });
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `Class.getAnnotationsByType(Class)` — associated annotations: direct +
+/// `@Repeatable` container contents, following the `@Inherited` superclass chain.
+pub(crate) fn native_class_get_annotations_by_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_annotations_by_type_impl(ctx, args, true)
+}
+
+/// `Class.getDeclaredAnnotationsByType(Class)` — like `getAnnotationsByType` but
+/// limited to THIS class's own annotations (no `@Inherited` superclass walk).
+pub(crate) fn native_class_get_declared_annotations_by_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_annotations_by_type_impl(ctx, args, false)
 }
 
 /// `Method.getAnnotationsByType(Class)` / `getDeclaredAnnotationsByType` —
@@ -8725,51 +8796,18 @@ pub(crate) fn native_method_get_annotations_by_type(
         None => return empty(ctx),
     };
     let target_desc = format!("L{};", ann_class_name);
+    let container_desc = repeatable_container_desc(ctx, ann_class_id);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
 
-    let mut matching: Vec<_> = annotations
-        .iter()
-        .filter(|a| a.type_descriptor == target_desc)
-        .cloned()
-        .collect();
-
-    // @Repeatable container unwrapping (matches the Class variant above).
-    if matching.is_empty() {
-        let ann_type_annotations = ctx.class_annotations(ann_class_id);
-        let repeatable_desc = "Ljava/lang/annotation/Repeatable;";
-        if let Some(repeatable_ann) = ann_type_annotations
-            .iter()
-            .find(|a| a.type_descriptor == repeatable_desc)
-        {
-            if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
-                repeatable_ann
-                    .elements
-                    .iter()
-                    .find(|(name, _)| name == "value")
-            {
-                for ann in &annotations {
-                    if ann.type_descriptor == *container_desc {
-                        if let Some((
-                            _,
-                            cratonvm_native_api::AnnotationElementValue::Array(elems),
-                        )) = ann.elements.iter().find(|(name, _)| name == "value")
-                        {
-                            for elem in elems {
-                                if let cratonvm_native_api::AnnotationElementValue::Annotation(
-                                    nested,
-                                ) = elem
-                                {
-                                    if nested.type_descriptor == target_desc {
-                                        matching.push(nested.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Direct + @Repeatable container contents, in declaration order. Methods
+    // have no `@Inherited` semantics, so there is no superclass walk. The prior
+    // code only unwrapped the container when no direct match existed, dropping
+    // the contained annotations whenever a direct one was also present.
+    let matching = directly_and_indirectly_present(
+        &annotations,
+        &target_desc,
+        container_desc.as_deref(),
+    );
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
