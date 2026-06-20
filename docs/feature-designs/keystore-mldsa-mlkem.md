@@ -1,8 +1,28 @@
 # KeyStore (PKCS12/JKS) + ML-DSA / ML-KEM Real-Provider Coverage
 
-Status: design / partially-built. M. Close the `KeyStore.getInstance` gap and
-route post-quantum ML-DSA / ML-KEM to a real provider — `java_security` is the
-lowest JCK-compliance row, and these are its named gaps.
+Status: implemented. M. Close the `KeyStore.getInstance` gap and route
+post-quantum ML-DSA / ML-KEM to a real provider — `java_security` is the lowest
+JCK-compliance row, and these are its named gaps.
+
+**Implementation status (2026-06-19):**
+- **Part A — KeyStore** load + read accessors + `engineStore` write path: done
+  (`native-builtins/src/keystore.rs`, JKS round-trip via `write_jks`).
+- **Part B — ML-DSA** keygen/keyfactory + `Signature` sign/verify: done, routed
+  to `sun.security.provider.ML_DSA_Impls$KPG*/$KF*/$SIG*`
+  (`jca::key_factory`, `jca::signature`).
+- **Part B — ML-KEM** keygen/keyfactory + **`javax.crypto.KEM` encaps/decaps**:
+  done, routed to `com.sun.crypto.provider.ML_KEM_Impls$KPG*/$KF*/$K*`
+  (`jca::key_factory`, new `jca::kem`). Validated end-to-end:
+  `KEM.getInstance(...).newEncapsulator(pub).encapsulate()` and
+  `newDecapsulator(priv).decapsulate(ct)` agree on the shared secret for
+  ML-KEM-512/768/1024 (sizes match HotSpot: secret=32, ct=768/1088/1568).
+  Required a sibling fix to the `MessageDigest` shim — registering the
+  `digest(byte[],int,int)` overload that ML-KEM's FIPS-203 keygen hashes
+  through (`jca::message_digest::md_digest_into`).
+- **TCK rows** (`vm/src/runtime/tck.rs`) corrected to honest `Partial` (routed,
+  not native) for both ML-KEM (496) and ML-DSA (497).
+- Gated behind `route_pqc_to_real()` (default on; `CRATONVM_SYNTHETIC_PQC=1`
+  fails closed with `NoSuchAlgorithmException`).
 
 ## Goal
 

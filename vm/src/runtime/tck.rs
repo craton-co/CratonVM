@@ -3343,16 +3343,18 @@ impl JepComplianceMatrix {
         // the real JDK SUN provider (`sun.security.provider.ML_DSA_Impls$KPG*/$KF*/
         // $SIG*`) behind `route_pqc_to_real`, so ML-DSA round-trips — but it relies
         // on the routed provider rather than a native impl, so it is Partial, not a
-        // self-contained Compliant. ML-KEM keygen/keyfactory route similarly, but
-        // the `javax.crypto.KEM` encaps/decaps SPI is not yet wired here.
+        // self-contained Compliant. ML-KEM keygen/keyfactory AND the
+        // `javax.crypto.KEM` encaps/decaps SPI are now routed the same way to
+        // SunJCE's `com.sun.crypto.provider.ML_KEM_Impls$KPG*/$KF*/$K*` (see
+        // `jca::kem`), so ML-KEM also round-trips via the routed provider — still
+        // Partial (routed, not native), never Compliant.
         self.add(
             496,
             "ML-KEM",
             ComplianceStatus::Partial(
-                "Keygen/KeyFactory routed to real provider; KEM encaps/decaps SPI not yet wired"
-                    .to_string(),
+                "Keygen/KeyFactory + KEM encaps/decaps routed to real SunJCE provider".to_string(),
             ),
-            "Post-quantum KEM partial",
+            "Post-quantum KEM routed (not native)",
         );
         self.add(
             497,
