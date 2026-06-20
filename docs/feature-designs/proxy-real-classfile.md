@@ -469,3 +469,95 @@ type-check bug exposed by the real-super layout:
   flipping `real_proxy_super()` default-ON: run the real-app proxy suites
   (Keycloak/Quarkus ArC, Hibernate JdbcSpies, Spring/JDK dynamic proxies) under
   `CRATONVM_REAL_PROXY_SUPER=1`. Default stays OFF until that soak is green.
+
+## Increment 6 — `InvocationHandler.invokeDefault` + live-path UndeclaredThrowableException parity
+
+Closes the highest-value orthogonal gap Increment 4/5 deferred (handler-driven
+default methods) and — exposed by that fix — a pre-existing divergence on the
+**live** proxy dispatch path. Both fixes apply on the canonical default path
+(`CRATONVM_REAL_PROXY` on) and under `CRATONVM_REAL_PROXY_SUPER=1`.
+
+### 1. `InvocationHandler.invokeDefault(proxy, m, args)` (was gap #1)
+
+The real JDK `static InvocationHandler.invokeDefault` drives `Proxy.invokeDefault`,
+which reflects the generated proxy class's `proxyClassLookup` accessor + a
+full-power `MethodHandles.Lookup` to bind an `invokespecial` MethodHandle to the
+interface's default body. CratonVM's generated `$ProxyN` emits no
+`proxyClassLookup` (and the proxy model has no real per-class Lookup), so the real
+bytecode threw `InternalError: NoSuchMethodException: proxyClassLookup` for *every*
+handler that delegated a default method via `invokeDefault` — the idiomatic
+pattern `default: return InvocationHandler.invokeDefault(proxy, m, a);`.
+
+- **Fix** — `native-builtins::native_invocation_handler_invoke_default`, force-
+  dispatched over the real bytecode via
+  `interpreter::force_native_over_real_jdk_bytecode`. It runs the interface default
+  body **directly** through `NativeContext::invoke_special` — the same super-call
+  dispatch (`Lookup.findSpecial` semantics: resolve the declaring interface, run
+  `I.m`, no virtual retarget) the JDK ultimately performs, minus the Lookup
+  plumbing. The native validates the JDK contract (proxy instance + `Method.isDefault`
+  → `IllegalArgumentException`), unboxes the `Object[]` args to the default method's
+  primitive/reference parameter types, prepends the proxy receiver, invokes, and
+  boxes the result. Nested *virtual* calls on the proxy inside the default body
+  still re-dispatch through the `InvocationHandler` (invoke_special only bypasses
+  the retarget for the single resolved method) — matching the JDK.
+
+### 2. UndeclaredThrowableException parity on the live dispatch path
+
+Fixing (1) let the `ProxyDispatch` soak progress past the default-method line and
+surfaced a separate pre-existing bug: the live proxy dispatch hooks
+(`vm_exec::proxy_invoke_handler{,_shared}`) returned the handler result verbatim,
+so a checked exception thrown by a handler that the proxied method does **not**
+declare surfaced unwrapped — where HotSpot's generated `$ProxyN` body wraps it in
+`java.lang.reflect.UndeclaredThrowableException` (JLS §15.12.4.4 / the `Proxy`
+contract). The dead-code generated-body path `native_proxy_dispatch_invoke`
+already wrapped (v3 item 6), but it is superseded by the interpreter hooks, so the
+wrap never ran for real calls.
+
+- **Fix** — `vm_exec::proxy_wrap_undeclared_if_needed`, applied on the
+  `Err(ExceptionThrown)` arm of both live hooks **including the lambda-handler
+  branch** (the common case — a `(proxy,m,a) -> …` passed straight to
+  `newProxyInstance` — which previously `?`-propagated past any end-of-function
+  wrap). It classifies the throw: `RuntimeException` / `Error` and any *declared*
+  checked exception of the proxied method (read from the exact declaring
+  interface's `Exceptions` attribute via `proxy_resolve_declaring_class_mirror` +
+  `proxy_method_declared_exceptions`) propagate verbatim; only an *undeclared*
+  checked exception is rewrapped in `UndeclaredThrowableException(thrown)`. Narrow
+  by construction — the verbatim cases (the overwhelming majority) are byte-for-byte
+  unchanged; best-effort wrap (on any resolve/ctor failure the original exception
+  propagates).
+
+### Validation
+
+Live three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=1`), fresh
+debug binary `cratonvm-proxyfin.exe`, harness `scratch/proxysoak/`:
+
+- **`ProxyDispatch`** — was `InternalError: proxyClassLookup` at the default-method
+  line (line 46); now **byte-identical to HotSpot in both modes** (`tag=calc:2`,
+  `declared=IOException:io-boom`,
+  `undeclared=UTE:java.lang.Exception:checked-boom`, `runtime=ISE:rt-boom`). The
+  `declared`/`runtime`/`undeclared` triple exercises all three classify branches
+  of fix (2).
+- **`DefaultMethodProxy`** (new focused probe — primitive returns/args,
+  default-calls-default, default-calls-abstract re-dispatch through the handler,
+  and the two `IllegalArgumentException` guards) — **byte-identical to HotSpot in
+  both modes**.
+- **`ProxySer` / `LoggingProxy`** — still MATCH (no regression). `ProxyIdentity` /
+  `ProxyEdge` default outputs **byte-identical to the pre-change baseline** — the
+  fixes touch only the default-method dispatch and the undeclared-throw path.
+
+### Still remaining (unchanged; do not block the `real_proxy_super` flip)
+
+The other orthogonal gaps from Increment 4/5 are untouched and still diverge
+equally in both modes:
+
+- **`Proxy.getProxyClass(loader, ifaces)`** (deprecated) → `InternalError: Proxy is
+  not supported until module system is fully initialized` (gap #2). Tractable via
+  the existing `define_or_get_proxy_class` machinery; deferred (deprecated API, and
+  it would still leave the naming gap below in `ProxyEdge`).
+- **Generated proxy package naming** `com.sun.proxy.$ProxyN` vs HotSpot-25's
+  per-loader `jdk.proxyN.$ProxyM` (gap #3, cosmetic). The current `com/sun/proxy`
+  name is load-bearing for the prohibited-package-name fix (3a) and the
+  serialization wiring of Increments 1/3, so a rename is deliberately deferred.
+
+The `real_proxy_super()` default flip remains gated on the real-app proxy suites
+per Increment 5 — unaffected by this increment.

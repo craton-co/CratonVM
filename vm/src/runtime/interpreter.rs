@@ -14182,6 +14182,22 @@ fn force_native_over_real_jdk_bytecode(
                 "resolveProxyClass",
                 "([Ljava/lang/String;)Ljava/lang/Class;",
             )
+            // proxy-real-classfile increment 6: `InvocationHandler.invokeDefault`
+            // (static, JDK 16+). The real JDK body drives `Proxy.invokeDefault`,
+            // which reflects the generated proxy class's `proxyClassLookup`
+            // accessor + a full-power `MethodHandles.Lookup` to bind an
+            // invokespecial MethodHandle to the interface default body. CratonVM's
+            // generated `$ProxyN` emits no `proxyClassLookup` (and the proxy model
+            // has no real per-class Lookup), so the real bytecode throws
+            // `InternalError: NoSuchMethodException: proxyClassLookup`. Force the
+            // registered native (native-builtins
+            // `native_invocation_handler_invoke_default`), which runs the default
+            // body directly via `invoke_special`.
+            | (
+                "java/lang/reflect/InvocationHandler",
+                "invokeDefault",
+                "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(

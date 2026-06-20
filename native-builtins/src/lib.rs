@@ -39403,6 +39403,20 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         native_proxy_dispatch_invoke,
     );
+    // proxy-real-classfile increment 6 — `InvocationHandler.invokeDefault`
+    // (static, JDK 16+). The real JDK body reflects the generated proxy class's
+    // `proxyClassLookup` accessor (which CratonVM's `$ProxyN` does not emit) and
+    // throws `InternalError: NoSuchMethodException: proxyClassLookup`. Force this
+    // native over the real bytecode (companion entry in
+    // `interpreter::force_native_over_real_jdk_bytecode`); it runs the interface
+    // default body directly via `invoke_special`. `Bridge` category so it
+    // survives the no-synthetic-stubs drop.
+    registry.register(
+        "java/lang/reflect/InvocationHandler",
+        "invokeDefault",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+        native_invocation_handler_invoke_default,
+    );
     // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])` override.
     // The serialization module's own copy (serialization.rs) is gated behind the
     // `experimental-serialization` feature and absent from the default build,
@@ -39881,6 +39895,158 @@ fn wrap_undeclared_throwable(
         &ctor_args,
     );
     ute
+}
+
+/// proxy-real-classfile increment 6 — `InvocationHandler.invokeDefault(Object
+/// proxy, Method method, Object... args)` (JDK 16+, a `static` interface
+/// method).
+///
+/// The real JDK body drives `Proxy.invokeDefault`, which reflects the generated
+/// proxy class's `proxyClassLookup` accessor + a full-power
+/// `MethodHandles.Lookup` to bind an `invokespecial` MethodHandle to the
+/// interface's default body. CratonVM's generated `$ProxyN` emits no
+/// `proxyClassLookup` accessor (and the proxy model has no real per-class
+/// Lookup), so the real bytecode throws
+/// `InternalError: NoSuchMethodException: proxyClassLookup`. This native is
+/// force-dispatched over the real bytecode (see
+/// `interpreter::force_native_over_real_jdk_bytecode`) and runs the default body
+/// directly via [`NativeContext::invoke_special`] — the same super-call dispatch
+/// (`Lookup.findSpecial` semantics) the JDK ultimately performs, minus the
+/// Lookup plumbing. Nested *virtual* calls on the proxy inside the default body
+/// still route back through the `InvocationHandler` (invoke_special only
+/// bypasses the retarget for the single *resolved* method).
+///
+/// Args (static method): `[0]` proxy, `[1]` `Method`, `[2]` `Object[]` args
+/// (may be `null` for a no-arg default method).
+fn native_invocation_handler_invoke_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    let proxy = match args.first() {
+        Some(Value::Object(Some(p))) => *p,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("InvocationHandler.invokeDefault: proxy is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let method_obj = match args.get(1) {
+        Some(Value::Object(Some(m))) => *m,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("InvocationHandler.invokeDefault: method is null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    // JDK contract: the receiver must be a proxy instance.
+    if !proxy_chain_reaches_instance(ctx, ctx.class_id_of_object(proxy)) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "'proxy' is not a proxy instance".to_string(),
+        }
+        .into());
+    }
+
+    // JDK contract: the method must be a default method — public, non-abstract,
+    // non-static, declared on an interface (mirrors `Method.isDefault()`).
+    const ACC_PUBLIC: i32 = 0x0001;
+    const ACC_STATIC: i32 = 0x0008;
+    const ACC_ABSTRACT: i32 = 0x0400;
+    let modifiers = match ctx.get_field_by_name(method_obj, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let declaring_mirror = match ctx.get_field_by_name(method_obj, "clazz") {
+        Value::Object(Some(m)) => m,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "InvocationHandler.invokeDefault: method has no declaring class"
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+    let decl_is_interface = ctx
+        .class_id_from_mirror(declaring_mirror)
+        .map(|cid| ctx.is_interface_class(cid))
+        .unwrap_or(false);
+    let is_default =
+        decl_is_interface && (modifiers & (ACC_ABSTRACT | ACC_PUBLIC | ACC_STATIC)) == ACC_PUBLIC;
+    if !is_default {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "method is not a default method".to_string(),
+        }
+        .into());
+    }
+
+    let iface_name = match crate::lang_class::mirror_class_name(ctx, declaring_mirror) {
+        Some(n) => n,
+        None => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "InvocationHandler.invokeDefault: cannot resolve declaring interface"
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+    let method_name = match ctx.get_field_by_name(method_obj, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let descriptor = crate::lang_class::method_descriptor_for_invoke(ctx, method_obj);
+    let (param_descs, ret_desc) = crate::lang_class::parse_descriptor_param_and_return(&descriptor);
+
+    // Unbox the `Object[]` args to match the default method's primitive /
+    // reference parameter types, prepending the proxy receiver (which is
+    // `invoke_special`'s `args[0]`).
+    let args_arr = match args.get(2) {
+        Some(Value::Object(Some(a))) => Some(*a),
+        _ => None,
+    };
+    let supplied = match args_arr {
+        Some(a) => ctx.array_length(a),
+        None => 0,
+    };
+    if supplied != param_descs.len() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "InvocationHandler.invokeDefault: wrong number of arguments for {}.{}: \
+                 expected {}, got {}",
+                iface_name,
+                method_name,
+                param_descs.len(),
+                supplied
+            ),
+        }
+        .into());
+    }
+    let mut invoke_args: Vec<Value> = Vec::with_capacity(param_descs.len() + 1);
+    invoke_args.push(Value::Object(Some(proxy)));
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let raw = match args_arr {
+            Some(a) => ctx.get_array_element(a, i),
+            None => Value::Object(None),
+        };
+        invoke_args.push(crate::lang_class::unbox_arg(ctx, raw, pdesc));
+    }
+
+    // Run the interface's default body as an invokespecial super-call — exactly
+    // `I.m(...)`, with no virtual retarget back to the proxy's intercepted
+    // dispatch. A thrown exception propagates verbatim (invokeDefault declares
+    // `throws Throwable`; it does NOT apply UndeclaredThrowableException
+    // wrapping — that is only on the proxy-method dispatch path).
+    let result = ctx.invoke_special(&iface_name, &method_name, &descriptor, &invoke_args)?;
+
+    // `invokeDefault` returns `Object` — box a primitive result per the return
+    // type; reference / void results pass through unchanged.
+    match result {
+        Some(val) => Ok(Some(crate::lang_class::box_value(ctx, val, &ret_desc))),
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 /// proxy-real-classfile increment 1 — gate for the real generated-`$ProxyN`
