@@ -470,6 +470,25 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if millis > 0 {
+        // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): a worker is
+        // stuck in a Thread.sleep poll-loop; sample the Java caller chain so we
+        // can identify which loop and what it polls. Sampled + capped to avoid
+        // flooding; off by default (one env check per real sleep call).
+        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            static PRINTED: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n % 16 == 0 && PRINTED.fetch_add(1, Ordering::Relaxed) < 60 {
+                let st = ctx.capture_stack_trace(0);
+                let frames: Vec<String> = st
+                    .iter()
+                    .take(12)
+                    .map(|e| format!("{}.{}:{}", e.class_name, e.method_name, e.line_number))
+                    .collect();
+                eprintln!("[SLEEP-TRACE #{n} millis={millis}] {}", frames.join(" <- "));
+            }
+        }
         // Check interrupted before sleeping
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
@@ -635,6 +654,19 @@ pub(crate) fn native_thread_join_timed(
     // target thread is still alive. Poll isAlive at a small cadence so we
     // don't block beyond the deadline.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis as u64);
+    if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+            let st = ctx.capture_stack_trace(0);
+            let frames: Vec<String> = st
+                .iter()
+                .take(10)
+                .map(|e| format!("{}.{}:{}", e.class_name, e.method_name, e.line_number))
+                .collect();
+            eprintln!("[JOIN-TIMED-TRACE millis={millis}] {}", frames.join(" <- "));
+        }
+    }
     loop {
         if !ctx.thread_is_alive(this) {
             break;
@@ -1781,6 +1813,24 @@ pub(crate) fn native_thread_sleep_nanos(
         _ => 0,
     };
     if nanos > 0 {
+        // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): JDK25
+        // Thread.sleep(millis) routes through Thread.sleepNanos -> here, so the
+        // worker's poll-loop sleeps land in THIS native (not the millis one).
+        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            static PRINTED: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n % 16 == 0 && PRINTED.fetch_add(1, Ordering::Relaxed) < 80 {
+                let st = ctx.capture_stack_trace(0);
+                let frames: Vec<String> = st
+                    .iter()
+                    .take(12)
+                    .map(|e| format!("{}.{}:{}", e.class_name, e.method_name, e.line_number))
+                    .collect();
+                eprintln!("[SLEEP-NANOS-TRACE #{n} nanos={nanos}] {}", frames.join(" <- "));
+            }
+        }
         // Check interrupted before sleeping — clear flag and throw
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(

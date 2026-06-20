@@ -567,6 +567,31 @@ VM's real file layer).
 > GC-validated, default-off diagnostic lever (not a fix for this bug). **Net: stop chasing GC roots
 > for Gap 9.**
 >
+> **LOCALIZATION via `cdb` + sleep tracing (2026-06-20) — it is a Rust-internal `std::thread::sleep`
+> poll-loop, NOT a Java-level wait, NOT JIT.** Confirmed `--nojit` wedges identically with the SAME
+> signature (main parked in `waitForExit`; the wedged worker undumpable by the Java-frame watchdog),
+> so JIT-miscompile is ruled out too. Attached `cdb` (Win10 debugger) to the live hung process
+> (`CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` so it doesn't self-abort): the wedged OS thread `"Thread-1"`
+> is in `std::thread::sleep` ← `std::sys::thread::windows::sleep` ← `CreateWaitableTimerExW` (a
+> *Rust* sleep, deep under interpreter/JIT frames); a separate `"main-vm"` OS thread is blocked in
+> `ntdll!ZwReadFile` (a synchronous handle read); OS `"main"` is in `NtWaitForSingleObject` (the
+> `waitForExit` park). Added a gated `CRATONVM_DBG_SLEEP_TRACE` (`native-builtins/src/lang_system.rs`)
+> that dumps the Java caller chain at `Thread.sleep`/`sleepNanos`/`join(timeout)` — it fired **0**
+> times during the wedge, proving the worker's sleep is NOT `java.lang.Thread.sleep`/`join` (and the
+> object monitor uses a real `parking_lot::Condvar`, not sleep-poll). So the loop is a *VM-internal*
+> Rust sleep-retry whose exact site is still unpinned because the release build (`strip=debuginfo`,
+> `debug=false`) leaves `cdb` resolving every private frame to `socket_addr::impl$6::fmt+<offset>`
+> (garbage). HotSpot oracle: after Hibernate Validator, the JPA Startup Thread does `Started
+> datasource` → SessionFactory, then *main* runs a burst of `JtaTransactionWrapper` commits
+> ("Non-HTTP task" — Keycloak DB bootstrap) → `Listening`. On CratonVM the log freezes right at
+> Hibernate Validator (none of that happens) and main reaches `waitForExit` without binding HTTP.
+> **Next-session unblock (highest leverage):** rebuild with full symbols (`[profile.release]
+> debug=2, strip="none"`) and re-attach `cdb` → real function names for `Thread-1`'s sleep-loop AND
+> `main-vm`'s `ZwReadFile` (use `!handle @rcx f` on `main-vm` to identify the file/socket it blocks
+> on — likely the actual wedge, with `Thread-1` merely polling for its result). Then fix that
+> primitive. This is a deep, nondeterministic concurrency/startup bug; the originally-assumed
+> register-resident-root cause is DISPROVEN.
+>
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
 > entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
