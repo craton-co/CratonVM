@@ -642,6 +642,33 @@ which is also why the DSE/escape/LICM passes are still latent) and (b) the
 harness to supply real helpers or move to VM-level differential validation. Those
 are the next step-3 slices.
 
+## Increment 13 (step 3 — IR gate relaxation: tableswitch / lookupswitch) landed
+
+Status: **landed** on `dev`. Second slice of step 3, harness-validated.
+
+The IR builder bailed on `tableswitch` (0xaa) / `lookupswitch` (0xab) — so int
+`switch` methods (state machines, dispatch) never reached the optimizing IR path.
+They now lower as a **CMP-equality chain** (the same shape the single-pass
+backend emits): each case becomes `if (key == match) goto target`, the unmatched
+edge falls through to the next comparison, and the final unmatched edge goes to
+the default. This reuses the existing `If`/`Cmp`/merge machinery — no dedicated
+multi-way node or new lowering.
+
+Implementation (`jit/src/ir.rs`):
+- A shared `parse_switch` helper parses either table (4-byte padding, signed
+  offsets relative to the opcode pc) and returns `(len, default_target, cases)`,
+  reusing the single-pass `checked_tableswitch_count` / `checked_lookupswitch_
+  npairs` caps and validating every target is in range (else `None` → bail).
+- The build loop's `0xaa | 0xab` arm pops the key and emits the comparison chain.
+- Both bytecode length walkers (`find_branch_targets`, `find_loop_headers`) use
+  `parse_switch` to register every case + default target (a backward target is a
+  loop header) and to advance the pc by the variable instruction length — without
+  this they would mis-parse the switch table as opcodes.
+
+**Tests** (`jit/tests/ir_vs_singlepass.rs`): `tableswitch` (dense 0..2 + default)
+and `lookupswitch` (sparse keys 10/20 + default), each checked on hits and
+out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
@@ -655,9 +682,10 @@ are the next step-3 slices.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
    soak flag (Front 1.2). **In progress**: branch-free / branchy / early-return /
    loop int methods all take the IR path and pass the harness; increment 12 added
-   `i2b`/`i2c`/`i2s`. **Remaining**: methods with `invoke*` / field / array ops —
-   the builder bails on those today, so this needs builder emission of those ops
-   + a real-helper (or VM-level) differential harness. ← next.
+   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`.
+   **Remaining**: methods with `invoke*` / field / array ops — the builder bails
+   on those today, so this needs builder emission of those ops + a real-helper
+   (or VM-level) differential harness. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the

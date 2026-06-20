@@ -1224,6 +1224,42 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // tableswitch / lookupswitch — lower as a CMP-equality chain
+                // (the same shape the single-pass backend emits): each case is
+                // `if (key == match) goto target`, the unmatched edge falls
+                // through to the next comparison, and the final unmatched edge
+                // goes to the default target. Reuses the existing If/Cmp/merge
+                // machinery — no dedicated multi-way node.
+                0xaa | 0xab => {
+                    let (len, default_target, cases) = parse_switch(code, code_len, pc)?;
+                    let key = self.pop();
+                    for (match_val, target) in &cases {
+                        let cval = self.iconst(*match_val as i64);
+                        let cmp =
+                            self.add_data(Op::Cmp(CmpOp::Eq), IrType::Int, vec![key, cval], pc);
+                        let if_node =
+                            self.graph
+                                .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
+                        let true_ctrl =
+                            self.graph
+                                .add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
+                        let false_ctrl =
+                            self.graph
+                                .add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
+                        // Matched edge → the case target. The abstract state is
+                        // invariant across the chain (the switch consumed only
+                        // `key`), so each predecessor snapshot is correct.
+                        self.ctrl = true_ctrl;
+                        self.add_merge_predecessor(*target);
+                        // Unmatched edge → next comparison.
+                        self.ctrl = false_ctrl;
+                    }
+                    // All comparisons failed → default target.
+                    self.add_merge_predecessor(default_target);
+                    self.ctrl = NO_NODE;
+                    pc += len;
+                }
+
                 // Unsupported opcode — bail out
                 _ => return None,
             }
@@ -1234,6 +1270,71 @@ impl IrBuilder {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Parse a `tableswitch` (0xaa) / `lookupswitch` (0xab) at opcode offset
+/// `op_pc`. Returns `(instruction_len, default_target, cases)` where each case
+/// is `(match_value, target_pc)`; all targets are absolute bytecode offsets
+/// (JVMS switch branch offsets are relative to the opcode pc). Returns `None`
+/// if the table is malformed, exceeds the dense/sparse caps shared with the
+/// single-pass scanner, or any target is out of range — callers treat that as
+/// "not IR-compilable" (the single-pass backend still handles it).
+fn parse_switch(
+    code: &[u8],
+    code_len: usize,
+    op_pc: usize,
+) -> Option<(usize, usize, Vec<(i32, usize)>)> {
+    let op = *code.get(op_pc)?;
+    // 0-3 bytes of padding so the table starts 4-byte aligned from method start.
+    let mut p = op_pc + 1;
+    while p % 4 != 0 {
+        p += 1;
+    }
+    let read_i32 =
+        |at: usize| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+    let target_of = |off: i32| -> Option<usize> {
+        let t = op_pc as i64 + off as i64;
+        (t >= 0 && (t as usize) < code_len).then_some(t as usize)
+    };
+    match op {
+        0xaa => {
+            if p + 12 > code_len {
+                return None;
+            }
+            let default = read_i32(p);
+            let low = read_i32(p + 4);
+            let high = read_i32(p + 8);
+            let num = crate::x64::checked_tableswitch_count(low, high)?;
+            let end = p + 12 + num * 4;
+            if end > code_len {
+                return None;
+            }
+            let mut cases = Vec::with_capacity(num);
+            for i in 0..num {
+                let off = read_i32(p + 12 + i * 4);
+                cases.push((low + i as i32, target_of(off)?));
+            }
+            Some((end - op_pc, target_of(default)?, cases))
+        }
+        0xab => {
+            if p + 8 > code_len {
+                return None;
+            }
+            let default = read_i32(p);
+            let npairs = crate::x64::checked_lookupswitch_npairs(read_i32(p + 4))?;
+            let end = p + 8 + npairs * 8;
+            if end > code_len {
+                return None;
+            }
+            let mut cases = Vec::with_capacity(npairs);
+            for i in 0..npairs {
+                let pair = p + 8 + i * 8;
+                cases.push((read_i32(pair), target_of(read_i32(pair + 4))?));
+            }
+            Some((end - op_pc, target_of(default)?, cases))
+        }
+        _ => None,
+    }
+}
 
 /// Scan bytecode for branch targets (PCs that are jumped to).
 fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
@@ -1268,6 +1369,20 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
                     }
                 }
                 pc += 3;
+            }
+            // tableswitch / lookupswitch — register the default + every case
+            // target (each case body is a merge target). A malformed switch is
+            // left for the builder to bail on; just step past the opcode.
+            0xaa | 0xab => {
+                if let Some((len, default_target, cases)) = parse_switch(code, code_len, pc) {
+                    targets.push(default_target);
+                    for (_, target) in cases {
+                        targets.push(target);
+                    }
+                    pc += len;
+                } else {
+                    pc += 1;
+                }
             }
             // 1-byte opcodes
             0x02..=0x0a
@@ -1338,6 +1453,23 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
                     }
                 }
                 pc += 3;
+            }
+            // tableswitch / lookupswitch — a backward case/default target is a
+            // loop header (same rule as a backward branch).
+            0xaa | 0xab => {
+                if let Some((len, default_target, cases)) = parse_switch(code, code_len, pc) {
+                    if default_target <= pc {
+                        headers.insert(default_target);
+                    }
+                    for (_, target) in cases {
+                        if target <= pc {
+                            headers.insert(target);
+                        }
+                    }
+                    pc += len;
+                } else {
+                    pc += 1;
+                }
             }
             // 1-byte opcodes
             0x02..=0x0a

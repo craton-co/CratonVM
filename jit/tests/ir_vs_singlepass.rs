@@ -355,6 +355,82 @@ fn ir_vs_singlepass_i2b_chained() {
     );
 }
 
+// ── switches (tableswitch / lookupswitch) ──────────────────────────────
+//
+// Step 3 second slice: the IR builder now lowers tableswitch/lookupswitch as a
+// CMP-equality chain (the same shape single-pass emits), so int switch methods
+// take the optimizing IR path. The harness confirms IR == single-pass for hits
+// and the default.
+
+#[test]
+fn ir_vs_singlepass_tableswitch() {
+    // int f(int x) { switch (x) { case 0: return 10; case 1: return 20;
+    //                             case 2: return 30; default: return 99; } }
+    // tableswitch at pc 1 → padding to pc 4; table low=0 high=2.
+    check(
+        "tswitch",
+        "(I)I",
+        vec![
+            0x1a, // 0: iload_0
+            0xaa, // 1: tableswitch
+            0x00, 0x00, // 2-3: padding
+            0x00, 0x00, 0x00, 0x24, // 4-7: default = +36 → 37
+            0x00, 0x00, 0x00, 0x00, // 8-11: low = 0
+            0x00, 0x00, 0x00, 0x02, // 12-15: high = 2
+            0x00, 0x00, 0x00, 0x1b, // 16-19: case 0 = +27 → 28
+            0x00, 0x00, 0x00, 0x1e, // 20-23: case 1 = +30 → 31
+            0x00, 0x00, 0x00, 0x21, // 24-27: case 2 = +33 → 34
+            0x10, 0x0a, 0xac, // 28-30: bipush 10; ireturn
+            0x10, 0x14, 0xac, // 31-33: bipush 20; ireturn
+            0x10, 0x1e, 0xac, // 34-36: bipush 30; ireturn
+            0x10, 0x63, 0xac, // 37-39: bipush 99; ireturn (default)
+        ],
+        1,
+        1,
+        &[
+            (vec![0], 10),
+            (vec![1], 20),
+            (vec![2], 30),
+            (vec![3], 99),
+            (vec![-1], 99),
+            (vec![100], 99),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_lookupswitch() {
+    // int g(int x) { switch (x) { case 10: return 1; case 20: return 2;
+    //                             default: return 0; } }
+    check(
+        "lswitch",
+        "(I)I",
+        vec![
+            0x1a, // 0: iload_0
+            0xab, // 1: lookupswitch
+            0x00, 0x00, // 2-3: padding
+            0x00, 0x00, 0x00, 0x1f, // 4-7: default = +31 → 32
+            0x00, 0x00, 0x00, 0x02, // 8-11: npairs = 2
+            0x00, 0x00, 0x00, 0x0a, // 12-15: match 10
+            0x00, 0x00, 0x00, 0x1b, // 16-19: offset +27 → 28
+            0x00, 0x00, 0x00, 0x14, // 20-23: match 20
+            0x00, 0x00, 0x00, 0x1d, // 24-27: offset +29 → 30
+            0x04, 0xac, // 28-29: iconst_1; ireturn
+            0x05, 0xac, // 30-31: iconst_2; ireturn
+            0x03, 0xac, // 32-33: iconst_0; ireturn (default)
+        ],
+        1,
+        1,
+        &[
+            (vec![10], 1),
+            (vec![20], 2),
+            (vec![0], 0),
+            (vec![15], 0),
+            (vec![-5], 0),
+        ],
+    );
+}
+
 #[test]
 fn ir_vs_singlepass_sum_loop() {
     // int sum(int n) { int s=0; for (int i=0;i<n;i++) s+=i; return s; }
