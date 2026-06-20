@@ -9907,6 +9907,14 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // delegates to the call site's current target.
     crate::lang_invoke::register_callsite_dynamic_invoker_bridge(registry);
 
+    // METHODHANDLE COMBINATOR EXTRAS (real-JDK mode): functional
+    // `MethodHandles.insertArguments` + `MethodHandle.asCollector`, and the
+    // `CallSite.makeUninitializedCallSite` / `MutableCallSite.setTarget`
+    // natives Groovy's `IndyInterface` fallback construction needs (real
+    // bytecode builds `BoundMethodHandle` species / hits a null
+    // `MethodTypeForm` cache). Allow-listed in vm_exec.rs.
+    crate::lang_invoke::register_method_handle_combinator_extras_bridge(registry);
+
     // RECORD DESERIALIZATION (real-JDK mode): `ObjectInputStream.readRecord`
     // rebuilds a serialized record by invoking the `MethodHandle` returned by
     // `ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`,

@@ -10575,7 +10575,26 @@ fn invoke_on_class_shared_inner(
                                 // the `MH_KIND_*` shims can't read (OOB field reads).
                                 // Pin the functional `MH_KIND_IDENTITY` native.
                                 | "identity"
+                                // METHODHANDLES.INSERTARGUMENTS: real bytecode builds
+                                // a `BoundMethodHandle` species (unimplemented) and the
+                                // old synthetic stub dropped the bound values. Groovy's
+                                // `IndyInterface` fallback binds the call site/metadata
+                                // via `insertArguments`. Pin the functional
+                                // `MH_KIND_INSERT` native.
+                                | "insertArguments"
+                                // METHODHANDLES.EXPLICITCASTARGUMENTS: real
+                                // bytecode runs strict type checks that reject
+                                // synthetic handles (WrongMethodTypeException in
+                                // Groovy's `Selector.setCallSiteTarget`). Pin the
+                                // passthrough native.
+                                | "explicitCastArguments"
                             ))
+                        // METHODHANDLE.ASCOLLECTOR/ASSPREADER: unimplemented (real
+                        // bytecode → species); Groovy's dispatch chains use
+                        // `asCollector(Object[].class, n)` / `asSpreader(...)`. Pin
+                        // `MH_KIND_COLLECT` / `MH_KIND_SPREAD`.
+                        || (class_name == "java/lang/invoke/MethodHandle"
+                            && matches!(method_name, "asCollector" | "asSpreader"))
                         // CALLSITE.DYNAMICINVOKER: `MutableCallSite`/
                         // `VolatileCallSite.dynamicInvoker()` — the real
                         // `makeDynamicInvoker` does `bindArgumentL` (BoundMethodHandle
@@ -10583,10 +10602,18 @@ fn invoke_on_class_shared_inner(
                         // calls it, so every `new SwitchPoint()` (Groovy
                         // `IndyInterface.<clinit>`) hangs. Pin the functional
                         // `MH_KIND_DYNAMIC_INVOKER` native that delegates to the call
-                        // site's current target.
+                        // site's current target. `setTarget` skips the real
+                        // `checkTargetChange` type comparison (synthetic MethodTypes
+                        // don't equal JDK forms → WrongMethodTypeException).
                         || ((class_name == "java/lang/invoke/MutableCallSite"
                             || class_name == "java/lang/invoke/VolatileCallSite")
-                            && method_name == "dynamicInvoker")
+                            && matches!(method_name, "dynamicInvoker" | "setTarget"))
+                        // CALLSITE.MAKEUNINITIALIZEDCALLSITE: `new MutableCallSite(
+                        // MethodType)` (Groovy `CacheableCallSite`) NPEs on a null
+                        // `MethodTypeForm` cache. Pin the typed-inert-placeholder
+                        // native.
+                        || (class_name == "java/lang/invoke/CallSite"
+                            && method_name == "makeUninitializedCallSite")
                         // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
                         // calls `ObjectStreamClass$RecordSupport.deserializationCtr`
                         // (concrete bytecode) to get a record-rebuild MethodHandle
