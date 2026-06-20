@@ -25,8 +25,14 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
 7. **`spring-bug-11` residual** — Groovy hang at `BEGIN` (the SIGSEGV half is FIXED via bug-12; open).
 8. **`kafka-bug-B`** — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch (open, deep).
 9. **`kafka-bug-C`** — `WeakHashMap.values().stream()` infinite hang (open; pure-JDK 3-line repro).
-10. **Hibernate JTA** (Narayana XA completion + synthetic-socket loopback) — **two docs consolidated into one** (open layers).
-11. **Hibernate JAXB/ByteBuddy bootstrap slow** (class-loading/`MethodGraph` throughput; open).
+10. **Hibernate JTA** (Narayana) — ✅ **RESOLVED 2026-06-20** (docs → [`docs/internal/`](../internal/)).
+    L0 fixed on dev; **L1 was never broken (refuted)**; **L2 = an `accept()` deadlock** (global `s2_registry`
+    lock held across blocking `accept()`) + `getLocalPort()==0`, both fixed on branch `fix/hib-jta-xa-loopback`
+    (`e0426050`). A full Hibernate 8.1 + Narayana 7.3.4 + H2 begin/persist/commit/truncate cycle now passes in
+    default (synthetic-socket) mode.
+11. **Hibernate JAXB/ByteBuddy bootstrap slow** — ✅ **RESOLVED / does-not-reproduce 2026-06-20**
+    (doc → [`docs/internal/`](../internal/)). Class-load storm fixed on dev; ByteBuddy `MethodGraph`
+    JoinedSubclass bootstrap completes ~16s `--nojit`.
 12. **Hibernate deserialized-`SessionFactory`-null** (`SessionFactoryRegistry` reconnect; open).
 13. **ES-HANG-02 — ✅ RESOLVED 2026-06-20** (`fix/es-restclient-gc-safety`; docs moved to
     [`docs/internal/elasticsearch-suite/`](../internal/elasticsearch-suite/)). The RestClient
@@ -241,28 +247,39 @@ memoize the known-absent result in `ClassManager`, re-armed on classpath
 extension. A/B: 20 000-node put loop 20 120 ms → 132 ms (now classpath-independent
 ≈ HotSpot's allocation scaling). Unmasks the deeper JTA/socket cluster below.
 
-## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback)
+## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback) — ✅ RESOLVED
 
-[hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
-— found in the full Hibernate ORM 8.0 suite census (dev, 2026-06-17). **Not** a
-GC/JIT issue. Three layers: (0) `ServerSocket.getInetAddress()` → null →
-`TxControl.<clinit>` NPE — **fixed** (`net_phase_e.rs` `getInetAddress` native);
-(1) Narayana **XA transaction completion** doesn't commit/release the enlisted H2
-connection → `@AfterEach truncate` blocks on H2 lock timeout → hang (🔴 open);
-(2) default-mode synthetic `ServerSocket` accept/connect **loopback** doesn't pair
-→ `TransactionStatusManager` bring-up hangs (🔴 open). Layers 1–2 are a deep
-JTA/XA + socket-subsystem handoff.
+[docs/internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md](../internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
+— found in the full Hibernate ORM 8.x suite census (dev, 2026-06-17); **re-investigated &
+resolved 2026-06-20**. **Not** a GC/JIT issue. Three "layers": (0) `ServerSocket.getInetAddress()`
+→ null → `TxControl.<clinit>` NPE — **fixed on dev** (`net_phase_e.rs` `getInetAddress`, `ada6cebf`);
+(1) Narayana **XA completion** — **was never broken on dev (REFUTED)**: `XaProbe`/`HibBoot` show
+`enlist=true → XA.commit(onePhase=true) → commit OK`, the H2 connection commits+releases, `truncate`
+does not block; (2) the default-mode "loopback never pairs" hang — **real root cause = a process-wide
+`accept()` deadlock** (the global `s2_registry` lock was held across the blocking `TcpListener::accept()`,
+so Narayana's Listener thread blocked the main thread's `SocketProcessId` bind) **plus** a separate
+`new ServerSocket(0).getLocalPort()==0` bug. Both **fixed** on branch `fix/hib-jta-xa-loopback`
+(`e0426050`, pending merge). A full Hibernate 8.1 + Narayana 7.3.4 + H2 begin/persist/commit/read-back/
+truncate cycle now passes in default (synthetic-socket) mode.
 
-## Standalone — Hibernate JAXB/ByteBuddy bootstrap slow (XML mapping hangs)
+## Standalone — Hibernate JAXB/ByteBuddy bootstrap slow (XML mapping hangs) — ✅ RESOLVED / no-repro
 
-[hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md)
-— full-suite census (dev, 2026-06-17). XML/JAXB mapping classes + complex-entity
-bootstrap time out (`rc=124` @ 600s). **Re-diagnosed**: NOT a `retainAll`/collection
-loop (standalone `LinkedHashMap.keySet().retainAll` is correct). Live `cdb` shows the
-time is in **class loading** (`alloc_object → ensure_synthetic_class → ZipArchive::by_name
-→ indexmap/hashbrown`) during JAXB reflection model-building, and ByteBuddy `MethodGraph`
-proxy generation — i.e. interpreter throughput / class-loading, possibly an intermittent
-zip-index hot spot. 🔴 open (handoff).
+[docs/internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](../internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md)
+— full-suite census (dev, 2026-06-17); **re-verified 2026-06-20**. The dominant class-load rescan storm is
+**fixed on dev** (`1db07c35`/`25c42e13`). The residual ByteBuddy `MethodGraph` bootstrap hang **does not
+reproduce**: a programmatic JOINED-inheritance bootstrap (forcing `JoinedSubclassEntityPersister` +
+`MethodGraph$Compiler$Default.doAnalyze`) completes in ~16s `--nojit` (census mode), well under the 600s
+timeout. The original `retainAll` framing was refuted. Caveat: the original JAXB-XML *JUnit* repro classes
+can't be re-run via the launcher because of a separate `@ExtendWith` meta-annotation gap (next entry).
+
+## Standalone — JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver` (🔴 OPEN, new)
+
+[junit5-extendwith-meta-annotation-parameterresolver.md](junit5-extendwith-meta-annotation-parameterresolver.md)
+— found 2026-06-20 while running the Hibernate JUnit suite. A composed/meta annotation that carries
+`@ExtendWith(...)` (e.g. Hibernate's `@Jpa`) does not register its extensions → `No ParameterResolver
+registered for [EntityManagerFactoryScope]`. Annotation-synthesis family (the meta-present `@Repeatable`
+`@ExtendWith` arm; direct-element merge is already on dev). Blocks running the real Hibernate JUnit suite
+end-to-end; subsystems were validated by programmatic bootstrap instead.
 
 ## Standalone — Hibernate deserialized SessionFactory is null
 
@@ -278,8 +295,8 @@ zip-index hot spot. 🔴 open (handoff).
 Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`:
 - [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
 - [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
-- ~~hibernate-jta-txcontrol-getinetaddress-per-class-report.md~~ — **consolidated 2026-06-18** into [hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md) (now a redirect stub).
-- [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — overview of the 22 census hangs grouped by root cause (JAXB/class-load, ByteBuddy MethodGraph, JTA/socket).
+- ~~hibernate-jta-txcontrol-getinetaddress-per-class-report.md~~ — consolidated 2026-06-18, then **moved to [`docs/internal/`](../internal/hibernate-jta-txcontrol-getinetaddress-per-class-report.md) 2026-06-20** (Layer 0 fixed on dev; a redirect stub into the resolved JTA doc).
+- [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — census overview; **H1/H2/H3 resolved 2026-06-20** (per-cluster docs now in `docs/internal/`; H4 not re-checked).
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 

@@ -1,12 +1,40 @@
 # Hibernate JTA cluster — Narayana XA transaction-completion gap + synthetic socket-loopback hang
 
-> **Status (2026-06-17):** 🟡 **Partial.** The entry crash — `ServerSocket.getInetAddress()` → `null` →
-> `TxControl.<clinit>` NPE — is **FIXED** (branch `suite-dev-run`, `native-builtins/src/net_phase_e.rs`).
-> Underneath it are **two deeper layers** that are NOT localized native bugs and remain **OPEN (handoff)**:
-> (1) Narayana **XA transaction completion** does not commit/release the enlisted H2 connection, and
-> (2) the default-mode **synthetic `ServerSocket` accept/connect loopback** does not pair up.
-> Found while running the full Hibernate ORM 8.0 suite under CratonVM (dev). Affects every test that boots
-> the real Narayana/Arjuna JTA platform (`TestingJtaPlatformImpl` / `WildFlyStandAloneJtaPlatform`).
+> **✅ RESOLVED (2026-06-20).** Re-investigated end-to-end against current `dev` with a freshly-built binary
+> + a programmatic Hibernate 8.1 + Narayana 7.3.4 + H2 bootstrap (`_hibrepro/HibBoot`, mirrors
+> `JtaCustomAfterCompletionTest.success`). **A full `TM.begin()` / `persist` / `TM.commit()` / read-back /
+> `schemaManager.truncate()` cycle now passes in DEFAULT (synthetic-socket) mode**, matching
+> `CRATONVM_REAL_NET_SOCKETS=1`. **Two of the three original diagnoses were wrong:**
+>
+> - **Layer 0 (entry crash):** ✅ on `dev` (`ada6cebf`, `net_phase_e.rs getInetAddress`). Confirmed.
+> - **Layer 1 (Narayana XA-completion "gap"):** ✅ **was never broken on `dev` — REFUTED.** `XaProbe`
+>   (`TM.begin → enlistResource → TM.commit`) and `HibBoot` both show `enlist=true → XA.commit(onePhase=true)
+>   → commit OK`; the enlisted H2 connection commits and releases (read-back sees the row; `truncate` does
+>   **not** block on `LOCK_TIMEOUT`). The "commit-walk never drives the resource / held lock" theory is wrong.
+> - **Layer 2 (synthetic socket "loopback never pairs"):** ✅ **FIXED** on branch `fix/hib-jta-xa-loopback`
+>   (commit `e0426050`, **pending merge to `dev`**) — and that diagnosis was wrong too: it is **not** a
+>   loopback-pairing/thread problem. Root cause = a **process-wide deadlock**. `re2_accept_into`'s no-timeout
+>   branch (and `p72 implAccept` / `s2_blocking_accept`) held the global `s2_registry` lock **across the
+>   blocking `TcpListener::accept()`**. Narayana's `TransactionStatusManager` Listener thread (no `SO_TIMEOUT`,
+>   so it takes that branch) blocks in `accept()` holding the lock, while the main thread's `SocketProcessId`
+>   bind (`s2_alloc_listener → s2_registry().lock()`) waits for the same lock forever → hang at recovery
+>   bring-up. Fix = clone the listener (`try_clone`) under a short lock, drop the lock, then block on
+>   `accept()` on the clone. A second, independent bug was fixed in the same commit:
+>   `new ServerSocket(0).getLocalPort()` returned `0` (the winning `getLocalPort` native — native-io
+>   `ss_wrapper_local_port` — returned 0 for a plain socket with no channel back-ref); now it reads a shared
+>   `native-api::server_socket_ports` registry that `re2_bind_listener` populates.
+>
+> Pinned via the native dispatch ring (`CRATONVM_ENABLE_NATIVE_RING=1`): the main thread sat in
+> `SocketProcessId.createSocket → new ServerSocket(...)` blocked on `s2_registry().lock()`. The historical
+> "deep handoff" write-up below is retained for the trail; the per-layer status above is authoritative.
+>
+> ---
+>
+> _Original status (2026-06-17, superseded):_ 🟡 **Partial.** The entry crash — `ServerSocket.getInetAddress()`
+> → `null` → `TxControl.<clinit>` NPE — is **FIXED** (branch `suite-dev-run`). Underneath it were claimed
+> **two deeper OPEN layers**: (1) Narayana XA completion doesn't commit/release the enlisted H2 connection,
+> and (2) the default-mode synthetic `ServerSocket` accept/connect loopback doesn't pair. Both refuted/fixed
+> above. Found running the full Hibernate ORM 8.0 suite under CratonVM (dev).
 
 Bug-report companion (per-class symptom + the applied `getInetAddress` fix):
 [`apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/JTA-txcontrol-clinit-gethostaddress-null.md`](../../apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/JTA-txcontrol-clinit-gethostaddress-null.md).
