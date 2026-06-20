@@ -191,6 +191,49 @@ per-framework native short-circuits by making the real container bytecode run.
 >   backfill); `nested_clinit_startup` + `iface_static_final_init` +
 >   `vm_util` clinit-swallow unit tests green; workspace builds clean.
 
+> **Increment 5 (Agroal — Step 2 gate, Keycloak Gap 8) — LANDED (branch `fix/keycloak-gap8-datasource`).**
+> Scope: retire the `agroal_pool.rs` datasource shim for the real Quarkus/Keycloak path by routing
+> to the real `io.agroal.pool.*` container bytecode behind an opt-in gate, and correct the
+> mis-scoping of the blocker.
+>
+> - **Re-scoped the blocker (the prior "real H2 engine under CratonVM" plan was wrong).** Isolated
+>   repros against the real `com.h2database.h2-2.4.240.jar` prove the **real `org.h2.Driver` already
+>   works** byte-identically to HotSpot (connect, DDL, sequences, `MERGE`, `DatabaseMetaData`,
+>   multi-connection file mode). Gap 8 is **not** an H2-engine gap. The real blocker, reproduced
+>   deterministically with the real `io.agroal.agroal-pool-3.0.1.jar`, is a classic shim-vs-real
+>   collision: `agroal_pool.rs`'s `AgroalDataSourceConfigurationSupplier.get()` native returns a
+>   synthetic object typed as the bare **interface** `AgroalDataSourceConfiguration` (no method
+>   bodies); the real `io.agroal.pool.DataSource.<init>` / `DataSourceProvider.getDataSource`
+>   bytecode then does `invokeinterface dataSourceImplementation()` →
+>   `AbstractMethodError: … has no Code attribute`. (Same shape as the old Gap-6 `getConfigMapping`
+>   interface-alloc shim.)
+> - **The gate (`CRATONVM_REAL_AGROAL`, currently opt-in).**
+>   `native_builtins::real_agroal()` (defined next to `real_proxy_super`) returns true when
+>   `CRATONVM_REAL_AGROAL` is set and `CRATONVM_SYNTHETIC_AGROAL` is not. When ON, the
+>   `register_agroal_natives` call in `lib.rs::register_essential_natives` is skipped, so the whole
+>   shim (config supplier / `AgroalDataSource` / `ConnectionPool` / `PoolHandler` / properties
+>   reader natives) is suppressed and the real Agroal bytecode runs over the real `org.h2.Driver`.
+>   The shim module + its (Rust-level) unit tests are RETAINED unchanged as the synthetic fallback.
+> - **Validation.** `KcAgroal` (real Agroal pool + real H2, isolated) reaches `== DONE OK ==` with
+>   the gate ON. The **real Keycloak 26.6.3 boot with `CRATONVM_REAL_AGROAL=1` no longer throws the
+>   `AbstractMethodError`** and advances through ArC, truststore, Hibernate ORM, the
+>   `keycloak-default` persistence unit, and Hibernate Validator to `ApplicationLifecycleManager
+>   .waitForExit` (real AQS `ConditionObject.awaitUninterruptibly` + ForkJoinPool — the concurrency
+>   the Risks section feared is exercised and works). The boot does not yet bind HTTP — a **separate
+>   deeper blocker** (a worker thread stuck in native before Liquibase / HTTP bind) is the next
+>   frontier; see `docs/known-issues/keycloak-quarkus-boot-progress.md` Gap 8/9.
+> - **Default flip (deferred):** flipping `real_agroal()` to default-on (opt-out
+>   `CRATONVM_SYNTHETIC_AGROAL`, mirroring AQS / Spring-startup) is gated on the Keycloak boot going
+>   fully green, per Step 2's "validate the suite before flipping" rule. The shim is broken for the
+>   real Quarkus path (AbstractMethodError) and its only consumer is Quarkus apps that carry the real
+>   agroal-pool jar, so the eventual flip is low-risk (no Agroal bytecode test depends on the shim).
+> - **Tangential general VM bug fixed (not Gap-8-specific):** `java.util.Properties.store` dropped
+>   every entry (wrote only the comment) for real-JDK-layout map nodes — `native_props_store` /
+>   `props_collect_keys` read bucket-node field 0 as the key (correct for legacy key=0 nodes, wrong
+>   for real hash=0/key=1 nodes). Rewrote `store` to use the layout-aware `map_collect_entries` + JDK
+>   `saveConvert` escaping + the real `#`-prefixed comment format. Surfaced via H2's `AUTO_SERVER`
+>   `FileLock` save→load→equals watchdog ("Concurrent update"); affects all `Properties.store` callers.
+
 ## Goal
 
 Run the **real** CDI / dependency-injection / service-container bytecode of

@@ -390,6 +390,62 @@ VM's real file layer).
   non-null (rule out a CDI-injection null vs an H2-engine null). Decide strategy: real-H2-under-CratonVM
   vs. an alternative Keycloak-supported DB path. The boot is otherwise within a few steps of binding HTTP.
 
+> **UPDATE (2026-06-20, branch `fix/keycloak-gap8-datasource`) — the "real H2 engine"
+> framing above is REFUTED; the real blocker was the Agroal shim, now fixed behind a gate.**
+> Isolated repros (real `com.h2database.h2-2.4.240.jar`, no full boot) prove the **real
+> `org.h2.Driver` already works under CratonVM byte-identically to HotSpot**: connect, DDL,
+> sequences, `MERGE`, `DatabaseMetaData` (URL / driver name / product / `2.4.240` version —
+> NOT "undefined/unknown"), and multiple file-mode connections to the same DB. So Gap 8 is
+> **not** an H2-engine gap and does **not** need "the H2 database engine running under the VM".
+> The only H2-engine gaps found are in the **`AUTO_SERVER=TRUE`** path (which Keycloak's
+> dev-file URL does NOT use): a now-fixed `Properties.store` bug (below) and a residual H2 TCP
+> auto-server bind issue — both out of scope for Keycloak.
+>
+> **Real blocker (deterministic, isolated via `KcAgroal` over the real `io.agroal.agroal-pool-3.0.1.jar`):**
+> the `native-builtins/src/agroal_pool.rs` **shim** intercepts
+> `AgroalDataSourceConfigurationSupplier.get()` and returns a synthetic object whose runtime
+> class is the bare **interface** `io/agroal/api/configuration/AgroalDataSourceConfiguration`
+> (no method bodies). Quarkus/Keycloak run the **real** container bytecode
+> (`DataSources.createDataSource` → `new io.agroal.pool.DataSource(supplier.get(), …)` and
+> `AgroalDataSource.from` → `DataSourceProvider.getDataSource`), which does
+> `invokeinterface config.dataSourceImplementation()` and hits the abstract method →
+> `AbstractMethodError: … dataSourceImplementation() … has no Code attribute`. This is the exact
+> shim-vs-real-bytecode collision the design doc's risk section predicted, NOT a silent H2 null.
+> (The earlier "silent null / undefined-unknown" Hibernate `HHH10001005` line is the *normal*
+> lazy-datasource bootstrap introspection — HotSpot logs the same — not the failure.)
+>
+> **Fix (real-cdi-bean-container, Step 2 gate):** `CRATONVM_REAL_AGROAL=1` suppresses the
+> Agroal shim registration (`native-builtins/src/lib.rs` — gated at the `register_agroal_natives`
+> call site via `real_agroal()`), so the real `io.agroal.pool.*` bytecode runs over the working
+> real `org.h2.Driver`. **Validated:** `KcAgroal` reaches `== DONE OK ==` in isolation (real
+> `io.agroal.pool.DataSource`, real `getConnection()`, DDL + pool reuse), and the **real Keycloak
+> boot with `CRATONVM_REAL_AGROAL=1` no longer throws the `AbstractMethodError`** — it advances
+> through truststore init, Hibernate ORM, the `keycloak-default` persistence unit, and Hibernate
+> Validator, and the main thread reaches `ApplicationLifecycleManager.waitForExit` (real AQS
+> `ConditionObject.awaitUninterruptibly` + ForkJoinPool — the concurrency the design doc feared
+> WORKS). Gate is currently **opt-in**; flip to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`)
+> once the boot is fully green (see next frontier), per the "validate the suite before flipping" rule.
+>
+> **New frontier (Gap 9, the next blocker):** with the gate ON the boot no longer fails at Agroal
+> but does not yet bind HTTP. At the 150s watchdog only **3 threads** exist (main +
+> `Thread-1` daemon + a `Timer`); main is parked normally in `waitForExit`, **no
+> exception** is thrown, **no `Listening on …`** / Liquibase / changelog output appears, and
+> `Thread-1` (the worker that should run Keycloak's DB migration + HTTP bind) is **stuck inside
+> Rust native code** (the watchdog cannot dump it). So the next blocker is a worker-thread stall
+> (likely Liquibase schema generation, a socket/HTTP bind, or a concurrency primitive), distinct
+> from the Agroal shim. Next-session start: get `Thread-1`'s wait-site (force a non-native
+> dump point, or add Rust tracing at the Vert.x/HTTP-bind + Liquibase entry points); confirm
+> whether the real Agroal pool actually opened a connection (housekeeping-executor trace).
+>
+> **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
+> (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
+> entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
+> (key=0) but not real-JDK nodes (hash=0, key=1, so field 0 is the int hash). Rewrote `store` to
+> use the layout-aware `map_collect_entries` (the collector behind `entrySet()`/`toString()`) +
+> JDK `saveConvert` escaping + the real `#`-prefixed comment format; fixed `props_collect_keys`
+> likewise. Affects every `Properties.store` consumer; surfaced here because H2's `AUTO_SERVER`
+> `FileLock` does a save→load→equals watchdog that an entry-less file fails ("Concurrent update").
+
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
 `InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC

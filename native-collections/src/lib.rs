@@ -26058,29 +26058,58 @@ fn native_props_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // Collect all key-value pairs
-    let keys = props_collect_keys(ctx, this);
     let mut output = String::new();
 
-    // Optional comment header
+    // Optional comment header — mirror JDK `Properties.writeComments`: the
+    // comment is prefixed with a bare `#` (no space), and an embedded newline
+    // starts a fresh `#` comment line. The previous `# {}` form inserted a
+    // spurious space; more importantly the entry loop below was broken (see
+    // next comment), so a save/load round-trip such as H2's `FileLock`
+    // watchdog (`AUTO_SERVER=TRUE`) read back an empty file and aborted with
+    // "Concurrent update".
     if let Value::Object(Some(comment)) = args[2] {
         if let Some(c) = ctx.read_string(comment) {
-            output.push_str(&format!("# {}\n", c));
+            output.push('#');
+            for ch in c.chars() {
+                match ch {
+                    '\n' | '\r' => {
+                        output.push('\n');
+                        output.push('#');
+                    }
+                    _ => output.push(ch),
+                }
+            }
+            output.push('\n');
         }
     }
 
-    for key_obj in keys {
-        if let Some(key_str) = ctx.read_string(key_obj) {
-            let val = native_map_get(
-                ctx,
-                &[Value::Object(Some(this)), Value::Object(Some(key_obj))],
-            )?;
-            let val_str = match val {
-                Some(Value::Object(Some(v))) => ctx.read_string(v).unwrap_or_default(),
-                _ => String::new(),
-            };
-            output.push_str(&format!("{}={}\n", key_str, val_str));
-        }
+    // Entries. Use the canonical, layout-aware collector that already backs
+    // `entrySet()`/`toString()` (`map_collect_entries`) rather than the old
+    // slot-0-only `props_collect_keys` + per-key `get`. `props_collect_keys`
+    // read field 0 of each bucket node as the key — correct for legacy nodes
+    // (key=0) but NOT for real-JDK-created nodes (hash=0, key=1), where field
+    // 0 is the primitive `int` hash. So every JDK-layout entry was silently
+    // dropped and `store` wrote only the comment. `map_collect_entries`
+    // resolves the real `this.map` ConcurrentHashMap backing / CHM/LHM
+    // receivers / slot-0 buckets and uses the layout-aware node accessors.
+    // Keys and values are escaped per JDK `Properties.saveConvert` so the
+    // output round-trips through our (faithful) `Properties.load`.
+    for (k, v) in map_collect_entries(ctx, this) {
+        let key_str = match k {
+            Value::Object(Some(o)) => match ctx.read_string(o) {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let val_str = match v {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        output.push_str(&props_save_convert(&key_str, true));
+        output.push('=');
+        output.push_str(&props_save_convert(&val_str, false));
+        output.push('\n');
     }
 
     // Write to output stream.
@@ -26113,22 +26142,61 @@ fn native_props_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(None)
 }
 
-/// Collect all key ObjectRefs from the HashMap backing store.
+/// Collect all key ObjectRefs from a Properties' backing store.
+///
+/// Delegates to the canonical `map_collect_keys` (which resolves the real
+/// `this.map` ConcurrentHashMap backing, CHM/LHM receivers, and slot-0
+/// buckets, all with the layout-aware node accessors) and keeps only the
+/// object-reference keys. The previous body read field 0 of each bucket node
+/// directly, which is the key only for legacy nodes (key=0); for real-JDK
+/// nodes (hash=0, key=1) field 0 is the primitive hash, so keys were dropped
+/// — the same defect that left `Properties.store` writing zero entries.
 fn props_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> {
-    let (buckets, _size, cap) = map_state(ctx, this);
-    let mut keys = Vec::new();
-    if let Some(b) = buckets {
-        for i in 0..(cap as usize) {
-            let mut node_val = ctx.get_array_element(b, i);
-            while let Value::Object(Some(node)) = node_val {
-                if let Value::Object(Some(key)) = ctx.get_field(node, NODE_FIELD_KEY) {
-                    keys.push(key);
+    map_collect_keys(ctx, this)
+        .into_iter()
+        .filter_map(|v| match v {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Escape a key or value for `Properties.store` output, mirroring JDK
+/// `Properties.saveConvert` for the `store(OutputStream, …)` path (i.e. with
+/// Unicode escaping enabled). Keys pass `escape_space = true` (every space is
+/// escaped); values pass `false` (only a leading space is escaped). The
+/// metacharacters `\ \t \n \r \f = : # !` are always escaped, and any
+/// control / non-ASCII character is emitted as `\\uXXXX` UTF-16 unit(s), so
+/// the result parses back to the original via `props_parse_logical_lines`.
+fn props_save_convert(s: &str, escape_space: bool) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, ch) in s.chars().enumerate() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{000C}' => out.push_str("\\f"),
+            ' ' => {
+                if i == 0 || escape_space {
+                    out.push('\\');
                 }
-                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                out.push(' ');
             }
+            '=' | ':' | '#' | '!' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
+                let mut buf = [0u16; 2];
+                for unit in c.encode_utf16(&mut buf) {
+                    out.push_str(&format!("\\u{:04X}", unit));
+                }
+            }
+            c => out.push(c),
         }
     }
-    keys
+    out
 }
 
 /// propertyNames() -> returns a real Enumeration<Object> over the property keys.
@@ -32162,6 +32230,51 @@ mod tests {
         assert_eq!(java_float_to_string(f32::INFINITY), "Infinity");
         assert_eq!(java_float_to_string(f32::NEG_INFINITY), "-Infinity");
         assert_eq!(java_float_to_string(f32::NAN), "NaN");
+    }
+
+    // `Properties.store` writes each entry as `saveConvert(key)=saveConvert(value)`;
+    // `Properties.load` must read it back to the original. This pins the symmetry
+    // between `props_save_convert` (store) and `props_parse_logical_lines` (load)
+    // that H2's `FileLock` watchdog relies on (save → sleep → load → equals).
+    #[test]
+    fn props_save_convert_roundtrips_through_load_parser() {
+        use super::{props_parse_logical_lines, props_save_convert};
+        let cases = [
+            // The exact shape H2's FileLock writes (method=file, id=<hex>).
+            ("method", "file"),
+            ("id", "18f3a2b1c0deadbeef0011"),
+            // Spaces in keys, and separator/comment metacharacters in values.
+            ("key with spaces", "value with = and : and # and ! chars"),
+            // Whitespace escapes and a backslash path.
+            ("tab\tkey", "line1\nline2\tc:\\winpath"),
+            // BMP non-ASCII (single \uXXXX units; supplementary chars are a
+            // separate known parser limitation and intentionally excluded).
+            ("accent\u{00e9}", "caf\u{00e9}\u{2603}value"),
+        ];
+        for (k, v) in cases {
+            let line = format!(
+                "{}={}\n",
+                props_save_convert(k, true),
+                props_save_convert(v, false)
+            );
+            let parsed = props_parse_logical_lines(&line);
+            assert_eq!(parsed.len(), 1, "case {k:?}: line={line:?}");
+            assert_eq!(parsed[0].0, k, "key mismatch: line={line:?}");
+            assert_eq!(parsed[0].1, v, "val mismatch: line={line:?}");
+        }
+    }
+
+    #[test]
+    fn props_save_convert_escapes_metacharacters() {
+        use super::props_save_convert;
+        // `= : # !` are escaped in both keys and values.
+        assert_eq!(props_save_convert("a=b:c#d!e", false), "a\\=b\\:c\\#d\\!e");
+        // Keys escape every space; values escape only a leading one.
+        assert_eq!(props_save_convert("a b", true), "a\\ b");
+        assert_eq!(props_save_convert("a b", false), "a b");
+        assert_eq!(props_save_convert(" x", false), "\\ x");
+        // Backslash, tab, newline.
+        assert_eq!(props_save_convert("p\\q\tr\n", false), "p\\\\q\\tr\\n");
     }
 
     // Fix item 1: a recycled identity hash on a different class must not inherit
