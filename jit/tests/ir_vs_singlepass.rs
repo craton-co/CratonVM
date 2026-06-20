@@ -278,6 +278,83 @@ fn ir_vs_singlepass_abs_early_return() {
     );
 }
 
+// ── int truncation conversions (i2b / i2c / i2s) ───────────────────────
+//
+// Step 3 (IR gate relaxation): the IR builder now lowers i2b/i2c/i2s (it used to
+// bail → single-pass). These decompose to existing shift/and ops, so the
+// optimizing IR path handles byte/char/short-truncating int methods. The
+// harness confirms IR == single-pass for the sign/zero-extension edge cases.
+
+#[test]
+fn ir_vs_singlepass_i2b() {
+    // int f(int a) { return (byte)a; }   iload_0; i2b; ireturn
+    check(
+        "i2b",
+        "(I)I",
+        vec![0x1a, 0x91, 0xac],
+        1,
+        1,
+        &[
+            (vec![127], 127),
+            (vec![128], -128),
+            (vec![256], 0),
+            (vec![-1], -1),
+            (vec![300], 44),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_i2c() {
+    // int f(int a) { return (char)a; }   iload_0; i2c; ireturn
+    check(
+        "i2c",
+        "(I)I",
+        vec![0x1a, 0x92, 0xac],
+        1,
+        1,
+        &[
+            (vec![65], 65),
+            (vec![-1], 65535),
+            (vec![65536], 0),
+            (vec![-65536], 0),
+            (vec![0xABCD], 0xABCD),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_i2s() {
+    // int f(int a) { return (short)a; }   iload_0; i2s; ireturn
+    check(
+        "i2s",
+        "(I)I",
+        vec![0x1a, 0x93, 0xac],
+        1,
+        1,
+        &[
+            (vec![32767], 32767),
+            (vec![32768], -32768),
+            (vec![65536], 0),
+            (vec![-1], -1),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_i2b_chained() {
+    // int g(int a) { return (byte)a + 1000; }   — the truncated value must feed
+    // a following int op correctly (sipush 1000; iadd).
+    check(
+        "i2b_chained",
+        "(I)I",
+        vec![0x1a, 0x91, 0x11, 0x03, 0xe8, 0x60, 0xac],
+        1,
+        1,
+        &[(vec![128], 872), (vec![127], 1127), (vec![-1], 999)],
+    );
+}
+
 #[test]
 fn ir_vs_singlepass_sum_loop() {
     // int sum(int n) { int s=0; for (int i=0;i<n;i++) s+=i; return s; }

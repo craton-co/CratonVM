@@ -1035,6 +1035,36 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // i2b — sign-extend the low byte. Decomposed to `(x << 24) >> 24`
+                // (32-bit `SHL`/`SAR EAX`, so the arithmetic shift sign-extends
+                // the byte) rather than a dedicated truncation node — no new Op
+                // or lowering, and the existing GVN/fold passes handle it.
+                0x91 => {
+                    let a = self.pop();
+                    let c = self.iconst(24);
+                    let shl = self.add_data(Op::Shl, IrType::Int, vec![a, c], pc);
+                    let r = self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // i2c — zero-extend the low 16 bits: `x & 0xFFFF` (char is an
+                // unsigned 16-bit value).
+                0x92 => {
+                    let a = self.pop();
+                    let mask = self.iconst(0xFFFF);
+                    let r = self.add_data(Op::And, IrType::Int, vec![a, mask], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // i2s — sign-extend the low 16 bits: `(x << 16) >> 16`.
+                0x93 => {
+                    let a = self.pop();
+                    let c = self.iconst(16);
+                    let shl = self.add_data(Op::Shl, IrType::Int, vec![a, c], pc);
+                    let r = self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc);
+                    self.push(r);
+                    pc += 1;
+                }
                 // dup
                 0x59 => {
                     let top = self.peek();
@@ -1263,6 +1293,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0x82
             | 0x85
             | 0x88
+            | 0x91..=0x93
             | 0xac
             | 0xad
             | 0xb1 => {
@@ -1332,6 +1363,7 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0x82
             | 0x85
             | 0x88
+            | 0x91..=0x93
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,

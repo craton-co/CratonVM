@@ -609,6 +609,39 @@ exit", not the sole exit.
 **Unblocks step 3**: the IR gate may now be relaxed onto conditional-early-return
 methods (behind a `CRATONVM_JIT_IR_*` soak flag), gated by this harness.
 
+## Increment 12 (step 3 — IR gate relaxation: i2b / i2c / i2s) landed
+
+Status: **landed** on `dev`. First slice of step 3 (relax the IR gate), validated
+by the increment-10 harness.
+
+The IR builder previously **bailed** (`build()` → `None` → fell to single-pass)
+on the int-truncation conversions `i2b` (0x91), `i2c` (0x92), `i2s` (0x93), so
+any byte/char/short-truncating int method never reached the optimizing IR path.
+They now lower (`jit/src/ir.rs`), decomposed to existing ops — no new IR node or
+lowering needed:
+
+- `i2b` → `(x << 24) >> 24` (32-bit `SHL`/`SAR EAX`; the arithmetic shift
+  sign-extends the low byte),
+- `i2s` → `(x << 16) >> 16`,
+- `i2c` → `x & 0xFFFF` (char is unsigned 16-bit).
+
+The two bytecode length walkers (`find_branch_targets`, the loop-header walk)
+list `0x91..=0x93` explicitly (they were already 1-byte via the default arm).
+
+**Tests** (`jit/tests/ir_vs_singlepass.rs`): `i2b`, `i2c`, `i2s`, and
+`i2b_chained` (`(byte)a + 1000`, proving the truncated value feeds a following
+int op correctly). IR == single-pass == host across sign/zero-extension edge
+cases (e.g. `i2b(128) = -128`, `i2c(-1) = 65535`, `i2s(32768) = -32768`). jit lib
+790/790, harness 10/10.
+
+**Why this scope**: the harness executes the compiled code with *dummy* runtime
+helpers, so it can only validate helper-free shapes (pure arithmetic / branches /
+loops / conversions). Relaxing the gate further onto methods with `invoke*` /
+field / array ops needs (a) the IR builder to *emit* those ops (it bails today —
+which is also why the DSE/escape/LICM passes are still latent) and (b) the
+harness to supply real helpers or move to VM-level differential validation. Those
+are the next step-3 slices.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
@@ -620,8 +653,11 @@ methods (behind a `CRATONVM_JIT_IR_*` soak flag), gated by this harness.
    the `optimize` toggle, executes both, and asserts equal results. Already
    caught (and now regression-guards) the multi-return miscompile.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
-   soak flag (Front 1.2). **UNBLOCKED** (increment 11); the harness (step 2) is
-   the gate. ← next.
+   soak flag (Front 1.2). **In progress**: branch-free / branchy / early-return /
+   loop int methods all take the IR path and pass the harness; increment 12 added
+   `i2b`/`i2c`/`i2s`. **Remaining**: methods with `invoke*` / field / array ops —
+   the builder bails on those today, so this needs builder emission of those ops
+   + a real-helper (or VM-level) differential harness. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the
