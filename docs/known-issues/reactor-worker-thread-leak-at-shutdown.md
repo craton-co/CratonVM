@@ -1,5 +1,13 @@
 # Intermittent reactor worker-thread leak at client shutdown (RUNNABLE, empty stack)
 
+> **➜ SUPERSEDED (2026-06-20) by
+> [gc-rscache-reactor-shutdown-timing-race.md](gc-rscache-reactor-shutdown-timing-race.md).** That doc has
+> the definitive characterization (GC-frequency-driven, rs_cache-PRESENCE-triggered STW-vs-shutdown timing
+> race; NOT a socket bug) and the validated `CRATONVM_ROOTSNAP_CACHE=0` workaround. The co-occurring (but
+> INDEPENDENT) teardown corruption is its own bug:
+> [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md). This file
+> is kept only for the prior-investigation trail below.
+
 **Status:** OPEN (intermittent, ~1 in 16–60 runs; rate inflated by concurrent peer-session load on the
 shared worktree). Follow-up to the `Thread.getState()` fix (commit `16d23e7b`).
 
@@ -178,3 +186,75 @@ that no `wakeup()` can interrupt.
 
 - `Thread.getState()` fix: commit `16d23e7b`.
 - ES-HANG-02 residuals + selector/connect work: [ES-HANG-02-residuals-handoff.md](ES-HANG-02-residuals-handoff.md).
+
+## UPDATE 2026-06-20 — captured leaked-thread stack (no longer empty) + ThreadLeakControl artifacts
+
+While fixing the ES-HANG-02 residual-2 GC bugs (branch `fix/es-restclient-gc-safety`) the leaked-thread
+stack DID print (the earlier "empty stack" note no longer holds for this case). At
+`RestClientSingleHostIntegTests` SUITE teardown, ~10% of `-Xmx1g` runs leak ONE thread, `state=RUNNABLE`
+(not parked in `WSAPoll` — it is busy in the WRITE path, so `interrupt()` can't stop it):
+
+```
+Thread[id=…, name=elasticsearch-rest-client-N-thread-M, state=RUNNABLE, group=TGRP-…]
+   at org.apache.http.impl.nio.reactor.IOSessionImpl.toString
+   at org.apache.http.impl.nio.conn.LoggingIOSession$LoggingByteChannel.write
+   at org.apache.http.impl.nio.reactor.SessionOutputBufferImpl.flush
+   at org.apache.http.impl.nio.DefaultNHttpClientConnection.produceOutput
+   at org.apache.http.impl.nio.client.InternalIODispatch.onOutputReady
+   at org.apache.http.impl.nio.reactor.BaseIOReactor.writable
+   at org.apache.http.impl.nio.reactor.AbstractIOReactor.processEvent(s)
+   at org.apache.http.impl.nio.reactor.AbstractIOReactor.execute
+```
+
+So at least one leak variant is NOT a missed `WSAPoll` wakeup — the worker is **busy-spinning in
+`produceOutput` → channel write**, i.e. the selector keeps reporting the channel WRITABLE (or the write
+keeps returning 0 / never errors) on a connection whose peer (the synthetic `Connection: close` server) has
+already closed, so the reactor never makes progress and never returns to `select()` to observe shutdown.
+Likely root: a non-blocking `SocketChannel.write` to a half-closed/reset loopback peer returns `0`
+(WouldBlock) instead of an error, and/or the selector reports persistent OP_WRITE readiness for it. Look at
+`native-io` write + `nio_selector.rs` OP_WRITE readiness for a peer-closed socket.
+
+**Downstream artifacts (NOT separate bugs):** once a thread leaks, randomizedtesting's
+`ThreadLeakControl.formatThreadStacks(Map)` runs to build the `ThreadLeakError` message and hits a CratonVM
+`NoSuchMethodError "java/lang/StringBuilder.flush()V"` (a stale/misresolved receiver inside the framework's
+formatter), and `RandomizedContext.randomnesses` / `Thread.group`-null NPEs appear while it inspects the
+leaked thread. These only fire *because* a thread leaked — fixing the leak removes them. (The
+NoSuchMethodError caller was localized with the new caller-frame field on the VM's NoSuchMethodError warning.)
+
+## UPDATE 2026-06-20 (#2) — DEFINITIVE: GC-frequency-driven; leak is rs_cache-PRESENCE-triggered (timing), corruption is a lost-tag root miss
+
+After the residual-2 GC fixes (`fix/es-restclient-gc-safety`) a focused pass settled several things. The
+leak + the teardown "all-zero header" corruption are BOTH driven by **young-GC frequency** (moving collector,
+`--nojit`): **`-Xmx6g` = 10/10 clean (0 leak, 0 corruption); `-Xmx1g` ≈ 15–25% leak + ~67% corruption.**
+
+**The leak and the corruption are INDEPENDENT.** A leak occurred with ZERO `all-zero header` corruption, and
+green runs occurred with up to 10 corruptions. So they are two distinct GC-pressure bugs:
+
+1. **Teardown corruption (benign).** A live object is missed by the moving collector → from-space reset zeroes
+   it → `gen_heap::get_field` OOB-drops the access (run usually stays green; the `ThreadLeakControl.
+   formatThreadStacks` `StringBuilder.flush` + `randomnesses`/`group` NPEs are downstream of it). A new gated
+   per-parked-thread verifier (`CRATONVM_GC_VERIFY_STALE=1` now also emits `POST-GC ZERO-HEADER PARKED tid=…
+   frame[…] CLASS.METHOD local[…]` from `apply_pointer_map_to_thread`) localizes it DETERMINISTICALLY to a
+   single site: **`tid=2 frame[13] com/carrotsearch/randomizedtesting/RandomizedRunner.invoke local[3] pc=72`**
+   (15/15 identical). This is a **LOST TAG**, NOT the rs_cache and NOT a missed remap: it persists with the
+   rs_cache disabled (`CRATONVM_ROOTSNAP_CACHE=0`), and the initiator-only `verify_no_stale_refs` never fires
+   for it. `local[3]` is tagged Object after the GC but was not scanned as an Object root at marking time, so
+   `scan_local_objects` skipped it. Next step: decompile `RandomizedRunner.invoke` around pc=72 and find the
+   bytecode that leaves `local[3]`'s slot tagged non-Object at a safepoint.
+
+2. **The reactor leak is rs_cache-PRESENCE-triggered (timing), not an rs_cache correctness bug.**
+   `CRATONVM_ROOTSNAP_CACHE=0` (disable the frozen-frame root cache) → **0 leaks in 22/22** runs at `-Xmx1g`
+   (corruption persists — confirming it is the separate lost-tag). But a freshness HARDENING of the cache
+   (also keying reuse on the callee frame's `seq`, so a frame that returned-and-re-called is re-scanned) did
+   **NOT** fix the leak (still ~5/20 with the cache ON) — and on analysis that check is REDUNDANT (a frame's
+   `seq` is stable, so the existing seq-prefix-closure already implies the callee matched). So the rs_cache is
+   *correct*; its mere PRESENCE perturbs snapshot timing enough to expose a latent **GC-STW-vs-reactor-shutdown
+   race** (the actual leak), and disabling it changes the interleaving so the race doesn't fire.
+
+**Reliable workaround:** run the suite with `CRATONVM_ROOTSNAP_CACHE=0` (0 leaks across 22 runs). Tradeoff:
+the cache is a per-snapshot optimization for deep-stack native-heavy workloads, so disabling it globally may
+slow (or, for a timeout-bound app, regress) those — measure before flipping the default.
+
+**Root cause still open:** the leak is the latent timing race (a reactor IO worker not terminating at
+`restClient.close()`), distinct from residual-2 and from the lost-tag corruption. It needs dedicated
+concurrency-race debugging (deterministic scheduling / instrumentation that does not itself change GC timing).

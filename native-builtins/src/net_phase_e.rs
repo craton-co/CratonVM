@@ -5858,6 +5858,64 @@ fn next_server_id() -> i32 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// GC root scan for the synthetic `com.sun.net.httpserver` server registry.
+///
+/// Each registered `HttpHandlerEntry.handler` is a live Java `HttpHandler`
+/// ObjectRef stored OUTSIDE the Java heap (in this native `server_registry`),
+/// so the collector has no other view of it. Without rooting it here a moving
+/// young GC could either reclaim the handler (the only strong reference is this
+/// native map) or relocate it and leave the stored ObjectRef dangling — and the
+/// per-request dispatcher (`re10_dispatch_pending`) then `invoke_virtual`s a
+/// stale receiver, which resolves to `java/lang/Object` and fails with
+/// `NoSuchMethodError: java/lang/Object.handle(...)`. Observed as an intermittent
+/// storm under `-Xmx1g` GC pressure (ES `RestClientSingleHostIntegTests`
+/// `testManyAsyncRequests`), GC-frequency-dependent (green at large heaps). The
+/// companion `gc_update_re10_handler_refs` re-points the stored refs after a
+/// move; this scan keeps them live across the collection.
+///
+/// Mirrors the established native-root pattern (locale / logmanager / jboss_msc).
+/// Arcs are cloned out from under the registry lock first so the registry lock
+/// and the per-server `handlers` lock are never held simultaneously.
+pub fn gc_scan_re10_handler_roots(out: &mut Vec<ObjectRef>) {
+    let states: Vec<std::sync::Arc<ServerState>> = {
+        let reg = server_registry().lock();
+        reg.values().cloned().collect()
+    };
+    for state in states {
+        let hs = state.handlers.lock();
+        for e in hs.iter() {
+            out.push(e.handler);
+        }
+    }
+}
+
+/// Companion to [`gc_scan_re10_handler_roots`]: after a moving collection,
+/// re-point every stored `HttpHandlerEntry.handler` to its relocated address so
+/// the dispatcher invokes the live handler, not a vacated from-space slot. A
+/// no-op when nothing moved (empty `pointer_map`) or for handlers the collector
+/// left in place (absent from the map).
+pub fn gc_update_re10_handler_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let states: Vec<std::sync::Arc<ServerState>> = {
+        let reg = server_registry().lock();
+        reg.values().cloned().collect()
+    };
+    for state in states {
+        let mut hs = state.handlers.lock();
+        for e in hs.iter_mut() {
+            let old = e.handler.as_ptr() as usize;
+            if let Some(&new) = pointer_map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: `new` is a relocated address produced by the collector's
+                // pointer map for this exact object; it points at a valid header.
+                e.handler = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+}
+
 struct PendingRequest {
     stream: TcpStream,
     method: String,
@@ -6081,13 +6139,25 @@ fn re10_build_headers(
     ctx: &mut dyn NativeContext,
     entries: &[(String, String)],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let hdrs = match ctx.new_object_initialized("com/sun/net/httpserver/Headers", "()V", &[])? {
+    let hdrs0 = match ctx.new_object_initialized("com/sun/net/httpserver/Headers", "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
         _ => return Err(ioex("Headers <init> failed")),
     };
+    // GC-safety: `hdrs` is held across `create_string`/`add` allocations for
+    // every entry. A moving GC mid-loop would otherwise leave the Rust-local
+    // `hdrs` stale and silently drop every subsequent `add` (writes to a vacated
+    // slot) — i.e. an incomplete request/response header map under GC pressure
+    // (ES testHeaders / auth). Pin `hdrs` for the whole build, and pin each key
+    // string across the value-string allocation that follows it; re-read the
+    // forwarded addresses before the `add`. The just-created value string `vs`
+    // is used immediately (no allocation before the invoke) so it needs no pin.
+    let h_pin = ctx.pin_native_root(hdrs0);
     for (k, v) in entries {
-        let ks = ctx.create_string(k);
+        let ks0 = ctx.create_string(k);
+        let ks_pin = ctx.pin_native_root(ks0);
         let vs = ctx.create_string(v);
+        let hdrs = ctx.read_native_pin(h_pin, hdrs0);
+        let ks = ctx.read_native_pin(ks_pin, ks0);
         let _ = ctx.invoke(
             "com/sun/net/httpserver/Headers",
             "add",
@@ -6098,7 +6168,11 @@ fn re10_build_headers(
                 Value::Object(Some(vs)),
             ],
         );
+        // Pop just this iteration's key-string pin (keep `hdrs` pinned).
+        ctx.unpin_native_roots(ks_pin);
     }
+    let hdrs = ctx.read_native_pin(h_pin, hdrs0);
+    ctx.unpin_native_roots(h_pin);
     Ok(hdrs)
 }
 
@@ -6117,7 +6191,7 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return out,
     };
-    let it = match ctx.invoke(
+    let it0 = match ctx.invoke(
         "java/util/Set",
         "iterator",
         "()Ljava/util/Iterator;",
@@ -6126,20 +6200,27 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
         Ok(Some(Value::Object(Some(i)))) => i,
         _ => return out,
     };
+    // GC-safety: the iterator (`it`), each `entry`, and each value `List` are
+    // held across the per-element `hasNext`/`next`/`getKey`/`getValue`/`size`/
+    // `get` invokes, every one of which allocates. A moving GC mid-walk would
+    // leave a Rust-local stale and truncate/garble the read header map (ES
+    // testHeaders). Pin the iterator for the whole walk and each entry / value
+    // list across the invokes that consume it; the key/value Strings are turned
+    // into Rust `String`s immediately (no held ObjectRef). `it_pin` is the base;
+    // per-iteration pins are popped before the next round so the pin stack stays
+    // bounded.
+    let it_pin = ctx.pin_native_root(it0);
     loop {
+        let it = ctx.read_native_pin(it_pin, it0);
         let has = matches!(
-            ctx.invoke(
-                "java/util/Iterator",
-                "hasNext",
-                "()Z",
-                &[Value::Object(Some(it))]
-            ),
+            ctx.invoke("java/util/Iterator", "hasNext", "()Z", &[Value::Object(Some(it))]),
             Ok(Some(Value::Int(1)))
         );
         if !has {
             break;
         }
-        let entry = match ctx.invoke(
+        let it = ctx.read_native_pin(it_pin, it0);
+        let entry0 = match ctx.invoke(
             "java/util/Iterator",
             "next",
             "()Ljava/lang/Object;",
@@ -6148,34 +6229,46 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
             Ok(Some(Value::Object(Some(e)))) => e,
             _ => break,
         };
+        let entry_pin = ctx.pin_native_root(entry0);
         let key = match ctx.invoke(
             "java/util/Map$Entry",
             "getKey",
             "()Ljava/lang/Object;",
-            &[Value::Object(Some(entry))],
+            &[Value::Object(Some(entry0))],
         ) {
             Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k).unwrap_or_default(),
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
-        let val_list = match ctx.invoke(
+        let entry = ctx.read_native_pin(entry_pin, entry0);
+        let val_list0 = match ctx.invoke(
             "java/util/Map$Entry",
             "getValue",
             "()Ljava/lang/Object;",
             &[Value::Object(Some(entry))],
         ) {
             Ok(Some(Value::Object(Some(l)))) => l,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
+        // `entry` is done; reuse its pin slot for the value list.
+        ctx.unpin_native_roots(entry_pin);
+        let vl_pin = ctx.pin_native_root(val_list0);
         let n = match ctx.invoke(
             "java/util/List",
             "size",
             "()I",
-            &[Value::Object(Some(val_list))],
+            &[Value::Object(Some(val_list0))],
         ) {
             Ok(Some(Value::Int(n))) => n,
             _ => 0,
         };
         for i in 0..n {
+            let val_list = ctx.read_native_pin(vl_pin, val_list0);
             if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
                 "java/util/List",
                 "get",
@@ -6185,7 +6278,9 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
                 out.push((key.clone(), ctx.read_string(s).unwrap_or_default()));
             }
         }
+        ctx.unpin_native_roots(vl_pin);
     }
+    ctx.unpin_native_roots(it_pin);
     out
 }
 
@@ -6216,33 +6311,78 @@ fn re10_dispatch_pending(
         };
         let (status, body_bytes, resp_headers, len_hint) = match handler_info {
             Some(h) => {
-                let ex = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange", 8);
+                // GC-safety: this native dispatcher holds the handler (`h`) and
+                // the HttpExchange (`ex`) across many VM allocations below
+                // (create_string, build-headers, byte arrays, ref array, and the
+                // handler invoke). A bare ObjectRef in a Rust local does NOT
+                // survive a moving GC those allocations may trigger — it goes
+                // stale, which surfaced as a `NoSuchMethodError
+                // java/lang/Object.handle` storm (stale receiver) and corrupted
+                // exchange field writes (landing in a vacated from-space slot)
+                // under -Xmx1g GC pressure (ES testManyAsyncRequests /
+                // testHeaders). Pin both as native roots and re-read the
+                // forwarded address (`read_native_pin`) after every allocation.
+                // Each freshly-created field VALUE is set immediately (no
+                // allocation between its create and its set), so values need no
+                // pin. `unpin_native_roots(h_pin)` releases the whole batch.
+                let h_pin = ctx.pin_native_root(h);
+                let ex0 = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange", 8);
+                let ex_pin = ctx.pin_native_root(ex0);
+
                 let m = ctx.create_string(&req.method);
-                let u = ctx.create_string(&req.uri);
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 0, Value::Object(Some(m)));
+                let u = ctx.create_string(&req.uri);
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 1, Value::Object(Some(u)));
                 // Request + response headers are REAL `Headers` (HashMap subclass)
                 // objects so the handler's `entrySet()`/`put()`/`getFirst()` run
                 // real bytecode. The synthetic Headers had no Map methods.
-                let rh = re10_build_headers(ctx, &req.headers)?;
+                let rh = match re10_build_headers(ctx, &req.headers) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(h_pin);
+                        return Err(e);
+                    }
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 2, Value::Object(Some(rh)));
-                let rsph = re10_build_headers(ctx, &[])?;
+                let rsph = match re10_build_headers(ctx, &[]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(h_pin);
+                        return Err(e);
+                    }
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 3, Value::Object(Some(rsph)));
                 let body_arr = new_java_byte_array(ctx, &req.body);
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 4, Value::Object(Some(body_arr)));
                 ctx.set_field(ex, 5, Value::Int(200));
                 let resp_body_chunks = ctx.new_ref_array(ClassId::new(0), 64);
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 6, Value::Object(Some(resp_body_chunks)));
                 ctx.set_field(ex, 7, Value::Int(0));
+
+                // Re-read both pinned roots immediately before the invoke (the
+                // exchange-build allocations above may have relocated them).
+                let h = ctx.read_native_pin(h_pin, h);
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 let _ = ctx.invoke_virtual(
                     h,
                     "handle",
                     "(Lcom/sun/net/httpserver/HttpExchange;)V",
                     &[Value::Object(Some(ex))],
                 );
+                // The handler ran bytecode (allocations) — refresh `ex` before
+                // reading its populated result fields.
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 let status = ctx.get_field(ex, 5).as_int().unwrap_or(200);
                 let mut body_bytes: Vec<u8> = Vec::new();
                 if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
+                    // array_length / get_array_element do not allocate, so the
+                    // chunk array and each `ba` stay valid through the walk.
                     let n = ctx.array_length(chunks);
                     for i in 0..n {
                         if let Value::Object(Some(ba)) = ctx.get_array_element(chunks, i) {
@@ -6255,13 +6395,16 @@ fn re10_dispatch_pending(
                         }
                     }
                 }
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 let resp_headers = match ctx.get_field(ex, 3) {
                     Value::Object(Some(rh)) => re10_read_headers(ctx, rh),
                     _ => Vec::new(),
                 };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
                 // Response-length hint from sendResponseHeaders: -1 => no body /
                 // no Content-Length (HEAD, 204, 304).
                 let len_hint = ctx.get_field(ex, 7).as_int().unwrap_or(0);
+                ctx.unpin_native_roots(h_pin);
                 (status, body_bytes, resp_headers, len_hint)
             }
             None => (404, b"Not Found".to_vec(), Vec::new(), 0),
@@ -6778,16 +6921,28 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let body = match ctx.get_field(this, 4) {
+            let body0 = match ctx.get_field(this, 4) {
                 Value::Object(Some(a)) => a,
                 _ => ctx.new_array(ArrayElementType::Byte, 0),
             };
-            let len = ctx.array_length(body) as i32;
+            let len = ctx.array_length(body0) as i32;
+            // GC-safety: `body0` is read here but used only AFTER the
+            // `ByteArrayInputStream` allocation below, which can trigger a moving
+            // GC. A stale `body` would set `ByteArrayInputStream.buf` to a vacated
+            // from-space slot, so the handler reads garbage request bytes and
+            // typically throws while decoding — aborting `handle()` BEFORE it
+            // calls `sendResponseHeaders(status)`, which the dispatcher then
+            // reports as the default 200 (observed as ES auth-test
+            // `expected:<403> but was:<200>` under -Xmx1g GC pressure). Pin it
+            // across the alloc and read the forwarded address back.
+            let body_pin = ctx.pin_native_root(body0);
             let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let body = ctx.read_native_pin(body_pin, body0);
             ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
             ctx.set_field(stream, 2, Value::Int(0)); // mark
             ctx.set_field(stream, 3, Value::Int(len)); // count
+            ctx.unpin_native_roots(body_pin);
             Ok(Some(Value::Object(Some(stream))))
         },
     );
@@ -6817,14 +6972,22 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         "getResponseBody",
         "()Ljava/io/OutputStream;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            // GC-safety: `this` (the exchange) is used AFTER the ResponseBody
+            // allocation, which can move it. A stale `this` would set
+            // `ResponseBody.owner` (slot 0) to a vacated exchange address, so a
+            // later `out.write(...)` reads the wrong/garbage owner and drops the
+            // response body. Pin it across the alloc and read it back forwarded.
+            let this0 = obj_arg(args, 0)?;
+            let this_pin = ctx.pin_native_root(this0);
             let out = alloc_concurrent_synthetic(
                 ctx,
                 "com/sun/net/httpserver/HttpExchange$ResponseBody",
                 2,
             );
+            let this = ctx.read_native_pin(this_pin, this0);
             ctx.set_field(out, 0, Value::Object(Some(this)));
             ctx.set_field(out, 1, Value::Int(0));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(out))))
         },
     );
@@ -6833,7 +6996,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let rb = "com/sun/net/httpserver/HttpExchange$ResponseBody";
     r.register(rb, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
+        let owner0 = match ctx.get_field(this, 0) {
             Value::Object(Some(o)) => o,
             _ => return Err(ioex("ResponseBody has no exchange")),
         };
@@ -6841,16 +7004,23 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let data = java_byte_array_to_vec(ctx, buf, off, len)?;
+        // GC-safety: `owner` (the exchange) is used after `new_java_byte_array`,
+        // which can relocate it. Pin across the alloc and read it back forwarded
+        // so the chunk lands in the live exchange's chunk array, not a vacated
+        // from-space slot (which would silently drop the response body).
+        let owner_pin = ctx.pin_native_root(owner0);
         let chunk = new_java_byte_array(ctx, &data);
+        let owner = ctx.read_native_pin(owner_pin, owner0);
         if let Value::Object(Some(chunks)) = ctx.get_field(owner, 6) {
             let cap = ctx.array_length(chunks);
             for i in 0..cap {
                 if let Value::Object(None) = ctx.get_array_element(chunks, i) {
                     ctx.set_array_element(chunks, i, Value::Object(Some(chunk)));
-                    return Ok(None);
+                    break;
                 }
             }
         }
+        ctx.unpin_native_roots(owner_pin);
         Ok(None)
     });
     // `OutputStream.write(byte[])` — the synthetic ResponseBody does not inherit
@@ -6859,43 +7029,51 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     // write([BII) over the whole array.
     r.register(rb, "write", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
+        let owner0 = match ctx.get_field(this, 0) {
             Value::Object(Some(o)) => o,
             _ => return Err(ioex("ResponseBody has no exchange")),
         };
         let buf = obj_arg(args, 1)?;
         let len = ctx.array_length(buf) as i32;
         let data = java_byte_array_to_vec(ctx, buf, 0, len)?;
+        // GC-safety: see write([BII) — pin `owner` across the chunk allocation.
+        let owner_pin = ctx.pin_native_root(owner0);
         let chunk = new_java_byte_array(ctx, &data);
+        let owner = ctx.read_native_pin(owner_pin, owner0);
         if let Value::Object(Some(chunks)) = ctx.get_field(owner, 6) {
             let cap = ctx.array_length(chunks);
             for i in 0..cap {
                 if let Value::Object(None) = ctx.get_array_element(chunks, i) {
                     ctx.set_array_element(chunks, i, Value::Object(Some(chunk)));
-                    return Ok(None);
+                    break;
                 }
             }
         }
+        ctx.unpin_native_roots(owner_pin);
         Ok(None)
     });
     r.register(rb, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = match ctx.get_field(this, 0) {
+        let owner0 = match ctx.get_field(this, 0) {
             Value::Object(Some(o)) => o,
             _ => return Err(ioex("ResponseBody has no exchange")),
         };
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) & 0xff;
+        // GC-safety: see write([BII) — pin `owner` across the 1-byte chunk alloc.
+        let owner_pin = ctx.pin_native_root(owner0);
         let chunk = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(chunk, 0, Value::Int(b as i8 as i32));
+        let owner = ctx.read_native_pin(owner_pin, owner0);
         if let Value::Object(Some(chunks)) = ctx.get_field(owner, 6) {
             let cap = ctx.array_length(chunks);
             for i in 0..cap {
                 if let Value::Object(None) = ctx.get_array_element(chunks, i) {
                     ctx.set_array_element(chunks, i, Value::Object(Some(chunk)));
-                    return Ok(None);
+                    break;
                 }
             }
         }
+        ctx.unpin_native_roots(owner_pin);
         Ok(None)
     });
     r.register(rb, "flush", "()V", |_ctx, _args| Ok(None));
