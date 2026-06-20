@@ -1,9 +1,27 @@
 # HIB-DEV-05 — deserialized `EntityManager`/`SessionFactory` has null SessionFactory → NPE (5 classes)
 
 **Severity:** Medium — fails Hibernate's serialization round-trip tests.
-**Status:** 🔴 OPEN — root narrowed; deeper than a single native (SessionFactory reconnection). Handoff/investigate.
-**Mode:** Interpreter (JIT-off).
+**Status:** ✅ **RESOLVED 2026-06-20** — root cause was reflective `Method.invoke` retargeting a **private** method to a subclass override. Fixed in `native-builtins/src/lang_class.rs` (`native_method_invoke`): private instance methods now dispatch via `invoke_special` (no virtual retarget). Real Hibernate 6.5 + H2 `EntityManager`/`EntityManagerFactory` serialize→deserialize→use round-trip now PASSES on CratonVM (interpreter and JIT); the serialized EM stream is byte-identical in structure to HotSpot (2216 bytes; only the random per-run UUIDs differ).
+**Mode:** Interpreter (JIT-off) — also verified with JIT on.
 **HotSpot (JDK 25):** all 5 **PASS**.
+
+## ✅ Resolution (2026-06-20) — reflective `Method.invoke` retargeted a private method to a subclass override
+
+The earlier refinements (below) were on a **dead path**. The Hibernate suite runs against a real `--java-home`, where CratonVM executes the **real** `java.io.ObjectOutputStream` / `ObjectStreamClass` bytecode (the synthetic `serialization.rs` natives are dormant — confirmed: zero hits during the run, and the produced classdesc field names are written by real `ObjectStreamClass.writeNonProxy` via `writeUTF`). So the "synthetic OOS object-graph encoding" / offset-divergence theory was a red herring (it reflected an older config where the synthetic OOS was active).
+
+**Actual root cause.** `java.io.ObjectStreamClass.writeSerialData` walks the class-data layout slot-by-slot (super-first) and, for each slot with a `writeObject` hook, calls `slotDesc.invokeWriteObject(obj, oos)` which does `writeObjectMethod.invoke(obj, {oos})` (reflection). For a `SessionImpl` graph the slots are `[AbstractSharedSessionContract, SessionImpl]`, both with a **private** `writeObject`. `AbstractSharedSessionContract` is an **abstract** class.
+
+CratonVM's `Method.invoke` native (`native_method_invoke`) correctly skipped virtual dispatch for private methods (`use_virtual_dispatch = !is_static && !is_private && !is_init`) but then called the resolved method through `ctx.invoke(class_name, …)` → `invoke_on_class_shared`. That helper **retargets** a call whose declaring class is **abstract/interface** onto the receiver's concrete class (a correct fix for abstract/interface methods with no `Code`, but **wrong** for a private concrete method that merely lives in an abstract class). So `invoke(AbstractSharedSessionContract.writeObject, sessionImpl)` ran **`SessionImpl.writeObject`** instead.
+
+Consequence: the `AbstractSharedSessionContract` slot's hook (which writes `factory.serialize(oos)` = the SessionFactory UUID via `oos.writeUTF`) was never invoked; instead `SessionImpl.writeObject` ran **twice** (its persistence-context/action-queue serialization appears twice in the trace; the UUID `writeUTF(len=36)` never appears). On deserialization, `SessionFactoryImpl.deserialize(ois)` read an empty UUID → `SessionFactoryRegistry.findSessionFactory("")` missed → `factory = null` → NPE on first use.
+
+**Why earlier minimal repros (MultiLevelSer, PrivInvoke*) passed:** their superclass was a **concrete** class, so the abstract-class retarget never fired. The trigger is specifically a **private method declared in an abstract (or interface) class, reflectively invoked on a concrete-subclass receiver** — see `jsonrepro/AbstractPriv.java` (returned `SUB` pre-fix, `BASE` after).
+
+**Fix.** In `native_method_invoke`, route private instance methods through `ctx.invoke_special` (→ `invoke_on_class_shared_no_retarget`) instead of `ctx.invoke`. `invoke_special` resolves to the declaring class with no retarget — exactly the invokespecial semantics a private method requires. One-branch change; all reflection repros (PrivInvoke/2/3, SlotRepro, AbstractPriv) and serialization repros (MultiLevelSer, InheritedFields, Utf2/3) pass, and the real Hibernate EM/EMF round-trip passes.
+
+---
+
+## Historical investigation (superseded — kept for context)
 
 ## Symptom
 

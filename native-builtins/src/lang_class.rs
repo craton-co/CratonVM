@@ -4938,6 +4938,27 @@ pub(crate) fn native_method_invoke(
                 return Err(wrap_as_invocation_target_exception(ctx, failure));
             }
         }
+    } else if is_private && !is_static && !is_init {
+        // Private instance methods bypass virtual dispatch AND must never be
+        // retargeted to a subclass's same-name method. `ctx.invoke`
+        // (invoke_on_class_shared) retargets a call whose declaring class is
+        // abstract/interface onto the receiver's concrete class — correct for
+        // an abstract/interface method with no Code, but WRONG for a private
+        // concrete method that merely lives in an abstract class. Reflectively
+        // invoking `AbstractSharedSessionContract.writeObject` (private, in an
+        // abstract class) on a `SessionImpl` receiver therefore ran
+        // `SessionImpl.writeObject`, so `ObjectStreamClass.invokeWriteObject`
+        // skipped the superclass slot's hook: Hibernate never wrote the
+        // SessionFactory UUID and deserialization reconnected a null factory
+        // → NPE (HIB-DEV-05). `invoke_special` resolves to the declaring class
+        // with no retarget — exactly the invokespecial semantics a private
+        // method requires.
+        match ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args) {
+            Ok(v) => v,
+            Err(failure) => {
+                return Err(wrap_as_invocation_target_exception(ctx, failure));
+            }
+        }
     } else {
         match ctx.invoke(&class_name, &method_name, &descriptor, &invoke_args) {
             Ok(v) => v,
