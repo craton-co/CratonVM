@@ -38,22 +38,41 @@ Ruled out by experiment:
 - **Not the JIT helping** — `--nojit` (51.9 s) ≈ JIT-on (55.8 s). The JIT does **not** accelerate the hot loop.
 
 What it is: ANTLR4's **cold full-context (LL) prediction** (`ParserATNSimulator.adaptivePredict` →
-`closure`/`computeReachSet`) for the `selectionList`/`selectExpression` grammar decisions runs **entirely in
-the interpreter**. Those methods are deeply **recursive** and are always on the call stack, so although they
-cross the invocation threshold (default 500), CratonVM has no **on-stack replacement (OSR)** to switch the
-in-flight recursive frames to compiled code — the freshly-compiled method body is never entered, and the
-parse runs interpreted at ~1000× HotSpot. (A `CRATONVM_DBG_JIT_COMPILE` capture of the 56 s parse shows the
-ANTLR/ATN/`HqlParser` methods are **never** compiled.) HotSpot wins via JIT + escape analysis on the
-allocation-heavy config objects.
+`closure`/`closureCheckingStopState`/`computeReachSet`) for the `selectionList`/`selectExpression` grammar
+decisions runs **entirely in the interpreter** at ~1000× HotSpot. HotSpot wins via JIT + escape analysis on
+the allocation-heavy config objects.
+
+### Why the JIT never engages (instrumented 2026-06-20 via `CRATONVM_DBG_JITC`)
+
+Confirmed at the compile-pipeline level — the hot ATN-simulation methods **cross the invocation threshold
+(500) but are declined by the single-pass JIT backend**, so they never run compiled:
+
+- `ParserATNSimulator.closureCheckingStopState` (3925 compile attempts), `ParserATNSimulator.closure_`
+  (3922), `ATNConfigSet.add` (1311), `ParserATNSimulator.ruleTransition` (1003),
+  `PredictionContext.mergeArrays` (316) — all repeatedly hit `try_compile` and bail, then short-circuit via
+  the dynamic `jit_bail_list` (`is_jit_bail_listed`).
+- The bail is **not one opcode and not a code-size cap**: these are complex, object- and exception-heavy
+  bodies (`closure_` alone has `athrow`×2 + `checkcast`×6 + `instanceof`×3 + `invokeinterface`×5). They are
+  exactly the method shapes the **single-pass C1-style x64 backend** (`jit::x64::compile` / `jit_scan`)
+  declines; `ATNSimulator.getCachedContext` is the one method observed taking a real `backend_attempted=true`
+  backend bail. (Ruled out: `code_len==0` — 0 occurrences when instrumented; an infinite retry loop — the
+  bail-list short-circuit already prevents re-running the gauntlet.)
+
+So it is a **JIT backend-coverage** gap, not a single bug, and not (only) the on-stack-recursion/OSR angle:
+even a non-recursive hot method of this shape (`ATNConfigSet.add`, `mergeArrays`) is declined.
 
 ## Why it surfaces as a "hang" in the suite
 
 The census runs **fork-per-class**, so each class re-pays the cold per-shape cost from scratch; a class with
-several distinct complex queries (e.g. `JsonArrayUnnestTest`) exceeds 600s. **Mitigation:** running the
-Hibernate suite in a **single shared JVM** amortizes the DFA-cache warmup across classes (warm parse = sub-second).
+several distinct complex queries (e.g. `JsonArrayUnnestTest`) exceeds 600s. **Mitigation (works today):**
+running the Hibernate suite in a **single shared JVM** amortizes the DFA-cache warmup across classes (warm
+parse = sub-second).
 
-## Fix direction (deferred, large)
+## Fix direction (deferred, large — NO safe quick fix)
 
-The real fix is **JIT throughput for the recursive ANTLR ATN-simulation hot loop** — i.e. OSR / effective
-tier-up for on-stack recursive methods (the deferred bug-C / instance-method-tier-up work). No quick targeted
-VM fix; this doc nails the mechanism + minimal repro for that project.
+The real fix is **broadening the JIT backend to compile these complex object/exception-heavy methods** (and,
+for the deepest recursion, OSR / tier-up for on-stack methods) — the deferred JIT-throughput / bug-C cluster.
+This was investigated to the compile-pipeline level (above) and there is **no one-line VM fix**: the blocker
+is the single-pass backend's method-shape coverage, and force-lifting individual codegen gates (athrow with
+control flow, etc.) is a substantial, correctness-sensitive change that should not be rushed onto `dev`. This
+doc + `_hibrepro/HqlParse` nail the mechanism and give a fast minimal repro for that project.
