@@ -113,7 +113,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize,
+        optimize, false,
     )
 }
 
@@ -269,12 +269,7 @@ fn ir_vs_singlepass_abs_early_return() {
         ],
         1,
         1,
-        &[
-            (vec![-5], 5),
-            (vec![0], 0),
-            (vec![7], 7),
-            (vec![-100], 100),
-        ],
+        &[(vec![-5], 5), (vec![0], 0), (vec![7], 7), (vec![-100], 100)],
     );
 }
 
@@ -514,6 +509,7 @@ fn compile_opt_fields(
         None,
         None,
         optimize,
+        false,
     )
 }
 
@@ -734,7 +730,10 @@ fn field_helpers() -> JitRuntimeHelpers {
         // heap object is aligned, where `jit_putfield_int`'s aligned write is
         // fine). The resulting cell bytes are identical either way.
         std::ptr::write_unaligned(p.add(off) as *mut u32, 0); // Value::Int discriminant
-        std::ptr::write_unaligned(p.add(off + FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32, val as i32);
+        std::ptr::write_unaligned(
+            p.add(off + FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32,
+            val as i32,
+        );
         std::ptr::write_unaligned(p.add(off + 8) as *mut u64, 0); // high qword
     }
     let mut h = dummy_helpers();
@@ -926,5 +925,170 @@ fn ir_vs_singlepass_putfield_two_fields() {
             (vec![1, 2], vec![10, 20], 30, vec![10, 20]),
             (vec![5, 5], vec![-3, 3], 0, vec![-3, 3]),
         ],
+    );
+}
+
+// ── Gap B: invokestatic → Op::Call via the invoke_dispatch helper ──────
+//
+// The IR builder lowers an int-only `invokestatic` in an oop-free method to
+// `Op::Call`, which the lowerer dispatches as
+//   i64 helper(vm_ptr, info_ptr, args_ptr, num_args)
+// (the same ABI as single-pass), marshalling the Java args contiguously into a
+// frame staging region. These tests supply a REAL stub `invoke_dispatch` so the
+// generated code actually runs — validating the marshalling (values, order,
+// count), the `needs_context` prologue, and the `i64::MIN` exception sentinel —
+// without the full VM (the handoff's "real dispatch stub for a direct static
+// call" option).
+
+/// Compile a method through the IR pipeline WITH `ir_emit_calls` on, supplying an
+/// invoke resolver and helpers (whose `invoke_dispatch` the caller has wired to a
+/// stub). Returns the compiled body (needs_context, since it contains a call).
+fn compile_with_dispatch(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        Some(invoke_resolver),
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        true, // optimize (C2 / IR pipeline)
+        true, // ir_emit_calls (Gap B)
+    )
+}
+
+/// Stub `invoke_dispatch` that reads `num_args` i64 args from `args_ptr` and
+/// returns an order- AND count-sensitive function of them, so a marshalling bug
+/// (wrong order, wrong base, wrong count) produces a divergent result:
+///   result = Σ arg[i] * 100^(n-1-i)   +   n * 1_000_000
+unsafe extern "C" fn positional_dispatch(
+    _vm: i64,
+    _info: i64,
+    args_ptr: i64,
+    num_args: i64,
+) -> i64 {
+    let p = args_ptr as *const i64;
+    let n = num_args as usize;
+    let mut acc: i64 = 0;
+    for i in 0..n {
+        acc = acc * 100 + (*p.add(i) as i32 as i64);
+    }
+    acc + (n as i64) * 1_000_000
+}
+
+fn host_positional(args: &[i64]) -> i64 {
+    let mut acc: i64 = 0;
+    for &a in args {
+        acc = acc * 100 + (a as i32 as i64);
+    }
+    acc + (args.len() as i64) * 1_000_000
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_two_int_args() {
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    // static int f(int a, int b) { return g(a, b); }
+    //   iload_0; iload_1; invokestatic #2; ireturn
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(II)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("IR compile of int invokestatic method");
+    assert!(
+        ir.needs_context(),
+        "an Op::Call method must report needs_context (VM ptr as hidden arg 0)"
+    );
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [
+        (3i64, 4i64),
+        (0, 0),
+        (7, 9),
+        (-1, 2),
+        (100, 200),
+        (i32::MAX as i64, 1),
+    ] {
+        // SAFETY: `ir` is a finalized IR-compiled body taking (vm_ptr, a, b); the
+        // dummy VM buffer is never dereferenced by the stub dispatch helper.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, b]) }
+            .unwrap_or_else(|e| panic!("call ({a},{b}): {e:?}"));
+        assert_eq!(
+            r,
+            host_positional(&[a, b]),
+            "invokestatic dispatch result for ({a}, {b})"
+        );
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_three_args_and_arith() {
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    // static int f(int a, int b, int c) { return g(a, b, c) + 1; }
+    //   iload_0; iload_1; iload_2; invokestatic #2; iconst_1; iadd; ireturn
+    let code = vec![0x1a, 0x1b, 0x1c, 0xb8, 0x00, 0x02, 0x04, 0x60, 0xac];
+    let cm = cached("f", "(III)I", code, 3, 3);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(III)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver).expect("IR compile of 3-arg method");
+    let dummy_vm = [0u8; 64];
+    for (a, b, c) in [(1i64, 2i64, 3i64), (9, 8, 7), (0, 0, 0), (-1, -2, -3)] {
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, b, c]) }
+            .unwrap_or_else(|e| panic!("call ({a},{b},{c}): {e:?}"));
+        // host: g(a,b,c) result, then + 1 (the trailing iconst_1; iadd).
+        let expected = (host_positional(&[a, b, c]) as i32).wrapping_add(1) as i64;
+        assert_eq!(r, expected, "3-arg dispatch + arith for ({a},{b},{c})");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_exception_sentinel() {
+    // A callee that throws makes `invoke_dispatch` return the `i64::MIN` sentinel;
+    // the JIT method must detect it and bail (returning the sentinel unchanged so
+    // the VM takes the pending exception) rather than use it as a result.
+    unsafe extern "C" fn throwing_dispatch(_vm: i64, _info: i64, _args: i64, _n: i64) -> i64 {
+        i64::MIN
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = throwing_dispatch as *const () as usize;
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(II)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch(&cm, &helpers, &resolver).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[1, 2]) }.expect("call");
+    assert_eq!(
+        r,
+        i64::MIN,
+        "a throwing callee (i64::MIN) must bail and return the sentinel"
     );
 }
