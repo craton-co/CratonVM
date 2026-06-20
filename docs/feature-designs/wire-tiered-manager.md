@@ -1,5 +1,61 @@
 # Wire the Tiered Compilation Manager
 
+> **Increment 3 (Step 3 — real per-call C1/C2 backend routing) landed.**
+> Builds on increment 2. The C1/C2 split is no longer advisory: the target tier
+> now selects the actual backend per compile.
+> - **Per-call `optimize` toggle in the jit crate.** `jit::try_compile` /
+>   `try_compile_inner` (`jit/src/lib.rs`) gained a trailing `optimize: bool`.
+>   The IR-pipeline gate (`lib.rs` ~4185) is now
+>   `optimize && ir::ir_compatible(&scan) && !method_uses_category2(...)`:
+>   `optimize == false` skips the whole optimizing pipeline (IR build → optimize
+>   → escape analysis → schedule → lower) and falls through to the single-pass
+>   `x64::compile` backend — the fast **C1** tier. `optimize == true` keeps the
+>   historical IR-first behaviour (**C2**). The single-pass backend is the
+>   existing, well-tested fallback (it already serves every category-2 /
+>   non-`ir_compatible` method), so C1 is a throughput trade-off, never a
+>   correctness risk.
+> - **Threaded VM-side.** `background_compile_task`
+>   (`vm/src/runtime/interpreter.rs`) passes
+>   `tiered::tier_uses_optimized_backend(task.target_tier)` into
+>   `try_jit_compile_callee` → `try_jit_compile_callee_slow` →
+>   `jit::try_compile`. Every inline JIT-dispatch caller (the three
+>   `try_jit_compile_callee` sites in `vm/src/jit/helpers.rs`, the eager
+>   direct-call site `interpreter.rs:16172`, and the early-compile / main-path
+>   `jit::try_compile` sites) passes `optimize = true`, so the default
+>   (`CRATONVM_BG_COMPILE`-off) path is byte-for-byte unchanged. Only the
+>   background tiered worker can request `optimize = false`.
+> - **`tier_uses_optimized_backend` is now real routing, not a hint** — the
+>   former "STUB" comments in `tiered.rs` and `background_compile_task` are
+>   updated accordingly.
+> - **Test:** `step3_optimize_toggle_routes_c1_singlepass_and_c2_ir`
+>   (`jit/src/lib.rs`) compiles `static int add(int,int)` both ways and asserts,
+>   via the thread-local `IR_LOWER_COMPILES` telemetry counter, that
+>   `optimize=true` takes the IR pipeline (count 1) while `optimize=false` skips
+>   it (count 0) — both producing non-empty native code. (777 jit-crate tests
+>   pass; `cratonvm-vm` builds clean.)
+> - **Runtime smoke (gated on):** with `CRATONVM_BG_COMPILE=1
+>   CRATONVM_DBG_JITC=1`, a hot `Bg.busy(I)I` enqueues `tier=C1`, the worker logs
+>   `bg-compile … tier=C1 optimized=false` + `full-compile … len=350`, and the
+>   program prints a result **identical** to the default run — the off-thread
+>   single-pass C1 code is correct.
+> - **Boundaries (follow-ups, all behind the default-off flag):**
+>   1. *No C1→C2 supersede yet.* The `jit_cache` probe in
+>      `try_jit_compile_callee` returns whatever body was published first,
+>      regardless of `optimize`, so a method is compiled at whichever tier
+>      reaches it first. Re-compiling a hot C1 method at C2 needs safe
+>      code-cache replacement (cf. the bug-24 baked-pointer UAF), out of scope
+>      here.
+>   2. *C1 is "single-pass", not "no-opt-at-all".* The single-pass backend still
+>      runs its own internal escape analysis; threading the flag into
+>      `x64::compile` to disable those passes for an even leaner C1 is separate.
+>   3. *With the default policy, the bg path only ever reaches C1.*
+>      `c1_threshold(200) < c2_threshold(5000)`, and `on_method_invocation` is
+>      consulted only at the interpreter's stride boundaries (every 64 calls past
+>      the warmup), so C1 fires first; once it publishes, the call site flips to
+>      `Jit` and tiered counting stops — the method never accumulates to the C2
+>      threshold. Reaching bg-C2 needs threshold tuning (Step 6) or supersede
+>      (boundary 1).
+>
 > **Increment 2 (Step 2 done + Step 3, gated `CRATONVM_BG_COMPILE` default-off) landed.**
 > Builds on increment 1. The background worker now runs a **real** compile
 > callback and (when the flag is on) the mutator no longer compiles inline:
@@ -186,10 +242,12 @@ tier instead of by the current ad-hoc gates.
 2. **Move compilation off the mutator.** Switch the interpreter trigger to
    enqueue-only; the method stays interpreted until the background compile
    publishes. Confirm no first-call stall and no lost compiles under the gauntlet.
-3. **Introduce the C1 tier.** Add the fast single-pass-no-opt compile; route the
-   manager's `C1`/`C1WithProfiling` recommendations to it, `C2` to the optimized
-   path. Honor `on_method_invocation`'s recommended tier instead of discarding
-   it (`interpreter.rs:14181`).
+3. **Introduce the C1 tier.** ✅ **Done (increment 3).** Added the per-call
+   `optimize` toggle to `jit::try_compile`; `C1`/`C1WithProfiling` route to the
+   single-pass `x64::compile` backend, `C2` to the optimizing IR pipeline. The
+   recommended tier is already honored (increment 1). Remaining nuance — the
+   single-pass backend keeps its own internal escape analysis, and there is no
+   C1→C2 supersede yet — is recorded in the increment-3 header above.
 4. **Profile handoff C1 → C2.** Have C1 populate the profile structures; have C2
    read them.
 5. **Wire `on_backedge` + OSR.** Add back-edge counting and the OSR entry
