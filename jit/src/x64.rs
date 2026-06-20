@@ -5688,6 +5688,18 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
+    /// A `newarray` (0xbc) OOM bail (`emit_post_alloc_oom_check`) was emitted in
+    /// this method. Forces `has_dispatch` for the SAME thread-availability
+    /// reason as `direct_calls` above: the fallible `jit_newarray` helper reads
+    /// the per-thread `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
+    /// allocation-failure STW GC (helpers.rs:1201) and to construct the
+    /// catchable `OutOfMemoryError` (helpers.rs:1265). The `!has_dispatch` fast
+    /// entry path skips `set_jit_thread`, so without this a JIT'd allocating
+    /// method would run `jit_newarray` with a null thread — no GC on young-gen
+    /// pressure, and on genuine exhaustion the OOME is never created so the
+    /// `i64::MIN` bail sentinel leaks as the method's (truncated) return value
+    /// (e.g. `new int[N]` silently yields 0) instead of throwing.
+    emitted_alloc_oom_check: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -6320,6 +6332,7 @@ impl Compiler {
             dbg_last_pc: 0,
             dbg_last_op: 0,
             emitted_athrow: false,
+            emitted_alloc_oom_check: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -13064,6 +13077,36 @@ impl Compiler {
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
         self.exception_check_stubs.push(patch_offset);
+    }
+
+    /// Emit the post-allocation OOM guard, immediately after an allocation
+    /// helper (`newarray` / `new_object` / `anewarray_object`) returns with its
+    /// result still in RAX. Those helpers return the `0`/null sentinel on heap
+    /// exhaustion (after stashing a `java/lang/OutOfMemoryError` in
+    /// `JIT_PENDING_EXCEPTION` — see `jit_alloc_oom`). A successful allocation is
+    /// never null, so `TEST RAX,RAX; JZ` distinguishes the OOM case.
+    ///
+    /// Without this guard the JIT pushed the null result onto the operand stack
+    /// and kept executing — the very next `arraylength` / `getfield` / array
+    /// store dereferenced it and SIGSEGV'd (read at `[null + offset]`) before
+    /// the method could return and drain the pending OOME. Branching to the same
+    /// shared stub the invoke guard uses (`emit_exception_check_stub`) loads the
+    /// `i64::MIN` deopt sentinel and runs the epilogue; the interpreter's
+    /// post-JIT drain then throws the stashed OOME through the method's
+    /// exception table (catchable, matching the interpreter's allocation paths).
+    fn emit_post_alloc_oom_check(&mut self) {
+        // TEST RAX, RAX  (48 85 C0)
+        self.buf.emit(&[0x48, 0x85, 0xC0]);
+        // JZ rel32 → shared exception-check stub (patched later)
+        self.buf.emit(&[0x0F, 0x84]);
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        self.exception_check_stubs.push(patch_offset);
+        // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
+        // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
+        // allocation-failure GC and to construct the OOME — which only the
+        // dispatch-aware entry path (`set_jit_thread`) provides.
+        self.emitted_alloc_oom_check = true;
     }
 
     /// Emit the single shared out-of-line stub for post-invoke exception
@@ -20462,6 +20505,10 @@ impl Compiler {
                     self.emit_call_absolute(self.helpers.newarray);
                     // T1.1.a — `newarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Heap-exhaustion guard: a null result means OOM (the helper
+                    // stashed an OutOfMemoryError). Bail before the null is pushed
+                    // and dereferenced by a following `arraylength`/store.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // A primitive array header is still an object reference.
                     self.mark_top_as_oop();
@@ -21644,7 +21691,10 @@ pub fn compile_with_param_slots(
         // `!has_dispatch` fast entry paths return the raw value WITHOUT
         // draining it, which would leak the exception (and mis-read the
         // sentinel as a return value). Force the dispatch-aware route.
-        || compiler.emitted_athrow;
+        || compiler.emitted_athrow
+        // A fallible `newarray` OOM bail needs the per-thread TLS set so the
+        // helper can GC + construct the OOME (same rationale as direct_calls).
+        || compiler.emitted_alloc_oom_check;
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {

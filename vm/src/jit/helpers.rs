@@ -1222,16 +1222,17 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
 /// `java/lang/OutOfMemoryError`, mirroring the interpreter's `gc_alloc_array`
 /// (runtime/interpreter.rs:853) OOM arm.
 ///
-/// The `newarray` codegen site (`jit/src/x64.rs` ~16349) has no `i64::MIN`
-/// deopt guard — it pushes RAX straight onto the operand stack — so unlike
-/// the invoke-dispatch helpers we cannot signal via the deopt sentinel.
-/// Instead we use the same channel the void-return store helpers
-/// (`jit_iastore` etc.) use for null-array NPEs: stash the throwable in
-/// `JIT_PENDING_EXCEPTION` and return the `0`/null sentinel. The interpreter's
-/// post-JIT drain (runtime/interpreter.rs:14079) calls
-/// `take_jit_pending_exception()` on *every* JIT return path and routes the
+/// The `newarray` codegen site (`emit_post_alloc_oom_check` in `jit/src/x64.rs`)
+/// null-checks RAX and, on the `0`/null OOM sentinel, bails to the shared
+/// exception stub (returning the `i64::MIN` deopt sentinel + running the
+/// epilogue). We stash the throwable in `JIT_PENDING_EXCEPTION` (the same
+/// channel the void-return store helpers use for null-array NPEs) and the
+/// interpreter's post-JIT general-exception drain
+/// (`take_jit_pending_exception()` on the dispatch-aware return path) routes the
 /// OOME through the JIT'd method's own exception table, giving a JIT'd
-/// `newarray` identical catchable-OOM semantics to the interpreter.
+/// `newarray` identical catchable-OOM semantics to the interpreter. The bail
+/// also forces the method `has_dispatch` (`emitted_alloc_oom_check` in `x64.rs`)
+/// so that drain runs AND so `jit_thread_mut()` below is non-null.
 ///
 /// If the OOME object itself cannot be constructed (e.g. the heap is too
 /// exhausted to even allocate the throwable), we fall back to leaving the
@@ -1239,13 +1240,36 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
 /// purely additive and never makes a previously-handled case worse.
 #[cold]
 fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
+    jit_alloc_oom(vm, &format!("Java heap space (alloc_array length {})", length))
+}
+
+/// Shared OOM signal for a fallible JIT allocation helper (currently
+/// `jit_newarray` — the only one that allocates via the fallible
+/// `try_alloc_array` and so can report exhaustion rather than aborting). On heap
+/// exhaustion the helper stashes a `java/lang/OutOfMemoryError` in
+/// `JIT_PENDING_EXCEPTION` and returns the `0`/null sentinel; the `newarray`
+/// codegen site null-checks the result and bails to the shared exception stub
+/// (`emit_post_alloc_oom_check` in `x64.rs`, which also forces the method
+/// `has_dispatch`), after which the interpreter's general-exception drain on the
+/// dispatch-aware return path routes the OOME through the method's exception
+/// table — giving a JIT'd `newarray` the same catchable-OOM semantics as the
+/// interpreter's `gc_alloc_array`, instead of the old SIGSEGV (null deref of the
+/// result). If the OOME object itself cannot be constructed (heap too exhausted
+/// to even allocate the throwable), the flag is left unset and `0` returned —
+/// the legacy behaviour, never worse.
+///
+/// `jit_new_object` / `jit_anewarray_object` still allocate via the non-fallible
+/// `alloc_object` / `alloc_array` (which fall back to the old generation before a
+/// hard abort) — converting them to catchable OOM needs a fallible-with-old-gen
+/// path and is a separate follow-up; they are NOT wired to this helper.
+#[cold]
+fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
-        let msg = format!("Java heap space (alloc_array length {})", length);
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
             thread,
             "java/lang/OutOfMemoryError",
-            Some(&msg),
+            Some(msg),
         ) {
             set_jit_pending_exception(exc);
         }
