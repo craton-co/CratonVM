@@ -1,5 +1,18 @@
 # spring-bug-06: `MergedAnnotationsTests` HANGS (infinite loop in annotation merge)
 
+> **UPDATE 2026-06-20:** Re-characterised. The hang is **JIT-ONLY**. Under `--nojit` the class
+> now completes (172/178 after the fam6 synthesis fixes on branch `fix/bug06-fam6-repeatable-merge`).
+> Under JIT it still TIMEOUTs (EXIT 124). Captured root cause: `java.util.stream.ReferencePipeline.toArray()`
+> infinite-recurses into itself — the `invokevirtual toArray(IntFunction)[Object` at pc6 mis-dispatches
+> to the no-arg `toArray()[Object` overload (a JIT virtual-overload-resolution bug), accompanied by a
+> GC-guard'd OOB slot-probe (`index=1 num_slots=1`) on a `java/util/stream/Stream` object. **This is the
+> SAME bug as the [[bug06-fam6-annotation-synthesis-mergedannotation]] "~2 GB OOM"** — they unify. It is
+> NOT the annotation-proxy `equals`/`hashCode` issue the original hypothesis (below) blamed — that turned
+> out to be a real but SEPARATE bug, now FIXED. The hang is receiver-specific: plain `Stream.of(..).toArray()`
+> does NOT reproduce it (works under JIT and interpreter). NEXT: localize the JIT invokevirtual overload
+> resolution that picks the no-arg `toArray()` for the Spring-suite stream receiver (release backtraces are
+> unsymbolized — needs a debug build or targeted JIT-dispatch instrumentation). OPEN (JIT codegen).
+
 | | |
 |---|---|
 | **Category** | **VM-HANG** (first hang found in the suite) |
