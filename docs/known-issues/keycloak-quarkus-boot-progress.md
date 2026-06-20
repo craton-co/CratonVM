@@ -426,16 +426,30 @@ VM's real file layer).
 > WORKS). Gate is currently **opt-in**; flip to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`)
 > once the boot is fully green (see next frontier), per the "validate the suite before flipping" rule.
 >
-> **New frontier (Gap 9, the next blocker):** with the gate ON the boot no longer fails at Agroal
-> but does not yet bind HTTP. At the 150s watchdog only **3 threads** exist (main +
-> `Thread-1` daemon + a `Timer`); main is parked normally in `waitForExit`, **no
-> exception** is thrown, **no `Listening on …`** / Liquibase / changelog output appears, and
-> `Thread-1` (the worker that should run Keycloak's DB migration + HTTP bind) is **stuck inside
-> Rust native code** (the watchdog cannot dump it). So the next blocker is a worker-thread stall
-> (likely Liquibase schema generation, a socket/HTTP bind, or a concurrency primitive), distinct
-> from the Agroal shim. Next-session start: get `Thread-1`'s wait-site (force a non-native
-> dump point, or add Rust tracing at the Vert.x/HTTP-bind + Liquibase entry points); confirm
-> whether the real Agroal pool actually opened a connection (housekeeping-executor trace).
+> **New frontier (Gap 9) — throughput, not a hard blocker.** With the gate ON, `--nojit` stalls
+> at 150s right after `Hibernate Validator` (no JPA-Startup-Thread / Liquibase output); the
+> single worker thread was undumpable (in Rust native). That looked like a hang, but it was
+> **slowness**: with **JIT enabled** and a 300s deadline the same boot blows *past* the entire DB
+> layer — through the JPA Startup Thread, the real Agroal datasource connect, Hibernate
+> SessionFactory + Liquibase — and reaches **RESTEasy Reactive deployment**
+> (`ApplicationImpl.<clinit>` pc≈790 → `ResteasyReactiveProcessor$setupDeployment.deploy_41` →
+> `RuntimeDeploymentManager.deploy` → `createDeployment`, plus generated-serializer class loading
+> via `RunnerClassLoader`/`JarFileReference.consumeSharedJarFile`). The main thread is **actively
+> running** there (the watchdog dump shows main at varying stack depths 16→44, not a fixed
+> wait-site), and the "**1425 threads dumped**" banner is the known watchdog re-dump artifact (every
+> entry is `name="main"`), NOT a thread explosion. So the Agroal fix unblocks Gap 8 in substance —
+> the DB layer completes — and the remaining wall is that the boot is **~15×+ slower than HotSpot's
+> 21 s** (HotSpot reaches `Listening on http://localhost:8080`). RESTEasy deployment is the *last*
+> phase before HTTP bind. Confirmed against the HotSpot oracle: HotSpot's boot logs the SAME benign
+> `HHH10001005 … connection was null / undefined-unknown / Database version 2.4.240 / Stop region
+> factory` block, then a dedicated **"JPA Startup Thread"** does `Started datasource <default>
+> connected to jdbc:h2:file:…keycloakdb;NON_KEYWORDS=VALUE;DB_CLOSE_ON_EXIT=FALSE;DB_CLOSE_DELAY=0`
+> → SessionFactory → Vert.x/Netty → `Listening` (21 s). Next-session start: (a) run the JIT boot
+> with a longer deadline / at `--log-level=info` (the default boot emits 31 k TRACE/DEBUG lines —
+> the logging itself is a large tax) to confirm it reaches `Listening`; (b) profile the slow phases
+> (JIT tier-up coverage of the Hibernate/RESTEasy hot loops; the `NestedPropertyMappingInterceptor`
+> config-resolution recursion seen on the hot stack; the per-class `RunnerClassLoader` jar reads).
+> Once it reaches `Listening`, flip the Agroal gate to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`).
 >
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
