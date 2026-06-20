@@ -902,6 +902,71 @@ reintroduce exactly the miscompile class this project guards against).
 `Op::Call` for real `invoke*` (needs the lowerer to gain `JitRuntimeHelpers`
 access + VM-level differential validation per `wire-tiered-manager`).
 
+## Increment 18 (Front 3 — `apply_ea_to_ir` zero-default for an un-stored field) landed
+
+Status: **landed** on `dev`. A soundness prerequisite for activating scalar
+replacement. `find_scalar_replacements` records `field_values[idx] = None` for a
+field that is **loaded but never stored** (the design intent — "use the object's
+zero default", per `escape_analysis.rs::test_uninitialized_field_returns_none`),
+but `apply_ea_to_ir` only redirected a load when `field_values` was `Some` and
+then killed the load **unconditionally** — so a load of an un-stored field was
+marked `Dead` with **no replacement**, leaving its consumers reading a dead node.
+Fix: when `field_values[idx]` is `None`, materialise a `Const(0)` (the correct
+default for a zero-initialised object's int field) and redirect the load to it.
+Sound only when the object is genuinely zero-initialised — which the eventual
+production caller must enforce (only admit allocations whose constructor sets no
+non-zero field). Test: `ea_unstored_field_load_resolves_to_zero_default`. jit lib
+801/801, field harness 20/20.
+
+## The VM-side trivial-constructor signal — actionable plan (the next sound unlock)
+
+The `Op::New` mechanism (inc 17) + the EA bridge (inc 16) + the zero-default fix
+(inc 18) are all in place; production scalar replacement is one signal away. The
+signal must answer: *is it sound to elide `new C(); dup; invokespecial C.<init>()V`
+and zero-initialise the scalar slots?*
+
+**Do NOT reuse `classify_init_complexity`** (`vm/src/jit/skip_list.rs`). Its
+`Trivial` means "no putfield/putstatic/monitor/invokedynamic" — sound for
+JIT-*compiling* the `<init>`, but it **admits regular calls** (`invokevirtual`/
+`invokestatic`/…). A `()V` ctor `C(){ register(this); }` is `Trivial` by that
+classifier yet escapes the receiver — eliding it would scalar-replace a live,
+escaped object (the surviving-New gate can't see the escape; it's hidden in the
+elided body).
+
+**Sound + simple + useful definition** — an *elidable construction*:
+`C.<init>()V`'s body is exactly `aload_0; invokespecial java/lang/Object.<init>()V;
+return` (bytes `2a b7 XX XX b1`, with `XX XX` resolving to `Object.<init>()V`).
+That is the default empty constructor of a direct `Object` subclass — no field
+stores (object stays zero-initialised → the inc-18 zero-default is correct), no
+escape of `this`, no side effects. Covers the common POJO/data-class case
+(`class Point { int x, y; }`). (A later refinement can recurse the super chain to
+admit non-`Object` supers whose `<init>` is itself elidable.)
+
+**Wiring** (cross-crate; production-activating → needs a soak):
+1. **VM**: an `is_elidable_construction(class_id) -> bool` in
+   `vm/src/runtime/interpreter.rs` near `resolve_jit_new_site` (it has CP +
+   hierarchy access) that checks the `<init>()V` body shape + resolves the
+   `invokespecial` target to `Object.<init>()V`.
+2. **Thread it** as a 5th field of the `cp_new_resolver` tuple
+   (`(class_id, num_fields, has_prim_init, has_finalizer, is_elidable)`) — the
+   least-disruptive option (one closure signature, ~3 call sites: interpreter.rs,
+   tiered.rs, the lib.rs consumer + the harness/in-crate test pass dummies).
+3. **lib.rs** (IR branch): build `new_info` from `scan.new_ops` (all news), and
+   `trivial_init_pcs` by linking each `new` (pc P, `is_elidable`) to the
+   `invokespecial <init>` that consumes its receiver — the canonical
+   `new@P; dup; invokespecial@P+? ` pair (match by the invoke immediately
+   following the new+dup, or resolve the invoke's class == the new's class).
+   Call `builder.set_new_info(new_info, trivial_init_pcs)`.
+4. **Gate behind a default-OFF soak flag** (e.g. `CRATONVM_JIT_SCALAR_NEW`, like
+   `CRATONVM_JIT_LICM`) so it lands inert and the production flip waits on a
+   **bt18 (== 68332206) + gauntlet soak** — it changes production scalar
+   replacement, the kafka-bug-25-sensitive area.
+5. **Validation**: the differential harness already validates scalar replacement
+   (a non-escaping `new` folds to pure-int → IR == single-pass == host); add a
+   `new`-bearing case once the resolver is wired. The surviving-New gate (inc 17)
+   + the zero-default (inc 18) + the receiver-is-New check (inc 17) are the
+   safety net.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
