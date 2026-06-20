@@ -134,6 +134,29 @@ per-framework native short-circuits by making the real container bytecode run.
 >   `<clinit>` *shape* is already pinned by `vm/tests/nested_clinit_startup.rs`,
 >   but an end-to-end fat-jar boot run is needed before removing the fallback.
 
+> **Increment 3 finalize (regression fix) — LANDED (branch `fix/spring-startup-shim-finalize`).**
+> Scope: close the one loose end the default flip left behind. The flip made
+> `real_spring_startup()` default-`true`, which made
+> `clinit_swallow_has_recovery("…/ApplicationStartup")` return `false` on the
+> default path (correct — the real `<clinit>` must run, not be swallowed +
+> backfilled). But the unit test `clinit_swallow_recovery_admits_documented_cases`
+> in `vm/src/vm/vm_util.rs` still listed `ApplicationStartup` among the classes
+> that "must stay swallowable", so a default `cargo test` asserted the old
+> pre-flip answer and failed. The flip commit (`save 18.06-5`) never updated it.
+>   - Fix: drop `ApplicationStartup` from that unconditional must-be-swallowable
+>     loop and replace it with an env-aware assertion (branching on the live
+>     `real_spring_startup()` gate, mirroring `lenient_clinit_defaults_off`): on
+>     the default real path it must NOT be swallowable; under the
+>     `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out it must stay swallowable. The
+>     production `clinit_swallow_has_recovery` / `post_clinit_fixup` arms are
+>     unchanged — only the test's expectation was stale.
+>   - Re-verified (default real path, unique-named binary): Spring Boot functional
+>     battery == HotSpot, `vm/tests/iface_static_final_init.rs`,
+>     `vm/tests/nested_clinit_startup.rs` (flag-ON real chain + opt-out fallback),
+>     and the corrected `vm_util` unit test all green. The nested-JAR no-op
+>     fallback is intentionally retained (deletion still gated on a fat-jar
+>     battery, above).
+
 ## Goal
 
 Run the **real** CDI / dependency-injection / service-container bytecode of

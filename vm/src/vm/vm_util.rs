@@ -3253,7 +3253,6 @@ mod tests {
             "java/math/BigInteger",
             "java/math/BigDecimal",
             "java/nio/file/attribute/PosixFilePermission",
-            "org/springframework/core/metrics/ApplicationStartup",
             "org/jboss/msc/service/ServiceContainerImpl",
             "org/jboss/msc/service/ServiceLogger",
             "org/wildfly/security/auth/server/_private/ElytronMessages",
@@ -3270,6 +3269,32 @@ mod tests {
         assert!(clinit_swallow_has_recovery(
             "ch/qos/logback/classic/util/ContextSelectorStaticBinder"
         ));
+
+        // Spring `ApplicationStartup` is the exception: it KEEPS a
+        // `post_clinit_fixup` arm + `has_fixup_arm` entry, but
+        // real-cdi-bean-container increment 3 flipped the real startup-metrics
+        // path to the DEFAULT, so on the default path `clinit_swallow_has_recovery`
+        // deliberately DECLINES the swallow (the real `<clinit>` must run and any
+        // failure surface per JVMS §5.5). It is swallowable ONLY under the
+        // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out. Branch on the live gate
+        // (process-lifetime `OnceLock`) rather than asserting one fixed answer —
+        // mirrors `lenient_clinit_defaults_off`'s env-aware guard.
+        const SPRING_STARTUP: &str = "org/springframework/core/metrics/ApplicationStartup";
+        if crate::runtime::env_cache::real_spring_startup() {
+            assert!(
+                !clinit_swallow_has_recovery(SPRING_STARTUP),
+                "on the default real path ApplicationStartup.<clinit> must NOT be \
+                 swallowed (increment 3 default flip) — its failure should surface \
+                 per JVMS §5.5, not be backfilled by post_clinit_fixup",
+            );
+        } else {
+            assert!(
+                clinit_swallow_has_recovery(SPRING_STARTUP),
+                "under the CRATONVM_SYNTHETIC_SPRING_STARTUP opt-out the legacy \
+                 shim relies on ApplicationStartup.<clinit> staying swallowable + \
+                 backfilled",
+            );
+        }
     }
 
     #[test]
