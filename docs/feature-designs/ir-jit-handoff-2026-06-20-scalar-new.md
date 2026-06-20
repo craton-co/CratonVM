@@ -1,8 +1,21 @@
 # Handoff — IR/JIT field + `new` scalar-replacement frontier (2026-06-20, session 2)
 
+> **UPDATE (session 3, increment 20): Gap A is CLOSED — and it was not just a
+> flag flip.** The flip exposed a *latent bug*: `new` scalar replacement
+> (inc 17–19) **never fired on real bytecode**. The IR builder had no `astore`
+> handler, so every real-javac allocation (`new; dup; invokespecial; astore_N`)
+> bailed to single-pass. Inc 19's "POJO probe == HotSpot" soak was **vacuous**
+> (a non-escaping POJO yields the same result whether or not it is
+> scalar-replaced). Fix: lower `astore`/`astore_0..3` in the builder + both
+> length walkers; flip `CRATONVM_JIT_SCALAR_NEW` to **default-ON**
+> (`=0` opt-out). Now `oneShot`/`sumPoints`/`sumBoxes` scalar-replace `1/1`
+> (verified via a new `CRATONVM_DBG_SCALAR_NEW` live-fire diagnostic), bt10/14/16/18
+> == HotSpot (default-on and opt-out), jit 803/803 + harness 21/21. See
+> `activate-ir-optimizer.md` increment 20. **Gap B (`Op::Call`) remains.**
+
 Supersedes [`ir-jit-handoff-2026-06-20.md`](ir-jit-handoff-2026-06-20.md).
 Authoritative per-increment detail: [`activate-ir-optimizer.md`](activate-ir-optimizer.md)
-(increments 14–19). This is the session-level map + **the gap** (where to resume).
+(increments 14–20). This is the session-level map + **the gap** (where to resume).
 
 All work below is **merged to `dev`** (tip was `b03112ba` at handoff). The main
 worktree `C:\craton\CratonVM` stays on `dev`; feature work happened in the sibling
