@@ -15,19 +15,26 @@
  *
  * It is NOT compiled by `cargo`; the orchestrator builds it against the
  * produced shared/static library. Build commands (run from the repo root after
- * `cargo build -p libcratonvm`):
+ * `cargo build -p libcratonvm`). cargo names the artifacts after the crate
+ * (`libcratonvm`): Windows `libcratonvm.dll` + `libcratonvm.dll.lib`, Linux
+ * `liblibcratonvm.so` / `liblibcratonvm.a` (linked `-llibcratonvm`). Substitute
+ * `release` for `debug` for a release build.
  *
- *   Linux:
- *     cc embed_flat.c -L target/debug -lcratonvm -ldl -lpthread -o embed_flat
- *     LD_LIBRARY_PATH=target/debug ./embed_flat
+ *   Linux (shared):
+ *     cc embed_flat.c -L target/release -llibcratonvm -ldl -lpthread \
+ *        -o embed_flat
+ *     LD_LIBRARY_PATH=target/release ./embed_flat
  *
- *   Windows (MSVC, links the import lib for cratonvm.dll):
- *     cl /Fe:embed_flat.exe embed_flat.c target\debug\cratonvm.dll.lib
- *     copy target\debug\cratonvm.dll .
+ *   Windows (MSVC, links the import lib for libcratonvm.dll):
+ *     cl /Fe:embed_flat.exe embed_flat.c target\release\libcratonvm.dll.lib
+ *     copy target\release\libcratonvm.dll .
  *     embed_flat.exe
  *
- *   Static link (any platform), against libcratonvm.a / cratonvm.lib:
- *     cc embed_flat.c target/debug/libcratonvm.a -ldl -lpthread -o embed_flat
+ *   Static link (any platform), against liblibcratonvm.a / libcratonvm.lib:
+ *     cc embed_flat.c target/release/liblibcratonvm.a -ldl -lpthread \
+ *        -o embed_flat
+ *
+ * The reproducible build+run wrapper is scripts/build-libcratonvm.ps1.
  *
  * This file re-declares the slice of the libcratonvm flat C ABI it touches so
  * it builds standalone. The declarations below match the `#[repr(C)]` types in
