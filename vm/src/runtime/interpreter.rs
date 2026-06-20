@@ -1883,6 +1883,59 @@ pub(crate) fn apply_pointer_map_to_thread(
     // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
     // across the relocation we just applied, in lockstep with the frames above.
     remap_rs_cache_after_gc(thread, pointer_map, heap);
+
+    // DIAG (CRATONVM_GC_VERIFY_STALE=1): after a NON-INITIATOR thread resumes
+    // from the STW barrier and applies the pointer map, walk its own frames and
+    // flag any Object slot whose header is ZEROED (class_id=0 && num_slots=0).
+    // A zeroed header means the object was NOT copied by the collector (a missed
+    // marking root — its ref was absent from this thread's deposited snapshot,
+    // e.g. a lost operand-stack tag), then young-from was reset over it. This is
+    // the per-PARKED-THREAD analogue of `verify_no_stale_refs` (which only
+    // checks the GC initiator) — it localizes the missed-root that surfaces as
+    // the teardown "all-zero header" corruption / reactor-thread leak.
+    // Cache the gate so the OFF path (the default) is a single relaxed load, not
+    // a per-parked-thread-per-GC environment lookup.
+    fn gc_verify_stale_enabled() -> bool {
+        use std::sync::OnceLock;
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1"))
+    }
+    if gc_verify_stale_enabled() {
+        use cratonvm_types::ObjectHeader;
+        let tname = thread.thread_id.0;
+        for (fi, frame) in thread.frames.iter().enumerate() {
+            let cn = frame.class_name();
+            let mn = frame.method_name();
+            for li in 0..frame.locals_len() {
+                if let crate::types::Value::Object(Some(o)) = frame.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if a != 0 {
+                        let h = unsafe { &*(a as *const ObjectHeader) };
+                        if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                            eprintln!(
+                                "POST-GC ZERO-HEADER PARKED tid={} frame[{}] {}.{} local[{}] pc={} addr=0x{:x}",
+                                tname, fi, cn, mn, li, frame.pc, a
+                            );
+                        }
+                    }
+                }
+            }
+            let mut stk = Vec::new();
+            frame.stack.scan_object_refs(&mut stk, heap);
+            for o in stk {
+                let a = o.as_ptr() as usize;
+                if a != 0 {
+                    let h = unsafe { &*(a as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                        eprintln!(
+                            "POST-GC ZERO-HEADER PARKED-STACK tid={} frame[{}] {}.{} pc={} addr=0x{:x}",
+                            tname, fi, cn, mn, frame.pc, a
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Keep the `update_root_snapshot` frozen-frame cache (`rs_cache`) valid across
