@@ -3334,6 +3334,23 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
             let receiver_ref = match &values[0] {
                 Value::Object(Some(obj)) => *obj,
+                // JVM semantics: invokevirtual/invokeinterface on a null
+                // receiver throws NullPointerException. Signal it like the
+                // array helpers — set the pending-NPE flag and return the
+                // i64::MIN sentinel so the interpreter's post-JIT drain builds
+                // the real NPE and routes it through the method's exception
+                // table. Previously this returned `0`, silently SWALLOWING the
+                // NPE: a null deref inside a JIT-compiled method (e.g. a
+                // once-called lambda body that reaches this cold dispatch
+                // helper before any inline null-check / MIC warm-up) completed
+                // normally instead of throwing, so `() -> nullRef.foo()` ran
+                // as a no-op under the JIT (the bug only reproduced JIT-on).
+                Value::Object(None) => {
+                    set_jit_pending_npe();
+                    return i64::MIN;
+                }
+                // A non-object receiver slot is a miscompile, not a legitimate
+                // null — keep the defensive 0 bail (does not mask a real NPE).
                 _ => return 0,
             };
             let method_args: Vec<Value> = values[1..].to_vec();
@@ -3550,7 +3567,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     let receiver_raw = args_slice[0];
     if receiver_raw == 0 {
-        return 0;
+        // Null receiver: throw NullPointerException (JVM semantics), mirroring
+        // the `jit_invoke_dispatch` fix. Set the pending-NPE flag + return the
+        // i64::MIN sentinel so the interpreter's post-JIT drain builds the real
+        // NPE and routes it through the method's exception table. Was `return
+        // 0`, which silently swallowed a null-receiver call in hot JIT'd code.
+        set_jit_pending_npe();
+        return i64::MIN;
     }
     // Defensive: a receiver slot carrying tagged-long bits (low 3 bits set
     // or value above the 48-bit canonical-address ceiling) is not a valid
