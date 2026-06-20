@@ -433,10 +433,40 @@ oracle bails on anything it cannot prove distinct.
   `New` is now the hard barrier. Full jit suite 784/784.
 
 **Boundary**: same latency as increments 1/2/4/5 — the oracle only fires once the
-IR builder emits `Op::Load`/`Op::Store` (production IR has neither yet). Next:
-extend the oracle past the local-alloc-only case (a store to a local alloc can't
-alias a load from a method `Param` either), and the cross-merge points-to needed
-for non-trivial bases.
+IR builder emits `Op::Load`/`Op::Store` (production IR has neither yet).
+Increment 7 extends the oracle past the local-alloc-only case.
+
+## Increment 7 (alias oracle: store-to-alloc cannot alias a parameter load) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Widens the increment-6 LICM alias oracle by one provably-sound class.
+
+**What landed** (`jit/src/ir_optimize.rs`, `load_safe_past_loop_stores`): the
+hoistable **load** base is no longer restricted to a local allocation — it may
+now also be a **method parameter** (`Op::Param`, including `this`). The reasoning:
+a `New`/`NewArray` executed in this method produces a reference that is *never*
+an already-existing object, so it can never equal a parameter the caller passed
+in (object identity is fixed at allocation, and this holds even if the
+allocation later escapes). Hence a store to a fresh local allocation leaves any
+parameter's memory untouched, and a load from a parameter may hoist past it.
+
+**Asymmetry (deliberate)**: the **store** base is *not* widened to `Param`. Two
+distinct parameters can be the same object (`foo(x, x)`), so a store through a
+parameter is not provably non-aliasing — every in-loop store must still write a
+distinct local `New`/`NewArray`. The widening is load-side only.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_param_load_past_local_store` — a load of `P.f` (parameter)
+  hoists past an in-loop store to a local allocation `B.f`.
+- `test_licm_keeps_param_load_when_store_base_is_param` — a load of `P0.f` does
+  NOT hoist past a store through `P1` (parameters may alias), locking the
+  store-side asymmetry.
+- All prior LICM/DSE/escape tests still pass. Full jit suite 786/786.
+
+**Next**: cross-merge points-to so non-trivial bases (a ref flowing through a
+phi/select) can participate, and recognising a `final`/effectively-immutable
+field load as invariant regardless of in-loop stores to other fields of the same
+object.
 
 ## Implementation steps (ordered)
 

@@ -793,11 +793,13 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
 //     (`loop_has_hard_barrier`, give up — conservative).
 //   * An in-loop `Store` no longer disqualifies the whole loop. A minimal alias
 //     oracle (`load_safe_past_loop_stores`) hoists a load past in-loop stores
-//     when the load base AND every store base are *distinct local allocations*
-//     (two distinct `New`/`NewArray` nodes never alias — the same invariant DSE
-//     relies on); any non-local / unreadable / same base keeps the load pinned.
-//     The common read-only invariant-load loop (no store at all) still fires
-//     unchanged.
+//     when EVERY store writes a *distinct local `New`/`NewArray` allocation* and
+//     the load base is either (a) a local allocation distinct from every store
+//     base, or (b) a method `Param` (a pre-existing reference — a fresh in-method
+//     allocation can never be an already-existing object). The store base is NOT
+//     widened to `Param` (two parameters can be the same object, `foo(x, x)`).
+//     Any other / unreadable / same base keeps the load pinned. The common
+//     read-only invariant-load loop (no store at all) still fires unchanged.
 //   * Hoisting never moves a node past an exception edge that should observe
 //     the pre-loop value: pure nodes raise nothing, and a load is only
 //     hoisted when the body contains no barrier (so no observable ordering
@@ -1045,19 +1047,35 @@ fn loop_has_hard_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
 /// True if a load with base `load_base` provably cannot read what any in-loop
 /// `Store` writes, so it may be hoisted past those stores.
 ///
-/// Sound only under the "distinct local allocations never alias" invariant (the
-/// same one DSE relies on): it holds iff `load_base` AND every in-loop store
-/// base are local `New`/`NewArray` allocations, and no store writes the *same*
-/// allocation as the load. Any non-local / unreadable / same base ⇒ `false`
-/// (conservative — never hoist past a possibly-aliasing store). A store writes
-/// only the memory of the object it names, so a store to a *different* local
-/// allocation leaves `load_base`'s memory untouched regardless of escape.
+/// Every in-loop store must write a **local `New`/`NewArray` allocation** — a
+/// store base that is anything else (a `Param`, a loaded ref, an unreadable
+/// layout) may alias the load and disqualifies hoisting. The store base
+/// category is NOT widened to `Param`: two distinct method parameters can be the
+/// same object (`foo(x, x)`), so a store through a parameter is not provably
+/// non-aliasing.
+///
+/// Given that, the **load** base is safe when it is a reference a freshly-
+/// allocated object can never equal:
+///   * a local `New`/`NewArray` allocation distinct from every store base —
+///     distinct allocations never alias (the invariant DSE relies on); or
+///   * a method parameter (`Op::Param`, including `this`) — a pre-existing
+///     reference from the caller. A `New` executed in THIS method is never an
+///     already-existing object, so no in-method allocation can alias a
+///     parameter (true even if the allocation later escapes — object identity
+///     is fixed at allocation). A store to a fresh local allocation therefore
+///     leaves any parameter's memory untouched.
+///
+/// Any other / unreadable / same base ⇒ `false` (conservative — never hoist past
+/// a possibly-aliasing store).
 fn load_safe_past_loop_stores(
     graph: &Graph,
     load_base: NodeId,
     body: &FxHashSet<NodeId>,
 ) -> bool {
-    if !is_local_alloc(graph, load_base) {
+    let base_is_local = is_local_alloc(graph, load_base);
+    let base_is_param = (load_base as usize) < graph.nodes.len()
+        && matches!(graph.nodes[load_base as usize].op, Op::Param(_));
+    if !base_is_local && !base_is_param {
         return false;
     }
     for &id in body {
@@ -1065,10 +1083,12 @@ fn load_safe_past_loop_stores(
             continue;
         }
         match store_operands(graph, id) {
-            // A store to the same object — or to any base we cannot prove is a
-            // distinct local allocation — may alias the load.
+            // A store must write a local allocation distinct from the load base.
+            // (When the load base is a `Param`, distinctness is automatic — a
+            // `Param` node is never a local allocation — so any store to a fresh
+            // local allocation is provably non-aliasing with it.)
             Some((sbase, _, _)) => {
-                if sbase == load_base || !is_local_alloc(graph, sbase) {
+                if !is_local_alloc(graph, sbase) || sbase == load_base {
                     return false;
                 }
             }
@@ -3382,6 +3402,83 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "a non-local store base is not provably non-aliasing → load stays pinned"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_param_load_past_local_store() {
+        // A load from a method parameter P.f, with an in-loop store to a local
+        // allocation B.f, hoists: a freshly-allocated object is never the
+        // pre-existing parameter object, so the store cannot clobber the load.
+        let (mut g, region, preheader, _iv) = loop_probe();
+        let mem = 2;
+        let p = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let b = g.add(
+            Op::New { class_id: 2, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cval = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, p, off],
+            None,
+        );
+        let _st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![region, mem, b, cval],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(
+            changed,
+            "the load of param P must hoist past the store to local B"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control must be re-anchored to the pre-header"
+        );
+    }
+
+    #[test]
+    fn test_licm_keeps_param_load_when_store_base_is_param() {
+        // The store base is NOT widened to Param: two parameters may be the same
+        // object (`foo(x, x)`), so a load from P0.f must NOT hoist past a store
+        // through P1 — they may alias.
+        let (mut g, region, _preheader, _iv) = loop_probe();
+        let mem = 2;
+        let p0 = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let p1 = g.add(Op::Param(1), IrType::Ref, vec![g.entry], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cval = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, p0, off],
+            None,
+        );
+        let _st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![region, mem, p1, cval],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let _ = licm(&mut g);
+
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], region,
+            "a store through a Param base may alias another Param load → stays pinned"
         );
     }
 
