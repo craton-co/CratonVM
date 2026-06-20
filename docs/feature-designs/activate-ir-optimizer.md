@@ -837,25 +837,70 @@ kills the New/Store/Load and redirects the return to the stored `Const(42)`;
 scalar-replaced (the kafka bug-25 escape rule is preserved). jit lib 798/798,
 field harness 20/20.
 
-**Remaining for the `new` scalar-replacement slice** (clearly scoped, NOT done):
-1. **Builder emits `Op::New`** (0xbb) with `class_id`/`num_fields` from
-   `cp_new_resolver` (thread it like `field_info`), plus `dup` (already handled).
-2. **`<init>` elision** — the soundness crux. `new Foo()` is `new; dup;
-   invokespecial Foo.<init>`. Single-pass treats **any** `()V` `<init>` as
-   trivial (`is_trivial_void_init`, `x64.rs`) and elides it, but a `()V`
-   constructor can still initialise fields (`Foo(){ x = 5; }`), which eliding
-   would silently drop — a real miscompile risk. Do NOT replicate the
-   `()V`-is-trivial assumption blindly; gate elision on a provably-effect-free
-   `<init>` (investigate `cp_new_resolver`'s `has_primitive_init` flag, or only
-   admit objects whose every read field is dominated by a visible `putfield`).
-3. **Gate**: after EA, if any live `Op::New` survives (escaping), bail to
-   single-pass — the IR lowerer has no allocation path yet.
-4. **Harness**: a non-escaping `new` scalar-replaces to pure-int code (no alloc,
-   no helper), so the existing dummy-helper differential validates it directly.
-5. **Then `Op::Call`** for real `invoke*` (needs the lowerer to gain
-   `JitRuntimeHelpers` access for the dispatch/alloc helper calls, plus VM-level
-   differential validation per `wire-tiered-manager` — the jit-crate stub harness
-   cannot faithfully validate dispatch).
+**Remaining for the `new` scalar-replacement slice**: see increment 17 (the
+mechanism) below.
+
+## Increment 17 (Front 3 — `Op::New` emission + scalar-replacement mechanism) landed
+
+Status: **landed** on `dev`; **inert in production** (not yet wired — see the
+soundness analysis). The IR builder can now lower `new` to `Op::New` and the EA
+scalar-replaces a non-escaping allocation end-to-end, but the production caller
+does not yet feed the builder the allocation metadata, because eliding a
+constructor soundly needs a signal that does not yet exist.
+
+**What landed** (`jit/src/ir.rs`, `jit/src/lib.rs`):
+- The builder gained `set_new_info(pc → (class_id, num_fields), trivial_init_pcs)`.
+  `new` (0xbb) emits `Op::New { class_id, num_fields }` (inputs `[ctrl, mem]`);
+  `invokespecial` (0xb7) is **elided** iff its pc is in `trivial_init_pcs` AND
+  the receiver on the abstract stack is a fresh `Op::New` we emitted (defence in
+  depth — eliding a `<init>` on `this`/a parameter would skip a real superclass
+  constructor and hide any escape it performs). Any other `invokespecial`, or a
+  `new`/`<init>` without resolved metadata, bails to single-pass. `0xbb`/`0xb7`
+  added to both length walkers.
+- **Surviving-New gate** (`lib.rs`): after escape analysis, if any `Op::New`/
+  `Op::NewArray` is still live (it escaped → was not scalar-replaced), bail to
+  single-pass — the lowerer has no allocation path, so emitting nothing for it
+  would leave a garbage object reference. (Scalar-replaced News are `Op::Dead`.)
+
+**Tests**: `ir_new_scalar_replaces_end_to_end` drives the whole path from
+bytecode (`Foo o = new Foo(); o.x = 42; return o.x`): the builder emits the New
++ elides the `<init>`, `optimize` + EA + `apply_ea_to_ir` scalar-replace it, and
+the return resolves to `Const(42)` with no live New. `ir_new_bails_on_init_of_
+nonfresh_receiver` proves a `super.<init>()` on `this` bails. jit lib 800/800,
+field harness 20/20 (no regression; the gate is inert with no News emitted).
+
+**The `<init>`-soundness analysis (why production wiring is DEFERRED).** Eliding
+`new Foo(); dup; invokespecial Foo.<init>` is sound only if `Foo.<init>` is
+provably **effect-free and does not escape its receiver**. Three hazards, none
+visible from the call site:
+1. **Field initialisers** — `Foo(){ x = 5; }` is a `()V` `<init>` that sets a
+   field; eliding it leaves the scalar slot at the zero default. (For int fields
+   the builder only admits a `new` whose `has_primitive_init == false`, i.e. no
+   non-zero primitive initialiser — but that is a *future* wiring constraint, and
+   reference-field initialisers are irrelevant only because a non-escaping object's
+   unread ref fields are dead.)
+2. **Escape inside the constructor** — `Foo(){ GLOBAL.add(this); }` escapes the
+   object *through the elided body*, which the caller's EA cannot see, so it would
+   wrongly scalar-replace a live, escaped object (the kafka bug-25 class). The
+   surviving-New gate does **not** catch this (the escape is hidden in the elided
+   `<init>`).
+3. **Arbitrary side effects** — a `()V` `<init>` may call other methods / do I/O.
+
+Single-pass treats **any** `()V` `<init>` as trivial (`is_trivial_void_init`,
+`x64.rs`) — an approximation that holds for its targeted patterns but is not
+provably sound. The only `<init>` provably safe to elide from the descriptor/name
+alone is `java/lang/Object.<init>()V` (empty), which scalar-replaces nothing
+useful (no fields). **A sound *and* useful production policy needs either (a) a
+VM-side "trivial constructor" signal — `<init>` only calls `super.<init>()` and
+does zero/default field stores, no escape, no other call — added to
+`cp_new_resolver`, or (b) constructor inlining so the `<init>` body's effects
+become visible IR.** Until one lands, `set_new_info` stays unwired in production
+(the mechanism is proven and ready; activating it on an unsound policy would
+reintroduce exactly the miscompile class this project guards against).
+
+**Next**: the VM-side trivial-constructor signal (smallest sound unlock) OR
+`Op::Call` for real `invoke*` (needs the lowerer to gain `JitRuntimeHelpers`
+access + VM-level differential validation per `wire-tiered-manager`).
 
 ## Implementation steps (ordered)
 
