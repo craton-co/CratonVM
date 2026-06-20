@@ -2060,12 +2060,21 @@ fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> 
     }
 }
 
-pub(crate) fn s2_blocking_accept(reg: &mut SocketRegistry, lid: i32) -> Option<i32> {
-    let listener = reg.listeners.get(&lid)?;
-    let _ = listener.set_nonblocking(false);
-    let result = listener.accept();
-    match result {
+pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
+    // Clone the listener handle out under a SHORT lock, then run the blocking
+    // accept() WITHOUT holding s2_registry, and re-lock only to register the
+    // accepted stream. Holding the global registry lock across a blocking
+    // accept() deadlocks every other synthetic-socket operation process-wide
+    // (the Hibernate JTA default-mode hang — see net_phase_e::re2_accept_into).
+    let listener = {
+        let reg = s2_registry().lock();
+        let l = reg.listeners.get(&lid)?;
+        let _ = l.set_nonblocking(false);
+        l.try_clone().ok()?
+    };
+    match listener.accept() {
         Ok((stream, _)) => {
+            let mut reg = s2_registry().lock();
             let id = reg.next_id;
             reg.next_id = reg.next_id.checked_add(1).unwrap_or(1);
             while reg.streams.contains_key(&reg.next_id) || reg.listeners.contains_key(&reg.next_id)
@@ -3474,10 +3483,7 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, S2SSC_PENDING, Value::Int(-1));
                 pending
             } else {
-                let result = {
-                    let mut reg = s2_registry().lock();
-                    s2_blocking_accept(&mut reg, lid)
-                };
+                let result = s2_blocking_accept(lid);
                 match result {
                     Some(id) => id,
                     None => return Ok(Some(Value::Object(None))),
