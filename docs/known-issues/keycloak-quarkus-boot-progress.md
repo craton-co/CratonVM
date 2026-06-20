@@ -521,6 +521,28 @@ VM's real file layer).
 > and reach `dev`, NOT as a drive-by in this datasource branch. Once it lands, re-run this boot; the
 > Agroal gate can then flip to default-on.
 >
+> **MAJOR REFINEMENT (2026-06-20, deeper code read + `CRATONVM_STRICT_JIT_ROOTS` boot) — a
+> cross-thread STACK scan is REDUNDANT; the real drop is REGISTER-RESIDENT.** Reading the park path:
+> `safepoint_check` (interpreter.rs:1742-1750) already calls `invalidate_scan_cache_for_gc()` (which
+> bumps the JIT-boundary gen → forces a *fresh* scan) and then `update_root_snapshot`, whose
+> `scan_active_jit_frames` conservatively scans `[scanner_sp, entry_sp]` for **every** JIT entry —
+> i.e. the parked peer's **entire JIT stack region**, fresh, into its deposited `root_snapshot`. Both
+> park paths (`safepoint_check`; the blocking-native `deposit_root_snapshot`) go through this. So the
+> collector, via `collect_all_root_snapshots`, **already has every parked peer's JIT *stack* roots.**
+> A collector-side conservative `[park_sp, stack_high]` re-scan would cover the *same* stack range
+> (plus interpreter frames already covered) → **provably redundant; it cannot fix the wedge.** A
+> `CRATONVM_GC_VERIFY_STALE=1 CRATONVM_STRICT_JIT_ROOTS=1` boot confirmed the *condition* (panic on
+> `Thread-1`, an `InnocuousThread` acting as GC collector, `GLOBAL_JIT_DEPTH=3` — genuinely
+> concurrent multi-thread JIT) but the deposit covers those stack roots. Therefore the residual
+> dropped root is **REGISTER-RESIDENT** — a live oop held in a register (not spilled to the stack) at
+> the GC safepoint, which **no** stack scan (deposit-side or collector-side) can see. This is exactly
+> the `reference_reflrepro_a2_register_root` class. **Correct fix = JIT codegen, not a scan:** spill
+> every live-oop GPR (incl. caller-saved / `rax`) across safepoints, OR emit precise oop maps that
+> record register locations (`CRATONVM_PRECISE_JIT_MAPS` path). This is the precise-JIT-stack-maps
+> program's core remaining work. Diagnostic to pin the exact oop: `CRATONVM_GC_VERIFY_STALE=1` WITHOUT
+> `STRICT` (so it doesn't abort on the benign conservative condition first), then inspect the
+> zeroed-header report. **Do NOT implement the cross-thread stack scan — it is redundant.**
+>
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
 > entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
