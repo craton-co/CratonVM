@@ -1,6 +1,6 @@
 # Keycloak 26.6.3 (Quarkus) boot under CratonVM — progress & gap chain
 
-**Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). **Gap 6 (@ConfigMapping / `getConfigMapping`) FIXED** (commit `bec91280`): the native now builds the real `<iface>$$CMImpl` from live config via SmallRye `configMappingObject` (no fabrication), unblocking the whole config-mapping cluster. **This reached real ArC** — `ApplicationImpl.<clinit>` now runs past `ArcProcessor.initializeContainer` (bci 634) into ArC bean creation (bci 685). New **OPEN** frontier: **Gap 7** — ArC bean-creation NPE (`jakarta.enterprise.inject.CreationException` ← NPE) in `io.quarkus.arc.impl.InstanceImpl.getBeanInstance` while instantiating the Hibernate Validator factory bean. **The real ArC CDI container is now running.**
+**Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). **Gaps 6 & 7 (@ConfigMapping) FIXED** (commits `bec91280`, `4ce68fd9`): `getConfigMapping` now builds the real `<iface>$$CMImpl` from live config via SmallRye `configMappingObject` **with default values applied** (mirrors `mapConfiguration`: `withMapping` + merge `getDefaultValues`) — no fabrication. **This unblocked the whole config cluster, ArC bean creation, and Keycloak's real startup.** The boot now runs through `Arc.initialize()` + CDI bean creation, Keycloak provider init, and Hibernate ORM/JPA, reaching the server-running lifecycle (`ApplicationLifecycleManager.waitForExit`). Current **OPEN** frontier: **Gap 8** — Keycloak's `start-dev` embedded H2/Agroal datasource yields **no `java.sql.Connection`** (Hibernate logs `Database JDBC URL [undefined/unknown]`, `connection was null`) and the interpreter spins. **Seven gaps fixed; the real ArC CDI container runs; HTTP not yet bound (DB layer is the wall).**
 
 Goal: reach and validate the **real Quarkus ArC** CDI path (`CRATONVM_REAL_ARC`,
 the `quarkus_arc.rs` shim's replacement). ArC's `Arc.initialize()` runs **late**
@@ -262,7 +262,25 @@ ctor against the live `SmallRyeConfig`. **Do NOT** swap the shim to a default-va
 no-arg `$$CMImpl` — that is the forbidden B5 fabricated-config stub (every
 `@ConfigMapping` would silently report wrong/empty values app-wide).
 
-### Gap 7 — ArC bean creation NPE ⏳ OPEN (new frontier — REAL ArC is now running)
+### Gap 7 — ArC bean creation NPE ✅ FIXED (2026-06-20, commit `4ce68fd9`)
+> **FIXED.** Root cause: a follow-on from Gap 6. `$12.apply` (the
+> HibernateValidatorFactory creation lambda) does
+> `localesBuildTimeConfig.locales().contains(Locale.ROOT)` at pc=122, and
+> `LocalesBuildTimeConfig.locales()` (a `@WithDefault` `Set`) returned **null** →
+> `Set.contains` NPE → `CreationException`. The Gap-6 `configMappingObject` path
+> built the `$$CMImpl` but skipped SmallRye's default-value setup, so `@WithDefault`
+> properties were null. Fix: `cm_construct_via_context` now mirrors
+> `ConfigMappings.mapConfiguration`'s per-mapping setup —
+> `builder.withMapping(configClass)` + `config.getDefaultValues().addDefaults(builder.getDefaultValues())`
+> — before `configMappingObject`, so defaulted/collection properties resolve.
+> **Result: ArC bean creation SUCCEEDS, `ApplicationImpl.<clinit>` completes, the
+> Quarkus application STARTS, and the boot reaches the server-running lifecycle
+> (`ApplicationLifecycleManager.waitForExit`) running REAL Keycloak startup**:
+> truststore provider init + Hibernate ORM (7.2.14) JPA persistence-unit
+> `[keycloak-default]` + Hibernate Validator 9.1.0. New frontier: **Gap 8** (DB
+> connection) below. The original write-up:
+
+#### Original Gap 7 write-up
 With Gap 6 fixed, `ApplicationImpl.<clinit>` reaches **bci=685** (past
 `ArcProcessor.initializeContainer` at 634) and fails in **real ArC**:
 ```
@@ -281,12 +299,40 @@ step: trace `InstanceImpl.getBeanInstance` (InstanceImpl.java:325) / the bean's
 `create()` to find the null (likely a generated `*_Bean.create()` reading a null
 injection point, container state, or a still-shimmed dependency).
 
-### Quarkus ArC (`CRATONVM_REAL_ARC`) — now reachable
-Real ArC bytecode now RUNS during the boot (the shimmed `Arc` entry points in
-`quarkus_arc.rs` are being exercised alongside the real container). A dedicated
+### Gap 8 — dev datasource yields no DB connection ⏳ OPEN (current frontier)
+With Gap 7 fixed, Keycloak's real startup runs all the way into the **database
+layer** and stalls there. Hibernate ORM resolves the dialect/version but the
+connection is null:
+```
+INFO  [org.hibernate.orm.connections.pooling] HHH10001005: Database info:
+        Database JDBC URL [undefined/unknown]
+        Database driver: undefined/unknown
+        Database dialect: H2Dialect
+        Database version: 2.4.240
+DEBUG [org.hibernate.orm.jdbc.lob] HHH10010002: Disabling contextual LOB creation as connection was null
+```
+The process then spins (CPU climbing, log frozen) in the interpreter — Keycloak's
+`start-dev` embedded **H2 + Agroal** datasource isn't producing a real
+`java.sql.Connection` (JDBC URL/driver "undefined/unknown"). Next frontier: the
+JDBC/Agroal/H2 dev-datasource subsystem (cf. `agroal_pool.rs` shim + real
+`java.sql` + the H2 driver bytecode, backed by the VM's real file/socket layers).
+Likely multi-session.
+
+### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
+Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
+`InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC
+successfully creates beans (HibernateValidatorFactory, etc.). A dedicated
 `CRATONVM_REAL_ARC` gate (suppress the `quarkus_arc.rs` shim so the real container
-is authoritative) is now meaningfully testable via the boot — appropriate to add
-once Gap 7+ clear enough bean creations to compare shim-vs-real behavior.
+is solely authoritative) is now meaningfully testable via the boot.
+
+### Milestone (2026-06-20)
+The real Keycloak 26.6.3 (Quarkus) server now boots under CratonVM **through ArC
+into real Keycloak startup** — past class loading, config (incl. real
+`@ConfigMapping`), the full recorder chain, `Arc.initialize()` + CDI bean creation,
+Keycloak provider init, and Hibernate ORM/JPA — stopping at the DB-connection gap
+(Gap 8). Seven boot gaps fixed (Gaps 1–7). Two general VM bugs landed on `dev`
+(Gap 4 static-sync monitor, Gap 5 ShutdownContext); Gaps 6–7 (real `@ConfigMapping`)
+are on `fix/keycloak-gap6-configmapping`.
 
 ## Key takeaway
 
