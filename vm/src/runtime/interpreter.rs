@@ -14714,7 +14714,12 @@ fn try_stackless_invoke(
     // 7. Handle synchronized: acquire monitor before pushing frame
     let monitor_obj: Option<ObjectRef> = if is_synchronized {
         let obj = if is_static {
-            shared.get_class_lock_object(declaring_id)
+            // JVMS §2.11.10: a `static synchronized` method's monitor is the
+            // `Class` object — the SAME object `ldc class`, `synchronized(X.class)`,
+            // and `X.class.wait()/notify()` use. Locking a synthetic per-class
+            // lock here desyncs from those, so e.g. a static-sync method calling
+            // `X.class.notifyAll()` would throw IllegalMonitorStateException.
+            get_or_create_class_mirror(shared, declaring_id)
         } else {
             match args.first() {
                 Some(Value::Object(Some(obj_ref))) => *obj_ref,
@@ -15751,7 +15756,9 @@ fn execute_invokestatic_cached(
             // Acquire monitor for synchronized methods
             let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
                 let obj = if cached.is_static {
-                    shared.get_class_lock_object(cached.declaring_class_id)
+                    // JVMS §2.11.10: static-synchronized monitor is the Class mirror
+                    // (same object as ldc class / synchronized(X.class) / X.class.wait).
+                    get_or_create_class_mirror(shared, cached.declaring_class_id)
                 } else {
                     match args_slice.first() {
                         Some(Value::Object(Some(obj_ref))) => *obj_ref,
@@ -20020,7 +20027,9 @@ fn execute_invokevirtual_cached(
                     // Acquire monitor for synchronized methods
                     let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
                         let obj = if cached.is_static {
-                            shared.get_class_lock_object(cached.declaring_class_id)
+                            // JVMS §2.11.10: static-synchronized monitor is the Class
+                            // mirror (same object as ldc class / synchronized(X.class)).
+                            get_or_create_class_mirror(shared, cached.declaring_class_id)
                         } else {
                             // Receiver is args_slice[0] for virtual calls
                             match args_slice.first() {
