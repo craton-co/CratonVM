@@ -1021,6 +1021,84 @@ inc-18 zero-default, the path is covered down to the machine-code level.)
   `JitRuntimeHelpers` access + VM-level differential validation per
   `wire-tiered-manager`).
 
+## Increment 20 (Front 3 — `astore` gap fixed + `new` scalar replacement default-ON) landed
+
+Status: **landed** on `dev`. Closes Gap A of the scalar-new handoff, but the
+headline is a **latent-bug fix**: `new` scalar replacement (inc 17–19) was
+**completely inert on real bytecode** — it never fired once outside the unit
+tests — and the soak that was supposed to prove it (inc 19's "POJO probe ==
+HotSpot") was **vacuous**: a non-escaping POJO produces the same result whether
+or not it is scalar-replaced, so "== HotSpot" passed while the optimization did
+nothing.
+
+**Root cause (the `astore` gap).** The IR builder (`jit/src/ir.rs`) lowered
+`aload`/`aload_0..3` (read a reference local) but had **no `astore` handler**.
+Real javac compiles `Foo o = new Foo()` as `new; dup; invokespecial <init>;
+astore_N` — it stores the fresh object into a local. With no `astore` arm, the
+builder hit its `_ => return None` catch-all on *every* allocation method and
+bailed to single-pass — so `Op::New` was emitted, the `<init>` elided, but the
+method never reached escape analysis. The inc-17 end-to-end unit test passed
+only because it hand-builds bytecode that keeps the ref on the *stack* via `dup`
+(`new; dup; invokespecial; dup; …`), never exercising `astore`. **Lesson: a
+"== reference output" probe cannot validate an optimization whose presence is
+output-invariant; assert the optimization *fired* (here via a
+`CRATONVM_DBG_SCALAR_NEW` live-fire diagnostic), not just that the result
+matches.**
+
+**What landed**
+- **`jit/src/ir.rs`** — the builder now lowers `astore` (0x3a) and
+  `astore_0..3` (0x4b..=0x4e), mirroring `istore` exactly (a reference is just a
+  `NodeId` slot in the abstract locals array, per the existing `aload` comment).
+  Both bytecode length walkers (`find_branch_targets`, `find_loop_headers`) list
+  `0x4b..=0x4e` (1-byte) and `0x3a` (2-byte). This widens the IR path generally
+  (it also un-bails the already-default-on int `getfield`/`putfield` path when a
+  ref base arrives via a local), not just scalar-new.
+- **`vm/src/runtime/interpreter.rs`** — `CRATONVM_JIT_SCALAR_NEW` flipped from
+  opt-in to **default-ON** at all three `try_compile` sites
+  (`std::env::var(..).map_or(true, |v| v != "0")`); `CRATONVM_JIT_SCALAR_NEW=0`
+  is the opt-out safety net (restores single-pass for `new`-bearing methods). The
+  noisy debugging `is_elidable_construction` print was removed.
+- **`jit/src/lib.rs`** — a focused `CRATONVM_DBG_SCALAR_NEW` diagnostic: for an
+  allocation method it reports `scalar-replaced N/M alloc(s)` (proves the path is
+  non-vacuously exercised) and flags an allocation method that bailed the IR
+  builder (the signal that surfaced this very gap).
+
+**Soundness of the widening**: `astore` itself is a trivial slot assignment; the
+builder still bails (`None` → single-pass) on any opcode it can't lower, so the
+newly-admitted methods are exactly those whose every op is already validated
+(int arithmetic/branches/loops + int `getfield`/`putfield` + elidable-`new`).
+The escape rules (Return→GlobalEscape, Call-arg→ArgEscape, store-value→bail) and
+the surviving-`New` gate are unchanged.
+
+**Tests**
+- `jit/src/lib.rs::ir_new_scalar_replaces_through_astore_local` — the inc-17
+  end-to-end fold, but through an `astore`/`aload` local (the real javac shape):
+  `new Foo(); o.x=42; return o.x` folds to `Const(42)`. This is the regression
+  guard the inc-17 dup-only test could not be.
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_getfield_via_astore_local` —
+  an `astore`/`aload` round-trip on the int-field path executes identically
+  (IR == single-pass == host).
+
+**Validation** (worktree `CratonVM-irnew`, branch `feat/ir-scalar-new-flip`,
+binary `cratonvm-irnew.exe`):
+- jit lib 803/803, differential harness 21/21; `cratonvm-vm` builds clean; clippy
+  neutral (the 10 pre-existing jit clippy errors are all in `deopt.rs`/`x64.rs`,
+  none in the changed files).
+- bt10/14/16/18 == HotSpot (`135854 / 3222190 / 14985902 / 68332206`) with the
+  flag default-ON **and** with `CRATONVM_JIT_SCALAR_NEW=0`; no timing regression
+  (a controlled bt16 A/B vs the old dev binary was within noise — the new
+  binary, opt-out, and old dev binary all ~6.9 s).
+- `scratch/scalarnew/ScalarNew.java` (pure-int POJO probe: straight-line,
+  loop, conditional-alloc, escaping-via-return) == HotSpot, **and** the
+  `CRATONVM_DBG_SCALAR_NEW` diagnostic confirms `oneShot`/`sumPoints`/`sumBoxes`
+  scalar-replace `1/1`, while the escaping helper correctly bails. (Pure-int is
+  mandatory: a `long` accumulator makes the whole method category-2 →
+  single-pass, which is what made the *original* probe vacuous twice over.)
+
+**Next**: recurse the super chain in `is_elidable_construction` (deeper
+hierarchies than direct-`Object` POJOs); `Op::Call` for real `invoke*`
+(Gap B — the remaining big lever).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.

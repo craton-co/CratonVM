@@ -4333,7 +4333,22 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
-        if let Some(mut graph) = builder.build(code, code_len) {
+        let built = builder.build(code, code_len);
+        // Soak diagnostic (CRATONVM_DBG_SCALAR_NEW): an allocation-bearing method
+        // that bailed the IR builder went single-pass, so `new` scalar
+        // replacement could not fire on it — the signal that the IR builder is
+        // missing an opcode the method uses (this is how the `astore` gap, which
+        // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        if built.is_none()
+            && !scan.new_ops.is_empty()
+            && std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
+        {
+            eprintln!(
+                "[cratonvm-scalarnew] IR builder bailed (single-pass) for allocation method {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+        if let Some(mut graph) = built {
             // History: the IR backend used to miscompile a *pure* (call-free)
             // method containing a conditional branch / φ merge — a tiny leaf
             // predicate like `static boolean f(int m){ return (m & K) != 0; }`
@@ -4367,6 +4382,32 @@ fn try_compile_inner(
                 {
                     let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                    // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
+                    // allocation-bearing method, report how many of its `new`s
+                    // escape analysis scalar-replaced. This proves the path is
+                    // actually exercised on real bytecode (a non-vacuous soak):
+                    // `scalar_replaceable < ir_news` means some `new` escaped and
+                    // the method will bail to single-pass via the surviving-New
+                    // gate below.
+                    if std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                        let ir_news = graph
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
+                            })
+                            .count();
+                        if ir_news > 0 {
+                            eprintln!(
+                                "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                ea_result.scalar_replaceable.len(),
+                                ir_news,
+                            );
+                        }
+                    }
                     if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
                     {
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
@@ -5753,6 +5794,78 @@ mod tests {
             graph.nodes[retval as usize].op,
             Op::Const(42),
             "the field load must resolve to the stored value (42)"
+        );
+    }
+
+    // REGRESSION (astore gap): the same scalar-replacement end-to-end, but the
+    // fresh object is round-tripped through a LOCAL via `astore`/`aload` — the
+    // shape REAL javac emits (`new; dup; invokespecial; astore_N; aload_N; …`).
+    // The `ir_new_scalar_replaces_end_to_end` test above keeps the ref on the
+    // stack via `dup`, so it never exercised `astore` — and the builder had NO
+    // `astore` handler, so EVERY production allocation method bailed to
+    // single-pass and `new` scalar replacement NEVER fired live (inc 17/19's
+    // "== HotSpot" probe was vacuous: it matches whether or not SR fires). With
+    // `astore` lowered, this folds to `Const(42)` exactly like the dup form.
+    #[test]
+    fn ir_new_scalar_replaces_through_astore_local() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }  (javac shape)
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — elided)
+        //   7: astore_0          4b
+        //   8: aload_0           2a
+        //   9: bipush 42         10 2a
+        //  11: putfield #3       b5 00 03
+        //  14: aload_0           2a
+        //  15: getfield #3       b4 00 03
+        //  18: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x4b, 0x2a, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+            0x2a, 0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(11usize, (0usize, b'I')); // putfield field 0
+        fi.insert(15usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder
+            .build(&code, 19)
+            .expect("IR build must succeed with astore lowered");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the astore-local non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load (via astore/aload local) must resolve to the stored value (42)"
         );
     }
 
