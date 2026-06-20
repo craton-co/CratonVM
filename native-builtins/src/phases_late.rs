@@ -3949,8 +3949,6 @@ fn native_smallrye_get_config_mapping(
     };
     let prefix = args.get(2).copied().unwrap_or(Value::Object(None));
 
-    let _ = prefix; // (the per-mapping construct path reads values for all prefixes)
-
     // Fast path: already in the config's mapping registry (e.g. if a real
     // Quarkus config-build ever populates it) — return that instance.
     if let Some(v) = cm_lookup_registered(ctx, this, cls, prefix) {
@@ -3962,7 +3960,7 @@ fn native_smallrye_get_config_mapping(
     // cross-mapping unknown-property validation that `registerConfigMappings`/
     // `buildMappings` perform (which can't pass until ALL mappings are
     // registered together — the deeper config-build gap).
-    if let Some(v) = cm_construct_via_context(ctx, this, cls) {
+    if let Some(v) = cm_construct_via_context(ctx, this, cls, prefix) {
         return Ok(Some(v));
     }
     // Could not build the real impl — defensive fallback so this call site
@@ -3974,10 +3972,18 @@ fn native_smallrye_get_config_mapping(
 /// `ConfigMappingLoader.configMappingObject(cls, ConfigMappingContext)` — the
 /// per-mapping constructor SmallRye uses internally, minus the cross-mapping
 /// `buildMappings` validation that requires the full mapping set.
+///
+/// Mirrors `ConfigMappings.mapConfiguration`'s per-mapping setup so DEFAULT
+/// values are applied (without it, `@WithDefault` collection/value properties —
+/// e.g. `LocalesBuildTimeConfig.locales()` — come back null and NPE downstream):
+///   builder.withMapping(configClass);                              // register + compute defaults
+///   config.getDefaultValues().addDefaults(builder.getDefaultValues()); // merge into live config
+///   configMappingObject(cls, new ConfigMappingContext(config, mb)) // build from real config
 fn cm_construct_via_context(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     cls: ObjectRef,
+    prefix: Value,
 ) -> Option<Value> {
     let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -3990,6 +3996,45 @@ fn cm_construct_via_context(
         &[Value::Object(Some(builder))],
     )
     .ok()?;
+    // Register the mapping in the builder (computes its @WithDefault values).
+    let config_class = match ctx.invoke(
+        "io/smallrye/config/ConfigMappings$ConfigClass",
+        "configClass",
+        "(Ljava/lang/Class;Ljava/lang/String;)Lio/smallrye/config/ConfigMappings$ConfigClass;",
+        &[Value::Object(Some(cls)), prefix],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    ctx.invoke_virtual(
+        builder,
+        "withMapping",
+        "(Lio/smallrye/config/ConfigMappings$ConfigClass;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+        &[Value::Object(Some(config_class))],
+    )
+    .ok()?;
+    // Merge the mapping's default values into the live config's default source so
+    // `getValue` sees them while building the impl (mapConfiguration step 2).
+    if let Ok(Some(Value::Object(Some(dvcs)))) = ctx.invoke_virtual(
+        this,
+        "getDefaultValues",
+        "()Lio/smallrye/config/DefaultValuesConfigSource;",
+        &[],
+    ) {
+        if let Ok(Some(Value::Object(Some(bdefs)))) = ctx.invoke_virtual(
+            builder,
+            "getDefaultValues",
+            "()Ljava/util/Map;",
+            &[],
+        ) {
+            let _ = ctx.invoke_virtual(
+                dvcs,
+                "addDefaults",
+                "(Ljava/util/Map;)V",
+                &[Value::Object(Some(bdefs))],
+            );
+        }
+    }
     let mb = match ctx.invoke_virtual(
         builder,
         "getMappingsBuilder",
