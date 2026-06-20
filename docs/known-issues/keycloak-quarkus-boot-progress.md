@@ -1,6 +1,6 @@
 # Keycloak 26.6.3 (Quarkus) boot under CratonVM — progress & gap chain
 
-**Status:** 🟡 PARTIAL (audit 2026-06-19) — **4 of 5 boot gaps FIXED** in dev: Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed, Gap 4 static-synchronized methods lock the `Class` mirror (`0e81bc70`, JVMS §2.11.10). Residual **OPEN** = the current boot frontier: **Gap 5** — Quarkus recorder `ShutdownContext` null NPE (`HibernateValidatorRecorder.shutdownConfigValidator`) + the JBoss-LogManager logging gap. The real ArC CDI boot is not yet reached.
+**Status:** 🟡 PARTIAL (updated 2026-06-20, branch `fix/keycloak-gap5-shutdownctx`) — **Gaps 1–5 FIXED; Gap 4 re-fixed; Gap 6 is the new frontier.** Gap 1 `JarEntry` getSize/getMethod=0, Gap 2 NIO missing-file `NoSuchFileException`, Gap 3 stale `sanitizeDisabledMappers` stub removed. **Gap 4 (static-synchronized → `Class` mirror, JVMS §2.11.10) had REGRESSED on dev for the real boot** — `0e81bc70` missed THREE interpreter invoke fast-paths (cached / stackless-cached / vcached) that still locked the synthetic `get_class_lock_object`, so `ApplicationStateNotification.notifyStartupFailed` (static-sync `notifyAll`) threw `IllegalMonitorStateException` and MASKED every real `<clinit>` failure; now fixed at all three sites (commit `8a3c6c07`). **Gap 5 (Quarkus recorder `ShutdownContext` null NPE) FIXED** — the `StartupContext` native shim shadowed the real `<init>` that registers the `StartupContext$1` `ShutdownContext` proxy under `getValue("io.quarkus.runtime.ShutdownContext")`; shim removed, real bytecode runs (commit `5a489187`). New **OPEN** frontier: **Gap 6** — `AbstractMethodError` on `VirtualThreadsConfig.enabled()` in `VirtualThreadsRecorder.setupVirtualThreads` (a Quarkus `@ConfigMapping`/SmallRye config-interface impl gap). The real ArC CDI boot is not yet reached.
 
 Goal: reach and validate the **real Quarkus ArC** CDI path (`CRATONVM_REAL_ARC`,
 the `quarkus_arc.rs` shim's replacement). ArC's `Arc.initialize()` runs **late**
@@ -96,7 +96,16 @@ lifecycle where ArC runs. **Lesson:** this is exactly the forbidden-synthetic-st
 pattern — a no-op shim added for one symptom silently skipped an unrelated,
 load-bearing side effect.
 
-### Gap 4 — `static synchronized` used a synthetic lock, not the `Class` mirror ✅ FIXED
+### Gap 4 — `static synchronized` used a synthetic lock, not the `Class` mirror ✅ FIXED (re-fixed 2026-06-20)
+> **UPDATE (2026-06-20): Gap 4 had REGRESSED on dev for the real boot.** `0e81bc70`
+> fixed some monitor sites but THREE interpreter invoke fast-paths still acquired
+> the synthetic `get_class_lock_object` for static-synchronized methods: the cached
+> direct-call path, the stackless-cached path, and the vcached path
+> (`vm/src/runtime/interpreter.rs` ~14717 / ~15754 / ~20023). So the IMSE below
+> reproduced on a clean dev boot and MASKED the real Gap-5 cause. Fixed at all
+> three sites — they now use `get_or_create_class_mirror(shared, declaring_id)`
+> (commit `8a3c6c07`). Lesson: the same fix must cover EVERY invoke fast-path;
+> grep `get_class_lock_object` to be sure none remain. The original write-up:
 **Symptom:** with gap 3 fixed, the boot reaches the real Quarkus application
 startup (`Quarkus.run → ApplicationImpl.<clinit>`) and dies:
 ```
@@ -122,7 +131,26 @@ throws on CratonVM but not HotSpot; instance `synchronized` was unaffected.
 CratonVM == HotSpot. After the fix the boot runs the **whole** Quarkus application
 startup (recorders, ArC via its shim, Hibernate Validator) and surfaces gap 5.
 
-### Gap 5 — Quarkus app startup fails: `HibernateValidatorRecorder` NPE ⏳ OPEN (next)
+### Gap 5 — Quarkus recorder `ShutdownContext` null NPE ✅ FIXED (2026-06-20)
+> **FIXED (commit `5a489187`).** Root cause confirmed by disassembly:
+> `HibernateValidatorProcessor$shutdownConfigValidator…​.deploy_0` obtains the
+> `ShutdownContext` via `startupContext.getValue("io.quarkus.runtime.ShutdownContext")`.
+> The **real** `io.quarkus.runtime.StartupContext.<init>` registers a
+> `StartupContext$1` (a `ShutdownContext` proxy whose `addShutdownTask` pushes to
+> the StartupContext's real `shutdownTasks` deque) into its `values` map under
+> `ShutdownContext.class.getName()`. CratonVM's `quarkus_staticinit.rs` native shim
+> SHADOWED `StartupContext.<init>` (+ getValue/putValue/addShutdownTask/close) with
+> salt-keyed side-tables, so the proxy was never registered → `getValue(…)` → null →
+> NPE (masked by Gap 4 until the monitor re-fix above). (NB: `StartupContext`
+> implements `Closeable`, NOT `ShutdownContext`; the proxy is a separate object —
+> the earlier note here was wrong.) Fix = remove the StartupContext shim entirely
+> and run the real bytecode (trivial HashMap + 2 ConcurrentLinkedDeques + the two
+> inner-class proxies); `synthetic_stub_fields` only padded field counts (real
+> class is larger, so its real layout was already used). Verified on the real boot:
+> execution advances one full deploy step (clinit bci 405 → 425) and the NPE is
+> gone. **The 5b logging gap is moot for the immediate frontier** — with Gap 4
+> re-fixed, `CLINIT-CAUSE` surfaces the real cause directly (it showed Gap 6 below).
+> The original write-up (for reference):
 **Symptom:** the monitor fix unmasked the real failure. The boot now runs
 `ApplicationImpl.<clinit>` to bci=814 (deep into the recorder chain — past ArC) and
 fails:
@@ -175,9 +203,59 @@ development mode" from Picocli shows). Investigation:
   primary failure (the null-`ShutdownContext` NPE), so 5a can proceed without 5b.
 
 This is **past ArC initialization** — the boot exercises the real Quarkus recorder
-chain end to end up to Hibernate Validator. Gap 5 is the next frontier and is a
-**multi-session, Quarkus-recorder-framework** effort (5a), with 5b as a visibility
-enabler.
+chain end to end up to Hibernate Validator.
+
+### Gap 6 — `VirtualThreadsConfig.enabled()` AbstractMethodError ⏳ OPEN (new frontier)
+**Symptom:** with Gaps 4 & 5 fixed, `ApplicationImpl.<clinit>` advances to the next
+deploy step (`VirtualThreadsProcessor$setup…​.deploy_0`, clinit bci=425) and fails:
+```
+java.lang.AbstractMethodError
+  at io.quarkus.virtual.threads.VirtualThreadsRecorder.setupVirtualThreads(VirtualThreadsRecorder.java:45) bci=4
+  at io.quarkus.runner.recorded.VirtualThreadsProcessor$setup1414761027.deploy_0
+  at io.quarkus.runner.ApplicationImpl.<clinit> (bci=425)
+```
+**Root cause (FULLY traced 2026-06-20):** `VirtualThreadsProcessor$setup….deploy_0`
+gets `runtimeConfig` from
+`SmallRyeConfig.getConfigMapping(VirtualThreadsConfig.class, "quarkus.virtual-threads")`
+(bci 10), then `new VirtualThreadsRecorder(that)`; `setupVirtualThreads` bci=4 calls
+`runtimeConfig.enabled()`. CratonVM has a **native shim** for
+`SmallRyeConfig.getConfigMapping` (`native-builtins/src/phases_late.rs` ~5051,
+"Round 87") that does `alloc_concurrent_synthetic(ctx, <interfaceName>, 0)` — i.e. it
+allocates an object **of the `@ConfigMapping` INTERFACE itself**, which has no method
+bodies → `invokeinterface enabled()` → `AbstractMethodError`. The real generated impl
+**`io/quarkus/virtual/threads/VirtualThreadsConfig$$CMImpl`** (SmallRye
+`ConfigMappingGenerator` output) IS present in `generated-bytecode.jar`, with a no-arg
+ctor (fields default-zeroed) and a real `(io.smallrye.config.ConfigMappingContext)`
+ctor that populates fields from config.
+
+Why the shim exists / why this is deep: real `SmallRyeConfig.getConfigMapping(Class,
+String)` reads `this.mappings` (a `Map<Class,Map<String,Object>>`) and throws
+`SRCFG00027 mappingNotFound` when empty. Under CratonVM `mappings` is **never
+populated** (the Quarkus runtime config build that calls `builder.withMapping(type,
+prefix)` → `ConfigMappingProvider` → `new $$CMImpl(ConfigMappingContext)` and stores
+them isn't wiring the registry). And `ConfigMappingContext`'s only ctor is
+`(SmallRyeConfig, SmallRyeConfigBuilder$MappingBuilder)` — so you can't cheaply build
+one ad-hoc in a native. **Two real fix paths (both multi-session SmallRye-config
+work):** (a) make the runtime config build register the `@ConfigMapping` mappings so
+the real `getConfigMapping` returns populated `$$CMImpl`s and the shim can be deleted;
+(b) have the native construct `<cls>$$CMImpl` via the real `(ConfigMappingContext)`
+ctor against the live `SmallRyeConfig`. **Do NOT** swap the shim to a default-valued
+no-arg `$$CMImpl` — that is the forbidden B5 fabricated-config stub (every
+`@ConfigMapping` would silently report wrong/empty values app-wide).
+
+### Where this leaves Quarkus ArC (`CRATONVM_REAL_ARC`)
+ArC's real boot is `ArcProcessor$initializeContainer643029769.deploy` at
+`ApplicationImpl.<clinit>` **bci=634** — i.e. it runs only AFTER VirtualThreads
+(bci=414, Gap 6), `HibernateValidatorProcessor$build` (574), and
+`ConfigBuildStep$validateStaticInitConfigProperty` (614). So **real ArC is gated
+behind Gap 6 (the `@ConfigMapping` subsystem) and the 574/614 steps** — the boot
+cannot reach `Arc.initialize()` until those clear. `CRATONVM_REAL_ARC` (the env gate
+that would suppress the `quarkus_arc.rs` shim so real ArC bytecode runs) **does not
+exist yet and is premature to add**: it is untestable until the boot reaches bci=634,
+and a minimal standalone ArC repro needs a small Quarkus app's generated
+`Default_ComponentsProvider` + beans (Keycloak's pull in the whole app). Recommended
+order: fix the `@ConfigMapping` registry (Gap 6) → re-walk 574/614 → reach bci=634 →
+then add + validate the `CRATONVM_REAL_ARC` gate against the real ArC bytecode.
 
 ## Key takeaway
 

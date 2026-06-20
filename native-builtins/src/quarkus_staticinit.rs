@@ -46,7 +46,6 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -61,9 +60,7 @@ use cratonvm_types::{ObjectRef, Value};
 pub(crate) const RV_FIELD_VALUE: usize = 0;
 pub(crate) const RV_FIELD_SUPPLIER: usize = 1;
 
-// StartupContext
-pub(crate) const SC_FIELD_SHUTDOWN_TASKS: usize = 0;
-pub(crate) const SC_FIELD_VALUES: usize = 1;
+// (Keycloak Gap 5) StartupContext is no longer shimmed — its real bytecode runs.
 
 // ApplicationConfig
 pub(crate) const AC_FIELD_NAME: usize = 0;
@@ -86,7 +83,6 @@ pub(crate) const TIMING_FIELD_MAIN_STOP: usize = 3;
 // ---------------------------------------------------------------------------
 
 const CLS_RUNTIME_VALUE: &str = "io/quarkus/runtime/RuntimeValue";
-const CLS_STARTUP_CONTEXT: &str = "io/quarkus/runtime/StartupContext";
 const CLS_APPLICATION_CONFIG: &str = "io/quarkus/runtime/ApplicationConfig";
 const CLS_DATASOURCE_CONFIG: &str = "io/quarkus/runtime/DataSourceRuntimeConfig";
 const CLS_TIMING: &str = "io/quarkus/runtime/Timing";
@@ -216,47 +212,10 @@ fn runtime_value_inprogress() -> &'static Mutex<std::collections::HashSet<u64>> 
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Process-wide monotonic counter used to mint unique u64 keys for
-/// StartupContext instances. ObjectRef-raw-pointer keys collide under
-/// parallel tests (each MockNativeContext restarts allocation at
-/// ptr=8), so we issue a globally-unique salt on each `<init>` and
-/// store it in the SC's own fields (slot 0 for shutdown-task key, slot
-/// 1 for values-map key). Reads recover the salt from the object and
-/// index the state maps with it.
-fn startup_context_next_key() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Process-wide lookup of the StartupContext `values` map. Keyed by the
-/// unique SC salt stored in slot `SC_FIELD_VALUES` of the object.
-fn startup_context_values() -> &'static Mutex<HashMap<u64, HashMap<String, Value>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<u64, HashMap<String, Value>>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Process-wide StartupContext shutdown-task list (ObjectRef of
-/// Runnable). Keyed by the unique SC salt stored in slot
-/// `SC_FIELD_SHUTDOWN_TASKS` of the object. Vec is ordered insertion;
-/// `close()` walks in reverse.
-fn startup_context_shutdown_tasks() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Recover the StartupContext's unique salt for one of its two
-/// tracked fields. Reads `slot` as Long; if the SC was constructed
-/// through our native `<init>`, both slots will hold valid salts.
-/// Returns 0 for a mis-initialised SC — callers treat 0 as "not
-/// tracked" and return defaults.
-fn sc_key(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> u64 {
-    match ctx.get_field(this, slot) {
-        Value::Long(v) => v as u64,
-        Value::Int(v) => v as u32 as u64,
-        _ => 0,
-    }
-}
+// (Keycloak Gap 5) The StartupContext salt-keyed side-tables
+// (`startup_context_next_key` / `startup_context_values` /
+// `startup_context_shutdown_tasks` / `sc_key`) were removed along with the
+// StartupContext natives — the real `StartupContext` bytecode owns that state now.
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -268,7 +227,15 @@ pub fn register_quarkus_staticinit_natives(registry: &mut NativeMethodRegistry) 
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_runtime_value(registry);
-    register_startup_context(registry);
+    // NOTE (Keycloak Gap 5): the `io.quarkus.runtime.StartupContext` natives were
+    // REMOVED. The real `StartupContext` is trivial bytecode (HashMap `values`,
+    // two `ConcurrentLinkedDeque`s) whose constructor registers a `StartupContext$1`
+    // `ShutdownContext` proxy into `values` under the key `ShutdownContext.class
+    // .getName()`. The native `<init>` shim shadowed that constructor, so
+    // `getValue("io.quarkus.runtime.ShutdownContext")` returned null and every
+    // recorder step taking a `ShutdownContext` (e.g.
+    // `HibernateValidatorRecorder.shutdownConfigValidator`) NPE'd. Running the real
+    // bytecode registers the proxy correctly. (Same class of bug as Gap 3.)
     register_application_config(registry);
     register_datasource_runtime_config(registry);
     register_application_lifecycle(registry);
@@ -581,38 +548,6 @@ fn register_runtime_value(registry: &mut NativeMethodRegistry) {
         "deepInstance",
         "()Ljava/lang/Object;",
         native_rv_get_value,
-    );
-    registry.set_category(__prev_cat);
-}
-
-fn register_startup_context(registry: &mut NativeMethodRegistry) {
-    let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    registry.register(CLS_STARTUP_CONTEXT, "<init>", "()V", native_sc_init);
-    registry.register(
-        CLS_STARTUP_CONTEXT,
-        "addShutdownTask",
-        "(Ljava/lang/Runnable;)V",
-        native_sc_add_shutdown_task,
-    );
-    registry.register(
-        CLS_STARTUP_CONTEXT,
-        "runAllInStartupContext",
-        "()V",
-        native_sc_run_all_in_startup_context,
-    );
-    registry.register(CLS_STARTUP_CONTEXT, "close", "()V", native_sc_close);
-    registry.register(
-        CLS_STARTUP_CONTEXT,
-        "getValue",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        native_sc_get_value,
-    );
-    registry.register(
-        CLS_STARTUP_CONTEXT,
-        "putValue",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_sc_put_value,
     );
     registry.set_category(__prev_cat);
 }
@@ -941,154 +876,6 @@ fn native_rv_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 // ---------------------------------------------------------------------------
-// StartupContext natives
-// ---------------------------------------------------------------------------
-
-/// `StartupContext()` — initialise both fields with unique salts and
-/// register empty entries in the global tables. The salt values live
-/// in the object's own fields; subsequent natives recover them via
-/// `sc_key` to index the correct state bucket, avoiding the
-/// ObjectRef-address collisions that break parallel unit tests.
-fn native_sc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else {
-        return Ok(None);
-    };
-    let tasks_key = startup_context_next_key();
-    let values_key = startup_context_next_key();
-    ctx.set_field(this, SC_FIELD_SHUTDOWN_TASKS, Value::Long(tasks_key as i64));
-    ctx.set_field(this, SC_FIELD_VALUES, Value::Long(values_key as i64));
-
-    {
-        let mut tasks = startup_context_shutdown_tasks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tasks.insert(tasks_key, Vec::new());
-    }
-    {
-        let mut values = startup_context_values()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        values.insert(values_key, HashMap::new());
-    }
-    Ok(None)
-}
-
-/// `StartupContext.addShutdownTask(Runnable task)`.
-fn native_sc_add_shutdown_task(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else {
-        return Ok(None);
-    };
-    let Some(task) = arg_obj(args, 1) else {
-        return Ok(None);
-    };
-    let key = sc_key(ctx, this, SC_FIELD_SHUTDOWN_TASKS);
-    if key == 0 {
-        return Ok(None);
-    }
-    let mut tasks = startup_context_shutdown_tasks()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    tasks.entry(key).or_default().push(task);
-    Ok(None)
-}
-
-/// `StartupContext.runAllInStartupContext()` — Quarkus-internal alias
-/// that invokes each pre-recorded step. We keep this as a no-op because
-/// the actual stepping logic lives in Java bytecode; the native hook is
-/// registered only so unresolved-native callsites in Quarkus' generated
-/// `Main` don't abort the VM.
-fn native_sc_run_all_in_startup_context(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(None)
-}
-
-/// `StartupContext.close()` — run shutdown tasks in reverse registration
-/// order, catching panics so one failure doesn't skip remaining tasks.
-fn native_sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else {
-        return Ok(None);
-    };
-    let tasks_key = sc_key(ctx, this, SC_FIELD_SHUTDOWN_TASKS);
-    let values_key = sc_key(ctx, this, SC_FIELD_VALUES);
-    let drained: Vec<ObjectRef> = if tasks_key == 0 {
-        Vec::new()
-    } else {
-        let mut tasks = startup_context_shutdown_tasks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tasks.remove(&tasks_key).unwrap_or_default()
-    };
-    // Iterate in reverse — matches `RunnableList` LIFO behaviour.
-    for task in drained.into_iter().rev() {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            ctx.invoke_virtual(task, "run", "()V", &[])
-        }));
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::error!("StartupContext shutdown task returned error: {:?}", e);
-            }
-            Err(_) => {
-                tracing::error!(
-                    "StartupContext shutdown task panicked — continuing with remaining tasks"
-                );
-            }
-        }
-    }
-    // Also drop the values map so the salt key doesn't leak.
-    if values_key != 0 {
-        let mut values = startup_context_values()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        values.remove(&values_key);
-    }
-    Ok(None)
-}
-
-fn native_sc_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let Some(name) = arg_string(ctx, args, 1) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let key = sc_key(ctx, this, SC_FIELD_VALUES);
-    if key == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let values = startup_context_values()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let v = values
-        .get(&key)
-        .and_then(|m| m.get(&name))
-        .cloned()
-        .unwrap_or(Value::Object(None));
-    Ok(Some(v))
-}
-
-fn native_sc_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = this_ref(args) else {
-        return Ok(None);
-    };
-    let Some(name) = arg_string(ctx, args, 1) else {
-        return Ok(None);
-    };
-    let value = arg_value(args, 2);
-    let key = sc_key(ctx, this, SC_FIELD_VALUES);
-    if key == 0 {
-        return Ok(None);
-    }
-    let mut values = startup_context_values()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    values.entry(key).or_default().insert(name, value);
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------------
 // ApplicationConfig natives
 // ---------------------------------------------------------------------------
 
@@ -1379,16 +1166,6 @@ mod tests {
         ctx.alloc_object(cid, 2)
     }
 
-    fn make_startup_context_obj(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
-        let cid = ctx.ensure_class_initialized(CLS_STARTUP_CONTEXT).unwrap();
-        ctx.alloc_object(cid, 2)
-    }
-
-    fn make_runnable(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
-        let cid = ctx.ensure_class_initialized("java/lang/Runnable").unwrap();
-        ctx.alloc_object(cid, 1)
-    }
-
     #[test]
     fn register_quarkus_staticinit_natives_registers_all_expected_entries() {
         let mut r = NativeMethodRegistry::new();
@@ -1400,14 +1177,6 @@ mod tests {
             .is_some());
         assert!(r
             .find(CLS_RUNTIME_VALUE, "<init>", "(Ljava/lang/Object;)V")
-            .is_some());
-        assert!(r.find(CLS_STARTUP_CONTEXT, "<init>", "()V").is_some());
-        assert!(r
-            .find(
-                CLS_STARTUP_CONTEXT,
-                "addShutdownTask",
-                "(Ljava/lang/Runnable;)V"
-            )
             .is_some());
         assert!(r
             .find(CLS_APPLICATION_CONFIG, "name", "()Ljava/lang/String;")
@@ -1522,96 +1291,6 @@ mod tests {
             queued.is_some(),
             "second getValue must not have dispatched to invoke_virtual"
         );
-    }
-
-    #[test]
-    fn t19_3_startup_context_shutdown_tasks_run_reverse_order() {
-        reset_supplier_state();
-        let mut ctx = mock_ctx();
-        let sc = make_startup_context_obj(&mut ctx);
-        native_sc_init(&mut ctx, &[Value::Object(Some(sc))]).unwrap();
-
-        let a = make_runnable(&mut ctx);
-        let b = make_runnable(&mut ctx);
-        let c = make_runnable(&mut ctx);
-
-        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(a))])
-            .unwrap();
-        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(b))])
-            .unwrap();
-        native_sc_add_shutdown_task(&mut ctx, &[Value::Object(Some(sc)), Value::Object(Some(c))])
-            .unwrap();
-
-        // Inspect the registered order directly via the SC's stored
-        // salt key (not the raw ObjectRef pointer — that would collide
-        // with concurrent tests allocating at the same address).
-        let tasks_key = sc_key(&ctx, sc, SC_FIELD_SHUTDOWN_TASKS);
-        assert!(tasks_key != 0, "init should have assigned a salt key");
-        {
-            let tasks = startup_context_shutdown_tasks()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let order = tasks.get(&tasks_key).cloned().unwrap_or_default();
-            assert_eq!(order, vec![a, b, c], "tasks stored in insertion order");
-        }
-
-        native_sc_close(&mut ctx, &[Value::Object(Some(sc))]).unwrap();
-
-        // After close, the queue is drained.
-        let tasks = startup_context_shutdown_tasks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            tasks.get(&tasks_key).is_none(),
-            "close() must drop the shutdown-task queue"
-        );
-    }
-
-    #[test]
-    fn t19_3_startup_context_get_put_round_trip() {
-        reset_supplier_state();
-        let mut ctx = mock_ctx();
-        let sc = make_startup_context_obj(&mut ctx);
-        native_sc_init(&mut ctx, &[Value::Object(Some(sc))]).unwrap();
-
-        let name = ctx.create_string("bean-42");
-        let payload = ctx.create_string("materialized-bean");
-
-        // put
-        native_sc_put_value(
-            &mut ctx,
-            &[
-                Value::Object(Some(sc)),
-                Value::Object(Some(name)),
-                Value::Object(Some(payload)),
-            ],
-        )
-        .unwrap();
-
-        // get (same key)
-        let got = native_sc_get_value(
-            &mut ctx,
-            &[Value::Object(Some(sc)), Value::Object(Some(name))],
-        )
-        .unwrap()
-        .unwrap();
-        match got {
-            Value::Object(Some(o)) => assert_eq!(o, payload),
-            other => panic!("expected payload, got {:?}", other),
-        }
-
-        // get with unknown key
-        let missing_name = ctx.create_string("unknown-bean");
-        let missing = native_sc_get_value(
-            &mut ctx,
-            &[Value::Object(Some(sc)), Value::Object(Some(missing_name))],
-        )
-        .unwrap()
-        .unwrap();
-        match missing {
-            Value::Object(None) => {}
-            other => panic!("expected null for missing key, got {:?}", other),
-        }
     }
 
     #[test]

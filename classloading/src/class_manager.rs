@@ -7156,25 +7156,9 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // StartupContext = 2 fields (shutdown_tasks List, values Map).
-        // Both fields are left null by the <init> native — the Rust-side
-        // HashMap + Vec owned by `startup_context_values` /
-        // `startup_context_shutdown_tasks` hold the real state. Reserving
-        // the slots keeps bytecode `getfield shutdownTasks` from OOB-ing.
-        "io/quarkus/runtime/StartupContext" => vec![
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("shutdownTasks"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/List;"),
-                attributes: vec![],
-            },
-            ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("values"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/ConcurrentMap;"),
-                attributes: vec![],
-            },
-        ],
+        // (Keycloak Gap 5) StartupContext is no longer shimmed — the real class
+        // (5 instance fields) is loaded from quarkus-core, so no synthetic padding
+        // is needed; its constructor owns `values`/`shutdownTasks` directly.
         // ApplicationConfig = 2 fields (name, version)
         "io/quarkus/runtime/ApplicationConfig" => vec![
             ClassFileField {
