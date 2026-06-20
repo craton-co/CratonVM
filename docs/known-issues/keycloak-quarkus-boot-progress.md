@@ -451,6 +451,34 @@ VM's real file layer).
 > config-resolution recursion seen on the hot stack; the per-class `RunnerClassLoader` jar reads).
 > Once it reaches `Listening`, flip the Agroal gate to default-on (opt-out `CRATONVM_SYNTHETIC_AGROAL`).
 >
+> **CORRECTION / refinement — Gap 9 is BOTH throughput AND a nondeterministic native stall.** A
+> third run (JIT, 580s deadline) did NOT match the lucky 300s run: it stalled again right after
+> `Hibernate Validator` with only 3 threads (main + `Thread-1` daemon + `Timer`), main parked in
+> `waitForExit`, `Thread-1` (the JPA Startup Thread) **stuck in Rust native** (undumpable). So the
+> boot is **nondeterministic**: sometimes it progresses past the DB layer into RESTEasy deployment
+> (proving the Agroal fix works end to end), other times the JPA Startup Thread wedges in native
+> before `Started datasource` while main parks prematurely in `waitForExit` (the persistence unit
+> never completes, no HTTP bind). That premature-park + native-stuck-worker pattern smells like a
+> concurrency / GC-vs-parked-thread race (cf. the FJP root-reclaim and ES reactor-worker entries),
+> NOT pure slowness. **Concrete evidence:** the stalling run logged
+> `cratonvm_vm::jit::conservative_roots: scan_active_jit_frames: another thread holds live JIT
+> frames while this thread's JIT chain is empty … the documented multi-thread-in-JIT-under-STW gap …
+> cross_thread_jit_gap_hits=1/2`. I.e. a stop-the-world GC fired while `Thread-1` (the JPA Startup
+> Thread) was executing JIT'd code with live roots the cross-thread root scanner could not see —
+> covered only by a possibly-stale `root_snapshot`. A dropped live root → freed-then-used object →
+> the worker wedges. This is the SAME tracked GC×JIT precise-roots gap as the
+> precise-JIT-stack-maps / FJP-root-reclaim / ReflRepro-A2 work (register-resident / cross-thread
+> JIT roots under STW), surfacing here because the boot is the first multi-threaded-JIT app to drive
+> it under real GC pressure. Confirm by re-running at a larger heap (`--Xmx 6g`, far fewer STW
+> collections — like the ES `6g→0` result): if the boot then progresses reliably, the cross-thread
+> JIT-root-under-STW gap is the cause. Candidate fixes are the tracked ones: `CRATONVM_SHADOW_STACK`
+> precise roots and the cross-thread STW JIT-root scan follow-up. (`--log-level=info` did not take effect — the boot still emitted TRACE/DEBUG —
+> so the logging-tax hypothesis for the slowness is still untested; set the level via `keycloak.conf`
+> / `quarkus.log.level` next time.) Net: the **deterministic** Gap-8 Agroal blocker is fixed and the
+> DB layer is reachable; the remaining Gap-9 frontier is (1) a nondeterministic JPA-Startup-Thread
+> native stall (get its wait-site — it is the single highest-value next step) and (2) raw throughput.
+> Do NOT flip the Agroal gate to default-on until the boot reaches `Listening` reliably.
+>
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
 > entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
