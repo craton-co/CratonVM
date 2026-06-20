@@ -3959,6 +3959,16 @@ pub fn try_compile(
     // (resolver absent, or it returns `None` for a given site) makes the
     // CRC32 intrinsic at that site bail to normal dispatch.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // activate-ir-optimizer (scalar-new wiring): given an `invokespecial`
+    // constant-pool index, returns `true` iff it targets a constructor whose
+    // *construction* is elidable for escape-analysis scalar replacement — a
+    // no-arg `<init>()V` of a direct `java/lang/Object` subclass whose body is
+    // exactly `aload_0; invokespecial Object.<init>()V; return` (no field
+    // initialiser, no escape, no side effect). `None` (the production default
+    // unless the soak flag is set) leaves scalar-replacement of `new` OFF: the
+    // IR builder bails on every `invokespecial`, so allocation-bearing methods
+    // take the single-pass backend exactly as before.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
     // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
     // function doc above.
@@ -3998,6 +4008,7 @@ pub fn try_compile(
         inline_resolver,
         string_layout_resolver,
         cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
         optimize,
         &mut backend_attempted,
     );
@@ -4120,6 +4131,9 @@ fn try_compile_inner(
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
     // Maps an invoke* CP index to its declared class id — see `try_compile`.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // Elidable-`<init>` resolver for scalar-replacement of `new` — see
+    // `try_compile`. `None` keeps `new` scalar replacement off.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: when `false`, the optimizing IR pipeline is
     // skipped entirely and compilation falls through to the single-pass
     // `x64::compile` backend (the fast C1 tier). See `try_compile`.
@@ -4291,6 +4305,32 @@ fn try_compile_inner(
                     }
                 }
                 builder.set_field_info(fm);
+            }
+        }
+        // Scalar replacement of `new`: only when the elidable-`<init>` resolver
+        // is supplied (the production soak flag is on, or a test wires it
+        // directly) do we feed the builder the allocation layout for every `new`
+        // and the pcs of elidable `<init>()V` invokespecials. Without it, the
+        // builder bails on `new`/`invokespecial`, so allocation-bearing methods
+        // stay on the single-pass backend exactly as before (inert default).
+        if let (Some(elidable_resolver), Some(new_resolver)) =
+            (cp_elidable_init_resolver, cp_new_resolver)
+        {
+            if !scan.new_ops.is_empty() {
+                let mut new_info_map =
+                    std::collections::HashMap::with_capacity(scan.new_ops.len());
+                for &(pc, cp_idx) in &scan.new_ops {
+                    if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
+                        new_info_map.insert(pc, (class_id, num_fields));
+                    }
+                }
+                let mut trivial_init_pcs = std::collections::HashSet::new();
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if opcode == 0xb7 && elidable_resolver(cp_idx) {
+                        trivial_init_pcs.insert(pc);
+                    }
+                }
+                builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
         if let Some(mut graph) = builder.build(code, code_len) {
@@ -5348,7 +5388,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, true,
+            None, None, true,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5361,7 +5401,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, false,
+            None, None, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5439,6 +5479,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
@@ -5455,7 +5496,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, true,
+            None, None, true,
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -5733,6 +5774,106 @@ mod tests {
         assert!(
             builder.build(&code, 5).is_none(),
             "eliding a <init> on a non-fresh receiver must bail to single-pass"
+        );
+    }
+
+    // activate-ir-optimizer (scalar-new wiring): a `new`-bearing method whose
+    // construction is elidable routes through the IR pipeline (scalar-replaced)
+    // ONLY when the elidable-`<init>` resolver is supplied — the production soak
+    // gate. Without it the builder bails on the `invokespecial`, keeping `new`
+    // scalar replacement off by default.
+    #[test]
+    fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
+        use std::sync::Arc;
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Mk"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("()I"),
+            source_file: None,
+            code: Arc::from(
+                [
+                    0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+                    0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+                ]
+                .as_slice(),
+            ),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 8,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        };
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
+            if cp == 1 {
+                Some((7, 1, false, false))
+            } else {
+                None
+            }
+        };
+        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+            if cp == 3 {
+                Some((0, b'I'))
+            } else {
+                None
+            }
+        };
+        let elidable = |cp: u16| -> bool { cp == 2 };
+
+        // With the elidable resolver → the IR pipeline scalar-replaces the new.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let r = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            Some(&elidable),
+            true,
+        );
+        assert!(r.is_some(), "an elidable `new` method must compile via IR");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "the elidable `new` method must route through the IR pipeline"
+        );
+
+        // Without it → the builder bails on the `invokespecial` → not the IR path.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _ = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without the elidable resolver, `new` must NOT take the IR pipeline"
         );
     }
 

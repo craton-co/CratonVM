@@ -967,6 +967,60 @@ admit non-`Object` supers whose `<init>` is itself elidable.)
    + the zero-default (inc 18) + the receiver-is-New check (inc 17) are the
    safety net.
 
+## Increment 19 (Front 3 — VM-side trivial-constructor signal wired, soak-gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_SCALAR_NEW`**.
+Production scalar replacement of `new` is now fully wired end-to-end (VM analysis →
+resolver → `lib.rs` → builder → EA), but stays inert until the soak flag is set,
+because flipping it on changes production scalar replacement (the
+kafka-bug-25-sensitive area) and must clear a bt18 + gauntlet soak first.
+
+**What landed**
+- **VM** (`vm/src/runtime/interpreter.rs`): `is_elidable_construction(cm,
+  class_id)` — true iff the class's `<init>()V` body is exactly `aload_0;
+  invokespecial java/lang/Object.<init>()V; return` (the empty default
+  constructor of a direct `Object` subclass: no field initialiser → object stays
+  zero-initialised, no escape of `this`, no side effect). `resolve_jit_elidable_
+  init(cm, holder, invoke_cp_idx)` resolves an `invokespecial` methodref and
+  applies that check. Deliberately stricter than `classify_init_complexity`'s
+  `Trivial` (which admits calls that can escape the receiver — unsound to elide).
+- **JIT** (`jit/src/lib.rs`): a new `try_compile` parameter
+  `cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>`. When supplied, the
+  IR branch builds `new_info` (from `cp_new_resolver`) + `trivial_init_pcs` (the
+  `invokespecial` pcs the resolver marks elidable) and calls
+  `builder.set_new_info`. `None` (the default) leaves it off — the builder bails
+  on `new`/`invokespecial`, single-pass as before.
+- **VM call sites**: each of the three `try_compile` sites builds the elidable
+  resolver and passes it **only when `CRATONVM_JIT_SCALAR_NEW` is set**, else
+  `None`. So production is inert by default.
+
+**Tests**: `scalar_new_wiring_routes_through_ir_only_with_resolver` (a
+`new Foo(); o.x=42; return o.x` method routes through the IR pipeline —
+`IR_LOWER_COMPILES==1` — only with the resolver; without it, counter stays 0).
+jit lib 802/802, field harness 20/20, `cratonvm-vm` builds clean. (Combined with
+the inc-17 end-to-end builder test proving the graph folds to `Const(42)` and the
+inc-18 zero-default, the path is covered down to the machine-code level.)
+
+**To soak / flip on** (the remaining production-validation step):
+1. Run with `CRATONVM_JIT_SCALAR_NEW=1` on the app gauntlet (kafka / spring /
+   tomcat / hibernate suites) + `bt18` (must stay `== 68332206`; bintrees' own
+   `TreeNode(left,right)` ctor is arg-bearing so NOT elidable → bt18 only checks
+   the flag-on path doesn't regress, it doesn't exercise scalar-new). A targeted
+   probe (`new`-heavy default-ctor POJOs, non-escaping) exercises the new path —
+   compare its output to HotSpot.
+2. Watch for the kafka-bug-25 class: an object that escapes via an elided
+   constructor body. The `Object.<init>`-only restriction makes the elided body
+   provably empty, so this is structurally excluded — but the soak is the proof.
+3. Once clean, default the flag on (or remove it) and re-run the gauntlet +
+   bt10/14/16/18 checksums, per step 8.
+
+**Next refinements** (after the flag flips clean):
+- Recurse the super chain in `is_elidable_construction` to admit non-`Object`
+  supers whose `<init>` is itself elidable (covers deeper hierarchies).
+- `Op::Call` for real `invoke*` — the remaining big lever (lowerer needs
+  `JitRuntimeHelpers` access + VM-level differential validation per
+  `wire-tiered-manager`).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
