@@ -1125,7 +1125,42 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem, base, offset],
                         Some(pc),
                     );
+                    // The load advances the memory token: a subsequent store to
+                    // a possibly-aliasing location must be ordered AFTER this
+                    // read (WAR), and the scheduler enforces ordering only via
+                    // the input-edge dependency this creates. (For a getfield-
+                    // only method this merely serialises reads — harmless.)
+                    self.mem = load;
                     self.push(load);
+                    pc += 3;
+                }
+                // putfield — write an instance field as an `Op::Store`.
+                //
+                // Slice 2 (read/write) of the field/call IR frontier: only
+                // int-category fields lower. The store consumes the current
+                // memory token and produces a new one (the store node itself),
+                // so the scheduler serialises it after every prior memory op and
+                // before every later one (RAW/WAR/WAW all preserved by the
+                // input-edge topological sort). Non-int fields and any pc without
+                // resolved layout bail (`None` → single-pass).
+                0xb5 => {
+                    let (field_index, type_tag) = match self.field_info.get(&pc) {
+                        Some(&fi) => fi,
+                        None => return None,
+                    };
+                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                        return None;
+                    }
+                    let value = self.pop();
+                    let base = self.pop();
+                    let offset = self.iconst(field_index as i64);
+                    let store = self.graph.add(
+                        Op::Store(MemKind::Int),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, base, offset, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
                     pc += 3;
                 }
                 // dup
@@ -1483,7 +1518,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
                 pc += 2;
             }
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 => {
+            0x11 | 0x84 | 0xb4 | 0xb5 => {
                 pc += 3;
             }
             _ => {
@@ -1567,7 +1602,7 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             // 2-byte opcodes
             0x10 | 0x15 | 0x19 | 0x36 => pc += 2,
             // 3-byte opcodes
-            0x11 | 0x84 | 0xb4 => pc += 3,
+            0x11 | 0x84 | 0xb4 | 0xb5 => pc += 3,
             _ => pc += 1,
         }
     }
@@ -1760,6 +1795,58 @@ mod tests {
         assert_eq!(load.inputs.len(), 4, "Load inputs = [ctrl, mem, base, offset]");
         assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
         assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
+    }
+
+    #[test]
+    fn test_ir_putfield_emits_store_and_threads_memory() {
+        // static void set(Corpus o, int v) { o.x = v; }
+        // aload_0; iload_1; putfield #2; return
+        let code = [0x2a, 0x1b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+        let mut builder = IrBuilder::new(2, 2);
+        let mut fi = HashMap::new();
+        fi.insert(2usize, (0usize, b'I'));
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 6).expect("IR build failed");
+        let store = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Store(_)))
+            .expect("putfield should emit an Op::Store");
+        // inputs = [ctrl, mem, base, offset, value]
+        assert_eq!(store.inputs.len(), 5);
+        assert_eq!(graph.nodes[store.inputs[2] as usize].op, Op::Param(0)); // base = o
+        assert_eq!(graph.nodes[store.inputs[3] as usize].op, Op::Const(0)); // field index
+        assert_eq!(graph.nodes[store.inputs[4] as usize].op, Op::Param(1)); // value = v
+        assert_eq!(store.ty, IrType::Memory);
+    }
+
+    #[test]
+    fn test_ir_putfield_store_after_load_in_memory_chain() {
+        // static int swap(Corpus o, int v) { int t = o.x; o.x = v; return t; }
+        // The store's memory input must be the load (so the scheduler orders the
+        // store AFTER the read — WAR), not the initial Start memory token.
+        // aload_0; getfield #2; istore_2; aload_0; iload_1; putfield #2; iload_2; ireturn
+        let code = [
+            0x2a, 0xb4, 0x00, 0x02, 0x3d, 0x2a, 0x1b, 0xb5, 0x00, 0x02, 0x1c, 0xac, 0, 0,
+        ];
+        let mut builder = IrBuilder::new(2, 3);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'I')); // getfield pc 1
+        fi.insert(7usize, (0usize, b'I')); // putfield pc 7
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 12).expect("IR build failed");
+        let store = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Store(_)))
+            .expect("putfield emits a Store");
+        // store.inputs[1] (memory) must be the Load node, not the Start Proj(1).
+        let mem_in = store.inputs[1];
+        assert!(
+            matches!(graph.nodes[mem_in as usize].op, Op::Load(_)),
+            "store's memory input must be the prior load (WAR ordering), got {:?}",
+            graph.nodes[mem_in as usize].op
+        );
     }
 
     #[test]

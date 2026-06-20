@@ -739,6 +739,47 @@ impl<'a> Lowerer<'a> {
                 // done: spill the result.
                 self.store_rax(slot);
             }
+            // putfield write — `Op::Store`. The IR builder emits only
+            // `Op::Store(MemKind::Int)` (int-category instance fields). Inline
+            // the `jit_putfield_int` heap write: null receiver → no-op, else
+            // write a `Value::Int(value)` cell (discriminant 0 + the 32-bit
+            // payload, high qword cleared so no stale ref/garbage survives —
+            // mirroring the scalar-replace store and the real helper).
+            // inputs = [ctrl, mem, base, offset, value]; produces no value
+            // (a pure memory-ordering token), so no slot is allocated.
+            Op::Store(_) => {
+                let base = node.inputs[2];
+                let offset_node = node.inputs[3];
+                let value = node.inputs[4];
+                let field_index = match self.graph.nodes[offset_node as usize].op {
+                    Op::Const(v) => v,
+                    _ => 0,
+                };
+                let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
+                let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+                let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
+                // Receiver → RAX, value → RCX. Both loaded BEFORE the null
+                // check so the guarded body is a fixed size (the value load is
+                // variable-width; doing it here keeps the JE displacement
+                // constant). The value load on the null path is harmless.
+                self.load_to_rax(self.slot_of(base));
+                self.load_to_rcx(self.slot_of(value));
+                // TEST RAX,RAX ; JE +27 → skip (null receiver = no-op).
+                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                self.buf.emit(&[0x74, 27]);
+                // MOV dword [RAX + tag_off], 0   (Value::Int discriminant) — 10 bytes.
+                self.buf.emit(&[0xC7, 0x80]);
+                self.buf.emit(&tag_off.to_le_bytes());
+                self.buf.emit(&0u32.to_le_bytes());
+                // MOV dword [RAX + pay_off], ECX (Int payload) — 6 bytes.
+                self.buf.emit(&[0x89, 0x88]);
+                self.buf.emit(&pay_off.to_le_bytes());
+                // MOV qword [RAX + high_off], 0  (clear high qword) — 11 bytes.
+                self.buf.emit(&[0x48, 0xC7, 0x80]);
+                self.buf.emit(&high_off.to_le_bytes());
+                self.buf.emit(&0u32.to_le_bytes());
+                // skip:  (10 + 6 + 11 = 27 bytes guarded — matches the JE rel8)
+            }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
             // Unhandled — skip (bail in ir_compatible prevents reaching here)

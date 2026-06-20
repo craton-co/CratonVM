@@ -1748,11 +1748,18 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // it (control, value, and the `If`'s opposite projection), collapsing the
     // conditional into a single-successor branch that always takes the surviving
     // return. Every Return is an observable program exit and must be a root.
+    // Seed from every `Op::Return` AND every `Op::Store`. A store is an
+    // observable side effect whose result (a memory token) may be consumed by
+    // no one — a pure-write `o.x = v; return v;` returns the value, not the
+    // store, so the store node is unreachable from any Return. Rooting it (and,
+    // transitively, the memory chain it depends on) keeps the write from being
+    // deleted. Strictly additive: a store already removed by DSE is `Op::Dead`
+    // and not matched, and a live store always has an observable effect.
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| matches!(n.op, Op::Return))
+        .filter(|(_, n)| matches!(n.op, Op::Return | Op::Store(_)))
         .map(|(id, _)| id as NodeId)
         .collect();
     if worklist.is_empty() {

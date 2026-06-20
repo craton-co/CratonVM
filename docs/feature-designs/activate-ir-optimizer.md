@@ -729,6 +729,73 @@ lowerer helper-call path or an inline tag+payload write), then `new` / `Op::Call
 — which is also what finally de-latents the inc-4–9 DSE/escape/LICM passes on
 production IR (they only fire once `Store`/`New` exist).
 
+## Increment 15 (step 3 — IR gate relaxation: int-category `putfield` → `Op::Store`) landed
+
+Status: **landed** on `dev`. Second slice of the field/call frontier: an
+int-category `putfield` now lowers to the first real `Op::Store` the production
+IR path emits. Together with inc 14 (`Op::Load`) the IR pipeline now does both
+reads and writes of int fields.
+
+**Memory ordering — the keystone, solved without a new scheduler.** The IR
+threads a single memory-token chain: *every* memory op consumes the current
+token and produces a new one. A `getfield` `Op::Load` now also advances the
+token (`self.mem = load`), and a `putfield` `Op::Store` consumes the prior token
+and becomes the new one. Because the scheduler's within-block order is a
+post-order DFS over **input edges** (`ir_schedule::topo_sort_block`), this chain
+is exactly the dependency that serialises memory ops in program order — RAW
+(load sees a prior store), WAR (a store waits for a prior load of a possibly-
+aliasing location), and WAW are all preserved with no memory-aware scheduler
+pass. (No alias precision yet: the chain is total, conservatively serialising
+even provably-independent accesses; the inc-4–9 alias oracle can refine this
+later.)
+
+**Implementation**
+- **`jit/src/ir.rs`** — `putfield` (0xb5) emits `Op::Store(MemKind::Int)` with
+  inputs `[ctrl, mem, base, Const(field_index), value]`, typed `IrType::Memory`,
+  and sets `self.mem = store`; the `getfield` `Op::Load` now also advances
+  `self.mem`. `0xb5` added to both length walkers. Non-int fields / unresolved
+  layout bail.
+- **`jit/src/ir_optimize.rs`** — `eliminate_dead_nodes` now roots from every
+  `Op::Store` as well as every `Op::Return`. A store is an observable side
+  effect whose memory-token result may be consumed by no one (a pure-write
+  `o.x = v; return v;`), so rooting only from returns would delete it. Strictly
+  additive (a DSE-removed store is already `Op::Dead`).
+- **`jit/src/ir_lower.rs`** — an `Op::Store(_)` arm inlines the
+  `jit_putfield_int` heap write: null receiver → no-op (matching the helper),
+  else write a `Value::Int` cell (discriminant 0 + 32-bit payload, high qword
+  cleared so no stale ref survives — the scalar-replace precedent). The receiver
+  and value are loaded before the null check so the guarded body is a fixed 27
+  bytes (a constant `JE` displacement). Produces no value, so no slot is
+  allocated.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` gains a `putfield_int` stub (so the
+single-pass backend, which lowers an int putfield to `CALL jit_putfield_int`, can
+execute) and a read/write differential that runs **each backend against its own
+fresh object** and compares the return value AND the post-call object state:
+`putfield_then_getfield` (RAW), `getfield_then_putfield` (WAR — proves the store
+waits for the read), `putfield_pure_write` (the store's memory result is unused —
+proves DCE keeps it), and `putfield_two_fields` (WAW + two fields). IR ==
+single-pass == host for all. `jit/src/ir.rs` adds builder tests for store
+emission and for the store's memory input being the prior load.
+
+**Trap recorded** (cost an investigation): a single-pass `putfield` method is
+`needs_heap` (`x64.rs` sets it unconditionally for 0xb5, since a *ref* putfield
+needs the VM pointer for write barriers), which makes the compiled body
+`needs_context` — it takes a hidden VM-context pointer as its first argument. The
+differential harness must invoke single-pass putfield via
+`try_call_with_context(dummy, [obj, …])`, not `try_call([obj, …])`, or the
+receiver lands in the context slot and every arg shifts by one (manifested as a
+`STATUS_ACCESS_VIOLATION` writing through `obj == value`). The inline IR store
+needs no context (`needs_context() == false`), so the harness dispatches on
+`needs_context()`. The int putfield path never dereferences the context pointer,
+so a zeroed dummy buffer suffices.
+
+jit lib 796/796, harness 20/20, `cratonvm-vm` builds clean.
+
+**Next**: `new` / `Op::Call` emission (needs the lowerer to gain
+`JitRuntimeHelpers` access for the allocation/dispatch helper calls), which also
+finally de-latents the inc-4–9 DSE/escape/LICM passes on production IR.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
