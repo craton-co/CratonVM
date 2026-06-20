@@ -791,15 +791,18 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
 //     effects), a guard, a monitor, or any other non-pure non-load non-store
 //     node — may touch arbitrary memory and disqualifies ALL loads in the loop
 //     (`loop_has_hard_barrier`, give up — conservative).
-//   * An in-loop `Store` no longer disqualifies the whole loop. A minimal alias
-//     oracle (`load_safe_past_loop_stores`) hoists a load past in-loop stores
-//     when EVERY store writes a *distinct local `New`/`NewArray` allocation* and
-//     the load base is either (a) a local allocation distinct from every store
-//     base, or (b) a method `Param` (a pre-existing reference — a fresh in-method
-//     allocation can never be an already-existing object). The store base is NOT
-//     widened to `Param` (two parameters can be the same object, `foo(x, x)`).
-//     Any other / unreadable / same base keeps the load pinned. The common
-//     read-only invariant-load loop (no store at all) still fires unchanged.
+//   * An in-loop `Store` no longer disqualifies the whole loop. An alias oracle
+//     resolves each load/store base to a points-to summary (`resolve_ref_points_
+//     to`), following `Phi`s transparently (cross-merge). EVERY store must be
+//     *tame* — its base resolves to a definite set of local `New`/`NewArray`
+//     allocations and nothing pre-existing (`loop_store_clobber`); one opaque
+//     store blocks all hoisting. A load then hoists past the tame stores when its
+//     possible-allocation set is disjoint from what they write
+//     (`load_safe_past_clobber`); its pre-existing (`Param`) component is always
+//     safe — a fresh in-method allocation is never an already-existing object.
+//     The store base is NOT widened to `Param` (two parameters can be the same
+//     object, `foo(x, x)`). An unknown-provenance base keeps the load pinned. The
+//     common read-only invariant-load loop (no store at all) fires unchanged.
 //   * Hoisting never moves a node past an exception edge that should observe
 //     the pre-loop value: pure nodes raise nothing, and a load is only
 //     hoisted when the body contains no barrier (so no observable ordering
@@ -1033,8 +1036,9 @@ fn is_loop_invariant_d(
 /// disqualifies ALL load hoisting for the loop.
 ///
 /// In-loop `Store`s are deliberately NOT hard barriers: they are handled with
-/// per-load alias precision by `load_safe_past_loop_stores` (a store to a local
-/// allocation distinct from a load's base cannot clobber that load).
+/// per-load alias precision by `loop_store_clobber` / `load_safe_past_clobber`
+/// (a store to a local allocation distinct from a load's base cannot clobber
+/// that load).
 fn loop_has_hard_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
     body.iter().any(|&id| {
         let op = &graph.nodes[id as usize].op;
@@ -1044,58 +1048,121 @@ fn loop_has_hard_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
     })
 }
 
-/// True if a load with base `load_base` provably cannot read what any in-loop
-/// `Store` writes, so it may be hoisted past those stores.
+/// Points-to summary of a reference node, used by the LICM alias oracle to
+/// reason about loads/stores whose base flows through a `Phi` (cross-merge).
+struct RefPointsTo {
+    /// The fresh local allocations this reference may be, or `None` if it may be
+    /// a value of unknown provenance (a loaded ref, a call result, …) — which
+    /// could alias anything.
+    allocs: Option<FxHashSet<NodeId>>,
+    /// Whether it may be a *pre-existing* reference (a method parameter /
+    /// `this`) — never a fresh in-method allocation.
+    has_pre: bool,
+}
+
+/// Resolve what a reference node points to, following `Phi`s transparently (the
+/// "cross-merge" join). Leaves:
+///   * `New`/`NewArray` → exactly that fresh allocation.
+///   * `Param`           → a pre-existing reference (no allocation).
+///   * anything else      → unknown provenance.
 ///
-/// Every in-loop store must write a **local `New`/`NewArray` allocation** — a
-/// store base that is anything else (a `Param`, a loaded ref, an unreadable
-/// layout) may alias the load and disqualifies hoisting. The store base
-/// category is NOT widened to `Param`: two distinct method parameters can be the
-/// same object (`foo(x, x)`), so a store through a parameter is not provably
-/// non-aliasing.
-///
-/// Given that, the **load** base is safe when it is a reference a freshly-
-/// allocated object can never equal:
-///   * a local `New`/`NewArray` allocation distinct from every store base —
-///     distinct allocations never alias (the invariant DSE relies on); or
-///   * a method parameter (`Op::Param`, including `this`) — a pre-existing
-///     reference from the caller. A `New` executed in THIS method is never an
-///     already-existing object, so no in-method allocation can alias a
-///     parameter (true even if the allocation later escapes — object identity
-///     is fixed at allocation). A store to a fresh local allocation therefore
-///     leaves any parameter's memory untouched.
-///
-/// Any other / unreadable / same base ⇒ `false` (conservative — never hoist past
-/// a possibly-aliasing store).
-fn load_safe_past_loop_stores(
-    graph: &Graph,
-    load_base: NodeId,
-    body: &FxHashSet<NodeId>,
-) -> bool {
-    let base_is_local = is_local_alloc(graph, load_base);
-    let base_is_param = (load_base as usize) < graph.nodes.len()
-        && matches!(graph.nodes[load_base as usize].op, Op::Param(_));
-    if !base_is_local && !base_is_param {
-        return false;
+/// A `Phi` joins its value inputs (the control anchor at its head is skipped):
+/// the allocation sets union, `has_pre` ORs, and any unknown input poisons the
+/// alloc set to `None`. Recursion is depth-bounded, so a loop-carried phi cycle
+/// resolves to unknown rather than hanging.
+fn resolve_ref_points_to(graph: &Graph, id: NodeId, depth: u32) -> RefPointsTo {
+    let unknown = RefPointsTo {
+        allocs: None,
+        has_pre: false,
+    };
+    if id == NO_NODE || (id as usize) >= graph.nodes.len() || depth > 32 {
+        return unknown;
     }
+    match &graph.nodes[id as usize].op {
+        Op::New { .. } | Op::NewArray { .. } => {
+            let mut s = FxHashSet::default();
+            s.insert(id);
+            RefPointsTo {
+                allocs: Some(s),
+                has_pre: false,
+            }
+        }
+        Op::Param(_) => RefPointsTo {
+            allocs: Some(FxHashSet::default()),
+            has_pre: true,
+        },
+        Op::Phi => {
+            let mut allocs: Option<FxHashSet<NodeId>> = Some(FxHashSet::default());
+            let mut has_pre = false;
+            let mut saw_value = false;
+            // inputs are [control_anchor, value0, value1, …]; skip control.
+            for &inp in &graph.nodes[id as usize].inputs {
+                if inp == NO_NODE || (inp as usize) >= graph.nodes.len() {
+                    continue;
+                }
+                if graph.nodes[inp as usize].op.is_control() {
+                    continue; // the phi's region/merge anchor, not a value
+                }
+                saw_value = true;
+                let pt = resolve_ref_points_to(graph, inp, depth + 1);
+                has_pre |= pt.has_pre;
+                allocs = match (allocs, pt.allocs) {
+                    (Some(mut a), Some(b)) => {
+                        a.extend(b);
+                        Some(a)
+                    }
+                    _ => None, // any unknown input poisons the join
+                };
+            }
+            if !saw_value {
+                return unknown;
+            }
+            RefPointsTo { allocs, has_pre }
+        }
+        _ => unknown,
+    }
+}
+
+/// The set of local allocations the in-loop stores may write, or `None` if any
+/// store has an **opaque** base — one that may write a pre-existing object or a
+/// value of unknown provenance, which could alias anything. When `None`, no load
+/// may be hoisted past the loop's stores.
+///
+/// A store is *tame* only if its base resolves (cross-merge) to a definite set
+/// of local allocations and nothing pre-existing. The store base category is NOT
+/// widened to `Param`: two parameters can be the same object (`foo(x, x)`), so a
+/// store through one is not provably non-aliasing.
+fn loop_store_clobber(graph: &Graph, body: &FxHashSet<NodeId>) -> Option<FxHashSet<NodeId>> {
+    let mut clobbered = FxHashSet::default();
     for &id in body {
         if !matches!(graph.nodes[id as usize].op, Op::Store(_)) {
             continue;
         }
-        match store_operands(graph, id) {
-            // A store must write a local allocation distinct from the load base.
-            // (When the load base is a `Param`, distinctness is automatic — a
-            // `Param` node is never a local allocation — so any store to a fresh
-            // local allocation is provably non-aliasing with it.)
-            Some((sbase, _, _)) => {
-                if !is_local_alloc(graph, sbase) || sbase == load_base {
-                    return false;
-                }
-            }
-            None => return false, // unreadable store layout — assume aliasing
+        let sbase = match store_operands(graph, id) {
+            Some((b, _, _)) => b,
+            None => return None, // unreadable layout — opaque
+        };
+        let pt = resolve_ref_points_to(graph, sbase, 0);
+        match pt.allocs {
+            Some(set) if !pt.has_pre => clobbered.extend(set),
+            _ => return None, // may write a pre-existing or unknown object
         }
     }
-    true
+    Some(clobbered)
+}
+
+/// True if a load with base `load_base` cannot read any allocation in
+/// `clobbered`, so it may be hoisted past the loop's (tame) stores.
+///
+/// The load's pre-existing (parameter) component is always safe — no store to a
+/// fresh local allocation can clobber a pre-existing object (object identity is
+/// fixed at allocation, even under escape) — so only its possible-allocation set
+/// must be disjoint from `clobbered`. An unknown-provenance base is never safe.
+fn load_safe_past_clobber(graph: &Graph, load_base: NodeId, clobbered: &FxHashSet<NodeId>) -> bool {
+    match resolve_ref_points_to(graph, load_base, 0).allocs {
+        Some(set) => set.is_disjoint(clobbered),
+        None => false,
+    }
 }
 
 /// Run loop-invariant code motion. Returns `true` if it changed the graph.
@@ -1105,11 +1172,13 @@ fn load_safe_past_loop_stores(
 /// `loop_headers`) — into the loop pre-header (the structurally-classified
 /// entry-predecessor control). A hard barrier (call / allocation / guard /
 /// monitor) in the body blocks all hoisting; an in-loop `Store` blocks only the
-/// loads it could alias (`load_safe_past_loop_stores` — a store to a distinct
-/// local allocation cannot clobber a load of another). Pure invariant nodes
+/// loads it could alias (`loop_store_clobber` / `load_safe_past_clobber` — a
+/// store to a distinct local allocation cannot clobber a load of another). Pure
+/// invariant nodes
 /// already float in Sea-of-Nodes, so no placement change is needed for them —
 /// but recognising them lets the trailing GVN pass dedup loop-entry vs loop-body
-/// copies.
+/// copies. The store-alias oracle resolves bases through `Phi`s (cross-merge),
+/// so a store via `(cond ? A : B)` is modelled as writing `{A, B}`.
 fn licm(graph: &mut Graph) -> bool {
     // Normalize the single-input `Op::Merge` control pass-throughs the builder
     // wraps around branch projections, so a javac loop header and its back-edge
@@ -1149,11 +1218,17 @@ fn licm(graph: &mut Graph) -> bool {
             continue;
         }
         // An in-loop store does NOT bail the whole loop: a load past it is
-        // gated per-load by `load_safe_past_loop_stores` below. We only pay that
-        // alias check when the body actually contains a store.
+        // gated per-load by the alias oracle below. Summarise the stores once —
+        // the set of local allocations they may write, or `None` if any store is
+        // opaque (then no load hoists past them). Only paid when a store exists.
         let body_has_store = body
             .iter()
             .any(|&id| matches!(graph.nodes[id as usize].op, Op::Store(_)));
+        let store_clobber = if body_has_store {
+            loop_store_clobber(graph, &body)
+        } else {
+            None
+        };
 
         // Collect hoistable loads: in the body, with invariant base/address,
         // typed as a real Load. We snapshot ids first (we mutate inputs after).
@@ -1194,11 +1269,18 @@ fn licm(graph: &mut Graph) -> bool {
                 continue;
             }
             // If the body has in-loop stores, the load may only hoist past them
-            // when none can alias it (load + all store bases are distinct local
-            // allocations). Without a store this check is skipped (pure
-            // invariant-load loop — the historical case).
-            if body_has_store && !load_safe_past_loop_stores(graph, base, &body) {
-                continue;
+            // when it cannot alias any of them: an opaque store (`None`) blocks
+            // every load, otherwise the load's points-to alloc set must be
+            // disjoint from what the stores write. Without a store this check is
+            // skipped (pure invariant-load loop — the historical case).
+            if body_has_store {
+                let safe = match &store_clobber {
+                    Some(clob) => load_safe_past_clobber(graph, base, clob),
+                    None => false,
+                };
+                if !safe {
+                    continue;
+                }
             }
             // The load is invariant and not clobbered by any in-loop store → safe
             // to compute once at the pre-header. Remove it from the body by
@@ -3479,6 +3561,107 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "a store through a Param base may alias another Param load → stays pinned"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_load_past_phi_store_of_distinct_allocs() {
+        // Cross-merge: the in-loop store's base flows through a Phi merging two
+        // local allocations A and B. The oracle resolves it to {A, B}, so a load
+        // from a DISTINCT allocation C (disjoint) still hoists past the store.
+        let (mut g, region, preheader, _iv) = loop_probe();
+        let mem = 2;
+        let a = g.add(
+            Op::New { class_id: 1, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let b = g.add(
+            Op::New { class_id: 2, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let c = g.add(
+            Op::New { class_id: 3, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        // Ref phi merging A and B (anchor at the region control in slot 0).
+        let phi = g.add(Op::Phi, IrType::Ref, vec![region, a, b], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cval = g.add(Op::Const(7), IrType::Int, vec![], None);
+        // Load of C (distinct), and a store through the phi (writes A or B).
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, c, off],
+            None,
+        );
+        let _st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![region, mem, phi, cval],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(
+            changed,
+            "the load of C must hoist past a phi-store of {{A, B}} (C is disjoint)"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control must be re-anchored to the pre-header"
+        );
+    }
+
+    #[test]
+    fn test_licm_keeps_load_when_phi_store_includes_its_alloc() {
+        // The phi-store resolves to {A, B}; a load from A IS in that set, so it
+        // may alias and must stay pinned.
+        let (mut g, region, preheader, _iv) = loop_probe();
+        let mem = 2;
+        let a = g.add(
+            Op::New { class_id: 1, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let b = g.add(
+            Op::New { class_id: 2, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let phi = g.add(Op::Phi, IrType::Ref, vec![region, a, b], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cval = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, a, off],
+            None,
+        );
+        let _st = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![region, mem, phi, cval],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let _ = licm(&mut g);
+
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], region,
+            "a load of A may be aliased by a phi-store that writes {{A, B}} → stays pinned"
         );
     }
 

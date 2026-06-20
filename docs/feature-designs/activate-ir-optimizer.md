@@ -463,10 +463,51 @@ distinct local `New`/`NewArray`. The widening is load-side only.
   store-side asymmetry.
 - All prior LICM/DSE/escape tests still pass. Full jit suite 786/786.
 
-**Next**: cross-merge points-to so non-trivial bases (a ref flowing through a
-phi/select) can participate, and recognising a `final`/effectively-immutable
-field load as invariant regardless of in-loop stores to other fields of the same
-object.
+**Next**: increment 8 adds cross-merge points-to.
+
+## Increment 8 (alias oracle: cross-merge points-to through phis) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Generalises the increment-6/7 LICM alias oracle from direct `New`/`Param` bases
+to bases that flow through a `Phi` (the IR's cross-merge primitive — Java
+`select`/ternary lower to branch + phi, not a select op).
+
+**What landed** (`jit/src/ir_optimize.rs`): the ad-hoc per-base checks were
+replaced by a small points-to lattice that the oracle resolves for every load
+and store base:
+
+- **`resolve_ref_points_to`** maps a reference node to `{ allocs: Option<set>,
+  has_pre: bool }`: a `New`/`NewArray` → that fresh allocation; a `Param` →
+  pre-existing (no allocation); a `Phi` → the join of its value inputs (alloc
+  sets union, `has_pre` ORs, any unknown input poisons `allocs` to `None`); a
+  loop-carried phi cycle bottoms out at a depth bound → unknown. Anything else →
+  unknown.
+- **`loop_store_clobber`** summarises the loop's stores once: the union of
+  allocations they may write, or `None` if any store is *opaque* (base resolves
+  to a pre-existing or unknown value — could alias anything), which blocks all
+  hoisting. A store via `(cond ? A : B).f` now resolves to writing `{A, B}`
+  instead of bailing because the base is not a direct `New`.
+- **`load_safe_past_clobber`** hoists a load when its possible-allocation set is
+  disjoint from the clobber set (its pre-existing/parameter component is always
+  safe — a fresh allocation is never an already-existing object).
+
+This **subsumes increments 6 and 7 exactly** (a direct `New` base resolves to a
+singleton set; a `Param` to the empty-set/pre-existing case) and adds the
+phi-base case. The store base is still NOT widened to `Param` (two parameters can
+be the same object); only definite-alloc-set stores are tame.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_past_phi_store_of_distinct_allocs` — a store through a
+  phi merging `{A, B}` does not block a load of a disjoint allocation `C`.
+- `test_licm_keeps_load_when_phi_store_includes_its_alloc` — a load of `A` stays
+  pinned past a phi-store that writes `{A, B}` (A is in the set).
+- All six prior inc-6/7 alias tests still pass unchanged. Full jit suite 788/788.
+
+**Next**: a load base that flows through a phi can only hoist once
+`is_loop_invariant` admits a non-loop-carried invariant phi (today it rejects all
+phis, so phi *load* bases never reach the oracle); and treating a `final`/
+effectively-immutable field load as invariant regardless of stores to other
+fields of the same object.
 
 ## Implementation steps (ordered)
 
