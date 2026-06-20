@@ -9106,7 +9106,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Class",
         "getDeclaredAnnotationsByType",
         "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
-        native_class_get_annotations_by_type,
+        lang_class::native_class_get_declared_annotations_by_type,
     );
     // Field annotation methods
     registry.register(

@@ -51,9 +51,11 @@ The machinery is real; the gates keep it mostly off.
   is currently used mostly for its `bytecode_len` walker (`lib.rs:3959`,
   `:4790`); the IV/trip-count analysis is not driving an aggressive unroll/LICM
   decision on the general path.
-- **DSE is the notable gap.** There is `eliminate_dead_nodes` (pure-node DCE)
-  but no *dead-store* elimination (eliminating a `StoreField`/`StoreStatic`
-  whose value is overwritten before any read) on the general path.
+- **DSE was the notable gap — now landed** (increments 1/2/4). Alongside
+  `eliminate_dead_nodes` (pure-node DCE) there is now `eliminate_dead_stores`
+  (overwrite + write-only dead-*store* elimination, with the load-alias
+  refinement of increment 4). The original-state gap this bullet described is
+  closed; see the increment notes below.
 
 Net: passes are correct and tested; the **φ/branch lowering bug** (`lib.rs:4143`)
 is the dam holding back broad activation, and DSE / aggressive LICM-via-SCEV are
@@ -303,6 +305,238 @@ the loops were actually unrolled. Default (flag off) is byte-for-byte unchanged.
 **Next**: partial unrolling (unroll-by-factor with a remainder) for large/
 non-constant trips; unrolling loops with internal branches (clone control);
 re-using the new node-clone approach to make LICM fire on `Merge` headers.
+
+## Increment 4 (DSE load-alias refinement) landed
+
+Status: **landed** on `dev`. A precision improvement to the DSE overwrite phase
+(Front 2.1) — the first slice of a real (if minimal) alias oracle.
+
+**What landed** (`jit/src/ir_optimize.rs`, `eliminate_dead_stores`):
+
+- The straight-line overwrite scan previously treated **every** `Op::Load` as an
+  unconditional memory barrier (flushing all pending stores). It now resolves a
+  load against the pending set with **allocation-level alias precision**:
+  - Every pending store targets a local `New`/`NewArray` allocation, and two
+    distinct local allocations never alias (the same fact the `(base, idx, kind)`
+    location key already relies on). So a load whose base is a **different local
+    allocation** flushes only pending stores to *its own* base, leaving stores to
+    other local objects dead-eligible.
+  - A load from a **non-local / unreadable base** (a `Param`, a `Call`/`Load`
+    result, a phi, …) may alias any escaped local and still flushes everything.
+- **Soundness**: the only way to read allocation `A`'s field is a load whose base
+  resolves to `A` (which flushes `A`'s pending stores) or to a non-local node
+  such as a load/phi result (which flushes all). So a store can only be removed
+  as overwritten when no load between it and its overwrite could observe `A`. The
+  shared `is_memory_barrier` helper still classifies `Load` as a barrier as the
+  safe fallback should the explicit load arm ever be removed.
+
+**Tests added** — `cargo test -p cratonvm-jit dse`:
+- `test_dse_removes_overwrite_across_unrelated_local_load` — `store A; load B
+  (distinct local); store A` ⇒ the first store to `A` is removed.
+- `test_dse_keeps_overwrite_across_nonlocal_load` — `store A; load P (Param);
+  store A` ⇒ the first store to `A` is kept (conservative full barrier).
+- All six pre-existing DSE tests still pass (the same-object-load and
+  distinct-fields cases were already exercising the same-base flush path).
+
+**Not yet done**: a general alias oracle that also lets a load past a
+*non-aliasing* in-loop store drive LICM hoisting (Front 2.2), and array-element
+overwrite DSE (still gated on a real array `Store` operand layout).
+
+## Increment 5 (LICM fires on javac `Merge`-header loops) landed
+
+Status: **landed** on `dev`, behind the existing default-OFF `CRATONVM_JIT_LICM`
+soak flag. Closes the increment-2/3 follow-up "make LICM fire on `Merge`
+headers": until now LICM only recognised `Op::Region` loop headers (the
+hand-built / EA-bridge shape), so it **never fired on real code** — the
+production bytecode→IR builder emits javac loops as a back-edge `Op::Merge`
+(the same shape the unroll pass already handles).
+
+**What landed** (`jit/src/ir_optimize.rs`):
+
+- **Generalised loop discovery (`loop_headers`)** replaces the
+  `Region`-only `loop_regions`. A header is an `Op::Region` *or* a back-edge
+  `Op::Merge`; of its control inputs, the back-edge(s) are control-reachable
+  forward from the header itself (`forward_control_closure`) and the remaining
+  input is the pre-header. Resolving entry vs back-edge **structurally** — not by
+  assuming the entry sits at input slot 0 — is essential because the builder does
+  not fix a `Merge` header's slot order (mirrors the unroll pass's discovery).
+  Only reducible single-entry loops (exactly one pre-header) are returned.
+- **`licm` now runs `collapse_trivial_merges` first** (the same normalisation
+  unroll uses, folding the single-input `Merge` control pass-throughs the builder
+  wraps around branch projections) so real loop headers/back-edges are
+  recognisable, and uses the **classified** entry-predecessor as the pre-header.
+- **`loop_body` takes the classified `(entry_pred, back_ctrls)`** and its forward
+  control walk no longer stops at nested headers: an over-large forward set is
+  trimmed back to the natural loop by the backward-reachability intersection, so
+  a nested loop's control (and its barriers) stays *inside* the body. This is the
+  safe direction — over-approximating the body only loses hoists, whereas
+  under-approximating could hide a nested-loop store from the barrier check.
+  (Net: also tightens the pre-existing nested-`Region` handling.)
+
+**Soundness**: unchanged hoist criteria — only an `Op::Load` whose base and
+address are loop-invariant, in a body with **no** memory barrier, is re-anchored
+to the pre-header. The new code only changes which loops are *discovered* and how
+entry/back-edge are identified; misclassification is prevented by the same
+forward-reachability test the validated unroll pass uses.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_invariant_load_merge_header` — an invariant load in a
+  barrier-free `Merge`-header loop is hoisted to the pre-header.
+- `test_licm_merge_header_classifies_entry_regardless_of_slot_order` — with the
+  back-edge moved to input slot 0, LICM still hoists to the structurally-resolved
+  entry (never the back-edge), proving slot-order independence.
+- All four pre-existing `Region`-header LICM tests still pass.
+
+**Boundary**: like the increment-1/2/4 escape/DSE work, LICM's load *hoisting*
+only fires once the IR builder emits `Op::Load` (it currently bails on
+field/array load opcodes, so production IR has no loads to hoist yet). What this
+increment delivers now is correct **loop recognition** on the real `Merge`-header
+shape — the prerequisite for every loop optimisation on real code, and already
+proven to reach the IR path live by the unroll pass (increment 3). A general
+alias oracle (hoist past a non-aliasing in-loop store) is increment 6.
+
+## Increment 6 (LICM minimal alias oracle — hoist past non-aliasing stores) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` soak
+flag. Closes the recurring increment-2/4/5 follow-up "let a load hoist past a
+*non-aliasing* in-loop store". Composes the increment-4 DSE alias insight
+("distinct local allocations never alias") with the increment-5 loop discovery.
+
+**What landed** (`jit/src/ir_optimize.rs`): LICM no longer bails the whole loop
+on *any* in-body memory effect. The barrier check is split:
+
+- **`loop_has_hard_barrier`** (replaces the all-or-nothing `loop_has_memory_
+  barrier`): a `Call`, allocation (`New`/`NewArray`, constructor side effects),
+  guard, or monitor still disqualifies ALL hoisting — these may touch arbitrary
+  memory. An in-loop `Store` is *not* a hard barrier.
+- **`load_safe_past_loop_stores`** (per-load alias gate): a candidate invariant
+  load is hoisted past the in-loop stores only when the load base AND every
+  in-loop store base are **distinct local allocations**. A store writes only the
+  memory of the object it names, so a store to a different `New`/`NewArray`
+  leaves the load's object untouched (regardless of escape). Any non-local /
+  unreadable / same base keeps the load pinned (conservative). Loops with no
+  store at all behave exactly as before.
+
+**Soundness**: the only relaxation is per-load and rests entirely on the
+distinct-`New`-nodes-don't-alias invariant (the same one DSE increment 4 uses);
+a wrong hoist past an aliasing store would be a stale-read miscompile, so the
+oracle bails on anything it cannot prove distinct.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_past_nonaliasing_local_store` — load of `A.f` hoists
+  past an in-loop store to a distinct allocation `B.f`.
+- `test_licm_keeps_load_when_store_to_same_alloc` — store to the *same* `A`
+  keeps the load pinned (may alias).
+- `test_licm_keeps_load_when_store_base_non_local` — store through a `Param`
+  base keeps the load pinned (not provably non-aliasing).
+- The pre-existing `test_licm_bails_on_barrier_in_loop` still bails — its in-body
+  `New` is now the hard barrier. Full jit suite 784/784.
+
+**Boundary**: same latency as increments 1/2/4/5 — the oracle only fires once the
+IR builder emits `Op::Load`/`Op::Store` (production IR has neither yet).
+Increment 7 extends the oracle past the local-alloc-only case.
+
+## Increment 7 (alias oracle: store-to-alloc cannot alias a parameter load) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Widens the increment-6 LICM alias oracle by one provably-sound class.
+
+**What landed** (`jit/src/ir_optimize.rs`, `load_safe_past_loop_stores`): the
+hoistable **load** base is no longer restricted to a local allocation — it may
+now also be a **method parameter** (`Op::Param`, including `this`). The reasoning:
+a `New`/`NewArray` executed in this method produces a reference that is *never*
+an already-existing object, so it can never equal a parameter the caller passed
+in (object identity is fixed at allocation, and this holds even if the
+allocation later escapes). Hence a store to a fresh local allocation leaves any
+parameter's memory untouched, and a load from a parameter may hoist past it.
+
+**Asymmetry (deliberate)**: the **store** base is *not* widened to `Param`. Two
+distinct parameters can be the same object (`foo(x, x)`), so a store through a
+parameter is not provably non-aliasing — every in-loop store must still write a
+distinct local `New`/`NewArray`. The widening is load-side only.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_param_load_past_local_store` — a load of `P.f` (parameter)
+  hoists past an in-loop store to a local allocation `B.f`.
+- `test_licm_keeps_param_load_when_store_base_is_param` — a load of `P0.f` does
+  NOT hoist past a store through `P1` (parameters may alias), locking the
+  store-side asymmetry.
+- All prior LICM/DSE/escape tests still pass. Full jit suite 786/786.
+
+**Next**: increment 8 adds cross-merge points-to.
+
+## Increment 8 (alias oracle: cross-merge points-to through phis) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Generalises the increment-6/7 LICM alias oracle from direct `New`/`Param` bases
+to bases that flow through a `Phi` (the IR's cross-merge primitive — Java
+`select`/ternary lower to branch + phi, not a select op).
+
+**What landed** (`jit/src/ir_optimize.rs`): the ad-hoc per-base checks were
+replaced by a small points-to lattice that the oracle resolves for every load
+and store base:
+
+- **`resolve_ref_points_to`** maps a reference node to `{ allocs: Option<set>,
+  has_pre: bool }`: a `New`/`NewArray` → that fresh allocation; a `Param` →
+  pre-existing (no allocation); a `Phi` → the join of its value inputs (alloc
+  sets union, `has_pre` ORs, any unknown input poisons `allocs` to `None`); a
+  loop-carried phi cycle bottoms out at a depth bound → unknown. Anything else →
+  unknown.
+- **`loop_store_clobber`** summarises the loop's stores once: the union of
+  allocations they may write, or `None` if any store is *opaque* (base resolves
+  to a pre-existing or unknown value — could alias anything), which blocks all
+  hoisting. A store via `(cond ? A : B).f` now resolves to writing `{A, B}`
+  instead of bailing because the base is not a direct `New`.
+- **`load_safe_past_clobber`** hoists a load when its possible-allocation set is
+  disjoint from the clobber set (its pre-existing/parameter component is always
+  safe — a fresh allocation is never an already-existing object).
+
+This **subsumes increments 6 and 7 exactly** (a direct `New` base resolves to a
+singleton set; a `Param` to the empty-set/pre-existing case) and adds the
+phi-base case. The store base is still NOT widened to `Param` (two parameters can
+be the same object); only definite-alloc-set stores are tame.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_past_phi_store_of_distinct_allocs` — a store through a
+  phi merging `{A, B}` does not block a load of a disjoint allocation `C`.
+- `test_licm_keeps_load_when_phi_store_includes_its_alloc` — a load of `A` stays
+  pinned past a phi-store that writes `{A, B}` (A is in the set).
+- All six prior inc-6/7 alias tests still pass unchanged. Full jit suite 788/788.
+
+**Next**: increment 9 admits a non-loop-carried invariant phi so phi *load*
+bases hoist.
+
+## Increment 9 (invariant phi recognition — cross-merge on the load side) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Completes the cross-merge story by admitting an invariant `Phi` as a hoistable
+load base — the increment-8 oracle could already resolve a phi *store* base, but
+`is_loop_invariant` rejected *every* phi, so a phi *load* base never reached it.
+
+**What landed** (`jit/src/ir_optimize.rs`, `is_loop_invariant_d`): the blanket
+`Op::Phi => false` is replaced by a sound test — a phi is loop-invariant iff:
+
+- its **control anchor** (input slot 0, the merge point) is OUTSIDE the loop
+  body — so the merge is decided once, before the loop, not per iteration — AND
+- every **value input** (slots 1..) is itself loop-invariant.
+
+A phi anchored at this loop's region (induction / loop-carried) or at an in-loop
+merge (an in-loop `if`/`else` join) has its anchor IN the body and stays variant,
+exactly as before. Recursion is depth-bounded, so a self-referential value input
+bottoms out as variant. This makes the `x = cond ? new A() : new B(); for (…) …
+x.f …` shape hoist its `x.f` load: `x` is a pre-loop invariant phi, and the
+increment-8 points-to resolver already understands `{A, B}` for the alias check.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_with_invariant_phi_base` — a load over a phi merged
+  before the loop (anchor outside the body) over invariant allocations hoists.
+- The existing `test_licm_does_not_hoist_variant_load` still passes and now
+  exercises the region-anchored-phi → variant path under the new logic.
+- Full jit suite 789/789.
+
+**Next**: treat a `final`/effectively-immutable field load as invariant
+regardless of in-loop stores to *other* fields of the same object (a field-
+sensitive refinement of the alias oracle).
 
 ## Implementation steps (ordered)
 

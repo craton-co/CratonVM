@@ -1,5 +1,11 @@
 # BUG-06-FAM5 — reflection returns `null` where HotSpot returns a `Class`/`Method` (`getDeclaredMethod on null` ×28)
 
+> **UPDATE 2026-06-20:** Still not reproducible standalone. During the fam6 synthesis work
+> (branch `fix/bug06-fam6-repeatable-merge`) the entire `AnnotationUtilsTests` (72/72) and
+> `AnnotatedElementUtilsTests` (82/82) reflection surface passed under `--nojit`; no
+> `getDeclaredMethod`-on-null surfaced in any annotation-cluster class. Consistent with the
+> "cross-family cascade, needs suite-level bisection" diagnosis below — not a single reflection-null.
+
 **Severity:** Medium — CV-unique reflection mismatch in the Spring suite assertion tail.
 **Status:** 🟡 PARTIAL (audit 2026-06-19) — the one clean family-5 reflection-null is **FIXED**: lambda/method-ref `getGenericSuperclass` now returns `Object` not `null` (`9d0974cf`, default path; `lang_class.rs` lambda guard). Residual **OPEN**: the headline `getDeclaredMethod`-on-null ×28 is a cross-family **cascade** (bug-04 GC + bug-05 generics + synthetic-type gaps), not a single reflection-null; per-test attribution never completed. Refl5/Refl6/BridgeProbe/SpringFam5 are byte-identical to HotSpot. Handoff / needs suite-level bisection.
 **Mode:** Interpreter (JIT-off); the null comes from a native, not codegen.
