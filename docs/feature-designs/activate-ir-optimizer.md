@@ -393,7 +393,50 @@ field/array load opcodes, so production IR has no loads to hoist yet). What this
 increment delivers now is correct **loop recognition** on the real `Merge`-header
 shape — the prerequisite for every loop optimisation on real code, and already
 proven to reach the IR path live by the unroll pass (increment 3). A general
-alias oracle (hoist past a non-aliasing in-loop store) remains future work.
+alias oracle (hoist past a non-aliasing in-loop store) is increment 6.
+
+## Increment 6 (LICM minimal alias oracle — hoist past non-aliasing stores) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` soak
+flag. Closes the recurring increment-2/4/5 follow-up "let a load hoist past a
+*non-aliasing* in-loop store". Composes the increment-4 DSE alias insight
+("distinct local allocations never alias") with the increment-5 loop discovery.
+
+**What landed** (`jit/src/ir_optimize.rs`): LICM no longer bails the whole loop
+on *any* in-body memory effect. The barrier check is split:
+
+- **`loop_has_hard_barrier`** (replaces the all-or-nothing `loop_has_memory_
+  barrier`): a `Call`, allocation (`New`/`NewArray`, constructor side effects),
+  guard, or monitor still disqualifies ALL hoisting — these may touch arbitrary
+  memory. An in-loop `Store` is *not* a hard barrier.
+- **`load_safe_past_loop_stores`** (per-load alias gate): a candidate invariant
+  load is hoisted past the in-loop stores only when the load base AND every
+  in-loop store base are **distinct local allocations**. A store writes only the
+  memory of the object it names, so a store to a different `New`/`NewArray`
+  leaves the load's object untouched (regardless of escape). Any non-local /
+  unreadable / same base keeps the load pinned (conservative). Loops with no
+  store at all behave exactly as before.
+
+**Soundness**: the only relaxation is per-load and rests entirely on the
+distinct-`New`-nodes-don't-alias invariant (the same one DSE increment 4 uses);
+a wrong hoist past an aliasing store would be a stale-read miscompile, so the
+oracle bails on anything it cannot prove distinct.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_past_nonaliasing_local_store` — load of `A.f` hoists
+  past an in-loop store to a distinct allocation `B.f`.
+- `test_licm_keeps_load_when_store_to_same_alloc` — store to the *same* `A`
+  keeps the load pinned (may alias).
+- `test_licm_keeps_load_when_store_base_non_local` — store through a `Param`
+  base keeps the load pinned (not provably non-aliasing).
+- The pre-existing `test_licm_bails_on_barrier_in_loop` still bails — its in-body
+  `New` is now the hard barrier. Full jit suite 784/784.
+
+**Boundary**: same latency as increments 1/2/4/5 — the oracle only fires once the
+IR builder emits `Op::Load`/`Op::Store` (production IR has neither yet). Next:
+extend the oracle past the local-alloc-only case (a store to a local alloc can't
+alias a load from a method `Param` either), and the cross-merge points-to needed
+for non-trivial bases.
 
 ## Implementation steps (ordered)
 
