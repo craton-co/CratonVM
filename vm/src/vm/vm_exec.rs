@@ -10557,6 +10557,18 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "arrayElementGetter"
                                 | "arrayElementSetter"
+                                // METHODHANDLES.CONSTANT: concrete static factory
+                                // whose JDK 25 bytecode runs the runtime
+                                // `BoundMethodHandle` species generator
+                                // (`makeConstantReturning` → `ClassSpecializer`),
+                                // unimplemented by CratonVM's `MH_KIND_*` shim model
+                                // — it NPEs in `generateConcreteSpeciesCode`,
+                                // breaking `SwitchPoint.<clinit>` and therefore every
+                                // Apache Groovy `invokedynamic` site. Pin the
+                                // functional `MH_KIND_CONSTANT` native
+                                // (`register_method_handles_constant_bridge`) ahead of
+                                // the broken bytecode.
+                                | "constant"
                             ))
                         // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
                         // calls `ObjectStreamClass$RecordSupport.deserializationCtr`

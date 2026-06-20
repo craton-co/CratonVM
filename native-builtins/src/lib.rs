@@ -9873,6 +9873,22 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // pins the native ahead of the (broken) JDK bytecode.
     crate::lang_invoke::register_array_element_accessor_bridges(registry);
 
+    // METHODHANDLES.CONSTANT (real-JDK mode): `MethodHandles.constant` runs
+    // genuine JDK bytecode that spins a `BoundMethodHandle` *species* class via
+    // `ClassSpecializer` (`makeConstantReturning` → `createConstantForm` →
+    // `BoundMethodHandle.<clinit>`). CratonVM models method handles with its
+    // `MH_KIND_*` shims rather than the real `BoundMethodHandle`/`LambdaForm`
+    // machinery, so that bytecode NPEs at
+    // `ClassSpecializer.generateConcreteSpeciesCode`, surfacing as
+    // `ExceptionInInitializerError` for `BoundMethodHandle`. `SwitchPoint.<clinit>`
+    // builds `K_true`/`K_false` via `constant(boolean.class, …)`, and Apache
+    // Groovy's `IndyInterface.<clinit>` initializes a `SwitchPoint` before any
+    // script executes — so without this shim every Groovy `invokedynamic` site
+    // dies. Pin the functional `MH_KIND_CONSTANT` shim ahead of the (broken) JDK
+    // bytecode; the companion `check_override` allow-list entry in
+    // `vm/src/vm/vm_exec.rs` makes the native win at the call site.
+    crate::lang_invoke::register_method_handles_constant_bridge(registry);
+
     // RECORD DESERIALIZATION (real-JDK mode): `ObjectInputStream.readRecord`
     // rebuilds a serialized record by invoking the `MethodHandle` returned by
     // `ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`,

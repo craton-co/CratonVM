@@ -3091,27 +3091,58 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+/// `MethodHandles.constant(Class type, Object value)` — a *functional*
+/// shim that returns an `MH_KIND_CONSTANT` handle which, when invoked,
+/// yields the captured `value`.
+///
+/// Promoted to the real-JDK essentials path (see `register_builtins`) — and
+/// allow-listed in `vm/src/vm/vm_exec.rs`'s `check_override` gate — because
+/// the genuine JDK `MethodHandles.constant` bytecode runs the runtime
+/// `BoundMethodHandle` *species* generator (`ClassSpecializer`), which the
+/// VM's `MH_KIND_*` shim model does not implement. That path NPEs at
+/// `ClassSpecializer.generateConcreteSpeciesCode` (the generated species
+/// class came back without working species-data linkage), wrapped as
+/// `ExceptionInInitializerError` for `BoundMethodHandle`. `SwitchPoint.<clinit>`
+/// builds two constant handles (`K_true`/`K_false`), and Apache Groovy's
+/// `IndyInterface.<clinit>` initializes a `SwitchPoint` before any script
+/// runs — so without this shim every Groovy `invokedynamic` site is dead.
+/// This mirrors the existing `register_array_element_accessor_bridges`
+/// pattern (another concrete `MethodHandles` static factory whose JDK
+/// bytecode CratonVM cannot execute).
+pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "java/lang/invoke/MethodHandles",
+        "constant",
+        "(Ljava/lang/Class;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            // arg0 = return type (Class mirror); arg1 = the (boxed) value.
+            let ret_desc = match args.first() {
+                Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
+                _ => DESC_OBJECT.to_string(),
+            };
+            let desc = format!("(){ret_desc}");
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT);
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(handle, MH_BOUND, value);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
     register_array_element_accessor_bridges(r);
+    // Functional `constant` shim (shared with the real-JDK essentials path).
+    register_method_handles_constant_bridge(r);
     r.register(
         mh,
         "identity",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        mh,
-        "constant",
-        "(Ljava/lang/Class;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
             if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
@@ -3526,6 +3557,23 @@ pub(crate) const MH_KIND_LAMBDA_FACTORY: i32 = 10;
 /// synthetic MethodHandles cannot execute (see
 /// `register_array_element_accessor_bridges`).
 pub(crate) const MH_KIND_RECORD_DESER: i32 = 11;
+/// Constant method handle produced by `MethodHandles.constant(type, value)`.
+/// A nullary handle that ignores all arguments and returns a captured value.
+/// `MH_BOUND` holds the (boxed) constant; `MH_DESC` is `()<type>` so the
+/// dispatch arm can coerce the boxed value to a primitive return type.
+///
+/// CratonVM needs this because in real-JDK mode `MethodHandles.constant`
+/// runs genuine JDK bytecode (`MethodHandleImpl.makeConstantReturning` →
+/// `LambdaForm.createConstantForm` → `BoundMethodHandle.<clinit>` →
+/// `ClassSpecializer` runtime *species* class generation). The VM models
+/// method handles with these `MH_KIND_*` shims instead of the real
+/// `BoundMethodHandle`/`LambdaForm` machinery, so that bytecode path dies
+/// generating a species class. `SwitchPoint.<clinit>` is the first thing
+/// Apache Groovy's `IndyInterface.<clinit>` triggers (it builds `K_true`/
+/// `K_false` via `MethodHandles.constant(boolean.class, …)`), so the failure
+/// breaks EVERY Groovy `invokedynamic` call site. Shimming `constant`
+/// keeps that init off the real species path entirely.
+pub(crate) const MH_KIND_CONSTANT: i32 = 12;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -4295,6 +4343,25 @@ pub(crate) fn mh_dispatch(
             // [primValues:byte[], objValues:Object[]] as passed by
             // `ObjectInputStream.readRecord`. Reflectively rebuild the record.
             record_deser_dispatch(ctx, mh, extra_args)
+        }
+        MH_KIND_CONSTANT => {
+            // constant(type, value): nullary handle that ignores its arguments
+            // and returns the captured value held in MH_BOUND. When the handle's
+            // return type is a primitive, unbox the captured wrapper so an
+            // `invokeExact()Z`/`()I`/… observes the raw value (and so the GUARD
+            // arm's `Int(v) => v != 0` boolean test stays correct). For a
+            // reference return type the captured object passes through unchanged;
+            // the signature-polymorphic return adapter re-boxes if the call site
+            // wants `Object`.
+            let ret = return_type_desc(&desc);
+            let v = match ret {
+                "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" => match bound {
+                    Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
+                    other => other,
+                },
+                _ => bound,
+            };
+            Ok(Some(v))
         }
         _ => {
             // Virtual: first extra_arg is receiver (unless bound)
