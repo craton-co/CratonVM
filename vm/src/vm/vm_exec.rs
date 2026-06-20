@@ -8060,21 +8060,16 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
             if cname == "java/lang/annotation/AnnotationProxy" {
                 return annotation_proxy_hash_code(shared, obj);
             }
-            // Class mirror вЂ” hash the class name (matches Class.hashCode в†’ name.hashCode)
-            if cname == "java/lang/Class" {
-                if let Some(name) = class_mirror_name(shared, obj) {
-                    return java_string_hash(&internal_to_dotted(&name));
-                }
-            }
-            // Enum / generic object вЂ” hash the `name` field if present (matches
-            // Enum.hashCode в†’ identity), else identity hash code.
-            if let Value::Object(Some(name_ref)) = shared.heap.get_field(obj, 0) {
-                if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
-                    if !name.is_empty() {
-                        return java_string_hash(&name);
-                    }
-                }
-            }
+            // Class mirror, Enum constant, and any other reference-typed member
+            // hash via `value.hashCode()`. `Class` and `Enum` do NOT override
+            // `Object.hashCode()`, so per the `Annotation.hashCode()` spec their
+            // member hash is the IDENTITY hash code вЂ” NOT a name-derived hash.
+            // (The native annotation proxy previously hashed the class/enum name,
+            // which disagreed with Spring's synthesized proxy that calls the real
+            // `value.hashCode()` в†’ identity, so `equals` could hold while the
+            // hash codes differed, breaking `MergedAnnotation` synthesis.) Both
+            // sides reference the same singleton mirror / enum constant within a
+            // run, so the identity hashes agree.
             shared.heap.identity_hash_code(obj)
         }
         _ => 0,
