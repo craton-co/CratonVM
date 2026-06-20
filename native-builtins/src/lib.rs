@@ -40181,23 +40181,28 @@ pub fn real_proxy_strict() -> bool {
     })
 }
 
-/// proxy-real-classfile real-super migration — generate `$ProxyN` classes that
-/// extend the **real** `java.lang.reflect.Proxy` (sole instance field `h` at
-/// slot 0, matching the handler slot the dispatch path reads) rather than the
-/// synthetic `java/lang/reflect/Proxy$Instance` shim. DEFAULT **OFF**: the
-/// synthetic super remains the default until the real-super path soaks against
-/// the reflection suites; both paths are kept (nothing is deleted) so the
-/// synthetic shim is still available for experiments via the default.
+/// proxy-real-classfile real-super gate — generate `$ProxyN` classes that extend
+/// the **real** `java.lang.reflect.Proxy` (sole instance field `h` at slot 0,
+/// matching the handler slot the dispatch path reads). DEFAULT **ON** (per the
+/// "real Java by default, synthetic experimental" project rule): real-`Proxy`-super
+/// proxies match HotSpot for `getSuperclass()` / `instanceof Proxy`. Set
+/// `CRATONVM_REAL_PROXY_SUPER=0` (or `false` / `off` / `no`) to opt into the
+/// **experimental synthetic** `java/lang/reflect/Proxy$Instance` super instead —
+/// both paths are kept and working; NOTHING is deleted (the synthetic super is a
+/// real experimental implementation, not a no-op stub).
 ///
 /// Must stay in lockstep with the VM-side accessor
 /// `crate::runtime::env_cache::real_proxy_super()` (same env var) — the VM reads
 /// it to recognise real-`Proxy`-super proxies in the dispatch chain walk.
-/// `CRATONVM_REAL_PROXY_SUPER` = `1`/`true`/`on`/`yes` → on.
 pub fn real_proxy_super() -> bool {
-    matches!(std::env::var("CRATONVM_REAL_PROXY_SUPER"), Ok(v) if {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "on" || v == "yes"
-    })
+    match std::env::var("CRATONVM_REAL_PROXY_SUPER") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        // Unset (the default): real `java.lang.reflect.Proxy` super.
+        Err(_) => true,
+    }
 }
 
 /// The internal name of the super class generated `$ProxyN` proxies extend,
@@ -40257,17 +40262,18 @@ mod proxy_strict_gate_tests {
         assert!(!super::real_proxy_strict());
     }
 
-    /// proxy-real-classfile real-super migration: the real-`Proxy`-super path is
-    /// opt-in and OFF by default, so generated proxies keep extending the
-    /// synthetic `Proxy$Instance` shim until the soak flips it. (Both paths are
-    /// retained — nothing is deleted.)
+    /// proxy-real-classfile real-super gate: real `java.lang.reflect.Proxy` is the
+    /// super by DEFAULT (real Java by default; the synthetic `Proxy$Instance` super
+    /// is the experimental opt-out via `CRATONVM_REAL_PROXY_SUPER=0`). Both paths
+    /// are retained — nothing is deleted. (Env-unset default asserted here; the
+    /// opt-out is exercised by the proxy soak under `CRATONVM_REAL_PROXY_SUPER=0`.)
     #[test]
-    fn real_proxy_super_defaults_off() {
-        assert!(!super::real_proxy_super());
-        assert_eq!(
-            super::proxy_super_class_name(),
-            "java/lang/reflect/Proxy$Instance"
-        );
+    fn real_proxy_super_defaults_on() {
+        // Only meaningful when the env var is not set in the test environment.
+        if std::env::var_os("CRATONVM_REAL_PROXY_SUPER").is_none() {
+            assert!(super::real_proxy_super());
+            assert_eq!(super::proxy_super_class_name(), "java/lang/reflect/Proxy");
+        }
     }
 }
 

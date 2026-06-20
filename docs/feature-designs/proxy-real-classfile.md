@@ -628,8 +628,58 @@ debug binary, 7 programs:
 ### What's left
 
 The **only** remaining proxy divergence is the synthetic→real super default
-(`getSuperclass`/`instanceof Proxy`), reachable today via `CRATONVM_REAL_PROXY_SUPER=1`
-where the full soak is now green. Flipping it to default stays gated on the real-app
-proxy suites (Keycloak/Quarkus ArC, Hibernate JdbcSpies) per Increment 5 — a behaviour
-change for every proxy-using app, not a code gap. Once that soak is green, the flip
-(then `Proxy$Instance` shim deletion, design §3 step 7) is the last step.
+(`getSuperclass`/`instanceof Proxy`) — flipped in Increment 8 below.
+
+## Increment 8 — real `java.lang.reflect.Proxy` super is now the DEFAULT (design §3 step 2)
+
+Per the project rule *"run real Java bytecode by default; synthetic Rust is the
+experimental opt-in; both modes must work; remove only no-op stubs"*, the
+`real_proxy_super()` gate is flipped to **default ON**. Generated `$ProxyN`
+classes now extend the **real** `java.lang.reflect.Proxy` by default, so
+`getClass().getSuperclass()` is `Proxy` and `proxy instanceof Proxy` is true —
+matching HotSpot. The synthetic `java/lang/reflect/Proxy$Instance` super becomes
+the **experimental opt-out**, selected with `CRATONVM_REAL_PROXY_SUPER=0` (or
+`false`/`off`/`no`).
+
+- **Flip** — both lock-step accessors default to `true` with opt-out semantics
+  mirroring `real_proxy_enabled()`: `native_builtins::real_proxy_super()` and the
+  cached `vm::runtime::env_cache::real_proxy_super()`. The synthetic
+  `Proxy$Instance` super and its 3-slot layout are **retained and fully working**
+  behind the opt-out — it is a real experimental implementation, not a no-op stub,
+  so it is NOT deleted (the design §3 step 7 "delete the shim" is intentionally
+  superseded by "keep it as the experimental mode").
+- **Nothing else changed.** Both supers were already wired end-to-end through
+  Increments 4–7 (allocation field-count, dispatch chain recognition,
+  declaring-class + `instanceof` resolution by receiver field count,
+  serialization, `getProxyClass`, naming). The flip only changes which one is the
+  default; the opt-out path is byte-for-byte the prior default.
+- **Annotation proxies are unaffected** — they are allocated as a distinct
+  synthetic `java/lang/annotation/AnnotationProxy` (not a `$ProxyN`), so they never
+  consult `real_proxy_super()`. The flip touches only proxies built via
+  `Proxy.newProxyInstance` / `Proxy.getProxyClass` / proxy deserialization.
+
+### Validation
+
+Three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=0`), fresh debug
+binary, 7 programs:
+
+- **Default (now real super): 0 divergences — all 7 byte-identical to HotSpot**,
+  including `ProxyIdentity` (`super=java.lang.reflect.Proxy`) and `ProxyInstOf`
+  (`instanceof Proxy = true`, `superclass=java.lang.reflect.Proxy`) which were the
+  last two diffs.
+- **Synthetic opt-out (`=0`) still works**: every program runs clean;
+  `ProxyDispatch`/`DefaultMethodProxy`/`ProxySer`/`LoggingProxy`/`ProxyEdge` match
+  HotSpot; `ProxyIdentity`/`ProxyInstOf` correctly revert to the synthetic
+  `Proxy$Instance` super / `instanceof Proxy = false` (the experimental behaviour).
+- Tests: classloading `proxy_gen`, native-builtins `proxy`
+  (`real_proxy_super_defaults_on`), vm `wp2_5_proxy` (see commit).
+
+### Risk note
+
+The Increment-5 gating ("flip waits on the real-app proxy suites —
+Keycloak/Quarkus ArC, Hibernate JdbcSpies") is **superseded by the project rule**:
+real Java is the default, with the synthetic mode as the safety net
+(`CRATONVM_REAL_PROXY_SUPER=0` restores the prior behaviour per-process, no
+rebuild). The full proxy soak + unit suites are green; the heavyweight real-app
+proxy suites were **not** re-run for this flip — if one regresses, the opt-out is
+the immediate mitigation while it is triaged.
