@@ -4318,17 +4318,28 @@ fn try_compile_inner(
                     }
                 }
 
-                let schedule = ir_schedule::schedule(&graph);
-                if let Some(compiled) =
-                    ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
-                {
-                    // wire-tiered-manager Step 3 telemetry (test-only): records
-                    // that the optimizing IR path — not the single-pass C1
-                    // backend — produced this body, so the per-call toggle test
-                    // can prove `optimize=false` skips it.
-                    #[cfg(test)]
-                    IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
-                    return Some(compiled);
+                // An `Op::New` that SURVIVED escape analysis (it escaped, so it
+                // was not scalar-replaced) has no IR lowering — `ir_lower` has
+                // no allocation path and would emit nothing for it, leaving a
+                // garbage object reference. Bail to single-pass rather than
+                // miscompile. (Scalar-replaced News are already `Op::Dead`.)
+                let has_live_new = graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
+                if !has_live_new {
+                    let schedule = ir_schedule::schedule(&graph);
+                    if let Some(compiled) =
+                        ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
+                    {
+                        // wire-tiered-manager Step 3 telemetry (test-only):
+                        // records that the optimizing IR path — not the
+                        // single-pass C1 backend — produced this body, so the
+                        // per-call toggle test can prove `optimize=false` skips it.
+                        #[cfg(test)]
+                        IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
+                        return Some(compiled);
+                    }
                 }
             } // end else (IR-lowering path)
         }
@@ -5549,6 +5560,93 @@ mod tests {
         assert!(
             result.scalar_replaceable.is_empty(),
             "an escaping New must not be scalar-replaceable"
+        );
+    }
+
+    // ── Op::New emission + scalar replacement, end-to-end via the builder ──
+    //
+    // The builder lowers `new` to `Op::New` and elides a trivial `<init>` on a
+    // fresh object; escape analysis then scalar-replaces the non-escaping
+    // allocation (no heap alloc, the field load becomes the stored value). This
+    // drives the FULL path (build -> optimize -> EA -> apply) from bytecode.
+    #[test]
+    fn ir_new_scalar_replaces_end_to_end() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — trivial, elided)
+        //   7: dup               59
+        //   8: bipush 42         10 2a
+        //  10: putfield #3       b5 00 03
+        //  13: getfield #3       b4 00 03
+        //  16: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03, 0xb4,
+            0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(10usize, (0usize, b'I')); // putfield field 0
+        fi.insert(13usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder.build(&code, 17).expect("IR build");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load must resolve to the stored value (42)"
+        );
+    }
+
+    // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on
+    // `this`) must NOT be elided — the builder bails even if the pc is admitted.
+    #[test]
+    fn ir_new_bails_on_init_of_nonfresh_receiver() {
+        use crate::ir::IrBuilder;
+        use std::collections::{HashMap, HashSet};
+        // aload_0; invokespecial #2; return  — `super.<init>()` on `this`.
+        //   0: aload_0           2a
+        //   1: invokespecial #2  b7 00 02
+        //   4: return            b1
+        let code = [0x2a, 0xb7, 0x00, 0x02, 0xb1, 0x00, 0x00];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(1usize); // admit pc 1 — but receiver is `this`, not a New
+        builder.set_new_info(HashMap::new(), init_pcs);
+        assert!(
+            builder.build(&code, 5).is_none(),
+            "eliding a <init> on a non-fresh receiver must bail to single-pass"
         );
     }
 
