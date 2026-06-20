@@ -4221,7 +4221,22 @@ fn try_compile_inner(
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
-        let builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // Thread the resolved instance-field layout (pc → (field_index,
+        // type_tag)) into the builder so it can lower an int-category
+        // `getfield` into `Op::Load`. A field the resolver can't resolve is
+        // simply omitted; the builder then bails that getfield to single-pass.
+        if !scan.field_ops.is_empty() {
+            if let Some(resolver) = cp_field_resolver {
+                let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
+                for &(pc, cp_idx) in &scan.field_ops {
+                    if let Some(fi) = resolver(cp_idx) {
+                        fm.insert(pc, fi);
+                    }
+                }
+                builder.set_field_info(fm);
+            }
+        }
         if let Some(mut graph) = builder.build(code, code_len) {
             // History: the IR backend used to miscompile a *pure* (call-free)
             // method containing a conditional branch / φ merge — a tiny leaf
@@ -5294,6 +5309,92 @@ mod tests {
         // Both tiers produced runnable native code.
         assert!(!c1.unwrap().code_bytes().is_empty());
         assert!(!c2.unwrap().code_bytes().is_empty());
+    }
+
+    // ── activate-ir-optimizer step 3: int-category `getfield` → `Op::Load` ──
+    //
+    // A method whose only heap op is an int-field read must now take the
+    // optimizing IR pipeline (the builder lowers `getfield` to `Op::Load`).
+    // Proven via `IR_LOWER_COMPILES`: a vacuous fall-through to single-pass
+    // would leave the counter at 0. (The integration harness
+    // `ir_vs_singlepass.rs` proves the *executed* result is correct; this
+    // proves the IR path — not single-pass — produced the body.)
+    #[test]
+    fn step3_getfield_int_routes_through_ir() {
+        use std::sync::Arc;
+
+        // `static int get(Corpus o) { return o.x; }`
+        //   aload_0 (0x2a); getfield #2 (0xb4 0x00 0x02); ireturn (0xac)
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Corpus"),
+            method_name: Arc::from("get"),
+            method_descriptor: Arc::from("(Lpkg/Corpus;)I"),
+            source_file: None,
+            // Trailing 0x00 0x00: the VM pads bytecode with two bytes that
+            // `try_compile` strips via `code.len() - 2`; without them the
+            // `ireturn` is truncated away.
+            code: Arc::from([0x2a, 0xb4, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 1,
+            num_params: 1,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
+        // is valid and never called (the inline getfield emits no helper call,
+        // and this test does not execute the generated code).
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // Resolve cp index 2 → field index 0, int (`I`).
+        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+            if cp == 2 {
+                Some((0, b'I'))
+            } else {
+                None
+            }
+        };
+
+        // C2 — optimize=true → IR pipeline lowers `getfield` to `Op::Load`.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let c2 = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "an int getfield method must route through the IR pipeline"
+        );
+
+        // Without the field resolver the builder cannot resolve the field, so
+        // the IR path must bail (counter stays 0). The whole compile then
+        // returns None — single-pass also needs the resolver to build
+        // `field_info` — which is the expected, safe fallback.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _ = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, true,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "an unresolved getfield must NOT take the IR pipeline"
+        );
     }
 
     // ── Stage A.4 (precise oop maps) — param oop mask ──────────────

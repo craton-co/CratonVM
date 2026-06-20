@@ -19,7 +19,7 @@
 //! corpus is exactly where the two backends genuinely differ.
 
 use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, JitRuntimeHelpers};
-use cratonvm_types::ClassId;
+use cratonvm_types::{ClassId, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 use std::sync::Arc;
 
 /// Dummy runtime helpers — the corpus is pure arithmetic / branches / counted
@@ -455,6 +455,225 @@ fn ir_vs_singlepass_sum_loop() {
             (vec![5], 10),
             (vec![10], 45),
             (vec![100], 4950),
+        ],
+    );
+}
+
+// ── instance-field reads (getfield → Op::Load) ─────────────────────────
+//
+// Step 3 (field/call frontier, slice 1): the IR builder now lowers an
+// int-category `getfield` into `Op::Load`, so a method whose only heap op is a
+// field read takes the optimizing IR path. Unlike the pure-arithmetic corpus
+// above, these execute a real memory access, so the harness builds a synthetic
+// heap object laid out exactly as the VM lays one out — header + 16-byte
+// `Value` cells — and passes its address as the receiver. Both backends read
+// the same bytes, so IR == single-pass == host proves the inline-getfield ABI
+// (null → 0, else MOVSXD the 32-bit `Value::Int` payload) is byte-faithful.
+//
+// Only int-category fields are exercised (the only shape the builder lowers);
+// every `putfield` still bails to single-pass (no IR `Op::Store` yet).
+
+/// Build a synthetic heap object with `fields.len()` int fields, each holding
+/// the given value. Mirrors the VM object layout: a `HEADER_SIZE`-byte header
+/// followed by one `SLOT_SIZE`-byte `Value` cell per field; an int value lives
+/// at `FIELD_CELL_PAYLOAD32_OFFSET` within its cell with a zero (`Value::Int`)
+/// discriminant tag (the all-zero buffer supplies the tag). The returned
+/// buffer must outlive every call that reads it.
+fn make_object(fields: &[i32]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + fields.len() * SLOT_SIZE];
+    for (i, &v) in fields.iter().enumerate() {
+        let off = HEADER_SIZE + i * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+/// Compile via the per-call `optimize` toggle, supplying a constant-pool field
+/// resolver (`cp_idx → (field_index, type_tag)`) both backends need to resolve
+/// the field layout.
+fn compile_opt_fields(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    field_resolver: &dyn Fn(u16) -> Option<(usize, u8)>,
+    optimize: bool,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        Some(field_resolver),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        optimize,
+    )
+}
+
+/// Compile a single-object-parameter `(L…;)I` method both ways, then for each
+/// `(field_values, expected)` case build an object from `field_values`, call
+/// both bodies with its address, and assert IR == single-pass == `expected`.
+fn check_field(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    field_resolver: &dyn Fn(u16) -> Option<(usize, u8)>,
+    cases: &[(Vec<i32>, i32)],
+) {
+    let helpers = dummy_helpers();
+    let cm = cached(name, descriptor, code, max_locals, 1);
+    let ir = compile_opt_fields(&cm, &helpers, field_resolver, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR pipeline) failed to compile"));
+    let sp = compile_opt_fields(&cm, &helpers, field_resolver, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    for (fields, expected) in cases {
+        let obj = make_object(fields);
+        let args = [obj.as_ptr() as i64];
+        // SAFETY: both bodies were JIT-compiled from valid getfield bytecode;
+        // `obj` is a live, correctly-laid-out heap object whose address is the
+        // sole (reference) argument, and it outlives both calls (dropped at the
+        // end of this iteration). No runtime helper is reachable (inline
+        // getfield emits no call).
+        let r_sp = unsafe { sp.try_call(&args) }
+            .unwrap_or_else(|e| panic!("{name}: single-pass call {fields:?}: {e:?}"));
+        let r_ir = unsafe { ir.try_call(&args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {fields:?}: {e:?}"));
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "{name}: IR vs single-pass DIVERGE for {fields:?}: IR={}, single-pass={}",
+            r_ir as i32, r_sp as i32,
+        );
+        assert_eq!(
+            r_ir as i32, *expected,
+            "{name}: both backends agree but disagree with host for {fields:?}: got {}, expected {expected}",
+            r_ir as i32,
+        );
+        drop(obj); // keep the object alive until after both calls
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_getfield_simple() {
+    // static int get(Corpus o) { return o.x; }   (field 0 = int)
+    //   aload_0; getfield #2; ireturn
+    let resolver = |cp: u16| if cp == 2 { Some((0, b'I')) } else { None };
+    check_field(
+        "getfield_simple",
+        "(Lpkg/Corpus;)I",
+        vec![0x2a, 0xb4, 0x00, 0x02, 0xac],
+        1,
+        &resolver,
+        &[
+            (vec![5], 5),
+            (vec![-7], -7),
+            (vec![0], 0),
+            (vec![i32::MIN], i32::MIN),
+            (vec![i32::MAX], i32::MAX),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_getfield_two_fields_sum() {
+    // static int sum(Corpus o) { return o.x + o.y; }   (fields 0,1 = int)
+    //   aload_0; getfield #2; aload_0; getfield #3; iadd; ireturn
+    let resolver = |cp: u16| match cp {
+        2 => Some((0, b'I')),
+        3 => Some((1, b'I')),
+        _ => None,
+    };
+    check_field(
+        "getfield_sum",
+        "(Lpkg/Corpus;)I",
+        vec![
+            0x2a, 0xb4, 0x00, 0x02, // aload_0; getfield #2 (x)
+            0x2a, 0xb4, 0x00, 0x03, // aload_0; getfield #3 (y)
+            0x60, 0xac, // iadd; ireturn
+        ],
+        1,
+        &resolver,
+        &[
+            (vec![3, 4], 7),
+            (vec![10, -3], 7),
+            (vec![-5, -6], -11),
+            (vec![i32::MAX, 1], i32::MIN), // wraps
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_getfield_branch() {
+    // static int sign(Corpus o) { int v = o.x; if (v < 0) return -1; return 1; }
+    // A field read feeding a conditional branch + two return points — proves the
+    // Load is pinned to the right control path and the value flows into a φ-free
+    // multi-return shape.
+    //   0: aload_0           2a
+    //   1: getfield #2       b4 00 02
+    //   4: istore_1          3c
+    //   5: iload_1           1b
+    //   6: iflt +5 → 11      9b 00 05
+    //   9: iconst_1; ireturn 04 ac
+    //  11: iconst_m1;ireturn 02 ac
+    let resolver = |cp: u16| if cp == 2 { Some((0, b'I')) } else { None };
+    check_field(
+        "getfield_branch",
+        "(Lpkg/Corpus;)I",
+        vec![
+            0x2a, 0xb4, 0x00, 0x02, 0x3c, 0x1b, 0x9b, 0x00, 0x05, 0x04, 0xac, 0x02, 0xac,
+        ],
+        2,
+        &resolver,
+        &[
+            (vec![5], 1),
+            (vec![-5], -1),
+            (vec![0], 1),
+            (vec![i32::MIN], -1),
+            (vec![i32::MAX], 1),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_getfield_loop() {
+    // static int f(Corpus o) { int s=0; for (int i=0;i<o.n;i++) s += o.x; return s; }
+    // getfield in BOTH the loop condition (o.n) and body (o.x), re-read each
+    // iteration (LICM is default-off), under a loop with carried phis + a memory
+    // phi — proves Op::Load schedules correctly inside a loop body.
+    //   locals: 0=o, 1=s, 2=i ; fields: 0=x, 1=n
+    let resolver = |cp: u16| match cp {
+        2 => Some((0, b'I')), // x
+        3 => Some((1, b'I')), // n
+        _ => None,
+    };
+    check_field(
+        "getfield_loop",
+        "(Lpkg/Corpus;)I",
+        vec![
+            0x03, 0x3c, // 0: iconst_0; istore_1   (s = 0)
+            0x03, 0x3d, // 2: iconst_0; istore_2   (i = 0)
+            0x1c, 0x2a, 0xb4, 0x00, 0x03, // 4: iload_2; aload_0; getfield #3 (n)
+            0xa2, 0x00, 0x10, // 9: if_icmpge +16 → 25
+            0x1b, 0x2a, 0xb4, 0x00, 0x02, // 12: iload_1; aload_0; getfield #2 (x)
+            0x60, 0x3c, // 17: iadd; istore_1
+            0x84, 0x02, 0x01, // 19: iinc 2, 1
+            0xa7, 0xff, 0xee, // 22: goto -18 → 4
+            0x1b, 0xac, // 25: iload_1; ireturn
+        ],
+        3,
+        &resolver,
+        &[
+            (vec![5, 3], 15),
+            (vec![5, 0], 0),
+            (vec![7, 4], 28),
+            (vec![-2, 3], -6),
+            (vec![3, 10], 30),
         ],
     );
 }

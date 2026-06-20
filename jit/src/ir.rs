@@ -457,6 +457,13 @@ pub struct IrBuilder {
     /// Loop-carried phis per loop-header PC, recorded at activation so the
     /// backward branch can fill each phi's back-edge input.
     loop_phis: HashMap<usize, LoopPhis>,
+    /// Resolved instance-field layout, keyed by bytecode pc:
+    /// `pc → (field_index, type_tag)`. Populated by the caller
+    /// ([`Self::set_field_info`]) from the constant-pool field resolver before
+    /// [`Self::build`]; empty for hand-built / test graphs. A `getfield` whose
+    /// pc is absent — or whose tag is not int-category — makes `build` bail
+    /// (`None` → single-pass), the existing safety net.
+    field_info: HashMap<usize, (usize, u8)>,
 }
 
 impl IrBuilder {
@@ -494,7 +501,16 @@ impl IrBuilder {
             merges: HashMap::new(),
             loop_headers: HashSet::new(),
             loop_phis: HashMap::new(),
+            field_info: HashMap::new(),
         }
+    }
+
+    /// Supply the resolved instance-field layout (`pc → (field_index,
+    /// type_tag)`) the builder uses to lower `getfield` into an `Op::Load`.
+    /// Must be called before [`Self::build`]; absent / non-int-category
+    /// entries make the corresponding `getfield` bail to single-pass.
+    pub fn set_field_info(&mut self, info: HashMap<usize, (usize, u8)>) {
+        self.field_info = info;
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -864,6 +880,21 @@ impl IrBuilder {
                     self.push(self.locals[idx]);
                     pc += 1;
                 }
+                // aload — push an object reference local (same node-graph
+                // mechanics as iload: a reference is just a NodeId on the
+                // abstract stack; its only consumer in the IR slice we lower is
+                // a `getfield` base).
+                0x19 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
+                // aload_0..3
+                0x2a..=0x2d => {
+                    let idx = (op - 0x2a) as usize;
+                    self.push(self.locals[idx]);
+                    pc += 1;
+                }
                 // istore
                 0x36 => {
                     let idx = code[pc + 1] as usize;
@@ -1064,6 +1095,38 @@ impl IrBuilder {
                     let r = self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc);
                     self.push(r);
                     pc += 1;
+                }
+                // getfield — read an instance field as an `Op::Load`.
+                //
+                // Slice 1 (read-only) of the field/call IR frontier: only
+                // int-category fields (`I`/`Z`/`B`/`C`/`S`) are lowered. They
+                // all read the 32-bit `Value::Int` payload sign-extended — the
+                // exact ABI the single-pass backend's inline getfield emits
+                // (`MOVSXD` from `HEADER_SIZE + field_index*SLOT_SIZE +
+                // FIELD_CELL_PAYLOAD32_OFFSET`). The cell-offset operand is a
+                // `Const(field_index)`; the lowerer derives the byte
+                // displacement. Float/long/double/reference fields and any pc
+                // without resolved layout bail (`None` → single-pass), as does
+                // every `putfield` (no IR `Op::Store` lowering yet — writes
+                // need scheduler memory ordering, a separate slice).
+                0xb4 => {
+                    let (field_index, type_tag) = match self.field_info.get(&pc) {
+                        Some(&fi) => fi,
+                        None => return None,
+                    };
+                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                        return None;
+                    }
+                    let base = self.pop();
+                    let offset = self.iconst(field_index as i64);
+                    let load = self.graph.add(
+                        Op::Load(MemKind::Int),
+                        IrType::Int,
+                        vec![self.ctrl, self.mem, base, offset],
+                        Some(pc),
+                    );
+                    self.push(load);
+                    pc += 3;
                 }
                 // dup
                 0x59 => {
@@ -1409,17 +1472,18 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0x85
             | 0x88
             | 0x91..=0x93
+            | 0x2a..=0x2d
             | 0xac
             | 0xad
             | 0xb1 => {
                 pc += 1;
             }
             // 2-byte opcodes
-            0x10 | 0x15 | 0x36 => {
+            0x10 | 0x15 | 0x19 | 0x36 => {
                 pc += 2;
             }
             // 3-byte opcodes
-            0x11 | 0x84 => {
+            0x11 | 0x84 | 0xb4 => {
                 pc += 3;
             }
             _ => {
@@ -1496,13 +1560,14 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0x85
             | 0x88
             | 0x91..=0x93
+            | 0x2a..=0x2d
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
             // 2-byte opcodes
-            0x10 | 0x15 | 0x36 => pc += 2,
+            0x10 | 0x15 | 0x19 | 0x36 => pc += 2,
             // 3-byte opcodes
-            0x11 | 0x84 => pc += 3,
+            0x11 | 0x84 | 0xb4 => pc += 3,
             _ => pc += 1,
         }
     }
@@ -1671,6 +1736,50 @@ mod tests {
         assert!(has_if, "Should contain an If node");
         let has_cmp = graph.nodes.iter().any(|n| matches!(n.op, Op::Cmp(_)));
         assert!(has_cmp, "Should contain a Cmp node");
+    }
+
+    #[test]
+    fn test_ir_getfield_emits_load() {
+        // static int get(Corpus o) { return o.x; }
+        // aload_0; getfield #2; ireturn
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'I'));
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 5).expect("IR build failed");
+        let has_load = graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        assert!(has_load, "getfield should emit an Op::Load node");
+        // The Load's base must be the Param(0) receiver and its offset operand a
+        // Const(0) (field index 0).
+        let load = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Load(_)))
+            .unwrap();
+        assert_eq!(load.inputs.len(), 4, "Load inputs = [ctrl, mem, base, offset]");
+        assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
+        assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
+    }
+
+    #[test]
+    fn test_ir_getfield_bails_without_field_info() {
+        // Same method but no field layout supplied → build must bail (None),
+        // the single-pass safety net.
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let builder = IrBuilder::new(1, 1);
+        assert!(builder.build(&code, 5).is_none());
+    }
+
+    #[test]
+    fn test_ir_getfield_bails_on_non_int_field() {
+        // A reference field (`L…;`) is not int-category → build bails.
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'L'));
+        builder.set_field_info(fi);
+        assert!(builder.build(&code, 5).is_none());
     }
 
     #[test]
