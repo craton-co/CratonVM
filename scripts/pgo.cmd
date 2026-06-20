@@ -19,7 +19,7 @@ REM   scripts\pgo.cmd
 setlocal enableextensions enabledelayedexpansion
 
 if "%PROFILE_DIR%"=="" set PROFILE_DIR=%TEMP%\cratonvm-pgo
-set TARGET_FEATURES=+sse4.2,+pclmul
+set TARGET_FEATURES=+sse4.2,+pclmulqdq
 
 echo [pgo] resetting profile directory: %PROFILE_DIR%
 if exist "%PROFILE_DIR%" rmdir /s /q "%PROFILE_DIR%"

@@ -15,7 +15,7 @@
 [build]
 
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-feature=+sse4.2,+pclmul"]
+rustflags = ["-C", "target-feature=+sse4.2,+pclmulqdq"]
 
 # The launcher spawns the real entry point on a dedicated `main-vm` thread
 # (see `vm-cli/src/main.rs`), but the launcher's OWN thread still runs

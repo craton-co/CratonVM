@@ -4,7 +4,7 @@
 # The release profile already enables fat LTO + codegen-units=1, but cargo
 # does not run PGO out of the box. This script wires the four-phase
 # instrument -> profile -> merge -> rebuild flow that the Rust toolchain
-# expects, pinning the same `+sse4.2,+pclmul` target features the CI
+# expects, pinning the same `+sse4.2,+pclmulqdq` target features the CI
 # workflows use so the binary produced here matches what CI ships.
 #
 # Requirements:
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 PROFILE_DIR="${PROFILE_DIR:-/tmp/cratonvm-pgo}"
-TARGET_FEATURES="+sse4.2,+pclmul"
+TARGET_FEATURES="+sse4.2,+pclmulqdq"
 
 echo "[pgo] resetting profile directory: $PROFILE_DIR"
 rm -rf "$PROFILE_DIR"

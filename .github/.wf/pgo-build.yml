@@ -22,10 +22,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Match scripts/pgo.sh and the rest of CI: `+sse4.2,+pclmul` is the
+  # Match scripts/pgo.sh and the rest of CI: `+sse4.2,+pclmulqdq` is the
   # target-feature baseline for the released binary. Without it the
   # PGO-instrumented build would diverge from what users actually run.
-  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmul"
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmulqdq"
 
 jobs:
   pgo:
