@@ -1276,13 +1276,20 @@ fn is_local_alloc(graph: &Graph, id: NodeId) -> bool {
 /// encountering it forces DSE to discard all pending (not-yet-overwritten)
 /// stores.  This is the conservative "alias barrier": anything that is not a
 /// pure data computation is treated as a potential reader.
+///
+/// `Op::Store` is handled explicitly by the scan (it drives the overwrite
+/// match), and `Op::Load` is intercepted by an earlier explicit arm in
+/// `eliminate_dead_stores` that resolves it against the pending set with
+/// allocation-level alias precision (a load of a distinct local allocation
+/// observes no other local's stores). A load never reaches this function;
+/// keeping `Load` classified as a barrier here is the SAFE fallback if that
+/// explicit arm is ever removed. Every other impure node (calls, returns,
+/// allocations, guards, monitors, control joins, projections, memory phis, …)
+/// is an unconditional barrier.
 fn is_memory_barrier(op: &Op) -> bool {
     if op.is_pure() {
         return false;
     }
-    // A store is handled explicitly by the scan; everything else that is
-    // impure (loads, calls, returns, allocations, guards, monitors, control
-    // joins, projections, memory phis, …) is a barrier.
     !matches!(op, Op::Store(_))
 }
 
@@ -1292,6 +1299,13 @@ fn is_memory_barrier(op: &Op) -> bool {
 /// tracking the most recent still-live store to each location written to a
 /// local allocation; an overwriting store to the same location kills the
 /// earlier one, and any memory barrier flushes the pending set.
+///
+/// Alias refinement (DSE-WIDEN): an intervening `Load` is not an unconditional
+/// barrier. Because every pending store targets a local allocation and two
+/// distinct local allocations never alias, a load of a *different* local
+/// allocation flushes only its own base; only a load of the same base, or of a
+/// non-local/unreadable base, flushes (the latter, everything). This lets a
+/// store survive an intervening read of an unrelated local object.
 fn eliminate_dead_stores(graph: &mut Graph) {
     // The location each currently-pending store writes, in node order. A
     // pending store is one we have seen but not yet proven observed; a later
@@ -1335,6 +1349,28 @@ fn eliminate_dead_stores(graph: &mut Graph) {
                 }
                 // This store is now the live writer of `loc`.
                 pending.push((store_id, loc));
+            }
+            Op::Load(_) => {
+                // A load is only a barrier for stores it could OBSERVE. Every
+                // pending store writes a local `New`/`NewArray` allocation, and
+                // two distinct local allocations never alias (the same fact the
+                // location key relies on). So:
+                //   * a load whose base is a DIFFERENT local allocation cannot
+                //     read any other local's fields — it only flushes pending
+                //     stores to its own base (which it genuinely could observe);
+                //   * a load from a non-local / unreadable base may alias any
+                //     escaped local, so it conservatively flushes everything.
+                // This lets an overwritten store stay dead-eligible across an
+                // intervening read of an unrelated local object (DSE-WIDEN),
+                // while remaining sound: the only way to read allocation A's
+                // field is a load whose base resolves to A (flushes A) or to a
+                // non-local node such as a load/phi result (flushes all).
+                match load_base(graph, id as NodeId) {
+                    Some(b) if is_local_alloc(graph, b) => {
+                        pending.retain(|(_, loc)| loc.base != b);
+                    }
+                    _ => pending.clear(),
+                }
             }
             other => {
                 // Any non-pure, non-store node may observe memory: give up on
@@ -2631,6 +2667,97 @@ mod tests {
 
         assert_eq!(g.nodes[s1 as usize].op, Op::Store(MemKind::Int));
         assert_eq!(g.nodes[s2 as usize].op, Op::Store(MemKind::Long));
+    }
+
+    // ── Widened DSE: load-alias refinement (DSE-WIDEN) ──────────────
+
+    #[test]
+    fn test_dse_removes_overwrite_across_unrelated_local_load() {
+        // store A.f = 1; load B.f (B a DISTINCT local allocation); store A.f = 2
+        // The intervening load reads a provably-different object, so it does not
+        // observe A's first store — which is therefore still dead. A trailing
+        // load of A keeps A "read" so the write-only phase doesn't also remove
+        // the live store, isolating the overwrite property.
+        let mut g = probe_graph();
+        let a = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
+        let b = g.add(
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let dead_store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![a, c1], None);
+        // Load of the UNRELATED local allocation B — not a barrier for A.
+        let _load_b = g.add(Op::Load(MemKind::Int), IrType::Int, vec![b], None);
+        let live_store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![a, c2], None);
+        // Read A so the write-only phase keeps the live store.
+        let load_a = g.add(Op::Load(MemKind::Int), IrType::Int, vec![a], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, load_a], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[dead_store as usize].op,
+            Op::Dead,
+            "the first store to A is dead: the intervening load reads a distinct \
+             local allocation B that cannot alias A"
+        );
+        assert_eq!(
+            g.nodes[live_store as usize].op,
+            Op::Store(MemKind::Int),
+            "the overwriting (live) store to A must be kept"
+        );
+    }
+
+    #[test]
+    fn test_dse_keeps_overwrite_across_nonlocal_load() {
+        // store A.f = 1; load P.f (P a Param — non-local, unknown provenance);
+        // store A.f = 2. The load's base could alias A if A had escaped, so the
+        // conservative path flushes all pending stores: the first store to A
+        // must be KEPT. (Locks the non-local-load fallback of the refinement.)
+        let mut g = probe_graph();
+        let a = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
+        let p = g.add(Op::Param(0), IrType::Ref, vec![], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![a, c1], None);
+        // Load from a non-local base — conservatively a full barrier.
+        let _load_p = g.add(Op::Load(MemKind::Int), IrType::Int, vec![p], None);
+        let s2 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![a, c2], None);
+        let load_a = g.add(Op::Load(MemKind::Int), IrType::Int, vec![a], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, load_a], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Store(MemKind::Int),
+            "a load from a non-local base may alias A, so the first store is kept"
+        );
+        assert_eq!(g.nodes[s2 as usize].op, Op::Store(MemKind::Int));
     }
 
     // ── Widened DSE: write-only, never-read local allocation ────────
