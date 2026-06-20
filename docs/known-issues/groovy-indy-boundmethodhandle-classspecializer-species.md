@@ -6,9 +6,9 @@
 | **Affected** | Any code path that initializes `java.lang.invoke.SwitchPoint` (or otherwise forces a *bound* `MethodHandle` whose species class is generated at runtime). Surfaced by **Apache Groovy 4/5** (`org.codehaus.groovy.vmplugin.v8.IndyInterface`), so **every Groovy script compile/execute** hits it. First seen via Spring's `GroovyScriptEvaluatorTests` (spring-bug-11 residual #3). |
 | **CratonVM** | `IndyInterface.<clinit>` → `SwitchPoint.<clinit>` runs real JDK bytecode that asks the VM to generate a `BoundMethodHandle` *species* class; CratonVM does not implement that, so the generated class comes back `null` and the JDK code NPEs at `Class.asSubclass(null)`, wrapped as `ExceptionInInitializerError`. |
 | **HotSpot JDK 25** | n/a — HotSpot generates BMH species classes (`java.lang.invoke.BoundMethodHandle$Species_*`) on demand via `ClassSpecializer` + hidden-class spinning. |
-| **CratonVM HEAD** | branch `feat/jli-bmh-species` (off `dev` `b3dbaaad`) — the `MethodHandles.constant` species blocker is now FIXED here; deeper bound-handle paths remain. |
-| **Status** | 🟡 PARTIAL. The documented headline NPE (`MethodHandles.constant` → `makeConstantReturning` → `ClassSpecializer` species) is FIXED via a functional `MH_KIND_CONSTANT` shim (see "Update 2026-06-20"). Remaining (still 🔴 OPEN, deep): `new SwitchPoint()` `<init>` → `CallSite.makeDynamicInvoker` → `MethodHandle.bindArgumentL` (a *bound-handle constructor* → BMH machinery) hangs; and the broader real-`DirectMethodHandle`-vs-`MH_KIND`-shim dispatch mismatch (`identity`/`findStatic` produce real handles the shim can't invoke). Full Groovy is still a sizable `java.lang.invoke` subsystem effort. |
-| **Suggested owner** | handoff / `java.lang.invoke`-focused (architectural). |
+| **CratonVM HEAD** | branch `feat/jli-bmh-species` (off `dev` `b3dbaaad`), commits `7bb93483` + `702efcf7` + `ac84f0b8`. |
+| **Status** | 🟡 PARTIAL — substantial progress. The headline NPE and the three documented "next walls" are FIXED, and Groovy now runs its **full runtime invokedynamic dispatch** (compiles, bootstraps, resolves the target method) — see "Update 2026-06-20 (part 2)". Current frontier (🔴 OPEN): Groovy's call-site **guard construction** (`Selector$MethodSelector.setGuards` → `getClass()` on a null element of `MethodSelector.args`). Reaching `3*2 == 6` is now an iterative shim-completion effort in Groovy's `Selector`/MetaClass dispatch rather than a structural `java.lang.invoke` blocker. |
+| **Suggested owner** | handoff / `java.lang.invoke` + Groovy-runtime-focused. |
 
 ## TL;DR
 
@@ -123,6 +123,45 @@ watchdog hang with no standalone benefit.
    `ClassLoader.loadClass` / `ServiceLoader` path than the verified scenario), separate from the
    species blocker; it currently blocks the script from ever reaching the indy/`SwitchPoint` runtime
    path.
+
+## Update 2026-06-20 (part 2) — all three "next walls" FIXED; Groovy runs its full indy dispatch
+
+The three walls above are now resolved (commit `702efcf7`), plus a `MethodHandle`/`CallSite` combinator
+subsystem (commit `ac84f0b8`). Groovy `GroovyShell.evaluate("return 3 * 2")` now compiles, bootstraps,
+and runs its full runtime dispatch up to **method resolution** — it resolves `multiply` and builds the
+optimized call-site handle. All shims follow the `constant`/`arrayElementGetter` bridge pattern
+(functional native, promoted to real-JDK essentials, `check_override`-allow-listed).
+
+* **Wall 1 — `new SwitchPoint()` hang** → FIXED. `MutableCallSite`/`VolatileCallSite.dynamicInvoker()`
+  shim (`MH_KIND_DYNAMIC_INVOKER`) delegates to the call site's current `target`, avoiding the real
+  `makeDynamicInvoker` → `bindArgumentL` → BMH path. `new SwitchPoint()` + `guardWithTest` work.
+* **Wall 2 — `MethodHandles.identity` OOB** → FIXED. Functional `MH_KIND_IDENTITY` shim.
+* **Wall 3 — `GrabAnnotation` CNFE** → FIXED. Re-applied the lost `92b7bd80` fix in
+  `populate_invoke_cache` (the declaring-class native-shadow check was trapped inside
+  `if method.is_native()`; it was reverted by merge `cd396a04`). The doc's earlier claim that this was
+  "a different classloading concern" was wrong — it was the *same* lost fix.
+* **CallSite construction + combinators** (commit `ac84f0b8`): `CallSite.makeUninitializedCallSite`
+  (real one NPEs on a null `MethodTypeForm` cache) + `MutableCallSite.setTarget` (real
+  `checkTargetChange` rejects synthetic `MethodType`s) shims; functional
+  `MethodHandles.insertArguments` (`MH_KIND_INSERT` — was a no-op stub that dropped bound values),
+  `MethodHandle.asCollector`/`asSpreader` (`MH_KIND_COLLECT`/`MH_KIND_SPREAD`),
+  `MethodHandles.explicitCastArguments` (passthrough). And `MH_KIND_STATIC` now unboxes boxed args
+  against primitive params (Groovy binds `int callType` boxed via `insertArguments` →
+  `CALL_TYPE_VALUES[callType]` AIOOBE in `Selector.getSelector` without it).
+
+**Current frontier (OPEN):** `Selector$MethodSelector.setGuards` (`Selector.java:973`) NPEs at
+`Arrays.stream(this.args).map(o -> o.getClass())` — a **null element in `MethodSelector.args`** while
+building the receiver-class guard. The target method is already resolved; this is guard/caching-wrapper
+construction. Likely a residual arg-marshaling detail in the indy→`selectMethod` `Object[]` flow (verify
+the indy call-site descriptor/arity for `3 * 2` vs what `asCollector(Object[], mt.parameterCount())`
+gathers). From here, reaching `3*2 == 6` is iterative shim/marshaling completion in Groovy's `Selector`
++ MetaClass dispatch, no longer a structural `BoundMethodHandle`/species blocker.
+
+**Repros** (`/tmp/sprepro`, JDK 25 real-boot): `SpRepro2` (constant + `new SwitchPoint()` → `SP-OK`),
+`MHProbe` (`identity().invoke()=="hi"`), `FBProbe` (the exact
+`findStatic.insertArguments(...).asCollector(...).invoke(...)` fallback chain → correct), `RegressMH`
+(lambdas/streams/findStatic/constant — no regression), `GroovyRun`
+(`new GroovyShell().evaluate("return 3 * 2")`).
 
 ## Root cause
 
