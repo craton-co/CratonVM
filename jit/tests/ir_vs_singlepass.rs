@@ -112,7 +112,7 @@ fn compile_opt(
     optimize: bool,
 ) -> Option<CompiledMethod> {
     try_compile(
-        cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None,
+        cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
         optimize,
     )
 }
@@ -509,6 +509,7 @@ fn compile_opt_fields(
         None,
         None,
         helpers,
+        None,
         None,
         None,
         None,
