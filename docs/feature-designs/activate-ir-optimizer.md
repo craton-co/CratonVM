@@ -669,6 +669,133 @@ Implementation (`jit/src/ir.rs`):
 and `lookupswitch` (sparse keys 10/20 + default), each checked on hits and
 out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
 
+## Increment 14 (step 3 — IR gate relaxation: int-category `getfield` → `Op::Load`) landed
+
+Status: **landed** on `dev`. **First slice of "THE NEXT FRONTIER"** (field / call /
+alloc emission). The IR builder now lowers an int-category `getfield` into the
+first real `Op::Load` the production IR path emits — so a method whose only heap
+op is an int-field read takes the optimizing IR pipeline, where before it bailed
+to single-pass.
+
+**Scope — read-only, sound without a memory scheduler.** Only `getfield` of an
+int-category field (`I`/`Z`/`B`/`C`/`S`) lowers. Crucially this needs **no**
+scheduler memory-ordering work: a getfield-only method has no `Store`/`Call`, so
+there is nothing for the (still memory-unaware) scheduler to mis-order against —
+loads of immutable memory may freely float / GVN / DCE. `putfield`, `new`, array
+ops, `invoke*`, and float/long/double/reference fields all still bail (`build()`
+→ `None` → single-pass), the existing safety net. (Writes need real scheduler
+memory ordering + lowerer helper access — a separate slice.)
+
+**Implementation**
+- **`jit/src/ir.rs`** — the builder gained `set_field_info(pc → (field_index,
+  type_tag))` (an `IrBuilder` field set by the caller before `build`; absent for
+  hand-built/test graphs). The `getfield` (0xb4) arm looks up the pc, bails on an
+  unresolved or non-int-category field, then emits
+  `Op::Load(MemKind::Int)` with inputs `[ctrl, mem, base, Const(field_index)]`
+  (the offset operand is the field index as a `Const`, keeping it visible to a
+  future field-sensitive alias oracle). `aload`/`aload_0..3` were added (a
+  getfield base is just a `NodeId` on the abstract stack). Both bytecode length
+  walkers list `0xb4` (3-byte), `0x19` (2-byte), `0x2a..=0x2d` (1-byte) — without
+  this a branchy/looping getfield method mis-parses the field index as opcodes.
+- **`jit/src/ir_lower.rs`** — a new `Op::Load(_)` arm emits the single-pass inline
+  getfield ABI byte-faithfully: receiver → RAX, `TEST/JE` null guard (null → 0,
+  matching `jit_getfield`'s early return), else `MOVSXD RAX, [RAX +
+  HEADER_SIZE + field_index*SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET]`
+  (sign-extend the 32-bit `Value::Int` payload). Constants come from
+  `cratonvm_types` (same source the single-pass backend uses).
+- **`jit/src/lib.rs`** — the IR branch builds the `pc → (field_index, type_tag)`
+  map from `scan.field_ops` + `cp_field_resolver` and calls `set_field_info`
+  before `build`; an unresolved field is omitted → that getfield bails.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — the harness gained a synthetic-heap-object
+  builder (`make_object`, VM-faithful header + 16-byte `Value` cells) and a field
+  resolver, then **executes** four getfield methods through both backends against
+  real objects: `getfield_simple` (getter), `getfield_two_fields_sum`,
+  `getfield_branch` (field read feeding a conditional + two returns), and
+  `getfield_loop` (getfield in both the loop condition and body, re-read each
+  iteration under loop-carried + memory phis). IR == single-pass == host for all.
+- `jit/src/ir.rs` — `test_ir_getfield_emits_load` (Load with the right base/offset
+  operands) + bail tests (no field info; non-int field).
+- `jit/src/lib.rs` — `step3_getfield_int_routes_through_ir` proves via
+  `IR_LOWER_COMPILES` that an int getfield method actually takes the IR pipeline
+  (not a vacuous single-pass fall-through), and bails without a resolver.
+
+jit lib 794/794, harness 16/16, `cratonvm-vm` builds clean.
+
+**Next** (the rest of the frontier): `putfield` → `Op::Store` (needs scheduler
+memory ordering so a store can't be re-ordered past an aliasing load, plus a
+lowerer helper-call path or an inline tag+payload write), then `new` / `Op::Call`
+— which is also what finally de-latents the inc-4–9 DSE/escape/LICM passes on
+production IR (they only fire once `Store`/`New` exist).
+
+## Increment 15 (step 3 — IR gate relaxation: int-category `putfield` → `Op::Store`) landed
+
+Status: **landed** on `dev`. Second slice of the field/call frontier: an
+int-category `putfield` now lowers to the first real `Op::Store` the production
+IR path emits. Together with inc 14 (`Op::Load`) the IR pipeline now does both
+reads and writes of int fields.
+
+**Memory ordering — the keystone, solved without a new scheduler.** The IR
+threads a single memory-token chain: *every* memory op consumes the current
+token and produces a new one. A `getfield` `Op::Load` now also advances the
+token (`self.mem = load`), and a `putfield` `Op::Store` consumes the prior token
+and becomes the new one. Because the scheduler's within-block order is a
+post-order DFS over **input edges** (`ir_schedule::topo_sort_block`), this chain
+is exactly the dependency that serialises memory ops in program order — RAW
+(load sees a prior store), WAR (a store waits for a prior load of a possibly-
+aliasing location), and WAW are all preserved with no memory-aware scheduler
+pass. (No alias precision yet: the chain is total, conservatively serialising
+even provably-independent accesses; the inc-4–9 alias oracle can refine this
+later.)
+
+**Implementation**
+- **`jit/src/ir.rs`** — `putfield` (0xb5) emits `Op::Store(MemKind::Int)` with
+  inputs `[ctrl, mem, base, Const(field_index), value]`, typed `IrType::Memory`,
+  and sets `self.mem = store`; the `getfield` `Op::Load` now also advances
+  `self.mem`. `0xb5` added to both length walkers. Non-int fields / unresolved
+  layout bail.
+- **`jit/src/ir_optimize.rs`** — `eliminate_dead_nodes` now roots from every
+  `Op::Store` as well as every `Op::Return`. A store is an observable side
+  effect whose memory-token result may be consumed by no one (a pure-write
+  `o.x = v; return v;`), so rooting only from returns would delete it. Strictly
+  additive (a DSE-removed store is already `Op::Dead`).
+- **`jit/src/ir_lower.rs`** — an `Op::Store(_)` arm inlines the
+  `jit_putfield_int` heap write: null receiver → no-op (matching the helper),
+  else write a `Value::Int` cell (discriminant 0 + 32-bit payload, high qword
+  cleared so no stale ref survives — the scalar-replace precedent). The receiver
+  and value are loaded before the null check so the guarded body is a fixed 27
+  bytes (a constant `JE` displacement). Produces no value, so no slot is
+  allocated.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` gains a `putfield_int` stub (so the
+single-pass backend, which lowers an int putfield to `CALL jit_putfield_int`, can
+execute) and a read/write differential that runs **each backend against its own
+fresh object** and compares the return value AND the post-call object state:
+`putfield_then_getfield` (RAW), `getfield_then_putfield` (WAR — proves the store
+waits for the read), `putfield_pure_write` (the store's memory result is unused —
+proves DCE keeps it), and `putfield_two_fields` (WAW + two fields). IR ==
+single-pass == host for all. `jit/src/ir.rs` adds builder tests for store
+emission and for the store's memory input being the prior load.
+
+**Trap recorded** (cost an investigation): a single-pass `putfield` method is
+`needs_heap` (`x64.rs` sets it unconditionally for 0xb5, since a *ref* putfield
+needs the VM pointer for write barriers), which makes the compiled body
+`needs_context` — it takes a hidden VM-context pointer as its first argument. The
+differential harness must invoke single-pass putfield via
+`try_call_with_context(dummy, [obj, …])`, not `try_call([obj, …])`, or the
+receiver lands in the context slot and every arg shifts by one (manifested as a
+`STATUS_ACCESS_VIOLATION` writing through `obj == value`). The inline IR store
+needs no context (`needs_context() == false`), so the harness dispatches on
+`needs_context()`. The int putfield path never dereferences the context pointer,
+so a zeroed dummy buffer suffices.
+
+jit lib 796/796, harness 20/20, `cratonvm-vm` builds clean.
+
+**Next**: `new` / `Op::Call` emission (needs the lowerer to gain
+`JitRuntimeHelpers` access for the allocation/dispatch helper calls), which also
+finally de-latents the inc-4–9 DSE/escape/LICM passes on production IR.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
@@ -682,10 +809,12 @@ out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
    soak flag (Front 1.2). **In progress**: branch-free / branchy / early-return /
    loop int methods all take the IR path and pass the harness; increment 12 added
-   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`.
-   **Remaining**: methods with `invoke*` / field / array ops — the builder bails
-   on those today, so this needs builder emission of those ops + a real-helper
-   (or VM-level) differential harness. ← next.
+   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`, increment 14
+   added int-category `getfield` (the first real `Op::Load`, with a synthetic-heap
+   real-execution harness).
+   **Remaining**: `putfield`→`Op::Store` (needs scheduler memory ordering), then
+   `new` / `invoke*` / array ops — builder emission of those + the rest of the
+   real-helper harness. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the
