@@ -297,7 +297,8 @@ Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cra
 - [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
 - [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
 - ~~hibernate-jta-txcontrol-getinetaddress-per-class-report.md~~ — consolidated 2026-06-18, then **moved to [`docs/internal/`](../internal/hibernate-jta-txcontrol-getinetaddress-per-class-report.md) 2026-06-20** (Layer 0 fixed on dev; a redirect stub into the resolved JTA doc).
-- [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — census overview; **H1/H2/H3 resolved 2026-06-20** (per-cluster docs now in `docs/internal/`; H4 not re-checked).
+- [hibernate-hang-clusters-summary.md](../internal/hibernate-hang-clusters-summary.md) — census overview (now in `docs/internal/`); **H1/H2/H3 resolved 2026-06-20**, **H4 root-caused** (its own open doc below).
+- [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md) — 🔴 **OPEN** (census H4, root-caused 2026-06-20). `function.json.JsonArrayUnnestTest` "hang" is the **HQL/ANTLR parser**, not JSON: cold full-context prediction runs interpreted (~1000× HotSpot) because the ATN-simulation hot methods (`closure_`, `closureCheckingStopState`, `mergeArrays`, …) are declined by the single-pass JIT backend (instrumented via `CRATONVM_DBG_JITC`). Terminates (2-item select = 52s), warm re-parse = 0.65s; deferred JIT-backend-coverage cluster. Mitigation: run the suite in one shared JVM.
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).
 

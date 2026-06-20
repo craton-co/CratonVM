@@ -10,12 +10,12 @@
 > select HQL takes 12.7s/52s/>600s to *parse* (1/2/3 items), terminating; warm re-parse of the same shape is
 > 649ms (DFA cache works); `--nojit` ≈ JIT-on and `-Xmx8g` doesn't help (the deeply-recursive ANTLR ATN-sim
 > hot loop is never JIT-compiled — no OSR). Full root-cause + minimal repro:
-> [hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). 🔴 OPEN
+> [hql-antlr-parser-cold-prediction-throughput.md](../known-issues/hql-antlr-parser-cold-prediction-throughput.md). 🔴 OPEN
 > (deferred JIT-throughput cluster; mitigation = run the suite in one shared JVM to amortize warmup).
 > The real Hibernate JUnit launcher works on CratonVM —
 > `JtaCustomAfterCompletionTest` passes end-to-end (the earlier `@ExtendWith` "blocker" was a misdiagnosed
 > non-reproducing transient — see
-> [`../internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md)).
+> [`../internal/junit5-extendwith-meta-annotation-parameterresolver.md`](junit5-extendwith-meta-annotation-parameterresolver.md)).
 
 Census mode: fork-per-class, JIT-off, 600s per-class timeout. All classes below **PASS on HotSpot**
 (JDK 25). Hangs are grouped by **confirmed** root cause (watchdog main-thread dump) or **inferred** (same
@@ -31,7 +31,7 @@ is correct on CratonVM (all sizes, under GC). Live `cdb` shows the native activi
 (`native_map_put → alloc_object → ensure_synthetic_class → ZipArchive::by_name → indexmap → hashbrown`)
 during JAXB's reflection-heavy model building — i.e. interpreter-slow class-loading/reflection (and/or an
 intermittent zip-index hot spot), not a localized collection loop. Deeper investigation, not a quick fix.
-Full write-up + repros: [hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](../internal/hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md) (now in `docs/internal/`).
+Full write-up + repros: [hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md) (now in `docs/internal/`).
 **Confirmed:** `annotations.xml.ejb3.Ejb3XmlElementCollectionTest`.
 **Inferred (same JAXB XML-binding path):** `Ejb3XmlManyToOneTest`, `Ejb3XmlOneToOneTest`,
 `bootstrap.binding.annotations.access.xml.XmlAccessTest`, `boot.models.xml.XmlProcessingSmokeTests`,
@@ -55,8 +55,8 @@ hierarchy from CV reflection) or pathological ByteBuddy slowness on the interpre
 
 ## Cluster H3 — JTA / socket (Narayana) hang (✅ FIXED — `accept()` deadlock)
 Same family as the JTA crash cluster. See (now in `docs/internal/`)
-[hibernate-jta-txcontrol-getinetaddress-per-class-report.md](../internal/hibernate-jta-txcontrol-getinetaddress-per-class-report.md) and
-[hibernate-jta-narayana-xa-completion-and-socket-loopback.md](../internal/hibernate-jta-narayana-xa-completion-and-socket-loopback.md).
+[hibernate-jta-txcontrol-getinetaddress-per-class-report.md](hibernate-jta-txcontrol-getinetaddress-per-class-report.md) and
+[hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md).
 **Classes:** `connections.ThreadLocalCurrentSessionTest` (and the `connections`/`transaction` crash classes
 that hang rather than crash depending on which JTA platform/socket path is hit).
 
@@ -69,9 +69,9 @@ at 52s). Re-parsing the same *shape* with a different entity drops to 649ms (ANT
 fork-per-class suite re-pays the cold cost per class → >600s "hang". `--nojit` ≈ JIT-on and `-Xmx8g` doesn't
 help — the JIT never compiles the deeply-recursive ANTLR ATN-simulation hot loop (no OSR for on-stack
 recursive methods). **Full characterization + minimal repro:**
-[hql-antlr-parser-cold-prediction-throughput.md](hql-antlr-parser-cold-prediction-throughput.md). Deferred
+[hql-antlr-parser-cold-prediction-throughput.md](../known-issues/hql-antlr-parser-cold-prediction-throughput.md). Deferred
 JIT-throughput cluster (cf.
-[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
+[springrepos-extension-hang-jit-throughput-and-deep-recursion.md](../known-issues/springrepos-extension-hang-jit-throughput-and-deep-recursion.md)).
 **Mitigation:** run the suite in a single shared JVM (amortizes the per-shape DFA warmup).
 
 ## Environmental (NOT a CV-only bug)
@@ -86,5 +86,5 @@ JIT-throughput cluster (cf.
 | H1 JAXB class-load storm | class-loading rescan storm (NOT `retainAll`) | ✅ **fixed on dev** (`1db07c35`/`25c42e13`) |
 | H2 ByteBuddy `MethodGraph` | bootstrap proxy gen | ✅ **does-not-reproduce** — JoinedSubclass boots ~16s `--nojit` |
 | H3 JTA / socket | `accept()` deadlock (NOT loopback-pairing) | ✅ **fixed** on branch `fix/hib-jta-xa-loopback` (`e0426050`) |
-| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [own doc](hql-antlr-parser-cold-prediction-throughput.md) |
+| H4 `JsonArrayUnnestTest` | HQL/ANTLR cold-prediction throughput (NOT JSON, NOT a loop) | 🔴 **OPEN** — root-caused 2026-06-20; interpreted ANTLR ATN-sim, JIT no-OSR; [own doc](../known-issues/hql-antlr-parser-cold-prediction-throughput.md) |
 | DefaultCatalogAndSchema | environmental (HS hangs too) | — excluded |
