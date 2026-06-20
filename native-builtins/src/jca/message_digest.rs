@@ -36,7 +36,7 @@
 //! matches HotSpot 25.0.1 for the probe's six algorithms.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, compute_digest, obj_arg};
@@ -328,6 +328,84 @@ fn md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     md_digest(ctx, &[Value::Object(Some(this))])
 }
 
+/// `digest(byte[] buf, int offset, int len)` — compute the digest and write it
+/// into the caller's buffer, returning the number of bytes written (JDK
+/// contract). Without this native the real `MessageDigest.digest([BII)I`
+/// bytecode runs `engineDigest(buf, off, len)` on our bare synthetic
+/// `java.security.MessageDigest`; the default
+/// `MessageDigestSpi.engineDigest(byte[],int,int)` then calls the abstract
+/// no-arg `engineDigest()` → `AbstractMethodError: engineDigest()[B has no Code
+/// attribute`. SunJCE's `ML_KEM.generateKemKeyPair` hashes the public key
+/// through this overload (the SHA3-256 `digest(out, off, len)` of FIPS-203
+/// keygen), so every ML-KEM `KeyPairGenerator.generateKeyPair()` aborted here
+/// before reaching the KEM SPI.
+fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "No output buffer given".to_string(),
+            }
+            .into())
+        }
+    };
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    if !accumulator_present(ctx, this) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "MessageDigest state missing post-GC or never initialized".into(),
+        }
+        .into());
+    }
+    let algo = read_algo(ctx, this);
+    let data = read_accumulator(ctx, this);
+    let hash = compute_digest(&algo, &data);
+    // JDK contract (MessageDigestSpi.engineDigest(byte[],int,int)): the caller's
+    // window must be able to hold the whole digest, else DigestException.
+    let buf_len = ctx.array_length(buf);
+    if len < hash.len() {
+        return Err(throw_digest_exception(ctx, "partial digests not returned"));
+    }
+    if buf_len.saturating_sub(offset) < hash.len() {
+        return Err(throw_digest_exception(
+            ctx,
+            "insufficient space in the output buffer to store the digest",
+        ));
+    }
+    for (i, &b) in hash.iter().enumerate() {
+        ctx.set_array_element(buf, offset + i, Value::Int(b as i8 as i32));
+    }
+    // Reset accumulator after digest() per JDK contract (see md_digest).
+    write_accumulator(ctx, this, &[]);
+    Ok(Some(Value::Int(hash.len() as i32)))
+}
+
+/// Construct & throw a real `java.security.DigestException` (a
+/// `GeneralSecurityException`, caught by Java callers exactly as under HotSpot).
+/// Falls back to a catchable `IllegalStateException` if the JDK class can't be
+/// built.
+fn throw_digest_exception(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/DigestException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 fn md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Reset to an empty accumulator (rather than removing the entry) so
@@ -437,6 +515,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     );
     r.register(md, "digest", "()[B", md_digest);
     r.register(md, "digest", "([B)[B", md_digest_input);
+    r.register(md, "digest", "([BII)I", md_digest_into);
     r.register(md, "reset", "()V", md_reset);
     r.register(md, "getAlgorithm", "()Ljava/lang/String;", md_get_algorithm);
     r.register(md, "getDigestLength", "()I", md_get_digest_length);

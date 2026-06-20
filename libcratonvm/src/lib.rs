@@ -752,7 +752,7 @@ pub extern "C" fn cratonvm_load_class(
                     return JNI_ERR;
                 }
                 // SAFETY: caller contract — `name` is a valid C string.
-                let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+                let name = match CStr::from_ptr(name).to_str() {
                     Ok(s) => s,
                     Err(_) => {
                         set_last_error("cratonvm_load_class: class name is not valid UTF-8");
@@ -764,7 +764,7 @@ pub extern "C" fn cratonvm_load_class(
                         if !out_class.is_null() {
                             // SAFETY: `out_class` checked non-null; caller
                             // contract says it is writable.
-                            unsafe { *out_class = class_id.as_u32() as CratonClass };
+                            *out_class = class_id.as_u32() as CratonClass;
                         }
                         JNI_OK
                     }
@@ -815,13 +815,11 @@ pub extern "C" fn cratonvm_invoke_static(
         unsafe {
             with_vm(vm, CratonValue::error(), |h| {
                 // SAFETY: caller contract — these are valid C strings or null.
-                let (class, method, sig) = match unsafe {
-                    (
-                        cstr_or_err(class, "class name"),
-                        cstr_or_err(method, "method name"),
-                        cstr_or_err(sig, "method signature"),
-                    )
-                } {
+                let (class, method, sig) = match (
+                    cstr_or_err(class, "class name"),
+                    cstr_or_err(method, "method name"),
+                    cstr_or_err(sig, "method signature"),
+                ) {
                     (Some(c), Some(m), Some(s)) => (c, m, s),
                     _ => return CratonValue::error(),
                 };
@@ -834,7 +832,7 @@ pub extern "C" fn cratonvm_invoke_static(
                     &[]
                 } else {
                     // SAFETY: checked `args` non-null and `n_args > 0` above.
-                    unsafe { std::slice::from_raw_parts(args, n_args as usize) }
+                    std::slice::from_raw_parts(args, n_args as usize)
                 };
                 let values: Vec<Value> = in_args.iter().map(|v| v.to_value()).collect();
 
@@ -911,7 +909,7 @@ pub extern "C" fn cratonvm_new_string(vm: *mut CratonVm, utf8: *const c_char) ->
         unsafe {
             with_vm(vm, 0u64, |h| {
                 // SAFETY: caller contract — `utf8` is a valid C string or null.
-                let text = match unsafe { cstr_or_err(utf8, "string") } {
+                let text = match cstr_or_err(utf8, "string") {
                     Some(s) => s,
                     None => return 0u64,
                 };
@@ -1093,12 +1091,10 @@ pub extern "C" fn cratonvm_invoke_virtual(
                     }
                 };
                 // SAFETY: caller contract — these are valid C strings or null.
-                let (method, sig) = match unsafe {
-                    (
-                        cstr_or_err(method, "method name"),
-                        cstr_or_err(sig, "method signature"),
-                    )
-                } {
+                let (method, sig) = match (
+                    cstr_or_err(method, "method name"),
+                    cstr_or_err(sig, "method signature"),
+                ) {
                     (Some(m), Some(s)) => (m, s),
                     _ => return CratonValue::error(),
                 };
@@ -1111,7 +1107,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
                     &[]
                 } else {
                     // SAFETY: checked `args` non-null and `n_args > 0` above.
-                    unsafe { std::slice::from_raw_parts(args, n_args as usize) }
+                    std::slice::from_raw_parts(args, n_args as usize)
                 };
 
                 // Resolve the receiver's *runtime* class — invoking on the
@@ -1182,7 +1178,7 @@ pub extern "C" fn cratonvm_object_class(
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 if !out_class.is_null() {
                     // SAFETY: `out_class` checked non-null; writable per contract.
-                    unsafe { *out_class = class_id.as_u32() as CratonClass };
+                    *out_class = class_id.as_u32() as CratonClass;
                 }
                 JNI_OK
             })
@@ -1363,7 +1359,7 @@ pub extern "C" fn cratonvm_field_index(
         unsafe {
             with_vm(vm, JNI_ERR, |h| {
                 // SAFETY: caller contract — `name` is a valid C string or null.
-                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                let field_name = match cstr_or_err(name, "field name") {
                     Some(s) => s,
                     None => return JNI_ERR,
                 };
@@ -1372,7 +1368,7 @@ pub extern "C" fn cratonvm_field_index(
                     Some(idx) => {
                         if !out_index.is_null() {
                             // SAFETY: `out_index` checked non-null; writable per contract.
-                            unsafe { *out_index = idx as JInt };
+                            *out_index = idx as JInt;
                         }
                         JNI_OK
                     }
@@ -1422,7 +1418,7 @@ pub extern "C" fn cratonvm_get_field_by_name(
                     }
                 };
                 // SAFETY: caller contract — `name` is a valid C string or null.
-                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                let field_name = match cstr_or_err(name, "field name") {
                     Some(s) => s,
                     None => return CratonValue::error(),
                 };
@@ -1525,7 +1521,7 @@ pub extern "C" fn cratonvm_set_field_by_name(
                     }
                 };
                 // SAFETY: caller contract — `name` is a valid C string or null.
-                let field_name = match unsafe { cstr_or_err(name, "field name") } {
+                let field_name = match cstr_or_err(name, "field name") {
                     Some(s) => s,
                     None => return JNI_ERR,
                 };

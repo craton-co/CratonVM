@@ -46,6 +46,10 @@ pub mod key_factory;
 pub mod signature;
 // `javax.crypto.KeyAgreement` — ECDH, by driving the real SunEC ECDH SPI.
 pub mod key_agreement;
+// `javax.crypto.KEM` — ML-KEM (FIPS 203) encaps/decaps, by driving the real
+// SunJCE `ML_KEM_Impls` KEM SPI. Companion to the ML-DSA Signature route in
+// `signature` and the PQC keygen route in `key_factory`.
+pub mod kem;
 // WP6.6 — `javax.security.auth.x500.X500Principal` DER + RFC 4514 round-trip.
 pub mod x500;
 // ASN.1 helper used by x500 (DER encode/decode primitives). No registrations
@@ -71,6 +75,9 @@ pub fn register_jca_natives(registry: &mut NativeMethodRegistry) {
     signature::register(registry);
     // `javax.crypto.KeyAgreement` ECDH → SunEC ECDH SPI.
     key_agreement::register(registry);
+    // `javax.crypto.KEM` ML-KEM encaps/decaps → SunJCE ML_KEM_Impls KEM SPI
+    // (gated on route_pqc_to_real / skipped in real_jca_mode, like signature).
+    kem::register(registry);
     // WP6.6: DER + RFC 4514 round-trip for `X500Principal`.
     x500::register(registry);
 }

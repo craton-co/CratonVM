@@ -12,19 +12,27 @@
  * produced shared/static library. Build commands (run from the repo root after
  * `cargo build -p libcratonvm`):
  *
- *   Linux:
- *     cc examples_embed_smoke embed_smoke.c \
- *        -I <path-to-jni-headers-or-the-decls-below> \
- *        -L target/debug -lcratonvm -ldl -lpthread -o embed_smoke
- *     LD_LIBRARY_PATH=target/debug ./embed_smoke
+ * NOTE on artifact names: cargo names the cdylib/staticlib after the crate
+ * (`libcratonvm`), so on Windows the import lib is `libcratonvm.dll.lib` and the
+ * runtime DLL is `libcratonvm.dll`; on Linux (crate name already starts with
+ * `lib`) the files are `liblibcratonvm.so` / `liblibcratonvm.a`, linked with
+ * `-llibcratonvm`. Substitute `release` for `debug` for a release build.
  *
- *   Windows (MSVC, links the import lib for cratonvm.dll):
- *     cl /Fe:embed_smoke.exe embed_smoke.c target\debug\cratonvm.dll.lib
- *     copy target\debug\cratonvm.dll .
+ *   Linux (shared):
+ *     cc embed_smoke.c -L target/release -llibcratonvm -ldl -lpthread \
+ *        -o embed_smoke
+ *     LD_LIBRARY_PATH=target/release ./embed_smoke
+ *
+ *   Windows (MSVC, links the import lib for libcratonvm.dll):
+ *     cl /Fe:embed_smoke.exe embed_smoke.c target\release\libcratonvm.dll.lib
+ *     copy target\release\libcratonvm.dll .
  *     embed_smoke.exe
  *
- *   Static link (any platform), against libcratonvm.a / cratonvm.lib:
- *     cc embed_smoke.c target/debug/libcratonvm.a -ldl -lpthread -o embed_smoke
+ *   Static link (any platform), against liblibcratonvm.a / libcratonvm.lib:
+ *     cc embed_smoke.c target/release/liblibcratonvm.a -ldl -lpthread \
+ *        -o embed_smoke
+ *
+ * The reproducible build+run wrapper is scripts/build-libcratonvm.ps1.
  *
  * This file deliberately re-declares the small slice of the JNI ABI it touches
  * so it builds without a JDK's <jni.h> present. The struct layouts below match
@@ -42,10 +50,20 @@ typedef int32_t jsize;
 typedef uint8_t jboolean;
 
 /* JavaVM / JNIEnv are pointers to a pointer-to-function-table, per the JNI
- * spec. We treat the table as an array of opaque function pointers and index
- * the slots we use. */
-typedef const void **JNIEnv;  /* *const *const fn */
-typedef const void **JavaVM;  /* *const *const fn */
+ * spec (the Invocation-API double indirection): env -> *env (the table) ->
+ * (*env)[i] (one slot). The VM hands back `*const *const usize` (a pointer to
+ * the pointer to a `[usize; N]` table); we mirror that here.
+ *
+ * A table slot must be a *sized* type for `(*env)[index]` to be valid pointer
+ * arithmetic, so we model it as `void *` (a function address, pointer-sized
+ * like the Rust `usize`). Modelling it as bare `void` — as an earlier draft did
+ * — compiles under GCC/Clang (which allow void-pointer arithmetic as an
+ * extension) but is rejected by MSVC ("unknown size"); `void *` builds on all
+ * three toolchains. */
+typedef void     *JniSlot;    /* one function-table slot (a function address) */
+typedef JniSlot  *JniTable;   /* the function table (array of slots) */
+typedef JniTable *JNIEnv;     /* env -> table -> slot  (double indirection) */
+typedef JniTable *JavaVM;     /* same shape; never indexed in this harness */
 
 typedef struct JavaVMOption {
     char *optionString;

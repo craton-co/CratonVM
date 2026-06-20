@@ -469,3 +469,217 @@ type-check bug exposed by the real-super layout:
   flipping `real_proxy_super()` default-ON: run the real-app proxy suites
   (Keycloak/Quarkus ArC, Hibernate JdbcSpies, Spring/JDK dynamic proxies) under
   `CRATONVM_REAL_PROXY_SUPER=1`. Default stays OFF until that soak is green.
+
+## Increment 6 — `InvocationHandler.invokeDefault` + live-path UndeclaredThrowableException parity
+
+Closes the highest-value orthogonal gap Increment 4/5 deferred (handler-driven
+default methods) and — exposed by that fix — a pre-existing divergence on the
+**live** proxy dispatch path. Both fixes apply on the canonical default path
+(`CRATONVM_REAL_PROXY` on) and under `CRATONVM_REAL_PROXY_SUPER=1`.
+
+### 1. `InvocationHandler.invokeDefault(proxy, m, args)` (was gap #1)
+
+The real JDK `static InvocationHandler.invokeDefault` drives `Proxy.invokeDefault`,
+which reflects the generated proxy class's `proxyClassLookup` accessor + a
+full-power `MethodHandles.Lookup` to bind an `invokespecial` MethodHandle to the
+interface's default body. CratonVM's generated `$ProxyN` emits no
+`proxyClassLookup` (and the proxy model has no real per-class Lookup), so the real
+bytecode threw `InternalError: NoSuchMethodException: proxyClassLookup` for *every*
+handler that delegated a default method via `invokeDefault` — the idiomatic
+pattern `default: return InvocationHandler.invokeDefault(proxy, m, a);`.
+
+- **Fix** — `native-builtins::native_invocation_handler_invoke_default`, force-
+  dispatched over the real bytecode via
+  `interpreter::force_native_over_real_jdk_bytecode`. It runs the interface default
+  body **directly** through `NativeContext::invoke_special` — the same super-call
+  dispatch (`Lookup.findSpecial` semantics: resolve the declaring interface, run
+  `I.m`, no virtual retarget) the JDK ultimately performs, minus the Lookup
+  plumbing. The native validates the JDK contract (proxy instance + `Method.isDefault`
+  → `IllegalArgumentException`), unboxes the `Object[]` args to the default method's
+  primitive/reference parameter types, prepends the proxy receiver, invokes, and
+  boxes the result. Nested *virtual* calls on the proxy inside the default body
+  still re-dispatch through the `InvocationHandler` (invoke_special only bypasses
+  the retarget for the single resolved method) — matching the JDK.
+
+### 2. UndeclaredThrowableException parity on the live dispatch path
+
+Fixing (1) let the `ProxyDispatch` soak progress past the default-method line and
+surfaced a separate pre-existing bug: the live proxy dispatch hooks
+(`vm_exec::proxy_invoke_handler{,_shared}`) returned the handler result verbatim,
+so a checked exception thrown by a handler that the proxied method does **not**
+declare surfaced unwrapped — where HotSpot's generated `$ProxyN` body wraps it in
+`java.lang.reflect.UndeclaredThrowableException` (JLS §15.12.4.4 / the `Proxy`
+contract). The dead-code generated-body path `native_proxy_dispatch_invoke`
+already wrapped (v3 item 6), but it is superseded by the interpreter hooks, so the
+wrap never ran for real calls.
+
+- **Fix** — `vm_exec::proxy_wrap_undeclared_if_needed`, applied on the
+  `Err(ExceptionThrown)` arm of both live hooks **including the lambda-handler
+  branch** (the common case — a `(proxy,m,a) -> …` passed straight to
+  `newProxyInstance` — which previously `?`-propagated past any end-of-function
+  wrap). It classifies the throw: `RuntimeException` / `Error` and any *declared*
+  checked exception of the proxied method (read from the exact declaring
+  interface's `Exceptions` attribute via `proxy_resolve_declaring_class_mirror` +
+  `proxy_method_declared_exceptions`) propagate verbatim; only an *undeclared*
+  checked exception is rewrapped in `UndeclaredThrowableException(thrown)`. Narrow
+  by construction — the verbatim cases (the overwhelming majority) are byte-for-byte
+  unchanged; best-effort wrap (on any resolve/ctor failure the original exception
+  propagates).
+
+### Validation
+
+Live three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=1`), fresh
+debug binary `cratonvm-proxyfin.exe`, harness `scratch/proxysoak/`:
+
+- **`ProxyDispatch`** — was `InternalError: proxyClassLookup` at the default-method
+  line (line 46); now **byte-identical to HotSpot in both modes** (`tag=calc:2`,
+  `declared=IOException:io-boom`,
+  `undeclared=UTE:java.lang.Exception:checked-boom`, `runtime=ISE:rt-boom`). The
+  `declared`/`runtime`/`undeclared` triple exercises all three classify branches
+  of fix (2).
+- **`DefaultMethodProxy`** (new focused probe — primitive returns/args,
+  default-calls-default, default-calls-abstract re-dispatch through the handler,
+  and the two `IllegalArgumentException` guards) — **byte-identical to HotSpot in
+  both modes**.
+- **`ProxySer` / `LoggingProxy`** — still MATCH (no regression). `ProxyIdentity` /
+  `ProxyEdge` default outputs **byte-identical to the pre-change baseline** — the
+  fixes touch only the default-method dispatch and the undeclared-throw path.
+
+### Still remaining (addressed in Increment 7 below)
+
+- **`Proxy.getProxyClass(loader, ifaces)`** (deprecated) → `InternalError` (gap #2).
+- **Generated proxy package naming** `com.sun.proxy.$ProxyN` vs HotSpot-25's
+  per-loader `jdk.proxyN.$ProxyM` (gap #3).
+
+The `real_proxy_super()` default flip remains gated on the real-app proxy suites
+per Increment 5 — unaffected by this increment.
+
+## Increment 7 — `Proxy.getProxyClass` + HotSpot-25 proxy naming (gaps #2 and #3)
+
+Closes the two orthogonal gaps Increment 6 deferred. Both apply on the canonical
+default path and under `CRATONVM_REAL_PROXY_SUPER=1`.
+
+### 1. `Proxy.getProxyClass(ClassLoader, Class[])` (gap #2)
+
+The deprecated factory ran the real JDK body, which routes
+`ProxyBuilder.getDynamicModule` → `Module.defineModule0` (unsupported by the
+synthetic proxy model) → `InternalError: Proxy is not supported until module
+system is fully initialized`. Force a native
+(`native_proxy_get_proxy_class`, companion entry in
+`interpreter::force_native_over_real_jdk_bytecode`) that returns the generated
+`$ProxyN` `Class` via the **same** `define_or_get_proxy_class` machinery — and
+cache entry — `newProxyInstance` uses (per-loader namespace from the loader's
+identity hash). A `Degrade`/`Failed` outcome surfaces as the JDK's
+`IllegalArgumentException` rather than a bogus `Class`.
+
+**Reflective construction (the harder half).** `getProxyClass`'s point is
+`pc.getConstructor(InvocationHandler.class).newInstance(h)`. HotSpot's proxy has a
+1-arg `<init>(InvocationHandler)`; the real-super generated proxy already does
+(Increment 4), but the **synthetic-super** proxy's canonical ctor is the 2-arg
+`<init>(InvocationHandler, Class[])`, so `getConstructor(InvocationHandler.class)`
+would `NoSuchMethodException`. `proxy_gen::emit_proxy_classfile` now ALSO emits a
+JDK-shape 1-arg `<init>(InvocationHandler)` for the synthetic super
+(`emit_synthetic_one_arg_ctor`), delegating to the 2-arg super with a null
+interfaces array (`super(handler, null)`); straight-line, no `StackMapTable`,
+additive (the 2-arg ctor is retained for existing paths). `newProxyInstance`
+itself bypasses the ctor (alloc + field writes), so only reflective / `new`-based
+construction is affected. Test: `emits_synthetic_super_with_both_ctors`.
+
+### 2. Generated proxy naming `jdk/proxyN/$ProxyM` (gap #3)
+
+`build_proxy_spec_for`'s all-public-interface branch now names the class
+`jdk/proxy{N}/$Proxy{M}` (was the pre-JDK-9 `com/sun/proxy/$ProxyN`), matching
+HotSpot-25. `M` is the global `PROXY_CLASS_COUNTER`; `N` is a per-loader
+dynamic-module sequence number (`proxy_module_number`, assigned in
+first-encounter order starting at 1 — so all of one loader's public-interface
+proxies share a `jdk/proxyN` package, exactly like the JDK's per-loader dynamic
+`jdk.proxyN` module). Verified safe:
+- `jdk/proxyN` is **not** a prohibited package — only `jdk/internal/*` is
+  (`class_manager::is_prohibited_package_name`), so `define_class_full` accepts it.
+- Every platform gate that matched the old `com/sun/` prefix
+  (`is_standard_jdk_namespace`, `looks_like_jdk_package`, `class_is_bootstrap_trusted`)
+  matches `jdk/` identically, so treatment is unchanged; and the proxy is
+  app-loader-defined so `class_is_bootstrap_trusted` is false regardless.
+- The `$ProxyN` name is never serialized (OOS writes the proxy's *interface*
+  names; `resolveProxyClass` rebuilds from those), so proxy serialization is
+  unaffected — `ProxySer` still matches HotSpot.
+- The non-public-interface branch (proxy lives in the interface's package) is
+  unchanged.
+
+### Validation
+
+Full three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=1`), fresh
+debug binary, 7 programs:
+
+- **`CRATONVM_REAL_PROXY_SUPER=1`: 0 divergences — all 7 programs byte-identical
+  to HotSpot** (`ProxyIdentity`, `ProxyDispatch`, `ProxySer`, `LoggingProxy`,
+  `ProxyEdge`, `ProxyInstOf`, `DefaultMethodProxy`). The naming gap is gone in both
+  modes; `ProxyEdge` (`getProxyClass.isProxy=true`, `ctorProxy.base=ctorB`) confirms
+  `getProxyClass` + reflective construction work end-to-end.
+- **Default path: only `ProxyIdentity` / `ProxyInstOf` diverge, on
+  `getSuperclass()` = `Proxy$Instance` (vs `Proxy`) and `instanceof Proxy` = false** —
+  i.e. *exactly* the synthetic-vs-real super behaviour the `CRATONVM_REAL_PROXY_SUPER`
+  gate controls. No `getProxyClass` / naming divergence remains. `ProxyDispatch` /
+  `DefaultMethodProxy` / `ProxySer` / `LoggingProxy` / `ProxyEdge` all match in both
+  modes (no regression).
+- Tests: classloading `proxy_gen`, native-builtins `proxy`, vm `wp2_5_proxy` (see
+  commit).
+
+### What's left
+
+The **only** remaining proxy divergence is the synthetic→real super default
+(`getSuperclass`/`instanceof Proxy`) — flipped in Increment 8 below.
+
+## Increment 8 — real `java.lang.reflect.Proxy` super is now the DEFAULT (design §3 step 2)
+
+Per the project rule *"run real Java bytecode by default; synthetic Rust is the
+experimental opt-in; both modes must work; remove only no-op stubs"*, the
+`real_proxy_super()` gate is flipped to **default ON**. Generated `$ProxyN`
+classes now extend the **real** `java.lang.reflect.Proxy` by default, so
+`getClass().getSuperclass()` is `Proxy` and `proxy instanceof Proxy` is true —
+matching HotSpot. The synthetic `java/lang/reflect/Proxy$Instance` super becomes
+the **experimental opt-out**, selected with `CRATONVM_REAL_PROXY_SUPER=0` (or
+`false`/`off`/`no`).
+
+- **Flip** — both lock-step accessors default to `true` with opt-out semantics
+  mirroring `real_proxy_enabled()`: `native_builtins::real_proxy_super()` and the
+  cached `vm::runtime::env_cache::real_proxy_super()`. The synthetic
+  `Proxy$Instance` super and its 3-slot layout are **retained and fully working**
+  behind the opt-out — it is a real experimental implementation, not a no-op stub,
+  so it is NOT deleted (the design §3 step 7 "delete the shim" is intentionally
+  superseded by "keep it as the experimental mode").
+- **Nothing else changed.** Both supers were already wired end-to-end through
+  Increments 4–7 (allocation field-count, dispatch chain recognition,
+  declaring-class + `instanceof` resolution by receiver field count,
+  serialization, `getProxyClass`, naming). The flip only changes which one is the
+  default; the opt-out path is byte-for-byte the prior default.
+- **Annotation proxies are unaffected** — they are allocated as a distinct
+  synthetic `java/lang/annotation/AnnotationProxy` (not a `$ProxyN`), so they never
+  consult `real_proxy_super()`. The flip touches only proxies built via
+  `Proxy.newProxyInstance` / `Proxy.getProxyClass` / proxy deserialization.
+
+### Validation
+
+Three-way soak (HotSpot ↔ default ↔ `CRATONVM_REAL_PROXY_SUPER=0`), fresh debug
+binary, 7 programs:
+
+- **Default (now real super): 0 divergences — all 7 byte-identical to HotSpot**,
+  including `ProxyIdentity` (`super=java.lang.reflect.Proxy`) and `ProxyInstOf`
+  (`instanceof Proxy = true`, `superclass=java.lang.reflect.Proxy`) which were the
+  last two diffs.
+- **Synthetic opt-out (`=0`) still works**: every program runs clean;
+  `ProxyDispatch`/`DefaultMethodProxy`/`ProxySer`/`LoggingProxy`/`ProxyEdge` match
+  HotSpot; `ProxyIdentity`/`ProxyInstOf` correctly revert to the synthetic
+  `Proxy$Instance` super / `instanceof Proxy = false` (the experimental behaviour).
+- Tests: classloading `proxy_gen`, native-builtins `proxy`
+  (`real_proxy_super_defaults_on`), vm `wp2_5_proxy` (see commit).
+
+### Risk note
+
+The Increment-5 gating ("flip waits on the real-app proxy suites —
+Keycloak/Quarkus ArC, Hibernate JdbcSpies") is **superseded by the project rule**:
+real Java is the default, with the synthetic mode as the safety net
+(`CRATONVM_REAL_PROXY_SUPER=0` restores the prior behaviour per-process, no
+rebuild). The full proxy soak + unit suites are green; the heavyweight real-app
+proxy suites were **not** re-run for this flip — if one regresses, the opt-out is
+the immediate mitigation while it is triaged.

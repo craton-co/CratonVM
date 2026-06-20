@@ -62,7 +62,7 @@ Also parked under `.github/_disabled-workflows/` (not this directory):
   or `'crate-name/**'`. A bare `'/foo.yml'` is a leading-slash typo and
   matches nothing — guard against it in code review.
 * **Cargo target features**: anything that sets `RUSTFLAGS:` MUST include
-  `-C target-feature=+sse4.2,+pclmul` to match `.cargo/config.toml`,
+  `-C target-feature=+sse4.2,+pclmulqdq` to match `.cargo/config.toml`,
   otherwise the CI binary diverges from the shipping binary.
 * **Binary names**: `cargo build -p cratonvm-cli` produces `cratonvm`
   (and `java`), not `cratonvm-cli`. See `vm-cli/Cargo.toml` for the
