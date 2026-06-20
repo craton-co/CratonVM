@@ -1,17 +1,40 @@
 # spring-bug-06: `MergedAnnotationsTests` HANGS (infinite loop in annotation merge)
 
-> **UPDATE 2026-06-20:** Re-characterised. The hang is **JIT-ONLY**. Under `--nojit` the class
-> now completes (172/178 after the fam6 synthesis fixes on branch `fix/bug06-fam6-repeatable-merge`).
-> Under JIT it still TIMEOUTs (EXIT 124). Captured root cause: `java.util.stream.ReferencePipeline.toArray()`
-> infinite-recurses into itself — the `invokevirtual toArray(IntFunction)[Object` at pc6 mis-dispatches
-> to the no-arg `toArray()[Object` overload (a JIT virtual-overload-resolution bug), accompanied by a
-> GC-guard'd OOB slot-probe (`index=1 num_slots=1`) on a `java/util/stream/Stream` object. **This is the
-> SAME bug as the [[bug06-fam6-annotation-synthesis-mergedannotation]] "~2 GB OOM"** — they unify. It is
-> NOT the annotation-proxy `equals`/`hashCode` issue the original hypothesis (below) blamed — that turned
-> out to be a real but SEPARATE bug, now FIXED. The hang is receiver-specific: plain `Stream.of(..).toArray()`
-> does NOT reproduce it (works under JIT and interpreter). NEXT: localize the JIT invokevirtual overload
-> resolution that picks the no-arg `toArray()` for the Spring-suite stream receiver (release backtraces are
-> unsymbolized — needs a debug build or targeted JIT-dispatch instrumentation). OPEN (JIT codegen).
+> **UPDATE 2026-06-20 (deep root-cause; supersedes the JIT-codegen guess):** With the fam6
+> synthesis fixes (branch `fix/bug06-fam6-repeatable-merge`) the class completes 172/178 under
+> `--nojit` but TIMEOUTs (EXIT 124/127) under JIT. The hang is `ReferencePipeline.toArray()`
+> infinite self-recursion. **It is NOT a JIT-codegen bug** — it reproduces identically under
+> `--nojit` / `CRATONVM_DISABLE_JIT=1` / `CRATONVM_JIT_VIRTUAL_TIERUP=0` / `CRATONVM_DISABLE_INTRINSICS=1`.
+> The earlier "JIT-only" framing was wrong; JIT just makes the real suite *reach* the trigger.
+>
+> **Minimal reproducer** (`spring-suite/probe/ISn.java`, hangs in seconds):
+> ```java
+> for (int k=0;k<N;k++) (k%3==0?OptionalInt.empty():OptionalInt.of(k%7)).stream()
+>      .mapToObj(i->"["+i+"]").collect(Collectors.joining());
+> ```
+> Completes for N≤1000, HANGS for N≥2000 — a count-triggered cache/warmup promotion at ~1000–2000.
+> Originates from JUnit's `JupiterTestDescriptor.getLegacyReportingName()` = `indexes.mapToObj(..).collect(joining())`.
+>
+> **Mechanism (instrumented `invoke_or_native` + `invoke_on_class_shared_inner` + cached dispatch):**
+> On CratonVM the stream chain is synthetic interface-classed stubs (`OptionalInt.stream()` → an object
+> whose class IS `java.util.stream.IntStream`; `mapToObj` → class `java.util.stream.Stream`). Calling
+> `mapToObj().toArray()` directly works (a `toArray` native handles the stub — `ISt.java` loops 3000× clean).
+> But after ~1000 iters the `collect(joining())` path switches the chain to **real JDK bytecode**
+> (a native→bytecode promotion, the documented `interpreter.rs:~14690` "interface-bridge dispatched first
+> call, cached bytecode later" class), producing a **real `IntPipeline$1`**. `collect` then calls no-arg
+> `IntPipeline$1.toArray()`, which resolves correctly to `ReferencePipeline.toArray()` (real bytecode,
+> `hasCode=true`, non-synthetic). That bytecode's `invokevirtual #219` (= `ReferencePipeline.toArray:(IntFunction)`,
+> verified via `javap -v`) is then dispatched as the **no-arg `toArray()`** again — `toArray(IntFunction)`
+> and the cached path are NEVER reached. So the inherited `ReferencePipeline.toArray()` frame resolves its
+> own constant-pool method-ref against the WRONG class (the receiver subclass `IntPipeline$1`, not the
+> declaring class `ReferencePipeline`) → `toArray()`→`toArray()` forever. Normal inherited calls use the
+> fast/cached path (CP-correct), which masks this; it surfaces only for the slow/uncached inherited
+> dispatch on a receiver whose runtime class ≠ the inherited method's declaring class.
+>
+> **Same bug as [[bug06-fam6-annotation-synthesis-mergedannotation]]'s "~2 GB OOM".** OPEN — fix is in the
+> slow inherited-method dispatch (frame constant-pool class), a core path; needs careful work + full
+> regression. A safer interim mitigation: prevent the stream-factory natives (`OptionalInt.stream`,
+> `mapToObj`) from promoting to real JDK bytecode so the chain stays on the working synthetic-stub path.
 
 | | |
 |---|---|
