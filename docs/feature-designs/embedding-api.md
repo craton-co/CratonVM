@@ -151,8 +151,16 @@ because it is the load-bearing piece a C host needs) — is implemented in a new
 `libcratonvm` crate:
 
 - **New crate `libcratonvm/`** with `crate-type = ["cdylib", "staticlib",
-  "rlib"]`, registered in the workspace-root `Cargo.toml` `members`. Produces
-  `libcratonvm.{so,dll,a}` / `cratonvm.dll` / `cratonvm.lib`.
+  "rlib"]`, registered in the workspace-root `Cargo.toml` `members`. cargo names
+  the artifacts after the crate, so the real outputs are: **Windows**
+  `libcratonvm.dll` + import lib `libcratonvm.dll.lib` + staticlib
+  `libcratonvm.lib`; **Linux** `liblibcratonvm.so` + `liblibcratonvm.a` (the
+  doubled `lib` is cargo's prefix on a crate already named `lib…`; linked with
+  `-llibcratonvm`). The lib is *not* renamed to `cratonvm` because the
+  `cratonvm-cli` bin already owns that name — a `cratonvm` cdylib would collide
+  with `cratonvm.pdb` on `--workspace` Windows builds. (See the acceptance
+  increment below; an earlier draft of this line claimed `cratonvm.dll` /
+  `cratonvm.lib`, which cargo does not actually emit.)
 - **Three exported entry points** (`#[no_mangle] pub extern "C"`):
   - `JNI_CreateJavaVM(JavaVM**, void** penv, void* args)` — parses
     `JavaVMInitArgs` (`-Xmx`, `-cp`/`-classpath`, `-D<k>=<v>`) into a
@@ -356,3 +364,61 @@ shippable. Layer 2 (`libcratonvm` C-ABI) is M. Layer 3 (`JNI_CreateJavaVM` +
 Invocation parity) is M–L but builds on the substantial JNI table already in
 `jni.rs` — the creation entry point + global registry is the real gap, not the
 function table.
+
+## Acceptance landed — built + run against a live JDK-25 VM
+
+Increments 1–5 were *coded* but the load-bearing proof — actually building the
+`cdylib`/`staticlib` and running a C host against it — had never been executed
+(the harness headers explicitly deferred the build to "the orchestrator"). That
+is now done; the feature is verified end-to-end.
+
+- **Library built.** `cargo build --release -p libcratonvm` produces
+  `target/release/libcratonvm.dll` + `libcratonvm.dll.lib` (+ `.lib` staticlib).
+  On a fresh worktree this hits the known libffi-sys MSVC `fficonfig.h` failure;
+  the fix (prepend libffi's four header dirs to `INCLUDE` *before* vcvars) is
+  encoded in the new reproducible wrapper `scripts/build-libcratonvm.ps1`.
+- **`embed_smoke.c` (JNI Invocation API) — PASS.** A C host does
+  `JNI_GetDefaultJavaVMInitArgs` → `JNI_CreateJavaVM(-Xmx64m, -D…)` →
+  `JNI_GetCreatedJavaVMs` (reports 1) → `FindClass(java/lang/System)` →
+  `GetStaticMethodID(gc,()V)` → `CallStaticVoidMethodA` through the live JNIEnv
+  table. Exit 0, `embed_smoke: OK`. **This is the task's acceptance criterion: a
+  C harness creates a VM and calls a static method.**
+- **`embed_flat.c` (flat `cratonvm_*` API) — PASS.** create → load_class →
+  new_string → invoke_static(System.gc) → deliberate bad-class last-error →
+  destroy. Exit 0, with the error path returning a real message
+  (`class not found: no/such/Class`).
+- **Full flat surface (increments 3–5) — PASS** through the shipped `.dll`,
+  `#include`-ing the public `cratonvm.h` (so the header is proven to compile from
+  C and match the ABI): `new_string`+`string_utf8` round trip; `invoke_virtual`
+  `"hello".length() == 5`; `object_class`+`class_name == "java/lang/String"`;
+  name-based `field_index`/`get_field_by_name`/`set_field_by_name` write-back on
+  `String.hash` (by-name read == by-index read; write 0x4d2 reads back 0x4d2);
+  unknown field name errors cleanly.
+- **Rust tests green:** `cargo test --release -p libcratonvm -p cratonvm-embed`
+  = 23 + 1 + 1 doc-test, all pass.
+
+**One real bug fixed.** `embed_smoke.c` modelled a JNIEnv table slot as bare
+`void` (`typedef const void **JNIEnv; … (*env)[index]`). GCC/Clang allow
+void-pointer arithmetic as an extension, so it "worked" on paper, but **MSVC
+rejects it** (`C2036/C2069: 'const void *': unknown size`) — i.e. the Windows
+acceptance harness never actually compiled. Fixed by modelling a slot as a sized
+`void *` through a small typedef chain (`JniSlot`→`JniTable`→`JNIEnv`), matching
+the VM's `JNIEnv = *const *const usize` double indirection. The slot indices
+(`FindClass`=6, `GetStaticMethodID`=113, `CallStaticVoidMethodA`=143) were
+verified against `build_function_table` in `jni.rs` and are correct.
+
+**Doc/harness corrections.** The earlier "Produces `cratonvm.dll`/`cratonvm.lib`"
+claim was wrong (cargo emits `libcratonvm.*`); both harness header build-command
+blocks and the Increment-1 text were corrected to the real per-platform names,
+and `embed_smoke.c`'s malformed Linux `cc` line was fixed.
+
+- **Reproduce:** `pwsh -File scripts/build-libcratonvm.ps1` (auto-discovers
+  vcvars + the libffi `INCLUDE` dirs, builds the lib, then compiles & runs both
+  harnesses with unique exe names). `-NoRun` to build only, `-Profile dev` for a
+  debug build, `-Suffix <tag>` to rename the harness exes.
+
+Still genuinely next (unchanged): descriptor-based disambiguation of shadowed
+same-name fields; a C-varargs convenience shim; foreign call-in thread
+registration with the GC safepoint machinery (out of scope here — the harnesses
+drive the VM only from the creating thread); and CI publication of the `.so`/
+`.dll`/`.a` + header.
