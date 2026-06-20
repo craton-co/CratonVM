@@ -343,6 +343,33 @@ just slow interpreted Hibernate metadata work. This is a large, multi-session DB
 (`agroal_pool.rs` / `jdbc.rs` / `apps_h2.rs` + real `java.sql` + the H2 driver, backed by the
 VM's real file layer).
 
+**Deep-dive follow-up (2026-06-20, continued):**
+- **Path confirmed REAL, shim bypassed.** `io.quarkus.agroal.runtime.DataSources.createDataSource`
+  does `new io.agroal.pool.DataSource(config, listeners)` (bci 432/476) — the real Agroal pool
+  impl. So `getConnection()` virtual-dispatches to real Agroal bytecode → its `ConnectionFactory`
+  → the real JDBC driver. The `agroal_pool.rs` shim (registered on the `io/agroal/api/AgroalDataSource`
+  **interface**) is never reached. To use the shim, force-override on the concrete
+  `io/agroal/pool/DataSource` (or shim the JDBC `Driver.connect`/`DriverManager.getConnection` the
+  real pool calls).
+- **The boot is FURTHER than "DB layer."** When Hibernate proceeds past the null connection (it
+  builds metadata on the explicit `H2Dialect`, so the null connection is non-fatal *for bootstrap*),
+  the boot advances into **RESTEasy Reactive deployment** — `ApplicationImpl.<clinit>` pc≈750 →
+  `ResteasyReactiveProcessor$setupDeployment.deploy_41` → `RuntimeDeploymentManager.deploy` →
+  `buildResourceMethod` → loading endpoint-invoker classes via `RunnerClassLoader`/`JarFileReference`
+  (nested-JAR). That's very close to the HTTP bind.
+- **Nondeterministic.** Some runs proceed to RESTEasy as above; others, after the null connection,
+  tear down the Hibernate bootstrap (`Stop region factory` / `Clear region references`) and then
+  hang/spin. No exception is printed (logging gap 5b). The variance points at a timing-dependent
+  null in the connection path.
+- **JIT-neutral.** Booting with JIT ENABLED neither crashes nor unblocks — it hits the same
+  Hibernate/connection wall. So the wall is the **DB connection itself**, not interpreter speed.
+- **Bottom line / strategy.** The real unlock is producing a working `java.sql.Connection` from the
+  real Agroal pool — either (a) make CratonVM's H2 path (`apps_h2.rs`/`jdbc.rs`, or H2→SQLite) serve
+  the real pool's `Driver.connect`/connection-factory, or (b) force the concrete
+  `io.agroal.pool.DataSource.getConnection` to the `agroal_pool.rs` shim. Then Keycloak's Liquibase
+  schema migrations + real SQL run on that connection — itself a substantial sub-effort. Genuinely
+  multi-session; the boot is otherwise within a few steps of binding HTTP.
+
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
 `InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC
