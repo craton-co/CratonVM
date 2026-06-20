@@ -1,5 +1,13 @@
 # Intermittent reactor worker-thread leak at client shutdown (RUNNABLE, empty stack)
 
+> **➜ SUPERSEDED (2026-06-20) by
+> [gc-rscache-reactor-shutdown-timing-race.md](gc-rscache-reactor-shutdown-timing-race.md).** That doc has
+> the definitive characterization (GC-frequency-driven, rs_cache-PRESENCE-triggered STW-vs-shutdown timing
+> race; NOT a socket bug) and the validated `CRATONVM_ROOTSNAP_CACHE=0` workaround. The co-occurring (but
+> INDEPENDENT) teardown corruption is its own bug:
+> [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md). This file
+> is kept only for the prior-investigation trail below.
+
 **Status:** OPEN (intermittent, ~1 in 16–60 runs; rate inflated by concurrent peer-session load on the
 shared worktree). Follow-up to the `Thread.getState()` fix (commit `16d23e7b`).
 
