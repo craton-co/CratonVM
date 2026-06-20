@@ -3569,6 +3569,21 @@ impl std::fmt::Debug for JitCache {
 // Escape analysis: IR graph → EA graph conversion
 // ---------------------------------------------------------------------------
 
+/// The instance-field index a full-layout `Op::Load`/`Op::Store` accesses,
+/// recovered from its `Const(field_index)` offset operand (input[3]). Returns
+/// `None` for a compact / malformed node (no constant offset), letting the
+/// caller fall back to the `MemKind`-derived index. This is the single place
+/// the EA bridge interprets a production field access's index, so the EA
+/// graph's field edges and `apply_ea_to_ir`'s `field_values` lookup agree.
+fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    let offset_node = *node.inputs.get(3)?;
+    match ir_graph.nodes.get(offset_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
 /// Convert an `ir::Graph` to an `escape_analysis::Graph` for standalone
 /// escape analysis.  The two modules define independent `Op` / `Node` /
 /// `Graph` types, so we translate node-by-node.  Returns both the EA graph
@@ -3605,7 +3620,24 @@ fn escape_analysis_from_ir(
             continue;
         }
         let ir_node = &ir_graph.nodes[i];
-        let ea_op = ir_op_to_ea_op(&ir_node.op);
+        // The production builder emits full-layout `Op::Load`/`Op::Store`
+        // (`[ctrl, mem, base, offset, (value)]`) carrying a `MemKind`, but the
+        // EA graph keys field edges by a real **field index**. Recover it from
+        // the `Const(field_index)` offset operand (input[3]); fall back to the
+        // `MemKind`-derived index (`ir_op_to_ea_op`) only when the offset isn't
+        // a constant (a malformed/compact node EA already treats
+        // conservatively).
+        let ea_op = match &ir_node.op {
+            ir::Op::Load(_) => match ir_load_store_field_index(ir_graph, i as ir::NodeId) {
+                Some(f) => escape_analysis::Op::Load(f),
+                None => ir_op_to_ea_op(&ir_node.op),
+            },
+            ir::Op::Store(_) => match ir_load_store_field_index(ir_graph, i as ir::NodeId) {
+                Some(f) => escape_analysis::Op::Store(f),
+                None => ir_op_to_ea_op(&ir_node.op),
+            },
+            _ => ir_op_to_ea_op(&ir_node.op),
+        };
         // Don't wire inputs yet — we need all id_map entries populated.
         let ea_id = ea.add_node(ea_op, vec![]);
         id_map[i] = ea_id;
@@ -3619,11 +3651,22 @@ fn escape_analysis_from_ir(
         }
         let ea_id = id_map[i];
         let ir_node = &ir_graph.nodes[i];
-        let ea_inputs: Vec<escape_analysis::NodeId> = ir_node
-            .inputs
-            .iter()
-            .map(|&inp| id_map[inp as usize])
-            .collect();
+        // The EA graph reads memory-access operands positionally in a *compact*
+        // layout (`Store [holder, value]`, `Load [holder]`); the full-layout IR
+        // node places the holder at input[2] and the store value at input[4].
+        // Translate those two shapes; everything else is forwarded verbatim.
+        // (A node whose expected operand is missing yields an empty input list,
+        // which EA's `store_holder`/`load_holder` treat conservatively.)
+        let map_id = |inp: ir::NodeId| -> escape_analysis::NodeId {
+            id_map.get(inp as usize).copied().unwrap_or(usize::MAX)
+        };
+        let ea_inputs: Vec<escape_analysis::NodeId> = match &ir_node.op {
+            ir::Op::Store(_) if ir_node.inputs.len() >= 5 => {
+                vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
+            }
+            ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            _ => ir_node.inputs.iter().map(|&inp| map_id(inp)).collect(),
+        };
         ea.nodes[ea_id].inputs = ea_inputs.clone();
         // Rebuild use-edges for the targets.
         for &inp_ea in &ea_inputs {
@@ -3708,22 +3751,20 @@ fn apply_ea_to_ir(
                 continue;
             }
 
-            // Determine the field index from the EA Load op so we can look
-            // up the replacement value in field_values.
-            let ea_field_idx = match &info.field_values.len() {
-                0 => continue,
-                _ => {
-                    // The EA graph's Load(field_idx) carries the field index.
-                    // We need to read it from the EA op, but we only have the
-                    // EA node ID.  Instead, we can derive it: the IR Load's
-                    // MemKind was mapped to the EA field index via
-                    // `*mk as usize` in ir_op_to_ea_op.
-                    if let ir::Op::Load(mk) = &ir_graph.nodes[idx].op {
-                        *mk as usize
-                    } else {
-                        continue;
-                    }
-                }
+            // Determine the field index of this load so we can look up the
+            // replacement value in `field_values`. It must match the index the
+            // EA bridge keyed field edges by: the real field index from the
+            // `Const` offset operand (full-layout production load), falling back
+            // to the `MemKind`-derived index for a compact/hand-built node.
+            if info.field_values.is_empty() {
+                continue;
+            }
+            let ea_field_idx = match ir_load_store_field_index(ir_graph, ir_load) {
+                Some(f) => f,
+                None => match &ir_graph.nodes[idx].op {
+                    ir::Op::Load(mk) => *mk as usize,
+                    _ => continue,
+                },
             };
 
             if ea_field_idx < info.field_values.len() {
@@ -5394,6 +5435,120 @@ mod tests {
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "an unresolved getfield must NOT take the IR pipeline"
+        );
+    }
+
+    // ── activate-ir-optimizer inc 16: EA bridge handles full-layout ops ──
+    //
+    // Escape analysis scalar-replaces a non-escaping allocation by killing the
+    // `Op::New` and its field stores and redirecting field loads to the stored
+    // value. That only works if the IR→EA bridge translates the *production*
+    // full-layout `Op::Load`/`Op::Store` (`[ctrl, mem, base, offset, value]`,
+    // `MemKind`-tagged) into the EA's compact `[holder]`/`[holder, value]`
+    // layout with the real field index from the `Const` offset operand — the
+    // exact thing inc 16 fixed. This builds such a graph by hand (the builder
+    // does not emit `Op::New` yet) and proves the round-trip.
+    #[test]
+    fn ea_bridge_scalar_replaces_full_layout_new_store_load() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        // Object o = new Foo(); o.f1 = 42; return o.f1;  (single int field at
+        // index 1, to also exercise a non-zero field index vs MemKind::Int=0).
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(1), IrType::Int, vec![], None); // field index 1
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "a non-escaping New with a matching field store/load must be \
+             scalar-replaceable once the bridge resolves the full layout"
+        );
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+        assert_eq!(g.nodes[newobj as usize].op, Op::Dead, "New killed");
+        assert_eq!(g.nodes[store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(g.nodes[load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            g.nodes[ret as usize].inputs[1], val,
+            "the load result must be redirected to the stored value (Const 42)"
+        );
+    }
+
+    // A New that escapes (returned by reference) must NOT be scalar-replaced —
+    // the bridge fix preserves the escape rule (a missed escape would scalar-
+    // replace an object a real use still needs: the kafka bug-25 class).
+    #[test]
+    fn ea_bridge_keeps_escaping_new() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let _store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        // Return the *reference* — the object escapes globally.
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, newobj], None);
+        g.exit = ret;
+
+        let (ea, _id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "an escaping New must not be scalar-replaceable"
         );
     }
 

@@ -796,6 +796,67 @@ jit lib 796/796, harness 20/20, `cratonvm-vm` builds clean.
 `JitRuntimeHelpers` access for the allocation/dispatch helper calls), which also
 finally de-latents the inc-4–9 DSE/escape/LICM passes on production IR.
 
+## Increment 16 (Front 3 — EA bridge handles the full-layout Load/Store) landed
+
+Status: **landed** on `dev`. The foundational first piece of the `new`/`Op::Call`
+frontier: the IR→escape-analysis bridge now correctly translates the
+**production** field-access layout, which is the prerequisite for escape analysis
+to ever scalar-replace a non-escaping allocation on real IR.
+
+**The bug it fixes.** `escape_analysis_from_ir` (`lib.rs`) used to copy an IR
+node's inputs verbatim into the EA graph. But the EA graph reads memory operands
+in a **compact** layout (`Store [holder, value]`, `Load [holder]`) keyed by a
+real **field index**, while the production `Op::Load`/`Op::Store` the builder now
+emits (inc 14/15) are **full-layout** (`[ctrl, mem, base, offset, value]`)
+carrying a `MemKind`. Forwarded verbatim, EA read the *holder* from input[0] (the
+control edge) and the field index from the `MemKind` discriminant (always
+`Int`=0). So EA could never match a field store/load to its allocation → it never
+scalar-replaced anything on real IR (silently conservative, hence sound but
+inert).
+
+**What landed** (`jit/src/lib.rs`):
+- `ir_load_store_field_index` recovers the real field index from the `Const`
+  offset operand (input[3]); `escape_analysis_from_ir`'s first pass uses it for
+  the EA `Load`/`Store` op, and the second pass emits the compact operands
+  (`holder = input[2]`, `value = input[4]`). Non-Load/Store nodes are forwarded
+  verbatim; a malformed/compact node yields empty operands EA treats
+  conservatively.
+- `apply_ea_to_ir` now derives the load's field index the same way (real index,
+  `MemKind` fallback) so its `field_values` lookup agrees with the bridge.
+
+**Why this is sound and inert today**: the only full-layout Load/Store in
+production come from int getfield/putfield whose base is a `Param` (escaping), so
+EA still finds nothing scalar-replaceable there — no behaviour change. The fix
+only *enables* scalar replacement for the not-yet-emitted `Op::New` case.
+
+**Tests** (`jit/src/lib.rs`): `ea_bridge_scalar_replaces_full_layout_new_store_
+load` builds a by-hand `o = new Foo(); o.f1 = 42; return o.f1` graph in the
+production layout (field index 1, distinct from `MemKind::Int`=0) and asserts EA
+kills the New/Store/Load and redirects the return to the stored `Const(42)`;
+`ea_bridge_keeps_escaping_new` asserts a returned-by-reference New is NOT
+scalar-replaced (the kafka bug-25 escape rule is preserved). jit lib 798/798,
+field harness 20/20.
+
+**Remaining for the `new` scalar-replacement slice** (clearly scoped, NOT done):
+1. **Builder emits `Op::New`** (0xbb) with `class_id`/`num_fields` from
+   `cp_new_resolver` (thread it like `field_info`), plus `dup` (already handled).
+2. **`<init>` elision** — the soundness crux. `new Foo()` is `new; dup;
+   invokespecial Foo.<init>`. Single-pass treats **any** `()V` `<init>` as
+   trivial (`is_trivial_void_init`, `x64.rs`) and elides it, but a `()V`
+   constructor can still initialise fields (`Foo(){ x = 5; }`), which eliding
+   would silently drop — a real miscompile risk. Do NOT replicate the
+   `()V`-is-trivial assumption blindly; gate elision on a provably-effect-free
+   `<init>` (investigate `cp_new_resolver`'s `has_primitive_init` flag, or only
+   admit objects whose every read field is dominated by a visible `putfield`).
+3. **Gate**: after EA, if any live `Op::New` survives (escaping), bail to
+   single-pass — the IR lowerer has no allocation path yet.
+4. **Harness**: a non-escaping `new` scalar-replaces to pure-int code (no alloc,
+   no helper), so the existing dummy-helper differential validates it directly.
+5. **Then `Op::Call`** for real `invoke*` (needs the lowerer to gain
+   `JitRuntimeHelpers` access for the dispatch/alloc helper calls, plus VM-level
+   differential validation per `wire-tiered-manager` — the jit-crate stub harness
+   cannot faithfully validate dispatch).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
