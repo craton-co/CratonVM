@@ -1,10 +1,82 @@
-# `ByteArrayMappingTests` SIGSEGV — log4j2 `getCallerClass` → `StackWalker.walk` re-entrant non-termination
+# `ByteArrayMappingTests` SIGSEGV — log4j2 `getCallerClass` → `StackWalker.walk` GC corruption
 
 **Severity:** High (hard, uncatchable crash, `EXCEPTION_ACCESS_VIOLATION` / SIGSEGV, rc=139).
-**Status:** 🔴 OPEN (root cause CONFIRMED & precisely pinned; root fix is non-trivial — handoff). A separate
-general **mitigation (H7 native stack-bang)** landed for the *class* of uncatchable native-stack overflows
-(it does NOT catch this bug — see below).
-**Mode:** Interpreter (JIT-off). **HotSpot (JDK 25):** PASS.
+**Status:** 🟠 PARTIALLY FIXED. The earlier "re-entrant non-termination" diagnosis (below, struck through)
+was **WRONG** — this is **GC memory corruption** during the `StackWalker` walk, not an infinite loop.
+A whole layer of GC-safety bugs in the synthetic stream / StackWalker natives is now fixed (minimal repros
+`DeepWalkGC.java` / `DeepWalkGC2.java` pass), but `ByteArrayMappingTests` itself still SIGSEGVs via a
+**distinct, deeper** residual (see "Corrected diagnosis" / "Residual").
+**Mode:** Interpreter (JIT-off, and JIT-on). **HotSpot (JDK 25):** PASS.
+
+## Corrected diagnosis (2026-06-20 — supersedes the "re-entrant loop" section below)
+
+It is **NOT** a re-entrant / non-terminating `StackWalker.walk`. Evidence: walks are NOT nested
+(`CRATONVM_DBG_SWREENTER`=0); the "captured stack grows each round 42→111" is just Hibernate startup
+nesting progressively deeper, not re-entrancy; `getCallerClass` returns the CORRECT class (toy `CallerWalk`
+matches HotSpot); only ~63 walks, depth maxes ~111. The crash is **GC corruption** — proven with
+`CRATONVM_DBG_GC_STRESS=1` (SIGSEGV → rc=1 with `gen_heap` `ClassId(0) num_slots=0` zeroed-header warnings =
+collected objects accessed). Heap-size-invariant (8g still crashes) and stack-size-invariant
+(`-Xss`-equivalent 1g still crashes → not native-stack overflow; H7 correctly never fires).
+
+**Root cause class:** CV native code holds Java object refs in Rust locals/`Vec`s across allocating `ctx`
+calls (`invoke_virtual` / `create_string` / `alloc_*`) **without re-reading them from a pin** afterwards.
+`safe_native_call` pins a native's *args*, but the native's local copies still go stale when the moving
+young-gen GC relocates the object (the pin is remapped; the bare local is not). The `StackWalker` walk
+drives this relentlessly (one `StackFrameInfo`+`StackTraceElement`+strings per frame via `populate_sfi`).
+
+**Fixed in this branch** (`fix/hib-stackwalk-reentrant-loop`):
+1. `native_fetch_stack_frames` was **re-capturing** the live stack (deeper, polluted with `java.util.stream.*`
+   / `StackStreamFactory$*` frames) and indexing it with the `callStackWalk`-relative cursor → fed the user
+   function garbage frames. Fix: `SW_FRAME_CACHE` caches the clean ordered list at `callStackWalk`.
+2. `populate_sfi` / `populate_stack_frame` / `p59_sw_walk` / the `callStackWalk`+`fetchStackFrames` natives:
+   pinned all in-flight allocations (`sf` / strings / mirror / `ste` / the frame buffer array).
+3. `native_stream_spliterator` / `stream_elements` / `materialize_lazy_stream` (native-collections): the
+   eager synthetic-stream path drained the StackWalker spliterator (heavy alloc → moving GC) then wrote the
+   result back through a **stale** `stream`/`elements`/`arr`. Pinned + re-read via `read_native_pin`
+   (`pin_value_slice` / `read_value_slice` helpers). This fixes `DeepWalkGC.java` (rc=1+corruption → rc=0).
+
+Pin-pointing tool added: `CRATONVM_DBG_STRAYSTACK=1` now prints `CULPRIT-NATIVE=… RVA=0x…` for any native
+that writes through a relocated/zeroed receiver — symbolize with `CRATONVM_SYMBOLIZE`.
+
+Minimal repro for the (now-fixed) stream-native layer — `cratonvm --nojit --Xmx 64m -cp . DeepWalkGC`
+(was rc=1 + `ClassId(0)` zeroed-header warnings; now `caller=DeepWalkGC$JLogger`, rc=0). `DeepWalkGC2`
+is the same with log4j2's exact non-allocating predicates (`getClassName().equals/startsWith`):
+```java
+import java.lang.StackWalker.StackFrame; import java.lang.StackWalker.Option;
+public class DeepWalkGC {
+    static final StackWalker WALKER = StackWalker.getInstance(Option.RETAIN_CLASS_REFERENCE);
+    static Class<?> getCallerClass(String fqcn) {                 // log4j2 java9 StackLocator pattern
+        return WALKER.walk(s -> { java.util.ArrayList<byte[]> junk = new java.util.ArrayList<>();
+            return s.dropWhile(f -> { junk.add(new byte[64]); return !f.getClassName().equals(fqcn); })
+                    .dropWhile(f -> f.getClassName().equals(fqcn))
+                    .dropWhile(f -> !f.getClassName().startsWith("")).findFirst(); })
+            .map(StackFrame::getDeclaringClass).orElse(null);
+    }
+    static class LogMgr { static Class<?> getContext() { return getCallerClass(LogMgr.class.getName()); } }
+    static class JLogger { final Class<?> c; JLogger() { c = LogMgr.getContext(); } }
+    static int sink;
+    static Class<?> deep(int n) { if (n>0){ byte[] b=new byte[32]; sink+=b.length; return deep(n-1);}
+        Class<?> last=null; for (int i=0;i<2000;i++) last=new JLogger().c; return last; }
+    public static void main(String[] x){ System.out.println("caller="+deep(95).getName()); }
+}
+```
+
+## Residual (still 🔴 OPEN — distinct, deeper bug)
+
+`ByteArrayMappingTests` STILL SIGSEGVs. Its walk uses the **real-JDK lazy drain** (`Stream.dropWhile` →
+`tryAdvance` → `StackFrameBuffer.fetchStackFrames()I` → `resize` → `fill`), not CV's eager spliterator path
+that the minimal repros exercise — so the stream-native fixes above don't cover it. The fault is
+`ValueStack::push` reading a wild address inside `StackFrameBuffer.fill`'s reflective `ctor.newInstance(walker)`
+loop. `CompactValue::from_value` does **not** dereference the value (it only stores the pointer), so the bad
+read is `self` = `thread.frames[frame_idx].stack` → **frame-index / value-stack corruption**, NOT a stale
+Java field value. Most likely an operand-stack-tag-loss / missed-root on the `fill` JDK frame during its
+allocating loop, or `thread.frames`/`frame_idx` mismanagement across the deep native↔interpreter re-entry
+(`native_call_stack_walk` → `ctx.invoke("doStackWalk")` → … → our `fetchStackFrames` native). Not reproduced
+by a minimal repro yet (needs the full Hibernate stack). Pre-existing — the pre-fix binary crashes identically.
+
+---
+
+## (Superseded) original hypothesis — re-entrant non-termination
 
 ## What it actually is (confirmed via instrumentation — supersedes earlier hypotheses)
 
