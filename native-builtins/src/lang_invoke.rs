@@ -4302,7 +4302,20 @@ pub(crate) fn mh_dispatch(
             // in `Selector.getSelector`. (`adapt_invoke_args` is a no-op for
             // already-correctly-typed args, so the direct `invoke` path that
             // already adapts is unaffected.)
-            let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+            //
+            // Honor a bound first argument: `staticHandle.bindTo(x)` keeps
+            // MH_KIND_STATIC but captures `x` in MH_BOUND (the first param), so
+            // prepend it to the incoming args before dispatch.
+            let full: Vec<Value> = match bound {
+                Value::Object(Some(_)) => {
+                    let mut v = Vec::with_capacity(extra_args.len() + 1);
+                    v.push(bound);
+                    v.extend_from_slice(extra_args);
+                    v
+                }
+                _ => extra_args.to_vec(),
+            };
+            let adapted = adapt_invoke_args(ctx, &full, &desc);
             ctx.invoke(&class, &name, &desc, &adapted)
         }
         MH_KIND_CONSTRUCTOR => {
@@ -4714,7 +4727,23 @@ pub(crate) fn mh_dispatch(
             let leading = extra_args.len() - count;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
             for i in 0..count {
-                ctx.set_array_element(arr, i, extra_args[leading + i]);
+                // Box primitive values into their wrappers — the collector
+                // gathers into an `Object[]`. The indy call site passes raw
+                // primitives (Groovy's `3 * 2` is `invoke(II)Object`), and the
+                // real JDK boxes them via the trailing `asType`; our `asType`
+                // shim is a passthrough, so box here. Without this, `selectMethod`
+                // receives raw `int`s in its `Object[] args` and Groovy's
+                // `args[0].getClass()` (Selector.setGuards) dereferences a raw
+                // int as an object → NPE.
+                let v = extra_args[leading + i];
+                let boxed = match v {
+                    Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
+                    Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
+                    Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
+                    Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
+                    other => other,
+                };
+                ctx.set_array_element(arr, i, boxed);
             }
             let mut full: Vec<Value> = Vec::with_capacity(leading + 1);
             full.extend_from_slice(&extra_args[..leading]);
@@ -5222,40 +5251,16 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let extra = &args[1..];
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            // Verify argument count matches descriptor
-            if !desc.is_empty() {
-                let expected_params = count_descriptor_params(&desc);
-                let kind = match ctx.get_field(this, MH_KIND) {
-                    Value::Int(k) => k,
-                    _ => MH_KIND_VIRTUAL,
-                };
-                // Virtual/special methods need a receiver arg in addition to params
-                let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
-                let expected_count = if needs_receiver {
-                    expected_params + 1
-                } else {
-                    expected_params
-                };
-                // Check for bound receiver (reduces expected by 1)
-                let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
-                let final_expected = if has_bound && needs_receiver {
-                    expected_count - 1
-                } else {
-                    expected_count
-                };
-                if extra.len() != final_expected {
-                    // WrongMethodTypeException — arity mismatch
-                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                        cratonvm_types::error::VmError::Internal {
-                            message: format!(
-                                "WrongMethodTypeException: expected {} args, got {}",
-                                final_expected,
-                                extra.len()
-                            ),
-                        },
-                    ));
-                }
-            }
+            // NOTE: a strict invokeExact arity check (throwing
+            // WrongMethodTypeException) cannot be enforced on CratonVM's
+            // synthetic `MH_KIND_*` model — adapters (insertArguments /
+            // asCollector / asSpreader / dropArguments / guardWithTest) keep
+            // their inner target's descriptor, so the apparent arity often
+            // differs from the real call-site arity. Throwing here aborted the
+            // VM mid-dispatch (Groovy's `IndyInterface` invokes its dispatch
+            // chains via invokeExact: "internal error: WrongMethodTypeException:
+            // expected 2 args, got 1"). Fall through to `mh_dispatch`, whose
+            // kind-specific arms splice/gather/forward the actual arguments.
             let kind = match ctx.get_field(this, MH_KIND) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
