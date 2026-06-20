@@ -373,6 +373,15 @@ fn youngscan_enabled() -> bool {
 
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
+thread_local! {
+    /// DBG (CRATONVM_DBG_STRAYSTACK): stack of (callback-address, name) of
+    /// natives currently executing on this thread, so the stray-receiver dump
+    /// can name + RVA-locate the one that wrote through a relocated/zeroed
+    /// receiver.
+    static CURRENT_NATIVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn youngscan_straystack_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -457,10 +466,26 @@ pub fn safe_native_call(
     // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
 
+    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
+    // thread-local stack so the stray-receiver dump can name the culprit.
+    let _dbg_native = if youngscan_straystack_enabled() {
+        let nm = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
+        true
+    } else {
+        false
+    };
+
     let result = {
         let mut ctx = NativeContextImpl { shared, thread };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut ctx, args)))
     };
+    if _dbg_native {
+        CURRENT_NATIVE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
 
     // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
@@ -2055,9 +2080,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let k = N.fetch_add(1, Ordering::Relaxed);
                 if k < 12 {
+                    let (cb_addr, culprit) = CURRENT_NATIVE_STACK
+                        .with(|s| s.borrow().last().cloned())
+                        .unwrap_or((0, "<unknown>".to_string()));
+                    let module_base = unsafe {
+                        extern "system" {
+                            fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+                        }
+                        GetModuleHandleW(core::ptr::null()) as usize
+                    };
+                    let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
-                        "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?}",
-                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value,
+                        "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value, culprit, rva,
                     );
                     eprintln!("[straystack-native] Java stack (top first):");
                     for f in self.thread.frames.iter().rev().take(28) {
