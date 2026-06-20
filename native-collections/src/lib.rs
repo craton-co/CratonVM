@@ -8945,6 +8945,271 @@ fn make_derived_stream(
     Ok(r)
 }
 
+// ===========================================================================
+// keycloak-16 Part B — lazy / short-circuiting synthetic Stream pipeline
+//
+// Gated behind `CRATONVM_LAZY_STREAMS` (default OFF — gate-off behaviour is
+// byte-identical to the historical eager pipeline). When ON, the value/cardinality
+// neutral-or-changing intermediate ops (peek/map/filter/limit/skip) DEFER instead
+// of materialising: they record themselves on the result stream's op-chain (slot 3)
+// while sharing the upstream's SOURCE element array (slot 0). Terminal ops then
+// either pull element-by-element with short-circuit (findFirst/findAny/anyMatch/
+// allMatch/noneMatch) or fully materialise via `stream_drain` (count/collect/
+// toArray/forEach/reduce/sorted/...). This makes
+//   Stream.of(1,2,3,4,5).peek(p).findFirst()
+// run `p` exactly once, matching HotSpot's lazy short-circuit semantics, while
+// keeping every eager terminal's *result* identical.
+// ===========================================================================
+
+/// Deferred-op chain slot on a lazy synthetic stream: an `Object[]` of
+/// `cratonvm/stream/LazyOp` records (field0=kind:Int, field1=lambda:Object|null,
+/// field2=aux:Long). Present only on streams produced by a deferred intermediate
+/// op under `CRATONVM_LAZY_STREAMS`; older 2/3-field streams simply have no chain.
+const STREAM_FIELD_OP_CHAIN: usize = 3;
+const STREAM_NUM_FIELDS_LAZY: usize = 4;
+
+const LAZY_OP_PEEK: i32 = 0;
+const LAZY_OP_MAP: i32 = 1;
+const LAZY_OP_FILTER: i32 = 2;
+const LAZY_OP_LIMIT: i32 = 3;
+const LAZY_OP_SKIP: i32 = 4;
+
+/// `true` iff `CRATONVM_LAZY_STREAMS` is set — enables the deferred/short-circuit
+/// synthetic Stream pipeline (keycloak-16 Part B). Default OFF.
+fn lazy_streams_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_LAZY_STREAMS").is_some())
+}
+
+/// A single deferred intermediate op read back from a stream's chain.
+struct LazyOp {
+    kind: i32,
+    lambda: Option<ObjectRef>,
+    aux: i64,
+}
+
+/// `true` if `this` is a synthetic stream that currently carries a non-empty
+/// deferred op-chain (slot 3). Cheap guard used by terminals to pick the lazy path.
+fn stream_has_chain(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    if ctx.object_num_fields(this) <= STREAM_FIELD_OP_CHAIN {
+        return false;
+    }
+    match ctx.get_field(this, STREAM_FIELD_OP_CHAIN) {
+        Value::Object(Some(a)) => ctx.array_length(a) > 0,
+        _ => false,
+    }
+}
+
+/// Read the deferred op-chain (slot 3) into a Vec. Empty for non-lazy streams.
+fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
+    if ctx.object_num_fields(this) <= STREAM_FIELD_OP_CHAIN {
+        return Vec::new();
+    }
+    let arr = match ctx.get_field(this, STREAM_FIELD_OP_CHAIN) {
+        Value::Object(Some(a)) => a,
+        _ => return Vec::new(),
+    };
+    let n = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Value::Object(Some(rec)) = ctx.get_array_element(arr, i) {
+            let kind = ctx.get_field(rec, 0).as_int().unwrap_or(-1);
+            let lambda = match ctx.get_field(rec, 1) {
+                Value::Object(o) => o,
+                _ => None,
+            };
+            let aux = match ctx.get_field(rec, 2) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            out.push(LazyOp { kind, lambda, aux });
+        }
+    }
+    out
+}
+
+/// Raw SOURCE elements of a (lazy) synthetic stream — slot 0, BEFORE the op-chain
+/// is applied. Drains a lazy spliterator source first.
+fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    materialize_lazy_stream(ctx, this);
+    match ctx.get_field(this, STREAM_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => {
+            let len = ctx.array_length(arr);
+            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build a lazy derived stream that appends op `(kind, lambda, aux)` to `src`'s
+/// op-chain while sharing `src`'s SOURCE array (slot 0). Caller must have checked
+/// `src` is a synthetic stream. No `invoke_virtual` here, so no safepoint/GC moves
+/// the locals between allocations.
+fn stream_make_lazy_derived(
+    ctx: &mut dyn NativeContext,
+    src: ObjectRef,
+    kind: i32,
+    lambda: Option<ObjectRef>,
+    aux: i64,
+) -> MethodCallResult {
+    materialize_lazy_stream(ctx, src);
+    let source = ctx.get_field(src, STREAM_FIELD_ELEMENTS);
+    let src_chain = if ctx.object_num_fields(src) > STREAM_FIELD_OP_CHAIN {
+        match ctx.get_field(src, STREAM_FIELD_OP_CHAIN) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let src_len = match src_chain {
+        Some(a) => ctx.array_length(a),
+        None => 0,
+    };
+    let new_chain = alloc_ref_array(ctx, src_len + 1);
+    if let Some(a) = src_chain {
+        for i in 0..src_len {
+            let v = ctx.get_array_element(a, i);
+            ctx.set_array_element(new_chain, i, v);
+        }
+    }
+    let rec = alloc_synthetic(ctx, "cratonvm/stream/LazyOp", 3);
+    ctx.set_field(rec, 0, Value::Int(kind));
+    ctx.set_field(rec, 1, Value::Object(lambda));
+    ctx.set_field(rec, 2, Value::Long(aux));
+    ctx.set_array_element(new_chain, src_len, Value::Object(Some(rec)));
+    let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source);
+    ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    ctx.set_field(stream, STREAM_FIELD_OP_CHAIN, Value::Object(Some(new_chain)));
+    stream_inherit_close_handlers(ctx, src, stream);
+    Ok(Some(Value::Object(Some(stream))))
+}
+
+/// `true` iff `this` is one of our synthetic stream interface objects.
+fn stream_is_synthetic(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cn = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    is_synthetic_stream(&cn)
+}
+
+enum PullStep {
+    Continue,
+    Stop,
+}
+
+/// Drive `this`'s SOURCE elements through its deferred op-chain, invoking `emit`
+/// for each element that survives the whole chain. `emit` returns `PullStep::Stop`
+/// to short-circuit. Stateful ops (limit/skip) keep per-op counters. Lambda
+/// exceptions propagate via `?`.
+fn stream_pull<F>(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    mut emit: F,
+) -> Result<(), MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed>,
+{
+    let base = stream_source_elems(ctx, this);
+    let chain = stream_read_chain(ctx, this);
+    let mut limit_passed = vec![0i64; chain.len()];
+    let mut skip_done = vec![0i64; chain.len()];
+    'outer: for v in base {
+        // Short-circuit: once any `limit` op has admitted its quota, the SOURCE
+        // stops — upstream ops (e.g. `peek`) must NOT run on any further element,
+        // matching HotSpot's `cancellationRequested` semantics. Checked at the top
+        // (before upstream ops) and also covers `limit(0)`.
+        for (i, op) in chain.iter().enumerate() {
+            if op.kind == LAZY_OP_LIMIT && limit_passed[i] >= op.aux {
+                break 'outer;
+            }
+        }
+        let mut cur = v;
+        for (i, op) in chain.iter().enumerate() {
+            match op.kind {
+                LAZY_OP_PEEK => {
+                    if let Some(l) = op.lambda {
+                        ctx.invoke_virtual(l, "accept", "(Ljava/lang/Object;)V", &[cur])?;
+                    }
+                }
+                LAZY_OP_MAP => {
+                    if let Some(l) = op.lambda {
+                        cur = ctx
+                            .invoke_virtual(
+                                l,
+                                "apply",
+                                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[cur],
+                            )?
+                            .unwrap_or(Value::Object(None));
+                    }
+                }
+                LAZY_OP_FILTER => {
+                    if let Some(l) = op.lambda {
+                        let t =
+                            ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
+                        if !matches!(t, Some(Value::Int(x)) if x != 0) {
+                            continue 'outer;
+                        }
+                    }
+                }
+                LAZY_OP_LIMIT => {
+                    limit_passed[i] += 1;
+                }
+                LAZY_OP_SKIP => {
+                    if skip_done[i] < op.aux {
+                        skip_done[i] += 1;
+                        continue 'outer;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match emit(ctx, cur)? {
+            PullStep::Stop => break 'outer,
+            PullStep::Continue => {}
+        }
+    }
+    Ok(())
+}
+
+/// Fully materialise a lazy stream's op-chain (apply every op to every source
+/// element). Used by `stream_elements` when a chain is present so eager terminals'
+/// *results* are identical whether or not upstream ops were deferred.
+///
+/// `stream_elements` returns `Vec` (it has ~90 call sites), so this swallows a
+/// lambda error mid-chain and returns the elements produced so far. This is the
+/// one fidelity gap of the gated lazy mode: a *throwing* intermediate lambda
+/// (peek/map/filter) consumed by an *eager* terminal (count/collect/...) yields a
+/// partial result instead of propagating. Short-circuit terminals (findFirst/
+/// anyMatch/...) drive `stream_pull` directly and DO propagate the exception.
+fn stream_apply_chain_eager(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let mut out = Vec::new();
+    let _ = stream_pull(ctx, this, |_c, v| {
+        out.push(v);
+        Ok(PullStep::Continue)
+    });
+    out
+}
+
+/// Defer an intermediate op when lazy streams are enabled and `this` is synthetic;
+/// otherwise return `None` so the caller runs its eager body. Centralises the
+/// gate + synthetic check for peek/map/filter/limit/skip.
+fn stream_try_defer(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    kind: i32,
+    lambda: Option<ObjectRef>,
+    aux: i64,
+) -> Result<Option<Value>, MethodCallFailed> {
+    if lazy_streams_enabled() && stream_is_synthetic(ctx, this) {
+        return Ok(stream_make_lazy_derived(ctx, this, kind, lambda, aux)?);
+    }
+    Ok(None)
+}
+
 /// Run (once) the close handlers registered on a synthetic stream: clear the
 /// field first (run-once / re-entrancy safe), then invoke each `Runnable.run()`.
 fn stream_run_close_handlers(
@@ -9031,6 +9296,13 @@ fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value>
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     if is_synthetic_stream(&class_name) {
+        // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
+        // ops onto slot 3 while sharing the upstream SOURCE array (slot 0). Apply
+        // the chain here so every eager terminal/op sees the fully-transformed
+        // elements. Gate-off (default) never has a chain, so this is inert.
+        if lazy_streams_enabled() && stream_has_chain(ctx, stream) {
+            return stream_apply_chain_eager(ctx, stream);
+        }
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
             return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
@@ -9812,7 +10084,10 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // the immutable helper would return Vec::new() — producing
     // `AssertionError: available names are []` even though
     // `ServiceLoader.iterator()` correctly produced 13 providers.
-    let elements = stream_elements_mut(ctx, this);
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_FILTER, Some(predicate), 0)? {
+        return Ok(Some(s));
+    }
+    let elements = stream_elements(ctx, this);
     let mut kept = Vec::new();
     for elem in &elements {
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
@@ -9835,7 +10110,10 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Mirror the `filter` fix: use the `_mut` variant so real-JDK
     // `ReferencePipeline` instances drain via `Stream.toArray()` rather than
     // silently producing an empty stream.
-    let elements = stream_elements_mut(ctx, this);
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_MAP, Some(function), 0)? {
+        return Ok(Some(s));
+    }
+    let elements = stream_elements(ctx, this);
     let mut mapped = Vec::with_capacity(elements.len());
     for elem in &elements {
         let result = ctx.invoke_virtual(
@@ -9987,6 +10265,9 @@ fn native_stream_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_LIMIT, None, n as i64)? {
+        return Ok(Some(s));
+    }
     let elements = stream_elements(ctx, this);
     let limited: Vec<Value> = elements.into_iter().take(n).collect();
     make_derived_stream(ctx, this, &limited)
@@ -10002,6 +10283,9 @@ fn native_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_SKIP, None, n as i64)? {
+        return Ok(Some(s));
+    }
     let elements = stream_elements(ctx, this);
     let skipped: Vec<Value> = elements.into_iter().skip(n).collect();
     make_derived_stream(ctx, this, &skipped)
@@ -10016,6 +10300,9 @@ fn native_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    if let Some(s) = stream_try_defer(ctx, this, LAZY_OP_PEEK, Some(consumer), 0)? {
+        return Ok(Some(s));
+    }
     let elements = stream_elements(ctx, this);
     for elem in &elements {
         ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
@@ -10163,6 +10450,18 @@ fn native_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
+    if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
+        let mut found: Option<Value> = None;
+        stream_pull(ctx, this, |_c, v| {
+            found = Some(v);
+            Ok(PullStep::Stop)
+        })?;
+        let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
+        if let Some(fv) = found {
+            ctx.set_field(opt, OPT_FIELD_VALUE, fv);
+        }
+        return Ok(Some(Value::Object(Some(opt))));
+    }
     let elements = stream_elements(ctx, this);
     let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
     if let Some(first) = elements.first() {
@@ -10180,6 +10479,19 @@ fn native_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
+        let mut matched = false;
+        stream_pull(ctx, this, |c, v| {
+            let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
+            if matches!(r, Some(Value::Int(x)) if x != 0) {
+                matched = true;
+                Ok(PullStep::Stop)
+            } else {
+                Ok(PullStep::Continue)
+            }
+        })?;
+        return Ok(Some(Value::Int(if matched { 1 } else { 0 })));
+    }
     let elements = stream_elements(ctx, this);
     for elem in &elements {
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
@@ -10199,6 +10511,19 @@ fn native_stream_all_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
+    if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
+        let mut all = true;
+        stream_pull(ctx, this, |c, v| {
+            let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
+            if !matches!(r, Some(Value::Int(x)) if x != 0) {
+                all = false;
+                Ok(PullStep::Stop)
+            } else {
+                Ok(PullStep::Continue)
+            }
+        })?;
+        return Ok(Some(Value::Int(if all { 1 } else { 0 })));
+    }
     let elements = stream_elements(ctx, this);
     for elem in &elements {
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
@@ -10218,6 +10543,19 @@ fn native_stream_none_match(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
+    if lazy_streams_enabled() && stream_is_synthetic(ctx, this) && stream_has_chain(ctx, this) {
+        let mut none = true;
+        stream_pull(ctx, this, |c, v| {
+            let r = c.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
+            if matches!(r, Some(Value::Int(x)) if x != 0) {
+                none = false;
+                Ok(PullStep::Stop)
+            } else {
+                Ok(PullStep::Continue)
+            }
+        })?;
+        return Ok(Some(Value::Int(if none { 1 } else { 0 })));
+    }
     let elements = stream_elements(ctx, this);
     for elem in &elements {
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;

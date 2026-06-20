@@ -153,3 +153,4 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `RJ_MAX_STACK_DEPTH` | Override `max_stack_depth` at startup (64–65536). |
 | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | Set to `1` to disable the 120-second hang watchdog. |
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | Override the default watchdog timeout. |
+| `CRATONVM_LAZY_STREAMS` | Set to `1` to enable the lazy / short-circuiting synthetic `java.util.stream` pipeline (keycloak-16 Part B). Intermediate ops (`peek`/`map`/`filter`/`limit`/`skip`) defer instead of materialising, and short-circuit terminals (`findFirst`/`findAny`/`anyMatch`/`allMatch`/`noneMatch`) stop early — so `Stream.of(...).peek(p).findFirst()` runs `p` once, matching HotSpot. Default OFF (eager); eager-terminal results are identical with or without the flag. |
