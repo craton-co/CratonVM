@@ -1174,11 +1174,74 @@ path fires). bt10/14/18 == HotSpot gate-OFF and gate-ON; 4 bench programs
    hibernate) + bt10/14/16/18, watching for any dispatch/exception/GC divergence.
 2. Flip the default (or remove the gate) once clean.
 
-**Next refinements** (after the flag flips clean):
-- `invokespecial` of a statically-resolved target (a second oop-free direct call).
-- Long/float/double args + return (category-2 / XMM marshalling).
-- Oop-across-call support via real GC oop maps (lifts the oop-free restriction).
-- Virtual/special/interface dispatch via inline caches (the bug-24-sensitive area).
+**Next refinements** (after the flag flips clean): see increment 22 (oop-free
+restriction lifted), then `invokespecial`/virtual dispatch and category-2 args.
+
+## Increment 22 (Gap B — oop-free restriction lifted: oops live across `Op::Call`) landed
+
+Status: **landed** on `dev`, still under `CRATONVM_JIT_IR_CALL` (default-OFF).
+Removes the inc-21 "oop-free method only" gate: an `invokestatic` `Op::Call` may
+now have **reference parameters, reference call arguments, reference returns, and
+int field ops** (a ref receiver) — i.e. object references *live across the call*.
+
+**Why it's GC-sound without oop maps** (the key finding). The IR lowerer spills
+every value to a frame slot — it keeps **no oop in a register across a call**
+(unlike single-pass, the source of the A2/A3 register-root UAFs). `JitEntryGuard`
+**conservatively scans** the IR frame's slots `[rsp, entry_sp)` at every
+safepoint, and the GC is forced **non-moving while any JIT frame is active**
+(`gc_quiescence`), so a pointer found in a slot is **pinned, never relocated** —
+a false positive (an `i64` that looks like a pointer) is harmless, and a real
+reference live across the call is neither moved nor reclaimed. No precise oop map
+is required. (Single-pass needs precise maps because it keeps oops in registers;
+the IR lowerer's spill-everything model is exactly what makes the conservative
+scan sufficient here.)
+
+**What landed**
+- **`jit/src/lib.rs`** — the gate dropped from "oop-free" to just
+  `new_ops.is_empty() && anewarray_ops.is_empty()` (a surviving `New` still has
+  no lowering; array ops bail the builder). `static_call_int_shape` →
+  `static_call_shape`: accepts reference args (`L…`/`[…`, passed as the raw
+  pointer in one GPR slot) and an int/void/**reference** return; still rejects
+  `long`/`float`/`double` (category-2 / XMM). The per-call tuple now carries the
+  return-type byte. `descriptor_has_ref_params` removed.
+- **`jit/src/ir.rs`** — `set_invoke_info` carries `ret_type`; the `Op::Call`
+  result is typed `IrType::Ref` for an `L`/`[` return (so a returned reference
+  flows correctly into a following `astore`/field-load/next-call), else
+  `IrType::Int`.
+- No lowerer change: the existing `Op::Call` marshalling stores each arg (int or
+  pointer) as one i64 to the staging region; the conservative scan covers both
+  the spilled args and the live references.
+
+**Validation** (the GC-correctness claim is proven *empirically*, per the
+project's hard-won lesson that this area needs real GC stress, not theory):
+- jit lib 804/804, differential harness 25/25 (adds
+  `invokestatic_reference_arg`: a synthetic object passed as a ref arg, the stub
+  reads a field off the marshalled pointer).
+- **GC-stress probe** `scratch/ircall/IrCallGc.java`: `process(Node a, Node b)`
+  holds two references live across two `invokestatic` calls into an
+  allocation-heavy callee; `main` passes freshly-made nodes directly so a/b are
+  rooted **only** via the IR frame. == HotSpot (`2721637800000`) gate OFF and ON,
+  4× deterministic at 64m, **and under `CRATONVM_DBG_GC_STRESS=1`** (a young GC
+  on *every* allocation → GC fires constantly mid-call while a/b are live). The
+  references survive — the conservative IR-frame scan roots them correctly under
+  maximal GC frequency.
+- No regression: at every heap size the IR-call path is **GC-behavior-identical
+  to single-pass** (both complete ≥64m, both fault <64m — the sub-64m fault is a
+  *pre-existing, backend-independent* VM robustness gap: CratonVM faults instead
+  of throwing `OutOfMemoryError` at a too-small heap, where HotSpot's GC keeps up
+  at 32m; spun off as a separate task). bt14/18 == HotSpot gate-ON; the oop-free
+  `IrCall` probe == HotSpot gate-ON.
+
+**To soak / flip on**: same as inc 21 — run `CRATONVM_JIT_IR_CALL=1` on the app
+gauntlet + bt checksums, then flip. The widened scope (oops across calls) makes
+the gauntlet soak more important before flipping.
+
+**Next refinements**: `invokespecial` of a statically-resolved target (now
+unblocked — the receiver oop is handled by the same conservative scan);
+long/float/double args + return (category-2 / XMM marshalling — gated on the IR
+path handling category-2 values, which `method_uses_category2` currently
+excludes); virtual/special/interface dispatch via inline caches (the
+bug-24-sensitive area).
 
 ## Implementation steps (ordered)
 
