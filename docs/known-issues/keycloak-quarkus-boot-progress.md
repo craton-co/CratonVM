@@ -499,6 +499,28 @@ VM's real file layer).
 > native stall (get its wait-site — it is the single highest-value next step) and (2) raw throughput.
 > Do NOT flip the Agroal gate to default-on until the boot reaches `Listening` reliably.
 >
+> **CONFIRMED after syncing to `dev` (53 commits) + testing the precise-roots opt-in.** The branch
+> was merged up to `dev` — including `5085b137 fix(gc): forward monitor + native roots on
+> safepoint-resume path` and the ES GC root-cause wave — and rebuilt. The Gap-9 wedge **still
+> reproduces** (boot wedges at the JPA Startup Thread, `cross_thread_jit_gap` fires twice), so dev's
+> current GC root-safety fixes do NOT close it. **`CRATONVM_SHADOW_STACK=1` also wedges** — and the
+> code shows why: the cross-thread STW collector (`thread_registry::collect_all_root_snapshots`)
+> reads ONLY each thread's *deposited* `root_snapshot`; it does no cross-thread stack scan, and
+> `CRATONVM_SHADOW_STACK` only changes how a thread scans *its own* (thread-local) roots — it does
+> not address the *staleness* of a peer's deposited snapshot. `wait_for_all` is cooperative (threads
+> arrive via `arrive_and_wait`), and the interpreter safepoint (interpreter.rs:1750) + GC initiator
+> (`maybe_gc_forced`, :618) both `update_root_snapshot` before parking — so the residual drop is a
+> subtle path where a JIT worker's deposited snapshot is stale at the moment a peer's STW collector
+> reads it. **The fix is a real cross-thread STW JIT-root scan**: at the safepoint, capture each
+> parked worker's `(JIT spill range / SP, stack_high)` and have the collector walk it directly. A
+> *conservative* peer-stack scan is provably sound here (GC is forced non-moving while any thread is
+> in JIT — over-rooting can only retain, never corrupt), but it is still a GC-core change that must
+> be validated against the precise-JIT GC oracle (bintrees18=68332206, pool 18/18). **Ownership:**
+> this is the precise-JIT-stack-maps program's tracked follow-up (worktree `CratonVM-pjsm` /
+> `feat/shadow-stack-followups`, whose §4 multi-thread work is partially done) — it should land there
+> and reach `dev`, NOT as a drive-by in this datasource branch. Once it lands, re-run this boot; the
+> Agroal gate can then flip to default-on.
+>
 > **Tangential general VM bug fixed:** `java.util.Properties.store(OutputStream, comments)`
 > (`native-collections/src/lib.rs::native_props_store`) wrote ONLY the comment and dropped EVERY
 > entry — `props_collect_keys` read bucket-node field 0 as the key, correct only for legacy nodes
