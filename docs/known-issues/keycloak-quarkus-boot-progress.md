@@ -469,10 +469,15 @@ VM's real file layer).
 > the worker wedges. This is the SAME tracked GC×JIT precise-roots gap as the
 > precise-JIT-stack-maps / FJP-root-reclaim / ReflRepro-A2 work (register-resident / cross-thread
 > JIT roots under STW), surfacing here because the boot is the first multi-threaded-JIT app to drive
-> it under real GC pressure. Confirm by re-running at a larger heap (`--Xmx 6g`, far fewer STW
-> collections — like the ES `6g→0` result): if the boot then progresses reliably, the cross-thread
-> JIT-root-under-STW gap is the cause. Candidate fixes are the tracked ones: `CRATONVM_SHADOW_STACK`
-> precise roots and the cross-thread STW JIT-root scan follow-up. (`--log-level=info` did not take effect — the boot still emitted TRACE/DEBUG —
+> it under real GC pressure. NOTE: `--Xmx 6g` does NOT avoid it (tested) — a larger *max* heap does
+> not reduce *young-gen* STW frequency, and the gap fires during young collections; so heap size is
+> not the lever here (unlike the ES `6g→0` case, which was a different GC behaviour). The warning is
+> conditional ("a stale snapshot *would* drop a live root"): it fires on essentially every run, but
+> the boot only *wedges* on the runs where a root is actually dropped — matching the observed
+> nondeterminism (same binary: one run reaches RESTEasy, others wedge at the JPA Startup Thread).
+> The real fixes are the tracked precise-roots ones: `CRATONVM_SHADOW_STACK` precise JIT roots and
+> the cross-thread STW JIT-root-scan follow-up (`CRATONVM_STRICT_JIT_ROOTS=1` makes the gap fatal,
+> useful to force/locate a drop). This is squarely the precise-JIT-stack-maps program's work. (`--log-level=info` did not take effect — the boot still emitted TRACE/DEBUG —
 > so the logging-tax hypothesis for the slowness is still untested; set the level via `keycloak.conf`
 > / `quarkus.log.level` next time.) Net: the **deterministic** Gap-8 Agroal blocker is fixed and the
 > DB layer is reachable; the remaining Gap-9 frontier is (1) a nondeterministic JPA-Startup-Thread
