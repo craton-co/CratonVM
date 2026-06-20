@@ -67,7 +67,11 @@ Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 $cargoProfileFlag = if ($Profile -eq "release") { "--release" } else { "" }
 $targetSub = if ($Profile -eq "release") { "release" } else { "debug" }
 Write-Host "building libcratonvm ($Profile)..."
-cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$repo`" && cargo build $cargoProfileFlag -p libcratonvm"
+# `2>&1` is INSIDE the cmd string so cargo's stderr (progress + warnings) is
+# merged into cmd's stdout and never reaches PowerShell as a native-stderr
+# stream — under `$ErrorActionPreference = Stop`, a single cargo warning on
+# stderr would otherwise be promoted to a terminating NativeCommandError.
+cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$repo`" && cargo build $cargoProfileFlag -p libcratonvm 2>&1"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 
 # cargo names the cdylib/import-lib after the crate (`libcratonvm`): on Windows
@@ -92,10 +96,17 @@ function Build-And-Run($srcName, $exeName) {
     $src = Join-Path $examples $srcName
     $exe = Join-Path $work $exeName
     Write-Host "`n=== $srcName -> $exeName ==="
-    cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$work`" && cl /nologo /Fe:`"$exe`" `"$src`" `"$implib`""
+    cmd /c "`"$vc`" >nul 2>&1 && cd /d `"$work`" && cl /nologo /Fe:`"$exe`" `"$src`" `"$implib`" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "cl failed for $srcName (exit $LASTEXITCODE)" }
+    # Run the harness with EAP relaxed: a native exe writing to stderr (even
+    # benign VM diagnostics) must not be promoted to a terminating error — gate
+    # on the real exit code instead.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & $exe
-    if ($LASTEXITCODE -ne 0) { throw "$exeName exited with $LASTEXITCODE" }
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+    if ($rc -ne 0) { throw "$exeName exited with $rc" }
 }
 
 Build-And-Run "embed_smoke.c" "embed_smoke_$Suffix.exe"
