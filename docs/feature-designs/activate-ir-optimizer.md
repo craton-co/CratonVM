@@ -503,11 +503,40 @@ be the same object); only definite-alloc-set stores are tame.
   pinned past a phi-store that writes `{A, B}` (A is in the set).
 - All six prior inc-6/7 alias tests still pass unchanged. Full jit suite 788/788.
 
-**Next**: a load base that flows through a phi can only hoist once
-`is_loop_invariant` admits a non-loop-carried invariant phi (today it rejects all
-phis, so phi *load* bases never reach the oracle); and treating a `final`/
-effectively-immutable field load as invariant regardless of stores to other
-fields of the same object.
+**Next**: increment 9 admits a non-loop-carried invariant phi so phi *load*
+bases hoist.
+
+## Increment 9 (invariant phi recognition — cross-merge on the load side) landed
+
+Status: **landed** on `dev`, behind the default-OFF `CRATONVM_JIT_LICM` flag.
+Completes the cross-merge story by admitting an invariant `Phi` as a hoistable
+load base — the increment-8 oracle could already resolve a phi *store* base, but
+`is_loop_invariant` rejected *every* phi, so a phi *load* base never reached it.
+
+**What landed** (`jit/src/ir_optimize.rs`, `is_loop_invariant_d`): the blanket
+`Op::Phi => false` is replaced by a sound test — a phi is loop-invariant iff:
+
+- its **control anchor** (input slot 0, the merge point) is OUTSIDE the loop
+  body — so the merge is decided once, before the loop, not per iteration — AND
+- every **value input** (slots 1..) is itself loop-invariant.
+
+A phi anchored at this loop's region (induction / loop-carried) or at an in-loop
+merge (an in-loop `if`/`else` join) has its anchor IN the body and stays variant,
+exactly as before. Recursion is depth-bounded, so a self-referential value input
+bottoms out as variant. This makes the `x = cond ? new A() : new B(); for (…) …
+x.f …` shape hoist its `x.f` load: `x` is a pre-loop invariant phi, and the
+increment-8 points-to resolver already understands `{A, B}` for the alias check.
+
+**Tests added** — `cargo test -p cratonvm-jit licm`:
+- `test_licm_hoists_load_with_invariant_phi_base` — a load over a phi merged
+  before the loop (anchor outside the body) over invariant allocations hoists.
+- The existing `test_licm_does_not_hoist_variant_load` still passes and now
+  exercises the region-anchored-phi → variant path under the new logic.
+- Full jit suite 789/789.
+
+**Next**: treat a `final`/effectively-immutable field load as invariant
+regardless of in-loop stores to *other* fields of the same object (a field-
+sensitive refinement of the alias oracle).
 
 ## Implementation steps (ordered)
 

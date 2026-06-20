@@ -981,8 +981,10 @@ fn loop_body(
 
 /// True if `id` produces a value that is constant across all iterations of the
 /// loop with header `region` and body `body`. Conservative: any uncertainty
-/// (out-of-range, Dead, a loop-carried phi, or membership in the body)
-/// returns false. `depth` bounds the recursion so a cyclic phi (e.g. from a
+/// (out-of-range, Dead, a phi whose merge point is in the body, or membership
+/// in the body) returns false. A phi whose control anchor is *outside* the loop
+/// and whose value inputs are all invariant IS invariant (a merge decided once,
+/// before the loop). `depth` bounds the recursion so a cyclic phi (e.g. from a
 /// *different* loop nest) cannot cause unbounded recursion — exceeding the
 /// bound is treated conservatively as variant.
 fn is_loop_invariant(graph: &Graph, id: NodeId, region: NodeId, body: &FxHashSet<NodeId>) -> bool {
@@ -1009,11 +1011,26 @@ fn is_loop_invariant_d(
         Op::Dead => false,
         // Constants / params are defined at Start — always invariant.
         Op::Const(_) | Op::ConstF(_) | Op::Param(_) => true,
-        // Any phi is a merge value. A phi anchored at *this* loop's region is
-        // the induction / loop-carried value: variant by construction. A phi
-        // anchored elsewhere is treated as variant too (conservative — we do
-        // not prove cross-merge invariance here).
-        Op::Phi => false,
+        // A phi is loop-invariant iff its control anchor (the merge point at
+        // input slot 0) is OUTSIDE the loop body — so the merge runs once, not
+        // per iteration — AND every value input is itself invariant. A phi
+        // anchored at this loop's region (induction / loop-carried) or at an
+        // in-loop merge (an in-loop if/else join) has its anchor IN the body and
+        // is variant. This is the cross-merge half of the alias oracle on the
+        // *load* side: a base like `cond ? A : B` decided before the loop is a
+        // hoistable invariant.
+        Op::Phi => {
+            let anchor = node.inputs.first().copied().unwrap_or(NO_NODE);
+            if anchor == NO_NODE || body.contains(&anchor) {
+                return false;
+            }
+            // Skip the control anchor (slot 0); every value input must be
+            // invariant. (A self-referential value input bottoms out at the
+            // depth bound → conservatively variant.)
+            node.inputs.iter().skip(1).all(|&inp| {
+                inp == NO_NODE || is_loop_invariant_d(graph, inp, region, body, depth + 1)
+            })
+        }
         _ => {
             // Anything physically in the loop body is variant.
             if body.contains(&id) {
@@ -3662,6 +3679,51 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "a load of A may be aliased by a phi-store that writes {{A, B}} → stays pinned"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_load_with_invariant_phi_base() {
+        // The cross-merge oracle on the LOAD side: a load whose base is a phi
+        // merged BEFORE the loop (anchor outside the body) over invariant
+        // allocations is itself invariant and hoists. (`x = cond ? new A() :
+        // new B(); for (...) ... x.f ...`)
+        let (mut g, region, preheader, _iv) = loop_probe();
+        let mem = 2;
+        let a = g.add(
+            Op::New { class_id: 1, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        let b = g.add(
+            Op::New { class_id: 2, num_fields: 1 },
+            IrType::Ref,
+            vec![preheader],
+            None,
+        );
+        // Phi anchored at the pre-loop control (slot 0 = preheader, OUTSIDE the
+        // loop body) merging two invariant allocations.
+        let phi = g.add(Op::Phi, IrType::Ref, vec![preheader, a, b], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, phi, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(
+            changed,
+            "a load over a pre-loop invariant phi base must hoist"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[0], preheader,
+            "the hoisted load's control must be re-anchored to the pre-header"
         );
     }
 
