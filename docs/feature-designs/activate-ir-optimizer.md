@@ -51,9 +51,11 @@ The machinery is real; the gates keep it mostly off.
   is currently used mostly for its `bytecode_len` walker (`lib.rs:3959`,
   `:4790`); the IV/trip-count analysis is not driving an aggressive unroll/LICM
   decision on the general path.
-- **DSE is the notable gap.** There is `eliminate_dead_nodes` (pure-node DCE)
-  but no *dead-store* elimination (eliminating a `StoreField`/`StoreStatic`
-  whose value is overwritten before any read) on the general path.
+- **DSE was the notable gap — now landed** (increments 1/2/4). Alongside
+  `eliminate_dead_nodes` (pure-node DCE) there is now `eliminate_dead_stores`
+  (overwrite + write-only dead-*store* elimination, with the load-alias
+  refinement of increment 4). The original-state gap this bullet described is
+  closed; see the increment notes below.
 
 Net: passes are correct and tested; the **φ/branch lowering bug** (`lib.rs:4143`)
 is the dam holding back broad activation, and DSE / aggressive LICM-via-SCEV are
@@ -303,6 +305,42 @@ the loops were actually unrolled. Default (flag off) is byte-for-byte unchanged.
 **Next**: partial unrolling (unroll-by-factor with a remainder) for large/
 non-constant trips; unrolling loops with internal branches (clone control);
 re-using the new node-clone approach to make LICM fire on `Merge` headers.
+
+## Increment 4 (DSE load-alias refinement) landed
+
+Status: **landed** on `dev`. A precision improvement to the DSE overwrite phase
+(Front 2.1) — the first slice of a real (if minimal) alias oracle.
+
+**What landed** (`jit/src/ir_optimize.rs`, `eliminate_dead_stores`):
+
+- The straight-line overwrite scan previously treated **every** `Op::Load` as an
+  unconditional memory barrier (flushing all pending stores). It now resolves a
+  load against the pending set with **allocation-level alias precision**:
+  - Every pending store targets a local `New`/`NewArray` allocation, and two
+    distinct local allocations never alias (the same fact the `(base, idx, kind)`
+    location key already relies on). So a load whose base is a **different local
+    allocation** flushes only pending stores to *its own* base, leaving stores to
+    other local objects dead-eligible.
+  - A load from a **non-local / unreadable base** (a `Param`, a `Call`/`Load`
+    result, a phi, …) may alias any escaped local and still flushes everything.
+- **Soundness**: the only way to read allocation `A`'s field is a load whose base
+  resolves to `A` (which flushes `A`'s pending stores) or to a non-local node
+  such as a load/phi result (which flushes all). So a store can only be removed
+  as overwritten when no load between it and its overwrite could observe `A`. The
+  shared `is_memory_barrier` helper still classifies `Load` as a barrier as the
+  safe fallback should the explicit load arm ever be removed.
+
+**Tests added** — `cargo test -p cratonvm-jit dse`:
+- `test_dse_removes_overwrite_across_unrelated_local_load` — `store A; load B
+  (distinct local); store A` ⇒ the first store to `A` is removed.
+- `test_dse_keeps_overwrite_across_nonlocal_load` — `store A; load P (Param);
+  store A` ⇒ the first store to `A` is kept (conservative full barrier).
+- All six pre-existing DSE tests still pass (the same-object-load and
+  distinct-fields cases were already exercising the same-base flush path).
+
+**Not yet done**: a general alias oracle that also lets a load past a
+*non-aliasing* in-loop store drive LICM hoisting (Front 2.2), and array-element
+overwrite DSE (still gated on a real array `Store` operand layout).
 
 ## Implementation steps (ordered)
 
