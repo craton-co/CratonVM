@@ -19,8 +19,10 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
 2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
 3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; only with an unmerged experiment).
 4. **bug-06 F5** — reflection native returns null vs a `Class`/`Method` (open, unattributed).
-5. **bug-06 F6 / `spring-bug-06` / `spring-bug-01`** — annotation **synthesis** mismatches +
-   `MergedAnnotations` hang + a ~2 GB OOM (all the annotation-proxy/synthesis cluster; open).
+5. **bug-06 F6 / `spring-bug-06` / `spring-bug-01`** — annotation **synthesis** value-mismatches.
+   (The `MergedAnnotations` **hang** + the `AnnotationUtilsTests` "~2 GB OOM" in this cluster were the
+   `toArray` self-recursion and are **FIXED** 2026-06-20, commit `8795b88d`; `MergedAnnotationsTests`
+   now runs 174/178, `AnnotationUtilsTests` 72/72. Only the synthesis value-mismatches remain open.)
 6. **`spring-bug-08`** — serializable JDK-proxy round-trip (open).
 7. **`spring-bug-11` residual** — Groovy hang at `BEGIN` (the SIGSEGV half is FIXED via bug-12; open).
 8. **`kafka-bug-B`** — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch (open, deep).
@@ -43,15 +45,26 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
     per-request native read-alloc-use staleness. Both ES RestClient suites are green at `-Xmx1g` with
     `CRATONVM_ROOTSNAP_CACHE=0` (single-host 22/22, multi-host 4/4) — see the two new GC defects #15/#16.
     Former siblings also resolved: **ES-HANG-01** (`1cd0ab26`), **ES-FAIL-03**, **ES-FAIL-04**.
-14. **Spring-suite 2026-06-19 sweep** — two new CV-unique bugs **FIXED on dev** this session:
-    [**Unsafe off-heap DirectBuffer**](springsuite-0619-unsafe-offheap-directbuffer.md) (single-element
-    `Unsafe.get/putX(long)` rejected real `DirectByteBuffer` pointers as "not in any live arena" →
-    off-heap `DataBuffer` broken) and [**getBeanClassName bean-filter**](springsuite-0619-getbeanclassname-bean-filter.md)
-    (loaded-set-only loadability check hid lazily-loadable beans → null bean → "Target object must not
-    be null", ~100+ failures). OPEN candidates from the same sweep (NOT yet triaged) are tracked in
-    [**springsuite-0619-open-candidates**](springsuite-0619-open-candidates.md): `ReactiveAdapterRegistry$MutinyRegistrar`
-    NCDFE (~40), XML "Unexpected failure during bean definition parsing" (~19), "Unnamed bean definition" (~35),
-    spring-jdbc mass-TIMEOUT (~25, needs isolation re-verify), scheduler `StringIndexOutOfBounds` (2).
+14. **Spring-suite sweep (2026-06-19 → re-verified 2026-06-20).** Status after running the suite
+    through the JUnit-Platform `KRun` harness on a fresh dev build (`cratonvm-spring0620`, off
+    `697134f8`):
+    - ✅ **toArray-recursion FIXED** (commit `8795b88d`, → dev) — `ReferencePipeline.toArray(IntFunction)`
+      was shadowed by a native that re-entered no-arg `toArray()` → `StackOverflowError`. This was the
+      open **`MergedAnnotations` hang** AND **bug-06 fam6 "~2 GB OOM"**, and it blocked the *entire*
+      JUnit launcher (no test class could run). Now: `MergedAnnotationsTests` 174/178,
+      `AnnotationUtilsTests` 72/72, `AnnotatedElementUtilsTests` 82/82. Doc:
+      [`docs/internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md`](../internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md).
+    - ✅ **Unsafe off-heap DirectBuffer (bug-A + bug-A2) FULLY RESOLVED** — `PooledDataBufferTests`
+      **10/10**, `LeakAwareDataBufferFactoryTests` 2/2. The bug-A2 Netty `refCnt` AIOOBE no longer
+      reproduces. Archived → [`docs/internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md`](../internal/fixed-suite-bugs/springsuite-0619-unsafe-offheap-directbuffer.md).
+    - 🟡 **getBeanClassName bean-filter (bug-B) PARTIAL** — primary filter fix holds (no "hiding bean"
+      warning), but **bug-B2 OPEN**: `LookupMethodTests` 0/7 / `LookupAnnotationTests` 0/10 still fail
+      `Target object must not be null` (CGLIB **method-injection** enhancer makes a null instance).
+      Kept in this folder: [getBeanClassName bean-filter / bug-B2](springsuite-0619-getbeanclassname-bean-filter.md).
+    - Still untriaged from the sweep: `ReactiveAdapterRegistry$MutinyRegistrar` NCDFE, XML
+      "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
+      mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
+      (heavy-reactive). (The prior `springsuite-0619-open-candidates.md` link was already dangling.)
 15. **[GC: moving-collector lost-tag missed root](gc-moving-interpreter-lost-tag-missed-root.md)** — 🔴 **OPEN**
     (benign in practice). Under `-Xmx1g` GC pressure the **moving** young collector zeroes a live object
     whose only reference is a frame slot tagged non-`Object` at the marking snapshot ("all-zero header" /
@@ -67,7 +80,9 @@ After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-c
 
 FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
 JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed
-stack-trace order, and the springrepos hang (3 fixes landed; `dev` passes the test).
+stack-trace order, and the springrepos hang (3 fixes landed; `dev` passes the test). 2026-06-20:
+the `ReferencePipeline.toArray(IntFunction)` recursion and the off-heap DirectBuffer (bug-A/A2) docs
+moved to [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/).
 
 ### Consolidations applied (2026-06-18)
 - The two Hibernate-JTA docs (`hibernate-jta-narayana-…` + `hibernate-jta-txcontrol-getinetaddress-per-class-report`)
@@ -211,8 +226,8 @@ and already-consolidated ones (fam5/6) were left in place.
 
 | Bug | Category | Status | Doc |
 |---|---|---|---|
-| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🔴 **OPEN** — a **Family A** (GC-root-undercount) manifestation, load-dependent | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
-| `MergedAnnotations` hang | VM-HANG | 🔴 **OPEN** — first hang found in the suite; annotation synthesis (cf. bug-06 F6) | [spring-bug-06-mergedannotations-hang.md](spring-bug-06-mergedannotations-hang.md) |
+| String constant corrupted → `Object` under load | VM-CORRECTNESS / GC | 🟡 **OPEN / needs batch re-verify** — Family-A; **not observed** in 2026-06-20 per-class + small-batch runs. Family-A precise-maps are default-on now and the `toArray` recursion that destabilised the launcher is fixed; a large single-JVM batch is needed to confirm resolution. | [springsuite-bug-04-string-constant-corrupted-under-load.md](springsuite-bug-04-string-constant-corrupted-under-load.md) |
+| `MergedAnnotations` hang | VM-HANG | ✅ **FIXED 2026-06-20** (`8795b88d`) — was the `ReferencePipeline.toArray(IntFunction)` self-recursion; `MergedAnnotationsTests` now 174/178 (residual 4 = synthesis mismatch, cf. bug-06 F6) | [toArray-recursion fix](../internal/fixed-suite-bugs/springsuite-0620-toarray-referencepipeline-recursion.md) |
 | Serializable proxy round-trip | VM-CORRECTNESS (proxy + serialization) | 🔴 **OPEN** | [spring-bug-08-serializable-proxy-roundtrip.md](spring-bug-08-serializable-proxy-roundtrip.md) |
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](spring-bug-11-groovy-and-scheduler-crashes.md) |

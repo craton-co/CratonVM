@@ -17,9 +17,14 @@ that `docs/known-issues/` holds only **open** items. Kept for traceability (repr
 | `spring-bug-05-dynamic-proxy-module-system.md` | `16f832c0` (merge `d75f7716`) |
 | `spring-bug-12-hashmap-view-spliterator-int16.md` | `fix/spring-bug-10-11` — validated |
 | `bug-A-arraylist-sublist-copy-not-view.md` | `9a535e85` (off dev `b8908…`) |
+| `springsuite-0620-toarray-referencepipeline-recursion.md` | `8795b88d` — `ReferencePipeline.toArray(IntFunction)` native re-entered no-arg `toArray()` → `StackOverflowError`; was the `MergedAnnotations` hang + bug-06 fam6 "~2 GB OOM" and blocked the whole JUnit suite. `MergedAnnotationsTests` 174/178, `AnnotationUtilsTests` 72/72. |
+| `springsuite-0619-unsafe-offheap-directbuffer.md` | `3b16e985` (bug-A) + re-verified 2026-06-20 (bug-A2 also resolved) — `PooledDataBufferTests` 10/10, `LeakAwareDataBufferFactoryTests` 2/2. |
 
-**Not moved — partial fixes with open residuals** (left in their suite folders):
+**Not moved — partial fixes with open residuals** (left in their suite folders / `docs/known-issues/`):
 - `spring-suite/crash-reports-2026-06-16/bug-05-generics-fieldtypesignature-cce.md`
   — wildcard-bound `Type[]` fixed (`d01345d1`); real-`ParameterizedType` residual open.
 - `spring-suite/bugs/spring-bug-09-collection-layout-probe-oob.md`
   — crash fixed (`5941addd`); a separate residual hang is still open.
+- `docs/known-issues/springsuite-0619-getbeanclassname-bean-filter.md`
+  — bug-B bean-filter fixed (`3b16e985`); bug-B2 CGLIB **method-injection** null-instance still
+  open (`LookupMethodTests` 0/7, "Target object must not be null").
