@@ -214,19 +214,48 @@ java.lang.AbstractMethodError
   at io.quarkus.runner.recorded.VirtualThreadsProcessor$setup1414761027.deploy_0
   at io.quarkus.runner.ApplicationImpl.<clinit> (bci=425)
 ```
-**Root cause (characterised, not yet fixed):** `setupVirtualThreads` bci=4 is
-`invokeinterface io/quarkus/virtual/threads/VirtualThreadsConfig.enabled()Z` on the
-recorder's `runtimeConfig` field. `VirtualThreadsConfig` is a Quarkus
-`@ConfigMapping` (SmallRye Config) **interface**; at runtime SmallRye generates an
-implementing class (`…​VirtualThreadsConfig$$Impl` via `ConfigMappingGenerator`).
-`AbstractMethodError` means the `runtimeConfig` object's class is accepted as a
-`VirtualThreadsConfig` but has **no concrete `enabled()`** — i.e. CratonVM is not
-producing a complete config-mapping implementation (or is handing the recorder a
-proxy/abstract instance). This is a distinct, likely multi-step gap:
-SmallRye `@ConfigMapping` interface-implementation generation. **Next step:** trace
-how `VirtualThreadsProcessor$setup….deploy_0` obtains/sets the recorder's
-`runtimeConfig` (CratonVM tracing on the `ConfigMapping` instance creation) and make
-the generated impl carry concrete accessor methods.
+**Root cause (FULLY traced 2026-06-20):** `VirtualThreadsProcessor$setup….deploy_0`
+gets `runtimeConfig` from
+`SmallRyeConfig.getConfigMapping(VirtualThreadsConfig.class, "quarkus.virtual-threads")`
+(bci 10), then `new VirtualThreadsRecorder(that)`; `setupVirtualThreads` bci=4 calls
+`runtimeConfig.enabled()`. CratonVM has a **native shim** for
+`SmallRyeConfig.getConfigMapping` (`native-builtins/src/phases_late.rs` ~5051,
+"Round 87") that does `alloc_concurrent_synthetic(ctx, <interfaceName>, 0)` — i.e. it
+allocates an object **of the `@ConfigMapping` INTERFACE itself**, which has no method
+bodies → `invokeinterface enabled()` → `AbstractMethodError`. The real generated impl
+**`io/quarkus/virtual/threads/VirtualThreadsConfig$$CMImpl`** (SmallRye
+`ConfigMappingGenerator` output) IS present in `generated-bytecode.jar`, with a no-arg
+ctor (fields default-zeroed) and a real `(io.smallrye.config.ConfigMappingContext)`
+ctor that populates fields from config.
+
+Why the shim exists / why this is deep: real `SmallRyeConfig.getConfigMapping(Class,
+String)` reads `this.mappings` (a `Map<Class,Map<String,Object>>`) and throws
+`SRCFG00027 mappingNotFound` when empty. Under CratonVM `mappings` is **never
+populated** (the Quarkus runtime config build that calls `builder.withMapping(type,
+prefix)` → `ConfigMappingProvider` → `new $$CMImpl(ConfigMappingContext)` and stores
+them isn't wiring the registry). And `ConfigMappingContext`'s only ctor is
+`(SmallRyeConfig, SmallRyeConfigBuilder$MappingBuilder)` — so you can't cheaply build
+one ad-hoc in a native. **Two real fix paths (both multi-session SmallRye-config
+work):** (a) make the runtime config build register the `@ConfigMapping` mappings so
+the real `getConfigMapping` returns populated `$$CMImpl`s and the shim can be deleted;
+(b) have the native construct `<cls>$$CMImpl` via the real `(ConfigMappingContext)`
+ctor against the live `SmallRyeConfig`. **Do NOT** swap the shim to a default-valued
+no-arg `$$CMImpl` — that is the forbidden B5 fabricated-config stub (every
+`@ConfigMapping` would silently report wrong/empty values app-wide).
+
+### Where this leaves Quarkus ArC (`CRATONVM_REAL_ARC`)
+ArC's real boot is `ArcProcessor$initializeContainer643029769.deploy` at
+`ApplicationImpl.<clinit>` **bci=634** — i.e. it runs only AFTER VirtualThreads
+(bci=414, Gap 6), `HibernateValidatorProcessor$build` (574), and
+`ConfigBuildStep$validateStaticInitConfigProperty` (614). So **real ArC is gated
+behind Gap 6 (the `@ConfigMapping` subsystem) and the 574/614 steps** — the boot
+cannot reach `Arc.initialize()` until those clear. `CRATONVM_REAL_ARC` (the env gate
+that would suppress the `quarkus_arc.rs` shim so real ArC bytecode runs) **does not
+exist yet and is premature to add**: it is untestable until the boot reaches bci=634,
+and a minimal standalone ArC repro needs a small Quarkus app's generated
+`Default_ComponentsProvider` + beans (Keycloak's pull in the whole app). Recommended
+order: fix the `@ConfigMapping` registry (Gap 6) → re-walk 574/614 → reach bci=634 →
+then add + validate the `CRATONVM_REAL_ARC` gate against the real ArC bytecode.
 
 ## Key takeaway
 
