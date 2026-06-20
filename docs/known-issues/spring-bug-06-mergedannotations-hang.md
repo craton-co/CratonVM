@@ -1,5 +1,27 @@
 # spring-bug-06: `MergedAnnotationsTests` HANGS (infinite loop in annotation merge)
 
+> **UPDATE 3 (2026-06-20, sharpest isolation — `toArray` recursion is NATIVE-mediated, in stream eval):**
+> Minimal repro `spring-suite/probe/ISn.java` = `OptionalInt.of(k).stream().mapToObj(..).collect(Collectors.joining())`
+> looped; SOEs after ~1000 iters (now a *catchable* `StackOverflowError` on current dev — it BREAKS
+> `AnnotationUtilsTests` JUnit *discovery*, a regression vs the pre-`c94657b5` dev where that class completed).
+> Clean Java SOE trace = pure `ReferencePipeline.toArray(:658)` ↔ itself, entered from the `.collect()` line.
+> Isolation (all no-rebuild on current dev):
+> - `toArray(IntFunction)` looped DIRECTLY (`String[]::new`) → COMPLETES (`ISg.java`).
+> - `mapToObj().toArray()` no-arg on a stub → COMPLETES (`ISt.java`, served by the stub `toArray` native).
+> - `Object[]::new` invokedynamic looped → COMPLETES (`Gen.java`). So the indy is fine.
+> - ONLY `collect(joining())` recurses.
+> Instrumented (`CRATONVM_DBG_STREAMREC`, throwaway worktree): the `invoke_cache` for the recursing
+> `toArray` site is **EMPTY** (`execute_invokevirtual_cached` never hits) and `execute_invoke_kind` resolves
+> `#219`→`toArray(IntFunction)` correctly only ~1022× — so the recursion is **NOT cache/vtable/overload-dispatch**
+> (every layer is descriptor-strict and correct). It is driven by a **native** re-entering no-arg `toArray()`:
+> real `ReferencePipeline.collect()` bytecode evaluates a **real `IntPipeline$1` whose pipeline SOURCE is the
+> `OptionalInt.stream()`/`mapToObj` synthetic interface-stub** — that real-pipeline-over-stub-source evaluation
+> loops back into `toArray()`. `p56_read_stream_elems` reads slot-0 (fine for stubs, empty for real pipelines),
+> so it is NOT the re-entry; the culprit native is in the real `evaluate`/`Sink`/`spliterator` path over a stub
+> source. **Fix is a stream-impl task** (keep the chain on stubs via force-native of the stream factories, OR
+> make the stub source's `spliterator`/terminal-op natives drain elements instead of re-entering `toArray`).
+> Verify any fix with `ISn.java`.
+
 > **UPDATE 2026-06-20 (deep root-cause; supersedes the JIT-codegen guess):** With the fam6
 > synthesis fixes (branch `fix/bug06-fam6-repeatable-merge`) the class completes 172/178 under
 > `--nojit` but TIMEOUTs (EXIT 124/127) under JIT. The hang is `ReferencePipeline.toArray()`
