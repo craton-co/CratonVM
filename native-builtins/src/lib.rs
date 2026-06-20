@@ -39320,6 +39320,40 @@ static PROXY_CLASS_CACHE: parking_lot::RwLock<
 /// than via `Class.getName()`.
 static PROXY_CLASS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// proxy-real-classfile increment 7 — per-loader dynamic-module sequence number
+/// backing the generated proxy package `jdk/proxyN/$ProxyM`, mirroring HotSpot's
+/// per-loader dynamic `jdk.proxyN` module (one module per class loader, `N`
+/// assigned in first-encounter order starting at 1; `$ProxyM` keeps using the
+/// global [`PROXY_CLASS_COUNTER`]). Public-interface proxies of the SAME loader
+/// share one `jdk/proxyN` package, exactly like the JDK's `ProxyBuilder`.
+static PROXY_MODULE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PROXY_LOADER_MODULES: parking_lot::RwLock<Option<rustc_hash::FxHashMap<u32, u32>>> =
+    parking_lot::RwLock::new(None);
+
+/// Module sequence number for `loader_id`'s generated proxies (the `N` in
+/// `jdk/proxyN`), assigned in first-encounter order starting at 1. Same loader →
+/// same number, so all of that loader's public-interface proxies land in one
+/// `jdk/proxyN` package — matching HotSpot's per-loader dynamic module.
+fn proxy_module_number(loader_id: u32) -> u32 {
+    {
+        let guard = PROXY_LOADER_MODULES.read();
+        if let Some(map) = guard.as_ref() {
+            if let Some(&n) = map.get(&loader_id) {
+                return n;
+            }
+        }
+    }
+    let mut guard = PROXY_LOADER_MODULES.write();
+    let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+    // Re-check under the write lock — another thread may have assigned it.
+    if let Some(&n) = map.get(&loader_id) {
+        return n;
+    }
+    let n = PROXY_MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    map.insert(loader_id, n);
+    n
+}
+
 /// Public accessor exposing the most-recently-created proxy's interfaces
 /// array as a raw pointer for the WP2.5 white-box test. Derives from the
 /// GC-tracked cell in `lang_class` (bug nb-lib-gckeys §2) — returns the
@@ -39362,6 +39396,21 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
     registry.register(p, "newProxyInstance",
         "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;",
         native_proxy_new_instance);
+    // proxy-real-classfile increment 7 — deprecated `Proxy.getProxyClass(loader,
+    // ifaces)`. The real JDK body routes the dynamic-module machinery
+    // (`ProxyBuilder.getDynamicModule` → `Module.defineModule0`) the synthetic
+    // proxy model can't satisfy → `InternalError: Proxy is not supported until
+    // module system is fully initialized`. Force this native (companion entry in
+    // `interpreter::force_native_over_real_jdk_bytecode`); it returns the same
+    // generated `$ProxyN` class `newProxyInstance` would build, so
+    // `pc.getConstructor(InvocationHandler.class).newInstance(h)` round-trips on
+    // CratonVM's own proxy machinery.
+    registry.register(
+        p,
+        "getProxyClass",
+        "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;",
+        native_proxy_get_proxy_class,
+    );
     // WP2.5: helper for the proxy-instance class so callers can read
     // the interfaces back from the proxy itself rather than walking
     // the side-table. Registered on the synthetic class name.
@@ -39402,6 +39451,20 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "invokeProxy",
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         native_proxy_dispatch_invoke,
+    );
+    // proxy-real-classfile increment 6 — `InvocationHandler.invokeDefault`
+    // (static, JDK 16+). The real JDK body reflects the generated proxy class's
+    // `proxyClassLookup` accessor (which CratonVM's `$ProxyN` does not emit) and
+    // throws `InternalError: NoSuchMethodException: proxyClassLookup`. Force this
+    // native over the real bytecode (companion entry in
+    // `interpreter::force_native_over_real_jdk_bytecode`); it runs the interface
+    // default body directly via `invoke_special`. `Bridge` category so it
+    // survives the no-synthetic-stubs drop.
+    registry.register(
+        "java/lang/reflect/InvocationHandler",
+        "invokeDefault",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+        native_invocation_handler_invoke_default,
     );
     // spring-bug-08: `ObjectInputStream.resolveProxyClass(String[])` override.
     // The serialization module's own copy (serialization.rs) is gated behind the
@@ -39672,6 +39735,51 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(proxy))))
 }
 
+/// proxy-real-classfile increment 7 — `Proxy.getProxyClass(ClassLoader,
+/// Class[])` (deprecated). Returns the generated `$ProxyN` `Class` for the given
+/// interface set via the same `define_or_get_proxy_class` machinery
+/// `newProxyInstance` uses (so it shares the per-(loader, iface-set) cache).
+/// Force-dispatched over the real JDK bytecode (see
+/// `interpreter::force_native_over_real_jdk_bytecode`), which otherwise throws
+/// `InternalError: Proxy is not supported until module system is fully
+/// initialized`.
+///
+/// Args (static method): `[0]` ClassLoader, `[1]` `Class[]` interfaces.
+fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Walk the Class[] into iface ClassIds (same as `native_proxy_new_instance`).
+    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(1).cloned() {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            if let Value::Object(Some(mirror)) = ctx.get_array_element(arr, i) {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    iface_cids.push(cid);
+                }
+            }
+        }
+    }
+    // Per-loader namespace = the loader instance's identity hash (bootstrap/null
+    // → 0), matching `native_proxy_new_instance` so both share the cache entry.
+    let loader_namespace: u32 = match args.first() {
+        Some(Value::Object(Some(loader_obj))) => ctx.identity_hash_code(*loader_obj) as u32,
+        _ => 0,
+    };
+    match define_or_get_proxy_class(ctx, loader_namespace, &iface_cids) {
+        ProxyClassOutcome::Real(cid) => {
+            let mirror = ctx.get_class_mirror(cid);
+            Ok(Some(Value::Object(Some(mirror))))
+        }
+        // Degrade (gate off) / Failed → the JDK raises IllegalArgumentException
+        // for an unbuildable proxy class; mirror that rather than returning a
+        // bogus Class.
+        _ => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Proxy.getProxyClass: cannot generate a proxy class for the given interfaces"
+                .to_string(),
+        }
+        .into()),
+    }
+}
+
 /// WP2.5 v3 — INVOKESTATIC target embedded in every generated `$ProxyN`
 /// method body. Dead code on the hot path (the interpreter's dispatch
 /// hook intercepts before this runs); registered defensively so any
@@ -39883,6 +39991,158 @@ fn wrap_undeclared_throwable(
     ute
 }
 
+/// proxy-real-classfile increment 6 — `InvocationHandler.invokeDefault(Object
+/// proxy, Method method, Object... args)` (JDK 16+, a `static` interface
+/// method).
+///
+/// The real JDK body drives `Proxy.invokeDefault`, which reflects the generated
+/// proxy class's `proxyClassLookup` accessor + a full-power
+/// `MethodHandles.Lookup` to bind an `invokespecial` MethodHandle to the
+/// interface's default body. CratonVM's generated `$ProxyN` emits no
+/// `proxyClassLookup` accessor (and the proxy model has no real per-class
+/// Lookup), so the real bytecode throws
+/// `InternalError: NoSuchMethodException: proxyClassLookup`. This native is
+/// force-dispatched over the real bytecode (see
+/// `interpreter::force_native_over_real_jdk_bytecode`) and runs the default body
+/// directly via [`NativeContext::invoke_special`] — the same super-call dispatch
+/// (`Lookup.findSpecial` semantics) the JDK ultimately performs, minus the
+/// Lookup plumbing. Nested *virtual* calls on the proxy inside the default body
+/// still route back through the `InvocationHandler` (invoke_special only
+/// bypasses the retarget for the single *resolved* method).
+///
+/// Args (static method): `[0]` proxy, `[1]` `Method`, `[2]` `Object[]` args
+/// (may be `null` for a no-arg default method).
+fn native_invocation_handler_invoke_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    let proxy = match args.first() {
+        Some(Value::Object(Some(p))) => *p,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("InvocationHandler.invokeDefault: proxy is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let method_obj = match args.get(1) {
+        Some(Value::Object(Some(m))) => *m,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("InvocationHandler.invokeDefault: method is null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    // JDK contract: the receiver must be a proxy instance.
+    if !proxy_chain_reaches_instance(ctx, ctx.class_id_of_object(proxy)) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "'proxy' is not a proxy instance".to_string(),
+        }
+        .into());
+    }
+
+    // JDK contract: the method must be a default method — public, non-abstract,
+    // non-static, declared on an interface (mirrors `Method.isDefault()`).
+    const ACC_PUBLIC: i32 = 0x0001;
+    const ACC_STATIC: i32 = 0x0008;
+    const ACC_ABSTRACT: i32 = 0x0400;
+    let modifiers = match ctx.get_field_by_name(method_obj, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let declaring_mirror = match ctx.get_field_by_name(method_obj, "clazz") {
+        Value::Object(Some(m)) => m,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "InvocationHandler.invokeDefault: method has no declaring class"
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+    let decl_is_interface = ctx
+        .class_id_from_mirror(declaring_mirror)
+        .map(|cid| ctx.is_interface_class(cid))
+        .unwrap_or(false);
+    let is_default =
+        decl_is_interface && (modifiers & (ACC_ABSTRACT | ACC_PUBLIC | ACC_STATIC)) == ACC_PUBLIC;
+    if !is_default {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "method is not a default method".to_string(),
+        }
+        .into());
+    }
+
+    let iface_name = match crate::lang_class::mirror_class_name(ctx, declaring_mirror) {
+        Some(n) => n,
+        None => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "InvocationHandler.invokeDefault: cannot resolve declaring interface"
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+    let method_name = match ctx.get_field_by_name(method_obj, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let descriptor = crate::lang_class::method_descriptor_for_invoke(ctx, method_obj);
+    let (param_descs, ret_desc) = crate::lang_class::parse_descriptor_param_and_return(&descriptor);
+
+    // Unbox the `Object[]` args to match the default method's primitive /
+    // reference parameter types, prepending the proxy receiver (which is
+    // `invoke_special`'s `args[0]`).
+    let args_arr = match args.get(2) {
+        Some(Value::Object(Some(a))) => Some(*a),
+        _ => None,
+    };
+    let supplied = match args_arr {
+        Some(a) => ctx.array_length(a),
+        None => 0,
+    };
+    if supplied != param_descs.len() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "InvocationHandler.invokeDefault: wrong number of arguments for {}.{}: \
+                 expected {}, got {}",
+                iface_name,
+                method_name,
+                param_descs.len(),
+                supplied
+            ),
+        }
+        .into());
+    }
+    let mut invoke_args: Vec<Value> = Vec::with_capacity(param_descs.len() + 1);
+    invoke_args.push(Value::Object(Some(proxy)));
+    for (i, pdesc) in param_descs.iter().enumerate() {
+        let raw = match args_arr {
+            Some(a) => ctx.get_array_element(a, i),
+            None => Value::Object(None),
+        };
+        invoke_args.push(crate::lang_class::unbox_arg(ctx, raw, pdesc));
+    }
+
+    // Run the interface's default body as an invokespecial super-call — exactly
+    // `I.m(...)`, with no virtual retarget back to the proxy's intercepted
+    // dispatch. A thrown exception propagates verbatim (invokeDefault declares
+    // `throws Throwable`; it does NOT apply UndeclaredThrowableException
+    // wrapping — that is only on the proxy-method dispatch path).
+    let result = ctx.invoke_special(&iface_name, &method_name, &descriptor, &invoke_args)?;
+
+    // `invokeDefault` returns `Object` — box a primitive result per the return
+    // type; reference / void results pass through unchanged.
+    match result {
+        Some(val) => Ok(Some(crate::lang_class::box_value(ctx, val, &ret_desc))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// proxy-real-classfile increment 1 — gate for the real generated-`$ProxyN`
 /// classfile path. Defaults to **ON** (the real path is canonical). Set
 /// `CRATONVM_REAL_PROXY=0` (or `false` / `off` / `no`, case-insensitive) to
@@ -39921,23 +40181,28 @@ pub fn real_proxy_strict() -> bool {
     })
 }
 
-/// proxy-real-classfile real-super migration — generate `$ProxyN` classes that
-/// extend the **real** `java.lang.reflect.Proxy` (sole instance field `h` at
-/// slot 0, matching the handler slot the dispatch path reads) rather than the
-/// synthetic `java/lang/reflect/Proxy$Instance` shim. DEFAULT **OFF**: the
-/// synthetic super remains the default until the real-super path soaks against
-/// the reflection suites; both paths are kept (nothing is deleted) so the
-/// synthetic shim is still available for experiments via the default.
+/// proxy-real-classfile real-super gate — generate `$ProxyN` classes that extend
+/// the **real** `java.lang.reflect.Proxy` (sole instance field `h` at slot 0,
+/// matching the handler slot the dispatch path reads). DEFAULT **ON** (per the
+/// "real Java by default, synthetic experimental" project rule): real-`Proxy`-super
+/// proxies match HotSpot for `getSuperclass()` / `instanceof Proxy`. Set
+/// `CRATONVM_REAL_PROXY_SUPER=0` (or `false` / `off` / `no`) to opt into the
+/// **experimental synthetic** `java/lang/reflect/Proxy$Instance` super instead —
+/// both paths are kept and working; NOTHING is deleted (the synthetic super is a
+/// real experimental implementation, not a no-op stub).
 ///
 /// Must stay in lockstep with the VM-side accessor
 /// `crate::runtime::env_cache::real_proxy_super()` (same env var) — the VM reads
 /// it to recognise real-`Proxy`-super proxies in the dispatch chain walk.
-/// `CRATONVM_REAL_PROXY_SUPER` = `1`/`true`/`on`/`yes` → on.
 pub fn real_proxy_super() -> bool {
-    matches!(std::env::var("CRATONVM_REAL_PROXY_SUPER"), Ok(v) if {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "on" || v == "yes"
-    })
+    match std::env::var("CRATONVM_REAL_PROXY_SUPER") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        // Unset (the default): real `java.lang.reflect.Proxy` super.
+        Err(_) => true,
+    }
 }
 
 /// The internal name of the super class generated `$ProxyN` proxies extend,
@@ -39997,17 +40262,18 @@ mod proxy_strict_gate_tests {
         assert!(!super::real_proxy_strict());
     }
 
-    /// proxy-real-classfile real-super migration: the real-`Proxy`-super path is
-    /// opt-in and OFF by default, so generated proxies keep extending the
-    /// synthetic `Proxy$Instance` shim until the soak flips it. (Both paths are
-    /// retained — nothing is deleted.)
+    /// proxy-real-classfile real-super gate: real `java.lang.reflect.Proxy` is the
+    /// super by DEFAULT (real Java by default; the synthetic `Proxy$Instance` super
+    /// is the experimental opt-out via `CRATONVM_REAL_PROXY_SUPER=0`). Both paths
+    /// are retained — nothing is deleted. (Env-unset default asserted here; the
+    /// opt-out is exercised by the proxy soak under `CRATONVM_REAL_PROXY_SUPER=0`.)
     #[test]
-    fn real_proxy_super_defaults_off() {
-        assert!(!super::real_proxy_super());
-        assert_eq!(
-            super::proxy_super_class_name(),
-            "java/lang/reflect/Proxy$Instance"
-        );
+    fn real_proxy_super_defaults_on() {
+        // Only meaningful when the env var is not set in the test environment.
+        if std::env::var_os("CRATONVM_REAL_PROXY_SUPER").is_none() {
+            assert!(super::real_proxy_super());
+            assert_eq!(super::proxy_super_class_name(), "java/lang/reflect/Proxy");
+        }
     }
 }
 
@@ -40076,7 +40342,7 @@ fn define_or_get_proxy_class(
     // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
     // only when an interface ClassId fails to resolve to a name (a
     // genuinely unloadable interface) — see its doc.
-    let (gen_name, spec) = match build_proxy_spec_for(ctx, &sorted) {
+    let (gen_name, spec) = match build_proxy_spec_for(ctx, loader_id, &sorted) {
         Some(v) => v,
         None => {
             if dbg {
@@ -40213,6 +40479,7 @@ pub(crate) fn resolve_serialized_proxy_class(
 /// `None` if any ClassId fails to resolve to a name.
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
+    loader_id: u32,
     sorted_ifaces: &[cratonvm_types::ClassId],
 ) -> Option<(String, cratonvm_classloading::proxy_gen::ProxyClassSpec)> {
     use cratonvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
@@ -40243,7 +40510,13 @@ fn build_proxy_spec_for(
     //   * If any proxied interface is non-public, the proxy must live in that
     //     interface's package (matches the JDK; yields `$ProxyN` in the default
     //     package for a package-private interface, exactly like HotSpot).
-    //   * Otherwise all interfaces are public → use `com/sun/proxy`.
+    //   * Otherwise all interfaces are public → use HotSpot-25's per-loader
+    //     dynamic module package `jdk/proxyN` (was `com/sun/proxy`, a pre-JDK-9
+    //     name). `jdk/proxyN` is NOT a prohibited package (only `jdk/internal/*`
+    //     is — see `class_manager::is_prohibited_package_name`) and matches every
+    //     `jdk/`-prefixed platform gate identically to the old `com/sun/` name,
+    //     so the rename is behaviour-preserving while making `Class.getName()`
+    //     match HotSpot (e.g. `jdk.proxy1.$Proxy0`).
     let non_public_pkg = sorted_ifaces.iter().find_map(|cid| {
         if ctx.class_access_flags(*cid) & ACC_PUBLIC == 0 {
             let name = ctx.class_name_of_id(*cid)?;
@@ -40259,7 +40532,7 @@ fn build_proxy_spec_for(
     let gen_class_name = match non_public_pkg {
         Some(pkg) if pkg.is_empty() => format!("$Proxy{n}"),
         Some(pkg) => format!("{pkg}/$Proxy{n}"),
-        None => format!("com/sun/proxy/$Proxy{n}"),
+        None => format!("jdk/proxy{}/$Proxy{n}", proxy_module_number(loader_id)),
     };
 
     // BFS over interface inheritance. Collect public, non-static,

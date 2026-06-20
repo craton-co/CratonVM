@@ -6932,14 +6932,28 @@ pub(super) fn proxy_invoke_handler(
             Value::Object(Some(method_obj)),
             args_value,
         ];
-        let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
+        // See `proxy_invoke_handler_shared`: route a lambda-handler throw through
+        // the UndeclaredThrowableException parity wrap instead of `?`.
+        let dispatch = match crate::runtime::interpreter::try_lambda_dispatch(
             ctx.shared,
             ctx.thread,
             handler_ref,
             handler_class_id,
             "invoke",
             &call_args,
-        )?;
+        ) {
+            Ok(d) => d,
+            Err(failure) => {
+                return proxy_wrap_undeclared_if_needed(
+                    ctx.shared,
+                    ctx.thread,
+                    proxy,
+                    method_name,
+                    descriptor,
+                    Err(failure),
+                );
+            }
+        };
         if let Some(result) = dispatch {
             return Ok(result);
         }
@@ -6965,12 +6979,13 @@ pub(super) fn proxy_invoke_handler(
         Value::Object(Some(method_obj)),
         args_value,
     ];
-    ctx.invoke_or_native(
+    let result = ctx.invoke_or_native(
         &handler_class_name,
         "invoke",
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
-    )
+    );
+    proxy_wrap_undeclared_if_needed(ctx.shared, ctx.thread, proxy, method_name, descriptor, result)
 }
 
 /// Dispatch a method call on an annotation proxy object.
@@ -7216,14 +7231,30 @@ pub(crate) fn proxy_invoke_handler_shared(
             Value::Object(Some(method_obj)),
             args_value,
         ];
-        let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
+        // Note: a thrown exception here must route through the
+        // UndeclaredThrowableException parity wrap (lambda handlers — e.g. a
+        // `(proxy,m,a) -> ...` passed straight to `newProxyInstance` — are the
+        // common case), so capture the Err instead of `?`-propagating it.
+        let dispatch = match crate::runtime::interpreter::try_lambda_dispatch(
             shared,
             thread,
             handler_ref,
             handler_class_id,
             "invoke",
             &call_args,
-        )?;
+        ) {
+            Ok(d) => d,
+            Err(failure) => {
+                return proxy_wrap_undeclared_if_needed(
+                    shared,
+                    thread,
+                    proxy,
+                    method_name,
+                    descriptor,
+                    Err(failure),
+                );
+            }
+        };
         if let Some(result) = dispatch {
             return Ok(result);
         }
@@ -7250,14 +7281,146 @@ pub(crate) fn proxy_invoke_handler_shared(
         Value::Object(Some(method_obj)),
         args_value,
     ];
-    invoke_or_native(
+    let result = invoke_or_native(
         shared,
         thread,
         &handler_class_name,
         "invoke",
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
+    );
+    proxy_wrap_undeclared_if_needed(shared, thread, proxy, method_name, descriptor, result)
+}
+
+/// proxy-real-classfile increment 6 — `UndeclaredThrowableException` parity for
+/// the live proxy dispatch hooks (`proxy_invoke_handler{,_shared}`).
+///
+/// HotSpot's generated `$ProxyN` method body wraps any exception thrown by
+/// `InvocationHandler.invoke` that is neither a `RuntimeException` / `Error` nor
+/// a checked type **declared** by the proxied method in
+/// `java.lang.reflect.UndeclaredThrowableException` (the `java.lang.reflect.Proxy`
+/// contract / JLS §15.12.4.4). CratonVM's live dispatch hooks returned the
+/// handler result verbatim, so an *undeclared checked* exception surfaced
+/// unwrapped — a HotSpot divergence. (It was only ever masked because the
+/// dead-code generated-body path that already wraps,
+/// `native_builtins::native_proxy_dispatch_invoke`, is superseded by these
+/// interpreter hooks.) This brings the live path to parity.
+///
+/// Pass-through for `Ok`, for a non-`ExceptionThrown` `Err`, for
+/// `RuntimeException` / `Error`, and for any declared checked exception — only an
+/// undeclared checked throw is rewrapped. Best-effort: if the
+/// `UndeclaredThrowableException` class can't be resolved / constructed the
+/// original exception propagates verbatim (losing the wrap beats losing the
+/// exception).
+fn proxy_wrap_undeclared_if_needed(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    proxy: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let thrown = match result {
+        Err(MethodCallFailed::ExceptionThrown(t)) => t,
+        other => return other,
+    };
+    let thrown_cid = shared.heap.class_id_of(thrown);
+
+    // RuntimeException / Error (or subclasses) propagate verbatim.
+    for base in ["java/lang/RuntimeException", "java/lang/Error"] {
+        if let Ok(bcid) = shared.load_class_concurrent(base) {
+            if thrown_cid == bcid || shared.class_manager.read().is_subclass_of(thrown_cid, bcid) {
+                return Err(MethodCallFailed::ExceptionThrown(thrown));
+            }
+        }
+    }
+
+    // A checked exception declared by the proxied method propagates verbatim.
+    // `proxy_resolve_declaring_class_mirror` lands on the exact declaring
+    // interface, so its `Exceptions` attribute is authoritative for (name,desc).
+    let decl_mirror = proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
+    let decl_cid = shared.class_mirrors_reverse.read().get(&decl_mirror).copied();
+    if let Some(decl_cid) = decl_cid {
+        for ex_name in proxy_method_declared_exceptions(shared, decl_cid, method_name, descriptor) {
+            if let Ok(ex_cid) = shared.load_class_concurrent(&ex_name) {
+                if thrown_cid == ex_cid
+                    || shared.class_manager.read().is_subclass_of(thrown_cid, ex_cid)
+                {
+                    return Err(MethodCallFailed::ExceptionThrown(thrown));
+                }
+            }
+        }
+    }
+
+    // Undeclared checked exception → wrap in UndeclaredThrowableException.
+    let ute_name = "java/lang/reflect/UndeclaredThrowableException";
+    let ute_cid = match shared.load_class_concurrent(ute_name) {
+        Ok(c) => c,
+        Err(_) => return Err(MethodCallFailed::ExceptionThrown(thrown)),
+    };
+    if super::ensure_class_initialized_shared(shared, thread, ute_cid).is_err() {
+        return Err(MethodCallFailed::ExceptionThrown(thrown));
+    }
+    let n_fields = shared
+        .class_manager
+        .read()
+        .get_class(ute_cid)
+        .map(|c| c.num_total_fields)
+        .unwrap_or(8)
+        .max(4);
+    let ute = shared.heap.alloc_object(ute_cid, n_fields);
+    let ctor_args = [Value::Object(Some(ute)), Value::Object(Some(thrown))];
+    // Run the real `<init>(Throwable)` so `getUndeclaredThrowable()` /
+    // `getCause()` observe the wrapped exception. On ctor failure fall back to
+    // verbatim propagation.
+    if invoke_or_native(
+        shared,
+        thread,
+        ute_name,
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+        &ctor_args,
     )
+    .is_err()
+    {
+        return Err(MethodCallFailed::ExceptionThrown(thrown));
+    }
+    Err(MethodCallFailed::ExceptionThrown(ute))
+}
+
+/// Declared `throws` types (internal names) of `(method_name, descriptor)` on
+/// `class_id`, read from the method's `Exceptions` attribute. The proxy
+/// declaring-class resolver already lands on the exact interface that declares
+/// the method, so no hierarchy walk is needed here.
+fn proxy_method_declared_exceptions(
+    shared: &SharedVm,
+    class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+) -> Vec<String> {
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return Vec::new();
+    };
+    for m in &class.methods {
+        if &*m.name == method_name && &*m.descriptor == descriptor {
+            for attr in &m.attributes {
+                if let Some(cratonvm_reader::attribute::Attribute::Exceptions {
+                    exception_indices,
+                }) = attr.as_decoded()
+                {
+                    return exception_indices
+                        .iter()
+                        .filter_map(|idx| {
+                            class.constant_pool.get_class_name(*idx).map(|s| s.to_string())
+                        })
+                        .collect();
+                }
+            }
+            return Vec::new();
+        }
+    }
+    Vec::new()
 }
 
 /// Shared-interpreter version of `annotation_proxy_invoke`.

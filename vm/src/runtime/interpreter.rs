@@ -14182,6 +14182,34 @@ fn force_native_over_real_jdk_bytecode(
                 "resolveProxyClass",
                 "([Ljava/lang/String;)Ljava/lang/Class;",
             )
+            // proxy-real-classfile increment 6: `InvocationHandler.invokeDefault`
+            // (static, JDK 16+). The real JDK body drives `Proxy.invokeDefault`,
+            // which reflects the generated proxy class's `proxyClassLookup`
+            // accessor + a full-power `MethodHandles.Lookup` to bind an
+            // invokespecial MethodHandle to the interface default body. CratonVM's
+            // generated `$ProxyN` emits no `proxyClassLookup` (and the proxy model
+            // has no real per-class Lookup), so the real bytecode throws
+            // `InternalError: NoSuchMethodException: proxyClassLookup`. Force the
+            // registered native (native-builtins
+            // `native_invocation_handler_invoke_default`), which runs the default
+            // body directly via `invoke_special`.
+            | (
+                "java/lang/reflect/InvocationHandler",
+                "invokeDefault",
+                "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            // proxy-real-classfile increment 7: deprecated `Proxy.getProxyClass`.
+            // The real JDK body routes the dynamic-module machinery
+            // (`ProxyBuilder.getDynamicModule` → `Module.defineModule0`) the
+            // synthetic proxy model can't satisfy → `InternalError: Proxy is not
+            // supported until module system is fully initialized`. Force the
+            // registered native (native-builtins `native_proxy_get_proxy_class`),
+            // which returns the generated `$ProxyN` class directly.
+            | (
+                "java/lang/reflect/Proxy",
+                "getProxyClass",
+                "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(
