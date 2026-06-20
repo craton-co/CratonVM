@@ -134,6 +134,63 @@ per-framework native short-circuits by making the real container bytecode run.
 >   `<clinit>` *shape* is already pinned by `vm/tests/nested_clinit_startup.rs`,
 >   but an end-to-end fat-jar boot run is needed before removing the fallback.
 
+> **Increment 3 finalize (regression fix) — LANDED (branch `fix/spring-startup-shim-finalize`).**
+> Scope: close the one loose end the default flip left behind. The flip made
+> `real_spring_startup()` default-`true`, which made
+> `clinit_swallow_has_recovery("…/ApplicationStartup")` return `false` on the
+> default path (correct — the real `<clinit>` must run, not be swallowed +
+> backfilled). But the unit test `clinit_swallow_recovery_admits_documented_cases`
+> in `vm/src/vm/vm_util.rs` still listed `ApplicationStartup` among the classes
+> that "must stay swallowable", so a default `cargo test` asserted the old
+> pre-flip answer and failed. The flip commit (`save 18.06-5`) never updated it.
+>   - Fix: drop `ApplicationStartup` from that unconditional must-be-swallowable
+>     loop and replace it with an env-aware assertion (branching on the live
+>     `real_spring_startup()` gate, mirroring `lenient_clinit_defaults_off`): on
+>     the default real path it must NOT be swallowable; under the
+>     `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out it must stay swallowable. The
+>     production `clinit_swallow_has_recovery` / `post_clinit_fixup` arms are
+>     unchanged — only the test's expectation was stale.
+>   - Re-verified (default real path, unique-named binary): Spring Boot functional
+>     battery == HotSpot, `vm/tests/iface_static_final_init.rs`,
+>     `vm/tests/nested_clinit_startup.rs`, and the corrected `vm_util` unit test
+>     all green. (Superseded by Increment 4 below, which then removed the fallback
+>     outright.)
+
+> **Increment 4 (Step 3 — outright deletion of the no-op shim) — LANDED (branch `fix/spring-startup-shim-finalize`).**
+> Scope: delete the Spring startup-metrics no-op shim entirely now that the real
+> path is the validated default. This completes Step 3 for the Spring startup
+> scalp (the no-stubs-policy goal). The default behavior is unchanged — the
+> no-op natives were only ever reachable under the now-removed opt-out.
+>
+> - **Removed.** The no-op `ApplicationStartup` / `StartupStep` singletons and
+>   their natives (`getApplicationStartup` / `start` / `tag` / `end` / `getName` /
+>   `getId` / `getParentId` / `getTags`) and the singleton helpers in
+>   `native-builtins/src/spring_startup_bootstrap.rs`; the two `vm_exec.rs`
+>   `check_override` force arms; the `vm_util.rs` `clinit_swallow_has_recovery`
+>   guard + `has_fixup_arm` entry + the `post_clinit_fixup` `ApplicationStartup`
+>   arm; and the `real_spring_startup()` gate + `CRATONVM_SYNTHETIC_SPRING_STARTUP`
+>   / `CRATONVM_REAL_SPRING_STARTUP` env vars (`vm/src/runtime/env_cache.rs` and
+>   the `native-builtins` twin). `ApplicationStartup` / `DefaultApplicationStartup`
+>   are now in the `clinit_swallow_recovery_rejects_unrecovered_classes` list (must
+>   NOT be swallowed). The obsolete opt-out subprocess test in
+>   `vm/tests/nested_clinit_startup.rs` and the
+>   `application_startup_intercepts_registered` native-builtins test were removed.
+> - **Kept.** The SEPARATE environment / bean-factory / property-source /
+>   config-data natives in the same module (they cover different partial-bootstrap
+>   gaps).
+> - **Why this is safe without a fat-jar battery.** The deleted natives were only
+>   ever registered under the opt-out, so the default (real) path — validated
+>   10/10 == HotSpot — is byte-for-byte unaffected by the deletion. The opt-out's
+>   only intended consumer was the Spring Boot fat-jar path, which is independently
+>   still partial (`vm/tests/wave3_spring_boot_fatjar.rs` shows the launcher stops
+>   earlier, at `JarFileArchive.getClassPathUrls`), so no working path loses a
+>   fallback. The `<clinit>` shape stays pinned by
+>   `vm/tests/nested_clinit_startup.rs` and `vm/tests/iface_static_final_init.rs`.
+> - **Re-verified (default path, unique-named binary `cratonvm-sbstartup.exe`):**
+>   Spring Boot functional battery 10/10 == HotSpot (zero divergence, no synthetic
+>   backfill); `nested_clinit_startup` + `iface_static_final_init` +
+>   `vm_util` clinit-swallow unit tests green; workspace builds clean.
+
 ## Goal
 
 Run the **real** CDI / dependency-injection / service-container bytecode of

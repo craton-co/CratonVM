@@ -90,20 +90,11 @@ fn lenient_clinit() -> bool {
 /// their true origin instead of being hidden behind a stamped-`Initialized`
 /// class with null statics.
 fn clinit_swallow_has_recovery(class_name: &str) -> bool {
-    // real-cdi-bean-container increment 3 (Step 2 → default flip): the Spring
-    // `ApplicationStartup` startup-metrics subsystem now runs its REAL bytecode
-    // by DEFAULT, so its `<clinit>` must NOT be swallowed + backfilled by
-    // `post_clinit_fixup`. Drop it from the recovery allowlist unless the
-    // `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out is active; any genuine
-    // `<clinit>` failure then surfaces per JVMS §5.5 instead of being masked by
-    // a synthetic `DEFAULT`. (Opt-out ON: the arm below stays active so the
-    // legacy shimmed path is unchanged.)
-    if (class_name == "org/springframework/core/metrics/ApplicationStartup"
-        || class_name == "org/springframework/core/metrics/DefaultApplicationStartup")
-        && crate::runtime::env_cache::real_spring_startup()
-    {
-        return false;
-    }
+    // NOTE (real-cdi-bean-container Step 3): Spring's `ApplicationStartup`
+    // startup-metrics subsystem runs its REAL bytecode and is intentionally NOT
+    // in this allowlist — its `<clinit>` must complete on its own and any failure
+    // surface per JVMS §5.5, never be swallowed + backfilled. The legacy no-op
+    // shim and its `post_clinit_fixup` backfill have been removed.
     // (1) Classes with an explicit `post_clinit_fixup` recovery arm.
     let has_fixup_arm = matches!(
         class_name,
@@ -127,7 +118,6 @@ fn clinit_swallow_has_recovery(class_name: &str) -> bool {
             | "java/math/BigInteger"
             | "java/nio/file/attribute/PosixFilePermission"
             | "java/math/BigDecimal"
-            | "org/springframework/core/metrics/ApplicationStartup"
             | "org/jboss/msc/service/ServiceContainerImpl"
             | "org/wildfly/security/auth/server/_private/ElytronMessages"
             | "org/jboss/msc/service/ServiceLogger"
@@ -2422,63 +2412,6 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 );
             }
         }
-        // S-SB: Spring ApplicationStartup.DEFAULT must be non-null.
-        // When DefaultApplicationStartup.<clinit> fails (it creates a
-        // DefaultStartupStep whose constructor fails in our partial bootstrap),
-        // the DEFAULT field stays null.  Populate it with a synthetic
-        // DefaultApplicationStartup object; the `start()` method is overridden
-        // natively by spring_startup_bootstrap.rs so the object doesn't need
-        // real field layout.
-        "org/springframework/core/metrics/ApplicationStartup" => {
-            // real-cdi-bean-container increment 3 (Step 2 → default flip): the
-            // real `ApplicationStartup.<clinit>` now runs by DEFAULT and
-            // populates `DEFAULT` itself, so the synthetic backfill must NOT fire
-            // unless the `CRATONVM_SYNTHETIC_SPRING_STARTUP` opt-out is active.
-            // (When real, `clinit_swallow_has_recovery` already declines the
-            // swallow so this arm is normally unreachable for a failed
-            // `<clinit>`; the explicit guard keeps the fixup off even if a future
-            // caller invokes `post_clinit_fixup` for this class directly.)
-            if crate::runtime::env_cache::real_spring_startup() {
-                return;
-            }
-            let def_startup = "org/springframework/core/metrics/DefaultApplicationStartup";
-            let def_startup_id = {
-                let cm = shared.class_manager.read();
-                cm.find_class_by_name(def_startup)
-            };
-            if let Some(sid) = def_startup_id {
-                // Check current value first — don't overwrite a good value
-                let current_null = {
-                    let cm = shared.class_manager.read();
-                    if let Some(cls) = cm.get_class(class_id) {
-                        let mut static_idx = 0usize;
-                        let mut is_null = true;
-                        for f in &cls.fields {
-                            if f.is_static() {
-                                if &*f.name == "DEFAULT" {
-                                    let v = super::get_static_shared(shared, class_id, static_idx);
-                                    is_null = matches!(v, Value::Object(None));
-                                    break;
-                                }
-                                static_idx += 1;
-                            }
-                        }
-                        is_null
-                    } else {
-                        true
-                    }
-                };
-                if current_null {
-                    if let Some(obj) = shared.heap.try_alloc_object(sid, 8) {
-                        if set_static_by_name("DEFAULT", Value::Object(Some(obj))) {
-                            tracing::warn!(
-                                "Post-clinit fixup: ApplicationStartup.DEFAULT populated"
-                            );
-                        }
-                    }
-                }
-            }
-        }
         // R55 (WildFly): `org/jboss/msc/service/ServiceContainerImpl.<clinit>`
         // can throw NPE downstream of a swallowed `ServiceLogger.<clinit>`
         // (ServiceLogger.ROOT is left null after its own clinit swallow,
@@ -3253,7 +3186,6 @@ mod tests {
             "java/math/BigInteger",
             "java/math/BigDecimal",
             "java/nio/file/attribute/PosixFilePermission",
-            "org/springframework/core/metrics/ApplicationStartup",
             "org/jboss/msc/service/ServiceContainerImpl",
             "org/jboss/msc/service/ServiceLogger",
             "org/wildfly/security/auth/server/_private/ElytronMessages",
@@ -3288,6 +3220,11 @@ mod tests {
             "org/wildfly/common/Assert",
             "com/sun/crypto/provider/SunJCE",
             "org/springframework/boot/loader/jar/JarFileArchive",
+            // real-cdi-bean-container Step 3: the Spring startup-metrics no-op
+            // shim is removed, so ApplicationStartup runs its real `<clinit>` and
+            // must NOT be swallowed/backfilled.
+            "org/springframework/core/metrics/ApplicationStartup",
+            "org/springframework/core/metrics/DefaultApplicationStartup",
             // Arbitrary app classes were never in the old allowlist and must
             // stay rejected.
             "com/example/MyService",
