@@ -491,6 +491,9 @@ impl<'a> Lowerer<'a> {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
                 self.emit_div_zero_guard(ty, bpc);
+                // JVMS MIN/-1 overflow guard: materialise MIN and skip the IDIV
+                // (a raw IDIV on MIN/-1 raises #DE).
+                let ovf_after = self.emit_div_overflow_guard(ty, /* is_rem */ false);
                 if ty == IrType::Int {
                     // CDQ (sign-extend EAX → EDX:EAX)
                     self.buf.emit_byte(0x99);
@@ -502,6 +505,7 @@ impl<'a> Lowerer<'a> {
                     // IDIV RCX
                     self.buf.emit(&[0x48, 0xF7, 0xF9]);
                 }
+                self.patch_div_overflow_after(ovf_after);
                 self.store_rax(slot);
             }
             Op::Rem => {
@@ -511,6 +515,9 @@ impl<'a> Lowerer<'a> {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
                 self.emit_div_zero_guard(ty, bpc);
+                // JVMS MIN/-1 overflow guard: materialise remainder 0 and skip
+                // the IDIV (a raw IDIV on MIN/-1 raises #DE).
+                let ovf_after = self.emit_div_overflow_guard(ty, /* is_rem */ true);
                 if ty == IrType::Int {
                     self.buf.emit_byte(0x99); // CDQ
                     self.buf.emit(&[0xF7, 0xF9]); // IDIV ECX
@@ -521,6 +528,7 @@ impl<'a> Lowerer<'a> {
                 // Remainder is in RDX; move to RAX
                 // MOV RAX, RDX
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
+                self.patch_div_overflow_after(ovf_after);
                 self.store_rax(slot);
             }
             Op::Neg => {
@@ -900,6 +908,85 @@ impl<'a> Lowerer<'a> {
             self.buf.emit(&[0x48, 0x85, 0xC9]);
         }
         self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
+    }
+
+    /// Emit the JVMS `MIN_VALUE / -1` overflow guard for an `Op::Div`/`Op::Rem`
+    /// whose dividend is in RAX and divisor in RCX (after `emit_div_zero_guard`).
+    /// A raw `IDIV` on `MIN / -1` raises `#DE` — the latent **hang** this fixes
+    /// (the single-pass backend's `emit_safe_idiv` already guards this; the IR
+    /// backend did not, so a JIT'd `idiv(Integer.MIN_VALUE, -1)` faulted and the
+    /// fault handler spun). When `dividend == MIN && divisor == -1` we
+    /// materialise the spec result (quotient == MIN, i.e. the dividend unchanged;
+    /// remainder == 0) and `JMP` past the `IDIV`. Always safe to emit (pure
+    /// inline branch, no deopt / no safepoint needed). Returns the position of
+    /// the forward `JMP` rel32 the caller must patch to the post-`IDIV`
+    /// continuation; the two `JNE`s to the `do_div` (`IDIV`) path are patched
+    /// here. Uses R10 as scratch for the 64-bit MIN compare (the IR lowering
+    /// never homes a value there).
+    fn emit_div_overflow_guard(&mut self, ty: IrType, is_rem: bool) -> usize {
+        // CMP dividend, MIN
+        if ty == IrType::Int {
+            // CMP EAX, imm32  (3D <imm32>)
+            self.buf.emit_byte(0x3D);
+            self.buf.emit(&(i32::MIN as u32).to_le_bytes());
+        } else {
+            // MOV R10, i64::MIN (49 BA <imm64>) ; CMP RAX, R10 (4C 39 D0)
+            self.buf.emit(&[0x49, 0xBA]);
+            self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+            self.buf.emit(&[0x4C, 0x39, 0xD0]);
+        }
+        // JNE do_div (0F 85 rel32)
+        self.buf.emit(&[0x0F, 0x85]);
+        let jne1 = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // CMP divisor, -1
+        if ty == IrType::Int {
+            self.buf.emit(&[0x83, 0xF9, 0xFF]); // CMP ECX, -1
+        } else {
+            self.buf.emit(&[0x48, 0x83, 0xF9, 0xFF]); // CMP RCX, -1
+        }
+        // JNE do_div (0F 85 rel32)
+        self.buf.emit(&[0x0F, 0x85]);
+        let jne2 = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // Materialise the overflow result (matches the zero-extended convention
+        // a 32-bit IDIV leaves in RAX).
+        if is_rem {
+            // remainder == 0 → XOR EAX, EAX (zeros the full RAX).
+            self.buf.emit(&[0x31, 0xC0]);
+        } else if ty == IrType::Int {
+            // quotient == MIN → MOV EAX, 0x80000000 (zero-extends into RAX).
+            self.buf.emit_byte(0xB8);
+            self.buf.emit(&(i32::MIN as u32).to_le_bytes());
+        } else {
+            // quotient == MIN → MOV RAX, i64::MIN.
+            self.buf.emit(&[0x48, 0xB8]);
+            self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+        }
+        // JMP after (E9 rel32) — patched by the caller after the IDIV.
+        self.buf.emit_byte(0xE9);
+        let after_patch = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // do_div: patch both JNEs to land here (the IDIV the caller emits next).
+        let do_div = self.buf.pos();
+        for p in [jne1, jne2] {
+            let rel = do_div as i32 - (p as i32 + 4);
+            self.buf
+                .try_patch_i32(p, rel)
+                .expect("div-overflow JNE patch in-bounds");
+        }
+        after_patch
+    }
+
+    /// Patch the forward `JMP` emitted by [`emit_div_overflow_guard`] to the
+    /// current position (the post-`IDIV` continuation, just before the result
+    /// is stored).
+    fn patch_div_overflow_after(&mut self, after_patch: usize) {
+        let cont = self.buf.pos();
+        let rel = cont as i32 - (after_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(after_patch, rel)
+            .expect("div-overflow JMP patch in-bounds");
     }
 
     /// Emit a deopt-on-zero branch, given the caller has already emitted a
