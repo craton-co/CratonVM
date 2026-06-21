@@ -816,9 +816,60 @@ unsafe fn with_vm<R>(vm: *mut CratonVm, err_val: R, f: impl FnOnce(&mut CratonVm
         set_last_error("null CratonVm handle");
         return err_val;
     }
-    // SAFETY: caller contract — `vm` is a live handle; we form a unique &mut
-    // for the duration of `f` (the flat API is single-threaded per handle).
+    // Reentrancy guard: forming `&mut *vm` while an outer `with_vm` for the same
+    // handle is already on the stack (e.g. a flat-API call made from Java code
+    // the VM is currently executing) would create two aliasing `&mut CratonVm`
+    // — instant UB. Mark the handle in-use for the duration of `f`; a re-entrant
+    // call with the same handle is rejected before any borrow is formed. The
+    // flag lives in a side table (not in the borrowed struct), so checking it
+    // never aliases the live `&mut`.
+    let _borrow = match BorrowGuard::acquire(vm) {
+        Some(g) => g,
+        None => {
+            set_last_error("re-entrant CratonVm access on the same handle is not allowed");
+            return err_val;
+        }
+    };
+    // SAFETY: caller contract — `vm` is a live handle; the borrow guard above
+    // guarantees no other `&mut CratonVm` for this handle is live, so this is
+    // the unique `&mut` for the duration of `f`.
     f(unsafe { &mut *vm })
+}
+
+/// Process-global set of `CratonVm` handles currently borrowed by an in-flight
+/// `with_vm`. Used purely as a reentrancy flag; the address is never
+/// dereferenced through this table.
+static BORROWED_HANDLES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+
+fn borrowed_handles() -> &'static Mutex<std::collections::HashSet<usize>> {
+    BORROWED_HANDLES.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// RAII reentrancy guard: marks a handle in-use on `acquire` and clears it on
+/// drop (including on panic), so a re-entrant `with_vm` on the same handle is
+/// rejected for the lifetime of the guard.
+struct BorrowGuard(usize);
+
+impl BorrowGuard {
+    /// Returns `Some(guard)` if the handle was free (now marked in-use), or
+    /// `None` if it is already borrowed (re-entrant access).
+    fn acquire(vm: *mut CratonVm) -> Option<Self> {
+        let key = vm as usize;
+        let mut set = borrowed_handles().lock().ok()?;
+        if set.insert(key) {
+            Some(BorrowGuard(key))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = borrowed_handles().lock() {
+            set.remove(&self.0);
+        }
+    }
 }
 
 // --- load_class ------------------------------------------------------------
@@ -1981,6 +2032,27 @@ mod tests {
     fn destroy_null_is_noop() {
         // Must not panic / segfault.
         cratonvm_destroy(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn borrow_guard_rejects_reentrant_same_handle() {
+        // A fabricated (never-dereferenced) handle address: the guard only keys
+        // on the pointer value, never reads through it.
+        let fake = 0xdead_beef_usize as *mut CratonVm;
+        let g1 = BorrowGuard::acquire(fake).expect("first acquire must succeed");
+        // A second acquire on the same handle (the re-entrant case) is rejected.
+        assert!(
+            BorrowGuard::acquire(fake).is_none(),
+            "re-entrant acquire on the same handle must be rejected"
+        );
+        // A different handle is independent.
+        let other = 0xfeed_face_usize as *mut CratonVm;
+        let g2 = BorrowGuard::acquire(other).expect("distinct handle must acquire");
+        drop(g2);
+        // After the first guard drops, the handle is free again.
+        drop(g1);
+        let g3 = BorrowGuard::acquire(fake).expect("handle must be re-acquirable after release");
+        drop(g3);
     }
 
     // Opt-in live-VM round trip: create → new_string → load_class →
