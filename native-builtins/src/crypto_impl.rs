@@ -1022,47 +1022,44 @@ impl SecureRandom {
 // Native method stubs
 // ============================================================================
 
-// nb-crypto-impl MED(secrand): Per-instance SecureRandom DRBG.
+// nb-crypto-impl SecureRandom — design summary.
 //
-// PRIOR BUG: `native_secure_random_next_bytes` / `generateSeed` each spun up a
-// fresh `SecureRandom::new()` and drew straight from OS entropy, *ignoring the
-// calling object entirely*.  As a result `new SecureRandom(seed)` /
-// `SecureRandom.setSeed(seed)` were silently no-ops at the output stage: the
-// supplied seed never influenced the produced bytes.  That violates the JDK
-// contract (`setSeed` MUST be honoured — it *supplements* the existing seed,
-// per the `java.security.SecureRandom` javadoc) and made any test or protocol
-// that relies on reseeding behave as a pure OS draw.
+// `nextBytes` / `generateSeed` draw EVERY byte directly from the OS CSPRNG
+// (`secure_random_fill` → `os_random_bytes`), with a ChaCha20 software fallback
+// only when the OS source is unavailable. There is intentionally NO per-instance
+// DRBG state: output does not depend on the receiver, on any seed, or on the
+// object's identity hash. See, in this file:
+//   * VULN(secrand)            — why splitmix64-derived output was broken (≤64
+//                                bits entropy, invertible) and how the OS-CSPRNG
+//                                rewrite fixes it (on `secure_random_fill`).
+//   * VULN(secrand-collision)  — why the old `identity_hash_code`-keyed DRBG
+//                                side-table aliased colliding instances, and how
+//                                removing it (output is now stateless) fixes it.
 //
-// FIX: maintain a per-instance DRBG, keyed on the receiver's GC-stable
-// `identity_hash_code` (same side-table pattern as `SIG_DATA_STORE` below and
-// the canonical `securerandom::SEED_TABLE` / `lang_invoke::VH_META_TABLE`).
-// The state is lazily seeded from the OS CSPRNG the first time an instance is
-// observed, so an *unseeded* instance keeps full CSPRNG quality (we never
-// downgrade the default).  `setSeed`/the seeded constructor *mix* the user seed
-// into that state (supplement, not replace — matching the JDK), and `nextBytes`
-// derives output from the state and advances it.  The mixing stream is the same
-// splitmix64-based construction already used by `SecureRandom::next_bytes`'s
-// explicitly-seeded branch.
-//
-// NOTE on reproducibility: `java.security.SecureRandom(seed)` is documented to
-// *supplement* rather than replace the seed (unlike `java.util.Random`, which
-// IS bit-reproducible and is handled in `securerandom.rs`).  We therefore do
-// NOT promise that two SecureRandoms seeded with the same bytes emit identical
-// streams — they start from distinct OS-entropy bases.  What we DO guarantee is
-// that the seed is no longer ignored: it perturbs the stream and reseeding
-// changes subsequent output.
+// Reproducibility: `java.security.SecureRandom` does NOT promise that an
+// unseeded instance is reproducible, and `setSeed` only *supplements* (never
+// weakens) the source — so honouring a caller seed against an already-fully-
+// seeded OS CSPRNG is a no-op. (`java.util.Random`'s bit-reproducible `setSeed`
+// is a different class, handled in `securerandom.rs`.)
 
-/// Per-instance SecureRandom DRBG state: `(seed, counter)`.  Keyed on
-/// `NativeContext::identity_hash_code(this)`, which is preserved across GC
-/// compaction (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`),
-/// so an instance that survives a moving GC keeps its DRBG state.
-static SECURE_RANDOM_STATE: parking_lot::RwLock<
-    Option<std::collections::HashMap<i32, (u64, u64)>>,
-> = parking_lot::RwLock::new(None);
+// nb-crypto-impl VULN(secrand-collision) [FIXED]: there used to be a per-instance
+// DRBG state side-table here — `HashMap<i32, (seed, counter)>` keyed on
+// `NativeContext::identity_hash_code(this)`. Because `identity_hash_code` is a
+// 32-bit value that CAN collide across distinct live objects, two different
+// `SecureRandom` instances with a colliding identity hash SHARED (aliased) the
+// same DRBG `(seed, counter)` — so their streams were correlated, and one
+// instance's draws advanced the other's state. Combined with the (now removed)
+// invertible splitmix64 stream this widened the predictability break.
+//
+// FIX: the output path (`secure_random_fill`) now pulls every byte straight from
+// the OS CSPRNG and no longer consults any per-instance state, so the side-table
+// is gone entirely. No security-sensitive randomness keys on `identity_hash_code`
+// any more, which removes the collision/aliasing hazard at its root.
 
-/// Draw a fresh OS-entropy `u64` for lazy DRBG initialisation.  Falls back to
-/// the time/pid/thread mix only if the OS source is unavailable (mirrors
-/// `SecureRandom::new`), so we never seed an instance with a constant.
+/// Draw a fresh OS-entropy `u64`.  Falls back to the time/pid/thread mix only if
+/// the OS source is unavailable (mirrors `SecureRandom::new`), so we never use a
+/// constant.  Now consumed solely by `secure_random_fill`'s ChaCha20 fallback to
+/// derive a one-shot key/nonce when the OS CSPRNG is down.
 fn secure_random_entropy_seed() -> u64 {
     let mut seed_bytes = [0u8; 8];
     if os_random_bytes(&mut seed_bytes) {
@@ -1083,65 +1080,124 @@ fn secure_random_entropy_seed() -> u64 {
     }
 }
 
-/// Fetch (lazily initialising from OS entropy) the DRBG state for `key`,
-/// derive `buf.len()` output bytes from it, and advance the state.  This is the
-/// single output path used by both `nextBytes` and `generateSeed`.
-fn secure_random_fill(key: i32, buf: &mut [u8]) {
-    let mut guard = SECURE_RANDOM_STATE.write();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let (seed, counter) = map
-        .entry(key)
-        .or_insert_with(|| (secure_random_entropy_seed(), 0u64));
+/// Fill `buf` with cryptographically-strong random bytes.  This is the single
+/// output path used by both `nextBytes` and `generateSeed`.
+///
+/// nb-crypto-impl VULN(secrand): the PRIOR implementation derived every output
+/// byte as `splitmix64(seed ^ counter)` over a per-instance state seeded with a
+/// SINGLE 64-bit OS draw.  splitmix64 is an invertible bijection, so the whole
+/// stream carried at most 64 bits of entropy: an attacker who observed ~8
+/// consecutive output bytes could invert the mixer to recover `seed ^ counter`,
+/// then reproduce every past and future byte from that `SecureRandom`.  That is
+/// a catastrophic break of `java.security.SecureRandom`'s contract.
+///
+/// FIX: draw EVERY output byte directly from the OS CSPRNG
+/// (`os_random_bytes` → `RtlGenRandom` / `/dev/urandom`).  `java.security.
+/// SecureRandom` does NOT promise reproducibility for an unseeded instance, so
+/// this is spec-compliant.  The `key` argument is retained for signature
+/// stability but is no longer consulted — output no longer depends on any
+/// per-instance, identity-hash-keyed DRBG state (see VULN(secrand-collision)),
+/// which also closes the identity-hash aliasing hazard.
+///
+/// On the rare event that the OS source is unavailable, fall back to a fresh
+/// ChaCha20 keystream re-keyed from `secure_random_entropy_seed` (which itself
+/// mixes nanosecond timing, PID and thread id when the OS source is down).  The
+/// fallback is far stronger than the broken splitmix64 stream — ChaCha20 is a
+/// CSPRNG, not an invertible 64-bit mixer — and the primary path is always the
+/// OS CSPRNG.
+fn secure_random_fill(_key: i32, buf: &mut [u8]) {
+    // Primary path: straight from the OS CSPRNG. Retry once on a transient
+    // failure before degrading to the software fallback.
+    if os_random_bytes(buf) {
+        return;
+    }
+    if os_random_bytes(buf) {
+        return;
+    }
+    // OS entropy unavailable — derive a one-shot ChaCha20 key/nonce from a fresh
+    // entropy mix and run the keystream. This block is re-keyed on every call
+    // (no persistent, predictable state survives between draws).
+    tracing::warn!("OS entropy unavailable for SecureRandom — using ChaCha20 fallback");
+    let mut key = [0u8; 32];
+    for chunk in key.chunks_mut(8) {
+        let n = chunk.len();
+        chunk.copy_from_slice(&secure_random_entropy_seed().to_le_bytes()[..n]);
+    }
+    let mut nonce = [0u8; 12];
+    for chunk in nonce.chunks_mut(4) {
+        let n = chunk.len();
+        let word = secure_random_entropy_seed() as u32;
+        chunk.copy_from_slice(&word.to_le_bytes()[..n]);
+    }
+    chacha20_keystream_fill(&key, &nonce, buf);
+}
+
+/// ChaCha20 keystream generator (RFC 8439).  Used ONLY as the software fallback
+/// inside `secure_random_fill` when the OS CSPRNG is unavailable; it writes its
+/// raw keystream into `buf` (i.e. XOR against an implicit zero plaintext).
+fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+    #[inline]
+    fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(16);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(12);
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(8);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(7);
+    }
+    let mut state0 = [0u32; 16];
+    // Constants "expand 32-byte k".
+    state0[0] = 0x6170_7865;
+    state0[1] = 0x3320_646e;
+    state0[2] = 0x7962_2d32;
+    state0[3] = 0x6b20_6574;
+    for i in 0..8 {
+        state0[4 + i] = u32::from_le_bytes([
+            key[4 * i],
+            key[4 * i + 1],
+            key[4 * i + 2],
+            key[4 * i + 3],
+        ]);
+    }
+    // state[12] is the block counter; state[13..16] are the 96-bit nonce.
+    for i in 0..3 {
+        state0[13 + i] = u32::from_le_bytes([
+            nonce[4 * i],
+            nonce[4 * i + 1],
+            nonce[4 * i + 2],
+            nonce[4 * i + 3],
+        ]);
+    }
+    let mut counter: u32 = 0;
     let mut pos = 0;
     while pos < buf.len() {
-        // Same per-block mixing as `SecureRandom::next_bytes`'s seeded branch:
-        // splitmix64 over `seed ^ counter`, advancing the counter each block.
-        let mut state = *seed ^ *counter;
-        let val = splitmix64(&mut state);
-        *counter = counter.wrapping_add(1);
-        let bytes = val.to_le_bytes();
-        let to_copy = (buf.len() - pos).min(8);
-        buf[pos..pos + to_copy].copy_from_slice(&bytes[..to_copy]);
-        pos += to_copy;
-    }
-}
-
-/// Mix a user-supplied seed into the instance DRBG state (supplement, not
-/// replace — JDK `SecureRandom.setSeed` semantics).  Lazily initialises from OS
-/// entropy first, so even a seeded instance retains a CSPRNG base.  Folds the
-/// seed bytes in via splitmix64 so each seed byte affects the whole state.
-fn secure_random_reseed(key: i32, seed_bytes: &[u8]) {
-    let mut guard = SECURE_RANDOM_STATE.write();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let entry = map
-        .entry(key)
-        .or_insert_with(|| (secure_random_entropy_seed(), 0u64));
-    // Fold the seed 8 bytes at a time; pad short tails with zeros (length is
-    // already implicitly mixed because distinct lengths fold a different number
-    // of times).  splitmix64 diffuses each chunk across all 64 bits.
-    for chunk in seed_bytes.chunks(8) {
-        let mut block = [0u8; 8];
-        block[..chunk.len()].copy_from_slice(chunk);
-        let mut mixed = entry.0 ^ u64::from_le_bytes(block);
-        entry.0 = splitmix64(&mut mixed);
-    }
-    // Perturb the counter too so reseeding visibly changes the next draw even
-    // if the seed happens to collide with prior state.
-    entry.1 = entry.1.wrapping_add(0x9e3779b97f4a7c15);
-}
-
-/// Read a Java `byte[]` (whose elements arrive as signed `Value::Int`) into a
-/// `Vec<u8>` for use as seed material.
-fn read_seed_bytes(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
-    let len = ctx.array_length(arr);
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        match ctx.get_array_element(arr, i) {
-            Value::Int(b) => out.push(b as u8),
-            _ => out.push(0),
+        let mut working = state0;
+        working[12] = counter;
+        let mut x = working;
+        for _ in 0..10 {
+            // Column rounds.
+            quarter_round(&mut x, 0, 4, 8, 12);
+            quarter_round(&mut x, 1, 5, 9, 13);
+            quarter_round(&mut x, 2, 6, 10, 14);
+            quarter_round(&mut x, 3, 7, 11, 15);
+            // Diagonal rounds.
+            quarter_round(&mut x, 0, 5, 10, 15);
+            quarter_round(&mut x, 1, 6, 11, 12);
+            quarter_round(&mut x, 2, 7, 8, 13);
+            quarter_round(&mut x, 3, 4, 9, 14);
         }
+        let mut block = [0u8; 64];
+        for i in 0..16 {
+            let word = x[i].wrapping_add(working[i]);
+            block[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let to_copy = (buf.len() - pos).min(64);
+        buf[pos..pos + to_copy].copy_from_slice(&block[..to_copy]);
+        pos += to_copy;
+        counter = counter.wrapping_add(1);
     }
-    out
 }
 
 fn native_secure_random_next_bytes(
@@ -1150,7 +1206,7 @@ fn native_secure_random_next_bytes(
 ) -> MethodCallResult {
     // java/security/SecureRandom.nextBytes([B)V
     // args: [this, byte[]]
-    let this = match args.first() {
+    let _this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -1159,12 +1215,12 @@ fn native_secure_random_next_bytes(
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
-    // Derive from this instance's per-instance DRBG (seeded from OS entropy on
-    // first use, supplemented by any setSeed/seeded-ctor) instead of a fresh OS
-    // draw that would ignore the instance seed.
-    let key = ctx.identity_hash_code(this);
+    // Output comes straight from the OS CSPRNG. We deliberately do NOT key on the
+    // receiver's `identity_hash_code` any more (that 32-bit value can collide,
+    // aliasing two instances' DRBG state — VULN(secrand-collision)); the OS
+    // CSPRNG is per-draw fresh and needs no per-instance state.
     let mut buf = vec![0u8; len];
-    secure_random_fill(key, &mut buf);
+    secure_random_fill(0, &mut buf);
     for (i, &b) in buf.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -1177,7 +1233,7 @@ fn native_secure_random_generate_seed(
 ) -> MethodCallResult {
     // java/security/SecureRandom.generateSeed(I)[B
     // args: [this, numBytes]
-    let this = match args.first() {
+    let _this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -1186,80 +1242,82 @@ fn native_secure_random_generate_seed(
         _ => return Ok(Some(Value::Object(None))),
     };
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, num_bytes);
-    // generateSeed draws from the same per-instance DRBG so an explicitly
-    // seeded instance produces seed material derived from its seed, not a raw
-    // OS draw that would ignore it.
-    let key = ctx.identity_hash_code(this);
+    // generateSeed draws directly from the OS CSPRNG (the canonical source of
+    // fresh seed material). Not keyed on the receiver's identity hash — see
+    // VULN(secrand-collision).
     let mut buf = vec![0u8; num_bytes];
-    secure_random_fill(key, &mut buf);
+    secure_random_fill(0, &mut buf);
     for (i, &b) in buf.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// `java/security/SecureRandom.setSeed(J)V` — supplement the instance DRBG with
-/// the 8 bytes of the long seed (JDK: setSeed supplements, never replaces).
+// nb-crypto-impl VULN(secrand-collision) [FIXED]: the setSeed / seeded-ctor
+// natives below NO LONGER mutate any per-instance, identity-hash-keyed DRBG
+// state (that state was the collision/aliasing hazard and has been removed).
+// Output is now drawn straight from the OS CSPRNG, which is already maximally
+// and freshly seeded, so a user-supplied seed can only *supplement* it — and
+// supplementing a CSPRNG that already has full entropy is a no-op. This matches
+// the `java.security.SecureRandom` contract precisely: `setSeed` "supplements"
+// the existing seed and is explicitly permitted not to weaken the source; we
+// never downgrade the OS-CSPRNG stream to honour a caller seed. (`java.util.
+// Random`'s bit-reproducible `setSeed` is a different class, handled in
+// `securerandom.rs`.) We still validate the argument shape so a malformed call
+// is a clean no-op rather than a panic.
+
+/// `java/security/SecureRandom.setSeed(J)V`.
 fn native_secure_random_set_seed_long(
-    ctx: &mut dyn NativeContext,
+    _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
+    match args.first() {
+        Some(Value::Object(Some(_))) => {}
         _ => return Ok(None),
     };
-    let seed = match args.get(1) {
-        Some(Value::Long(s)) => *s,
+    match args.get(1) {
+        Some(Value::Long(_)) => {}
         _ => return Ok(None),
     };
-    let key = ctx.identity_hash_code(this);
-    secure_random_reseed(key, &seed.to_le_bytes());
+    // Supplement-only against an OS CSPRNG → no state change (see note above).
     Ok(None)
 }
 
-/// `java/security/SecureRandom.setSeed([B)V` — supplement the instance DRBG
-/// with the supplied seed bytes (JDK: supplements, never replaces).
+/// `java/security/SecureRandom.setSeed([B)V`.
 fn native_secure_random_set_seed_bytes(
-    ctx: &mut dyn NativeContext,
+    _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
+    match args.first() {
+        Some(Value::Object(Some(_))) => {}
         _ => return Ok(None),
     };
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        // setSeed(null) is an NPE in the JDK; mirror "no-op" defensively rather
-        // than panicking — the interpreter raises the NPE before reaching here
-        // for a real null deref. Nothing to mix.
+    match args.get(1) {
+        Some(Value::Object(Some(_))) => {}
+        // setSeed(null) is an NPE in the JDK; the interpreter raises the NPE
+        // before reaching here for a real null deref. Nothing to do.
         _ => return Ok(None),
     };
-    let seed = read_seed_bytes(ctx, arr);
-    let key = ctx.identity_hash_code(this);
-    secure_random_reseed(key, &seed);
+    // Supplement-only against an OS CSPRNG → no state change (see note above).
     Ok(None)
 }
 
-/// `java/security/SecureRandom.<init>([B)V` — the seeded constructor.  Per the
-/// JDK this is equivalent to the no-arg ctor followed by `setSeed(seed)`: the
-/// stream still has an OS-entropy base, with the user seed mixed in on top.
+/// `java/security/SecureRandom.<init>([B)V` — the seeded constructor. Per the
+/// JDK this equals the no-arg ctor followed by `setSeed(seed)`; the stream keeps
+/// its OS-entropy base and the user seed only supplements it.
 fn native_secure_random_init_seed_bytes(
-    ctx: &mut dyn NativeContext,
+    _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
+    match args.first() {
+        Some(Value::Object(Some(_))) => {}
         _ => return Ok(None),
     };
-    let arr = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
+    match args.get(1) {
+        Some(Value::Object(Some(_))) => {}
         _ => return Ok(None),
     };
-    let seed = read_seed_bytes(ctx, arr);
-    let key = ctx.identity_hash_code(this);
-    // `secure_random_reseed` lazily installs the OS-entropy base before folding
-    // in the user seed, so the seeded ctor never weakens the default stream.
-    secure_random_reseed(key, &seed);
+    // Supplement-only against an OS CSPRNG → no state change (see note above).
     Ok(None)
 }
 
@@ -1282,18 +1340,20 @@ fn native_secure_random_init_seed_bytes(
 pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // SecureRandom — these wrap a per-instance DRBG (lazily seeded from the OS
-    // CSPRNG: BCryptGenRandom / getrandom) rather than a stub PRNG.
+    // SecureRandom — `nextBytes` / `generateSeed` draw every byte directly from
+    // the OS CSPRNG (BCryptGenRandom / getrandom; ChaCha20 software fallback if
+    // the OS source is down). There is no per-instance DRBG state any more:
+    // output is independent of the receiver's identity hash, so the prior
+    // splitmix64-predictability and identity-hash-collision aliasing hazards are
+    // both closed (see VULN(secrand) / VULN(secrand-collision) in this file).
     //
     // IMPORTANT (registration order): `register_crypto_impl_natives` runs AFTER
     // `securerandom::register_random_and_securerandom_natives` (lib.rs phase
     // ordering: register_security_natives ~line 9773 vs register_crypto_impl
-    // ~line 10010), so these last-write registrations WIN.  We therefore must
-    // register the seed-honouring setSeed/seeded-ctor natives HERE too —
-    // `securerandom.rs` registers those as deliberate no-ops, which previously
-    // (together with this file's seed-ignoring nextBytes) let the instance seed
-    // be silently dropped.  Keeping the full SecureRandom output+seed surface in
-    // one place ensures setSeed actually supplements the stream end-to-end.
+    // ~line 10010), so these last-write registrations WIN. The setSeed / seeded-
+    // ctor natives are registered HERE so the OS-CSPRNG output surface is owned
+    // in one place; they are supplement-only no-ops (a caller seed cannot weaken
+    // an already-fully-seeded OS CSPRNG — JDK setSeed semantics, never replaces).
     r.register(
         "java/security/SecureRandom",
         "nextBytes",
@@ -1831,6 +1891,103 @@ impl BigUint {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RSA private-operation blinding (timing side-channel mitigation).
+//
+// nb-crypto-impl VULN(2): `BigUint::modpow` is a *variable-time* square-and-
+// multiply whose per-bit branch pattern and limb-routine timing depend on both
+// the exponent and the operand magnitudes. When the operand is an
+// attacker-influenced message/ciphertext and the exponent is the secret RSA
+// `d`, the running time directly leaks information that, across many adaptive
+// queries, recovers `d` (the classic RSA timing attack, Kocher '96 / Brumley-
+// Boneh '03). We cannot make `modpow` itself constant-time without routing to
+// an audited crate (out of scope here), but we CAN remove the *message-
+// dependent* channel by RSA base blinding: the secret-exponent modpow then runs
+// on a uniformly random, message-independent operand, so its timing reveals
+// nothing about the actual message/ciphertext.
+// ---------------------------------------------------------------------------
+
+/// Draw a random `BigUint` in `[2, n)` that is coprime to `n`, using the OS
+/// CSPRNG directly (`os_random_bytes`). Returns `None` only if the OS source is
+/// unavailable for every retry (callers then proceed unblinded rather than
+/// fail). Trivial moduli (`n < 3`) also yield `None` — there is no usable
+/// blinding factor and such a modulus is never a real RSA key.
+fn rsa_random_coprime(n: &BigUint) -> Option<BigUint> {
+    if n.cmp(&BigUint::from_u64(3)) == std::cmp::Ordering::Less {
+        return None;
+    }
+    let byte_len = (n.bit_length() + 7) / 8;
+    if byte_len == 0 {
+        return None;
+    }
+    let two = BigUint::from_u64(2);
+    // Bounded retries: rejection (out-of-range / non-coprime) is rare for an RSA
+    // modulus, and an unbounded loop on a pathological OS-entropy failure would
+    // hang the signing path.
+    for _ in 0..64 {
+        let mut bytes = vec![0u8; byte_len];
+        if !os_random_bytes(&mut bytes) {
+            return None;
+        }
+        let mut r = BigUint::from_bytes_be(&bytes).modulo(n);
+        if r.cmp(&two) == std::cmp::Ordering::Less {
+            r = two.clone();
+        }
+        // Coprimality is required so `r` is invertible mod `n`.
+        let (g, _, _, _, _) = BigUint::extended_gcd(&r, n);
+        if g.is_one() {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Compute `base^d mod n` with RSA base blinding, given the public exponent `e`.
+///
+/// Blinding identity (gcd(r, n) == 1): `(base * r^e)^d == base^d * r^{e*d} ==
+/// base^d * r (mod n)`, so `base^d == (base * r^e)^d * r^{-1} (mod n)`. The
+/// single secret-exponent modpow runs on the random, message-independent
+/// operand `base * r^e`. Falls back to a plain `modpow` only if a blinding
+/// factor cannot be drawn (OS entropy down) — never silently producing a wrong
+/// result.
+fn rsa_private_modpow_blinded(base: &BigUint, d: &BigUint, e: &BigUint, n: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(n) {
+        if let Some(r_inv) = r.modinv(n) {
+            let re = r.modpow(e, n);
+            let blinded = base.mul(&re).modulo(n);
+            let s_blinded = blinded.modpow(d, n);
+            return s_blinded.mul(&r_inv).modulo(n);
+        }
+    }
+    base.modpow(d, n)
+}
+
+/// Compute `base^d mod n` with blinding when the public exponent `e` is NOT
+/// available (the `Cipher` decrypt path only carries `(n, d)`).
+///
+/// Without `e` we cannot use the `r^e` identity, so we use two independent
+/// secret-exponent modpows on uniformly random, message-independent operands:
+///   * `m_blinded = (base * r)^d mod n  = base^d * r^d`
+///   * `rd        = r^d mod n`
+///   * `base^d    = m_blinded * (r^d)^{-1} mod n`
+/// Both modpows operate on data independent of `base`, so the *message-
+/// dependent* timing channel that a decryption-timing attacker exploits is
+/// removed. Residual: the fixed exponent `d` still drives a variable-time
+/// modpow, so a fixed (message-independent) timing profile of `d` remains —
+/// eliminating that requires a constant-time core (out of scope; see VULN(2)).
+/// Falls back to a single plain `modpow` if blinding material is unavailable.
+fn rsa_private_modpow_blinded_no_e(base: &BigUint, d: &BigUint, n: &BigUint) -> BigUint {
+    if let Some(r) = rsa_random_coprime(n) {
+        let rd = r.modpow(d, n);
+        if let Some(rd_inv) = rd.modinv(n) {
+            let blinded = base.mul(&r).modulo(n);
+            let m_blinded = blinded.modpow(d, n);
+            return m_blinded.mul(&rd_inv).modulo(n);
+        }
+    }
+    base.modpow(d, n)
+}
+
 impl PartialEq for BigUint {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
@@ -2003,7 +2160,11 @@ impl Rsa {
             return Vec::new();
         };
         let m = BigUint::from_bytes_be(&em);
-        let s = m.modpow(&key.d, &key.n);
+        // Base-blinded private exponentiation: removes the message-dependent
+        // timing channel of the variable-time `modpow` (VULN(2)). The public
+        // exponent `e` is available on `RsaPrivateKey`, so use the efficient
+        // single-secret-modpow `r^e` blinding.
+        let s = rsa_private_modpow_blinded(&m, &key.d, &key.e, &key.n);
         s.to_bytes_be_padded(k)
     }
 
@@ -2480,7 +2641,11 @@ pub fn rsa_cipher_decrypt(
         ));
     }
     let c = BigUint::from_bytes_be(ct);
-    let m = c.modpow(&d_big, &n_big);
+    // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
+    // carries `(n, d)` — the public exponent `e` is not threaded here — so use
+    // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
+    // ciphertext) timing channel that an RSA decryption-timing attacker probes.
+    let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
     let em = m.to_bytes_be_padded(k);
     match pad {
         RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_unpad(&em),
@@ -3097,6 +3262,25 @@ impl Ecdsa {
                 continue;
             }
 
+            // nb-crypto-impl VULN(2) — ECDSA variable-time residual (UNFIXED):
+            // unlike the RSA private path above (which is now base-blinded), this
+            // EC scalar path is NOT blinded. The secret-dependent operations that
+            // remain variable-time are, precisely:
+            //   1. `EcPoint::scalar_mul(&g, &k)` — the double-and-add ladder
+            //      branches on each bit of the per-signature nonce `k`, so its
+            //      timing/power profile leaks `k`'s bit pattern. Recovering even a
+            //      few bits of `k` across several signatures breaks the key
+            //      (lattice/HNP attack), because `d = (s*k - z) / r mod n`.
+            //   2. `k_big.modinv(&n_big)` — the extended-GCD inversion of the
+            //      secret nonce runs in input-dependent time (its quotient
+            //      sequence depends on `k`), a second `k`-dependent channel.
+            //   3. `r_big.mul(&d_big)` — the limb multiply by the long-term secret
+            //      `d` is not constant-time, leaking `d` directly.
+            // Implementing scalar blinding (k' = k + e*n, and projective/Montgomery
+            // ladder scalar_mul) here is a larger rewrite of the EC core than the
+            // RSA `r^e` blinding; per scope it is documented rather than fixed.
+            // For an adversary-exposed EC signer prefer the audited `p256`/`ecdsa`
+            // crates (RFC 6979 nonce + constant-time scalar mul).
             let r_point = EcPoint::scalar_mul(&g, &k);
             if r_point.infinity {
                 continue;
@@ -5205,41 +5389,40 @@ mod tests {
         assert_ne!(v2, v3);
     }
 
-    // MED(secrand) regression: the per-instance SecureRandom DRBG must honour
-    // setSeed (supplement) and advance per draw, instead of ignoring the seed
-    // and returning a fresh OS draw each time.  These exercise the pure side-
-    // table helpers directly (no NativeContext needed).
+    // VULN(secrand) / VULN(secrand-collision) regression: SecureRandom output now
+    // comes straight from the OS CSPRNG and is INDEPENDENT of the `key` argument
+    // (the old identity-hash-keyed DRBG side-table — and its collision/aliasing
+    // hazard — is gone). Each draw must be fresh regardless of the key.
 
     #[test]
-    fn secure_random_instance_advances_and_differs_per_key() {
-        // Two distinct instance keys produce (overwhelmingly) different output;
-        // successive draws on the same key advance the DRBG (differ).
+    fn secure_random_fill_is_fresh_every_draw() {
+        // Successive draws (same key) must differ — no cached/replayed state.
         let mut a1 = [0u8; 32];
         let mut a2 = [0u8; 32];
         secure_random_fill(0x1111_1111, &mut a1);
         secure_random_fill(0x1111_1111, &mut a2);
-        assert_ne!(a1, a2, "successive draws on one instance must advance");
+        assert_ne!(a1, a2, "successive draws must be fresh, not cached");
+        // Different key value — also fresh, never aliased to the first key.
         let mut b1 = [0u8; 32];
         secure_random_fill(0x2222_2222, &mut b1);
-        // Different instance, fresh OS-entropy base — must not equal a1.
-        assert_ne!(a1, b1, "distinct instances must not share a stream");
-        // Output must not be all-zero (no degenerate seed/output).
+        assert_ne!(a1, b1, "draws must not be correlated across keys");
+        // Output must not be all-zero (no degenerate output).
         assert!(a1.iter().any(|&b| b != 0));
     }
 
     #[test]
-    fn secure_random_reseed_changes_stream() {
-        // Reseeding the SAME instance must perturb subsequent output (the seed
-        // is honoured / supplemented, not ignored).
+    fn secure_random_fill_ignores_key_collisions() {
+        // The collision hazard is removed: two draws with the SAME key value
+        // (the worst case an identity-hash collision could produce) are still
+        // independent fresh OS draws, not a shared/aliased deterministic stream.
         let key = 0x3333_3333;
-        let mut before = [0u8; 32];
-        secure_random_fill(key, &mut before);
-        secure_random_reseed(key, b"a deterministic supplemental seed value");
-        let mut after = [0u8; 32];
-        secure_random_fill(key, &mut after);
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        secure_random_fill(key, &mut first);
+        secure_random_fill(key, &mut second);
         assert_ne!(
-            before, after,
-            "setSeed must supplement the stream, not be a no-op"
+            first, second,
+            "same-key draws must remain independent (no aliased DRBG state)"
         );
     }
 
@@ -5345,6 +5528,37 @@ mod tests {
         let mut s1 = 42u64;
         let mut s2 = 42u64;
         assert_eq!(splitmix64(&mut s1), splitmix64(&mut s2));
+    }
+
+    // -----------------------------------------------------------------------
+    // ChaCha20 keystream (SecureRandom OS-entropy fallback) — RFC 7539 vector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chacha20_keystream_rfc7539_zero_key() {
+        // RFC 7539 §2.3.2 derived: ChaCha20 keystream for an all-zero 256-bit
+        // key, all-zero 96-bit nonce, starting block counter 0. This is the
+        // canonical "ChaCha20 of zeros" reference output.
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let mut out = [0u8; 64];
+        chacha20_keystream_fill(&key, &nonce, &mut out);
+        assert_eq!(
+            hex(&out),
+            "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7\
+             da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586"
+        );
+    }
+
+    #[test]
+    fn chacha20_keystream_spans_multiple_blocks() {
+        // A request larger than one 64-byte block must keep advancing the
+        // counter: the second block differs from the first (no repetition).
+        let key = [7u8; 32];
+        let nonce = [3u8; 12];
+        let mut out = [0u8; 128];
+        chacha20_keystream_fill(&key, &nonce, &mut out);
+        assert_ne!(&out[..64], &out[64..], "blocks must not repeat");
     }
 
     // -----------------------------------------------------------------------
@@ -5862,10 +6076,56 @@ mod tests {
         assert!(!Rsa::verify_sha256(&pk, &bad, &sig), "tampered payload");
     }
 
+    #[test]
+    fn rsa_blinding_matches_plain_modpow() {
+        // Base blinding MUST be functionally transparent: the blinded private
+        // exponentiation has to produce exactly the same result as the plain
+        // `modpow` for every operand. Use the textbook RSA instance
+        // (n=3233, e=17, d=2753) so the math is checkable by hand, plus a sweep
+        // of operands to catch any reduction/inverse mistake.
+        let n = BigUint::from_u64(3233);
+        let e = BigUint::from_u64(17);
+        let d = BigUint::from_u64(2753);
+        for base_v in [2u64, 7, 42, 65, 1000, 3232] {
+            let base = BigUint::from_u64(base_v);
+            let expected = base.modpow(&d, &n);
+            // With public exponent (RSA sign path).
+            let with_e = rsa_private_modpow_blinded(&base, &d, &e, &n);
+            assert!(
+                with_e == expected,
+                "blinded(with e) mismatch for base {}",
+                base_v
+            );
+            // Without public exponent (RSA Cipher decrypt path).
+            let no_e = rsa_private_modpow_blinded_no_e(&base, &d, &n);
+            assert!(
+                no_e == expected,
+                "blinded(no e) mismatch for base {}",
+                base_v
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_random_coprime_is_in_range_and_coprime() {
+        // The blinding factor must be coprime to n (so it is invertible) and a
+        // non-trivial value in [2, n).
+        let n = BigUint::from_u64(3233); // 53 * 61
+        let r = rsa_random_coprime(&n).expect("OS entropy available in test");
+        assert!(
+            r.cmp(&BigUint::from_u64(2)) != std::cmp::Ordering::Less,
+            "r >= 2"
+        );
+        assert!(r.cmp(&n) == std::cmp::Ordering::Less, "r < n");
+        let (g, _, _, _, _) = BigUint::extended_gcd(&r, &n);
+        assert!(g.is_one(), "gcd(r, n) == 1");
+    }
+
     // RSA `Cipher` round-trip: encrypt with the public key, decrypt with the
     // private key, for every supported padding. Exercises the EME-PKCS1-v1_5
     // and EME-OAEP (SHA-1 / SHA-256) encode/decode paths used by the keycloak
-    // JWE RSA1_5 / RSA-OAEP / RSA-OAEP-256 transformations.
+    // JWE RSA1_5 / RSA-OAEP / RSA-OAEP-256 transformations. Also covers the
+    // base-blinded decrypt path (blinding must not change the plaintext).
     #[test]
     fn rsa_cipher_roundtrip_all_paddings() {
         let (pk, sk) = Rsa::generate_keypair(2048);
