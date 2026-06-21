@@ -581,11 +581,95 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
     false
 }
 
+/// Finalize a class initialization: set its final state, clear the
+/// `initializing_thread` claim, keep the `AtomicU8` fast-path cache in sync, then
+/// remove the waiter entry and notify every thread blocked on this class.
+///
+/// This is the single cleanup primitive used by [`initialize_class_shared`].
+/// Both the success/explicit-error terminal paths and the RAII
+/// [`InitCleanupGuard`] (which covers the early `?`/error returns) funnel through
+/// here, so a `<clinit>` that fails part-way no longer leaks the init claim and
+/// waiter — other threads are notified of the `InitializationError` immediately
+/// instead of blocking for the full wait timeout.
+///
+/// Round 5 audit fix (HIGH): only `Initialized` flips the fast-path cache to the
+/// fast-return state — `InitializationError` stays UNINITIALIZED so the fast path
+/// always falls through to the slow path which converts it to
+/// `NoClassDefFoundError`.
+fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {
+    {
+        let mut cm = shared.class_manager.write();
+        if let Some(class) = cm.get_class_mut(class_id) {
+            class.state = new_state;
+            class.initializing_thread = None;
+        }
+        if matches!(new_state, ClassState::Initialized) {
+            cm.set_class_init_state(class_id, cratonvm_classloading::CLASS_INIT_INITIALIZED);
+        }
+    }
+    // Remove waiter and notify all blocked threads.
+    let removed = shared.class_init_waiters.lock().remove(&class_id);
+    if let Some(pair) = removed {
+        let (lock, cvar) = &*pair;
+        // Round-9 HIGH-4: parking_lot — no poison/unwrap.
+        let mut done = lock.lock();
+        *done = true;
+        cvar.notify_all();
+    }
+}
+
+/// RAII guard ensuring that a class claimed for initialization is always
+/// finalized, even on the early `?`/`return Err(..)` paths inside
+/// [`initialize_class_shared`] (superclass init, verification, preparation,
+/// superinterface init, `System` stdin setup). If the guarded body returns
+/// without reaching a terminal `finalize`, the guard runs
+/// `finalize_class_init(.., InitializationError)` on drop — clearing the
+/// `initializing_thread` claim, removing the waiter, and notifying all waiters of
+/// the error state.
+///
+/// The guarded body disarms the guard (`finalized.set(true)`) at every terminal
+/// `finalize` so the success path (and the explicit `InitializationError`
+/// terminal path) never double-finalizes.
+struct InitCleanupGuard<'a> {
+    shared: &'a SharedVm,
+    class_id: ClassId,
+    /// Shared with the body's `finalize_init` closure; set to `true` once a
+    /// terminal finalize has run so the guard's drop becomes a no-op.
+    finalized: &'a std::cell::Cell<bool>,
+}
+
+impl Drop for InitCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finalized.get() {
+            // The body returned early without finalizing (a propagated `Err`
+            // from superclass/interface init, verification, preparation, or the
+            // System-streams setup, or a panic unwinding through the body).
+            // Mark the class Erroneous and release every waiter promptly.
+            finalize_class_init(self.shared, self.class_id, ClassState::InitializationError);
+        }
+    }
+}
+
 fn initialize_class_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
     class_id: ClassId,
 ) -> Result<(), MethodCallFailed> {
+    // Cleanup safety net: the caller (`ensure_class_initialized_shared`) has
+    // already claimed this class (`initializing_thread` set) and registered a
+    // waiter. Every return path below MUST clear that claim and notify waiters,
+    // otherwise concurrent threads block until their wait timeout. The terminal
+    // success/error paths do so explicitly via the `finalize_init` closure; this
+    // guard covers the early `?`/`return Err(..)` paths (superclass init,
+    // verification, preparation, superinterface init, `System` stdin) and any
+    // panic unwinding through the body.
+    let finalized = std::cell::Cell::new(false);
+    let _init_guard = InitCleanupGuard {
+        shared,
+        class_id,
+        finalized: &finalized,
+    };
+
     // Step 1: Initialize the superclass first
     let superclass_id = shared
         .class_manager
@@ -645,9 +729,13 @@ fn initialize_class_shared(
                     });
                     if let Err(e) = bytecode {
                         drop(cm);
-                        if let Some(class) = shared.class_manager.write().get_class_mut(class_id) {
-                            class.state = ClassState::InitializationError;
-                        }
+                        // Cleanup (state -> InitializationError, clear the init
+                        // claim, remove the waiter, notify all waiters) is run by
+                        // `InitCleanupGuard::drop` since `finalized` is still
+                        // false on this early return. Funnelling through the guard
+                        // keeps a single cleanup point and, unlike the previous
+                        // bare `state = InitializationError` write, also releases
+                        // threads blocked on this class.
                         return Err(MethodCallFailed::InternalError(VmError::Linkage(e)));
                     }
                 }
@@ -815,33 +903,15 @@ fn initialize_class_shared(
         crate::native::builtins::aot::aot_record_class_loaded(&class_name_for_jfr);
     }
 
-    // Helper: finalize initialization вЂ” set final state, clear tracking,
-    // remove waiter entry, and notify all waiting threads.
+    // Helper: finalize initialization — set final state, clear tracking,
+    // remove waiter entry, and notify all waiting threads. Delegates to the
+    // shared `finalize_class_init` primitive and disarms `InitCleanupGuard` so
+    // the guard's drop does not re-finalize (double-finalize would mark an
+    // already-`Initialized` class `InitializationError`). Borrows `&finalized`
+    // by shared ref — same `Cell` the guard borrows — so both coexist.
     let finalize_init = |shared: &SharedVm, class_id: ClassId, new_state: ClassState| {
-        {
-            let mut cm = shared.class_manager.write();
-            if let Some(class) = cm.get_class_mut(class_id) {
-                class.state = new_state;
-                class.initializing_thread = None;
-            }
-            // Round 5 audit fix (HIGH): keep the AtomicU8 fast-path
-            // cache in sync. Only `Initialized` flips the cache to the
-            // fast-return state — `InitializationError` stays
-            // UNINITIALIZED so the fast path always falls through to
-            // the slow path which converts it to `NoClassDefFoundError`.
-            if matches!(new_state, ClassState::Initialized) {
-                cm.set_class_init_state(class_id, cratonvm_classloading::CLASS_INIT_INITIALIZED);
-            }
-        }
-        // Remove waiter and notify all blocked threads
-        let removed = shared.class_init_waiters.lock().remove(&class_id);
-        if let Some(pair) = removed {
-            let (lock, cvar) = &*pair;
-            // Round-9 HIGH-4: parking_lot — no poison/unwrap.
-            let mut done = lock.lock();
-            *done = true;
-            cvar.notify_all();
-        }
+        finalize_class_init(shared, class_id, new_state);
+        finalized.set(true);
     };
 
     if crate::runtime::env_cache::modstatic_dbg()
@@ -3101,6 +3171,67 @@ mod tests {
                 panic!("expected MethodCallFailed::InternalError(VmError::Linkage), got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn clinit_failure_clears_claim_and_removes_waiter() {
+        // Regression: an early-return failure inside `initialize_class_shared`
+        // (here the bytecode/structural verification failure path) must fully
+        // finalize the class via the `InitCleanupGuard` — NOT leak the init
+        // claim + waiter. Before the guard, the verify-error path set
+        // `state = InitializationError` directly but left `initializing_thread`
+        // set and the `class_init_waiters` entry in place, so other threads
+        // blocked on the class were never notified and waited out the full
+        // timeout.
+        use crate::classloading::ClassLoaderId;
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let class_id = {
+            let mut cm = shared.class_manager.write();
+            let id = cm.class_store.next_id();
+            // FINAL+ABSTRACT user-classpath class -> verification runs and fails.
+            let mut c = make_malformed_class("com/example/Boom", ClassLoaderId::Application);
+            c.id = id;
+            cm.class_store.add(c);
+            id
+        };
+
+        let result = ensure_class_initialized_shared(&shared, &mut thread, class_id);
+        assert!(
+            result.is_err(),
+            "malformed user class must fail initialization; got {result:?}"
+        );
+
+        // (1) State is Erroneous, and (2) the init claim is cleared.
+        {
+            let cm = shared.class_manager.read();
+            let class = cm.get_class(class_id).expect("class still registered");
+            assert_eq!(
+                class.state,
+                ClassState::InitializationError,
+                "failed init must leave the class in InitializationError"
+            );
+            assert_eq!(
+                class.initializing_thread, None,
+                "failed init must clear the initializing_thread claim (leak guard)"
+            );
+        }
+
+        // (3) The waiter entry is removed so blocked threads are notified
+        // immediately rather than waiting out the timeout. This is the core of
+        // the leak the guard fixes.
+        assert!(
+            !shared.class_init_waiters.lock().contains_key(&class_id),
+            "failed init must remove the class_init_waiters entry (waiter leak)"
+        );
+
+        // (4) A subsequent init attempt observes the Erroneous state and fails
+        // fast (NoClassDefFoundError) instead of re-claiming or blocking.
+        let again = ensure_class_initialized_shared(&shared, &mut thread, class_id);
+        assert!(
+            again.is_err(),
+            "re-init of an Erroneous class must fail fast; got {again:?}"
+        );
     }
 
     #[test]
