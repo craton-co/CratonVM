@@ -1,6 +1,18 @@
 # Activate the IR Optimizer (GVN / const-fold / DSE / LICM + scalar replacement)
 
-Status: design / partially-built-mostly-dormant. L. The Sea-of-Nodes IR and its
+Status: **largely landed (increments 1–29).** The Sea-of-Nodes IR + passes are
+live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Call`
+emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
+built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
+inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
+arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
+inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
+on in **inc 29** (each with a `=0` opt-out). See the per-increment sections below
+and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for
+what is left (long/double call returns, `ldiv`/`lrem`, and the `double`/`float`
+XMM tier). Original plan text follows.
+
+The Sea-of-Nodes IR and its
 optimization passes exist and are unit-tested, but the live JIT path only
 exercises them on a **narrow gated subset** of methods. This plan turns the
 passes on broadly behind safety gates, and opens the escape-analysis →
@@ -1831,6 +1843,56 @@ review behind it; `=0` remains the opt-out if a suite ever regresses.
 (`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
 `double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
 (the concurrent inc-26 track) has its own flag/soak.
+
+## Remaining roadmap (post-inc-29)
+
+The single consolidated to-do for whoever picks this up next. Increments 1–29
+are landed and (where flagged) default-ON. What remains, in dependency order:
+
+1. **`i64::MIN`-return / deopt-sentinel fix** *(unblocks long/double call returns;
+   own task)*. The JIT returns `i64::MIN` in RAX as the universal deopt/exception
+   sentinel (`x64.rs` epilogue + the `Op::Call` bail check; interpreter.rs post-JIT
+   dispatch does `CMP RAX, i64::MIN; JE`). A method that legitimately returns
+   `Long.MIN_VALUE` is misread as deoptimized → silently re-executed (side effects
+   can double). **Pre-existing in BOTH backends** (single-pass already compiles
+   long-returning methods), found by the inc-26 adversarial review. Fix: signal
+   deopt/exception **out-of-band** (a TLS flag the helper sets, checked *before*
+   inspecting RAX, like the pending-NPE/AIOOBE flags) for `J`/`D` returns. Spun
+   off as a background task (see commit history / `spawn_task`). Once fixed,
+   relax `static_call_shape` to accept `J`/`D` *returns* and the
+   `lreturn`/`dreturn` paths are fully safe.
+
+2. **`ldiv`/`lrem`** *(blocked on long deopt-resume)*. The IR `Op::Div`/`Op::Rem`
+   div-by-zero guard **deopts** (`emit_div_zero_guard` → `emit_deopt_if_zero`),
+   unlike single-pass's direct-throw. A `long` live at that deopt needs frame
+   reconstruction, but (a) `frame_value_for` maps `Long` to
+   `FrameValue::Unsupported` (`ir_lower.rs`), and (b) the IR deopt entry isn't
+   wired into VM dispatch (no `ir_deopt_entry`/`take_last_deopt` caller — emit-and
+   -discard). So the inc-25 gate bails any long method with int `idiv`/`irem`
+   (`method_has_int_div`) and the builder never lowers `ldiv`/`lrem`. To unlock:
+   wire the IR deopt entry into VM dispatch **and** make long (and double) a
+   real `FrameValue` width on resume; then add the `ldiv`/`lrem` builder arms
+   (the lowerer's `Op::Div`/`Rem` are already 64-bit-aware) and drop the
+   `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
+   phis correctly for that resume.)
+
+3. **`double`/`float` value tier (XMM)** *(the next major sub-project; unblocked)*.
+   The whole second half of category-2. Needs an XMM register class in
+   `ir_lower.rs` (the IR lowerer is currently GPR-only), the FP opcodes
+   (`fadd`/`dadd`/…, `fcmpl`/`dcmpg`/…, `f2d`/`i2d`/`d2l`/…, `fconst`/`dconst`,
+   the `double` half of `ldc2_w`, `fload`/`dload`/`faload`/…), FP-slot deopt
+   resume, and `method_uses_double` flipped from a bail to a gate. This **also
+   unlocks `double` call args + returns** (extend `static_call_shape` to accept
+   `D`/`F` once XMM marshalling exists). Mirror the long track's increment
+   discipline (value ops → constants → load/store → compare/branches → call
+   args), each gated behind a new `CRATONVM_JIT_IR_FP` flag + differential/probe
+   soak.
+
+**Adjacent (separate tracks, not this doc's to finish):** virtual/interface
+dispatch via inline caches (`CRATONVM_JIT_IR_CALL` for `invokevirtual`/
+`invokeinterface`, the concurrent inc-26 work — bug-24-sensitive); the deopt/OSR
+machinery (`real-frame-deopt*.md`) whose completion is what items 1–2 above
+ultimately lean on.
 
 ## Implementation steps (ordered)
 
