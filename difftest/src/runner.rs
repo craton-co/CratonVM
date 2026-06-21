@@ -245,6 +245,34 @@ pub struct RunnerConfig {
     pub ledger: PathBuf,
     /// Whether to write discovered divergences back into the ledger.
     pub update_ledger: bool,
+    /// Determinism pre-flight: run each program **twice** on HotSpot and reject
+    /// it (don't judge it) when the two runs disagree under the normalizer — the
+    /// oracle's soundness guard (design §3.3). The single most important
+    /// correctness property of the gate.
+    pub determinism_check: bool,
+    /// Re-confirm a divergence by re-running the diverging CratonVM mode; a
+    /// divergence that doesn't reproduce was a transient (e.g. a concurrent
+    /// rebuild overwriting the binary mid-run) and is dropped.
+    pub reconfirm: bool,
+}
+
+impl RunnerConfig {
+    /// A default config for `corpus`: `jit-on,nojit`, 120 s timeout, default
+    /// ledger path, no determinism/reconfirm/ledger-write. Tests and callers
+    /// tweak from here so adding a field is a one-line change, not a churn.
+    pub fn for_corpus(corpus: PathBuf) -> Self {
+        Self {
+            corpus,
+            modes: vec![Mode::JitOn, Mode::NoJit],
+            timeout: DEFAULT_TIMEOUT,
+            jdk_home: None,
+            allow_jdk_downgrade: false,
+            ledger: crate::ledger::default_ledger_path(),
+            update_ledger: false,
+            determinism_check: false,
+            reconfirm: false,
+        }
+    }
 }
 
 /// Why a run could not be performed.

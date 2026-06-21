@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
+use cratonvm_difftest::generate::{self, TargetFamily};
 use cratonvm_difftest::harness;
 use cratonvm_difftest::ledger::{self, Ledger};
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
@@ -89,22 +90,40 @@ struct RunArgs {
     #[arg(long)]
     allow_jdk_downgrade: bool,
 
-    /// Divergence ledger path (default: `bench/differential-divergences.json`).
+    /// Divergence ledger path (default: the committed `difftest/ledger.json`).
     #[arg(long)]
     ledger: Option<PathBuf>,
 
     /// Write newly-confirmed divergences back into the ledger.
     #[arg(long)]
     update_ledger: bool,
+
+    /// Determinism pre-flight: run each program twice on HotSpot and skip any
+    /// whose two runs disagree (`gate` forces this on).
+    #[arg(long)]
+    check_determinism: bool,
+
+    /// Re-run a diverging mode to filter transient (non-reproducing)
+    /// divergences (`gate` forces this on).
+    #[arg(long)]
+    reconfirm: bool,
 }
 
 #[derive(Args)]
 struct GenArgs {
-    /// Number of programs to generate.
-    #[arg(long, default_value_t = 100)]
+    /// Number of programs to generate (per family).
+    #[arg(long, default_value_t = 20)]
     count: usize,
 
-    /// Where to write generated programs (default: `difftest/corpus`).
+    /// Target family: `arith` | `concat` | `exceptions` | `all`.
+    #[arg(long, default_value = "arith")]
+    family: String,
+
+    /// PRNG seed — the same seed reproduces the exact corpus.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Where to write generated `.java` programs (default: `difftest/corpus`).
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -143,6 +162,8 @@ impl RunArgs {
                 .clone()
                 .unwrap_or_else(ledger::default_ledger_path),
             update_ledger: self.update_ledger,
+            determinism_check: self.check_determinism,
+            reconfirm: self.reconfirm,
         }
     }
 }
@@ -235,12 +256,46 @@ fn cmd_run(args: &RunArgs) -> ExitCode {
 
 fn cmd_gen(args: &GenArgs) -> ExitCode {
     let out = args.out.clone().unwrap_or_else(default_corpus);
-    println!("difftest gen — planned, not yet wired (Step 4).");
-    println!("  count: {}", args.count);
-    println!("  out  : {}", out.display());
+
+    // Resolve the family selection (`all` ⇒ every family).
+    let families: Vec<TargetFamily> = if args.family == "all" {
+        TargetFamily::all().to_vec()
+    } else {
+        match TargetFamily::from_label(&args.family) {
+            Some(f) => vec![f],
+            None => {
+                eprintln!(
+                    "difftest gen: unknown --family {:?} (expected arith|concat|exceptions|all)",
+                    args.family
+                );
+                return ExitCode::from(exit::BOOTSTRAP);
+            }
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&out) {
+        eprintln!("difftest gen: cannot create {}: {e}", out.display());
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let mut written = 0usize;
+    for family in families {
+        for prog in generate::generate(family, args.count, args.seed) {
+            let path = out.join(format!("{}.java", prog.name));
+            match std::fs::write(&path, &prog.source) {
+                Ok(()) => written += 1,
+                Err(e) => eprintln!("difftest gen: cannot write {}: {e}", path.display()),
+            }
+        }
+    }
+
     println!(
-        "  -> Step 4 will emit type-directed self-printing Java weighted toward the bug history."
+        "difftest gen — wrote {written} program(s) (family={}, seed={}) to {}",
+        args.family,
+        args.seed,
+        out.display()
     );
+    println!("  next: difftest run --corpus {}", out.display());
     ExitCode::from(exit::OK)
 }
 
@@ -260,54 +315,66 @@ fn cmd_min(args: &MinArgs) -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_gate(args: &RunArgs) -> ExitCode {
-    let corpus = args.corpus.clone().unwrap_or_else(default_corpus);
-    let ledger_path = args
-        .ledger
-        .clone()
-        .unwrap_or_else(ledger::default_ledger_path);
+    let mut config = args.to_runner_config();
+    // The gate MUST be sound: the determinism pre-flight and divergence
+    // re-confirmation are forced on regardless of CLI flags.
+    config.determinism_check = true;
+    config.reconfirm = true;
 
-    let program_count = harness::discover_programs(&corpus).len();
-    if program_count == 0 {
+    // Prerequisites → bootstrap (non-fatal exit 3), so CI can adopt the step
+    // before a JDK / the cratonvm binary is provisioned.
+    if harness::discover_programs(&config.corpus).is_empty() {
         eprintln!(
             "difftest gate: corpus {} is empty — bootstrap, exit {} (non-fatal).",
-            corpus.display(),
+            config.corpus.display(),
             exit::BOOTSTRAP
         );
         return ExitCode::from(exit::BOOTSTRAP);
     }
-
-    if !runner::java_available(args.jdk.as_deref()) {
+    if runner::cratonvm_binary().is_none() || !runner::java_available(config.jdk_home.as_deref()) {
         eprintln!(
-            "difftest gate: `java` not found (set --jdk / DIFFTEST_JAVA_HOME / PATH) — \
-             bootstrap, exit {} (non-fatal).",
+            "difftest gate: cratonvm binary or java not found (build cratonvm / set CRATONVM_BIN, \
+             --jdk / DIFFTEST_JAVA_HOME / PATH) — bootstrap, exit {} (non-fatal).",
             exit::BOOTSTRAP
         );
         return ExitCode::from(exit::BOOTSTRAP);
     }
 
-    // Load the ledger purely to report known-divergence counts; the actual
-    // comparison that could return exit 1 / 2 lands in Step 3. A file that does
-    // not parse as the promoted `Ledger` schema is *not* fatal here: the
-    // default path still holds the legacy §2.1 `DivergenceReport` shape until
-    // Step 3 migrates it, so we treat any non-promoted/unreadable ledger as
-    // "0 known" and proceed rather than red-flagging the gate.
-    let known = match Ledger::load(&ledger_path) {
-        Ok(Some(l)) => l.entries.len(),
-        Ok(None) => 0,
+    // The committed known-divergence ledger. A missing file or a legacy-schema
+    // file is treated as an empty baseline (every divergence is then "new").
+    let ledger = match Ledger::load(&config.ledger) {
+        Ok(Some(l)) => l,
+        Ok(None) => Ledger::new(host_tag(), captured_at(), "unknown".into()),
         Err(e) => {
             eprintln!(
-                "difftest gate: note — {} is not yet in the promoted ledger schema \
-                 ({e}); treating as 0 known (migration lands in Step 3).",
-                ledger_path.display()
+                "difftest gate: note — {} is not in the promoted ledger schema ({e}); \
+                 treating as an empty baseline.",
+                config.ledger.display()
             );
-            0
+            Ledger::new(host_tag(), captured_at(), "unknown".into())
         }
     };
 
-    println!(
-        "difftest gate: {program_count} program(s) staged, ledger has {known} known \
-         divergence(s); comparison not wired yet (Step 3) — no new divergences. exit {}.",
-        exit::OK
-    );
-    ExitCode::from(exit::OK)
+    let summary = match harness::run_corpus(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "difftest gate: {e} — bootstrap, exit {} (non-fatal).",
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+
+    let report = harness::gate(&summary, &ledger);
+    print!("{}", harness::render_gate(&report));
+    let code = report.exit_code();
+    let verdict = match code {
+        exit::OK => "clean — no new or regressed divergence",
+        exit::NEW_DIVERGENCE => "FAIL — a new or drifted divergence appeared",
+        exit::FIXED_REGRESSED => "FAIL — a fixed divergence re-opened",
+        _ => "bootstrap",
+    };
+    println!("difftest gate: {verdict}. exit {code}.");
+    ExitCode::from(code)
 }

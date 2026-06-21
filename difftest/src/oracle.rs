@@ -195,6 +195,17 @@ pub fn compare(cratonvm: &Observation, hotspot: &Observation, normalizer: &Norma
     }
 }
 
+/// Whether two observations are equal on the **gated** observables — stdout
+/// (normalized), exit/timeout status, and uncaught-exception identity — i.e.
+/// the channels [`compare`] judges. Ignores `stderr` (non-gated warnings) and
+/// `wall_ms` (timing). Used by the gate to detect drift in a `known`
+/// divergence's CratonVM side.
+pub fn gated_eq(a: &Observation, b: &Observation, normalizer: &Normalizer) -> bool {
+    exit_token(a) == exit_token(b)
+        && normalizer.apply(&a.stdout) == normalizer.apply(&b.stdout)
+        && a.exception == b.exception
+}
+
 /// Render the exit channel: a timed-out run never matches a clean exit.
 fn exit_token(o: &Observation) -> String {
     if o.timed_out {

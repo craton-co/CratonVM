@@ -9,13 +9,16 @@
 //! comparison ([`crate::oracle`]). The same compiled `.class` runs on both VMs
 //! (design §3.1, the wrapper-free path).
 //!
-//! ## Status: Step 2
+//! ## Status: Step 3
 //!
 //! For each program HotSpot runs **once** (the deterministic reference) and
 //! CratonVM runs **once per configured [`Mode`]**; the per-mode agree/diverge
 //! map feeds [`oracle::classify`] to auto-label the divergence
 //! (`JitOnly`/`GcMode`/`Universal`/`Hang`/`Crash`) — automating the manual
-//! `--nojit` bisection.
+//! `--nojit` bisection. Step 3 adds the **determinism pre-flight** (run HotSpot
+//! twice, reject programs whose runs disagree), **divergence re-confirmation**
+//! (re-run a diverging mode to drop transients), and [`gate`] — the verdict
+//! that diffs a run against the committed [`Ledger`] for the §3.5 exit codes.
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +92,10 @@ pub struct RunSummary {
     /// `(program, reason)` for programs that could not be run (e.g. javac
     /// failure) — surfaced, never silently dropped.
     pub skipped: Vec<(String, String)>,
+    /// `(program, reason)` for programs rejected by the determinism pre-flight
+    /// (the two HotSpot runs disagreed). These are *not* judged — admitting a
+    /// nondeterministic program would make the gate flap (design §3.3).
+    pub nondeterministic: Vec<(String, String)>,
 }
 
 impl RunSummary {
@@ -111,9 +118,11 @@ impl RunSummary {
             if !r.diverged() {
                 continue;
             }
+            // Store timing-stripped observations so the committed ledger is
+            // stable across regenerations and drift checks use plain equality.
             let cratonvm = r
                 .representative()
-                .map(|m| m.cratonvm.clone())
+                .map(|m| m.cratonvm.canonical())
                 .unwrap_or_else(Observation::empty);
             ledger.entries.push(LedgerEntry {
                 id: format!("div-{i:04}"),
@@ -121,7 +130,7 @@ impl RunSummary {
                 repro_path: r.source.to_string_lossy().into_owned(),
                 classification: r.classification().unwrap_or(Classification::Universal),
                 cratonvm,
-                hotspot: r.hotspot.clone(),
+                hotspot: r.hotspot.canonical(),
                 status: LedgerStatus::New,
                 first_seen: captured_at.clone(),
                 linked_doc: None,
@@ -210,15 +219,41 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
 
         // HotSpot is the deterministic reference — run it once and reuse it
         // across every CratonVM mode.
-        let mut hotspot = runner::run_hotspot(&classpath, &main_class, jdk, config.timeout)?;
-        hotspot.exception = oracle::parse_exception(&hotspot.stderr);
+        let hotspot = hotspot_obs(&classpath, &main_class, jdk, config.timeout)?;
+
+        // Determinism pre-flight (design §3.3): a program admitted to the
+        // corpus MUST be deterministic, or the gate flaps. Run HotSpot a second
+        // time and reject the program if the two disagree under the normalizer.
+        if config.determinism_check {
+            let hotspot2 = hotspot_obs(&classpath, &main_class, jdk, config.timeout)?;
+            if !oracle::compare(&hotspot, &hotspot2, &normalizer).agrees() {
+                summary.nondeterministic.push((
+                    main_class,
+                    "two HotSpot runs disagree under the normalizer".to_string(),
+                ));
+                continue;
+            }
+        }
 
         let mut outcomes = Vec::with_capacity(modes.len());
         for &mode in &modes {
             let mut cratonvm =
-                runner::run_cratonvm(&bin, &classpath, &main_class, mode, config.timeout)?;
-            cratonvm.exception = oracle::parse_exception(&cratonvm.stderr);
-            let verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
+                cratonvm_obs(&bin, &classpath, &main_class, mode, jdk, config.timeout)?;
+            let mut verdict = oracle::compare(&cratonvm, &hotspot, &normalizer);
+
+            // Re-confirm a divergence: a transient (e.g. a concurrent rebuild
+            // overwriting the binary mid-run) won't reproduce. If the re-run
+            // agrees, the divergence was spurious — adopt the agreeing run.
+            if config.reconfirm && !verdict.agrees() {
+                let cratonvm2 =
+                    cratonvm_obs(&bin, &classpath, &main_class, mode, jdk, config.timeout)?;
+                let verdict2 = oracle::compare(&cratonvm2, &hotspot, &normalizer);
+                if verdict2.agrees() {
+                    cratonvm = cratonvm2;
+                    verdict = verdict2;
+                }
+            }
+
             outcomes.push(ModeOutcome {
                 mode,
                 cratonvm,
@@ -236,6 +271,33 @@ pub fn run_corpus(config: &RunnerConfig) -> Result<RunSummary, RunError> {
 
     let _ = std::fs::remove_dir_all(&workdir);
     Ok(summary)
+}
+
+/// Run one program on HotSpot and attach the parsed uncaught exception.
+fn hotspot_obs(
+    classpath: &Path,
+    main_class: &str,
+    jdk: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<Observation, RunError> {
+    let mut o = runner::run_hotspot(classpath, main_class, jdk, timeout)?;
+    o.exception = oracle::parse_exception(&o.stderr);
+    Ok(o)
+}
+
+/// Run one program on CratonVM in `mode` and attach the parsed uncaught
+/// exception.
+fn cratonvm_obs(
+    bin: &Path,
+    classpath: &Path,
+    main_class: &str,
+    mode: Mode,
+    _jdk: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<Observation, RunError> {
+    let mut o = runner::run_cratonvm(bin, classpath, main_class, mode, timeout)?;
+    o.exception = oracle::parse_exception(&o.stderr);
+    Ok(o)
 }
 
 /// Render a one-line-per-program human summary of a run (used by `difftest
@@ -309,6 +371,130 @@ fn classification_label(c: Classification) -> &'static str {
         Classification::Hang => "hang",
         Classification::Crash => "crash",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gate (design §3.5)
+// ---------------------------------------------------------------------------
+
+/// The gate's verdict: a run's divergences diffed against the committed
+/// known-divergence ledger. Drives the §3.5 exit-code contract.
+#[derive(Debug, Clone, Default)]
+pub struct GateReport {
+    /// Diverging programs with **no** ledger entry — newly appeared (exit 1).
+    pub new: Vec<String>,
+    /// Diverging programs matching a `fixed` entry — a closed bug re-opened
+    /// (exit 2, the most severe).
+    pub regressed: Vec<String>,
+    /// `known` entries whose CratonVM side **changed** — silent drift (exit 1).
+    pub drifted: Vec<String>,
+    /// `known` entries that matched as recorded — allowed (no gate failure).
+    pub known: Vec<String>,
+    /// Ledger divergences that now **agree** — a fix landed (informational; the
+    /// entry should be promoted to `fixed`).
+    pub resolved: Vec<String>,
+    /// Programs rejected by the determinism pre-flight (informational).
+    pub nondeterministic: Vec<String>,
+}
+
+impl GateReport {
+    /// The §3.5 exit code: 2 (a `fixed` bug re-diverged) > 1 (new/drift) > 0.
+    pub fn exit_code(&self) -> u8 {
+        if !self.regressed.is_empty() {
+            2
+        } else if !self.new.is_empty() || !self.drifted.is_empty() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Whether the gate passes (no new/regressed/drifted divergence).
+    pub fn is_clean(&self) -> bool {
+        self.exit_code() == 0
+    }
+}
+
+/// Compute the gate verdict by diffing a run's `summary` against the committed
+/// `ledger` (design §3.5), keyed by program (class) name.
+///
+/// - a divergence with no ledger entry → **new**;
+/// - a divergence matching a `fixed` entry → **regressed**;
+/// - a divergence matching a `known`/`new` entry whose CratonVM observation
+///   changed → **drifted**, else **known** (allowed);
+/// - a program that now agrees but has a `known`/`new` entry → **resolved**.
+pub fn gate(summary: &RunSummary, ledger: &Ledger) -> GateReport {
+    use std::collections::HashMap;
+    let normalizer = Normalizer::strict();
+    let by_class: HashMap<&str, &LedgerEntry> = ledger
+        .entries
+        .iter()
+        .map(|e| (e.class.as_str(), e))
+        .collect();
+
+    let mut report = GateReport {
+        nondeterministic: summary
+            .nondeterministic
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect(),
+        ..Default::default()
+    };
+
+    for r in &summary.results {
+        let entry = by_class.get(r.program.as_str()).copied();
+        if r.diverged() {
+            match entry {
+                None => report.new.push(r.program.clone()),
+                Some(e) if e.status == LedgerStatus::Fixed => {
+                    report.regressed.push(r.program.clone())
+                }
+                Some(e) => {
+                    // `known` / `new`: allowed unless the CratonVM side drifted.
+                    let drifted = match r.representative() {
+                        Some(m) => !oracle::gated_eq(&m.cratonvm, &e.cratonvm, &normalizer),
+                        None => true,
+                    };
+                    if drifted {
+                        report.drifted.push(r.program.clone());
+                    } else {
+                        report.known.push(r.program.clone());
+                    }
+                }
+            }
+        } else if let Some(e) = entry {
+            if matches!(e.status, LedgerStatus::Known | LedgerStatus::New) {
+                report.resolved.push(r.program.clone());
+            }
+        }
+    }
+    report
+}
+
+/// Render the gate verdict for the CLI.
+pub fn render_gate(report: &GateReport) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let line = |s: &mut String, tag: &str, items: &[String]| {
+        if !items.is_empty() {
+            let _ = writeln!(s, "  {tag}: {}", items.join(", "));
+        }
+    };
+    line(
+        &mut s,
+        "REGRESSED (fixed bug re-diverged)",
+        &report.regressed,
+    );
+    line(&mut s, "NEW divergence", &report.new);
+    line(&mut s, "DRIFT (known divergence changed)", &report.drifted);
+    line(&mut s, "known (allowed)", &report.known);
+    line(&mut s, "resolved (now agrees)", &report.resolved);
+    line(
+        &mut s,
+        "nondeterministic (skipped)",
+        &report.nondeterministic,
+    );
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +593,7 @@ mod tests {
         };
         let summary = RunSummary {
             results: vec![agree, universal],
-            skipped: vec![],
+            ..Default::default()
         };
         assert_eq!(summary.total(), 2);
         assert_eq!(summary.diverged(), 1);
@@ -423,5 +609,119 @@ mod tests {
         assert!(rendered.contains("DIFF  B [universal]"));
         assert!(rendered.contains("jit-on:stdout"));
         assert!(rendered.contains("nojit:stdout"));
+    }
+
+    // -- gate (design §3.5) -------------------------------------------------
+
+    /// A program that diverges in both modes (the Universal shape).
+    fn diverging_program(name: &str) -> ProgramResult {
+        ProgramResult {
+            program: name.into(),
+            source: PathBuf::from(format!("seeds/{name}.java")),
+            hotspot: Observation::empty(),
+            modes: vec![
+                diverging_outcome(Mode::JitOn),
+                diverging_outcome(Mode::NoJit),
+            ],
+        }
+    }
+
+    fn agreeing_program(name: &str) -> ProgramResult {
+        ProgramResult {
+            program: name.into(),
+            source: PathBuf::from(format!("seeds/{name}.java")),
+            hotspot: Observation::empty(),
+            modes: vec![agreeing_outcome(Mode::JitOn), agreeing_outcome(Mode::NoJit)],
+        }
+    }
+
+    /// A ledger holding one entry for `class` with the given status; its
+    /// recorded CratonVM stdout is `cratonvm_stdout`.
+    fn ledger_with(class: &str, status: LedgerStatus, cratonvm_stdout: &str) -> Ledger {
+        let mut l = Ledger::new("host".into(), "t".into(), "25".into());
+        l.entries.push(LedgerEntry {
+            id: "div-0000".into(),
+            class: class.into(),
+            repro_path: format!("seeds/{class}.java"),
+            classification: Classification::Universal,
+            cratonvm: Observation {
+                stdout: cratonvm_stdout.into(),
+                exit_code: Some(0),
+                ..Observation::empty()
+            },
+            hotspot: Observation::empty(),
+            status,
+            first_seen: "t".into(),
+            linked_doc: None,
+        });
+        l
+    }
+
+    fn summary_of(results: Vec<ProgramResult>) -> RunSummary {
+        RunSummary {
+            results,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gate_new_divergence_fails_exit_1() {
+        // Diverges, but nothing in the (empty) ledger ⇒ new.
+        let summary = summary_of(vec![diverging_program("X")]);
+        let ledger = Ledger::new("h".into(), "t".into(), "25".into());
+        let report = gate(&summary, &ledger);
+        assert_eq!(report.new, vec!["X".to_string()]);
+        assert_eq!(report.exit_code(), 1);
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn gate_known_divergence_is_allowed_exit_0() {
+        // The diverging_outcome's recorded stdout is "42"; a Known entry with
+        // the same stdout matches ⇒ allowed.
+        let summary = summary_of(vec![diverging_program("X")]);
+        let ledger = ledger_with("X", LedgerStatus::Known, "42");
+        let report = gate(&summary, &ledger);
+        assert_eq!(report.known, vec!["X".to_string()]);
+        assert!(report.new.is_empty());
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn gate_drift_fails_exit_1() {
+        // Known entry recorded a different CratonVM stdout ⇒ drift.
+        let summary = summary_of(vec![diverging_program("X")]);
+        let ledger = ledger_with("X", LedgerStatus::Known, "99-was-different");
+        let report = gate(&summary, &ledger);
+        assert_eq!(report.drifted, vec!["X".to_string()]);
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn gate_fixed_redivergence_fails_exit_2() {
+        let summary = summary_of(vec![diverging_program("X")]);
+        let ledger = ledger_with("X", LedgerStatus::Fixed, "42");
+        let report = gate(&summary, &ledger);
+        assert_eq!(report.regressed, vec!["X".to_string()]);
+        assert_eq!(report.exit_code(), 2);
+    }
+
+    #[test]
+    fn gate_resolved_is_clean() {
+        // A Known divergence that now agrees ⇒ resolved (a fix), exit 0.
+        let summary = summary_of(vec![agreeing_program("X")]);
+        let ledger = ledger_with("X", LedgerStatus::Known, "42");
+        let report = gate(&summary, &ledger);
+        assert_eq!(report.resolved, vec!["X".to_string()]);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn gate_all_agree_empty_ledger_is_clean() {
+        let summary = summary_of(vec![agreeing_program("A"), agreeing_program("B")]);
+        let ledger = Ledger::new("h".into(), "t".into(), "25".into());
+        let report = gate(&summary, &ledger);
+        assert!(report.is_clean());
+        assert_eq!(report.exit_code(), 0);
     }
 }
