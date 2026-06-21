@@ -7504,21 +7504,38 @@ fn ir_deopt_resume_enabled() -> bool {
 }
 
 /// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
-/// `Value`s. Conservative first cut: only integer slots are mapped (the IR
-/// path's deopt-eligible methods are integer-only). Any other variant —
-/// `Object`/`Float`/`VirtualObject`, or an unresolved `Register`/`StackSlot`
-/// (which should never reach here) — returns `None`, signalling the caller to
-/// fall back to the safe re-run path rather than materialise a mistyped slot.
+/// `Value`s. Handles the two type-source kinds the producer can emit today:
+/// a cat-1 `Int` slot and an object-reference slot (`StackSlotRef`, resolved
+/// in-stub to the raw heap-pointer word). Any other variant —
+/// `Float`/`Long`/`Double`/`Unsupported`/`VirtualObject`, or an unresolved
+/// `Register`/`StackSlot` (which should never reach here) — returns `None`,
+/// signalling the caller to fall back to the safe re-run path rather than
+/// materialise a mistyped or truncated slot.
 ///
-/// LIMITATION: a long/double resolves to `FrameValue::Int(bits)` and would be
-/// truncated by `Value::Int`; until per-slot width tags exist, methods with
-/// category-2 locals must not precise-resume. The all-`Int` requirement plus
-/// the default-OFF gate keep that case off the live path.
+/// `Object(w)` is the `real-frame-deopt` type source for ref-typed locals
+/// (e.g. an instance method's `this`): `w` is the raw heap pointer captured
+/// **in-stub** at the guard (0 == null). No Java allocation runs between that
+/// capture and the frame push (`refill_pools_from_shared` only recycles Rust
+/// buffers — see `resume_from_ir_deopt`), so the pointer stays valid and needs
+/// no temporary GC root here; once the frame is pushed its locals are scanned
+/// as roots. (A GC-backed `VirtualObject` materialisation — which *does*
+/// allocate — is Phase B and is still rejected via the `None` arm.)
+///
+/// LIMITATION: a `long`/`double` is tagged `Unsupported` by the producer (it
+/// occupies two interpreter slots and a single `Value` cannot be re-expanded
+/// 1:1 here), so any method with a category-2 slot live at a guard falls back
+/// to re-run. See `real-frame-deopt.md` (cat-2 two-slot expansion follow-up).
 fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
     use cratonvm_jit::deopt::FrameValue;
     vals.iter()
         .map(|v| match v {
             FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Object(w) => Some(match *w {
+                0 => Value::Object(None),
+                // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
+                // synchronously at the guard; no GC has run since (see above).
+                p => Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) })),
+            }),
             FrameValue::Undefined => Some(Value::Int(0)),
             _ => None,
         })
@@ -7538,12 +7555,35 @@ fn resume_from_ir_deopt(
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<CachedCallResult> {
+    // CRATONVM_DBG_DEOPT: trace the resume decision (PRECISE mid-bci resume vs
+    // FALLBACK re-run, with the reason) so the type source can be validated
+    // live — e.g. an instance method's `this` resolving to `Value::Object(..)`
+    // rather than a truncated `Value::Int`. Cheap (only when the var is set).
+    let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
+    let bail = |why: &str| -> Option<CachedCallResult> {
+        if trace {
+            eprintln!(
+                "[cratonvm-deopt] FALLBACK re-run {}.{}{} at bci={} ({why})",
+                cached.class_name, cached.method_name, cached.method_descriptor, rframe.bci,
+            );
+        }
+        None
+    };
     // Phase-A scope: single non-inlined frame, no held monitors.
-    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
-        return None;
+    if !rframe.caller_frames.is_empty() {
+        return bail("inlined caller chain");
     }
-    let locals = ir_deopt_frame_values(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+    if !rframe.monitors.is_empty() {
+        return bail("held monitors");
+    }
+    let locals = match ir_deopt_frame_values(&rframe.locals) {
+        Some(l) => l,
+        None => return bail("unmappable local slot"),
+    };
+    let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
+        Some(s) => s,
+        None => return bail("unmappable stack slot"),
+    };
 
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
@@ -7551,7 +7591,7 @@ fn resume_from_ir_deopt(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled(
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
         cached.declaring_class_id,
         cached.class_name.clone(),
         cached.method_name.clone(),
@@ -7565,12 +7605,27 @@ fn resume_from_ir_deopt(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    push_frame_and_fire_entry(thread, frame);
-    let idx = thread.frames.len() - 1;
+    // Populate the operand stack and resume pc BEFORE pushing the frame, so that
+    // when `push_frame_and_fire_entry` fires a JVMTI MethodEntry callback (which
+    // may allocate Java heap and trigger a GC) EVERY reconstructed oop — locals
+    // AND operand-stack refs — is already in a GC-scanned frame slot. (Review
+    // finding: a reconstructed stack ref held only in the Rust `stack_vals` Vec
+    // was momentarily unrooted across the fire; locals were already safe.)
     for v in stack_vals {
-        thread.frames[idx].stack.push(v).ok()?;
+        frame.stack.push(v).ok()?;
     }
-    thread.frames[idx].pc = rframe.bci as usize;
+    frame.pc = rframe.bci as usize;
+    if trace {
+        eprintln!(
+            "[cratonvm-deopt] PRECISE resume {}.{}{} at bci={} locals={:?}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            rframe.bci,
+            locals,
+        );
+    }
+    push_frame_and_fire_entry(thread, frame);
     Some(CachedCallResult::FramePushed)
 }
 
@@ -19652,16 +19707,29 @@ fn execute_jit_call_decoded(
         }
     }
 
-    // real-frame-deopt: IR-path deopt detection (see the matching block at the
-    // fast sink). `ir_deopt_entry` stashes `LAST_DEOPT` and returns `i64::MIN`
-    // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
-    // (clearing it) and re-run the method from entry. Precise mid-bci resume is
-    // wired at the fast sink; this slow path falls back to re-run, which is
-    // correct for the side-effect-free methods that deopt today. Gated on
-    // `result == i64::MIN` (a deopt always returns it) so the common path skips
-    // the thread-local access while never missing an IR deopt.
-    if result == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
-        return Ok(None);
+    // real-frame-deopt: IR-path deopt detection (mirrors the block in
+    // `execute_jit_call`). `ir_deopt_entry` stashes `LAST_DEOPT` and returns
+    // `i64::MIN` without setting `JIT_DEOPT_PENDING`, so consume the stashed
+    // frame here too (clearing it). When precise resume is enabled and the frame
+    // is mappable, resume the interpreter at the trapping bci (`Ok(Some(..))`);
+    // otherwise re-run the method from entry (`Ok(None)`), which the caller
+    // does from `args_slice` (the operand-stack args were popped by
+    // `execute_invokevirtual_cached` before this call). This is the path the
+    // instance-method invocation tier-up takes, so wiring resume here is what
+    // makes an instance method's ref receiver/locals precise-resume (the static
+    // MIC path goes through `execute_jit_call`). `resume_from_ir_deopt` bails
+    // (returns `None`) side-effect-free before any frame mutation, so falling
+    // through to re-run after a `None` is safe. Gated on `result == i64::MIN`
+    // (a deopt always returns it) so the common path skips the thread-local.
+    if result == i64::MIN {
+        if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            if ir_deopt_resume_enabled() {
+                if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(Some(r));
+                }
+            }
+            return Ok(None);
+        }
     }
 
     // Deopt sentinel → interpreter fallback. The operand stack was never
@@ -21914,6 +21982,51 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // real-frame-deopt — IR-path deopt frame-value mapping (type source)
+    // -----------------------------------------------------------------------
+
+    /// `ir_deopt_frame_values` maps the producer's type-source variants to the
+    /// right interpreter `Value`s: a cat-1 `Int` stays an `Int`, an object-ref
+    /// slot (`StackSlotRef` already resolved in-stub to a raw heap word) becomes
+    /// `Value::Object` (null word → `None`, non-null word → the pointer
+    /// verbatim — NOT a truncated `Int`), and `Undefined` is a zero slot. Any
+    /// not-yet-reconstructable variant (`Unsupported` cat-2, `Float`-in-slot,
+    /// or a `VirtualObject`) returns `None`, forcing the safe re-run path.
+    #[test]
+    fn ir_deopt_frame_values_maps_object_and_int() {
+        use cratonvm_jit::deopt::FrameValue;
+        // 8-byte aligned, never dereferenced — only wrapped in an `ObjectRef`.
+        let raw: u64 = 0x1000;
+        let mapped = ir_deopt_frame_values(&[
+            FrameValue::Object(0),
+            FrameValue::Object(raw),
+            FrameValue::Int(42),
+            FrameValue::Undefined,
+        ])
+        .expect("Int/Object/Undefined are all mappable");
+        assert_eq!(mapped[0], Value::Object(None), "null word → null ref");
+        match mapped[1] {
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr() as u64, raw,
+                "non-null ref slot must carry the heap pointer verbatim"
+            ),
+            other => panic!("expected a non-null object reference, got {other:?}"),
+        }
+        assert_eq!(mapped[2], Value::Int(42));
+        assert_eq!(mapped[3], Value::Int(0), "Undefined → zero slot");
+
+        // Not-yet-reconstructable variants force the safe re-run (None).
+        assert!(
+            ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
+            "a category-2 (long/double) slot must re-run, not resume"
+        );
+        assert!(
+            ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none(),
+            "an FP-in-slot must re-run until XMM resolution lands"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // H6 — native-stack-aware re-entrant recursion ceiling
