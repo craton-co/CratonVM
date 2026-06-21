@@ -7,6 +7,9 @@
 //! This module re-exports them and adds VM-specific functionality:
 //! - [`roots`] — GC root scanning (depends on VM-internal types)
 //! - [`gc::update_all_roots`] — post-GC root remapping (depends on VM-internal types)
+//! - [`native_roots`] — uniform registry letting native side-tables register
+//!   their held `ObjectRef`s as GC roots (scan + post-move remap) without
+//!   editing `roots`/`gc` directly
 
 // Re-export submodules from the gc crate so that existing
 // `use crate::memory::{arena, heap, ...}` paths continue to work.
@@ -20,6 +23,7 @@ pub use cratonvm_gc::vm_heap;
 
 // VM-local modules that depend on VM-internal types.
 pub mod gc;
+pub mod native_roots;
 pub mod roots;
 
 // Top-level re-exports for convenience.

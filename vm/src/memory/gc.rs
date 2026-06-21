@@ -379,6 +379,15 @@ pub fn update_all_roots(
         .thread_registry
         .update_thread_objs_after_gc(pointer_map);
 
+    // 22. Uniform native-root registry — the post-move companion to
+    //     `roots.rs` step 21 (`scan_all_native_roots`). Fans out to every
+    //     subsystem that registered via `crate::memory::native_roots`,
+    //     repointing each held ObjectRef through `pointer_map`. Each registered
+    //     remap self-guards the empty (non-moving) map; the whole fan-out is a
+    //     no-op until a subsystem registers, so behaviour is byte-identical to
+    //     baseline on the default path.
+    crate::memory::native_roots::remap_all_native_roots(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
