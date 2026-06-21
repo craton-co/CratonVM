@@ -4251,7 +4251,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let abs = p.starts_with('/') || (p.len() >= 2 && p.as_bytes()[1] == b':');
+        // keycloak-15: a drive-relative (`C:foo`) or driveless-rooted (`\foo`)
+        // path is NOT absolute on Windows — see `p57_win_is_absolute`. On Unix
+        // the POSIX rule (leading `/`) applies.
+        let abs = if cfg!(windows) {
+            p57_win_is_absolute(&p)
+        } else {
+            p.starts_with('/')
+        };
         Ok(Some(Value::Int(if abs { 1 } else { 0 })))
     });
 
@@ -6927,7 +6934,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let abs = p.starts_with('/') || (p.len() > 2 && p.as_bytes()[1] == b':');
+        // keycloak-15: drive-relative / driveless-rooted paths are not absolute on
+        // Windows (see `p57_win_is_absolute`); POSIX leading-`/` rule on Unix.
+        let abs = if cfg!(windows) {
+            p57_win_is_absolute(&p)
+        } else {
+            p.starts_with('/')
+        };
         Ok(Some(Value::Int(if abs { 1 } else { 0 })))
     });
 
@@ -7431,6 +7444,133 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
     (None, split_names(work))
 }
 
+/// keycloak-15: Windows (`sun.nio.fs.WindowsPath`) `isAbsolute()` semantics.
+///
+/// A Windows path is absolute **only** when it names both a root *and* a drive
+/// (or is a UNC path). Two prefixes that have a root component but are NOT
+/// absolute trip up a naive "has a root ⇒ absolute" check:
+///   * **drive-relative** `C:foo` — relative to the current dir *on drive C*;
+///   * **driveless-rooted** `\foo` / `/foo` — relative to the current *drive*.
+/// HotSpot returns `false` for both; the previous
+/// `p.starts_with('/') || p[1]==':'` heuristic returned `true`. Classify off the
+/// parsed root instead (roots are rendered in `\`-form by [`p57_parse_win_root`]):
+///   * `C:\` (drive + separator)  → absolute
+///   * `\\server\share\` (UNC)    → absolute
+///   * `C:` (drive only)          → NOT absolute (drive-relative)
+///   * `\`  (separator only)      → NOT absolute (driveless-rooted)
+fn p57_win_is_absolute(s: &str) -> bool {
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    match p57_parse_win_root(s).0 {
+        None => false,
+        Some(root) => {
+            let b = root.as_bytes();
+            let unc = b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]);
+            let drive_abs = b.len() >= 3 && b[1] == b':' && is_sep(b[2]);
+            unc || drive_abs
+        }
+    }
+}
+
+/// keycloak-15: Windows (`sun.nio.fs.WindowsPath`) `getParent()` semantics.
+///
+/// HotSpot computes the parent as a pure last-separator split that keeps `.`/`..`
+/// name elements verbatim — it does **not** normalize curdir. Rust's
+/// `std::path::Path::parent()` normalizes a trailing `.` away first, so it
+/// over-trims: the parent of `C:\a\b\.` becomes `C:\a` instead of `C:\a\b`.
+/// Rebuild the parent from the parsed (root, names) so it stays consistent with
+/// `getRoot`/`getNameCount`/`getName`. Returns "" when there is no parent
+/// (caller maps that to `null`).
+fn p57_win_parent_of(path: &str) -> String {
+    let (root, names) = p57_parse_win_root(path);
+    let n = names.len();
+    match root {
+        // Rooted path (`C:\…`, `\\server\share\…`, `\…`, `C:foo`).
+        Some(r) => {
+            if n == 0 {
+                // The path is just the root → no parent.
+                String::new()
+            } else if n == 1 {
+                // A single element under a root → the parent is the root itself.
+                r
+            } else {
+                // root + all-but-last name. The root string already carries its
+                // trailing separator for absolute/UNC roots; a drive-relative
+                // root (`C:`) carries none, so the first name attaches directly —
+                // which is exactly HotSpot's `C:foo\bar` → parent `C:foo`.
+                let mut out = r;
+                for (i, name) in names[..n - 1].iter().enumerate() {
+                    if i > 0 {
+                        out.push('\\');
+                    }
+                    out.push_str(name);
+                }
+                out
+            }
+        }
+        // Relative path (`a\b\c`).
+        None => {
+            if n <= 1 {
+                String::new()
+            } else {
+                names[..n - 1].join("\\")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod p57_win_path_tests {
+    //! keycloak-15: Windows `WindowsPath.isAbsolute()` / `getParent()` semantics.
+    //! Pure-function tests (no VM); each expectation matches HotSpot
+    //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
+    //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
+    //! internal form, so both spellings are exercised.
+    use super::{p57_win_is_absolute, p57_win_parent_of};
+
+    #[test]
+    fn is_absolute_matches_hotspot() {
+        // Absolute: drive + root, or UNC.
+        assert!(p57_win_is_absolute("C:\\foo\\bar"));
+        assert!(p57_win_is_absolute("C:/foo/bar")); // `/`-canonical internal form
+        assert!(p57_win_is_absolute("\\\\server\\share\\d"));
+        assert!(p57_win_is_absolute("//server/share/d"));
+        // NOT absolute: drive-relative, driveless-rooted, relative.
+        assert!(!p57_win_is_absolute("C:foo"));
+        assert!(!p57_win_is_absolute("\\foo\\bar"));
+        assert!(!p57_win_is_absolute("/foo/bar"));
+        assert!(!p57_win_is_absolute("a\\b\\c"));
+        assert!(!p57_win_is_absolute("a/b/c"));
+        assert!(!p57_win_is_absolute(""));
+    }
+
+    #[test]
+    fn parent_keeps_curdir_and_root_boundary() {
+        // Trailing `.` must be kept (Rust Path::parent would over-trim to "C:\a").
+        assert_eq!(p57_win_parent_of("C:\\a\\b\\."), "C:\\a\\b");
+        assert_eq!(p57_win_parent_of("C:/a/b/."), "C:\\a\\b");
+        // Drive-absolute.
+        assert_eq!(p57_win_parent_of("C:\\foo\\bar"), "C:\\foo");
+        assert_eq!(p57_win_parent_of("C:\\foo"), "C:\\");
+        // Drive-relative: the first name attaches to `C:` with no separator.
+        assert_eq!(p57_win_parent_of("C:foo\\bar"), "C:foo");
+        assert_eq!(p57_win_parent_of("C:foo"), "C:");
+        // Driveless-rooted.
+        assert_eq!(p57_win_parent_of("\\foo\\bar"), "\\foo");
+        assert_eq!(p57_win_parent_of("\\foo"), "\\");
+        // UNC.
+        assert_eq!(
+            p57_win_parent_of("\\\\server\\share\\d\\e"),
+            "\\\\server\\share\\d"
+        );
+        // Relative.
+        assert_eq!(p57_win_parent_of("a\\b\\c"), "a\\b");
+        // No parent → "" (caller maps to null).
+        assert_eq!(p57_win_parent_of("a"), "");
+        assert_eq!(p57_win_parent_of("C:\\"), "");
+        assert_eq!(p57_win_parent_of("\\\\server\\share\\"), "");
+    }
+}
+
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
@@ -7895,6 +8035,14 @@ fn p57_parent_of(path: &str) -> String {
     }
     if path.is_empty() {
         return String::new();
+    }
+    // Windows: keep `.`/`..` name elements and treat the drive/UNC/root prefix as
+    // a unit (HotSpot WindowsPath.getParent is a pure last-separator split). Rust's
+    // Path::parent() normalizes a trailing `.` away and over-trims — see
+    // `p57_win_parent_of`. `cfg!(windows)` is a const, so the helper is still
+    // compiled (referenced) on every target — no dead-code warning.
+    if cfg!(windows) {
+        return p57_win_parent_of(path);
     }
     match std::path::Path::new(path).parent() {
         Some(p) => {
@@ -20906,39 +21054,20 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(p))))
         },
     );
+    // keycloak-15: route through the shared `p57_parent_of` (jar-FS aware +
+    // Windows last-separator split that keeps `.`/`..`) instead of Rust's
+    // `Path::parent()`, which normalizes a trailing `.` and over-trims. This is
+    // the last-registered (winning) `getParent`; keep it identical to the
+    // earlier registration so behaviour does not depend on phase order.
     r.register(path, "getParent", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let path_str = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        if let Some((jar, entry)) = jarfs_decode(&path_str) {
-            let trimmed = entry.trim_end_matches('/');
-            if trimmed.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let parent_entry = match trimmed.rfind('/') {
-                Some(i) => &trimmed[..i],
-                None => "",
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&jarfs_encode(&jar, parent_entry));
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            return Ok(Some(Value::Object(Some(p))));
-        }
-        if let Some(parent) = std::path::Path::new(&path_str)
-            .parent()
-            .and_then(|p| p.to_str())
-        {
-            if parent.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(parent);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        } else {
+        let p = p57_read_path(ctx, this);
+        let parent = p57_parent_of(&p);
+        if parent.is_empty() {
             Ok(Some(Value::Object(None)))
+        } else {
+            let result = p57_alloc_path(ctx, &parent);
+            Ok(Some(Value::Object(Some(result))))
         }
     });
     r.register(
