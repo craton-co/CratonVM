@@ -196,6 +196,18 @@ thread_local! {
     /// Entries are keyed by the returned pointer (`buf.as_mut_ptr() as usize`).
     static JNI_CRITICAL_COPIES: std::cell::RefCell<HashMap<usize, CriticalCopy>> =
         std::cell::RefCell::new(HashMap::new());
+    /// GC-correctness (vm-jni-roots #2): maps a DIRECT (no-copy) data pointer we
+    /// handed back to native code -> the base address of the backing array
+    /// object that we PINNED in `cratonvm_gc::pinned` for the lifetime of the
+    /// handout. `GetPrimitiveArrayCritical` / no-copy `Get<Type>ArrayElements`
+    /// return `array_data_ptr` (object base + header) and a moving GC must not
+    /// relocate or reclaim the array while the native pointer is live, so we pin
+    /// the object base. The matching `Release` only receives the data pointer,
+    /// not the array object, so we record `data_ptr -> object_base` here and
+    /// look it up to UNPIN. Refcounted in `pinned`, so overlapping critical
+    /// sections on the same array are safe.
+    static JNI_CRITICAL_PINS: std::cell::RefCell<HashMap<usize, usize>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Thread-local cache for parsed method descriptors.
     /// Maps descriptor string → parsed parameter type tags, avoiding
     /// repeated parsing of the same descriptor in hot JNI call paths.
@@ -719,13 +731,28 @@ pub fn pop_local_frame(result: JObject) -> JObject {
 }
 
 /// Record a local ref in the current top frame.
-/// If there is no active frame, the ref is untracked (still valid; auto-freed on JNI return).
+///
+/// GC-correctness (vm-jni-roots #2): previously, if there was no active frame
+/// the ref was silently DROPPED ("untracked") and therefore was NOT a GC root —
+/// a local ref a native obtained (NewObject, GetObjectField, …) outside any
+/// explicit `PushLocalFrame` was invisible to `collect_local_ref_roots` and
+/// could be reclaimed (or left dangling under a moving GC) mid-native-call.
+/// The native dispatch path now pushes an IMPLICIT top-level local frame for
+/// the duration of every JNI native call (see `vm_exec`), but we additionally
+/// synthesize a frame here so a `track_local_ref` that races ahead of (or runs
+/// without) an enclosing frame still roots the handle rather than leaking it.
 pub fn track_local_ref(jobj: JObject) {
     if jobj == 0 {
         return;
     }
     JNI_LOCAL_FRAMES.with(|f| {
         let mut stack = f.borrow_mut();
+        if stack.last().is_none() {
+            // No active frame: synthesize an implicit top-level frame so the
+            // handle is tracked (and thus a GC root) instead of being dropped.
+            stack.push(Vec::with_capacity(16));
+        }
+        // Safe: we just ensured a top frame exists.
         if let Some(top) = stack.last_mut() {
             top.push(jobj);
         }
@@ -800,6 +827,44 @@ pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize,
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// JNI critical-section array pinning (vm-jni-roots #2)
+// ---------------------------------------------------------------------------
+
+/// Pin the array object `oref` (so a moving GC neither relocates nor reclaims
+/// it) and remember which `data_ptr` we handed to native code so the matching
+/// `Release` can find and unpin it. Called on every DIRECT (no-copy)
+/// `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements` handout.
+///
+/// `data_ptr` is the pointer returned to the native caller (object base +
+/// header), while the pin is keyed on the OBJECT BASE (`oref.as_ptr()`) because
+/// that is the address a moving collector tests in its relocation decision.
+fn pin_critical_array(oref: ObjectRef, data_ptr: usize) {
+    let base = oref.as_ptr() as usize;
+    if base == 0 || data_ptr == 0 {
+        return;
+    }
+    cratonvm_gc::pinned::pin(base);
+    JNI_CRITICAL_PINS.with(|c| {
+        c.borrow_mut().insert(data_ptr, base);
+    });
+}
+
+/// Undo a [`pin_critical_array`] for the buffer at `data_ptr`. Looks up the
+/// pinned object base recorded at Get time and unpins it (refcounted, so an
+/// overlapping critical section keeps the array pinned until its own Release).
+/// A `data_ptr` that was never a direct handout (e.g. a copy-path buffer) is
+/// absent from the map and ignored.
+fn unpin_critical_array(data_ptr: usize) {
+    if data_ptr == 0 {
+        return;
+    }
+    let base = JNI_CRITICAL_PINS.with(|c| c.borrow_mut().remove(&data_ptr));
+    if let Some(base) = base {
+        cratonvm_gc::pinned::unpin(base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2445,6 +2510,12 @@ macro_rules! get_array_elements {
                     // The data region is a native-endian block of `$rust_type`
                     // (see `write_prim_element`), so this reinterpretation is the
                     // same bit pattern the per-element copy loop would have built.
+                    //
+                    // GC-correctness (vm-jni-roots #2): this is a DIRECT pointer
+                    // into the live array body. Pin the array so a moving GC will
+                    // not relocate or reclaim it while native code holds the
+                    // pointer; unpinned by `Release<Type>ArrayElements`.
+                    pin_critical_array(oref, base as usize);
                     return Some((base as *mut $rust_type, JNI_FALSE));
                 }
                 // SLOW PATH (G1 humongous): materialise a contiguous copy via the
@@ -2512,6 +2583,13 @@ macro_rules! release_array_elements {
             if elems.is_null() {
                 return;
             }
+            // GC-correctness (vm-jni-roots #2): if this was a DIRECT (no-copy)
+            // handout, `elems` is the live array body and we pinned the array at
+            // Get time; unpin it now (no-op for the copy path, whose pointer was
+            // never recorded in JNI_CRITICAL_PINS). Done before the copy-buffer
+            // lookup so the direct path — which has no JNI_ARRAY_ELEM_BUFFERS
+            // entry and returns early below — still releases its pin.
+            unpin_critical_array(elems as usize);
             // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
             // recorded for THIS buffer at Get time. Never re-derive the length
             // from the array handle — the array may have moved/realloc'd under a
@@ -3243,6 +3321,11 @@ extern "C" fn jni_get_primitive_array_critical(
             // Ordinary (single-region) array: hand out the live, contiguous
             // payload pointer — no copy, release is a no-op.
             Some(ptr) => {
+                // GC-correctness (vm-jni-roots #2): direct pointer into the live
+                // array body. Pin the array so a moving GC will not relocate or
+                // reclaim it while native code holds it; unpinned by
+                // `ReleasePrimitiveArrayCritical`.
+                pin_critical_array(oref, ptr as usize);
                 if !is_copy.is_null() {
                     unsafe {
                         *is_copy = JNI_FALSE;
@@ -3309,6 +3392,10 @@ extern "C" fn jni_release_primitive_array_critical(
     if carray.is_null() {
         return;
     }
+    // GC-correctness (vm-jni-roots #2): release the GC pin taken at Get time for
+    // a DIRECT (no-copy) critical pointer. No-op for the humongous copy path,
+    // whose buffer pointer was never recorded in JNI_CRITICAL_PINS.
+    unpin_critical_array(carray as usize);
     // Fast path: for ordinary arrays we handed out a direct pointer and
     // recorded nothing, so there is nothing to copy back or free.
     let copy = JNI_CRITICAL_COPIES.with(|c| c.borrow_mut().remove(&(carray as usize)));

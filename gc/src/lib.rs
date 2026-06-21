@@ -61,6 +61,8 @@ pub mod mark_bitmap;
 pub mod metaspace;
 pub mod numa;
 pub mod old_gen;
+/// JNI critical-section object pin set (see [`pinned`]).
+pub mod pinned;
 pub mod reference;
 pub mod region;
 #[cfg(feature = "gpu-offload")]

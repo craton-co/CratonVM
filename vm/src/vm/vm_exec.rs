@@ -11525,6 +11525,13 @@ fn invoke_on_class_shared_inner(
             // call) per `set_jni_thread`'s contract.
             let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
 
+            // GC-correctness (vm-jni-roots #2): bracket the native call in an
+            // implicit local-ref frame so any local jobject the native creates
+            // is a GC root for the call's lifetime. Dropped (frame popped) on
+            // every exit below — normal return, arity-mismatch early return,
+            // and panic unwind through the unsafe dispatch.
+            let _jni_local_frame = JniImplicitFrameGuard::enter();
+
             let env = crate::native::jni::get_jni_env();
             // For instance methods, args[0] is the receiver; for static, it is absent.
             let (receiver, call_args) = if is_static {
@@ -11602,6 +11609,11 @@ fn invoke_on_class_shared_inner(
             // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
             // for this dispatch; it outlives the guard per `set_jni_thread`.
             let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
+
+            // GC-correctness (vm-jni-roots #2): implicit local-ref frame for the
+            // auto-resolved native, identical bracketing to the RegisterNatives
+            // arm above (popped on normal/early/panic exit).
+            let _jni_local_frame = JniImplicitFrameGuard::enter();
 
             let env = crate::native::jni::get_jni_env();
             let (receiver, call_args) = if is_static {
@@ -11827,6 +11839,40 @@ impl Drop for JniContextGuard {
     fn drop(&mut self) {
         crate::native::jni::clear_jni_context();
         crate::native::jni::clear_jni_thread();
+    }
+}
+
+/// GC-correctness (vm-jni-roots #2): RAII guard that brackets a JNI native
+/// dispatch with an IMPLICIT local-reference frame.
+///
+/// A native that obtains a fresh local jobject (NewObject, GetObjectField, …)
+/// expects it to stay live until the native returns. Those handles are tracked
+/// via `track_local_ref`, but without an enclosing frame they had no scope and
+/// were dropped from the root set. JNI semantics say every native call runs
+/// inside an implicit local frame whose refs are freed on return; this guard
+/// supplies it: `push_local_frame` on construction, `pop_local_frame` on
+/// `Drop` (so the frame is released on the normal-return path, on the
+/// arity-mismatch early return, AND on a panic unwind through the unsafe
+/// dispatch). While it lives, every local ref the native creates is a GC root
+/// (scanned by `collect_local_ref_roots`) and is remapped by
+/// `update_local_refs_after_gc` if a moving collection relocates it.
+struct JniImplicitFrameGuard;
+
+impl JniImplicitFrameGuard {
+    #[inline]
+    fn enter() -> Self {
+        crate::native::jni::push_local_frame(16);
+        JniImplicitFrameGuard
+    }
+}
+
+impl Drop for JniImplicitFrameGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Pop the implicit frame, discarding its handles. We promote nothing:
+        // the dispatch result is a `Value`, not a JObject borrowed from this
+        // frame, so there is no local ref that must outlive the call here.
+        let _ = crate::native::jni::pop_local_frame(0);
     }
 }
 
