@@ -153,3 +153,81 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `RJ_MAX_STACK_DEPTH` | Override `max_stack_depth` at startup (64–65536). |
 | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | Set to `1` to disable the 120-second hang watchdog. |
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | Override the default watchdog timeout. |
+
+### Behavior / experimental toggles
+
+The table above lists the boot/path environment variables. The `CRATONVM_*`
+namespace additionally carries a large set of behavior switches. The
+user-facing ones — the knobs you might reasonably set when running an
+application — are documented here. (Hundreds of `CRATONVM_DBG_*` /
+`CRATONVM_DIAG_*` / `CRATONVM_TRACE_*` variables also exist; those are
+**internal debug toggles**, not part of the supported surface — see the note at
+the end of this section.) Each switch is read **once** at startup and cached;
+changing it mid-run has no effect.
+
+#### Real-vs-synthetic JDK gates
+
+CratonVM can run real JDK bytecode or, for a few subsystems, fall back to a
+Rust "synthetic" implementation. These flags pick which path a subsystem uses.
+Most accept presence-as-on (set to any value to enable); the opt-out spellings
+disable a default-on behavior.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CRATONVM_NO_STUBS` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Opt-in; surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. | Off (stubs present) |
+| `CRATONVM_REAL_NET_SOCKETS` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | Off (synthetic) |
+| `CRATONVM_REAL_AQS` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | Off (synthetic) |
+| `CRATONVM_REAL_ANNOTATIONS` | Route annotation reflection (`getAnnotation`/`annotationType`/attribute reads) through real JDK bytecode. | Off (synthetic) |
+| `CRATONVM_REAL_FORKJOINPOOL` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. **Experimental** (see Family A4 in known-issues). | Off (synthetic) |
+| `CRATONVM_REAL_RAF` / `CRATONVM_SYNTHETIC_RAF` | Force real / synthetic `RandomAccessFile`. | Real (auto) |
+| `CRATONVM_REAL_PROXY_SUPER` | Use the real `java.lang.reflect.Proxy` super-class path. Opt out to the synthetic experimental path with `=0`. | On (real) |
+| `CRATONVM_EAGER_STREAMS` | Opt **out** of the lazy/short-circuiting synthetic `Stream` pipeline back to the legacy eager pipeline. (`CRATONVM_LAZY_STREAMS` force-enables lazy and wins if both are set.) | Lazy (HotSpot-faithful) |
+| `CRATONVM_SYNTHETIC_*` (e.g. `CRATONVM_SYNTHETIC_AQS`, `_EC`, `_RSA`, `_RAF`, `_FILEWRITER`, `_QUARKUS_ARC`, `_SPRING_STARTUP`, …) | Per-subsystem **force-synthetic** opt-out switches: select the experimental Rust implementation for that one subsystem even when the real-JDK path is the default. | Off (real path) |
+
+> The real path is the **default** wherever a real JDK is detected; the
+> synthetic implementations are experimental opt-ins. Prefer leaving these
+> unset unless you are reproducing a synthetic-vs-real difference.
+
+#### JIT / GC tuning
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CRATONVM_DISABLE_JIT` | Interpreter-only execution (the `--nojit` flag sets this). Useful for isolating whether a misbehaviour originates in the JIT. | Off (JIT on) |
+| `CRATONVM_JIT_THRESHOLD` | Invocation count at which a method becomes JIT-eligible. Higher keeps short-lived code interpreted; `0` is clamped to `1`. | `500` |
+| `CRATONVM_JIT_CODE_CACHE_MAX_MB` | Upper bound on total retained JIT code, in MiB; when reached, new methods stay interpreted. `0` disables the cap (unbounded). | (built-in cap) |
+| `CRATONVM_DISABLE_INTRINSICS` | Prevent the interpreter from installing `Intrinsic` inline-cache entries, forcing ordinary native/bytecode dispatch (differential-test off-switch). | Off |
+| `CRATONVM_NO_PRECISE_JIT_MAPS` | Opt **out** of precise JIT oop maps (revert to the older conservative stack scan). For diagnosing GC-root coverage under JIT. | Precise maps on |
+
+#### Security / sandbox
+
+These harden the VM for running untrusted bytecode or multi-tenant hosting.
+All are **off by default** (the default posture is JDK-faithful single-tenant).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CRATONVM_CONFINE_IO` | Enable CWD file-I/O confinement (fail-closed): filesystem access is restricted to the working directory and explicitly registered sandbox roots. The certified hardening switch. | Off |
+| `CRATONVM_UNTRUSTED_CODE` | Like `CRATONVM_CONFINE_IO` but warning-mode — auto-enables CWD confinement for untrusted-bytecode hosting. | Off |
+| `CRATONVM_BLOCK_PRIVATE_NETS` | Additionally deny outbound connections to loopback and RFC1918 private ranges (the link-local cloud-metadata block always runs). | Off |
+| `CRATONVM_RESOLVE_OUTBOUND_HOST` | Resolve outbound **hostnames** and apply the per-IP outbound policy to every resolved address (closes the DNS-alias / DNS-rebinding bypass). | Off (no DNS in policy) |
+| `CRATONVM_REQUIRE_POLICY` | With a `SecurityManager` installed but no policy loaded, **deny** (fail-closed) instead of allow-all. Used by the certification profile. | Off (allow-all when no policy) |
+| `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | Drop JAR-manifest `Class-Path` entries that resolve outside the JAR's own directory (absolute roots, `file:/…`, `..` escapes). | Off |
+| `CRATONVM_HTTP_MAX_BODY` | Max accepted HTTP request body, in bytes, for the built-in HTTP server; larger requests get a `413`. | `8 MiB` |
+| `CRATONVM_ZIP_MAX_ENTRY_BYTES` | Per-entry uncompressed-size cap when inflating zip/jar entries (decompression-bomb guard). | `512 MiB` |
+| `CRATONVM_MAX_INFLATED_BYTES` | Companion total-inflation cap for the zip/jar reader. | (built-in) |
+| `CRATONVM_TRUST_PEM` | Path to a PEM trust bundle, consulted after the `javax.net.ssl.trustStore` sys-prop and before the JDK `cacerts`. | — |
+
+#### Diagnostics / resource limits
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CRATONVM_LOCK_ORDER_CHECK` | Opt in (release builds) to runtime lock-ordering deadlock detection. Truthy values: `1`/`true`/`yes`/`on`. Always on in debug builds. | Off (release) |
+| `CRATONVM_RESOLVE_CACHE_CAP` | Capacity of the shared symbol-resolution cache (bounds the footprint against a key-minting adversary). Clamped to ≥ 1. | `65536` |
+| `CRATONVM_ENABLE_ASSERTIONS` | Enable Java `assert` statement evaluation (the `-ea` analog) for the run. | Off |
+
+> **Debug-only toggles.** Every `CRATONVM_DBG_*`, `CRATONVM_DIAG_*`,
+> `CRATONVM_TRACE_*`, and `CRATONVM_*_DBG` variable is an **internal
+> developer/debug switch** (tracing, GC stress, JIT bisection, etc.). They are
+> not a supported configuration surface, may change or disappear without
+> notice, and are intentionally not enumerated here. Discover them with
+> `grep -rhoE "CRATONVM_[A-Z0-9_]+" --include=*.rs vm/ gc/ jit/ native-*` if you
+> are working on the VM internals.
