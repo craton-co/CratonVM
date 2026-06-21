@@ -1454,7 +1454,7 @@ mod tests {
         ms.allocate(64, 2).unwrap();
         ms.free_loader_metaspace(1);
         ms.trigger_gc(); // removes loader 1's freed chunk, shifts indices
-        // Loader 2's chunk survived; further allocation bumps it correctly.
+                         // Loader 2's chunk survived; further allocation bumps it correctly.
         let a = ms.allocate(64, 2).unwrap();
         assert_eq!(a.offset, 64);
         assert_eq!(ms.chunks.len(), 1);
