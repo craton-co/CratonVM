@@ -55,7 +55,49 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
   - Generational `ConcurrentMarker::remark` already drains the registry (its
     remark calls `deactivate_and_drain` → `flush_all`), so it is unaffected.
     Applying the same discipline uniformly is a small follow-up.
-- Steps 4–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
+- **Step 4 (atomic concurrent-mark slot reads) — INVESTIGATED; original fix
+  infeasible as specified, needs an architectural decision** (branch
+  `feat/g1-atomic-mark-reads`). Findings:
+  - The *standalone* `ConcurrentMarker::scan_object` (`concurrent_mark.rs`) is
+    already mitigated: 8-byte ref-array elements use a single-word `u64` read;
+    16-byte object slots read under `collector::volatile_stripe_lock` + SeqCst
+    fences. G1's own concurrent scan `scan_object_refs` (`g1.rs`) is **not** —
+    it does a plain non-atomic `ptr::read::<Value>` (the §2.8 g1.rs sites).
+  - The design's primary fix — *"8-byte atomic load of the reference word"* — is
+    **not portable**: `Value` is `repr(Rust)` (line ~22; `repr(C)` would grow it
+    to 24 bytes and break JIT slot layout), so the discriminant/payload offsets
+    are compiler-private — there is no stable "reference word" to load. And the
+    mutator write (`set_field`) is a non-atomic `ptr::write::<Value>`, so even an
+    atomic read would be **mixed-atomicity UB** unless every writer (interpreter,
+    JIT raw stores, natives) also becomes atomic — a cross-cutting, perf-critical
+    change far beyond a marker tweak.
+  - The design's alternative — *"prove + assert STW-only"* — fits the **other
+    three** g1.rs Value reads (`scan_and_evacuate_refs`,
+    `scan_source_region_for_cset_refs`, `verify_no_dangling_into_cset`: all in
+    the STW evacuation path) but **not** `scan_object_refs`, which is genuinely
+    concurrent.
+  - The `concurrent_mark.rs` **stripe-lock** approach is **ruled out for G1**:
+    `scan_object_refs` runs holding `self.regions.lock()`, while the volatile
+    write path is `set_field_volatile` → stripe → `set_field` → `regions.lock()`.
+    Adding a stripe lock under the regions lock inverts the order (regions→stripe
+    vs stripe→regions) → **deadlock**.
+  - In practice the race is **benign**: a Java field has a static type, so a
+    reference field's `Value` tag is invariant across writes; a torn read keeps
+    that constant tag and an 8-byte single-word (hence non-torn) pointer payload
+    → a valid `Object(ptr-or-null)`, never a spliced garbage pointer. It is
+    therefore formal UB (non-atomic read racing non-atomic write) rather than a
+    reachable memory-safety hole — but "benign" is not rigorously provable under
+    `repr(Rust)`.
+  - **Real options (need a decision):** (a) full atomic-per-word slot access
+    across *all* readers/writers incl. the JIT (large, perf-sensitive);
+    (b) restructure `concurrent_mark_step` to drop the `regions` lock so the
+    stripe-lock becomes order-safe (medium, but loses the lock's other
+    guarantees); (c) make `Value` carry an explicit, stably-located ref word
+    (layout change, JIT impact); (d) accept + formally document the benign race
+    with a targeted concurrency (loom/TSan-style) test and add STW `debug_assert`s
+    to the three evacuation sites. Recommendation: (d) now (low-risk, honest),
+    escalate to (b) if/when G1 is promoted toward default.
+- Steps 5–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
   validation) and Step 5 (moving-GC root-parity audit under G1).
 
 ---
