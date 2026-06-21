@@ -3210,6 +3210,11 @@ struct CriticalCopy {
     len: usize,
     /// Bytes per element (the contiguous buffer is `len * stride` bytes).
     stride: usize,
+    /// G1 region(s) pinned for this critical section (Step 6 / JEP 423) so the
+    /// backing array cannot be relocated before the copy-back at `Release`.
+    /// Empty under the generational collector. Released on the final
+    /// `ReleasePrimitiveArrayCritical` (not on `JNI_COMMIT`).
+    pinned_regions: Vec<usize>,
 }
 
 /// Bytes per stored element for a primitive array element type.
@@ -3335,6 +3340,15 @@ extern "C" fn jni_get_primitive_array_critical(
         }
         let ptr = buf.as_mut_ptr();
         std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
+
+        // Step 6 (JEP 423): pin the array's G1 region for the critical section so
+        // a moving young/mixed collection cannot relocate it before the copy-back
+        // at Release. The copy-back re-resolves the Get-time array handle
+        // (`jobject_to_obj(copy.array)`); if the array had been evacuated that raw
+        // address would be stale (data loss / write to a recycled object). Empty
+        // (no-op) under the generational collector. Released by
+        // `ReleasePrimitiveArrayCritical`.
+        let pinned_regions = shared.heap.pin_critical_region(oref);
         JNI_CRITICAL_COPIES.with(|c| {
             c.borrow_mut().insert(
                 ptr as usize,
@@ -3343,12 +3357,14 @@ extern "C" fn jni_get_primitive_array_critical(
                     element_type,
                     len,
                     stride,
+                    pinned_regions,
                 },
             );
         });
         // Keep-alive ONLY (not no-relocation): pin the source array so it cannot
         // be reclaimed before the copy-back at Release. Unpinned by
-        // `ReleasePrimitiveArrayCritical`. Data safety comes from the copy.
+        // `ReleasePrimitiveArrayCritical`. Data safety comes from the copy; the
+        // region pin above additionally keeps the array in place under G1.
         pin_critical_array(oref, ptr as usize);
         if !is_copy.is_null() {
             unsafe {
@@ -3401,6 +3417,16 @@ extern "C" fn jni_release_primitive_array_critical(
         });
     }
     if mode != 1 {
+        // Step 6 (JEP 423): release the G1 region pin(s) taken at Get. Done on
+        // the FINAL release only — NOT on JNI_COMMIT (mode 1), whose section
+        // continues and must keep the array pinned in place. No-op / empty under
+        // the generational collector.
+        if !copy.pinned_regions.is_empty() {
+            with_shared_vm(|shared| {
+                shared.heap.unpin_critical_regions(&copy.pinned_regions);
+                Some(())
+            });
+        }
         // Reconstruct the `Vec<u8>` with its original layout and drop it.
         let byte_len = copy.len * copy.stride;
         // SAFETY: `carray` was produced by `Vec::<u8>::as_mut_ptr` +
@@ -3411,7 +3437,8 @@ extern "C" fn jni_release_primitive_array_critical(
         }
     } else {
         // JNI_COMMIT: we kept the buffer alive but already removed it from the
-        // map; re-insert so a later release can still find it.
+        // map; re-insert so a later release can still find it (the region pin
+        // taken at Get also stays held for the continuing section).
         JNI_CRITICAL_COPIES.with(|c| {
             c.borrow_mut().insert(carray as usize, copy);
         });
