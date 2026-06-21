@@ -147,24 +147,31 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     window (a `was_in_collection_set(old_ptr)` accepted alongside `is_heap_addr`),
     mirroring gen's "from-space still resolvable during remap". Needs its own
     focused change + the frame.rs collision tests re-run.
-  - **GAP C — Panama/FFM upcall targets never rooted (MEDIUM, affects BOTH
-    collectors) — DOCUMENTED.** `native-builtins/src/panama.rs` UPCALL_REGISTRY
-    holds an upcall stub's target `ObjectRef` (also leaked into the libffi closure)
-    with ZERO `register_native_root_source` calls, so it is neither scanned nor
-    remapped — a moving-GC UAF on the next upcall. Not G1-specific (any moving
-    collector); manifests under G1 young because objects actually move. Fix:
-    register a native-root source (scan+remap) for the upcall registry, like
-    `oscache.rs:175`.
+  - **GAP C — Panama/FFM upcall targets never rooted (MEDIUM, both collectors)
+    — FIXED.** The libffi upcall trampoline dispatched to a Java target reachable
+    only through a leaked `UpcallUserdata.target` (an `ObjectRef`) that nothing
+    scanned or remapped — a moving-GC UAF on the next upcall once the target was
+    collected or relocated. Fix: make `UpcallUserdata.target` an `AtomicUsize`
+    (remappable in place; the trampoline loads it per dispatch), hold the leaked
+    userdata pointer in `UPCALL_REGISTRY`, and export
+    `panama::{gc_scan_upcall_target_roots, gc_update_upcall_target_refs}` wired into
+    the VM root scan (`roots.rs`) and `update_all_roots` (`gc.rs`) — the same
+    `gc_scan_*`/`gc_update_*` idiom xnio/selector/classloader use. Regression test
+    `upcall_target_root_scan_and_remap_gap_c`; the existing
+    `new18_upcall_libffi_closure_dispatches_to_java` exercises the atomic-load
+    trampoline read. (Note: the *legacy* `ctx.register_upcall` slot-table copy is a
+    separate, pre-existing un-rooted path — out of scope here.)
   - **GAP D — ec_watch table not remapped on multi-thread GC paths (LOW,
-    diagnostic-only) — DOCUMENTED.** `ec_watch::remap` is missing from the two
-    multi-threaded initiator paths (`maybe_gc_forced`, `force_gc_with_finalizers`);
-    degrades only the debug corruption-watch, no production UAF.
-  - The synthesizer also DOWNGRADED a `monitor_on_exit` over-claim: it is reachable
-    via local-0 / class-mirror in the normal case, so it is in `pointer_map`; the
+    diagnostic-only) — FIXED.** Added the missing `ec_watch::remap` after
+    `update_all_roots` in the multi-threaded `maybe_gc_forced` and
+    `force_gc_from_native` initiator paths (the single-threaded paths already had
+    it). Diagnostic consistency only — no production UAF.
+  - The audit also DOWNGRADED a `monitor_on_exit` over-claim: it is reachable via
+    local-0 / class-mirror in the normal case, so it is in `pointer_map`; the
     residual (a method overwriting local 0) is pre-existing and not G1-specific.
-  - Remaining for Step 5: implement the GAP A G1-lifecycle fix + GAP C registration,
-    and a moving-GC stress test (smuggled jobject + multi-thread precise-JIT frame
-    relocated under `-XX:+UseG1GC`) asserting no staleness.
+  - Remaining for Step 5: the GAP A fix shipped a per-slot remap correction; a
+    fuller moving-GC stress test (multi-thread precise-JIT frame + FFM upcall
+    relocated under `-XX:+UseG1GC`) asserting no staleness is still worthwhile.
 - Steps 6–10 — not started. Next highest-value: Step 8 (opt-in G1 gauntlet
   validation).
 

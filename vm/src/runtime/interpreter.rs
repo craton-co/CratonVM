@@ -653,6 +653,13 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: remap the ec_watch corruption-watch table across this
+            // multi-threaded forced collection too. The single-threaded GC paths
+            // already do (mirrors the `update_all_roots` -> `ec_watch::remap`
+            // pairing at maybe_gc:419 / maybe_gc_forced:636); this multi-threaded
+            // initiator path was missing it, so a relocating G1 evacuation left
+            // ec_watch holders stale and the watchpoint read moved-away memory.
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
@@ -790,6 +797,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
+            // across this multi-threaded finalizer collection (single-threaded
+            // paths already remap it; this initiator path was missing the call).
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
             }

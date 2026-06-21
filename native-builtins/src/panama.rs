@@ -2058,8 +2058,14 @@ use libffi::middle::{Cif as MiddleCif, Closure, Type as MiddleType};
 struct UpcallEntry {
     /// libffi closure object — owns the executable trampoline page.
     _closure: Box<Closure<'static>>,
-    /// Java target object the closure dispatches to.
-    _target: ObjectRef,
+    /// The leaked `&'static UpcallUserdata` the trampoline reads its target from.
+    /// Held here (the closure captures the same allocation) so the GC root
+    /// scan/remap can reach and rewrite `target` in place — see
+    /// `gc_scan_upcall_target_roots` / `gc_update_upcall_target_refs`. Step 5
+    /// GAP C: the upcall target is a live Java object the native trampoline
+    /// holds; without this it was neither kept alive nor remapped across a
+    /// moving GC (use-after-free on the next upcall).
+    userdata: *const UpcallUserdata,
 }
 
 // SAFETY: libffi closures are immutable after construction and their
@@ -2070,7 +2076,12 @@ unsafe impl Sync for UpcallEntry {}
 
 /// Userdata captured by every upcall trampoline.
 struct UpcallUserdata {
-    target: ObjectRef,
+    /// Java target object address (a relocatable heap pointer), stored as an
+    /// `AtomicUsize` so the GC remap (`gc_update_upcall_target_refs`) can rewrite
+    /// it in place after a moving collection. The trampoline loads it on each
+    /// dispatch; both run at a stop-the-world safepoint relative to one another,
+    /// so `Relaxed` is sufficient.
+    target: std::sync::atomic::AtomicUsize,
     param_kinds: Vec<i32>,
     return_kind: i32,
 }
@@ -2081,6 +2092,48 @@ static UPCALL_REGISTRY: std::sync::OnceLock<
 
 fn upcall_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, UpcallEntry>> {
     UPCALL_REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Step 5 GAP C — GC root scan for FFM/Panama upcall targets. Each registered
+/// upcall trampoline holds a live Java target (a `MethodHandle`/lambda) only
+/// through its leaked `UpcallUserdata.target`, which is otherwise invisible to
+/// the GC. Push every one so a moving collector keeps it alive and records its
+/// relocation in the pointer map. Companion of [`gc_update_upcall_target_refs`]
+/// — the two MUST visit the identical set. Called from the VM root scan
+/// (`memory::roots`). The registry mutex is a leaf lock (no Java allocation
+/// while held), so this is safe to call at a stop-the-world safepoint.
+pub fn gc_scan_upcall_target_roots(out: &mut Vec<ObjectRef>) {
+    let reg = upcall_registry().lock();
+    for entry in reg.values() {
+        // SAFETY: `userdata` is a leaked `&'static UpcallUserdata`, alive for the
+        // whole process (the closure captures the same allocation).
+        let addr = unsafe { (*entry.userdata).target.load(std::sync::atomic::Ordering::Relaxed) };
+        if addr != 0 {
+            // SAFETY: a non-zero, 8-byte-aligned heap address previously stored
+            // from a live `ObjectRef`; used only as a GC root here.
+            out.push(unsafe { ObjectRef::from_raw(addr as *mut u8) });
+        }
+    }
+}
+
+/// Step 5 GAP C — post-move remap for upcall targets (companion of
+/// [`gc_scan_upcall_target_roots`]). After a moving collection relocates a
+/// target, rewrite each `UpcallUserdata.target` in place so the next trampoline
+/// dispatch reaches the new address. Called from the VM's `update_all_roots`.
+pub fn gc_update_upcall_target_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let reg = upcall_registry().lock();
+    for entry in reg.values() {
+        // SAFETY: see `gc_scan_upcall_target_roots`.
+        let cell = unsafe { &(*entry.userdata).target };
+        let old = cell.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            cell.store(new, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// libffi `Callback<UpcallUserdata, u64>` — runs whenever the trampoline
@@ -2122,6 +2175,15 @@ unsafe extern "C" fn upcall_dispatch(
         java_args.push(v);
     }
 
+    // GAP C: read the GC-remappable target address atomically before re-entering
+    // Java. The remap (`gc_update_upcall_target_refs`) rewrites `userdata.target`
+    // in place at a stop-the-world safepoint, so the next dispatch loads the new
+    // address; this load and that store never overlap (STW).
+    let target = unsafe {
+        cratonvm_types::ObjectRef::from_raw(
+            userdata.target.load(std::sync::atomic::Ordering::Relaxed) as *mut u8,
+        )
+    };
     // Dispatch into Java via the active NativeContext.
     let dispatch_result = plf::with_active_context(|ctx| {
         // The Java target is a MethodHandle / functional interface impl.
@@ -2138,11 +2200,11 @@ unsafe extern "C" fn upcall_dispatch(
             ctx.set_array_element(arr, i, *v);
         }
         ctx.invoke_virtual(
-            userdata.target,
+            target,
             "invoke",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             &[
-                Value::Object(Some(userdata.target)),
+                Value::Object(Some(target)),
                 Value::Object(Some(arr)),
             ],
         )
@@ -2224,7 +2286,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     // Heap-allocate userdata so the closure has a stable reference.
     let userdata = Box::new(UpcallUserdata {
-        target,
+        target: std::sync::atomic::AtomicUsize::new(target.as_ptr() as usize),
         param_kinds: param_kinds.clone(),
         return_kind,
     });
@@ -2240,7 +2302,9 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         code_ptr,
         UpcallEntry {
             _closure: boxed_closure,
-            _target: target,
+            // Same leaked allocation the closure captured — the GC root scan/remap
+            // reach `target` through this (Step 5 GAP C).
+            userdata: userdata_ptr as *const UpcallUserdata,
         },
     );
 
@@ -4618,5 +4682,55 @@ mod tests {
             r.is_err(),
             "downcall must be denied when native access is disabled"
         );
+    }
+
+    #[test]
+    fn upcall_target_root_scan_and_remap_gap_c() {
+        // Step 5 GAP C: a leaked FFM/Panama upcall target must be reported as a
+        // GC root and remapped in place after a move. Build a minimal registered
+        // upcall around a fake target address, then scan + remap.
+        let userdata = Box::new(UpcallUserdata {
+            target: std::sync::atomic::AtomicUsize::new(0xABCD_0000),
+            param_kinds: Vec::new(),
+            return_kind: -1,
+        });
+        let userdata_ptr: &'static UpcallUserdata = Box::leak(userdata);
+        let cif = MiddleCif::new(Vec::new(), MiddleType::void());
+        let closure = Closure::new(cif, upcall_dispatch, userdata_ptr);
+        let code_ptr = *closure.code_ptr() as *const () as usize;
+        upcall_registry().lock().insert(
+            code_ptr,
+            UpcallEntry {
+                _closure: Box::new(closure),
+                userdata: userdata_ptr as *const UpcallUserdata,
+            },
+        );
+
+        // Scan reports the (fake) target as a root.
+        let mut roots = Vec::new();
+        gc_scan_upcall_target_roots(&mut roots);
+        assert!(
+            roots.iter().any(|r| r.as_ptr() as usize == 0xABCD_0000),
+            "upcall target must be scanned as a GC root"
+        );
+
+        // Remap 0xABCD_0000 -> 0xABCD_8000; the leaked userdata is rewritten.
+        let mut map = std::collections::HashMap::new();
+        map.insert(0xABCD_0000usize, 0xABCD_8000usize);
+        gc_update_upcall_target_refs(&map);
+        assert_eq!(
+            userdata_ptr.target.load(std::sync::atomic::Ordering::Relaxed),
+            0xABCD_8000,
+            "upcall target must be remapped in place"
+        );
+        let mut roots2 = Vec::new();
+        gc_scan_upcall_target_roots(&mut roots2);
+        assert!(
+            roots2.iter().any(|r| r.as_ptr() as usize == 0xABCD_8000),
+            "re-scan must report the moved target"
+        );
+
+        // Don't leak our entry into other tests sharing the global registry.
+        upcall_registry().lock().remove(&code_ptr);
     }
 }
