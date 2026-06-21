@@ -61,7 +61,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::native::jni::{get_java_vm, get_jni_env, set_jni_context_arc};
+use cratonvm_vm::native::jni::{
+    clear_jni_context, get_java_vm, get_jni_env, set_jni_context_arc,
+};
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -790,8 +792,14 @@ pub extern "C" fn cratonvm_destroy(vm: *mut CratonVm) {
         // SAFETY: caller contract — `vm` came from `cratonvm_create` and is not
         // double-freed. Reclaim the Box and drop it.
         let boxed = unsafe { Box::from_raw(vm) };
-        // Clear this thread's JNI context if it still points here is not
-        // tracked precisely; dropping the VM releases its Arc regardless.
+        // Release this VM's opaque-handle table (and the global refs that pinned
+        // its objects as GC roots) so they are not leaked for the process life.
+        drop_handle_table(&boxed.vm.shared);
+        // Clear this thread's JNI TLS context: `cratonvm_create` published it to
+        // point at this VM, and once the VM is dropped that `Arc<SharedVm>` would
+        // otherwise dangle in TLS — a later JNIEnv-table call on this thread
+        // would resolve a freed VM. Clearing drops the TLS `Arc` for this thread.
+        clear_jni_context();
         drop(boxed);
     }));
 }
