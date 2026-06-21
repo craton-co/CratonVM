@@ -311,6 +311,18 @@ pub enum VectorArrangement {
 /// byte buffer that can later be copied into executable memory.
 pub struct Aarch64Emitter {
     code: Vec<u8>,
+    /// Sticky flag set when a branch/patch target offset does not fit the
+    /// instruction's immediate field (e.g. a B/BL beyond ±128 MB, a
+    /// conditional/CBZ branch beyond ±1 MB, or a TBZ beyond ±32 KB).
+    ///
+    /// AArch64 branch immediates are masked into a fixed-width field, so an
+    /// out-of-range offset would silently wrap to a wrong target and corrupt
+    /// control flow. Rather than miscompile, the encoder/patcher records the
+    /// overflow here (in addition to a hard `debug_assert!`) and the codegen
+    /// driver bails to the interpreter — mirroring the x86-64 backend's
+    /// `ExecutableBuffer::overflowed` rel8/rel32 `DisplacementOverflow`
+    /// handling (`jit/src/lib.rs`).
+    overflow: bool,
 }
 
 #[allow(dead_code)]
@@ -319,12 +331,39 @@ impl Aarch64Emitter {
     pub fn new() -> Self {
         Self {
             code: Vec::with_capacity(1024),
+            overflow: false,
         }
     }
 
     /// Return a reference to the generated machine code.
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    /// Whether any branch encoder or patch helper has seen an out-of-range
+    /// offset since this emitter was created. When `true`, the generated code
+    /// contains at least one truncated branch target and MUST NOT be executed;
+    /// the codegen driver should discard it and fall back to the interpreter.
+    ///
+    /// The flag is sticky: once set it stays set, so a single check after all
+    /// emission/patching is sufficient.
+    #[inline]
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Record a branch-offset range overflow: trips a hard `debug_assert!`
+    /// (loud failure in debug builds / tests) and sets the sticky
+    /// [`overflowed`](Self::overflowed) flag so release builds bail to the
+    /// interpreter instead of executing a wrong-target branch.
+    #[inline]
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    fn mark_branch_overflow(&mut self, kind: &str, delta: i64) {
+        debug_assert!(
+            false,
+            "aarch64 {kind} branch offset {delta} out of range — would truncate to a wrong target"
+        );
+        self.overflow = true;
     }
 
     /// Current offset (byte position) in the code buffer.
@@ -787,6 +826,9 @@ impl Aarch64Emitter {
     /// Returns the offset of this instruction for later patching.
     pub fn b(&mut self, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm26_fits(offset as i64) {
+            self.mark_branch_overflow("B", offset as i64);
+        }
         let imm26 = ((offset >> 2) as u32) & 0x03FF_FFFF;
         let inst = 0b000101_00_0000_0000_0000_0000_0000_0000u32 | imm26;
         self.emit_u32(inst);
@@ -796,6 +838,9 @@ impl Aarch64Emitter {
     /// BL <offset>  (branch with link)
     pub fn bl(&mut self, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm26_fits(offset as i64) {
+            self.mark_branch_overflow("BL", offset as i64);
+        }
         let imm26 = ((offset >> 2) as u32) & 0x03FF_FFFF;
         let inst = 0b100101_00_0000_0000_0000_0000_0000_0000u32 | imm26;
         self.emit_u32(inst);
@@ -832,6 +877,9 @@ impl Aarch64Emitter {
     /// `offset` is in bytes, must be 4-aligned, range +/- 1MB.
     pub fn b_cond(&mut self, cond: Cond, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm19_fits(offset as i64) {
+            self.mark_branch_overflow("B.cond", offset as i64);
+        }
         let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
         // 0101010 0 imm19(19) 0 cond(4)
         let inst = 0x5400_0000 | (imm19 << 5) | cond.enc();
@@ -842,6 +890,9 @@ impl Aarch64Emitter {
     /// CBZ Xt, <offset>  (compare and branch if zero, 64-bit)
     pub fn cbz(&mut self, rt: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm19_fits(offset as i64) {
+            self.mark_branch_overflow("CBZ", offset as i64);
+        }
         let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
         // sf=1, 011010 0 imm19 Rt
         let inst = 0xB400_0000 | (imm19 << 5) | rt.enc();
@@ -852,6 +903,9 @@ impl Aarch64Emitter {
     /// CBZ Wt, <offset>  (32-bit)
     pub fn cbz_w(&mut self, rt: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm19_fits(offset as i64) {
+            self.mark_branch_overflow("CBZ (W)", offset as i64);
+        }
         let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
         let inst = 0x3400_0000 | (imm19 << 5) | rt.enc();
         self.emit_u32(inst);
@@ -861,6 +915,9 @@ impl Aarch64Emitter {
     /// CBNZ Xt, <offset>  (compare and branch if not zero, 64-bit)
     pub fn cbnz(&mut self, rt: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm19_fits(offset as i64) {
+            self.mark_branch_overflow("CBNZ", offset as i64);
+        }
         let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
         let inst = 0xB500_0000 | (imm19 << 5) | rt.enc();
         self.emit_u32(inst);
@@ -870,6 +927,9 @@ impl Aarch64Emitter {
     /// CBNZ Wt, <offset>  (32-bit)
     pub fn cbnz_w(&mut self, rt: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm19_fits(offset as i64) {
+            self.mark_branch_overflow("CBNZ (W)", offset as i64);
+        }
         let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
         let inst = 0x3500_0000 | (imm19 << 5) | rt.enc();
         self.emit_u32(inst);
@@ -880,6 +940,9 @@ impl Aarch64Emitter {
     /// `bit` is 0..63, `offset` in bytes (4-aligned), range +/- 32KB.
     pub fn tbz(&mut self, rt: Reg, bit: u8, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm14_fits(offset as i64) {
+            self.mark_branch_overflow("TBZ", offset as i64);
+        }
         let imm14 = ((offset >> 2) as u32) & 0x3FFF;
         let b5 = ((bit as u32) >> 5) & 1;
         let b40 = (bit as u32) & 0x1F;
@@ -892,6 +955,9 @@ impl Aarch64Emitter {
     /// TBNZ Xt, #bit, <offset>  (test bit and branch if not zero)
     pub fn tbnz(&mut self, rt: Reg, bit: u8, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm14_fits(offset as i64) {
+            self.mark_branch_overflow("TBNZ", offset as i64);
+        }
         let imm14 = ((offset >> 2) as u32) & 0x3FFF;
         let b5 = ((bit as u32) >> 5) & 1;
         let b40 = (bit as u32) & 0x1F;
@@ -907,6 +973,9 @@ impl Aarch64Emitter {
     /// ADR Xd, <offset>  (PC-relative, +/- 1MB)
     pub fn adr(&mut self, rd: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm21_fits(offset as i64) {
+            self.mark_branch_overflow("ADR", offset as i64);
+        }
         let imm = offset as u32;
         let immlo = imm & 0x3;
         let immhi = (imm >> 2) & 0x7FFFF;
@@ -918,6 +987,9 @@ impl Aarch64Emitter {
     /// ADRP Xd, <offset>  (PC-relative page, +/- 4GB)
     pub fn adrp(&mut self, rd: Reg, offset: i32) -> usize {
         let pos = self.offset();
+        if !imm21_fits(offset as i64) {
+            self.mark_branch_overflow("ADRP", offset as i64);
+        }
         let imm = offset as u32;
         let immlo = imm & 0x3;
         let immhi = (imm >> 2) & 0x7FFFF;
@@ -959,7 +1031,11 @@ impl Aarch64Emitter {
     /// Patch a B or BL instruction at `offset` to branch to `target`.
     /// Both `offset` and `target` are byte positions in the code buffer.
     pub fn patch_branch(&mut self, offset: usize, target: usize) {
-        let delta = (target as i64 - offset as i64) as i32;
+        let delta64 = target as i64 - offset as i64;
+        if !imm26_fits(delta64) {
+            self.mark_branch_overflow("B/BL patch", delta64);
+        }
+        let delta = delta64 as i32;
         let imm26 = ((delta >> 2) as u32) & 0x03FF_FFFF;
         // Read existing opcode to preserve B vs BL distinction.
         let existing = u32::from_le_bytes([
@@ -976,7 +1052,11 @@ impl Aarch64Emitter {
 
     /// Patch a B.cond / CBZ / CBNZ instruction at `offset` to target `target`.
     pub fn patch_bcond(&mut self, offset: usize, target: usize) {
-        let delta = (target as i64 - offset as i64) as i32;
+        let delta64 = target as i64 - offset as i64;
+        if !imm19_fits(delta64) {
+            self.mark_branch_overflow("B.cond/CBZ patch", delta64);
+        }
+        let delta = delta64 as i32;
         let imm19 = ((delta >> 2) as u32) & 0x7FFFF;
         let existing = u32::from_le_bytes([
             self.code[offset],
@@ -992,7 +1072,11 @@ impl Aarch64Emitter {
 
     /// Patch an ADR instruction at `offset` with the given target.
     pub fn patch_adr(&mut self, offset: usize, target: usize) {
-        let delta = (target as i64 - offset as i64) as i32;
+        let delta64 = target as i64 - offset as i64;
+        if !imm21_fits(delta64) {
+            self.mark_branch_overflow("ADR patch", delta64);
+        }
+        let delta = delta64 as i32;
         let imm = delta as u32;
         let immlo = imm & 0x3;
         let immhi = (imm >> 2) & 0x7FFFF;
@@ -1011,7 +1095,11 @@ impl Aarch64Emitter {
     /// Patch a LDR (literal) instruction at `offset` so that it loads from `target`.
     /// The delta must be a multiple of 4 (both are instruction-aligned offsets).
     pub fn patch_ldr_literal(&mut self, offset: usize, target: usize) {
-        let delta = (target as i64 - offset as i64) as i32;
+        let delta64 = target as i64 - offset as i64;
+        if !imm19_fits(delta64) {
+            self.mark_branch_overflow("LDR-literal patch", delta64);
+        }
+        let delta = delta64 as i32;
         let imm19 = ((delta >> 2) as u32) & 0x7FFFF;
         let existing = u32::from_le_bytes([
             self.code[offset],
@@ -1308,6 +1396,43 @@ enum ShiftType {
     LSR = 0b01,
     ASR = 0b10,
     ROR = 0b11, // only for logic ops
+}
+
+// ---------------------------------------------------------------------------
+// Branch-offset range checks
+// ---------------------------------------------------------------------------
+//
+// AArch64 PC-relative branch immediates are masked into a fixed-width field,
+// so an offset that does not fit silently wraps to a wrong target. These
+// helpers report whether a *byte* offset is encodable, so the encoders/patchers
+// can flag overflow (see `Aarch64Emitter::mark_branch_overflow`) instead of
+// emitting a truncated branch.
+
+/// `B`/`BL` imm26: byte offset must be 4-aligned and within ±128 MB.
+/// The field stores `offset >> 2`, a 26-bit signed value, so the byte range is
+/// −2^27 ..= 2^27 − 4.
+#[inline]
+fn imm26_fits(delta: i64) -> bool {
+    (delta & 0b11) == 0 && (-(1 << 27)..(1 << 27)).contains(&delta)
+}
+
+/// `B.cond`/`CBZ`/`CBNZ`/`LDR(literal)` imm19: 4-aligned, within ±1 MB.
+#[inline]
+fn imm19_fits(delta: i64) -> bool {
+    (delta & 0b11) == 0 && (-(1 << 20)..(1 << 20)).contains(&delta)
+}
+
+/// `TBZ`/`TBNZ` imm14: 4-aligned, within ±32 KB.
+#[inline]
+fn imm14_fits(delta: i64) -> bool {
+    (delta & 0b11) == 0 && (-(1 << 15)..(1 << 15)).contains(&delta)
+}
+
+/// `ADR`/`ADRP` imm21: a 21-bit signed value (unscaled for ADR; pages for
+/// ADRP). Range −2^20 ..= 2^20 − 1.
+#[inline]
+fn imm21_fits(delta: i64) -> bool {
+    (-(1 << 20)..(1 << 20)).contains(&delta)
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,5 +2169,113 @@ mod tests {
         // we need 0xFFFF_FFFF_FFFF_0000. So MOVN X5, #0xFFFF, LSL#0.
         // NOT of (0x000000000000FFFF) = 0xFFFFFFFFFFFF0000. Correct!
         assert_eq!(e.code().len(), 4); // single instruction
+    }
+
+    // -- Branch-offset range checks ----------------------------------------
+
+    #[test]
+    fn test_imm_fits_boundaries() {
+        // imm26 (B/BL): ±128 MB, 4-aligned.
+        assert!(imm26_fits(0));
+        assert!(imm26_fits((1 << 27) - 4));
+        assert!(imm26_fits(-(1 << 27)));
+        assert!(!imm26_fits(1 << 27)); // just out of range
+        assert!(!imm26_fits(-(1 << 27) - 4));
+        assert!(!imm26_fits(2)); // not 4-aligned
+
+        // imm19 (B.cond/CBZ/CBNZ/LDR-literal): ±1 MB.
+        assert!(imm19_fits((1 << 20) - 4));
+        assert!(imm19_fits(-(1 << 20)));
+        assert!(!imm19_fits(1 << 20));
+        assert!(!imm19_fits(-(1 << 20) - 4));
+        assert!(!imm19_fits(1)); // not 4-aligned
+
+        // imm14 (TBZ/TBNZ): ±32 KB.
+        assert!(imm14_fits((1 << 15) - 4));
+        assert!(imm14_fits(-(1 << 15)));
+        assert!(!imm14_fits(1 << 15));
+        assert!(!imm14_fits(-(1 << 15) - 4));
+
+        // imm21 (ADR/ADRP): 21-bit signed, unscaled.
+        assert!(imm21_fits((1 << 20) - 1));
+        assert!(imm21_fits(-(1 << 20)));
+        assert!(!imm21_fits(1 << 20));
+        assert!(!imm21_fits(-(1 << 20) - 1));
+    }
+
+    #[test]
+    fn test_in_range_branch_does_not_overflow() {
+        let mut e = Aarch64Emitter::new();
+        e.b(0x100);
+        e.b_cond(Cond::EQ, -0x40);
+        e.tbz(Reg::X0, 5, 8);
+        e.cbz(Reg::X3, (1 << 20) - 4);
+        assert!(
+            !e.overflowed(),
+            "in-range branches must not set the overflow flag"
+        );
+    }
+
+    #[test]
+    fn test_in_range_patch_does_not_overflow() {
+        let mut e = Aarch64Emitter::new();
+        let p = e.b(0);
+        // Patch to a nearby in-range target.
+        e.patch_branch(p, p + 0x20);
+        assert!(!e.overflowed());
+    }
+
+    // The encoders trip a `debug_assert!` on overflow (loud failure in
+    // debug/test builds) AND set the sticky `overflowed` flag so release
+    // builds bail to the interpreter. Here we confirm the debug-assert fires
+    // for each out-of-range field by catching the unwind.
+
+    fn assert_branch_panics<F>(f: F)
+    where
+        F: FnOnce() + std::panic::UnwindSafe,
+    {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the panic message
+        let result = std::panic::catch_unwind(f);
+        std::panic::set_hook(prev);
+        assert!(
+            result.is_err(),
+            "expected an out-of-range branch offset to trip debug_assert!"
+        );
+    }
+
+    #[test]
+    fn test_b_cond_beyond_1mb_overflows() {
+        // > ±1 MB conditional branch must not silently truncate.
+        assert_branch_panics(|| {
+            let mut e = Aarch64Emitter::new();
+            e.b_cond(Cond::NE, 1 << 20);
+        });
+    }
+
+    #[test]
+    fn test_tbz_beyond_32kb_overflows() {
+        // > ±32 KB test-bit branch must not silently truncate.
+        assert_branch_panics(|| {
+            let mut e = Aarch64Emitter::new();
+            e.tbz(Reg::X0, 3, 1 << 15);
+        });
+    }
+
+    #[test]
+    fn test_b_beyond_128mb_overflows() {
+        assert_branch_panics(|| {
+            let mut e = Aarch64Emitter::new();
+            e.b(1 << 27);
+        });
+    }
+
+    #[test]
+    fn test_patch_branch_out_of_range_overflows() {
+        assert_branch_panics(|| {
+            let mut e = Aarch64Emitter::new();
+            let p = e.b(0);
+            e.patch_branch(p, p + (1 << 27));
+        });
     }
 }
