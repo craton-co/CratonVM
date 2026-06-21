@@ -62,30 +62,46 @@ a state a healthy heap never reaches. Validated: bintrees10/14/18 =
 135854/3222190/68332206 (no false OOM at 8g), BigArrayOom caught, NegArray
 `NegativeArraySizeException`, fresh-OOM path intact.
 
-## Known remaining (layer 4 — separate, core-collector, higher risk)
+## Layer 4 — collector promotion abort — FIXED (merge `0f4177c4`)
 
-`ObjAllocOom.objLoop` (a `while(true)` retaining every `new Node()`) still
-aborts — now inside the **copying collector** during promotion (layer 4), which
-happens mid-`collect_garbage`, *before* the overhead limit (built from completed
-GCs) can fire. Diagnostic run confirmed the streak climbs correctly (freed=0,
-unproductive) but a promotion-failure abort lands at streak≈5.
+The moving (Cheney) young collector aborts the **process** mid-collection when
+it cannot relocate a survivor — old gen full AND young to-space overflowed during
+promotion-fallback (`gen_heap.rs` ~5255). This fires *inside* `collect_garbage`,
+before the overhead limit (built from completed GCs) can.
 
-Making `objLoop` fully catchable requires one of:
-- **Recoverable promotion failure:** thread the "could not relocate" failure up
-  out of the Cheney copy loop and abort the *collection* cleanly (revert / mark
-  OOM) rather than `process::abort()` — invasive (the copy runs per live object).
-- **Non-moving fallback collection** when to-space + old-gen can't hold all
-  survivors.
-- **Headroom reservation / pre-GC capacity gate:** refuse to start a moving GC
-  that provably can't evacuate (e.g. live young > to-space + old free) and OOM
-  upfront; then the overhead-limit/singleton path takes over.
+**Fix (`collect_garbage_inner`):** also route to the **non-moving young sweep**
+(`sweep_young_non_moving` — already the default + superior collector while JIT
+frames are active) when old gen cannot absorb a full young's worth of survivors
+(`old_gen_free < young_from_used`, the necessary precondition for the abort). The
+non-moving sweep never relocates, so it can't hit the abort: it reclaims dead
+young in place and leaves un-promotable survivors in young (graceful
+`old_full = true`, line ~3791), after which the allocation paths / GC-overhead
+limit surface a *catchable* OOM (the singleton). Opt out:
+`CRATONVM_NO_GC_PROMOTION_GUARD`. (The chosen approach is a refinement of the
+"non-moving fallback"; the pre-GC capacity-gate variant `young_from_used >
+to-space + old_free` can never fire because to-space == from-space size.)
 
-All three are core-collector changes and are tracked as a separate task. The
-landed building blocks (singleton + overhead limit) are prerequisites for any of
-them.
+Validated == HotSpot (caught + "alive after OOM"): `ObjAllocOom.objLoop` at **16m
+JIT-off, 64m JIT-on, 64m JIT-off** (3–7s), where it previously aborted. No
+regression: bintrees10/14/18 = 135854/3222190/68332206 (reroute doesn't fire at
+8g), sieve250k=22044, IrCall inc-22, BigArrayOom caught.
+
+## Known residual (layer 5 — non-moving-sweep perf, separate)
+
+`ObjAllocOom.objLoop` at **16m + JIT-on** no longer aborts (stale=0, no FATAL)
+and *does* eventually OOM — the GC-overhead streak reaches the limit (9 ≥ 8) —
+but only ~9 forced GCs occur in 70s, so it catches too slowly to be usable. The
+time is spent in the *regular* (non-forced) non-moving young GC at a tight heap,
+freeing slivers via promotion while old fills. This is a non-moving-sweep
+performance pathology (specific to tight-heap + JIT-active + fully-retained
+allocation), not the promotion abort and not a correctness defect (no abort, no
+crash, correct eventual OOM). The other three configs are fast. Tracked
+separately. Possible directions: extend overhead/productivity tracking to the
+regular young-GC path so the death-spiral is cut sooner, or speed up the
+non-moving sweep at small heaps.
 
 ## Note
 
 The earlier `POST-GC STALE STACK … objLoop` warnings seen during exploration did
-NOT reproduce at JIT-off on the diagnostic run (`stale=0`); they appear tied to a
-different (JIT-frame) scenario and are not the `objLoop` blocker — layer 4 is.
+NOT reproduce on the diagnostic runs (`stale=0`); they appear tied to a different
+(JIT-frame) scenario and are not an `objLoop` blocker.
