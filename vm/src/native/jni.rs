@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
@@ -518,8 +518,11 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
 
 pub struct JniGlobalRefs {
     /// Raw `Box<ObjectRef>` pointers (stored as usize for Send/Sync).
-    /// Each entry owns its allocation until `remove` is called.
-    entries: Vec<usize>,
+    /// Each entry owns its allocation until `remove` is called. Keyed by the
+    /// pointer itself so `resolve`/`remove` are O(1) on this hot path (the
+    /// handle is just `raw | 1`, so the untagged pointer is a unique key —
+    /// distinct `Box` allocations never collide).
+    entries: HashSet<usize>,
 }
 
 // Safety: `JniGlobalRefs` is stored behind `parking_lot::Mutex<>` in `SharedVm`.
@@ -534,7 +537,7 @@ unsafe impl Sync for JniGlobalRefs {}
 impl JniGlobalRefs {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashSet::new(),
         }
     }
 
@@ -542,7 +545,7 @@ impl JniGlobalRefs {
     pub fn add(&mut self, obj: ObjectRef) -> JObject {
         let boxed: Box<ObjectRef> = Box::new(obj);
         let raw = Box::into_raw(boxed) as usize; // OWNERSHIP: transferred to self.entries, freed by JniGlobalRefs::remove() or Drop impl
-        self.entries.push(raw);
+        self.entries.insert(raw);
         (raw | 1) as JObject
     }
 
@@ -552,8 +555,7 @@ impl JniGlobalRefs {
             return false; // not a global ref handle
         }
         let raw = (handle & !1) as usize;
-        if let Some(pos) = self.entries.iter().position(|&e| e == raw) {
-            self.entries.swap_remove(pos);
+        if self.entries.remove(&raw) {
             // Safety: raw was created by Box::into_raw and we own it.
             unsafe { drop(Box::from_raw(raw as *mut ObjectRef)) };
             true
