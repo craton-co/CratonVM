@@ -25,7 +25,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - SATB pre-barrier wired at remaining `aastore`/`putfield` sites plus a real stop-the-world for `newarray` (`vm/src/runtime/interpreter.rs`, `jit/src/runtime_helpers.rs`).
 - `gc` mutating heap entry points now require a `StopTheWorldToken` witness (`gc/src/lib.rs`).
 - Async-signal-safe SIGSEGV handler installed on Unix (no allocations, no locks) (`vm/src/runtime/signals.rs`).
-- AArch64 icache flush on Linux and FreeBSD after JIT code emission (`jit/src/aarch64/mod.rs`).
+- AArch64 icache flush on Linux and FreeBSD after JIT code emission (`jit/src/aarch64.rs`).
 - `vm` hot locks reordered through `OrderedMutex` matching `docs/lock-order.md` (`vm/src/lock_order.rs`).
 - JIT switch-target offsets are now overflow-checked; `try_patch` replaces panicking `patch_i32`/`patch_byte` (`jit/src/buffer.rs`).
 - `reader::ByteView::try_new` returns `Result` on overflow / misalignment instead of UB (`reader/src/byte_view.rs`).
@@ -47,7 +47,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 
 #### OSS / Distribution
 - `vm-cli` produces the `cratonvm` binary by default; the `java[.exe]` alias is opt-in via `--features java-bin-alias` so `cargo install` does not shadow a real JDK (`vm-cli/Cargo.toml`).
-- Added `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `THIRD_PARTY_NOTICES.md`, `CITATION.cff`, and a GitHub issue-template config (top-level + `.github/`).
+- Added `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `THIRD-PARTY-NOTICES.md`, and a GitHub issue-template config (top-level + `.github/`).
 - SPDX `Apache-2.0` headers on every Rust source file across the workspace.
 - MSRV bumped to 1.77 and synchronized across `README.md`, `BUILD_GUIDE.md`, `CONTRIBUTING.md`, and `docs/INSTALL.md`.
 - Workspace version raised to `0.3.0`; every inter-crate `path = "../<crate>"` declaration now carries `version = "0.3.0"` so `cargo publish --dry-run` accepts the manifest.
