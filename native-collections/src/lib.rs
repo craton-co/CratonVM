@@ -9259,7 +9259,11 @@ fn stream_make_lazy_derived(
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source);
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
-    ctx.set_field(stream, STREAM_FIELD_OP_CHAIN, Value::Object(Some(new_chain)));
+    ctx.set_field(
+        stream,
+        STREAM_FIELD_OP_CHAIN,
+        Value::Object(Some(new_chain)),
+    );
     stream_inherit_close_handlers(ctx, src, stream);
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -9325,8 +9329,7 @@ where
                 }
                 LAZY_OP_FILTER => {
                     if let Some(l) = op.lambda {
-                        let t =
-                            ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
+                        let t = ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
                         if !matches!(t, Some(Value::Int(x)) if x != 0) {
                             continue 'outer;
                         }
@@ -9679,7 +9682,12 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // `spring.config.name` binding). native-collections registers after
     // native-builtins (last-writer-wins), so this override wins; it materialises
     // via the chain-aware `stream_elements` before iterating.
-    r.register(c, "iterator", "()Ljava/util/Iterator;", native_stream_iterator);
+    r.register(
+        c,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_stream_iterator,
+    );
     r.register(
         "java/util/stream/BaseStream",
         "iterator",

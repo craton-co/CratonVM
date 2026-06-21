@@ -1344,8 +1344,7 @@ impl ValueStack {
                 // for the right reason, but skip the rewrite too so a primitive
                 // long/double whose bits coincidentally match a moved object's
                 // from-space address is never mutated.
-                if longroot_strict()
-                    && (self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE)
+                if longroot_strict() && (self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE)
                 {
                     continue;
                 }
