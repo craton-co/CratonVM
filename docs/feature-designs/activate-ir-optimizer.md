@@ -1593,6 +1593,104 @@ Both are long-only, so inert for the int path.
 `lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (long deopt-resume);
 then `double`/`float` (XMM); then long/double call args + returns.
 
+## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
+
+Status: **landed**, **default-OFF behind `CRATONVM_JIT_C2_FIRST_CALL`**. This is
+not a new optimizer increment — it is the change that makes increments **14–26
+actually run at runtime**. Until now they were correct (proven by the
+`ir_vs_singlepass` differential harness, which drives `try_compile` directly) but
+**latent**: in an ordinary run the optimizing IR pipeline (`jit::try_compile`,
+`optimize=true`) was essentially never invoked.
+
+**Root cause (by-design, NOT a regression — confirmed by git archaeology back to
+the initial open-source commit `a6dc911e`).** CratonVM compiles a method through
+several paths; only three reach `try_compile` (the warmup→`try_jit_upgrade_with_gate`
+sites at `interpreter.rs:17672/17788`, and the JIT-dispatch-helper path
+`try_jit_compile_callee_slow:18370`), and all pass `optimize=true`. But the
+**first-call compile block in `fn execute`** (`interpreter.rs` ~3132–3651) calls
+the single-pass backend `jit::x64::compile` **directly** on the first uncached
+invocation and publishes the body into `jit_cache`. Every other path (dispatcher
+warmup, OSR-reuse, background worker) probes `jit_cache` **first**, so any method
+first touched via `fn execute` is permanently single-pass-cached and the IR path
+is never reconsidered for it. OSR (`try_osr:16642`) is also single-pass. Net: the
+IR optimizer was unreached for the broad population of methods. **This also means
+the inc 21–25 "gate-ON ≡ gate-OFF" soaks were largely vacuous** — `ON==OFF` is the
+signature of the gated IR-call code never running for the benchmarked hot methods
+(their first-call single-pass artifact was cached first).
+
+**The fix.** In the `fn execute` first-call `or_else` (`interpreter.rs` ~3132),
+when `CRATONVM_JIT_C2_FIRST_CALL` is set: instead of eager single-pass, (a)
+invocation-count the method and, **below `CRATONVM_JIT_THRESHOLD` (default 500),
+return `None` so it interprets** — which *un-preempts* the dispatcher/OSR warmup
+paths already wired to `try_compile`; and (b) once hot, compile through
+`try_jit_compile_callee(…, optimize=true)` — which **subsumes single-pass** (its
+`try_compile_inner` falls back to `x64::compile_with_param_slots` internally for
+IR-incompatible bodies) — then re-fetch the cached body. The invocation gate is
+mandatory: the first-call block fires on call #1 of *every* uncached method, many
+run-once (class-load/reflection), so eager IR there would pay full C2 cost for
+zero benefit. Per-feature sub-gates are threaded identically to the upgrade path
+(`CRATONVM_JIT_IR_CALL` default-ON; `…_SPECIAL`/`…_LONG`/`…_CALL_VIRTUAL`
+default-OFF; `CRATONVM_JIT_SCALAR_NEW` default-ON). Default-OFF ⇒ the single-pass
+first-call path is byte-for-byte unchanged. (`c2_first_call_enabled()` +
+gated branch in `fn execute`; reuses `try_jit_compile_callee`.)
+
+**Validation — the IR path now fires at runtime, non-vacuously, and correctly:**
+- **Non-vacuous fire (the headline):** with the gate ON, `[cratonvm-ircall]`
+  (emitted only from `try_compile_inner`'s IR branch) fires for real methods —
+  `V.hot` (invokevirtual, +`CRATONVM_JIT_IR_CALL_VIRTUAL`), `IrCall.f`
+  (invokestatic), and `binarytrees.itemCheck` (recursive `invokestatic` +
+  `getfield`, allocation-heavy). With the gate **OFF the count is zero** — proving
+  the wiring, not a pre-existing path, is what makes IR reachable.
+- **Correct (IR == single-pass == HotSpot), gate-ON:** `V`=32961579424,
+  `IrCall`=1053069400800, `Cat2` (long params)=13500377993856, broad-JDK `Smoke`
+  (HashMap/ArrayList/sort/StringBuilder)=23033321990476 — all == HotSpot and ==
+  gate-OFF.
+- **GC-safe:** `binarytrees` bt10/14/16/18 == `135854 / 3222190 / 14985902 /
+  68332206` gate-ON (byte-exact; the canonical moving-GC stress, with `itemCheck`
+  on the IR path).
+- **P2 (category-2 params):** `Cat2`'s `long`-param method, which the eager
+  first-call path *refuses* (`count_param_slots_jvm_spec != count_param_slots`
+  guard), now compiles correctly via `try_compile`'s param-slot-aware path.
+- jit lib **820/820**, `ir_vs_singlepass` **34/34**, `cratonvm-vm` builds clean.
+
+**To soak / flip on.** This is the first time the IR optimizer becomes *broad* at
+runtime, so the gate stays OFF pending: (1) the full kafka/spring/tomcat/hibernate
+gauntlet with `CRATONVM_JIT_C2_FIRST_CALL=1` (GC-safety is the key risk — more
+methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS=1` and an
+`-Xmx6g`-vs-`-Xmx1g` A/B); (2) a perf pass — IR virtual/interface dispatch has no
+inline cache yet, so per-call dispatch is slower; an invocation-count default and
+an MIC/PIC fast path are the likely follow-ups before any default flip.
+
+**Scope (what this does and does NOT reach).** The dispatcher warmup path
+(`try_jit_upgrade_with_gate`) was *already* wired to `try_compile(optimize=true)`
+gate-OFF (`CRATONVM_JIT_IR_CALL` default-ON); what made the IR pipeline *de facto*
+dead was the **cache-precedence race** — `fn execute`'s eager first-call block
+single-pass-compiled on call #1 and published to `jit_cache` first, after which
+every later path's leading `jit_cache.get` returned the single-pass body. This fix
+removes that preemption for the `fn execute` population. It does **not** cover two
+populations: (a) methods reached only through the stackless dispatcher already use
+*its* warmup→`try_compile` once un-preempted (no change needed); (b) **OSR-dominated
+/ loop-on-first-call methods remain single-pass** — `try_osr` compiles via
+`x64::compile` directly (not `try_compile`) and fires at ~1000 back-edges *within a
+single invocation*, so a method whose first frame loops hot (stream pipelines,
+parsers, crypto inner loops) OSR-compiles and pins the cache before the c2
+invocation counter (500 *separate* invocations) ever crosses. Routing OSR through
+`try_compile(optimize=true)` is the natural follow-up to reach that slice. The
+three validated probes (V.hot / IrCall.f / itemCheck) are invoked >500× as separate
+calls before any single frame loops 1000×, which is exactly the shape this wiring
+targets — they are not representative of OSR-heavy loop kernels.
+
+**Caveats / follow-ups.** The bail-list becomes shared between the first-call and
+upgrade paths (`try_jit_compile_callee` uses the global `mark_jit_bail_listed`,
+vs the first-call path's local `jit_skip_set`) — bounded to genuine backend bails,
+which are path-independent. Below the warmup threshold the gated branch returns
+`None` WITHOUT sealing `jit_skip_set` (a `c2_not_hot` guard on the first-call seal),
+so the invocation counter survives across calls — without it an `execute`-only-hot
+method would be sealed on call #1 and never reach the counter. Trade-off vs gate-OFF:
+a method called 1–499× via `fn execute` then never again now interprets to completion
+where gate-OFF it single-pass-compiled on call #1 — a warmup-latency cost, acceptable
+for the gated soak.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.

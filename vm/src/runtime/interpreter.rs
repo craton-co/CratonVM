@@ -2436,6 +2436,21 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// activate-ir-optimizer (runtime wiring): cached `CRATONVM_JIT_C2_FIRST_CALL`
+/// flag. The `fn execute` first-call compile path uses the single-pass backend
+/// (`jit::x64::compile`) directly and caches a non-IR body on call #1, which
+/// preempts the optimizing IR pipeline (`jit::try_compile`) on every later path
+/// (dispatcher warmup, OSR, background worker all probe `jit_cache` first). When
+/// this flag is set, that eager first-call single-pass compile is replaced by an
+/// invocation-counted upgrade through `try_jit_compile_callee` →
+/// `jit::try_compile(optimize=true)` (which SUBSUMES single-pass), so hot methods
+/// actually reach the IR optimizer. Read once and cached (this is on the hot
+/// uncached-invocation path). Default-OFF → behaviour is byte-for-byte unchanged.
+fn c2_first_call_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some())
+}
+
 /// Execute a method on the given class.
 ///
 /// This is called by `invoke_on_class_shared` for non-native methods.
@@ -3129,7 +3144,62 @@ pub fn execute(
                     let jit_cache = shared.jit_cache.read();
                     jit_cache.get(&class_name_str, method_name, method_descriptor)
                 };
+                // CRATONVM_JIT_C2_FIRST_CALL: set when the gated branch DEFERS a
+                // not-yet-hot method (returns None to interpret rather than compile).
+                // The first-call-failure seal below must NOT fire for that case —
+                // sealing inserts `skip_key` into `jit_skip_set`, which makes the next
+                // call's `already_skipped` gate skip the whole JIT block, permanently
+                // stopping the invocation counter from ever re-running (so an
+                // `execute`-only-reached hot method would never compile gate-ON). A
+                // genuine hot-path backend bail (try_jit_compile_callee → None) leaves
+                // this false and still seals, matching the gate-OFF semantics.
+                let mut c2_not_hot = false;
                 let compiled = compiled.or_else(|| {
+                    // activate-ir-optimizer (runtime wiring, CRATONVM_JIT_C2_FIRST_CALL,
+                    // default-OFF): replace the eager single-pass first-call compile
+                    // below with an invocation-counted upgrade through the optimizing
+                    // IR pipeline. The eager `x64::compile` (further down) caches a
+                    // non-IR body on call #1 and thereby preempts `jit::try_compile`
+                    // on every later path. Here we instead: (a) count invocations and,
+                    // below the warmup threshold, return None so the method INTERPRETS
+                    // — which ALSO un-preempts the dispatcher/OSR warmup paths that are
+                    // already wired to `try_compile(optimize=true)`, so a method that
+                    // goes hot through the stackless dispatcher still reaches IR there;
+                    // and (b) once hot, compile via `try_jit_compile_callee` →
+                    // `jit::try_compile(optimize=true)`, which SUBSUMES single-pass
+                    // (it falls back to `x64::compile_with_param_slots` internally for
+                    // IR-incompatible bodies), then re-fetch the cached body. The
+                    // single-pass block below is unreached while the flag is set.
+                    if c2_first_call_enabled() {
+                        let invoc_key = {
+                            let mut h = 0u32;
+                            for &b in method_name.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32);
+                            }
+                            for &b in method_descriptor.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32);
+                            }
+                            ((class_id.as_u32() as u64) << 32) | (h as u64)
+                        };
+                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        if n < crate::runtime::env_cache::jit_invocation_threshold() {
+                            c2_not_hot = true; // defer, do NOT seal (counter must keep running)
+                            return None; // not hot yet — interpret (dispatcher/OSR may reach IR)
+                        }
+                        return match try_jit_compile_callee(
+                            shared,
+                            &class_name_str,
+                            method_name,
+                            method_descriptor,
+                            true, // optimize = C2 / optimizing IR pipeline
+                        ) {
+                            Some(_) => {
+                                let jit_cache = shared.jit_cache.read();
+                                jit_cache.get(&class_name_str, method_name, method_descriptor)
+                            }
+                            None => None,
+                        };
+                    }
                     let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
                     let code_len = code_attr.code.len();
                     let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
@@ -3650,7 +3720,7 @@ pub fn execute(
                     cached_result
                 });
 
-                if compiled.is_none() {
+                if compiled.is_none() && !c2_not_hot {
                     // RBC.4 — seal first-call compile failures for the same
                     // reason as the scan-reject seal above: without it every
                     // uncached invocation of a backend-bailing method re-ran
@@ -3658,6 +3728,11 @@ pub fn execute(
                     // transient resolver miss can still be compiled later by
                     // the invocation-counter upgrade path; the cache fast-path
                     // then routes calls to it.)
+                    //
+                    // `!c2_not_hot`: under CRATONVM_JIT_C2_FIRST_CALL a not-yet-hot
+                    // method returned None on purpose (to interpret until its
+                    // invocation counter crosses the threshold) — sealing it here
+                    // would set `already_skipped` and permanently stop that counter.
                     shared.jit_skip_set.write().insert(skip_key.clone());
                 }
                 if let Some(compiled) = compiled {
