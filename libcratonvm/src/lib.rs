@@ -555,20 +555,24 @@ impl CratonValue {
     }
 
     /// Convert an inbound `CratonValue` (from C) into a VM [`Value`].
-    /// Unknown tags map to `Value::Object(None)` (null) defensively.
-    fn to_value(self) -> Value {
+    /// Unknown tags map to `Value::Object(None)` (null) defensively. An
+    /// `OBJECT` payload is resolved through `shared`'s per-VM handle table, so
+    /// an unknown / stale token decodes to `null` rather than a raw address.
+    fn to_value(self, shared: &SharedVm) -> Value {
         match self.tag {
             craton_tag::INT => Value::Int(self.payload as u32 as i32),
             craton_tag::LONG => Value::Long(self.payload as i64),
             craton_tag::FLOAT => Value::Float(f32::from_bits(self.payload as u32)),
             craton_tag::DOUBLE => Value::Double(f64::from_bits(self.payload)),
-            craton_tag::OBJECT => Value::Object(ref_from_handle(self.payload)),
+            craton_tag::OBJECT => Value::Object(resolve_handle(shared, self.payload)),
             _ => Value::Object(None),
         }
     }
 
-    /// Convert an outbound VM [`Value`] into a `CratonValue` for C.
-    fn from_value(v: Value) -> Self {
+    /// Convert an outbound VM [`Value`] into a `CratonValue` for C. An object
+    /// reference is registered in `shared`'s per-VM handle table and returned
+    /// as an opaque token (never a raw heap address).
+    fn from_value(shared: &SharedVm, v: Value) -> Self {
         match v {
             Value::Int(i) => CratonValue {
                 tag: craton_tag::INT,
@@ -588,7 +592,7 @@ impl CratonValue {
             },
             Value::Object(o) => CratonValue {
                 tag: craton_tag::OBJECT,
-                payload: handle_from_ref(o),
+                payload: register_handle(shared, o),
             },
             // ReturnAddress / Uninitialized never escape a normal return; treat
             // as void so the C side sees a defined (if empty) result.
@@ -597,25 +601,114 @@ impl CratonValue {
     }
 }
 
-/// `ObjectRef` → `CratonRef` (`0` == null).
-fn handle_from_ref(o: Option<ObjectRef>) -> CratonRef {
-    match o {
-        Some(r) => r.as_ptr() as u64,
-        None => 0,
-    }
+// ---------------------------------------------------------------------------
+// Per-VM opaque-handle table.
+//
+// A `CratonRef` handed to the host MUST NOT be a raw heap address: a host that
+// fabricated, retained-past-GC, or corrupted such a value would steer the VM
+// into dereferencing an arbitrary pointer (use-after-free / out-of-bounds). So
+// every object handle is an **opaque token** validated against a per-VM table
+// before it is ever turned back into an `ObjectRef`.
+//
+// The table is layered on top of the VM's existing `JniGlobalRefs`
+// (`shared.jni_global_refs`), which is the only channel that (a) keeps the
+// referenced object alive as a GC root and (b) has its stored `ObjectRef`s
+// rewritten by the moving collector via `update_after_gc`. We never store a raw
+// pointer ourselves; the gref handle resolves to the live, GC-updated object.
+//
+// On top of that we add a **generation/liveness** layer keyed by a
+// monotonically increasing per-VM counter: tokens are never reused, so a token
+// for a destroyed table (or one the host invented) is rejected by a table miss
+// rather than aliasing a live entry (no ABA). Identical object refs dedup to a
+// single token so repeated returns of one object do not grow the table.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use cratonvm_vm::native::jni::JObject;
+use cratonvm_vm::SharedVm;
+
+/// One VM's opaque-token ↔ global-ref mapping.
+#[derive(Default)]
+struct VmHandleTable {
+    /// Next token to hand out. Starts at 1 (`0` is the reserved null token) and
+    /// only ever increases, so a token is never reused for a different object.
+    next_token: u64,
+    /// token → the `JniGlobalRefs` handle that owns the GC-rooted `ObjectRef`.
+    by_token: HashMap<u64, JObject>,
+    /// object address → token, so the same live object dedups to one token.
+    by_addr: HashMap<usize, u64>,
 }
 
-/// `CratonRef` → `Option<ObjectRef>` (`0` == null). The non-null pointer is
-/// reconstructed from the handle the VM previously handed out; the caller
-/// contract is that it is still a live heap object (the VM does not move
-/// objects out from under a handed-out handle within a single call sequence).
-fn ref_from_handle(h: CratonRef) -> Option<ObjectRef> {
+/// Process-global registry of per-VM handle tables, keyed by the `SharedVm`'s
+/// stable address (each `SharedVm` lives behind an `Arc` for the VM's life).
+/// `cratonvm_destroy` drops the VM's entry, after which its tokens no longer
+/// resolve.
+static HANDLE_TABLES: OnceLock<Mutex<HashMap<usize, VmHandleTable>>> = OnceLock::new();
+
+fn handle_tables() -> &'static Mutex<HashMap<usize, VmHandleTable>> {
+    HANDLE_TABLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stable per-VM key (the `SharedVm`'s address).
+fn vm_key(shared: &SharedVm) -> usize {
+    shared as *const SharedVm as usize
+}
+
+/// `Option<ObjectRef>` → `CratonRef` opaque token (`0` == null).
+///
+/// Registers a non-null object in `shared`'s `JniGlobalRefs` (making it a GC
+/// root with moving-GC pointer fixup) and mints / reuses an opaque token for it.
+fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
+    let oref = match o {
+        Some(r) if !r.as_ptr().is_null() => r,
+        _ => return 0,
+    };
+    let mut tables = match handle_tables().lock() {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    let table = tables.entry(vm_key(shared)).or_default();
+    // Dedup: the same live object always maps to the same token.
+    if let Some(&tok) = table.by_addr.get(&(oref.as_ptr() as usize)) {
+        return tok;
+    }
+    // Park the object as a GC root and mint a fresh, never-reused token.
+    let gref = shared.jni_global_refs.lock().add(oref);
+    table.next_token = table.next_token.checked_add(1).unwrap_or(1).max(1);
+    let tok = table.next_token;
+    table.by_token.insert(tok, gref);
+    table.by_addr.insert(oref.as_ptr() as usize, tok);
+    tok
+}
+
+/// `CratonRef` opaque token → `Option<ObjectRef>` (`0` == null).
+///
+/// Validates the token against `shared`'s per-VM table and the underlying
+/// `JniGlobalRefs`; an unknown, stale, or fabricated token resolves to `None`
+/// (rejected) rather than being turned into a raw pointer dereference.
+fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
     if h == 0 {
-        None
-    } else {
-        // SAFETY: `h` is a handle the flat API produced from a live
-        // `ObjectRef` (`as_ptr()`), so it is non-null and 8-byte aligned.
-        Some(unsafe { ObjectRef::from_raw(h as *mut u8) })
+        return None;
+    }
+    let tables = handle_tables().lock().ok()?;
+    let gref = *tables.get(&vm_key(shared))?.by_token.get(&h)?;
+    // `JniGlobalRefs::resolve` validates the gref is still live and returns the
+    // current (post-GC) address.
+    shared.jni_global_refs.lock().resolve(gref)
+}
+
+/// Drop a VM's handle table (called from `cratonvm_destroy`). Releases the
+/// underlying global refs so the parked objects are no longer GC roots.
+fn drop_handle_table(shared: &SharedVm) {
+    if let Ok(mut tables) = handle_tables().lock() {
+        if let Some(table) = tables.remove(&vm_key(shared)) {
+            let mut grefs = shared.jni_global_refs.lock();
+            for gref in table.by_token.into_values() {
+                grefs.remove(gref);
+            }
+        }
     }
 }
 
@@ -836,10 +929,11 @@ pub extern "C" fn cratonvm_invoke_static(
                     // SAFETY: checked `args` non-null and `n_args > 0` above.
                     unsafe { std::slice::from_raw_parts(args, n_args as usize) }
                 };
-                let values: Vec<Value> = in_args.iter().map(|v| v.to_value()).collect();
+                let values: Vec<Value> =
+                    in_args.iter().map(|v| v.to_value(&h.vm.shared)).collect();
 
                 match h.vm.invoke(class, method, sig, &values) {
-                    Ok(Some(v)) => CratonValue::from_value(v),
+                    Ok(Some(v)) => CratonValue::from_value(&h.vm.shared, v),
                     Ok(None) => CratonValue::void(),
                     Err(e) => {
                         set_last_error(describe_failure(&e));
@@ -919,7 +1013,7 @@ pub extern "C" fn cratonvm_new_string(vm: *mut CratonVm, utf8: *const c_char) ->
                 // `vm::create_java_string`), the same one the JNIEnv table and
                 // the interpreter use for `ldc` of a literal.
                 let obj = cratonvm_vm::vm::create_java_string(&h.vm.shared, text);
-                handle_from_ref(Some(obj))
+                register_handle(&h.vm.shared, Some(obj))
             })
         }
     }))
@@ -950,7 +1044,7 @@ pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mu
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, std::ptr::null_mut(), |h| {
-                let oref = match ref_from_handle(str) {
+                let oref = match resolve_handle(&h.vm.shared, str) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_string_utf8: null string handle");
@@ -1085,7 +1179,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, CratonValue::error(), |h| {
-                let recv = match ref_from_handle(receiver) {
+                let recv = match resolve_handle(&h.vm.shared, receiver) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_invoke_virtual: null receiver handle");
@@ -1130,10 +1224,10 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 // The receiver is arg 0 (descriptor excludes it); typed args follow.
                 let mut values: Vec<Value> = Vec::with_capacity(in_args.len() + 1);
                 values.push(Value::Object(Some(recv)));
-                values.extend(in_args.iter().map(|v| v.to_value()));
+                values.extend(in_args.iter().map(|v| v.to_value(&h.vm.shared)));
 
                 match h.vm.invoke(&class_name, method, sig, &values) {
-                    Ok(Some(v)) => CratonValue::from_value(v),
+                    Ok(Some(v)) => CratonValue::from_value(&h.vm.shared, v),
                     Ok(None) => CratonValue::void(),
                     Err(e) => {
                         set_last_error(describe_failure(&e));
@@ -1172,7 +1266,7 @@ pub extern "C" fn cratonvm_object_class(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, JNI_ERR, |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_object_class: null object handle");
@@ -1251,7 +1345,7 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, -1, |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_field_count: null object handle");
@@ -1303,7 +1397,7 @@ pub extern "C" fn cratonvm_get_field(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, CratonValue::error(), |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_get_field: null object handle");
@@ -1326,7 +1420,7 @@ pub extern "C" fn cratonvm_get_field(
                 }
                 // Bounds-checked above; `heap.get_field` reads the slot value.
                 let v = h.vm.shared.heap.get_field(oref, index as usize);
-                CratonValue::from_value(v)
+                CratonValue::from_value(&h.vm.shared, v)
             })
         }
     }))
@@ -1414,7 +1508,7 @@ pub extern "C" fn cratonvm_get_field_by_name(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, CratonValue::error(), |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_get_field_by_name: null object handle");
@@ -1428,7 +1522,9 @@ pub extern "C" fn cratonvm_get_field_by_name(
                 };
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
-                    Some(idx) => CratonValue::from_value(h.vm.get_instance_field(oref, idx)),
+                    Some(idx) => {
+                        CratonValue::from_value(&h.vm.shared, h.vm.get_instance_field(oref, idx))
+                    }
                     None => {
                         set_last_error(format!(
                             "cratonvm_get_field_by_name: no instance field \"{field_name}\""
@@ -1469,7 +1565,7 @@ pub extern "C" fn cratonvm_set_field(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, JNI_ERR, |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_set_field: null object handle");
@@ -1484,7 +1580,8 @@ pub extern "C" fn cratonvm_set_field(
                     ));
                     return JNI_ERR;
                 }
-                h.vm.set_instance_field(oref, index as usize, value.to_value());
+                let value = value.to_value(&h.vm.shared);
+                h.vm.set_instance_field(oref, index as usize, value);
                 JNI_OK
             })
         }
@@ -1517,7 +1614,7 @@ pub extern "C" fn cratonvm_set_field_by_name(
         // SAFETY: `vm` per caller contract.
         unsafe {
             with_vm(vm, JNI_ERR, |h| {
-                let oref = match ref_from_handle(obj) {
+                let oref = match resolve_handle(&h.vm.shared, obj) {
                     Some(r) => r,
                     None => {
                         set_last_error("cratonvm_set_field_by_name: null object handle");
@@ -1532,7 +1629,8 @@ pub extern "C" fn cratonvm_set_field_by_name(
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
-                        h.vm.set_instance_field(oref, idx, value.to_value());
+                        let value = value.to_value(&h.vm.shared);
+                        h.vm.set_instance_field(oref, idx, value);
                         JNI_OK
                     }
                     None => {
@@ -1640,9 +1738,13 @@ mod tests {
     }
 
     #[test]
-    fn craton_value_round_trips_each_tag() {
-        // int / long / float / double / object survive a to_value→from_value
-        // round trip with identical bit content.
+    fn craton_value_round_trips_primitive_tags() {
+        // int / long / float / double survive a `to_value → from_value` round
+        // trip with identical bit content. These tags are independent of the
+        // VM (no handle-table access), so the conversion is exercised through a
+        // never-dereferenced `&SharedVm` (the primitive arms ignore it). The
+        // OBJECT tag, which *does* go through the per-VM handle table, is
+        // covered end-to-end by `flat_api_live_round_trip`.
         let cases = [
             CratonValue {
                 tag: craton_tag::INT,
@@ -1660,17 +1762,27 @@ mod tests {
                 tag: craton_tag::DOUBLE,
                 payload: (-2.25f64).to_bits(),
             },
-            CratonValue {
-                tag: craton_tag::OBJECT,
-                payload: 0,
-            }, // null ref
         ];
+        // SAFETY: the primitive `to_value`/`from_value` arms never read through
+        // this reference; a dangling pointer is only formed, never dereferenced.
+        let shared: &SharedVm = unsafe { &*std::ptr::NonNull::<SharedVm>::dangling().as_ptr() };
         for c in cases {
-            let v = c.to_value();
-            let back = CratonValue::from_value(v);
+            let v = c.to_value(shared);
+            let back = CratonValue::from_value(shared, v);
             assert_eq!(back.tag, c.tag, "tag changed for {:?}", c.tag);
             assert_eq!(back.payload, c.payload, "payload changed for tag {}", c.tag);
         }
+    }
+
+    #[test]
+    fn null_object_handle_resolves_to_null_without_vm() {
+        // The reserved null token (`0`) must short-circuit before any handle
+        // table or `SharedVm` access, so a dangling reference is safe here.
+        // SAFETY: `resolve_handle` returns on `h == 0` before reading `shared`.
+        let shared: &SharedVm = unsafe { &*std::ptr::NonNull::<SharedVm>::dangling().as_ptr() };
+        assert!(resolve_handle(shared, 0).is_none());
+        // `register_handle(None)` likewise returns the null token without access.
+        assert_eq!(register_handle(shared, None), 0);
     }
 
     #[test]
