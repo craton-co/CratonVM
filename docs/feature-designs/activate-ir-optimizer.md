@@ -1787,6 +1787,51 @@ a method called 1–499× via `fn execute` then never again now interprets to co
 where gate-OFF it single-pass-compiled on call #1 — a warmup-latency cost, acceptable
 for the gated soak.
 
+## Increment 29 (flip `CRATONVM_JIT_IR_LONG` + `CRATONVM_JIT_IR_CALL_SPECIAL` ON) landed
+
+Status: **landed** on `dev`. The production-validation step for the long track
+(inc 25–28) and `invokespecial` (inc 24): both gates flip from default-OFF to
+**default-ON**, with `=0` as the opt-out at each of the 6 VM `try_compile` sites
+(3 each). Mirrors the inc-23 `IR_CALL` flip. After this, long-using methods and
+`super.`/non-virtual `invokespecial` callers take the optimizing IR path by
+default.
+
+**What landed** (`vm/src/runtime/interpreter.rs`): the 6 gate reads change from
+`std::env::var_os("CRATONVM_JIT_IR_{LONG,CALL_SPECIAL}").is_some()` (default-OFF)
+to `std::env::var(..).map_or(true, |v| v != "0")` (default-ON, `=0` opt-out). No
+other change — the inc-24..28 machinery is unchanged.
+
+**Soak** (the gate is a runtime env var, so one flipped build validates both
+states: default = both ON, `CRATONVM_JIT_IR_LONG=0 CRATONVM_JIT_IR_CALL_SPECIAL=0`
+= both OFF). The decisive invariant is **ON ≡ OFF on every workload** (the flip
+only changes a default), confirmed across a broad, diverse set:
+- **bt10/14/16/18** (long-heavy) == HotSpot (`135854 / 3222190 / 14985902 /
+  68332206`), ON and OFF.
+- **Six targeted probes** — `IrLong`/`IrLong2`/`IrLong3`/`IrLong4` (long
+  arithmetic / wide load-store + `ldc2_w` / shifts-bitwise-`lcmp` / long call
+  arg), `IrSpecial` (`invokespecial`), `IrCall` (`invokestatic`) — all == HotSpot
+  ON and OFF.
+- **23 bench programs** (`binarytrees`, `fannkuch`, `IntegrationTest`,
+  `Benchmark`, `QuickBench`, `MatrixJIT`/`Scale`, `IntrinsicBench`,
+  `FullStackBench`, `NBody3D`/`Mini`, `TestLambda`/`Stream`/`Switch`/`Enum`/
+  `Generics`/`Sort`/`Interface`/`Varargs`/`Pair`, `SieveBench`, …) == HotSpot,
+  ON and OFF.
+- **`QuickBenchLong`** (long-heavy: a 1.5-billion-iteration `long` arithmetic
+  checksum `2812500002999999995`, Fibonacci(44), sieve, matrix) — ON ≡ OFF.
+
+**Scope of the soak (honest)**: the full kafka/spring/tomcat/hibernate gradle
+suites were **not** run (impractical in this environment — Linux-path harness
+scripts, heavy JUnit setup); the soak is bt + 6 targeted probes + 23 diverse
+bench programs + `QuickBenchLong`, all ON≡OFF==HotSpot — the same bar used to flip
+`IR_CALL` (inc 23). `IR_CALL_SPECIAL` is narrow (`super.`/non-virtual instance
+calls), and `IR_LONG` carries 39 differential tests + a 5-agent adversarial
+review behind it; `=0` remains the opt-out if a suite ever regresses.
+
+**Still gated-OFF / deferred** (unchanged): long/double call *returns*
+(`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
+`double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
+(the concurrent inc-26 track) has its own flag/soak.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
