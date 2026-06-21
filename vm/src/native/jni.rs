@@ -654,13 +654,28 @@ pub fn pop_local_frame(result: JObject) -> JObject {
 }
 
 /// Record a local ref in the current top frame.
-/// If there is no active frame, the ref is untracked (still valid; auto-freed on JNI return).
+///
+/// GC-correctness (vm-jni-roots #2): previously, if there was no active frame
+/// the ref was silently DROPPED ("untracked") and therefore was NOT a GC root —
+/// a local ref a native obtained (NewObject, GetObjectField, …) outside any
+/// explicit `PushLocalFrame` was invisible to `collect_local_ref_roots` and
+/// could be reclaimed (or left dangling under a moving GC) mid-native-call.
+/// The native dispatch path now pushes an IMPLICIT top-level local frame for
+/// the duration of every JNI native call (see `vm_exec`), but we additionally
+/// synthesize a frame here so a `track_local_ref` that races ahead of (or runs
+/// without) an enclosing frame still roots the handle rather than leaking it.
 pub fn track_local_ref(jobj: JObject) {
     if jobj == 0 {
         return;
     }
     JNI_LOCAL_FRAMES.with(|f| {
         let mut stack = f.borrow_mut();
+        if stack.last().is_none() {
+            // No active frame: synthesize an implicit top-level frame so the
+            // handle is tracked (and thus a GC root) instead of being dropped.
+            stack.push(Vec::with_capacity(16));
+        }
+        // Safe: we just ensured a top frame exists.
         if let Some(top) = stack.last_mut() {
             top.push(jobj);
         }
