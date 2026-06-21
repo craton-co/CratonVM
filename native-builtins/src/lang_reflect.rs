@@ -1762,6 +1762,26 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             out.push(elem);
         }
         if !any_tree {
+            // An EMPTY raw bound array (e.g. an unbounded wildcard `?`, whose
+            // `lowerBounds` field is an empty `sun.reflect…FieldTypeSignature[0]`)
+            // has no tree node to reify, but it must still be handed back as a
+            // `java/lang/reflect/Type[]` — not the raw `FieldTypeSignature[]`.
+            // Returning the raw array looked fine for direct callers
+            // (`Arrays.toString` prints `[]`), but Spring's SerializableTypeWrapper
+            // reflectively casts the result `(Type[]) getLowerBounds()` and threw
+            // `ClassCastException: …FieldTypeSignature cannot be cast to
+            // [Ljava/lang/reflect/Type;` (ResolvableTypeTests gh32327/gh33535/
+            // hasResolvableGenericsWithSingleWildcard/isAssignableFromForWildcards).
+            // A non-empty `!any_tree` array is one we already reified+wrote back as
+            // a Type[] on a prior call, so returning it as-is stays correct.
+            if len == 0 {
+                let type_cid = ctx
+                    .class_id_by_name("java/lang/reflect/Type")
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
+                let result = ctx.new_ref_array(type_cid, 0);
+                ctx.set_field_by_name(this, field, Value::Object(Some(result)));
+                return Value::Object(Some(result));
+            }
             return Value::Object(Some(arr));
         }
         let type_cid = ctx
@@ -1934,6 +1954,22 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
+    // getBounds() reifies the `bounds` field (a volatile Object[] holding the
+    // unreified sun.reflect…FieldTypeSignature nodes). The JDK bytecode does the
+    // same lazily, but running it reflectively (Spring's SerializableTypeWrapper
+    // proxy) returned the raw FieldTypeSignature[] → ClassCastException to Type[]
+    // (ResolvableTypeTests.identifyTypeVariable + the bounded-type-variable cases).
+    // Reify ourselves via the same helper the WildcardTypeImpl bounds use; it now
+    // always returns a java/lang/reflect/Type[] (incl. the empty case).
+    registry.register(
+        tvi_real,
+        "getBounds",
+        "()[Ljava/lang/reflect/Type;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
+        },
+    );
     let wti_real = "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl";
     registry.register(
         wti_real,
