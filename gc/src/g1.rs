@@ -17,6 +17,7 @@
 //! - **Humongous allocation:** Objects > region_size/2 span contiguous regions.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -90,12 +91,68 @@ impl Default for G1CollectorConfig {
 // G1 Region
 // ---------------------------------------------------------------------------
 
+/// Non-owning view of one region's backing slice inside
+/// [`G1Collector::arena`].
+///
+/// `base` is the slice's start address in the arena and `len` is
+/// `region_size`. `base` is stored as a `usize` (not a raw pointer) so that
+/// `G1Region` stays `Send + Sync` exactly as it did with the old
+/// `data: Vec<u8>` field. `Deref`/`DerefMut` expose the slice, so every
+/// existing `region.data.as_ptr()` / `.len()` / `.fill(0)` / indexing call
+/// site keeps working unchanged.
+///
+/// IMPORTANT: cross-region access (a humongous object whose payload extends
+/// past this region's `len` into the physically-adjacent next region) must go
+/// through [`RegionBuf::addr`] integer arithmetic, NOT through the `Deref`
+/// slice — `.as_ptr().add(off)` past `len` would be out of the slice's
+/// provenance. The arena guarantees those bytes are contiguous and live.
+pub struct RegionBuf {
+    base: usize,
+    len: usize,
+}
+
+impl RegionBuf {
+    #[inline]
+    fn new(base: usize, len: usize) -> Self {
+        Self { base, len }
+    }
+    /// Start address of this region's slice, as a `usize`. Use this (plus an
+    /// offset cast to `*mut u8`) for any access that may cross into the
+    /// adjacent region (humongous payloads); the arena keeps the bytes
+    /// contiguous and live.
+    #[inline]
+    fn addr(&self) -> usize {
+        self.base
+    }
+}
+
+impl Deref for RegionBuf {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `[base, base+len)` is a live, per-region-exclusive slice of
+        // the collector's `arena` (allocated once, never freed/reallocated for
+        // the collector's lifetime); standalone test regions point at a leaked
+        // boxed slice, equally stable. Region ranges never overlap.
+        unsafe { std::slice::from_raw_parts(self.base as *const u8, self.len) }
+    }
+}
+
+impl DerefMut for RegionBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: see `deref`; `&mut self` gives unique access to this region's
+        // disjoint arena range.
+        unsafe { std::slice::from_raw_parts_mut(self.base as *mut u8, self.len) }
+    }
+}
+
 /// Enhanced region descriptor for the G1 collector.
 pub struct G1Region {
     /// Current region classification.
     pub region_type: RegionType,
-    /// Backing storage for this region.
-    pub data: Vec<u8>,
+    /// Backing storage for this region (a slice of [`G1Collector::arena`]).
+    pub data: RegionBuf,
     /// Bump pointer: next free byte offset.
     pub cursor: usize,
     /// Bytes of live data (computed during marking).
@@ -132,16 +189,16 @@ pub struct G1Region {
 }
 
 impl G1Region {
-    /// Create a new free region of the given size.
-    fn new(region_size: usize) -> Self {
-        let data = vec![0u8; region_size];
+    /// Create a free region backed by `region_size` bytes starting at arena
+    /// address `base`. The caller ([`G1Collector::new`]) guarantees the range
+    /// is a live, region-exclusive slice of the collector's `arena`.
+    fn from_arena(base: usize, region_size: usize) -> Self {
         // Round-2 fix (HIGH — GC #5): bitmap covers exactly this region's
-        // heap-allocated buffer. Base = data.as_ptr(), span = region_size.
-        let base = data.as_ptr() as usize;
+        // backing slice. Base = arena address, span = region_size.
         let mark_bitmap = MarkBitmap::new(base, region_size);
         Self {
             region_type: RegionType::Free,
-            data,
+            data: RegionBuf::new(base, region_size),
             cursor: 0,
             live_bytes: 0,
             gc_efficiency: 0.0,
@@ -151,6 +208,18 @@ impl G1Region {
             age: 0,
             mark_bitmap,
         }
+    }
+
+    /// Standalone test constructor: allocates a dedicated, leaked backing
+    /// buffer so a region can own stable memory without a shared arena.
+    /// Production regions come from [`G1Region::from_arena`] over
+    /// [`G1Collector::arena`]; this exists only for the unit tests that
+    /// exercise a single region in isolation.
+    #[cfg(test)]
+    fn new(region_size: usize) -> Self {
+        let buf = vec![0u8; region_size].into_boxed_slice();
+        let base = Box::leak(buf).as_mut_ptr() as usize;
+        Self::from_arena(base, region_size)
     }
 
     /// Remaining free bytes in this region.
@@ -264,6 +333,23 @@ pub enum G1CollectionType {
 pub struct G1Collector {
     /// Collector configuration.
     config: G1CollectorConfig,
+    /// Single contiguous backing store for every region.
+    ///
+    /// All `num_regions` regions are carved as adjacent `region_size` slices
+    /// of this one allocation (region `i` lives at `arena_base + i*region_size`).
+    /// This makes a humongous object spanning a contiguous run of region
+    /// indices one physically-contiguous block, so the JIT's flat
+    /// `base + HEADER_SIZE + i*stride` array addressing (and JNI-critical /
+    /// Unsafe / arraycopy raw pointers) address every element correctly. The
+    /// previous design gave each region its own `Vec<u8>`, so a humongous
+    /// element past the first region's payload read/wrote unrelated heap
+    /// memory (silent zero tail → SIGSEGV). Allocated once in
+    /// [`G1Collector::new`]; never moved or reallocated, so every region base
+    /// and the `region_lookup` table stay address-stable for the collector's
+    /// lifetime. `Box<[u8]>` (not `Vec`) to make the no-realloc contract
+    /// explicit. Dropped with the collector — no leak.
+    #[allow(dead_code)]
+    arena: Box<[u8]>,
     /// All heap regions.
     regions: Mutex<Vec<G1Region>>,
 
@@ -388,13 +474,26 @@ impl G1Collector {
             config.region_size
         );
 
+        // One contiguous arena carved into `num_regions` adjacent slices, so
+        // region `i+1` physically follows region `i`. This is what makes a
+        // humongous object spanning a contiguous run of region indices one
+        // contiguous block (see the `arena` field doc and `alloc_humongous_locked`).
+        // Allocated once and never moved/reallocated → every region base and
+        // the `region_lookup` table are address-stable for the collector's life.
+        let arena: Box<[u8]> = vec![0u8; num_regions * config.region_size].into_boxed_slice();
+        let arena_base = arena.as_ptr() as usize;
+
         let regions: Vec<G1Region> = (0..num_regions)
-            .map(|_| G1Region::new(config.region_size))
+            .map(|i| {
+                G1Region::from_arena(arena_base + i * config.region_size, config.region_size)
+            })
             .collect();
 
         // Build the address-to-region lookup table (sorted by base addr).
-        // Each region's `data` Vec was just allocated; its `as_ptr()` is
-        // stable for the lifetime of the collector (see field doc).
+        // Bases are `arena_base + i*region_size` — already ascending; the sort
+        // is retained for robustness and parity with the previous construction.
+        // The arena is never reallocated so these addresses are stable for the
+        // lifetime of the collector (see field doc).
         let mut region_lookup: Vec<(usize, usize)> = regions
             .iter()
             .enumerate()
@@ -412,6 +511,7 @@ impl G1Collector {
 
         Self {
             config: config.clone(),
+            arena,
             regions: Mutex::new(regions),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
@@ -493,121 +593,76 @@ impl G1Collector {
         None
     }
 
-    /// Allocate a humongous object spanning contiguous free regions.
+    /// Allocate a humongous object spanning a contiguous run of free regions.
+    ///
+    /// The object occupies ONE physically-contiguous block: the regions are
+    /// adjacent slices of [`G1Collector::arena`], so a span of `regions_needed`
+    /// consecutive region indices is `regions_needed * region_size` contiguous
+    /// bytes. The real `ObjectHeader` lives at offset 0 of the start region and
+    /// the payload flows straight through the following regions — exactly like
+    /// any other array, just larger. This is what lets the JIT (and
+    /// JNI-critical / Unsafe / arraycopy) address every element with flat
+    /// `base + HEADER_SIZE + i*stride` arithmetic.
+    ///
+    /// Layout / bookkeeping:
+    /// * `start` is `HumongousStart` with `cursor = size` (the full object
+    ///   size). Heap walkers iterating `[0, cursor)` therefore read the single
+    ///   humongous object once — reads cross region boundaries safely because
+    ///   the arena is contiguous — then stop.
+    /// * Continuation regions are `HumongousContinuation` with `cursor = 0`, so
+    ///   walkers skip them (their bytes are the start object's payload, NOT
+    ///   independent objects). No per-region header prefix and no
+    ///   `HumongousFiller` sentinel: those would corrupt the contiguous
+    ///   payload. (`is_humongous_filler` is now never true for live data and
+    ///   stays only as a defensive no-op in the walkers.)
+    ///
+    /// Replaces the previous region-fragmented layout (each region a separate
+    /// `Vec<u8>` with its own HEADER_SIZE prefix), which was safe for the
+    /// GC-internal region-aware accessors but invisible to the JIT's flat
+    /// addressing — a humongous element past the first region read/wrote
+    /// unrelated memory (silent zero tail at ~1–2 MB, SIGSEGV at ~4 MB+).
     fn alloc_humongous_locked(
         &self,
         regions: &mut Vec<G1Region>,
         size: usize,
     ) -> Option<(*mut u8, usize)> {
         let region_size = self.config.region_size;
-
-        // CRIT (round-12 gc C2, humongous OOB R/W): a humongous object is laid
-        // out so that **every** region in the span carries a HEADER_SIZE prefix
-        // (the real ObjectHeader on the start region, a HumongousFiller sentinel
-        // on each continuation), and the object's payload lives in the
-        // `region_size - HEADER_SIZE` bytes AFTER that prefix. The previous
-        // layout returned `regions[start].base_ptr_mut()` and then accessed
-        // fields/elements via a single FLAT offset from that base — but each
-        // `G1Region.data` is a SEPARATE `vec![0u8; region_size]` allocation, so
-        // any logical offset past `region_size - HEADER_SIZE` landed outside
-        // region[start]'s Vec in unrelated heap memory (arbitrary OOB R/W).
-        //
-        // With the prefixed layout, every access is translated to the owning
-        // continuation region's own buffer (see `humongous_segment_for` /
-        // `humongous_payload_ptr` and the field/array accessors), so no access
-        // can ever escape the object's backing memory. The per-region prefix
-        // also lets us keep the HumongousFiller walker sentinel unchanged —
-        // walkers stay correct and continuation regions remain dark.
-        //
-        // `usable` is the payload capacity of one region; `payload_bytes` is the
-        // object size minus its single ObjectHeader.
-        let usable = region_size.checked_sub(HEADER_SIZE)?;
-        if usable == 0 {
+        if region_size == 0 || size < HEADER_SIZE {
             return None;
         }
-        let payload_bytes = size.saturating_sub(HEADER_SIZE);
-        let regions_needed = payload_bytes.div_ceil(usable).max(1);
+
+        // Number of contiguous regions whose combined bytes hold the whole
+        // object (header + payload). Contiguity in the arena makes this a
+        // single block, so we size by the FULL object, not a per-region chunk.
+        let regions_needed = size.div_ceil(region_size).max(1);
 
         let start = find_contiguous_free(regions, regions_needed)?;
 
-        // Mark regions
+        // Classify the span. `cursor = size` on the start makes walkers read
+        // the one object; `cursor = 0` on continuations makes walkers skip them.
         regions[start].region_type = RegionType::HumongousStart;
+        regions[start].cursor = size;
         for i in 1..regions_needed {
             regions[start + i].region_type = RegionType::HumongousContinuation;
+            regions[start + i].cursor = 0;
         }
 
-        // Per-region byte usage (`cursor`): each region stores its HEADER_SIZE
-        // prefix plus the payload chunk it owns. Chunk `i` covers payload bytes
-        // `[i*usable, (i+1)*usable)`.
-        for i in 0..regions_needed {
-            let chunk = payload_bytes.saturating_sub(i * usable).min(usable);
-            regions[start + i].cursor = HEADER_SIZE + chunk;
+        // Zero the entire contiguous span before handing it out. Continuation
+        // regions come from `Free` slots that may still hold stale collected
+        // data; `G1Region::reset` zeroes a region only on its STW retire path.
+        // The arena is one allocation, so a single `write_bytes` across the
+        // full span is in-bounds and contiguous.
+        let start_addr = regions[start].data.addr();
+        unsafe {
+            // SAFETY: `[start_addr, start_addr + regions_needed*region_size)` is
+            // `regions_needed` adjacent arena slices reserved by this
+            // allocation (`find_contiguous_free` returned a Free run); `size <=
+            // regions_needed*region_size`, so zeroing `size` bytes stays inside
+            // the reserved span.
+            std::ptr::write_bytes(start_addr as *mut u8, 0, size);
         }
 
-        // CRIT (round-5 GC #1, heap walker UAF): zero the *entire* humongous
-        // span, not just the first region's payload. Continuation regions
-        // (start+1..start+regions_needed) come from `Free` slots that may
-        // have last held arbitrary collected data; G1Region::reset() zeroes
-        // a region only on its STW retire path. If we leave the residual
-        // bytes intact, the heap walker that scans `cursor` bytes per
-        // continuation region will treat those stale bytes as live object
-        // headers / reference slots, follow the garbage pointers, and
-        // either crash, corrupt the bitmap, or revive freed objects.
-        //
-        // Zero each region's `cursor` bytes individually rather than a
-        // single `write_bytes` across `total_bytes`: G1Region buffers are
-        // separate `Vec<u8>` allocations and are NOT guaranteed to live
-        // at contiguous addresses, even though they are logically adjacent
-        // in region index space.
-        for i in 0..regions_needed {
-            let n = regions[start + i].cursor;
-            if n > 0 {
-                let p = regions[start + i].base_ptr_mut();
-                unsafe {
-                    std::ptr::write_bytes(p, 0, n);
-                }
-            }
-        }
-
-        // CRIT (round-9 gc CRIT-1): install a `HumongousFiller` sentinel
-        // header at the START of every continuation region. The previous
-        // round-5 fix only zeroed the continuation bytes, but a zero
-        // header still decodes as a well-formed `Object` (class_id=0,
-        // kind=Object=0, num_slots=0). A heap walker iterating with the
-        // generic per-object size formula treats the zeroed bytes as a
-        // 40-byte object and the next 40 bytes as another, and so on,
-        // following any garbage that survives at later offsets.
-        //
-        // The filler is a single sentinel header (HEADER_SIZE bytes) that
-        // walkers detect via `is_humongous_filler()` and use to break out
-        // of the per-region iteration. No oops are scanned and the
-        // continuation region is effectively dark to the walker.
-        //
-        // The first region (start) is the HumongousStart and contains the
-        // actual application object header at offset 0 — leave it alone.
-        for i in 1..regions_needed {
-            let n = regions[start + i].cursor;
-            if n >= HEADER_SIZE {
-                let p = regions[start + i].base_ptr_mut();
-                // SAFETY: continuation region's first HEADER_SIZE bytes are
-                // owned by this allocation and were just zeroed; writing a
-                // sentinel ObjectHeader here is well-defined.
-                let filler = ObjectHeader::new(
-                    ClassId::new(0),
-                    ObjectKind::HumongousFiller,
-                    ArrayElementType::Reference,
-                    0,
-                    0,
-                    0,
-                );
-                unsafe {
-                    std::ptr::write(p as *mut ObjectHeader, filler);
-                }
-            }
-        }
-
-        let ptr = regions[start].base_ptr_mut();
-        Some((ptr, start))
+        Some((start_addr as *mut u8, start))
     }
 
     /// Allocate in a region of the specified type (Survivor or Old).
@@ -2713,7 +2768,7 @@ impl G1Collector {
     /// Returns `Some(idx)` iff `addr` falls within `[base, base + region_size)`
     /// for some region. The check uses `self.config.region_size` instead of
     /// the per-region `data.len()` because every region's backing buffer is
-    /// allocated at exactly `region_size` bytes (see [`G1Region::new`]).
+    /// allocated at exactly `region_size` bytes (see [`G1Region::from_arena`]).
     #[inline]
     fn lookup_region_for_addr(&self, addr: usize) -> Option<usize> {
         // Find the largest base address that is <= addr.
@@ -2734,19 +2789,16 @@ impl G1Collector {
     }
 
     // -----------------------------------------------------------------------
-    // Humongous object addressing (round-12 gc C2)
+    // Humongous object addressing
     // -----------------------------------------------------------------------
     //
-    // A humongous object spans several non-contiguous `G1Region.data`
-    // buffers. Each region carries a HEADER_SIZE prefix (real ObjectHeader on
-    // the start region, HumongousFiller sentinel on continuations) followed by
-    // `region_size - HEADER_SIZE` payload bytes. Logical payload byte `P`
-    // (0-based, i.e. measured from the end of the object's ObjectHeader)
-    // therefore lives in region `start + P / usable` at physical offset
-    // `HEADER_SIZE + (P % usable)`.
-    //
-    // The accessors below translate every field/array access through this map
-    // so a read/write can never fall outside the object's own backing memory.
+    // A humongous object spans a contiguous run of region indices, which —
+    // because all regions are adjacent slices of one `arena` — is one
+    // physically-contiguous block. The real `ObjectHeader` sits at offset 0 of
+    // the start region and the payload flows straight through, so logical
+    // payload byte `P` lives at `start_addr + HEADER_SIZE + P`. The accessors
+    // below could read/write that flat range directly; `humongous_copy` is
+    // retained so the existing field/array accessor call sites are unchanged.
 
     /// If `obj`'s start address names a `HumongousStart` region, return the
     /// start region index and the total payload byte count (object size minus
@@ -2770,13 +2822,11 @@ impl G1Collector {
 
     /// `true` iff `obj`'s start address names a `HumongousStart` region.
     ///
-    /// A humongous object's payload is laid out across several
-    /// NON-contiguous region buffers (each with its own HEADER_SIZE prefix),
-    /// so it has no single valid contiguous data pointer. Callers that would
-    /// otherwise hand out `obj.as_ptr() + HEADER_SIZE` and walk a flat
-    /// `[base, base + len*stride)` range must instead route through the
-    /// region-aware per-element accessors (`get_array_element` /
-    /// `set_array_element`) when this returns `true`.
+    /// The object's payload is one contiguous block (the regions are adjacent
+    /// arena slices), so a flat `obj.as_ptr() + HEADER_SIZE + i*stride` access
+    /// is valid for callers — this predicate is retained for the GC-internal
+    /// accessor routing and for callers that must distinguish humongous (e.g.
+    /// to skip evacuation of an in-place, non-relocated object).
     ///
     /// This is the size-independent sibling of `humongous_span` (which also
     /// needs the object's total size to compute the payload byte count).
@@ -2792,28 +2842,21 @@ impl G1Collector {
     }
 
     /// Copy `len` bytes of a humongous object's payload, starting at logical
-    /// payload offset `payload_off`, between the (region-fragmented) heap
-    /// backing store and the caller-provided `buf`.
+    /// payload offset `payload_off`, between the heap backing store and the
+    /// caller-provided `buf`.
     ///
-    /// `write == true` copies `buf -> heap`; otherwise `heap -> buf`. Every
-    /// byte is bounds-checked against the owning region's payload capacity and
-    /// against `total_payload`, so a straddling element (the per-region
-    /// payload capacity is not necessarily a multiple of the element/slot
-    /// size, since HEADER_SIZE is not a power-of-two divisor of region_size)
-    /// is handled correctly by splitting across the two regions. Returns
-    /// `false` if the access would exceed the object's payload (checked up
-    /// front, before any copy) — the caller turns that into a dropped access,
-    /// exactly as the `index >= len` bounds checks do. The per-region checks
-    /// inside the loop are defense-in-depth and are unreachable for a
-    /// well-formed humongous span (the allocator reserves
-    /// `payload_bytes.div_ceil(usable)` regions, so the region run always
-    /// covers `total_payload`).
+    /// `write == true` copies `buf -> heap`; otherwise `heap -> buf`. The
+    /// humongous object is one contiguous block (its regions are adjacent
+    /// arena slices), so this is a single bounds-checked `memcpy` at
+    /// `start_addr + HEADER_SIZE + payload_off`. Returns `false` if the access
+    /// would exceed the object's payload (checked up front, before any copy) —
+    /// the caller turns that into a dropped access, exactly as the `index >=
+    /// len` bounds checks do.
     ///
     /// SAFETY: callers hold the `regions` lock for the duration, so the region
-    /// buffers are not concurrently reset/reallocated (the `Vec<G1Region>` is
-    /// never resized and each `data` Vec is never reallocated — only
-    /// zero-filled by `reset`). `start` must be a `HumongousStart` index with
-    /// `regions_needed` valid continuation regions following it.
+    /// classification (and thus the reserved arena span) is stable. `start`
+    /// must be a `HumongousStart` index and `total_payload` the object's
+    /// payload byte count (object size minus the single `ObjectHeader`).
     fn humongous_copy(
         &self,
         regions: &[G1Region],
@@ -2824,11 +2867,6 @@ impl G1Collector {
         len: usize,
         write: bool,
     ) -> bool {
-        let region_size = self.config.region_size;
-        let usable = match region_size.checked_sub(HEADER_SIZE) {
-            Some(u) if u > 0 => u,
-            _ => return false,
-        };
         // Reject any access whose end exceeds the object's payload.
         let end = match payload_off.checked_add(len) {
             Some(e) => e,
@@ -2837,43 +2875,26 @@ impl G1Collector {
         if end > total_payload {
             return false;
         }
+        if start >= regions.len() {
+            return false;
+        }
 
-        let mut remaining = len;
-        let mut p = payload_off;
-        let mut buf_off = 0usize;
-        while remaining > 0 {
-            let region_slot = p / usable;
-            let within = p % usable;
-            let region_idx = start + region_slot;
-            if region_idx >= regions.len() {
-                return false;
+        // The payload is contiguous from `start_addr + HEADER_SIZE`. Use the
+        // region's integer base address (not the `Deref` slice, whose `len` is
+        // only `region_size`) so the pointer carries arena provenance across
+        // region boundaries.
+        let phys = (regions[start].data.addr() + HEADER_SIZE + payload_off) as *mut u8;
+        // SAFETY: `payload_off + len <= total_payload`, and the humongous span
+        // reserved `ceil(size/region_size)` contiguous arena regions covering
+        // `HEADER_SIZE + total_payload` bytes from `start_addr`, so
+        // `[phys, phys+len)` is inside the object's reserved, contiguous,
+        // arena-backed memory. `buf` is a caller-owned buffer of >= `len` bytes.
+        unsafe {
+            if write {
+                std::ptr::copy_nonoverlapping(buf, phys, len);
+            } else {
+                std::ptr::copy_nonoverlapping(phys, buf, len);
             }
-            let region = &regions[region_idx];
-            // Physical span actually backed by this region's payload.
-            let region_payload = region.cursor.saturating_sub(HEADER_SIZE);
-            if within >= region_payload {
-                return false;
-            }
-            let chunk = remaining.min(region_payload - within).min(usable - within);
-            if chunk == 0 {
-                return false;
-            }
-            // SAFETY: `within < region_payload <= usable` and
-            // `HEADER_SIZE + within + chunk <= cursor <= data.len()`, so the
-            // physical slice is fully inside this region's buffer. `buf` is a
-            // caller-owned buffer of at least `len` bytes.
-            unsafe {
-                let phys = region.data.as_ptr().add(HEADER_SIZE + within) as *mut u8;
-                let dst_src = buf.add(buf_off);
-                if write {
-                    std::ptr::copy_nonoverlapping(dst_src, phys, chunk);
-                } else {
-                    std::ptr::copy_nonoverlapping(phys, dst_src, chunk);
-                }
-            }
-            remaining -= chunk;
-            p += chunk;
-            buf_off += chunk;
         }
         true
     }
@@ -4010,6 +4031,69 @@ mod tests {
         // OOB index is rejected, not a wild write.
         assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
         assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    // G1 SIGSEGV regression (CpuOnlyBench / gpu-bench-cpu): a humongous array
+    // must be ONE physically-contiguous block so the JIT's flat
+    // `base + HEADER_SIZE + i*stride` array addressing — which bypasses the
+    // GC's region-aware accessors entirely — reads/writes every element
+    // correctly. The old region-fragmented layout backed each region with a
+    // SEPARATE `Vec<u8>`, so flat access past the first region's payload hit
+    // unrelated heap memory: silent zero tail at ~1–2 MB arrays, hard SIGSEGV
+    // at ~4 MB+. This test writes/reads through a RAW FLAT POINTER (exactly as
+    // JIT-compiled code does), including a full sweep over every element.
+    #[test]
+    fn humongous_int_array_is_contiguous_for_flat_jit_access() {
+        let gc = make_collector();
+        let n = 400_000; // ~1.6 MB → spans multiple 1 MB regions
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        assert!(gc.is_humongous(arr), "test array must be humongous");
+        assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
+
+        // Raw flat base pointer to element 0 — what the JIT computes from the
+        // array oop (`obj + HEADER_SIZE`), with no region-aware translation.
+        let base = unsafe { arr.as_ptr().add(HEADER_SIZE) as *mut i32 };
+
+        // 1) GC accessor writes, flat pointer reads back — including the tail
+        //    element, which lives in a continuation region.
+        let probes = [0usize, 1, 262_143, 262_144, 300_000, n - 1];
+        for &i in &probes {
+            gc.set_array_element(arr, i, Value::Int((i as i32).wrapping_mul(31) ^ 0x1234))
+                .unwrap();
+        }
+        for &i in &probes {
+            let v = unsafe { std::ptr::read(base.add(i)) };
+            assert_eq!(
+                v,
+                (i as i32).wrapping_mul(31) ^ 0x1234,
+                "flat JIT-style read mismatch at index {i}"
+            );
+        }
+
+        // 2) Flat pointer writes EVERY element, GC accessor reads back. This is
+        //    the crashing direction: a tight JIT store loop over the whole
+        //    array. Pre-fix this would corrupt unrelated heap / SIGSEGV.
+        for i in 0..n {
+            unsafe { std::ptr::write(base.add(i), i as i32) };
+        }
+        for &i in &[0usize, 100_000, 262_144, 350_000, n - 1] {
+            assert_eq!(
+                gc.get_array_element(arr, i).unwrap().as_int(),
+                Some(i as i32),
+                "accessor read-back mismatch at index {i}"
+            );
+        }
+
+        // 3) Contiguity invariant: the byte just past the last element stays
+        //    inside the reserved span [start, start + regions_needed*region_size).
+        let rs = gc.config.region_size;
+        let total = HEADER_SIZE + n * 4;
+        let regions_needed = total.div_ceil(rs);
+        let start_base = arr.as_ptr() as usize;
+        assert!(
+            start_base + total <= start_base + regions_needed * rs,
+            "humongous tail escapes its reserved contiguous span"
+        );
     }
 
     // Residual humongous-OOB fix: `is_humongous` must distinguish a
