@@ -2477,7 +2477,10 @@ mod aot_tests {
         // straight SHA-256 over those bytes.
         let payload = &blob[..blob.len() - AotCache::INTEGRITY_DIGEST_LEN];
         let expect = crate::crypto_impl::Sha256::digest(payload);
-        assert_eq!(&blob[blob.len() - AotCache::INTEGRITY_DIGEST_LEN..], &expect[..]);
+        assert_eq!(
+            &blob[blob.len() - AotCache::INTEGRITY_DIGEST_LEN..],
+            &expect[..]
+        );
     }
 
     #[test]

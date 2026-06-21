@@ -649,7 +649,12 @@ impl WakeupTimer {
     /// Register a wakeup for `vt_id` at `deadline`, carrying its registry
     /// `signal`. Lazily starts the single timer thread on first use and wakes it
     /// so it can re-evaluate the head deadline.
-    fn schedule(self: &Arc<Self>, vt_id: u64, deadline: Instant, signal: Arc<(Mutex<bool>, Condvar)>) {
+    fn schedule(
+        self: &Arc<Self>,
+        vt_id: u64,
+        deadline: Instant,
+        signal: Arc<(Mutex<bool>, Condvar)>,
+    ) {
         let mut state = self.state.lock();
         state.heap.push(std::cmp::Reverse(WakeupEntry {
             deadline,

@@ -1204,11 +1204,7 @@ mod async_signal_safe {
         unsafe {
             *libc::__error()
         }
-        #[cfg(any(
-            target_os = "android",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        ))]
+        #[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
         unsafe {
             *libc::__errno()
         }

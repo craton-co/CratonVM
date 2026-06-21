@@ -173,7 +173,7 @@ fn check_single_thread_against(guard: &AtomicU64, token: u64) -> Result<(), u64>
     ) {
         Ok(_) => Ok(()), // we are the first; invariant trivially holds.
         Err(recorded) if recorded == token => Ok(()), // same thread again.
-        Err(recorded) => Err(recorded),               // a *different* OS thread — violation.
+        Err(recorded) => Err(recorded), // a *different* OS thread — violation.
     }
 }
 
