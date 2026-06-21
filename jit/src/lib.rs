@@ -4553,21 +4553,26 @@ fn try_compile_inner(
             || (ir_emit_long
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
-            // Scope: FP PARAMS still ride XMM the prologue does not yet marshal,
-            // so `!fp_in_params`. The RETURN side is now fully open (inc 32:
-            // `double`; inc 33: `float`): an FP result's bits ride RAX (the i64
-            // return ABI) — no XMM return marshalling — via the `dreturn`/
-            // `freturn` builder arms + `Op::Return`'s `load_to_rax` (the
-            // interpreter reads `result as u64`/`as u32` → `from_bits`). A
-            // `float`'s 32-bit upper-stale-bits / `i64::MIN` collision on a call
-            // result is handled by the call-site `dispatch_threw` peek. Still
-            // excludes FP *params* (`fp_in_params`), int-div (would strand an FP
-            // value at the div deopt — whose resume can't yet reconstruct an FP
-            // slot), and `ldc2_w` (the builder does not yet disambiguate long-vs-
-            // double constant bits).
+            // The VM uses the COMPACT all-GPR i64 ABI (`execute_jit_call` /
+            // `jit_invoke_dispatch` marshal each FP value as `to_bits() as i64`
+            // into an INTEGER arg register, NOT XMM), so NOTHING about FP
+            // params/returns/call-args needs XMM register marshalling:
+            //   - PARAMS (inc 34): an FP param arrives as bits in a GPR; the
+            //     prologue stores it to the param slot like any other param, and
+            //     `ir_param_types`/`set_param_types` already type it Float/Double
+            //     (the cat-2 two-slot layout for `D`, as for `J`), so a later
+            //     `dload`/`fload` reads the slot via `fp_load`. The whole gate is
+            //     now FP-signature-agnostic — `fp_in_body` identifies FP methods.
+            //   - RETURNS (inc 32/33): the FP result's bits ride RAX (interpreter
+            //     reads `result as u64`/`as u32` → `from_bits`).
+            //   - CALL-ARGS (inc 34): `static_call_shape` admits `D`/`F` args
+            //     (one GPR slot each); the marshaller stores the slot bits to the
+            //     staging region and `decode_dispatch_values` reads them back.
+            // Still excludes int-div (would strand an FP value at the div deopt —
+            // whose resume can't yet reconstruct an FP slot) and `ldc2_w` (the
+            // builder does not yet disambiguate long-vs-double constant bits).
             || (ir_emit_fp
                 && fp_in_body(code, code_len)
-                && !fp_in_params(&cached.method_descriptor)
                 && !method_has_int_div(code, code_len)
                 && scan.ldc2w_ops.is_empty()))
     {
@@ -5939,45 +5944,6 @@ fn fp_in_descriptor(descriptor: &str) -> bool {
     false
 }
 
-/// inc 32: a `float`/`double` appears among the method's PARAMETERS (not the
-/// return). FP params ride XMM registers the IR prologue does not yet marshal, so
-/// such a method stays off the FP IR path. This is `fp_in_descriptor`'s parameter
-/// loop WITHOUT the return-type check — the return side is governed separately by
-/// `returns_float` (a `double` return is now admitted; see the FP gate clause).
-fn fp_in_params(descriptor: &str) -> bool {
-    let b = descriptor.as_bytes();
-    let mut i = 1;
-    while i < b.len() && b[i] != b')' {
-        match b[i] {
-            b'F' | b'D' => return true,
-            b'L' => {
-                i += 1;
-                while i < b.len() && b[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'[' => {
-                i += 1;
-                while i < b.len() && b[i] == b'[' {
-                    i += 1;
-                }
-                if i < b.len() && b[i] == b'L' {
-                    i += 1;
-                    while i < b.len() && b[i] != b';' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else if i < b.len() {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
 /// inc 30: the method uses `float`/`double` anywhere — signature OR body. Used by
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
@@ -6027,18 +5993,15 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
                 num_args += 1;
                 i += 1;
             }
-            // inc 28: a `long` arg is one i64 slot in the compact JIT ABI (the
-            // IR builder treats a long as one operand-stack node and the
-            // marshaller stores it as one i64), so it counts as one arg — same as
-            // an int/ref. Only reachable under `ir_emit_long` (producing a long
-            // requires a category-2 opcode → `method_uses_category2`), so this is
-            // inert for the default int/ref path. `double`/`float` args (XMM) are
-            // still rejected; a `double`/`float` RETURN is still rejected below
-            // (needs the XMM value tier). A `long` (`J`) RETURN is now accepted
-            // (post-inc-29): the `Long.MIN_VALUE`/`i64::MIN` deopt-sentinel
-            // collision is disambiguated at the call site via the out-of-band
-            // `dispatch_threw` peek (see `ir_lower.rs::Op::Call`).
-            b'J' => {
+            // A `long`/`double`/`float` arg is ONE i64 slot in the compact JIT
+            // ABI — the VM marshals every value (incl. FP, as `to_bits() as i64`)
+            // into one INTEGER arg register, not XMM, so each counts as one arg
+            // exactly like an int/ref. `J` args: inc 28; `D`/`F` args: inc 34
+            // (the marshaller stores the slot bits to the staging region and
+            // `decode_dispatch_values` reads them back as `Double`/`Float`). Only
+            // reachable under `ir_emit_long`/`ir_emit_fp` (producing a cat-2/FP
+            // value needs such an opcode), so inert for the default int/ref path.
+            b'J' | b'D' | b'F' => {
                 num_args += 1;
                 i += 1;
             }
@@ -6066,7 +6029,7 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
                     i += 1; // primitive array element type
                 }
             }
-            // long / float / double — category-2 / XMM, not handled.
+            // Any other byte is a malformed descriptor — bail.
             _ => return None,
         }
     }

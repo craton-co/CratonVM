@@ -2039,7 +2039,27 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
      both variants; IR == single-pass == host) + E2E (all 5 relational operators
      on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
    - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
-   - **FP params/returns + call-args** — *partially landed*.
+   - ✅ **FP params/returns + call-args — DONE (inc 32/33/34).** Key realization:
+     the VM uses the **compact all-GPR i64 ABI** — `execute_jit_call` /
+     `jit_invoke_dispatch` marshal every FP value as `to_bits() as i64` into an
+     INTEGER register, NOT XMM — so the doc's "FP args in XMM0-3/0-7" was wrong for
+     this VM and **no XMM register marshalling is needed anywhere** for the call
+     boundary. Returns landed in inc 32/33 (below); inc 34 finished params +
+     call-args:
+     - ✅ **FP params (inc 34).** Dropped the gate's `!fp_in_params` — the gate is
+       now FP-signature-agnostic (`fp_in_body` identifies FP methods). An FP param
+       arrives as bits in a GPR; the prologue stores it to the param slot like any
+       other param (`Op::Param` is a plain 64-bit copy from `(idx+1)*8`), and
+       `ir_param_types`/`set_param_types` already type it `Float`/`Double` (cat-2
+       two-slot layout for `D`, as for `J`), so a `dload`/`fload` reads the slot
+       via `fp_load`. Methods with FP SIGNATURES now take the IR path.
+     - ✅ **`D`/`F` call-args (inc 34).** `static_call_shape` admits `D`/`F` args
+       (one GPR slot each); the `Op::Call` marshaller stores the slot bits to the
+       staging region and `decode_dispatch_values` reads them back as
+       `Double`/`Float`.
+     - Validated: `ir_vs_singlepass` `…_double_param`/`…_float_param`/
+       `…_invokestatic_fp_args`; E2E (FpSig: FP-signature `hyp2`/`scalef`/`combine`
+       with FP params + FP call-args + FP call-returns) `== HotSpot`.
      - ✅ **`double` returns — DONE (inc 32).** A `double` result rides RAX as a
        clean 64-bit bit pattern (the i64 return ABI; the interpreter reads
        `result as u64` → `f64::from_bits`), so NO XMM return marshalling is
@@ -2063,8 +2083,6 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
        joins `dreturn`; `static_call_shape` accepts a `F` return. Validated:
        `ir_vs_singlepass` `…_float_return`/`…_invokestatic_float_return`/
        `…_float_return_min_bits_collision`; E2E `== HotSpot`.
-     - **Remaining:** FP *params* + `D`/`F` call-*args* (XMM prologue/epilogue
-       marshalling + an FP-aware VM→JIT call convention — FP args in XMM0-3/0-7).
    - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
      inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries

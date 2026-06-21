@@ -2379,6 +2379,94 @@ fn ir_vs_singlepass_float_return_min_bits_collision() {
     );
 }
 
+// ── FP PARAMS + D/F call-ARGS (inc 34) ──────────────────────────────────────
+//
+// The VM uses the compact all-GPR i64 ABI: an FP param/arg arrives as bits in an
+// INTEGER register (`to_bits() as i64`), NOT XMM. The prologue stores it to the
+// param slot like any other param; `set_param_types` types it Float/Double (cat-2
+// two-slot layout for `D`), so a `dload`/`fload` reads it via `fp_load`. So a
+// method with an FP SIGNATURE (not just FP-internal) now takes the IR path.
+
+#[test]
+fn ir_vs_singlepass_double_param() {
+    // static double f(double a, int b) { return a + (double)b; }
+    //   dload_0; iload_2; i2d; dadd; dreturn   (a: D @ jvm 0-1, b: I @ jvm 2)
+    let code = vec![0x26, 0x1c, 0x87, 0x63, 0xaf];
+    let cm = cached("dparam", "(DI)D", code, 3, 2);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("IR double-param");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("single-pass double-param");
+    for (a, b) in [(1.5f64, 2i64), (-3.25, 7), (1e10, -5), (0.0, 0)] {
+        let args = [a.to_bits() as i64, b];
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
+        let expected = a + b as f64;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR double-param a={a},b={b}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass double-param a={a},b={b}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_param() {
+    // static float f(float a, int b) { return a + (float)b; }
+    //   fload_0; iload_1; i2f; fadd; freturn   (a: F @ jvm 0, b: I @ jvm 1)
+    let code = vec![0x22, 0x1b, 0x86, 0x62, 0xae];
+    let cm = cached("fparam", "(FI)F", code, 2, 2);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("IR float-param");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("single-pass float-param");
+    for (a, b) in [(1.5f32, 2i64), (-3.25, 7), (100.0, -5), (0.0, 0)] {
+        let args = [a.to_bits() as i64, b];
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u32);
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u32);
+        let expected = a + b as f32;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-param a={a},b={b}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-param a={a},b={b}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_fp_args() {
+    // static double f(double a, float b) { return g(a, b); }   // g:(DF)D
+    //   dload_0; fload_2; invokestatic #2; dreturn   (a: D @ 0-1, b: F @ 2)
+    // Exercises a `double` arg + a `float` arg through `Op::Call` (marshalled as
+    // bits to the staging region) + the FP params of the caller + a `D` call return.
+    unsafe extern "C" fn dfarg_dispatch(_vm: i64, _i: i64, args_ptr: i64, n: i64) -> i64 {
+        assert_eq!(n, 2, "dfarg_dispatch expects (double, float)");
+        let p = args_ptr as *const i64;
+        let a = f64::from_bits(unsafe { *p } as u64); // arg0 = double (full 64 bits)
+        let b = f32::from_bits(unsafe { *p.add(1) } as u32); // arg1 = float (low 32)
+        (a + b as f64).to_bits() as i64
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = dfarg_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x26, 0x24, 0xb8, 0x00, 0x02, 0xaf];
+    let cm = cached("f", "(DF)D", code, 3, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(DF)D".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver)
+        .expect("IR compile of FP-call-args method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [(1.5f64, 2.5f32), (-3.0, 0.25), (1e9, -1.0), (0.0, 0.0)] {
+        let args = [a.to_bits() as i64, b.to_bits() as i64];
+        let r = f64::from_bits(
+            unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }.unwrap() as u64,
+        );
+        let expected = a + b as f64;
+        assert_eq!(r.to_bits(), expected.to_bits(), "FP call-args a={a},b={b}");
+    }
+}
+
 #[test]
 fn ir_vs_singlepass_fp_constants() {
     // int f(int a) { return (int)((float)a + 2.0f); }  — fconst_2
