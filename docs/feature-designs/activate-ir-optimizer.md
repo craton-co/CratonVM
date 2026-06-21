@@ -2083,9 +2083,19 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
        joins `dreturn`; `static_call_shape` accepts a `F` return. Validated:
        `ir_vs_singlepass` `…_float_return`/`…_invokestatic_float_return`/
        `…_float_return_min_bits_collision`; E2E `== HotSpot`.
-   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
+   - ✅ **`double` `ldc2_w` constants — DONE (inc 35).** Lifted the FP-gate
+     `ldc2_w` exclusion: `cp_ldc2w_resolver` now returns `(bits, is_double)` (it
+     already read `ConstantPoolEntry::Long`/`Double` but had collapsed both to
+     `i64`), so the builder lowers a `double` constant to `dconst`
+     (`Op::ConstF`/`Double`) and a `long` to `lconst` — double literals (`1.5`,
+     `3.14`, …) no longer bail. Single-pass ignores the flag (types by the
+     consuming opcode). Validated: `ir_vs_singlepass` `…_double_ldc2w_constant`
+     (and `…_long_ldc2w_constant` for no long-path regression); E2E (DLit:
+     `a*1.5+0.25`, polynomial) `== HotSpot`.
+   - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction;
+     needs a new `JitRuntimeHelpers` table entry).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
-     inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
+     remaining inc-30 int-div exclusion). `typed_stack_slot` already carries
      `FrameValue::Float` for a future FP-aware resume.
    Continue mirroring the long track's increment discipline, each slice gated
    behind `CRATONVM_JIT_IR_FP` + differential/probe soak.

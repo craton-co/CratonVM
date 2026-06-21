@@ -400,7 +400,7 @@ fn compile_long_ldc2w(
     cm: &CachedBytecodeMethod,
     helpers: &JitRuntimeHelpers,
     optimize: bool,
-    ldc2w: &dyn Fn(u16) -> Option<i64>,
+    ldc2w: &dyn Fn(u16) -> Option<(i64, bool)>, // inc 35: (bits, is_double)
 ) -> Option<CompiledMethod> {
     try_compile(
         cm,
@@ -427,6 +427,46 @@ fn compile_long_ldc2w(
     )
 }
 
+/// Like [`compile_long_ldc2w`] but with the FP gate on (inc 35) so a `double`
+/// `ldc2_w` constant is admitted and lowered to `dconst`.
+fn compile_fp_ldc2w(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    ldc2w: &dyn Fn(u16) -> Option<(i64, bool)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm, None, None, None, None, None, None, None, Some(ldc2w), None, helpers, None, None, None,
+        None, optimize, false, false, true, false, true, // ir_emit_fp ON
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_double_ldc2w_constant() {
+    // inc 35: a `double` `ldc2_w` constant. double f(double a) { return a * 1.5; }
+    //   dload_0; ldc2_w #1 (1.5); dmul; dreturn
+    const C: f64 = 1.5;
+    let code = vec![0x26, 0x14, 0x00, 0x01, 0x6b, 0xaf];
+    let ldc2w = |cp: u16| -> Option<(i64, bool)> {
+        match cp {
+            1 => Some((C.to_bits() as i64, true)), // double → is_double = true
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("dldc", "(D)D", code, 2, 1);
+    let ir = compile_fp_ldc2w(&cm, &helpers, true, &ldc2w).expect("IR double ldc2_w");
+    let sp = compile_fp_ldc2w(&cm, &helpers, false, &ldc2w).expect("single-pass double ldc2_w");
+    for a in [3.0f64, 0.0, -7.25, 1e10, -0.5] {
+        let args = [a.to_bits() as i64];
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
+        let host = a * C;
+        assert_eq!(r_ir.to_bits(), host.to_bits(), "double ldc2_w IR for a={a}");
+        assert_eq!(r_sp.to_bits(), host.to_bits(), "double ldc2_w single-pass for a={a}");
+    }
+}
+
 #[test]
 fn ir_vs_singlepass_long_ldc2w_constant() {
     // inc 26: `ldc2_w` long constants. long f(long a) { return a * C1 + C2; }
@@ -441,10 +481,10 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
         0x61, // ladd
         0xad, // lreturn
     ];
-    let ldc2w = |cp: u16| -> Option<i64> {
+    let ldc2w = |cp: u16| -> Option<(i64, bool)> {
         match cp {
-            1 => Some(C1),
-            2 => Some(C2),
+            1 => Some((C1, false)), // long constants → is_double = false
+            2 => Some((C2, false)),
             _ => None,
         }
     };

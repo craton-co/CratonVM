@@ -18068,12 +18068,14 @@ fn try_jit_upgrade_with_gate(
         Some(cm.find_class_by_name(target_class)?.as_u32())
     };
 
-    let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id)?;
+        // inc 35: report `(bits, is_double)` so the IR builder lowers a `double`
+        // constant to `dconst` and a `long` to `lconst`.
         let val = match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Long(v) => Some(*v),
-            ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Long(v) => Some((*v, false)),
+            ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
         if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
@@ -18081,7 +18083,7 @@ fn try_jit_upgrade_with_gate(
                 "[cratonvm-ldc2w] upgrade idx={} -> {:?} (f64 {})",
                 cp_idx,
                 val,
-                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+                val.map(|(v, _)| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
             );
         }
         val
@@ -18351,12 +18353,13 @@ fn try_jit_upgrade_with_gate(
                 Some(cm.find_class_by_name(target_class)?.as_u32())
             };
 
-            let c_ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+            let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
                 let cm = shared.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
+                // inc 35: `(bits, is_double)`.
                 match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Long(v) => Some(*v),
-                    ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Long(v) => Some((*v, false)),
+                    ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
                     _ => None,
                 }
             };
@@ -19037,12 +19040,13 @@ fn try_jit_compile_callee_slow(
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         Some(cm.find_class_by_name(target_class)?.as_u32())
     };
-    let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
+    let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
+        // inc 35: `(bits, is_double)`.
         let val = match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Long(v) => Some(*v),
-            ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            ConstantPoolEntry::Long(v) => Some((*v, false)),
+            ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
             _ => None,
         };
         if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
@@ -19050,7 +19054,7 @@ fn try_jit_compile_callee_slow(
                 "[cratonvm-ldc2w] full idx={} -> {:?} (f64 {})",
                 cp_idx,
                 val,
-                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+                val.map(|(v, _)| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
             );
         }
         val

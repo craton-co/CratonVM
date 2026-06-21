@@ -4126,7 +4126,7 @@ pub fn try_compile(
     // so the post-init helper call stays in place.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
@@ -4368,7 +4368,7 @@ fn try_compile_inner(
     // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
@@ -4581,12 +4581,13 @@ fn try_compile_inner(
             //     (one GPR slot each); the marshaller stores the slot bits to the
             //     staging region and `decode_dispatch_values` reads them back.
             // Still excludes int-div (would strand an FP value at the div deopt —
-            // whose resume can't yet reconstruct an FP slot) and `ldc2_w` (the
-            // builder does not yet disambiguate long-vs-double constant bits).
+            // whose resume can't yet reconstruct an FP slot). inc 35 lifted the
+            // `ldc2_w` exclusion: the resolver now reports `is_double`, so the
+            // builder lowers a `double` constant to `dconst` (a `long` ldc2_w
+            // stays `lconst`) — double literals (`1.5`, `3.14`, …) no longer bail.
             || (ir_emit_fp
                 && fp_in_body(code, code_len)
-                && !method_has_int_div(code, code_len)
-                && scan.ldc2w_ops.is_empty()))
+                && !method_has_int_div(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
@@ -4611,12 +4612,14 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
-        if ir_emit_long {
-            // inc 26: resolve `ldc2_w` long constants (pc → i64) so the builder
-            // can lower them to `Op::Const(Long)`. A double constant is excluded
-            // upstream (its consuming double opcode trips `method_uses_double`),
-            // so every resolved value here is a long bit pattern. An unresolved
-            // `ldc2_w` is omitted → that opcode bails to single-pass.
+        if ir_emit_long || ir_emit_fp {
+            // inc 26 (long) / inc 35 (double): resolve `ldc2_w` constants to
+            // `(pc → (bits, is_double))` so the builder lowers a `long` to
+            // `Op::Const(Long)` (`lconst`) and a `double` to `Op::ConstF`
+            // (`dconst`). inc 35 lifts the inc-30 FP-gate `ldc2_w` exclusion now
+            // that the builder disambiguates by `is_double` (a `double` constant
+            // is admitted under `ir_emit_fp`). An unresolved `ldc2_w` is omitted →
+            // that opcode bails to single-pass.
             if !scan.ldc2w_ops.is_empty() {
                 if let Some(resolver) = cp_ldc2w_resolver {
                     let mut lm = std::collections::HashMap::with_capacity(scan.ldc2w_ops.len());
@@ -5041,12 +5044,14 @@ fn try_compile_inner(
         }
     }
 
-    // Resolve ldc2_w constants (long/double from CP)
+    // Resolve ldc2_w constants (long/double from CP). Single-pass types the
+    // value by the consuming opcode (lstore/dstore/…), so it ignores the inc-35
+    // `is_double` flag and keeps just the bits.
     let mut ldc2w_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc2w_ops.is_empty() {
         let resolver = cp_ldc2w_resolver?;
         for &(pc, cp_idx) in &scan.ldc2w_ops {
-            let val = resolver(cp_idx)?;
+            let (val, _is_double) = resolver(cp_idx)?;
             ldc2w_info.push((pc, val));
         }
     }

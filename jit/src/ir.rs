@@ -506,12 +506,11 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
-    /// inc 26: resolved `ldc2_w` (0x14) long-constant values (`pc → i64`). Set by
-    /// [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to single-pass.
-    /// Only long constants are admitted — a double `ldc2_w` is excluded upstream
-    /// (its consuming double opcode trips `method_uses_double`), so a present
-    /// value is always the `long` bit pattern.
-    ldc2w_info: HashMap<usize, i64>,
+    /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
+    /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
+    /// single-pass. `is_double` selects the lowering: a `long` constant becomes
+    /// `Op::Const(Long)` (`lconst`), a `double` constant `Op::ConstF` (`dconst`).
+    ldc2w_info: HashMap<usize, (i64, bool)>,
 }
 
 impl IrBuilder {
@@ -559,7 +558,7 @@ impl IrBuilder {
 
     /// inc 26: supply resolved `ldc2_w` long-constant values (`pc → i64`). Must
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
-    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, i64>) {
+    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
     }
 
@@ -2105,18 +2104,22 @@ impl IrBuilder {
                     self.push(c);
                     pc += 1;
                 }
-                // ldc2_w (long constant from the constant pool) — inc 26. The
-                // resolved long value comes from `set_ldc2w_info` (`pc → i64`);
-                // an absent pc bails to single-pass. A double `ldc2_w` is
-                // excluded upstream (its consuming double opcode trips
-                // `method_uses_double`), so a present value is the long bits.
-                // (`ldc2_w` is 3 bytes: opcode + 2-byte CP index.)
+                // ldc2_w (long OR double constant from the constant pool) — inc 26
+                // (long) / inc 35 (double). The resolved `(bits, is_double)` comes
+                // from `set_ldc2w_info`; an absent pc bails to single-pass. A
+                // `double` constant lowers to `dconst` (`Op::ConstF`/`Double`), a
+                // `long` to `lconst` (`Op::Const`/`Long`). (`ldc2_w` is 3 bytes:
+                // opcode + 2-byte CP index.)
                 0x14 => {
-                    let val = match self.ldc2w_info.get(&pc) {
+                    let (val, is_double) = match self.ldc2w_info.get(&pc) {
                         Some(&v) => v,
                         None => return None,
                     };
-                    let c = self.lconst(val);
+                    let c = if is_double {
+                        self.dconst(f64::from_bits(val as u64))
+                    } else {
+                        self.lconst(val)
+                    };
                     self.push(c);
                     pc += 3;
                 }
