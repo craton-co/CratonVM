@@ -63,12 +63,6 @@ residual the original analysis flagged for handoff.
   class-definition path (`ClassLoader.defineClass`/`defineClass1` →
   `define_class_via_full`, `native-builtins/src/classloader.rs`) return a real mirror
   for Groovy's generated classes the way the Gradle path was fixed.
-  **CAUTION (2026-06-21):** the obvious "make the bailing methods JIT-compile by loading
-  their referenced classes" angle is a **disproven dead end** — see the
-  `DEAD END` note in [[springrepos-extension-hang-jit-throughput-and-deep-recursion]].
-  The compile-bail count is a red herring (native/always-loaded methods bail too), and a
-  real diagnosis needs an interpreter sampling profiler first, not codegen/class-loading
-  changes.
 - **`GroovyBeanDefinitionReaderTests` still HANGS** (300 s timeout) — same ANTLR
   parse-throughput hang; not closed for this class. Same handoff.
 
