@@ -6172,6 +6172,62 @@ struct Compiler {
     /// zero-initialization so a `long`/`double` parameter's slot is never
     /// clobbered. `0` ⇒ fall back to `num_params`.
     param_slot_span: usize,
+
+    /// deopt-osr Step 1: precise deopt-exit snapshots (machine-state -> interpreter
+    /// frame) recorded at eligible guards (currently the speculative-BCE loop-header
+    /// guard), transferred to `CompiledMethod::deopt_points` at finalize.
+    /// Emit-and-discard for now — no live path consumes them until the in-stub
+    /// trampoline + resume land (`real-frame-deopt-x64-backport.md` Steps 2-4).
+    deopt_points: Vec<crate::deopt::DeoptimizationPoint>,
+    /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the future
+    /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
+    deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
+}
+
+/// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
+/// `FrameValue` for a deopt snapshot. Pure (no `&self`) so it is unit-testable
+/// without a live compile.
+///
+/// `spill_off` is the positive `[rbp - spill_off]` frame offset; the resolver
+/// reads `*(rbp + off)`, so a spilled slot is encoded with the negated offset.
+/// A register-resident slot is `Register(r)` regardless of oop-ness — typing a
+/// register slot oop-vs-primitive is the deferred width/type source (Phase A
+/// `can_deopt_resume` excludes the ambiguous cases). XMM-resident slots have no
+/// resolver in Phase A (`SavedRegisters` is `gpr[16]` only) -> `Unsupported`.
+fn frame_value_for_slot(
+    reg: Option<u8>,
+    xmm: Option<u8>,
+    spill_off: i32,
+    is_oop: bool,
+) -> crate::deopt::FrameValue {
+    use crate::deopt::FrameValue;
+    if let Some(r) = reg {
+        FrameValue::Register(r)
+    } else if xmm.is_some() {
+        FrameValue::Unsupported
+    } else if is_oop {
+        FrameValue::StackSlotRef(-spill_off)
+    } else {
+        FrameValue::StackSlot(-spill_off)
+    }
+}
+
+#[cfg(test)]
+mod deopt_snapshot_tests {
+    use super::frame_value_for_slot;
+    use crate::deopt::FrameValue;
+
+    #[test]
+    fn frame_value_for_slot_maps_provenance() {
+        // Register-resident wins (provenance is the GPR), oop-ness aside.
+        assert_eq!(frame_value_for_slot(Some(3), None, 16, false), FrameValue::Register(3));
+        assert_eq!(frame_value_for_slot(Some(3), None, 16, true), FrameValue::Register(3));
+        // XMM-resident: not resolvable in Phase A.
+        assert_eq!(frame_value_for_slot(None, Some(9), 16, false), FrameValue::Unsupported);
+        // Spilled primitive vs spilled oop -> StackSlot vs StackSlotRef at [rbp-off].
+        assert_eq!(frame_value_for_slot(None, None, 16, false), FrameValue::StackSlot(-16));
+        assert_eq!(frame_value_for_slot(None, None, 24, true), FrameValue::StackSlotRef(-24));
+    }
 }
 
 impl Compiler {
@@ -6485,6 +6541,8 @@ impl Compiler {
             // here preserves legacy "arg index == slot" behavior.
             param_jvm_slots: Vec::new(),
             param_slot_span: 0,
+            deopt_points: Vec::new(),
+            deopt_boxes: Vec::new(),
         }
     }
 
@@ -6585,6 +6643,89 @@ impl Compiler {
     /// Offset for local variable `idx`: [rbp - (idx+1)*8]
     fn local_offset(&self, idx: usize) -> i32 {
         (idx as i32 + 1) * 8 // Cast: x86-64 immediate encoding
+    }
+
+    /// deopt-osr Step 1: record a precise deopt-exit snapshot (the interpreter
+    /// frame state — locals + operand stack as `FrameValue`s — reconstructable
+    /// from live machine state) at an eligible guard whose loop-header/canonical
+    /// bytecode index is `bci`.
+    ///
+    /// Provenance comes from the current register allocation (`reg_for_local` /
+    /// `xmm_for_local`, else the spilled frame slot) and the positive oop source
+    /// (`local_oop_masks`/`local_oop_reached` for locals, `stack_oop_marks` for
+    /// the operand stack — `Object`/ref iff the bit is SET *and* reached). The
+    /// primitive width/type source is a deferred follow-up; a register-resident
+    /// slot is recorded by provenance only and the `can_deopt_resume` gate (a
+    /// later step) excludes the ambiguous cases, so nothing resumes on a mistyped
+    /// slot.
+    ///
+    /// EMIT-AND-DISCARD: the point is recorded into `deopt_points` / `deopt_boxes`
+    /// (transferred to `CompiledMethod` at finalize) but no live path consumes it
+    /// yet, so this does not change the `i64::MIN` re-run behaviour.
+    fn emit_deopt_snapshot_at_guard(&mut self, bci: usize) {
+        use crate::deopt::{DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue};
+
+        let native_offset = self.buf.pos() as u32;
+
+        // Locals: oop-ness from the intersection-dataflow mask (only when the
+        // forward dataflow reached this PC; otherwise treat as non-oop). A slot
+        // beyond bit 63, or in an unmapped method, reads as non-oop here — sound
+        // only because `can_deopt_resume` (later) gates such methods off.
+        let oop_reached = self.local_oop_reached.get(bci).copied().unwrap_or(false);
+        let oop_mask = if oop_reached {
+            self.local_oop_masks.get(bci).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let mut locals = Vec::with_capacity(self.num_locals);
+        for i in 0..self.num_locals {
+            let is_oop = i < 64 && (oop_mask & (1u64 << i)) != 0;
+            locals.push(frame_value_for_slot(
+                self.reg_for_local(i),
+                self.xmm_for_local(i),
+                self.local_offset(i),
+                is_oop,
+            ));
+        }
+
+        // Operand stack (canonically empty at a BCE loop header, but handle the
+        // general case): map each live entry's StackSlot location to a FrameValue.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        let mut stack = Vec::with_capacity(n);
+        for i in 0..n {
+            let is_oop = self.stack_oop_marks[i];
+            stack.push(match &self.stack[i] {
+                StackSlot::Frame(off) => {
+                    if is_oop {
+                        FrameValue::StackSlotRef(-*off)
+                    } else {
+                        FrameValue::StackSlot(-*off)
+                    }
+                }
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => FrameValue::Register(*r),
+                StackSlot::Xmm(_) => FrameValue::Unsupported,
+            });
+        }
+
+        let point = DeoptimizationPoint {
+            native_offset,
+            bci: bci as u32,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: bci as u32,
+                locals,
+                stack,
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        // Record a stable boxed copy (the future imm64-baked stub loads it by
+        // pointer) and the by-value point (find_deopt_point / iteration).
+        self.deopt_boxes.push(Box::new(point.clone()));
+        self.deopt_points.push(point);
     }
 
     /// Push a value onto the simulated operand stack.
@@ -14032,6 +14173,7 @@ impl Compiler {
                     .get(&pc)
                     .cloned()
                     .unwrap_or_default();
+                let had_guards = !guards.is_empty();
                 for guard in guards {
                     // Load array reference into RAX
                     if let Some(reg) = self.reg_for_local(guard.array_local) {
@@ -14057,6 +14199,12 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
                     self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                }
+                // deopt-osr Step 1: record a precise deopt snapshot for this
+                // BCE loop-header guard (emit-and-discard; nothing reads it yet,
+                // so the i64::MIN re-run via deopt_stubs above is unchanged).
+                if had_guards {
+                    self.emit_deopt_snapshot_at_guard(pc);
                 }
             }
 
@@ -21909,6 +22057,13 @@ pub fn compile_with_param_slots(
     // to the conservative stack scan for that frame — always a
     // correct super-set of the precise coverage.
     cm.oop_maps = compiler.oop_maps;
+    // deopt-osr Step 1: transfer precise deopt-exit snapshots collected at
+    // eligible guards (currently the speculative-BCE loop-header guard). No live
+    // path consumes these yet — emit-and-discard until the in-stub trampoline +
+    // resume land (real-frame-deopt-x64-backport Steps 2-4) — so this is inert
+    // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
+    cm.deopt_points = compiler.deopt_points;
+    cm._deopt_point_boxes = compiler.deopt_boxes;
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;

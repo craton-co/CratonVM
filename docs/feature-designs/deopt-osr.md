@@ -350,14 +350,27 @@ feature branch. All additive and gated **unreachable in production**
   rewrite), `materializes_two_object_cycle` (A↔B materializes with the
   cross-references wired, under stress GC).
 
-Not yet done: **Step 7+** (OSR-exit map emission + flip), the remaining
-scaffolding (the x64 `emit_osr_exit_map_at` / `osr_exit_points` emitter stub),
-and wiring materialization into the live resume path (flip `can_deopt_resume`
-for virtual-bearing frames behind `CRATONVM_DEOPT_REAL`). Steps 1–4 (the x64
-deopt-exit machinery in the companion x64-backport doc) remain the prerequisite
-for an *end-to-end* real deopt that would *produce* a virtual-bearing frame; the
-tests drive `materialize_virtual_objects` directly on synthetic frames rather
-than through a real guard deopt.
+- **x64 deopt-exit Step 1 (companion `real-frame-deopt-x64-backport.md`).** The
+  production single-pass x64 backend now records a precise deopt-exit snapshot at
+  the speculative-BCE loop-header guard: `Compiler.{deopt_points,deopt_boxes}` +
+  `emit_deopt_snapshot_at_guard(bci)` (builds a `FrameState` from regalloc
+  provenance — `Register` / `StackSlot` / `StackSlotRef` via the pure, unit-tested
+  `frame_value_for_slot`, plus the positive oop source
+  `local_oop_masks`/`local_oop_reached`/`stack_oop_marks`), transferred to
+  `CompiledMethod` at finalize. EMIT-AND-DISCARD and verified inert:
+  `find_deopt_point` / `deopt_points` have no live-path consumer, so the
+  `i64::MIN` re-run is unchanged. The primitive width/type source and
+  register-resident-oop typing are deferred (gated later by `can_deopt_resume`).
+
+Not yet done: x64 deopt-exit **Steps 2–4** (in-stub 3-arg `x64_deopt_entry` +
+16-GPR spill into `SavedRegisters`; build + validate the interpreter `Frame` at
+the sink; flip the resume behind `CRATONVM_DEOPT_REAL`), then **Step 5+** of the
+backport (coverage-gate finalize + eager-deopt verifier, widen guards); deopt-osr
+**Step 7+** (OSR-exit map emission + flip) + the x64 `emit_osr_exit_map_at` /
+`osr_exit_points` scaffolding; and wiring `materialize_virtual_objects` into the
+live resume path (flip `can_deopt_resume` for virtual-bearing frames). Until the
+x64 trampoline + resume land, the materializer tests drive it on synthetic frames
+rather than through a real guard deopt.
 
 ## Risks & open questions
 
