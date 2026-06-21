@@ -1,0 +1,47 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: cargo-llvm-cov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Generate an LCOV coverage report over the whole workspace.
+      #
+      # This is ADVISORY for now: some workspace tests need a JDK runtime image
+      # (they boot the VM and run real Java), which this job does NOT provision.
+      # Those tests skip gracefully, but a coverage run that exercises them can
+      # still fail. `continue-on-error` keeps a missing JDK / boot failure from
+      # red-flagging the build. Once a JDK is wired in here this can become a
+      # blocking gate by dropping `continue-on-error`. See the matching note on
+      # the synthetic-stub census guard in ci.yml.
+      - name: Generate coverage
+        continue-on-error: true
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov.info
+          path: lcov.info
+          if-no-files-found: warn
