@@ -38,6 +38,30 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Step 9 (parallel evacuation) opt-out flag, declared early per the design's
+/// §7 scaffolding convention: a recognized env knob, read **once** behind a
+/// `OnceLock`, defaulting to the SAFE single-threaded behaviour so a later step
+/// can flip the default without re-plumbing. `CRATONVM_G1_PARALLEL_EVAC=1` (or
+/// `true`) will opt INTO the multi-threaded evacuator once it is built; unset or
+/// any other value keeps evacuation single-threaded.
+///
+/// Nothing gates on it yet — the parallel work_list / CAS-forwarding machinery
+/// is a deliberate follow-up: the single-threaded evacuator must be memory-safe
+/// across the gauntlet first (cf. the open gpu-bench-cpu G1 SIGSEGV). The
+/// behaviour-identical groundwork that *does* land now is the `evacuate_object`
+/// freshness signal that removes the `pointer_map.contains_key` evacuation
+/// TOCTOU at the ref-scan sites.
+#[allow(dead_code)]
+fn parallel_evac_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CRATONVM_G1_PARALLEL_EVAC")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Configuration for the G1 garbage collector.
 #[derive(Debug, Clone)]
 pub struct G1CollectorConfig {
@@ -692,7 +716,12 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
-                    if let Some(new_ptr) = self.evacuate_object(
+                    // Step 9: `fresh` is ignored here — the root loop keeps its
+                    // existing unconditional push (a duplicate root re-scans
+                    // idempotently). Gating it on `fresh` is deferred to the
+                    // parallel evacuator (where duplicate worklist entries
+                    // matter for worker load).
+                    if let Some((new_ptr, _fresh)) = self.evacuate_object(
                         &mut regions,
                         old_ptr,
                         &mut pointer_map,
@@ -1030,7 +1059,12 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
-                    if let Some(new_ptr) = self.evacuate_object(
+                    // Step 9: `fresh` is ignored here — the root loop keeps its
+                    // existing unconditional push (a duplicate root re-scans
+                    // idempotently). Gating it on `fresh` is deferred to the
+                    // parallel evacuator (where duplicate worklist entries
+                    // matter for worker load).
+                    if let Some((new_ptr, _fresh)) = self.evacuate_object(
                         &mut regions,
                         old_ptr,
                         &mut pointer_map,
@@ -1180,7 +1214,19 @@ impl G1Collector {
     }
 
     /// Evacuate a single object from its current region to Survivor or Old.
-    /// Returns the new pointer, or None on evacuation failure.
+    /// Returns `Some((new_ptr, fresh))` where `fresh` is `true` iff THIS call
+    /// performed the copy (vs found an existing forwarding entry), or `None`
+    /// on evacuation failure.
+    ///
+    /// Step 9 (parallel-evac foundation): `fresh` is the dedup signal callers
+    /// use to gate the work_list push, replacing a separate
+    /// `pointer_map.contains_key` pre-check — that pre-check is a TOCTOU the
+    /// moment evacuation is sharded across worker threads (two workers both
+    /// sample "absent", both copy, the loser's allocation leaks and is
+    /// double-scanned). Reading the freshness from the evacuation outcome
+    /// instead means the parallel evacuator can later derive it from the
+    /// atomic CAS-forwarding install in the object header (`forwarding_ptr`)
+    /// without changing the call sites.
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
@@ -1188,12 +1234,12 @@ impl G1Collector {
         pointer_map: &mut HashMap<usize, usize>,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
-    ) -> Option<*mut u8> {
+    ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
-        // Already forwarded?
+        // Already forwarded (not fresh) — return the existing forward.
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            return Some(new_addr as *mut u8);
+            return Some((new_addr as *mut u8, false));
         }
 
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
@@ -1266,7 +1312,7 @@ impl G1Collector {
         *objects_copied += 1;
         *bytes_copied += obj_size;
 
-        Some(new_ptr)
+        Some((new_ptr, true))
     }
 
     /// Scan an evacuated object's reference fields. For each reference pointing
@@ -1322,15 +1368,13 @@ impl G1Collector {
                                 // pathological graphs. The dedup signal we
                                 // need is "was this evacuation fresh?".
                                 // `evacuate_object` inserts into
-                                // `pointer_map` only when it actually
-                                // copies; if the entry was already present
-                                // it returns the existing forward without
-                                // touching the map. Sample BEFORE the call
-                                // and push to the worklist only on a fresh
-                                // evacuation.
-                                let already_forwarded =
-                                    pointer_map.contains_key(&(ref_ptr as usize));
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // `pointer_map` only when it actually copies.
+                                // Step 9: take the freshness from the
+                                // evacuation outcome (`fresh`) rather than a
+                                // separate `contains_key` pre-check (a TOCTOU
+                                // under parallel evacuation) and push to the
+                                // worklist only on a fresh evacuation.
+                                if let Some((new_ptr, fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
@@ -1340,7 +1384,7 @@ impl G1Collector {
                                     unsafe {
                                         std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                                     }
-                                    if !already_forwarded {
+                                    if fresh {
                                         work_list.push(new_ptr);
                                     }
                                 }
@@ -1364,10 +1408,11 @@ impl G1Collector {
                         if cset.contains(&region_idx) {
                             // Round-5 fix (CRIT, O(N²)): only push the
                             // forwarded target onto the worklist when this
-                            // call site actually evacuated it. See the
-                            // matching comment in the Array branch above.
-                            let already_forwarded = pointer_map.contains_key(&(ref_ptr as usize));
-                            if let Some(new_ptr) = self.evacuate_object(
+                            // call site actually evacuated it. Step 9: the
+                            // freshness comes from the evacuation outcome
+                            // (`fresh`), not a separate `contains_key`
+                            // pre-check (a TOCTOU under parallel evacuation).
+                            if let Some((new_ptr, fresh)) = self.evacuate_object(
                                 regions,
                                 ref_ptr,
                                 pointer_map,
@@ -1379,7 +1424,7 @@ impl G1Collector {
                                 unsafe {
                                     std::ptr::write(slot_ptr as *mut Value, new_value);
                                 }
-                                if !already_forwarded {
+                                if fresh {
                                     work_list.push(new_ptr);
                                 }
                             }
@@ -1459,7 +1504,11 @@ impl G1Collector {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&ridx) {
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // Step 9: `fresh` ignored — this RSet-source
+                                // scan keeps its existing unconditional push
+                                // (behaviour-identical; the parallel evacuator
+                                // will gate it on `fresh`).
+                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
@@ -1483,7 +1532,8 @@ impl G1Collector {
                         let ref_ptr = ref_obj.as_ptr();
                         if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&ridx) {
-                                if let Some(new_ptr) = self.evacuate_object(
+                                // Step 9: `fresh` ignored (see the Array branch).
+                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
                                     regions,
                                     ref_ptr,
                                     pointer_map,
