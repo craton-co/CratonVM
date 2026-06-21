@@ -1038,12 +1038,15 @@ impl PlatformBackend for Win32Backend {
                     return None;
                 }
                 // GetClipboardData returns a borrowed handle whose buffer may
-                // be corrupt or missing the wide-char NUL terminator. Cap the
-                // scan so an un-terminated buffer is treated as truncated
-                // rather than reading unbounded out-of-bounds memory.
-                const MAX_CLIP_WCHARS: usize = 16 * 1024 * 1024;
+                // be corrupt or missing the wide-char NUL terminator. Bound
+                // every read by the actual allocation size reported by
+                // GlobalSize so an un-terminated or short buffer is treated as
+                // truncated rather than reading out-of-bounds memory. GlobalSize
+                // returns bytes (0 on failure); convert to a wchar cap (rounding
+                // down so we never read a partial trailing wchar).
+                let cap_wchars = GlobalSize(HGLOBAL(h.0)) / 2;
                 let mut len = 0;
-                while len < MAX_CLIP_WCHARS && *ptr.add(len) != 0 {
+                while len < cap_wchars && *ptr.add(len) != 0 {
                     len += 1;
                 }
                 let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
