@@ -2763,22 +2763,96 @@ extern "C" fn jni_define_class(
     _env: JNIEnv,
     name: *const c_char,
     _loader: JObject,
-    _buf: *const u8,
-    _len: JSize,
+    buf: *const u8,
+    len: JSize,
 ) -> JClass {
-    // DefineClass from raw bytes: parse the name and load the class via the
-    // standard class manager path. Full bytecode injection is not yet supported.
-    let class_name = match unsafe { cstr_to_str(name) } {
-        Some(s) => s.replace('.', "/"),
-        None => return 0,
-    };
-    with_shared_vm(|shared| {
+    // DefineClass from raw bytes: define the class from the caller-supplied
+    // `buf[..len]` bytecode via the same `define_class` path the interpreter
+    // uses for `ClassLoader.defineClass` / agent retransform, so JNI/agent code
+    // that synthesises classes at runtime gets the bytes it actually passed —
+    // not a same-named class loaded from the classpath.
+    //
+    // Per JNI, `name` may be NULL (the name is then taken from the class file);
+    // when supplied it is the expected binary name. The bytecode buffer is
+    // mandatory: a NULL/empty/negative-length buffer is a hard error.
+    if buf.is_null() || len <= 0 {
+        raise_jni_no_class_def_found("DefineClass called with a null or empty bytecode buffer");
+        return 0;
+    }
+    // The class name may be NULL (JNI allows deriving it from the class file).
+    let class_name = unsafe { cstr_to_str(name) }.map(|s| s.replace('.', "/"));
+
+    // SAFETY: the caller guarantees `buf` points to `len` readable bytes for
+    // the duration of the call (standard JNI DefineClass contract). We copy the
+    // bytes out immediately so the slice does not outlive this borrow.
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(buf, len as usize) }.to_vec();
+
+    let result = with_shared_vm(|shared| {
+        // If the caller did not supply a name, the class manager will derive it
+        // from the class file's `this_class` entry; use the empty string as a
+        // placeholder that `define_class` overrides from the bytes.
+        let define_name = class_name.as_deref().unwrap_or("");
         let mut cm = shared.class_manager.write();
-        let class_id = cm.load_class(&class_name).ok()?;
-        Some(class_id.as_u32() as JClass)
+        let cid = cm
+            .define_class(
+                define_name,
+                &bytes,
+                cratonvm_types::ClassLoaderId::Application,
+            )
+            .ok()?;
+        drop(cm);
+        // Mirror the interpreter's defineClass path: invalidate any JIT code
+        // that may have inlined from a previously-loaded class of this name so
+        // a redefinition is honoured rather than served stale.
+        if let Some(n) = class_name.as_deref() {
+            let _ = shared.jit_cache.write().invalidate_for_class(n);
+            let _ = shared.invalidate_jit_for_class(n);
+        }
+        Some(cid.as_u32() as JClass)
     })
-    .flatten()
-    .unwrap_or(0)
+    .flatten();
+
+    match result {
+        Some(c) => c,
+        None => {
+            // Defining from the supplied bytes failed (malformed class file,
+            // linkage error, or no VM context). Surface it as a real Java
+            // exception instead of silently substituting a classpath class.
+            let label = class_name.as_deref().unwrap_or("<unnamed>");
+            raise_jni_no_class_def_found(&format!(
+                "DefineClass failed to define class {label} from the supplied bytecode"
+            ));
+            0
+        }
+    }
+}
+
+/// Raise a `NoClassDefFoundError` on the current thread so a failed
+/// `DefineClass` surfaces as a real Java exception rather than a fabricated
+/// null/0 return. Mirrors [`raise_jni_aioobe`].
+fn raise_jni_no_class_def_found(msg: &str) {
+    let raised =
+        with_jni_context(
+            |shared, thread| match crate::runtime::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/NoClassDefFoundError",
+                Some(msg),
+            ) {
+                Ok(exc) => {
+                    let handle = obj_to_jobject(exc);
+                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .unwrap_or(false);
+    if !raised {
+        // No thread context or allocation failed: flag the pending-exception
+        // sentinel so the condition is not silently swallowed.
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
+    }
 }
 
 // ---- Index 7: FromReflectedMethod ----
@@ -3273,6 +3347,26 @@ extern "C" fn jni_get_object_ref_type(_env: JNIEnv, obj: JObject) -> JInt {
 /// Stub for unimplemented JNI functions. Logs a warning and returns 0.
 extern "C" fn jni_stub() -> usize {
     tracing::warn!("unimplemented JNI function called");
+    0
+}
+
+/// Stub for the bare C-varargs (`...`) JNI call slots — `CallObjectMethod`,
+/// `CallStatic<Type>Method`, `CallNonvirtual<Type>Method`, etc.
+///
+/// The `...`-taking forms cannot be dispatched in stable Rust: there is no
+/// portable way to walk a platform `va_list` that the caller assembled inline
+/// (the V/`*MethodV` form receives an explicit `va_list` and the A/`*MethodA`
+/// form receives a `jvalue[]`, both of which *are* implemented and wired).
+///
+/// Rather than silently fabricating a `0`/null result (which a native would
+/// mistake for a real return value — an empty string, a null object, a zero
+/// count), this raises an `UnsatisfiedLinkError` so the unsupported call fails
+/// loudly. Native callers should use the `*MethodV` / `*MethodA` variants.
+extern "C" fn jni_varargs_unsupported() -> usize {
+    jni_throw_unsatisfied_link(
+        "bare C-varargs JNI call form (CallXxxMethod(...)) is not supported on this VM; \
+         use the CallXxxMethodV (va_list) or CallXxxMethodA (jvalue[]) variant instead",
+    );
     0
 }
 
@@ -5034,7 +5128,13 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[33] = jni_get_method_id as *const () as usize;
 
     // Call<Type>Method/V/A — virtual instance (groups of 3: varargs, va_list, array)
-    // varargs slots (34,37,40,...) left as stubs — not implementable in stable Rust
+    // Bare-varargs `...` slots (34,37,40,...) can't be dispatched in stable
+    // Rust; wire them to a stub that raises UnsatisfiedLinkError so a native
+    // calling them fails loudly instead of getting a fabricated 0/null. The
+    // V (va_list) and A (jvalue[]) forms below are fully implemented.
+    for slot in [34, 37, 40, 43, 46, 49, 52, 55, 58, 61] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[35] = jni_call_object_method_v as *const () as usize;
     t[36] = jni_call_object_method_a as *const () as usize;
     t[38] = jni_call_boolean_method_v as *const () as usize;
@@ -5057,6 +5157,10 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[63] = jni_call_void_method_a as *const () as usize;
 
     // CallNonvirtual<Type>Method/V/A (groups of 3)
+    // Bare-varargs `...` slots (64,67,70,...) raise UnsatisfiedLinkError; V/A wired below.
+    for slot in [64, 67, 70, 73, 76, 79, 82, 85, 88, 91] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[65] = jni_call_nonvirtual_object_method_v as *const () as usize;
     t[66] = jni_call_nonvirtual_object_method_a as *const () as usize;
     t[68] = jni_call_nonvirtual_boolean_method_v as *const () as usize;
@@ -5079,6 +5183,10 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[93] = jni_call_nonvirtual_void_method_a as *const () as usize;
 
     // CallStatic<Type>Method/V/A (groups of 3)
+    // Bare-varargs `...` slots (114,117,120,...) raise UnsatisfiedLinkError; V/A wired below.
+    for slot in [114, 117, 120, 123, 126, 129, 132, 135, 138, 141] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[115] = jni_call_static_object_method_v as *const () as usize;
     t[116] = jni_call_static_object_method_a as *const () as usize;
     t[118] = jni_call_static_boolean_method_v as *const () as usize;
@@ -5739,6 +5847,59 @@ mod tests {
             func_ptr, stub_ptr,
             "index 216 should be UnregisterNatives, not stub"
         );
+    }
+
+    #[test]
+    fn jni_bare_varargs_slots_raise_unsatisfied_link() {
+        // The bare C-varargs `...` call slots cannot be dispatched in stable
+        // Rust. They must be wired to `jni_varargs_unsupported` (which raises
+        // UnsatisfiedLinkError), NOT to the silent `jni_stub` (which would
+        // fabricate a 0/null return that a native would mistake for a result).
+        let env = get_jni_env();
+        let stub_ptr = jni_stub as *const () as usize;
+        let varargs_ptr = jni_varargs_unsupported as *const () as usize;
+        // Instance, nonvirtual, and static bare-varargs slot bases.
+        let bare_varargs_slots = [
+            34, 37, 40, 43, 46, 49, 52, 55, 58, 61, // CallXxxMethod(...)
+            64, 67, 70, 73, 76, 79, 82, 85, 88, 91, // CallNonvirtualXxxMethod(...)
+            114, 117, 120, 123, 126, 129, 132, 135, 138, 141, // CallStaticXxxMethod(...)
+        ];
+        for slot in bare_varargs_slots {
+            let func_ptr = unsafe { *(*env).add(slot) };
+            assert_ne!(
+                func_ptr, stub_ptr,
+                "bare-varargs slot {slot} must not be the silent stub"
+            );
+            assert_eq!(
+                func_ptr, varargs_ptr,
+                "bare-varargs slot {slot} must raise UnsatisfiedLinkError"
+            );
+        }
+    }
+
+    #[test]
+    fn jni_va_list_and_jvalue_array_call_slots_are_wired() {
+        // The V (va_list) and A (jvalue[]) call forms ARE implemented; their
+        // slots must point at real functions, not the stub.
+        let env = get_jni_env();
+        let stub_ptr = jni_stub as *const () as usize;
+        let varargs_ptr = jni_varargs_unsupported as *const () as usize;
+        // V/A slots for instance / nonvirtual / static Object-returning calls
+        // plus NewObjectV / NewObjectA.
+        let va_list_and_array_slots = [
+            29, 30, // NewObjectV / NewObjectA
+            35, 36, // CallObjectMethodV / CallObjectMethodA
+            65, 66, // CallNonvirtualObjectMethodV / ...A
+            115, 116, // CallStaticObjectMethodV / ...A
+        ];
+        for slot in va_list_and_array_slots {
+            let func_ptr = unsafe { *(*env).add(slot) };
+            assert_ne!(func_ptr, stub_ptr, "V/A slot {slot} must be implemented");
+            assert_ne!(
+                func_ptr, varargs_ptr,
+                "V/A slot {slot} must not be the varargs-unsupported stub"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
