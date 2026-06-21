@@ -768,6 +768,34 @@ VM's real file layer).
 > the chain is truncated after RESTEasy-deploy) — plus the silent post-park exit (~570 s) and the
 > logging-flush visibility. This is squarely the Quarkus recorder-framework work (cf. Gaps 5–7).
 
+> **BREAKTHROUGH (2026-06-21) — the silent-exit was a NO-OP SHIM on `Application.start`; gating it
+> off unblocks RUNTIME_INIT and makes the failure VISIBLE.** SMOKING GUN: `quarkus_staticinit.rs`
+> registered `io.quarkus.runtime.Application.start([String])V` (+ `stop`/`awaitShutdown`) as a no-op
+> (`native_app_lifecycle_no_op`). `Application.start()` → generated `ApplicationImpl.doStart()` is the
+> **RUNTIME_INIT** phase (Vert.x HTTP listen, datasource connect, Infinispan, Narayana JTA, …). The
+> STATIC_INIT `<clinit>` deploy steps (ArC / RESTEasy-metadata / Hibernate) run as real bytecode (Gaps
+> 4–7), which is why the boot reached RESTEasy deploy — but the no-op SKIPPED all of RUNTIME_INIT, so no
+> HTTP server, no Vert.x threads, and `start()` "succeeded" → main parked at `waitForExit`, then silently
+> exited. **FIX: `CRATONVM_REAL_QUARKUS_START` gate** (opt-in, mirrors `real_agroal`/`real_vertx`)
+> suppresses the no-op so the real `start()`→`doStart()` bytecode runs (commit on
+> `fix/keycloak-gap8-datasource`). With it + `REAL_AGROAL`/`REAL_VERTX`/`REAL_NET_SOCKETS`, the full boot
+> **now runs RUNTIME_INIT** — the log shows Infinispan (`Virtual threads support: enabled`), Narayana JTA,
+> **Vert.x** (`io.vertx.core.logging…`) and **Netty** (`io.netty.util.ResourceLeakDetector`,
+> `InternalThreadLocalMap`) all INITIALIZING (none of which happened before) — and the failure is now
+> LOUD instead of silent (Keycloak's own `ExecutionExceptionHandler`: *"ERROR: Failed to start server in
+> (development) mode"* + the cause + `[cratonvm] System.exit(1) called`). So the doc's #1 blocker
+> (invisible failures) is resolved for the full boot.
+>
+> **NEXT GAP (now visible + being fixed): JBoss-LogManager `LoggerNode` NPE.** RUNTIME_INIT logging
+> config fails with *"Cannot invoke org.jboss.logmanager.LoggerNode.setUseParentHandlers(boolean) because
+> this.loggerNode is null"*. CratonVM uses synthetic `org/jboss/logmanager/Logger` objects with NO
+> `loggerNode` and intercepts the loggerNode-deref methods (getLevel/setLevel/isLoggable/logRaw/
+> getUseParentHandlers/…), but `setUseParentHandlers(Z)V` was MISSING from that list, so its real bytecode
+> derefs the null node. FIX: add a null-safe no-op `org/jboss/logmanager/Logger.setUseParentHandlers(Z)V`
+> (logmanager.rs, mirroring the JUL override + the constant `getUseParentHandlers`). Building + validating;
+> expect the boot to advance to the next RUNTIME_INIT gap (then iterate toward `Listening`). The boot is
+> now an iterative, VISIBLE gap-walk through RUNTIME_INIT, not a silent wall.
+
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
 `InstanceImpl` bean resolution/creation all execute as real bytecode, and ArC

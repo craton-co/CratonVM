@@ -2018,6 +2018,20 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_jboss_logger_get_use_parent_handlers,
     );
+    // setUseParentHandlers(Z)V — the REAL bytecode does
+    // `this.loggerNode.setUseParentHandlers(flag)`, which NPEs on our synthetic
+    // Logger's null `loggerNode`. Keycloak's RUNTIME_INIT logging configuration
+    // calls this (per-category `setUseParentHandlers(false)`) and the NPE aborts
+    // startup: "Cannot invoke org.jboss.logmanager.LoggerNode.setUseParentHandlers
+    // because this.loggerNode is null". Null-safe no-op, mirroring the
+    // `java/util/logging/Logger` override and `getUseParentHandlers`'s constant
+    // (we don't model a real LoggerNode; the value isn't tracked).
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "setUseParentHandlers",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
     // Keycloak boot NPE — `Logger.logRaw` real-JDK bytecode dereferences
     // `this.loggerNode` and NPEs at `LoggerNode.isLoggable` (pc=48) and
     // `LoggerNode.publish` (pc=70). Our synthetic Logger has no
