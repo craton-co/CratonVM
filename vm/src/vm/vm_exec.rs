@@ -367,6 +367,37 @@ fn native_range_is_in_bounds(base: u64, len: usize) -> bool {
     base.checked_add(len as u64).is_some()
 }
 
+/// Atomically claim a raw `Box<JoinHandle<()>>` pointer for exactly-once
+/// consumption, returning `true` only on the FIRST claim of a given pointer.
+///
+/// `register_native_thread` / `attach_join_handle_to_native_thread` receive a
+/// `usize` that the caller produced via `Box::into_raw` and reconstruct it with
+/// `Box::from_raw`. If the SAME pointer value were ever passed twice (a
+/// duplicated handle, or a register-then-attach on the same raw pointer), the
+/// second `Box::from_raw` would reconstruct an already-freed allocation and
+/// double-free it on drop. Gating each reconstruction on this claim makes the
+/// `Box::from_raw` happen at most once per pointer: a second call sees the
+/// pointer already recorded, returns `false`, and the caller skips the unsafe
+/// reconstruction (a leak of that handle is acceptable; a double-free is not).
+///
+/// Pointers reused by the allocator after their owning thread has fully torn
+/// down are not a concern here — the dedup set only needs to prevent a
+/// double-consume of a handle that is still considered live by a caller, and
+/// in practice each spawned thread's handle is claimed exactly once. The set is
+/// bounded by the number of live native-thread handles, which is small.
+fn claim_raw_join_handle(ptr: usize) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static CLAIMED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    let set = CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
+    // A poisoned lock here only means a prior holder panicked; the contained
+    // set is still structurally valid, so recover the guard and proceed.
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    // `HashSet::insert` returns `true` iff the value was NOT already present,
+    // i.e. iff this is the first claim — exactly the exactly-once predicate.
+    guard.insert(ptr)
+}
+
 /// Pin a value that may encode a jobject as `Value::Long` for the duration
 /// of a native call (see `safe_native_call`).
 #[inline]
@@ -4116,17 +4147,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared
             .thread_registry
             .register_with_daemon(tid, name, None, daemon);
-        if join_handle_ptr != 0 {
+        // Claim the raw pointer for exactly-once consumption BEFORE
+        // reconstructing the Box: if this exact pointer were ever passed twice
+        // (a duplicated handle), the second `Box::from_raw` would double-free
+        // the allocation. `claim_raw_join_handle` returns `false` on a repeat,
+        // and we skip the reconstruction entirely.
+        if join_handle_ptr != 0 && claim_raw_join_handle(join_handle_ptr) {
             // SAFETY: the caller built this via
             // `Box::into_raw(Box::new(join_handle))` immediately before
             // the call, and is contractually obliged to pass us the
-            // exclusive ownership of that allocation. We take it back
-            // and move the `JoinHandle<()>` into the registry, where
-            // it lives until `wait_for_non_daemon_threads` joins on it
-            // (or the registry is dropped on VM teardown вЂ” in that
-            // case the handle is dropped, which detaches the OS thread,
-            // matching HotSpot's behaviour for daemon-on-shutdown
-            // teardown).
+            // exclusive ownership of that allocation. The claim above
+            // guarantees this is the first (and only) reconstruction of
+            // this pointer. We take it back and move the `JoinHandle<()>`
+            // into the registry, where it lives until
+            // `wait_for_non_daemon_threads` joins on it (or the registry is
+            // dropped on VM teardown вЂ” in that case the handle is dropped,
+            // which detaches the OS thread, matching HotSpot's behaviour for
+            // daemon-on-shutdown teardown).
             let boxed: Box<std::thread::JoinHandle<()>> =
                 unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
             self.shared.thread_registry.set_join_handle(tid, *boxed);
@@ -4164,8 +4201,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.thread_registry.thread_name(tid).is_none() {
             return false;
         }
+        // Claim the raw pointer for exactly-once consumption before
+        // reconstructing the Box. A duplicated pointer (already consumed by a
+        // prior `register_native_thread` / `attach_*` call) would otherwise be
+        // `Box::from_raw`'d a second time and double-freed. On a repeat claim we
+        // report failure without touching the (already-owned) allocation.
+        if !claim_raw_join_handle(join_handle_ptr) {
+            return false;
+        }
         // SAFETY: caller built this via `Box::into_raw` and is
-        // contractually obliged to pass us the exclusive ownership.
+        // contractually obliged to pass us the exclusive ownership; the claim
+        // above guarantees this is the only reconstruction of this pointer.
         let boxed: Box<std::thread::JoinHandle<()>> =
             unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
         self.shared.thread_registry.set_join_handle(tid, *boxed);
@@ -11765,6 +11811,29 @@ mod tests {
         // A forged length that pushes the end past u64::MAX wraps — reject it.
         assert!(!native_range_is_in_bounds(u64::MAX, 1));
         assert!(!native_range_is_in_bounds(u64::MAX - 4, 16));
+    }
+
+    // -----------------------------------------------------------------------
+    // claim_raw_join_handle — exactly-once consumption / double-free guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn claim_raw_join_handle_first_claim_succeeds_repeat_fails() {
+        // The set backing `claim_raw_join_handle` is process-global, so use
+        // distinctive sentinel values unlikely to collide with any real
+        // allocation or another test. These are NEVER reconstructed via
+        // Box::from_raw — only the dedup predicate is exercised.
+        let p1 = 0xDEAD_BEEF_0000_1001usize;
+        let p2 = 0xDEAD_BEEF_0000_1002usize;
+
+        // First claim of a fresh pointer succeeds.
+        assert!(claim_raw_join_handle(p1));
+        // A second claim of the same pointer is rejected (would be a double
+        // consume → double-free at the call site).
+        assert!(!claim_raw_join_handle(p1));
+        // A different pointer is independent and still claimable.
+        assert!(claim_raw_join_handle(p2));
+        assert!(!claim_raw_join_handle(p2));
     }
 
     #[test]
