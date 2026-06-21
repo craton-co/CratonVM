@@ -158,6 +158,14 @@ impl G1Region {
         self.data.len().saturating_sub(self.cursor)
     }
 
+    /// Step 7 — estimated time (ns) to evacuate this region's live data, used
+    /// by pause-target collection-set sizing. Evacuation cost is dominated by
+    /// copying the region's live bytes (plus per-slot reference rewriting);
+    /// `ns_per_byte` is the collector's rolling `evac_ns_per_byte` calibration.
+    pub fn estimated_evac_cost_ns(&self, ns_per_byte: u64) -> u64 {
+        (self.live_bytes as u64).saturating_mul(ns_per_byte)
+    }
+
     /// Reset this region to Free state.
     fn reset(&mut self) {
         self.region_type = RegionType::Free;
@@ -278,6 +286,16 @@ pub struct G1Collector {
     collection_count: AtomicU64,
     /// Total pause time in milliseconds across all collections.
     total_pause_ms: AtomicU64,
+
+    /// Step 7 (pause-target CSet sizing) — rolling per-region copy-cost
+    /// calibration: an EMA of observed evacuation cost in **nanoseconds per
+    /// live byte copied**, refreshed from each *mixed* collection (the
+    /// collections that actually evacuate old regions). `estimated_evac_cost_ns`
+    /// multiplies a region's `live_bytes` by this to bound the mixed collection
+    /// set against `max_gc_pause_ms`. Initialised to 4 ns/byte (~250 MB/s,
+    /// matching `region::Region::estimated_evac_cost_ns`) and clamped positive.
+    /// Relaxed: a statistics/scheduling signal, not a correctness guard.
+    evac_ns_per_byte: AtomicU64,
 
     /// Current old-gen bytes (for IHOP tracking).
     old_gen_bytes: AtomicUsize,
@@ -401,6 +419,7 @@ impl G1Collector {
             satb_queue: Arc::new(SatbQueue::new()),
             collection_count: AtomicU64::new(0),
             total_pause_ms: AtomicU64::new(0),
+            evac_ns_per_byte: AtomicU64::new(4),
             old_gen_bytes: AtomicUsize::new(0),
             marking_threshold_bytes: AtomicUsize::new(ihop_threshold),
             string_dedup_table: Mutex::new(FxHashMap::default()),
@@ -884,7 +903,12 @@ impl G1Collector {
     /// 3. **Cap:** at most `old_cset_region_threshold_percent` of all
     ///    regions (defaults to 10%), with a minimum of one region so
     ///    a tiny heap still makes progress.
-    /// 4. **Deterministic:** ties broken by ascending region index.
+    /// 4. **Pause-target cap (Step 7):** on top of the percentage cap, stop
+    ///    adding old regions once their estimated copy time (rolling
+    ///    `evac_ns_per_byte` × `live_bytes`) would exceed `max_gc_pause_ms`,
+    ///    always keeping ≥1 region. Deferred regions are reclaimed in a later
+    ///    mixed cycle.
+    /// 5. **Deterministic:** ties broken by ascending region index.
     ///
     /// This helper is exposed publicly so tests and external policy
     /// hooks can inspect the selection without running a full mixed
@@ -907,11 +931,23 @@ impl G1Collector {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        candidates
-            .into_iter()
-            .take(max_old)
-            .map(|(i, _)| i)
-            .collect()
+        // Step 7 — pause-target cap, mirroring the inline `mixed_collection`
+        // path: bound the old CSet by the `max_gc_pause_ms` copy-time budget
+        // (rolling `evac_ns_per_byte` × `live_bytes`) on top of the percentage
+        // cap, always keeping at least one region for forward progress.
+        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let mut cost_ns: u64 = 0;
+        let mut out: Vec<usize> = Vec::new();
+        for (i, _) in candidates.into_iter().take(max_old) {
+            let cost = regions[i].estimated_evac_cost_ns(ns_per_byte);
+            if !out.is_empty() && cost_ns.saturating_add(cost) > budget_ns {
+                break;
+            }
+            out.push(i);
+            cost_ns = cost_ns.saturating_add(cost);
+        }
+        out
     }
 
     /// Perform a mixed collection. Evacuates young + selected old regions.
@@ -963,8 +999,27 @@ impl G1Collector {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
+        // Step 7 — pause-target CSet sizing. On top of the percentage cap
+        // (`max_old`), bound the OLD collection set by an estimated copy-time
+        // budget so a mixed pause stays near `max_gc_pause_ms`. Per-region cost
+        // uses the rolling `evac_ns_per_byte` calibration. Always include at
+        // least one old region for forward progress; stop before the budget is
+        // exceeded — the deferred regions are reclaimed in a later mixed cycle
+        // (`mixed_gc_remaining`). The percentage cap remains the hard upper
+        // bound; the budget only binds when a single mixed GC would copy enough
+        // live old data to blow the target (a genuinely long pause).
+        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let mut old_cost_ns: u64 = 0;
+        let mut old_selected: usize = 0;
         for (idx, _) in old_candidates.into_iter().take(max_old) {
+            let cost = regions[idx].estimated_evac_cost_ns(ns_per_byte);
+            if old_selected > 0 && old_cost_ns.saturating_add(cost) > budget_ns {
+                break;
+            }
             cset.push(idx);
+            old_cost_ns = old_cost_ns.saturating_add(cost);
+            old_selected += 1;
         }
 
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -1082,7 +1137,12 @@ impl G1Collector {
             }
         }
 
-        let pause_ms = start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed();
+        let pause_ms = elapsed.as_millis() as u64;
+        // Step 7 — recalibrate the rolling copy-cost from this mixed cycle's
+        // actual pause / bytes copied, so the next mixed CSet is sized against
+        // real wall-clock throughput.
+        self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
         // Relaxed ordering: statistics counters for monitoring/logging only.
         self.collection_count.fetch_add(1, Ordering::Relaxed);
         self.total_pause_ms.fetch_add(pause_ms, Ordering::Relaxed);
@@ -2229,6 +2289,23 @@ impl G1Collector {
     // -----------------------------------------------------------------------
 
     /// Log a GC event if logging is enabled.
+    /// Step 7 — refresh the rolling `evac_ns_per_byte` calibration from a
+    /// completed mixed collection. Observed cost = whole pause / bytes copied
+    /// (deliberately includes the fixed scan overhead, so it slightly
+    /// *over*-estimates → a smaller, safer collection set). Smoothed with a
+    /// slow EMA (1/8 weight on the new sample) and clamped to a sane band so a
+    /// single anomalous cycle cannot wreck the estimate. No-op when nothing was
+    /// copied (no signal).
+    fn update_evac_cost(&self, pause_ns: u64, bytes_copied: usize) {
+        if bytes_copied == 0 || pause_ns == 0 {
+            return;
+        }
+        let observed = (pause_ns / bytes_copied as u64).clamp(1, 4096);
+        let prev = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
+        let next = (prev.saturating_mul(7).saturating_add(observed)) / 8;
+        self.evac_ns_per_byte.store(next.max(1), Ordering::Relaxed);
+    }
+
     fn log_gc_event(&self, collection_type: &G1CollectionType, pause_ms: u64, stats: &GcStats) {
         if !self.gc_log_enabled.load(Ordering::Relaxed) {
             return;
@@ -5188,6 +5265,76 @@ mod tests {
         assert_eq!(r.estimated_evac_cost_ns(), 1000);
         let r_empty = make_old_region(0, 1000, 0);
         assert_eq!(r_empty.estimated_evac_cost_ns(), 0);
+    }
+
+    // -- Step 7: pause-target CSet sizing --
+
+    #[test]
+    fn g1region_estimated_evac_cost_scales_with_live_and_rate() {
+        // G1Region cost = live_bytes * ns_per_byte (the rolling calibration).
+        let gc = make_collector();
+        gc.with_regions_mut(|rs| {
+            rs[0].live_bytes = 1000;
+        });
+        let regions = gc.regions.lock();
+        assert_eq!(regions[0].estimated_evac_cost_ns(4), 4000);
+        assert_eq!(regions[0].estimated_evac_cost_ns(1), 1000);
+        assert_eq!(regions[0].estimated_evac_cost_ns(0), 0);
+    }
+
+    #[test]
+    fn evac_cost_ema_calibrates_toward_observed() {
+        // The rolling copy-cost EMA starts at 4 ns/byte and moves toward the
+        // observed cost; a cycle that copied nothing is no signal.
+        let gc = make_collector();
+        assert_eq!(gc.evac_ns_per_byte.load(Ordering::Relaxed), 4);
+        for _ in 0..100 {
+            gc.update_evac_cost(100, 1); // observed 100 ns/byte
+        }
+        let after = gc.evac_ns_per_byte.load(Ordering::Relaxed);
+        assert!(
+            (5..=100).contains(&after),
+            "EMA must rise from 4 toward 100, got {after}"
+        );
+        // No bytes copied / zero pause => no change.
+        let frozen = gc.evac_ns_per_byte.load(Ordering::Relaxed);
+        gc.update_evac_cost(1_000_000, 0);
+        gc.update_evac_cost(0, 1_000);
+        assert_eq!(gc.evac_ns_per_byte.load(Ordering::Relaxed), frozen);
+    }
+
+    #[test]
+    fn mixed_cset_old_selection_respects_pause_budget() {
+        // With a tight pause target the time-budget cap bounds the old CSet
+        // (always >=1); with a generous target only the percentage cap applies.
+        // Four old regions, each 125_000 live bytes => 0.5ms at 4 ns/byte.
+        let build = |pause_ms: u64| {
+            let mut cfg = small_config();
+            cfg.max_gc_pause_ms = pause_ms;
+            cfg.old_cset_region_threshold_percent = 100; // percentage cap won't bind
+            let gc = G1Collector::new(cfg);
+            gc.with_regions_mut(|rs| {
+                for r in rs.iter_mut().take(4) {
+                    r.region_type = RegionType::Old;
+                    r.live_bytes = 125_000; // 0.5ms at the default 4 ns/byte
+                    r.gc_efficiency = 0.1;
+                }
+            });
+            gc
+        };
+        let tight = build(1).select_old_regions_for_mixed_gc();
+        assert!(!tight.is_empty(), "always keep >=1 old region for progress");
+        assert!(
+            tight.len() < 4,
+            "pause budget must cap the old CSet below the 4 available, got {}",
+            tight.len()
+        );
+        let generous = build(10_000).select_old_regions_for_mixed_gc();
+        assert_eq!(
+            generous.len(),
+            4,
+            "a generous pause target leaves only the percentage cap"
+        );
     }
 
     #[test]
