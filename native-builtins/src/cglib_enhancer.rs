@@ -623,6 +623,18 @@ struct LookupCp {
     valueof_short: u16,
     ame_class_idx: u16,
     ame_init_ref: u16,
+    // Generic-aware by-type lookup: getBeanProvider(ResolvableType.forMethodReturnType(m)).getObject()
+    class_class_idx: u16,
+    object_getclass_ref: u16,
+    class_getsuperclass_ref: u16,
+    class_getdeclaredmethod_ref: u16,
+    resolvabletype_formethodreturntype_ref: u16,
+    getbeanprovider_ref: u16,
+    objectprovider_getobject_ref: u16,
+    // NullBean → null unwrap for by-name lookups
+    class_getname_ref: u16,
+    string_equals_ref: u16,
+    nullbean_fqn_string_idx: u16,
 }
 
 /// Push a small int constant (`iconst`/`bipush`/`sipush`).
@@ -793,6 +805,37 @@ pub fn build_lookup_subclass(
     let ame_class_idx = cw.add_class("java/lang/AbstractMethodError");
     let ame_init_ref = cw.add_methodref(ame_class_idx, "<init>", "()V");
 
+    let class_class_idx = cw.add_class("java/lang/Class");
+    let object_getclass_ref =
+        cw.add_methodref(object_class_idx, "getClass", "()Ljava/lang/Class;");
+    let class_getsuperclass_ref =
+        cw.add_methodref(class_class_idx, "getSuperclass", "()Ljava/lang/Class;");
+    let class_getdeclaredmethod_ref = cw.add_methodref(
+        class_class_idx,
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    let resolvabletype_cls = cw.add_class("org/springframework/core/ResolvableType");
+    let resolvabletype_formethodreturntype_ref = cw.add_methodref(
+        resolvabletype_cls,
+        "forMethodReturnType",
+        "(Ljava/lang/reflect/Method;)Lorg/springframework/core/ResolvableType;",
+    );
+    let getbeanprovider_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBeanProvider",
+        "(Lorg/springframework/core/ResolvableType;)Lorg/springframework/beans/factory/ObjectProvider;",
+    );
+    let objectprovider_cls = cw.add_class("org/springframework/beans/factory/ObjectProvider");
+    let objectprovider_getobject_ref =
+        cw.add_interface_methodref(objectprovider_cls, "getObject", "()Ljava/lang/Object;");
+    let class_getname_ref = cw.add_methodref(class_class_idx, "getName", "()Ljava/lang/String;");
+    let string_cls = cw.add_class("java/lang/String");
+    let string_equals_ref =
+        cw.add_methodref(string_cls, "equals", "(Ljava/lang/Object;)Z");
+    let nullbean_fqn_string_idx =
+        cw.add_string("org.springframework.beans.factory.support.NullBean");
+
     let cp = LookupCp {
         code_attr_name_idx,
         bf_field_ref,
@@ -812,6 +855,16 @@ pub fn build_lookup_subclass(
         valueof_short,
         ame_class_idx,
         ame_init_ref,
+        class_class_idx,
+        object_getclass_ref,
+        class_getsuperclass_ref,
+        class_getdeclaredmethod_ref,
+        resolvabletype_formethodreturntype_ref,
+        getbeanprovider_ref,
+        objectprovider_getobject_ref,
+        class_getname_ref,
+        string_equals_ref,
+        nullbean_fqn_string_idx,
     };
 
     let ctor = emit_default_ctor(
@@ -844,57 +897,115 @@ pub fn build_lookup_subclass(
         }
 
         let rettype_class_idx = cw.add_class(&m.return_internal);
-        let name_string_idx = m.bean_name.as_ref().map(|bn| cw.add_string(bn));
-
-        let mut code: Vec<u8> = Vec::new();
-        // bf = (BeanFactory) this.$$beanFactory
-        code.push(0x2A); // aload_0
-        code.push(0xB4); // getfield
-        code.extend_from_slice(&b(cp.bf_field_ref));
-        code.push(0xC0); // checkcast BeanFactory
-        code.extend_from_slice(&b(cp.beanfactory_cast_idx));
-        // selector: name string (by name) or return Class (by type)
-        code.push(0x13); // ldc_w
-        match name_string_idx {
-            Some(s) => code.extend_from_slice(&b(s)),
-            None => code.extend_from_slice(&b(rettype_class_idx)),
-        }
         let has_args = !params.is_empty();
-        if has_args {
-            push_int(&mut code, params.len() as i32);
+        let mut code: Vec<u8> = Vec::new();
+
+        let emit_arg_array = |code: &mut Vec<u8>| {
+            push_int(code, params.len() as i32);
             code.push(0xBD); // anewarray
             code.extend_from_slice(&b(cp.object_class_idx));
             let mut slot = 1u16;
             for (i, p) in params.iter().enumerate() {
                 code.push(0x59); // dup
-                push_int(&mut code, i as i32);
-                emit_load_box(&mut code, &cp, p, slot);
+                push_int(code, i as i32);
+                emit_load_box(code, &cp, p, slot);
                 slot += if p == "J" || p == "D" { 2 } else { 1 };
                 code.push(0x53); // aastore
             }
-            let r = if name_string_idx.is_some() {
-                cp.getbean_name_args_ref
+        };
+
+        if let Some(bn) = m.bean_name.as_ref() {
+            // ---- BY NAME: (Ret) bf.getBean(name[, args]); NullBean/null → null ----
+            let name_string_idx = cw.add_string(bn);
+            code.push(0x2A);
+            code.push(0xB4);
+            code.extend_from_slice(&b(cp.bf_field_ref));
+            code.push(0xC0);
+            code.extend_from_slice(&b(cp.beanfactory_cast_idx));
+            code.push(0x13);
+            code.extend_from_slice(&b(name_string_idx));
+            if has_args {
+                emit_arg_array(&mut code);
+                code.push(0xB9);
+                code.extend_from_slice(&b(cp.getbean_name_args_ref));
+                code.push(0x03);
+                code.push(0x00);
             } else {
-                cp.getbean_type_args_ref
-            };
-            code.push(0xB9); // invokeinterface
-            code.extend_from_slice(&b(r));
-            code.push(0x03); // count = this + (name|class) + array
-            code.push(0x00);
-        } else {
-            let r = if name_string_idx.is_some() {
-                cp.getbean_name_ref
-            } else {
-                cp.getbean_type_ref
-            };
+                code.push(0xB9);
+                code.extend_from_slice(&b(cp.getbean_name_ref));
+                code.push(0x02);
+                code.push(0x00);
+            }
+            // NullBean/null → null (branch offsets constant relative to suffix start)
+            code.push(0x59); // dup
+            code.extend_from_slice(&[0xC6, 0x00, 0x17]); // ifnull +23 (0xC6, NOT 0x99=ifeq)
+            code.push(0x59); // dup
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.object_getclass_ref));
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.class_getname_ref));
+            code.push(0x13);
+            code.extend_from_slice(&b(cp.nullbean_fqn_string_idx));
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.string_equals_ref));
+            code.extend_from_slice(&[0x9A, 0x00, 0x07]); // ifne +7
+            code.push(0xC0);
+            code.extend_from_slice(&b(rettype_class_idx));
+            code.push(0xB0); // areturn
+            code.push(0x57); // L: pop
+            code.push(0x01); // aconst_null
+            code.push(0xB0); // areturn
+        } else if !has_args {
+            // ---- BY TYPE, no args: generic-aware getBeanProvider(ResolvableType) ----
+            let mname_string_idx = cw.add_string(&m.name);
+            code.push(0x2A);
+            code.push(0xB4);
+            code.extend_from_slice(&b(cp.bf_field_ref));
+            code.push(0xC0);
+            code.extend_from_slice(&b(cp.beanfactory_cast_idx)); // [bf]
+            code.push(0x2A); // aload_0
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.object_getclass_ref));
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.class_getsuperclass_ref));
+            code.push(0x13);
+            code.extend_from_slice(&b(mname_string_idx));
+            code.push(0x03); // iconst_0
+            code.push(0xBD);
+            code.extend_from_slice(&b(cp.class_class_idx)); // anewarray Class
+            code.push(0xB6);
+            code.extend_from_slice(&b(cp.class_getdeclaredmethod_ref));
+            code.push(0xB8);
+            code.extend_from_slice(&b(cp.resolvabletype_formethodreturntype_ref));
             code.push(0xB9);
-            code.extend_from_slice(&b(r));
+            code.extend_from_slice(&b(cp.getbeanprovider_ref));
             code.push(0x02);
             code.push(0x00);
+            code.push(0xB9);
+            code.extend_from_slice(&b(cp.objectprovider_getobject_ref));
+            code.push(0x01);
+            code.push(0x00);
+            code.push(0xC0);
+            code.extend_from_slice(&b(rettype_class_idx));
+            code.push(0xB0);
+        } else {
+            // ---- BY TYPE, with args: (Ret) bf.getBean(Ret.class, args) ----
+            code.push(0x2A);
+            code.push(0xB4);
+            code.extend_from_slice(&b(cp.bf_field_ref));
+            code.push(0xC0);
+            code.extend_from_slice(&b(cp.beanfactory_cast_idx));
+            code.push(0x13);
+            code.extend_from_slice(&b(rettype_class_idx));
+            emit_arg_array(&mut code);
+            code.push(0xB9);
+            code.extend_from_slice(&b(cp.getbean_type_args_ref));
+            code.push(0x03);
+            code.push(0x00);
+            code.push(0xC0);
+            code.extend_from_slice(&b(rettype_class_idx));
+            code.push(0xB0);
         }
-        code.push(0xC0); // checkcast Ret
-        code.extend_from_slice(&b(rettype_class_idx));
-        code.push(0xB0); // areturn
         method_bytes.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &code, 8, mlocals));
     }
 
