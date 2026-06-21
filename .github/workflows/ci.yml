@@ -119,6 +119,31 @@ jobs:
   # Future CI hardening — not yet enabled. Uncomment once the
   # corresponding gates are ready to be enforced.
   #
+  # Semantic differential gate (difftest, design
+  # docs/feature-designs/differential-fuzzer.md §3.5 / §6.7). The `difftest`
+  # crate already builds and `difftest gate` honors the exit-code contract
+  # (0 ok / 1 new divergence / 2 fixed-regressed / 3 bootstrap), exiting 3 on
+  # an empty corpus or when `java` is absent — so this step is safe to adopt
+  # now and only starts *failing* once Step 3 wires the comparison + ledger.
+  # Needs a pinned JDK 25 (the HotSpot oracle) and the cratonvm binary.
+  #
+  # difftest-gate:
+  #   name: Semantic differential gate
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - name: Set up JDK 25 (HotSpot oracle)
+  #       uses: actions/setup-java@v4
+  #       with:
+  #         distribution: temurin
+  #         java-version: '25'
+  #     - name: Build difftest + cratonvm
+  #       run: cargo build -p cratonvm-difftest -p cratonvm-cli
+  #     - name: Run the semantic differential gate
+  #       run: cargo run -p cratonvm-difftest --bin difftest -- gate --corpus difftest/seeds
+  #
   # coverage:
   #   name: Coverage
   #   runs-on: ubuntu-latest
