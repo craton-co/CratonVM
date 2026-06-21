@@ -9,15 +9,31 @@
 CratonVM's `javax.crypto.*` / `java.security.*` natives are NOT considered
 production-ready as of the 0.3.0 release. Specific limitations:
 
-- **ML-KEM (JEP 496) and ML-DSA (JEP 497)**: post-quantum algorithm
-  resolution now throws `NoSuchAlgorithmException`. Earlier prototypes
-  returned zero-filled "keys" that decapsulated to constant values.
-- **HKDF / PBKDF2WithHmacSHA***: throws `NoSuchAlgorithmException`.
-  Earlier prototype used fixed salt/IKM constants and produced the same
-  output across every process.
+- **ML-KEM (JEP 496) and ML-DSA (JEP 497)**: post-quantum key
+  generation, KEM encapsulate/decapsulate, and ML-DSA sign/verify are
+  routed to the real JDK 25 SPIs (SunJCE `ML_KEM_Impls`, SUN
+  `ML_DSA_Impls`) and run interpreted — correct but slow. Earlier
+  prototypes returned zero-filled "keys" that decapsulated to constant
+  values; the synthetic stubs that threw `NoSuchAlgorithmException` are
+  now opt-in only (`CRATONVM_SYNTHETIC_PQC=1`).
+- **PBKDF2WithHmacSHA1/224/256**: real PKCS#5 v2.0 derivation via
+  `SecretKeyFactory` (HMAC over `sha1`/`sha2`). `PBKDF2WithHmacSHA512`
+  is not mapped and throws `NoSuchAlgorithmException`. Earlier prototype
+  used fixed salt/IKM constants and produced the same output across every
+  process.
+- **HKDF**: the `javax.crypto.KDF` SPI throws `NoSuchAlgorithmException`
+  (an in-tree `crypto_impl::Hkdf` primitive exists but is not advertised
+  through the provider chain).
 - **AES / AES-GCM**: routed through the `aes`/`aes-gcm` RustCrypto
   crates (constant-time, AES-NI capable). Previous in-tree implementation
   used T-table SBOX lookups (cache-timing oracle).
+- **SecureRandom**: seeded from the OS CSPRNG (`BCryptGenRandom` on
+  Windows, `getrandom`/`/dev/urandom` elsewhere). An unseeded instance
+  draws bytes directly from the OS source; a per-instance DRBG (seeded
+  from OS entropy, mixed with any user `setSeed`) supplies the remaining
+  output paths. A time/PID/thread fallback is used only if the OS source
+  is entirely unavailable. The earlier constant `splitmix64`-only stub is
+  gone.
 - **JCA provider chain**: 13 provider names are advertised; only `SUN`,
   `SunJCE`, and `SunRsaSign` are backed by real Service maps. Others —
   including the `SunEC` *provider object* — return null on
