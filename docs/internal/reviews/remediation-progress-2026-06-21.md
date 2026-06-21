@@ -16,6 +16,16 @@ The **GC-root cluster is now 8/9 done** (all build-green, merged in order). Adde
 
 Everything below is the original plan; the GC-root cluster items above are now DONE except JNI.
 
+### Also landed (docs + scripts/CI):
+- **Docs consistency** (`fix/docs-consistency`): crate count 17→**19** (+ documented `libcratonvm`/`cratonvm-embed`); `CRYPTO_STATUS.md` reclassified PBKDF2/ML-KEM/ML-DSA/DESede as **implemented** (HKDF/Scrypt/Argon2 kept accurate); `SECURITY.md` crypto + SecureRandom (OS CSPRNG) corrected; GC maturity (G1/ZGC experimental) reconciled; CHANGELOG file refs (`THIRD-PARTY-NOTICES.md`, drop `CITATION.cff`, `aarch64.rs`); MSRV requirement statements 1.77→**1.80**.
+- **Scripts/CI** (`fix/scripts-ci`): parked `jck.yml`/`pgo-build.yml` corrected to `-p cratonvm-cli` / `bin cratonvm`; dangling census step made self-contained (the `test-infra/native-census` script genuinely does not exist — a real follow-up is to create it); **no-debug-prints gate** (`scripts/check-no-diag-prints.sh`) added to active `ci.yml`; de-hardcoded `C:\Users\Victor` toolchain/libffi paths in 5 `.bat` build scripts.
+
+### Still remaining after this session
+- **JNI** local-ref-frame + array-pin (cross-file: `gc` pinned-set + `jni.rs` + `vm_exec.rs`) — last GC-root item.
+- ~60 mediums (full report Part 1.2), perf items (Part 1.3 per-module), S/M features (Part 5).
+- OSS hygiene `git rm --cached` of the 595 `.class` + 383 `bench/` + `dd1.out` (a bulk index op; left for a deliberate commit), README for libcratonvm/cratonvm-embed.
+- The **workspace-wide clippy debt** (jit ~104, vm, native-builtins) + **fmt debt** (~18 files) — a separate cleanup project; build stays green.
+
 ## Orchestration model (how this was/ is run)
 - One Opus agent per finding-cluster, each in an **isolated git worktree** on a **properly-named branch**, editing a **disjoint set of files** (no two in-flight agents touch the same file). Agents only write code/docs; they do **not** build.
 - The orchestrator merges branches into `dev` in **severity order (critical → high → medium)** with one-line commit subjects, formats the changed files, and runs the build gate. Merges are seamless because file ownership is disjoint.
