@@ -7372,8 +7372,7 @@ fn route_jit_exception_through_method(
         // catch an out-of-region exception); typed handlers still match on
         // exception class — wrong-type exceptions cannot be silently swallowed.
         if pc_unknown {
-            if entry.catch_type == 0
-                && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
+            if entry.catch_type == 0 && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
             {
                 continue;
             }
@@ -16465,7 +16464,13 @@ fn try_osr(
             {
                 if let Some((entry, needs_ctx)) =
                     // Eager direct-call callee compile — optimized (C2) tier.
-                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc, true)
+                    try_jit_compile_callee(
+                        shared,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                        true,
+                    )
                 {
                     direct_calls2.push((
                         ipc,

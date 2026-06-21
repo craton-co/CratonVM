@@ -1888,8 +1888,10 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
             (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
         return Err(
-            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: bad_index }
-                .into(),
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: bad_index,
+            }
+            .into(),
         );
     }
     let buf = match buf {

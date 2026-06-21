@@ -28772,10 +28772,7 @@ mod biginteger_modpow_modinverse_tests {
         // Same exponent with a modulus that is itself larger than i128
         // (Mersenne prime 2^61 - 1): since 2^61 ≡ 1, 2^256 ≡ 2^(256 mod 61) =
         // 2^12 = 4096. Cross-checked: pow(2, 256, 2305843009213693951) == 4096.
-        assert_eq!(
-            bi_mod_pow_str("2", "256", "2305843009213693951"),
-            "4096"
-        );
+        assert_eq!(bi_mod_pow_str("2", "256", "2305843009213693951"), "4096");
     }
 
     // --- modInverse: real arbitrary-precision inverse + non-invertible None ---
@@ -39958,11 +39955,14 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // Degrade (gate off) / Failed → the JDK raises IllegalArgumentException
         // for an unbuildable proxy class; mirror that rather than returning a
         // bogus Class.
-        _ => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Proxy.getProxyClass: cannot generate a proxy class for the given interfaces"
-                .to_string(),
-        }
-        .into()),
+        _ => Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message:
+                    "Proxy.getProxyClass: cannot generate a proxy class for the given interfaces"
+                        .to_string(),
+            }
+            .into(),
+        ),
     }
 }
 
