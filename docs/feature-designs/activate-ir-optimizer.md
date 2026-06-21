@@ -1301,6 +1301,97 @@ proof of the inc-22 risk, and `=0` remains the opt-out if a suite ever regresses
 `invokespecial` of a statically-resolved target; category-2 (long/float/double)
 args + return; virtual/special/interface dispatch via inline caches.
 
+## Increment 24 (Gap B — `invokespecial` → `Op::Call`, gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_CALL_SPECIAL`**.
+Extends the `Op::Call` lever from `invokestatic` (inc 21/22/23) to a resolved
+**non-`<init>` `invokespecial`** — a `super.m(…)` / private / otherwise
+non-virtual instance call. It lands inert + validated (unit + differential +
+live soak); flipping it on is a follow-up (like inc 21→23 for invokestatic),
+gated on the broader app-gauntlet soak since it would put a dispatch path live by
+default.
+
+**Why it's a small, sound extension.** `invokespecial` is *statically resolved*
+(no virtual dispatch), so it reuses the entire `invokestatic` machinery — the
+`Op::Call` node, the `ir_lower` `Op::Call` arm, the `invoke_dispatch` ABI, the
+leaked `JitInvokeInfo`, and the conservative IR-frame GC scan — with exactly two
+deltas: the **receiver is marshalled as arg0** (`num_jit_args = 1 + descriptor
+args`) and the `JitInvokeInfo` carries **`invoke_kind = 1`** so `invoke_dispatch`
+does the non-virtual dispatch to the resolved target. Both are precisely what the
+single-pass backend already does for `invokespecial` (`invoke_kind` 1, receiver
+included), so the IR path produces byte-identical dispatch arguments.
+
+**GC-safety** is the inc-22 argument unchanged: the IR lowerer spills every value
+to a frame slot (no oop in a register across a call), the GC is non-moving while a
+JIT frame is active, and `JitEntryGuard` conservatively scans the frame slots at
+every safepoint — so the receiver oop (and any reference args) live across the
+call are pinned, never reclaimed or relocated. No oop map needed.
+
+**What landed**
+- **`jit/src/ir.rs`** — the `invokespecial` (0xb7) arm gains an `Op::Call` path:
+  if the pc is in `invoke_info` (the caller populated it), lower exactly like
+  `invokestatic` (pop `num_args`, thread the memory token, push a non-void
+  result); otherwise fall through to the existing elidable-`<init>` elision. A pc
+  in neither bails to single-pass. (The two are mutually exclusive: a `<init>`
+  method has a `new` → not call-eligible.)
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_special_calls`.
+  The Gap-B gate now admits `invokestatic` (under `ir_emit_calls`) **and**
+  non-`<init>` `invokespecial` (under `ir_emit_special_calls`); for a special
+  call it sets `num_args = static_call_shape(desc) + 1` (the receiver) and
+  `invoke_kind = 1`. `static_call_shape` still rejects category-2 args/returns, so
+  only int/reference receivers+args+returns are admitted (the receiver is always a
+  reference → one GPR slot).
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_special_calls` from `CRATONVM_JIT_IR_CALL_SPECIAL` (default-OFF). No
+  other VM change (the cache already routes `Op::Call` methods via
+  `try_call_with_context`).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokespecial_instance_call` —
+  **executes** the IR-emitted call: `int f(Corpus o, int n){ return o.g(n); }`
+  via `invokespecial` to `g(I)I`, with a stub `invoke_dispatch` that reads field 0
+  off the marshalled receiver pointer and returns `recv.x + n`. IR == host across
+  sign/zero edge cases — proves receiver-first marshalling, `num_jit_args = 2`,
+  and `needs_context` at the machine-code level.
+- `jit/src/lib.rs::ir_special_call_wiring_routes_through_ir_only_with_flag` —
+  crosses the two flags (`ir_emit_calls` off, `ir_emit_special_calls` on, and vice
+  versa) to prove `invokespecial` routes through the IR pipeline (`IR_LOWER_
+  COMPILES == 1`) **iff** `ir_emit_special_calls` is on — independent of the
+  invokestatic gate. Guards against a vacuous validation (single-pass also
+  dispatches `invokespecial`).
+- jit lib **816/816**, differential harness **26/26**, `cratonvm-vm` builds clean.
+
+**Live soak** (worktree `CratonVM-irspecial`, `CRATONVM_JIT_IR_CALL_SPECIAL`
+toggled; the gate is a runtime env var so one build validates both paths):
+- `scratch/irspecial/IrSpecial.java` (a hot `f` whose only invokes are
+  `super.add`/`super.poly` → real `invokespecial`) == HotSpot (`1442980800000`)
+  gate-ON **and** gate-OFF, and `CRATONVM_DBG_IR_CALL` confirms the path fires
+  (non-vacuous — `super.*` is the reliable non-`<init>` `invokespecial` source
+  since modern javac compiles private-method calls as `invokevirtual`).
+- `scratch/irspecial/IrSpecialGc.java` (the receiver `this` + two `Node` refs live
+  across two allocation-heavy `super.consume` `invokespecial` calls, rooted only
+  via the IR frame) == HotSpot (`2721637800000`) gate-ON and gate-OFF at `-Xmx`
+  4g/8g **and** under `CRATONVM_DBG_GC_STRESS=1` at 2g (a young GC on every
+  allocation → constant GC mid-`invokespecial` while the refs are live). The
+  conservative IR-frame scan roots the receiver + ref args under maximal GC
+  frequency. (At `-Xmx 2g` without GC-stress the heavy allocator faults with empty
+  output **identically gate-ON and gate-OFF** — the inc-22-documented pre-existing
+  small-heap robustness gap, backend-independent, not from this change.)
+- No regression with `CRATONVM_JIT_IR_CALL_SPECIAL=1`: bt10/14/16/18 == HotSpot
+  (`135854 / 3222190 / 14985902 / 68332206`) and the invokestatic `IrCall` probe
+  == HotSpot (`23762906400000`) — the special gate does not perturb the
+  invokestatic path or the GC checksums.
+
+**To soak / flip on** (the remaining production step, like inc 21→23): run
+`CRATONVM_JIT_IR_CALL_SPECIAL=1` across the kafka/spring/tomcat/hibernate gauntlet
++ bt checksums, then default the flag on. The widened reach (every `super.`/
+non-virtual instance call, receiver oop live across the call) makes the gauntlet
+soak the gating step before the flip.
+
+**Next refinements**: category-2 (long/float/double) args + return (XMM
+marshalling, gated on the IR path handling category-2 values); virtual /
+interface dispatch via inline caches (the bug-24-sensitive area).
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.

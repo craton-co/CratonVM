@@ -1271,25 +1271,62 @@ impl IrBuilder {
                 // scalar-replaced slots don't already model). Any other
                 // `invokespecial` bails to single-pass.
                 0xb7 => {
-                    if !self.trivial_init_pcs.contains(&pc) {
-                        return None;
+                    // inc 24 (Gap B): a resolved non-`<init>` `invokespecial`
+                    // lowered to `Op::Call` — identical to the `invokestatic`
+                    // arm except the receiver is arg0 (the caller's
+                    // `invoke_info` entry already counts it in `num_args`, and
+                    // the leaked `JitInvokeInfo` carries `invoke_kind == 1` so
+                    // `invoke_dispatch` does the non-virtual dispatch to the
+                    // statically-resolved target). GC-safe by the same
+                    // conservative IR-frame scan that roots reference args
+                    // (inc 22). Only populated when the special-call gate is on;
+                    // otherwise `invoke_info` has no entry for this pc and we
+                    // fall through to the elidable-`<init>` path below.
+                    if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                        let mut args = Vec::with_capacity(num_args);
+                        for _ in 0..num_args {
+                            args.push(self.pop());
+                        }
+                        args.reverse();
+                        let mut inputs = Vec::with_capacity(2 + num_args);
+                        inputs.push(self.ctrl);
+                        inputs.push(self.mem);
+                        inputs.extend(args);
+                        let returns_value = ret_type != b'V';
+                        let ty = match ret_type {
+                            b'V' => IrType::Void,
+                            b'L' | b'[' => IrType::Ref,
+                            _ => IrType::Int,
+                        };
+                        let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                        self.mem = call;
+                        if returns_value {
+                            self.push(call);
+                        }
+                        pc += 3;
+                    } else {
+                        // Elidable-`<init>` path (scalar-new): elide a trivial
+                        // `<init>()V` on a fresh object.
+                        if !self.trivial_init_pcs.contains(&pc) {
+                            return None;
+                        }
+                        // Defence in depth: only elide when the receiver (top of
+                        // stack for a no-arg `<init>`) is a fresh `Op::New` we
+                        // emitted. Eliding a `<init>` whose receiver is `this` or
+                        // a parameter would skip a real superclass constructor
+                        // (and hide any escape it performs).
+                        let recv = self.peek();
+                        let recv_is_new = recv != NO_NODE
+                            && matches!(
+                                self.graph.nodes.get(recv as usize).map(|n| &n.op),
+                                Some(Op::New { .. })
+                            );
+                        if !recv_is_new {
+                            return None;
+                        }
+                        self.pop();
+                        pc += 3;
                     }
-                    // Defence in depth: only elide when the receiver (top of
-                    // stack for a no-arg `<init>`) is a fresh `Op::New` we
-                    // emitted. Eliding a `<init>` whose receiver is `this` or a
-                    // parameter would skip a real superclass constructor (and
-                    // hide any escape it performs).
-                    let recv = self.peek();
-                    let recv_is_new = recv != NO_NODE
-                        && matches!(
-                            self.graph.nodes.get(recv as usize).map(|n| &n.op),
-                            Some(Op::New { .. })
-                        );
-                    if !recv_is_new {
-                        return None;
-                    }
-                    self.pop();
-                    pc += 3;
                 }
                 // invokestatic — lower a resolved static call to `Op::Call`
                 // (Gap B). Only emitted for an oop-free method (the caller
