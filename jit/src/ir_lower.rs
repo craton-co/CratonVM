@@ -1063,13 +1063,13 @@ impl<'a> Lowerer<'a> {
         }
         let node = &self.graph.nodes[node_id as usize];
         match node.op {
-            // Integer / long constants need no machine location. A `long`
-            // constant doesn't fit a `Value::Int` resume slot (it would
-            // truncate), so mark it Unsupported until cat-2 two-slot expansion
-            // lands; a cat-1 `int` constant resolves directly.
+            // Integer / long constants need no machine location. A cat-1 `int`
+            // constant resolves to `Int`; a cat-2 `long` constant resolves to
+            // `Long` (the resume builds a `Value::Long` with cat-2 two-slot
+            // local placement — `real-frame-deopt` cat-2).
             Op::Const(v) => {
                 if node.ty == IrType::Long {
-                    FrameValue::Unsupported
+                    FrameValue::Long(v)
                 } else {
                     FrameValue::Int(v)
                 }
@@ -1108,15 +1108,18 @@ impl<'a> Lowerer<'a> {
     /// `FrameValue` location, driven by the IR node's value type
     /// (`real-frame-deopt` type source). A `Ref` slot becomes `StackSlotRef`
     /// (resolves to a `Value::Object`); a cat-1 `Int` slot stays `StackSlot`
-    /// (resolves to `Value::Int`). Category-2 (`Long`/`Double`) and FP (`Float`)
-    /// slots are `Unsupported` for now — the resume falls back to the safe
-    /// re-run path rather than truncate/mistype them (two-slot expansion + FP
-    /// resolution are follow-ups). `Void`/`Control`/`Memory` are never live
-    /// data slots, so they too map to `Unsupported`.
+    /// (resolves to `Value::Int`); a cat-2 `Long` slot becomes `StackSlotLong`
+    /// (resolves to a `Value::Long` with cat-2 two-slot placement). `Double` and
+    /// FP (`Float`) slots are `Unsupported` for now — the IR path does not
+    /// compile float/double methods, and FP-slot/XMM resolution is a follow-up,
+    /// so the resume falls back to the safe re-run path rather than truncate/
+    /// mistype them. `Void`/`Control`/`Memory` are never live data slots, so they
+    /// too map to `Unsupported`.
     fn typed_stack_slot(off: i32, ty: IrType) -> FrameValue {
         match ty {
             IrType::Ref => FrameValue::StackSlotRef(off),
             IrType::Int => FrameValue::StackSlot(off),
+            IrType::Long => FrameValue::StackSlotLong(off),
             _ => FrameValue::Unsupported,
         }
     }

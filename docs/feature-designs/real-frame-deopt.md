@@ -54,14 +54,33 @@
 >   is now **live-exercised on both call paths**, not merely unit-validated.
 > - **Still gated default-OFF** (`CRATONVM_IR_DEOPT_RESUME`); production re-runs
 >   (correct for the side-effect-free div trigger today). **Remaining follow-ups:**
->   **cat-2 two-slot expansion** — a `long`/`double` is one IR stack entry but TWO
->   interpreter slots (`Value::Long` + `Value::Uninitialized` high-half), and
->   `copy_args_to_locals` applies its own cat-2 slot-skip, so the resume cannot map
->   1:1; tagged `Unsupported`→re-run until a slot-expanding builder lands.
 >   **FP/XMM-slot resolution** (needs `SavedRegisters.xmm[16]` + a width source).
->   `materialize_virtual_objects` (Phase B, GC-backed; still a panic stub).
->   Inlined-frame chains + monitor re-entry. The x64 single-pass backport
->   ([`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md)).
+>   `materialize_virtual_objects` (Phase B, GC-backed; consumer built in
+>   `vm/src/runtime/deopt_materialize.rs`, but the IR producer never emits
+>   `FrameValue::VirtualObject` yet — escape-analysis→snapshot wiring needed).
+>   Inlined-frame chains + monitor re-entry (no inliner exists yet). The x64
+>   single-pass backport ([`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md)),
+>   whose remaining blocker is the **primitive/width source** (StackMapTable
+>   threading) — the IR path gets widths free from each node's `IrType`.
+>
+> **Follow-up increment — cat-2 (`long`) resume on the IR path.** The builder now
+> lowers `ldiv`/`lrem` (`Op::Div`/`Op::Rem` `IrType::Long`; the lowerer already
+> emitted 64-bit `IDIV`+guards), so a `long`-div method (no int-div, no double)
+> compiles on the IR path under `CRATONVM_JIT_IR_LONG` and its long div-by-zero
+> guard is the first cat-2 deopt trigger. cat-2 resume implemented:
+> `FrameValue::Long` (const) + `FrameValue::StackSlotLong` (slot → reads the full
+> 64-bit word) in `deopt.rs`; `typed_stack_slot(Long)`→`StackSlotLong` +
+> `frame_value_for` long-const→`Long` in `ir_lower.rs`; VM `fv_to_value` maps
+> `Long`→`Value::Long` and a new `ir_deopt_locals` produces a COMPACT arg list
+> (the operand stack is one compact slot per value, but JVM locals are two-slot —
+> the snapshot's reserved upper-half `Undefined` after each `Long` is skipped so
+> `copy_args_to_locals` re-expands cat-2 correctly). **Live PROOF**
+> (`CRATONVM_JIT_IR_LONG=1 CRATONVM_IR_DEOPT_RESUME=1`): `sd(JJ)J` with `b==0`
+> deopts and `PRECISE resume … at bci=2 locals=[Long(123456789012345), Long(0)]`,
+> full 64-bit precision, throwing `ArithmeticException`; holds under
+> `CRATONVM_GC_STRESS`; default (resume OFF) re-runs. 823 jit lib tests + the vm
+> mapping/compaction tests green. (`double` stays `Unsupported`→re-run — the IR
+> path does not compile double/float; that is the FP/XMM follow-up.)
 
 Status: design / not started. XL. **This is the keystone** — almost every
 other aggressive JIT optimization (speculative guards, aggressive inlining,

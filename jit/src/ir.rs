@@ -1140,11 +1140,30 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // ldiv — the lowerer already emits CQO + 64-bit `IDIV RCX` for a
+                // `Long` Op::Div (incl. the div-by-zero + MIN/-1 overflow guards),
+                // so the builder just needs to produce the typed node. The long
+                // div-by-zero guard is the cat-2 deopt trigger (real-frame-deopt).
+                0x6d => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Div, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
                 // irem
                 0x70 => {
                     let b = self.pop();
                     let a = self.pop();
                     let r = self.add_data(Op::Rem, IrType::Int, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lrem — see `ldiv`: the lowerer handles the 64-bit `Long` path.
+                0x71 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Rem, IrType::Long, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
                 }
