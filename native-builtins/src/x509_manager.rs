@@ -60,11 +60,17 @@
 //!   4. Intermediate `BasicConstraints.cA = TRUE` (RFC 5280 §4.2.1.9).
 //!   5. The last cert's subject DN matches the subject DN of a trust anchor
 //!      pulled from `rustls_native_certs::load_native_certs()`.
-//!   6. Name constraints — currently we *parse* the extension and reject
-//!      anything that fails the simplest DNS-name `excludedSubtree` check;
-//!      a complete RFC 5280 §4.2.1.10 implementation is queued as
-//!      WP5.3.followup once a real EJBCA-issued nameConstraints fixture
-//!      lands in `bench/`.
+//!   6. Name constraints (RFC 5280 §4.2.1.10) — every CA's `NameConstraints`
+//!      extension (permitted / excluded subtrees) is enforced against the
+//!      subject DN and SubjectAltName of every certificate beneath it in the
+//!      path (and against a name-constrained root even when that root is not
+//!      shipped in the chain). The `GeneralName` types evaluated are dNSName,
+//!      rfc822Name, uniformResourceIdentifier (host), iPAddress (CIDR), and
+//!      directoryName (RDN prefix). Self-issued non-leaf certs are exempt
+//!      (§6.1.3(b)). Residual limits: subtree types we do not model (otherName,
+//!      x400Address, ediPartyName, registeredID) are not enforced, and
+//!      directoryName matching is byte-exact per RDN (no string-value
+//!      normalisation). See `check_name_constraints`.
 //!
 //! Failure throws a `CertificateException` (mapped to `RuntimeError::IO`
 //! at the bytecode boundary).
@@ -215,6 +221,52 @@ pub struct ParsedCert {
     /// The most-specific `commonName` RDN from the subject DN, if any. Used
     /// only as a legacy fallback identity when the leaf has no `dNSName` SAN.
     pub subject_cn: Option<String>,
+    /// `rfc822Name` (email) entries from the SubjectAltName extension,
+    /// lower-cased. Used for RFC 5280 §4.2.1.10 name-constraint matching.
+    pub san_rfc822_names: Vec<String>,
+    /// `uniformResourceIdentifier` entries from the SubjectAltName extension
+    /// (original case preserved; the host portion is lower-cased when matched).
+    pub san_uris: Vec<String>,
+    /// `directoryName` entries from the SubjectAltName extension as the DER of
+    /// each `Name` SEQUENCE. Used for directoryName name-constraint matching.
+    pub san_dir_names: Vec<Vec<u8>>,
+    /// Parsed `NameConstraints` extension (OID 2.5.29.30), present only on CA
+    /// certificates that carry it. Drives RFC 5280 §4.2.1.10 enforcement of
+    /// every subordinate certificate's names. `None` = no constraints imposed.
+    pub name_constraints: Option<NameConstraints>,
+}
+
+/// RFC 5280 §4.2.1.10 `GeneralSubtrees`, split by the `GeneralName` types this
+/// verifier evaluates (dNSName, rfc822Name, URI, iPAddress, directoryName).
+/// Each vector holds the `base` of one `GeneralSubtree`; the rarely-used
+/// `minimum`/`maximum` fields are ignored (RFC 5280 fixes `minimum = 0` and
+/// forbids `maximum` for the PKIX profile). Subtree types this verifier does
+/// not model (otherName, x400Address, ediPartyName, registeredID) are dropped
+/// at parse time and therefore not enforced — see the module-level doc.
+#[derive(Clone, Debug, Default)]
+pub struct GeneralSubtrees {
+    /// dNSName bases, lower-cased. A leading `.` (subdomain-only) is preserved
+    /// and honoured by [`dns_constraint_matches`].
+    pub dns: Vec<String>,
+    /// rfc822Name (email) bases, lower-cased.
+    pub email: Vec<String>,
+    /// uniformResourceIdentifier bases, lower-cased (the host portion is what
+    /// the constraint applies to, per RFC 5280 §4.2.1.10).
+    pub uri: Vec<String>,
+    /// iPAddress bases as `address || mask`: 8 bytes for IPv4 (4+4), 32 bytes
+    /// for IPv6 (16+16).
+    pub ip: Vec<Vec<u8>>,
+    /// directoryName bases as the DER of each `Name` SEQUENCE.
+    pub dir: Vec<Vec<u8>>,
+}
+
+/// Parsed `NameConstraints` extension (RFC 5280 §4.2.1.10):
+/// `NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL,
+///                                 excludedSubtrees  [1] GeneralSubtrees OPTIONAL }`.
+#[derive(Clone, Debug, Default)]
+pub struct NameConstraints {
+    pub permitted: GeneralSubtrees,
+    pub excluded: GeneralSubtrees,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +334,8 @@ const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 ///   2.5.29.17 — SubjectAltName
 const OID_EXT_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
+///   2.5.29.30 — NameConstraints
+const OID_EXT_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 
 /// AttributeType OID `2.5.4.3` — commonName (CN), used as the legacy
 /// fallback identity when a leaf carries no `dNSName` SubjectAltName.
@@ -294,6 +348,16 @@ const OID_AT_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
 const SAN_TAG_DNS_NAME: u8 = 0x82;
 ///   [7] IMPLICIT OCTET STRING — iPAddress (4 bytes v4 / 16 bytes v6)
 const SAN_TAG_IP_ADDRESS: u8 = 0x87;
+
+/// Additional `GeneralName` context-specific tags consumed for RFC 5280
+/// §4.2.1.10 name-constraint evaluation (both inside SubjectAltName and as the
+/// `base` of a `GeneralSubtree`). The dNSName/iPAddress tags above are reused.
+///   [1] IMPLICIT IA5String — rfc822Name (email address)
+const GN_TAG_RFC822: u8 = 0x81;
+///   [6] IMPLICIT IA5String — uniformResourceIdentifier
+const GN_TAG_URI: u8 = 0x86;
+///   [4] EXPLICIT Name — directoryName (constructed: wraps a `Name` SEQUENCE)
+const GN_TAG_DIRECTORY: u8 = 0xa4;
 
 /// Signature-algorithm OIDs (the OID inside `tbsCertificate.signature` and
 /// the outer `signatureAlgorithm`).
@@ -477,6 +541,10 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
     let mut basic_constraints_ca: Option<bool> = None;
     let mut san_dns_names: Vec<String> = Vec::new();
     let mut san_ip_addresses: Vec<Vec<u8>> = Vec::new();
+    let mut san_rfc822_names: Vec<String> = Vec::new();
+    let mut san_uris: Vec<String> = Vec::new();
+    let mut san_dir_names: Vec<Vec<u8>> = Vec::new();
+    let mut name_constraints: Option<NameConstraints> = None;
 
     while !cursor.is_empty() {
         let tlv = read_tlv(cursor)?;
@@ -568,9 +636,38 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
                                         san_ip_addresses.push(gn.content.to_vec());
                                     }
                                 }
+                                GN_TAG_RFC822 => {
+                                    if let Ok(s) = std::str::from_utf8(gn.content) {
+                                        san_rfc822_names.push(s.to_ascii_lowercase());
+                                    }
+                                }
+                                GN_TAG_URI => {
+                                    if let Ok(s) = std::str::from_utf8(gn.content) {
+                                        san_uris.push(s.to_string());
+                                    }
+                                }
+                                GN_TAG_DIRECTORY => {
+                                    // [4] EXPLICIT Name — gn.content is the
+                                    // wrapped `Name` SEQUENCE DER.
+                                    if let Ok(name) =
+                                        read_tlv_tagged(gn.content, TAG_SEQUENCE)
+                                    {
+                                        san_dir_names.push(name.full.to_vec());
+                                    }
+                                }
                                 _ => {}
                             }
                         }
+                    }
+                } else if oid.content == OID_EXT_NAME_CONSTRAINTS {
+                    // RFC 5280 §4.2.1.10. A structurally-malformed constraints
+                    // extension is dropped (treated as "no constraints") rather
+                    // than aborting the whole parse — consistent with the
+                    // lenient SAN handling above. The CA practically never ships
+                    // a malformed NameConstraints, and the chain still gets the
+                    // signature/clock/BC checks.
+                    if let Ok(nc) = parse_name_constraints(value_tlv.content) {
+                        name_constraints = Some(nc);
                     }
                 }
             }
@@ -597,7 +694,82 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
         san_dns_names,
         san_ip_addresses,
         subject_cn,
+        san_rfc822_names,
+        san_uris,
+        san_dir_names,
+        name_constraints,
     })
+}
+
+/// Parse a `NameConstraints` extension value (the bytes inside the extension's
+/// OCTET STRING):
+/// `NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL,
+///                                 excludedSubtrees  [1] GeneralSubtrees OPTIONAL }`.
+/// Both subtree fields are IMPLICIT-tagged, so the `[0]`/`[1]` constructed tag
+/// directly wraps the `SEQUENCE OF GeneralSubtree`.
+fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, CertParseError> {
+    let seq = read_tlv_tagged(value, TAG_SEQUENCE)?;
+    let mut nc = NameConstraints::default();
+    let mut c = seq.content;
+    while !c.is_empty() {
+        let t = read_tlv(c)?;
+        c = t.rest;
+        match t.tag {
+            0xa0 => nc.permitted = parse_general_subtrees(t.content)?, // [0] permittedSubtrees
+            0xa1 => nc.excluded = parse_general_subtrees(t.content)?,  // [1] excludedSubtrees
+            _ => {}
+        }
+    }
+    Ok(nc)
+}
+
+/// Parse `GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree`. The
+/// input is the *content* of the IMPLICIT `[0]`/`[1]` tag, i.e. the
+/// concatenation of `GeneralSubtree` SEQUENCE elements.
+///
+/// `GeneralSubtree ::= SEQUENCE { base GeneralName, minimum [0] DEFAULT 0,
+///                                maximum [1] OPTIONAL }`. We read the `base`
+/// (first element) and ignore `minimum`/`maximum` (RFC 5280 §4.2.1.10 mandates
+/// `minimum = 0` and absent `maximum` in the PKIX profile).
+fn parse_general_subtrees(input: &[u8]) -> Result<GeneralSubtrees, CertParseError> {
+    let mut out = GeneralSubtrees::default();
+    let mut c = input;
+    while !c.is_empty() {
+        let sub = read_tlv_tagged(c, TAG_SEQUENCE)?;
+        c = sub.rest;
+        let base = read_tlv(sub.content)?;
+        match base.tag {
+            SAN_TAG_DNS_NAME => {
+                if let Ok(s) = std::str::from_utf8(base.content) {
+                    out.dns.push(s.to_ascii_lowercase());
+                }
+            }
+            GN_TAG_RFC822 => {
+                if let Ok(s) = std::str::from_utf8(base.content) {
+                    out.email.push(s.to_ascii_lowercase());
+                }
+            }
+            GN_TAG_URI => {
+                if let Ok(s) = std::str::from_utf8(base.content) {
+                    out.uri.push(s.to_ascii_lowercase());
+                }
+            }
+            SAN_TAG_IP_ADDRESS => {
+                // address || mask: 8 bytes (IPv4) or 32 bytes (IPv6).
+                if base.content.len() == 8 || base.content.len() == 32 {
+                    out.ip.push(base.content.to_vec());
+                }
+            }
+            GN_TAG_DIRECTORY => {
+                // [4] EXPLICIT Name — base.content wraps the `Name` SEQUENCE.
+                if let Ok(name) = read_tlv_tagged(base.content, TAG_SEQUENCE) {
+                    out.dir.push(name.full.to_vec());
+                }
+            }
+            _ => { /* unsupported GeneralName type — not modelled (see doc) */ }
+        }
+    }
+    Ok(out)
 }
 
 /// Pull the most-specific `commonName` (OID 2.5.4.3) attribute value out of
@@ -905,7 +1077,37 @@ pub enum TrustError {
         at: usize,
         oid: Vec<u8>,
     },
+    /// A certificate's subject/SAN name fell outside the permitted subtrees, or
+    /// inside an excluded subtree, imposed by a CA above it in the chain
+    /// (RFC 5280 §4.2.1.10). `at` is the offending cert's chain index
+    /// (0 = leaf).
+    NameConstraintViolation {
+        at: usize,
+        kind: NcViolation,
+    },
     Parse(CertParseError),
+}
+
+/// The specific name that triggered a [`TrustError::NameConstraintViolation`].
+#[derive(Debug, Clone)]
+pub enum NcViolation {
+    Dns(String),
+    Ip(Vec<u8>),
+    Email(String),
+    Uri(String),
+    DirName,
+}
+
+impl std::fmt::Display for NcViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NcViolation::Dns(s) => write!(f, "dNSName {:?}", s),
+            NcViolation::Ip(b) => write!(f, "iPAddress {:02x?}", b),
+            NcViolation::Email(s) => write!(f, "rfc822Name {:?}", s),
+            NcViolation::Uri(s) => write!(f, "URI {:?}", s),
+            NcViolation::DirName => f.write_str("directoryName"),
+        }
+    }
 }
 
 impl std::fmt::Display for TrustError {
@@ -938,6 +1140,13 @@ impl std::fmt::Display for TrustError {
                     f,
                     "signature-algorithm OID at index {} not implemented (oid bytes={:02x?})",
                     at, oid
+                )
+            }
+            TrustError::NameConstraintViolation { at, kind } => {
+                write!(
+                    f,
+                    "name-constraint violation at index {}: {} not within permitted/within excluded subtrees",
+                    at, kind
                 )
             }
             TrustError::Parse(e) => write!(f, "parse: {}", e),
@@ -1038,13 +1247,20 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
     // re-verify it. Only when the cert is *not* itself an anchor do we
     // fall through to the issuer-DN lookup (cross-signed roots, classic
     // intermediate-anchored chains).
-    let (anchor_spki, last_is_anchor): (&[u8], bool) = match trust.anchors.get(&last.subject_der) {
-        Some(a) => (a.spki_der.as_slice(), true),
+    let (anchor, last_is_anchor): (&AnchorInfo, bool) = match trust.anchors.get(&last.subject_der) {
+        Some(a) => (a, true),
         None => match trust.anchors.get(&last.issuer_der) {
-            Some(a) => (a.spki_der.as_slice(), false),
+            Some(a) => (a, false),
             None => return Err(TrustError::NoTrustAnchor),
         },
     };
+    let anchor_spki = anchor.spki_der.as_slice();
+
+    // Step 5b: name constraints (RFC 5280 §4.2.1.10). Enforce every CA's
+    // permitted/excluded subtrees against the names of each certificate it
+    // (transitively) issued. Independent of the signature step below — name
+    // constraints bind on names, not keys.
+    check_name_constraints(&parsed, anchor, last_is_anchor)?;
 
     // Step 6: cryptographic signature verification.
     //
@@ -1079,6 +1295,307 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RFC 5280 §4.2.1.10 name constraints
+// ---------------------------------------------------------------------------
+//
+// The RFC §6.1.4(g) state machine maintains, as it walks the path from the
+// trust anchor down to the leaf, a `permitted_subtrees` set (intersected at
+// each CA) and an `excluded_subtrees` set (unioned at each CA). The membership
+// test we actually need — "is name N within the permitted_subtrees" — is
+// equivalent to "N is within *every* contributing CA's permittedSubtrees", and
+// "is N within the excluded_subtrees" is equivalent to "N is within *some*
+// CA's excludedSubtrees". So instead of materialising the intersection/union
+// we check each subordinate certificate's names directly against every CA above
+// it. Chains are short (≤ a handful of certs), so the O(n²) walk is trivial.
+//
+// Coverage: dNSName, rfc822Name (email), uniformResourceIdentifier (host),
+// iPAddress (CIDR), and directoryName (RDN prefix). GeneralName types this
+// verifier does not model are neither parsed into subtrees nor checked.
+
+/// Enforce name constraints over the whole parsed chain. `anchor` is the matched
+/// trust anchor; `last_is_anchor` is true when that anchor is also the last cert
+/// in `parsed` (a self-signed root shipped in the chain).
+fn check_name_constraints(
+    parsed: &[ParsedCert],
+    anchor: &AnchorInfo,
+    last_is_anchor: bool,
+) -> Result<(), TrustError> {
+    let n = parsed.len();
+
+    // A name-constrained root that is NOT shipped in the chain still binds
+    // every certificate beneath it; parse it from the stored anchor DER. When
+    // the anchor IS the last cert in `parsed`, its constraints are already
+    // reachable through the loop below, so we skip the extra parse.
+    let ext_anchor_nc: Option<NameConstraints> = if last_is_anchor {
+        None
+    } else {
+        anchor
+            .full_cert_der
+            .as_ref()
+            .and_then(|der| parse_certificate(der).ok())
+            .and_then(|a| a.name_constraints)
+    };
+
+    // Certificates subject to name-constraint checking: everything except the
+    // trust anchor itself (a trust anchor is authoritative — RFC 5280 §6.1.1).
+    // When the last cert is the anchor, exclude it; otherwise check all.
+    let top_checked = if last_is_anchor { n.saturating_sub(1) } else { n };
+
+    for j in 0..top_checked {
+        let cert = &parsed[j];
+
+        // RFC 5280 §6.1.3(b): a self-issued certificate that is not the final
+        // (leaf) certificate is not checked against name constraints.
+        let is_self_issued = cert.issuer_der == cert.subject_der;
+        if is_self_issued && j != 0 {
+            continue;
+        }
+
+        // Every CA above `cert` in the chain constrains it.
+        for k in (j + 1)..n {
+            if let Some(nc) = &parsed[k].name_constraints {
+                enforce_name_constraints(cert, nc)
+                    .map_err(|kind| TrustError::NameConstraintViolation { at: j, kind })?;
+            }
+        }
+        if let Some(nc) = &ext_anchor_nc {
+            enforce_name_constraints(cert, nc)
+                .map_err(|kind| TrustError::NameConstraintViolation { at: j, kind })?;
+        }
+    }
+    Ok(())
+}
+
+/// Check one subordinate certificate's names against one CA's `NameConstraints`.
+/// Returns `Err(NcViolation)` for the first name that is inside an excluded
+/// subtree, or — when that name type is restricted by a permitted subtree —
+/// outside every permitted subtree. Names of a type the CA does not restrict
+/// are unaffected (RFC 5280 §4.2.1.10).
+fn enforce_name_constraints(cert: &ParsedCert, nc: &NameConstraints) -> Result<(), NcViolation> {
+    // dNSName
+    for name in &cert.san_dns_names {
+        if nc.excluded.dns.iter().any(|c| dns_constraint_matches(c, name)) {
+            return Err(NcViolation::Dns(name.clone()));
+        }
+        if !nc.permitted.dns.is_empty()
+            && !nc.permitted.dns.iter().any(|c| dns_constraint_matches(c, name))
+        {
+            return Err(NcViolation::Dns(name.clone()));
+        }
+    }
+
+    // iPAddress
+    for ip in &cert.san_ip_addresses {
+        if nc.excluded.ip.iter().any(|c| ip_constraint_matches(c, ip)) {
+            return Err(NcViolation::Ip(ip.clone()));
+        }
+        if !nc.permitted.ip.is_empty()
+            && !nc.permitted.ip.iter().any(|c| ip_constraint_matches(c, ip))
+        {
+            return Err(NcViolation::Ip(ip.clone()));
+        }
+    }
+
+    // rfc822Name (email)
+    for email in &cert.san_rfc822_names {
+        if nc.excluded.email.iter().any(|c| email_constraint_matches(c, email)) {
+            return Err(NcViolation::Email(email.clone()));
+        }
+        if !nc.permitted.email.is_empty()
+            && !nc.permitted.email.iter().any(|c| email_constraint_matches(c, email))
+        {
+            return Err(NcViolation::Email(email.clone()));
+        }
+    }
+
+    // uniformResourceIdentifier — the constraint applies to the URI's host.
+    for uri in &cert.san_uris {
+        match uri_host(uri) {
+            Some(host) => {
+                if nc.excluded.uri.iter().any(|c| dns_constraint_matches(c, &host)) {
+                    return Err(NcViolation::Uri(uri.clone()));
+                }
+                if !nc.permitted.uri.is_empty()
+                    && !nc.permitted.uri.iter().any(|c| dns_constraint_matches(c, &host))
+                {
+                    return Err(NcViolation::Uri(uri.clone()));
+                }
+            }
+            None => {
+                // No extractable host but a permitted-URI constraint exists:
+                // we cannot prove the URI is within the permitted set, so fail
+                // closed rather than admit it.
+                if !nc.permitted.uri.is_empty() {
+                    return Err(NcViolation::Uri(uri.clone()));
+                }
+            }
+        }
+    }
+
+    // directoryName — applies to the subject DN and any SAN directoryName.
+    // Empty DNs (zero RDNs) carry no directoryName to constrain and are skipped.
+    let mut dir_names: Vec<&[u8]> = Vec::new();
+    if rdn_count(&cert.subject_der) > 0 {
+        dir_names.push(cert.subject_der.as_slice());
+    }
+    for d in &cert.san_dir_names {
+        if rdn_count(d) > 0 {
+            dir_names.push(d.as_slice());
+        }
+    }
+    for dn in dir_names {
+        if nc.excluded.dir.iter().any(|c| dir_name_within(c, dn)) {
+            return Err(NcViolation::DirName);
+        }
+        if !nc.permitted.dir.is_empty()
+            && !nc.permitted.dir.iter().any(|c| dir_name_within(c, dn))
+        {
+            return Err(NcViolation::DirName);
+        }
+    }
+
+    Ok(())
+}
+
+/// RFC 5280 §4.2.1.10 dNSName matching. A constraint matches a presented name
+/// if the name can be formed by prepending zero or more labels to the
+/// constraint (`example.com` matches `example.com` and `www.example.com`, but
+/// not `notexample.com`). An empty constraint matches everything. A constraint
+/// with a leading `.` (`.example.com`) is honoured as subdomain-only: it
+/// matches strict subdomains but not the bare domain. Both arguments must be
+/// lower-cased by the caller.
+fn dns_constraint_matches(constraint: &str, presented: &str) -> bool {
+    if constraint.is_empty() {
+        return true;
+    }
+    if let Some(_bare) = constraint.strip_prefix('.') {
+        // ".example.com" — match strict subdomains only.
+        return presented.len() > constraint.len() && presented.ends_with(constraint);
+    }
+    if presented == constraint {
+        return true;
+    }
+    // Suffix match with a label boundary: presented == "<labels>." + constraint.
+    presented.len() > constraint.len()
+        && presented.ends_with(constraint)
+        && presented.as_bytes()[presented.len() - constraint.len() - 1] == b'.'
+}
+
+/// RFC 5280 §4.2.1.10 rfc822Name (email) matching. The constraint is either a
+/// full mailbox (`user@host` — exact match), a host (`host` — matches every
+/// mailbox at that host), or a domain with a leading `.` (`.example.com` —
+/// matches every mailbox whose host is a subdomain). All lower-cased.
+fn email_constraint_matches(constraint: &str, presented: &str) -> bool {
+    if constraint.is_empty() {
+        return true;
+    }
+    if constraint.contains('@') {
+        return presented == constraint;
+    }
+    // Constraint restricts the host part of the presented mailbox.
+    let host = match presented.rsplit_once('@') {
+        Some((_, h)) if !h.is_empty() => h,
+        _ => return false,
+    };
+    if let Some(_bare) = constraint.strip_prefix('.') {
+        return host.len() > constraint.len() && host.ends_with(constraint);
+    }
+    host == constraint
+}
+
+/// RFC 5280 §4.2.1.10 iPAddress matching. `constraint` is `address || mask`
+/// (8 bytes IPv4, 32 bytes IPv6); `presented` is a raw address (4 / 16 bytes).
+/// Families must match and `presented & mask == address & mask`.
+fn ip_constraint_matches(constraint: &[u8], presented: &[u8]) -> bool {
+    let alen = match constraint.len() {
+        8 => 4,
+        32 => 16,
+        _ => return false,
+    };
+    if presented.len() != alen {
+        return false;
+    }
+    let (addr, mask) = constraint.split_at(alen);
+    for i in 0..alen {
+        if (presented[i] & mask[i]) != (addr[i] & mask[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract the lower-cased host from a URI for name-constraint matching:
+/// `scheme://[userinfo@]host[:port][/path]`. Handles bracketed IPv6 literals.
+/// Returns `None` when no authority/host can be isolated.
+fn uri_host(uri: &str) -> Option<String> {
+    let after = uri.split_once("://").map(|(_, b)| b).unwrap_or(uri);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map(|(_, b)| b).unwrap_or(authority);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        // IPv6 literal: take up to ']'.
+        rest.split_once(']').map(|(h, _)| h).unwrap_or(rest)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        // Strip a trailing :port only when it is all digits; otherwise the
+        // colon belongs to the host (defensive — unbracketed v6 won't appear
+        // in a well-formed URI authority).
+        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            hostport
+        }
+    } else {
+        hostport
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Count the RDNs in a `Name` SEQUENCE DER (an `RDNSequence`). Returns 0 on a
+/// structural error or an empty DN.
+fn rdn_count(name_der: &[u8]) -> usize {
+    split_rdns(name_der).map(|v| v.len()).unwrap_or(0)
+}
+
+/// Split a `Name` SEQUENCE DER into its RDN element DERs (each an outer SET),
+/// in document (most-significant-first) order.
+fn split_rdns(name_der: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let seq = read_tlv_tagged(name_der, TAG_SEQUENCE).ok()?;
+    let mut out = Vec::new();
+    let mut c = seq.content;
+    while !c.is_empty() {
+        let rdn = read_tlv(c).ok()?;
+        out.push(rdn.full.to_vec());
+        c = rdn.rest;
+    }
+    Some(out)
+}
+
+/// RFC 5280 §4.2.1.10 directoryName matching: the constraint DN matches the
+/// presented DN when its RDN sequence is an initial prefix of the presented
+/// DN's RDN sequence. Comparison is byte-exact per RDN (no attribute-value
+/// string normalisation), which is correct for the canonical DER that issued
+/// certificates use; the documented residual limit is that two RDNs that are
+/// equal only after case-folding/whitespace-normalisation are treated as
+/// distinct.
+fn dir_name_within(constraint: &[u8], presented: &[u8]) -> bool {
+    let cr = match split_rdns(constraint) {
+        Some(v) => v,
+        None => return false,
+    };
+    let pr = match split_rdns(presented) {
+        Some(v) => v,
+        None => return false,
+    };
+    if cr.len() > pr.len() {
+        return false;
+    }
+    cr.iter().zip(pr.iter()).all(|(a, b)| a == b)
 }
 
 /// Verify cert[i]'s signature against its issuer's SubjectPublicKeyInfo.
@@ -2548,6 +3065,7 @@ mod tests {
             key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
             ext_key_usages: &[],
             basic_constraints_ca: Some(false), // explicitly NOT a CA
+            subject_alt_dns: &[],
         });
         let anchor = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
@@ -2939,7 +3457,6 @@ mod tests {
             key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
             ext_key_usages: &[OID_KP_SERVER_AUTH],
             basic_constraints_ca: Some(false),
-            subject_alt_dns: &[],
         });
         let fake_sig = Rsa::sign_sha256(root_sk, &tbs);
         let leaf = assemble_cert(&tbs, OID_SIG_RSA_PSS, &fake_sig);
@@ -3087,5 +3604,246 @@ mod tests {
         assert!(check_endpoint_identity(&[der], "wrong.example.com").is_err());
         // Empty chain has no leaf identity.
         assert!(check_endpoint_identity(&[], "leaf.example.com").is_err());
+    }
+
+    // ====================================================================
+    // RFC 5280 §4.2.1.10 name-constraints tests.
+    // ====================================================================
+
+    /// Build a `Name` SEQUENCE with one CN-RDN per supplied label, in order.
+    fn name_with_rdns(cns: &[&str]) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        for cn in cns {
+            let cn_oid = der_oid(&[0x55, 0x04, 0x03]);
+            let cn_val = der_tlv(0x13, cn.as_bytes());
+            let atv = der_seq([cn_oid, cn_val].concat());
+            body.extend_from_slice(&der_set(atv));
+        }
+        der_seq(body)
+    }
+
+    /// Encode a `NameConstraints` extension (critical) from `(GeneralName tag,
+    /// base bytes)` entries. `der_tlv(tag, base)` is the GeneralName; each is
+    /// wrapped in a one-element `GeneralSubtree` SEQUENCE.
+    fn nc_extension(permitted: &[(u8, &[u8])], excluded: &[(u8, &[u8])]) -> Vec<u8> {
+        fn subtrees(entries: &[(u8, &[u8])]) -> Vec<u8> {
+            let mut body = Vec::new();
+            for (tag, base) in entries {
+                let gn = der_tlv(*tag, base);
+                body.extend_from_slice(&der_seq(gn)); // GeneralSubtree ::= SEQ { base }
+            }
+            body
+        }
+        let mut seq_body = Vec::new();
+        if !permitted.is_empty() {
+            seq_body.extend_from_slice(&der_tlv(0xa0, &subtrees(permitted))); // [0]
+        }
+        if !excluded.is_empty() {
+            seq_body.extend_from_slice(&der_tlv(0xa1, &subtrees(excluded))); // [1]
+        }
+        extension(OID_EXT_NAME_CONSTRAINTS, true, der_seq(seq_body))
+    }
+
+    /// Build + RSA-sign a v3 cert carrying BasicConstraints plus an arbitrary
+    /// set of pre-encoded extensions. Keeps the name-constraints tests from
+    /// having to widen the shared `SignedCertSpec`.
+    fn mk_rsa_cert_with_exts(
+        subject_cn: &str,
+        issuer_cn: &str,
+        spki_der: &[u8],
+        is_ca: bool,
+        extra_exts: &[u8],
+        issuer_sk: &RsaPrivateKey,
+    ) -> Vec<u8> {
+        let mut tbs: Vec<u8> = Vec::new();
+        tbs.extend_from_slice(&der_context_explicit(0, &der_int(2)));
+        tbs.extend_from_slice(&der_int(1));
+        tbs.extend_from_slice(&sig_alg_seq(OID_SIG_SHA256_RSA));
+        tbs.extend_from_slice(&name_with_cn(issuer_cn));
+        tbs.extend_from_slice(&der_seq(
+            [der_utctime("200101000000Z"), der_utctime("490101000000Z")].concat(),
+        ));
+        tbs.extend_from_slice(&name_with_cn(subject_cn));
+        tbs.extend_from_slice(spki_der);
+        let mut exts: Vec<u8> = Vec::new();
+        exts.extend_from_slice(&extension(OID_EXT_BASIC_CONSTRAINTS, true, bc_seq(is_ca)));
+        exts.extend_from_slice(extra_exts);
+        tbs.extend_from_slice(&der_context_explicit(3, &der_seq(exts)));
+        let tbs = der_seq(tbs);
+        let sig = Rsa::sign_sha256(issuer_sk, &tbs);
+        assemble_cert(&tbs, OID_SIG_SHA256_RSA, &sig)
+    }
+
+    #[test]
+    fn dns_constraint_matching_follows_rfc5280() {
+        // Bare constraint: matches itself and any subdomain, label-aligned.
+        assert!(dns_constraint_matches("example.com", "example.com"));
+        assert!(dns_constraint_matches("example.com", "www.example.com"));
+        assert!(dns_constraint_matches("example.com", "a.b.example.com"));
+        assert!(!dns_constraint_matches("example.com", "notexample.com"));
+        assert!(!dns_constraint_matches("example.com", "example.com.evil.com"));
+        assert!(!dns_constraint_matches("example.com", "com"));
+        // Empty constraint matches everything.
+        assert!(dns_constraint_matches("", "anything.test"));
+        // Leading-dot constraint: strict subdomains only.
+        assert!(dns_constraint_matches(".example.com", "www.example.com"));
+        assert!(!dns_constraint_matches(".example.com", "example.com"));
+    }
+
+    #[test]
+    fn email_constraint_matching_follows_rfc5280() {
+        // Full mailbox: exact match.
+        assert!(email_constraint_matches("ann@example.com", "ann@example.com"));
+        assert!(!email_constraint_matches("ann@example.com", "bob@example.com"));
+        // Host constraint: any mailbox at that host, not a subdomain.
+        assert!(email_constraint_matches("example.com", "ann@example.com"));
+        assert!(!email_constraint_matches("example.com", "ann@sub.example.com"));
+        // Leading-dot: subdomains only.
+        assert!(email_constraint_matches(".example.com", "ann@sub.example.com"));
+        assert!(!email_constraint_matches(".example.com", "ann@example.com"));
+        // Malformed presented address (no host).
+        assert!(!email_constraint_matches("example.com", "no-at-sign"));
+    }
+
+    #[test]
+    fn ip_constraint_matching_uses_cidr_mask() {
+        // 192.168.0.0/16 = addr 192.168.0.0, mask 255.255.0.0.
+        let v4 = [192u8, 168, 0, 0, 255, 255, 0, 0];
+        assert!(ip_constraint_matches(&v4, &[192, 168, 1, 5]));
+        assert!(ip_constraint_matches(&v4, &[192, 168, 255, 255]));
+        assert!(!ip_constraint_matches(&v4, &[10, 0, 0, 1]));
+        assert!(!ip_constraint_matches(&v4, &[192, 169, 0, 1]));
+        // Family mismatch: v4 constraint vs 16-byte address.
+        assert!(!ip_constraint_matches(&v4, &[0u8; 16]));
+        // IPv6 ::/0 (all-zero mask) matches anything v6.
+        let v6_any = [0u8; 32];
+        assert!(ip_constraint_matches(&v6_any, &[1u8; 16]));
+    }
+
+    #[test]
+    fn uri_host_extraction() {
+        assert_eq!(uri_host("https://host.example.com/path"), Some("host.example.com".into()));
+        assert_eq!(uri_host("http://user@h.example.com:8443/x"), Some("h.example.com".into()));
+        assert_eq!(uri_host("https://[2001:db8::1]:443/"), Some("2001:db8::1".into()));
+        assert_eq!(uri_host("HTTPS://Host.Example.COM"), Some("host.example.com".into()));
+        assert_eq!(uri_host(""), None);
+    }
+
+    #[test]
+    fn dir_name_prefix_matching() {
+        let base = name_with_rdns(&["Acme"]);
+        let leaf = name_with_rdns(&["Acme", "leaf"]);
+        let other = name_with_rdns(&["Other"]);
+        // Constraint is an initial RDN prefix of the presented DN.
+        assert!(dir_name_within(&base, &leaf));
+        assert!(dir_name_within(&base, &base));
+        // Different first RDN → not within.
+        assert!(!dir_name_within(&other, &leaf));
+        // Constraint longer than presented → not within.
+        assert!(!dir_name_within(&leaf, &base));
+    }
+
+    #[test]
+    fn parse_name_constraints_round_trips() {
+        let ext = nc_extension(
+            &[(SAN_TAG_DNS_NAME, b"example.com")],
+            &[(SAN_TAG_DNS_NAME, b"bad.example.com")],
+        );
+        // `ext` is a full Extension SEQUENCE; pull the OCTET STRING value out.
+        // Extension ::= SEQ { OID, BOOL critical, OCTET STRING value }.
+        let seq = read_tlv_tagged(&ext, TAG_SEQUENCE).unwrap();
+        let oid = read_tlv_tagged(seq.content, TAG_OID).unwrap();
+        let after_oid = oid.rest;
+        let crit = read_tlv(after_oid).unwrap();
+        let octet = read_tlv_tagged(crit.rest, TAG_OCTET_STRING).unwrap();
+        let nc = parse_name_constraints(octet.content).expect("parse NC");
+        assert_eq!(nc.permitted.dns, vec!["example.com".to_string()]);
+        assert_eq!(nc.excluded.dns, vec!["bad.example.com".to_string()]);
+    }
+
+    #[test]
+    fn validate_chain_enforces_permitted_dns_subtree() {
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        // Root permits only the example.com dNSName subtree.
+        let nc = nc_extension(&[(SAN_TAG_DNS_NAME, b"example.com")], &[]);
+        let root = mk_rsa_cert_with_exts("NC Root", "NC Root", &root_spki, true, &nc, root_sk);
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+
+        // Leaf inside the permitted subtree validates.
+        let san_ok =
+            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.example.com"]));
+        let leaf_ok =
+            mk_rsa_cert_with_exts("host.example.com", "NC Root", &root_spki, false, &san_ok, root_sk);
+        validate_chain(&[leaf_ok, root.clone()], &trust)
+            .expect("leaf within permitted subtree must validate");
+
+        // Leaf outside the permitted subtree is rejected at index 0.
+        let san_bad =
+            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.evil.com"]));
+        let leaf_bad =
+            mk_rsa_cert_with_exts("host.evil.com", "NC Root", &root_spki, false, &san_bad, root_sk);
+        match validate_chain(&[leaf_bad, root.clone()], &trust) {
+            Err(TrustError::NameConstraintViolation { at, .. }) => assert_eq!(at, 0),
+            other => panic!("expected NameConstraintViolation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_chain_enforces_excluded_dns_subtree() {
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        // Root excludes the evil.example.com subtree (permits everything else).
+        let nc = nc_extension(&[], &[(SAN_TAG_DNS_NAME, b"evil.example.com")]);
+        let root = mk_rsa_cert_with_exts("X Root", "X Root", &root_spki, true, &nc, root_sk);
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+
+        // A name outside the excluded subtree is fine.
+        let san_ok =
+            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["host.good.com"]));
+        let leaf_ok =
+            mk_rsa_cert_with_exts("host.good.com", "X Root", &root_spki, false, &san_ok, root_sk);
+        validate_chain(&[leaf_ok, root.clone()], &trust).expect("non-excluded leaf must validate");
+
+        // A name inside the excluded subtree is rejected.
+        let san_bad = extension(
+            OID_EXT_SUBJECT_ALT_NAME,
+            false,
+            san_dns_value(&["www.evil.example.com"]),
+        );
+        let leaf_bad = mk_rsa_cert_with_exts(
+            "www.evil.example.com",
+            "X Root",
+            &root_spki,
+            false,
+            &san_bad,
+            root_sk,
+        );
+        match validate_chain(&[leaf_bad, root], &trust) {
+            Err(TrustError::NameConstraintViolation { .. }) => {}
+            other => panic!("expected NameConstraintViolation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_chain_without_name_constraints_is_unaffected() {
+        // A chain whose CA carries NO NameConstraints extension must still
+        // validate names of every kind (regression guard for the new step).
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+        let root = mk_rsa_cert_with_exts("Plain Root", "Plain Root", &root_spki, true, &[], root_sk);
+        let san =
+            extension(OID_EXT_SUBJECT_ALT_NAME, false, san_dns_value(&["anything.example"]));
+        let leaf =
+            mk_rsa_cert_with_exts("anything.example", "Plain Root", &root_spki, false, &san, root_sk);
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        validate_chain(&[leaf, root], &trust).expect("unconstrained chain must validate");
     }
 }

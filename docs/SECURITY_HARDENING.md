@@ -180,11 +180,21 @@ zeros in a few KiB" entry is refused rather than inflated.
 The `X509TrustManagerImpl` natives (`x509_manager.rs`) perform real RFC 5280 §6
 chain validation on `checkServerTrusted` / `checkClientTrusted`: validity-period
 (clock) checks, signature verification against each issuer's SPKI, issuer↔subject
-DN continuity, intermediate `BasicConstraints.cA = TRUE`, and chain-end matching
-against trust anchors from `rustls_native_certs`. Failure raises a
-`CertificateException`. Caveats: name-constraints validation is **partial** (only
-a simple DNS `excludedSubtree` check; full RFC 5280 §4.2.1.10 is queued), and
-CRL checking is gated off by default.
+DN continuity, intermediate `BasicConstraints.cA = TRUE`, **name constraints
+(RFC 5280 §4.2.1.10)**, and chain-end matching against trust anchors from
+`rustls_native_certs`. Failure raises a `CertificateException`.
+
+Name constraints are now enforced per the §6.1.4 state machine: each CA's
+`NameConstraints` extension (permitted *and* excluded subtrees) is checked
+against the subject DN and SubjectAltName of every certificate beneath it in the
+path — including a name-constrained root that is not shipped in the chain, and
+honouring the §6.1.3(b) self-issued-intermediate exemption. The `GeneralName`
+types evaluated are `dNSName`, `rfc822Name`, `uniformResourceIdentifier` (host),
+`iPAddress` (CIDR), and `directoryName` (RDN prefix). Residual limits:
+`GeneralName` types this verifier does not model (`otherName`, `x400Address`,
+`ediPartyName`, `registeredID`) are not enforced; `directoryName` matching is
+byte-exact per RDN (no attribute-value string normalisation); and CRL revocation
+checking remains gated off by default.
 
 ## Limitations / what's not done
 
