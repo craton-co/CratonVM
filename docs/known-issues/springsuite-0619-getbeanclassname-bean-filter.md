@@ -13,24 +13,6 @@
 | **Status** | 🟢 **MOSTLY FIXED** — primary bean-filter FIXED; **bug-B2 (CGLIB method-injection) now implemented** (`LookupMethodTests` 6/7, `LookupAnnotationTests` 6/10). Two narrow residuals remain (generic-type disambiguation + `@Lookup` null-bean). |
 | **Suggested owner** | residual: generic-aware `getBeanProvider(ResolvableType)` lookup |
 
-> **RE-VERIFIED 2026-06-21 on dev `0c904c04`** (binary `b1011vm`, JDK 25, `--Xmx 2g`).
-> The documented state reproduces **exactly** — the primary "Target object must not be
-> null" symptom is **gone** (zero occurrences across the bug-B classes *and* the
-> AspectJ classes that shared it, incl. `AfterThrowingAdviceBindingTests` which is now
-> 6/6). Only the two narrow residuals remain:
-> - `LookupMethodTests` **6/7** — sole fail `withGenericBean()`
->   (`NoUniqueBeanDefinitionException: …NumberStore … found 2: doubleStore,floatStore`
->   = residual #1, generic-type disambiguation).
-> - `LookupAnnotationTests` **6/10** — `withGenericBean`,
->   `prototypeWithoutMetadataCaching`, `singletonWithoutMetadataCaching` (all #1) +
->   `withNullBean` (`NoSuchBeanDefinitionException: …TestBean` = residual #2,
->   `@Lookup` null-bean).
-> - `FactoryBeanTests` **4/6** — both fails are the unrelated `${myName}` placeholder
->   (`Could not resolve placeholder 'myName'`), as the doc already notes.
->
-> So this doc is accurate as of `0c904c04`; the only open work is the generic-aware
-> `getBeanProvider(ResolvableType)` lookup (#1) and the `NullBean` marker (#2).
-
 > **bug-B2 FIX 2026-06-21** (`cratonvm-spring0620-b2`, dev `7c66d89f`+, JDK 25). Method-injection
 > (`<lookup-method>` / `@Lookup`) is now implemented. The bean class is abstract, so the
 > `SimpleInstantiationStrategy.instantiate` shim
