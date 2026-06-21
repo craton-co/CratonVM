@@ -764,6 +764,42 @@ pub(crate) fn socket_available_stream(s: &TcpStream) -> Option<i32> {
 
 // ---------- I/O ----------
 
+// Per-thread reusable scratch buffer for the read0/write0 syscall staging
+// area. A tight socket read/write loop calls these natives back-to-back; the
+// previous `vec![0u8; len]` allocated AND zeroed a fresh heap buffer on every
+// single call (see native-io-review.md, net.rs read0/write0 finding). Because
+// each native is fully synchronous (the staged bytes are consumed before the
+// call returns) the buffer is never aliased across calls, so a thread-local
+// `Vec` reused across calls is sound and removes the per-op malloc + memset.
+//
+// The closure receives a mutable slice of EXACTLY `len` bytes. Growing the
+// buffer zero-extends only the freshly added tail (amortized), so steady-state
+// loops at a stable length pay zero allocation and zero zeroing. Callers must
+// treat the slice contents as undefined on entry: read0 overwrites only the
+// `[..n]` prefix it actually fills and reads back only that prefix; write0
+// fully overwrites the whole slice before reading it. Neither observes stale
+// tail bytes left by a prior call.
+thread_local! {
+    static IO_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with a thread-local scratch slice of exactly `len` bytes, avoiding a
+/// per-call heap allocation on the hot socket I/O path. The slice's initial
+/// contents are unspecified (may contain bytes from a previous call); `f` must
+/// not rely on them. The buffer only ever grows (zero-filling the new tail).
+fn with_io_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    IO_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            // `resize` zeroes only the newly added tail; existing capacity is
+            // left as-is (its bytes are not observed — see module note above).
+            buf.resize(len, 0);
+        }
+        f(&mut buf[..len])
+    })
+}
+
 /// `read0(FileDescriptor fd, long address, int len) -> int`
 ///
 /// Reads up to `len` bytes from the stream into the raw memory at `address`.
@@ -780,7 +816,6 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
     dbgnet!("read0 fd={fd:#x} len={len} addr={addr:#x}");
 
-    let mut buf = vec![0u8; len_usize];
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
     // brief read-lock, drop the map lock, then perform the blocking read
     // on the per-socket Mutex. Otherwise the global map lock serializes
@@ -792,28 +827,31 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => return Err(ioex("read0: fd not a stream")),
         }
     };
-    let n = {
-        let s = stream_handle.lock();
-        // The std impl is `impl Read for &TcpStream` so we can
-        // read through a &TcpStream without needing &mut.
-        let mut r = &*s;
-        r.read(&mut buf).map_err(|e| net_err("read0", e))?
-    };
-    if n == 0 {
-        return Ok(Some(Value::Int(-1)));
-    }
-    socket_capture('r', fd, &buf[..n]);
-    // Store the bytes into the caller's native buffer. `addr` may be a real
-    // OS pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer
-    // from `Util.getTemporaryDirectBuffer`) — route through the context so an
-    // arena handle lands in the off-heap store instead of being dereferenced
-    // raw (which SIGSEGVs on the synthetic 2^36-based handle).
-    if !ctx.copy_to_native_memory(addr, &buf[..n]) {
-        return Err(ioex(format!(
-            "read0: invalid destination address {addr:#x}"
-        )));
-    }
-    Ok(Some(Value::Int(n as i32)))
+    // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
+    with_io_scratch(len_usize, |buf| {
+        let n = {
+            let s = stream_handle.lock();
+            // The std impl is `impl Read for &TcpStream` so we can
+            // read through a &TcpStream without needing &mut.
+            let mut r = &*s;
+            r.read(buf).map_err(|e| net_err("read0", e))?
+        };
+        if n == 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
+        socket_capture('r', fd, &buf[..n]);
+        // Store the bytes into the caller's native buffer. `addr` may be a real
+        // OS pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer
+        // from `Util.getTemporaryDirectBuffer`) — route through the context so an
+        // arena handle lands in the off-heap store instead of being dereferenced
+        // raw (which SIGSEGVs on the synthetic 2^36-based handle).
+        if !ctx.copy_to_native_memory(addr, &buf[..n]) {
+            return Err(ioex(format!(
+                "read0: invalid destination address {addr:#x}"
+            )));
+        }
+        Ok(Some(Value::Int(n as i32)))
+    })
 }
 
 /// `write0(FileDescriptor fd, long address, int len) -> int`
@@ -829,32 +867,36 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("write0: FileDescriptor has no fd id"))?;
     dbgnet!("write0 fd={fd:#x} len={len} addr={addr:#x}");
 
-    let mut buf = vec![0u8; len_usize];
-    // Load the bytes from the caller's native buffer. `addr` may be a real OS
-    // pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer from
-    // `Util.getTemporaryDirectBuffer`) — route through the context so an arena
-    // handle is read from the off-heap store instead of dereferenced raw (a
-    // raw memcpy from the synthetic 2^36-based handle SIGSEGVs).
-    if !ctx.copy_from_native_memory(addr, &mut buf) {
-        return Err(ioex(format!("write0: invalid source address {addr:#x}")));
-    }
-    // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
-    // brief read-lock, drop the map lock, then perform the blocking write
-    // on the per-socket Mutex (see net_read0 for the rationale).
-    let stream_handle = {
-        let map = net_sockets().read();
-        match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => Arc::clone(s),
-            _ => return Err(ioex("write0: fd not a stream")),
+    // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
+    // The whole slice is overwritten by `copy_from_native_memory` below before
+    // it is read, so any stale bytes from a prior call are never observed.
+    with_io_scratch(len_usize, |buf| {
+        // Load the bytes from the caller's native buffer. `addr` may be a real OS
+        // pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer from
+        // `Util.getTemporaryDirectBuffer`) — route through the context so an arena
+        // handle is read from the off-heap store instead of dereferenced raw (a
+        // raw memcpy from the synthetic 2^36-based handle SIGSEGVs).
+        if !ctx.copy_from_native_memory(addr, buf) {
+            return Err(ioex(format!("write0: invalid source address {addr:#x}")));
         }
-    };
-    let n = {
-        let s = stream_handle.lock();
-        let mut w = &*s;
-        w.write(&buf).map_err(|e| net_err("write0", e))?
-    };
-    socket_capture('w', fd, &buf[..n]);
-    Ok(Some(Value::Int(n as i32)))
+        // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
+        // brief read-lock, drop the map lock, then perform the blocking write
+        // on the per-socket Mutex (see net_read0 for the rationale).
+        let stream_handle = {
+            let map = net_sockets().read();
+            match map.get(&fd) {
+                Some(NetSocketHandle::Stream(s)) => Arc::clone(s),
+                _ => return Err(ioex("write0: fd not a stream")),
+            }
+        };
+        let n = {
+            let s = stream_handle.lock();
+            let mut w = &*s;
+            w.write(buf).map_err(|e| net_err("write0", e))?
+        };
+        socket_capture('w', fd, &buf[..n]);
+        Ok(Some(Value::Int(n as i32)))
+    })
 }
 
 /// `available(FileDescriptor fd) -> int`
@@ -1682,5 +1724,63 @@ mod tests {
             }
             _ => panic!("expected Int results"),
         }
+    }
+
+    #[test]
+    fn io_scratch_yields_exact_len_slice() {
+        // The closure must see a slice whose length matches the request exactly,
+        // even though the backing Vec may carry extra capacity from a prior
+        // (larger) call on the same thread.
+        with_io_scratch(64, |buf| assert_eq!(buf.len(), 64));
+        with_io_scratch(8, |buf| assert_eq!(buf.len(), 8));
+        with_io_scratch(0, |buf| assert_eq!(buf.len(), 0));
+    }
+
+    #[test]
+    fn io_scratch_reuses_backing_without_shrinking() {
+        // A large request grows the buffer; a subsequent smaller request reuses
+        // the same allocation (capacity does not shrink) and still hands back a
+        // correctly-sized slice. This is the property that removes the per-call
+        // malloc on a steady-state socket loop.
+        with_io_scratch(4096, |buf| {
+            assert_eq!(buf.len(), 4096);
+            buf.fill(0xAB);
+        });
+        let cap_after_large = IO_SCRATCH.with(|c| c.borrow().capacity());
+        assert!(cap_after_large >= 4096);
+        with_io_scratch(16, |buf| assert_eq!(buf.len(), 16));
+        let cap_after_small = IO_SCRATCH.with(|c| c.borrow().capacity());
+        assert_eq!(
+            cap_after_large, cap_after_small,
+            "smaller request must not shrink the reused buffer"
+        );
+    }
+
+    #[test]
+    fn io_scratch_grow_zeroes_only_new_tail() {
+        // Growing the buffer zero-extends the freshly added tail. Bytes the
+        // caller wrote into the prefix remain (they are overwritten by the next
+        // real read/write before being observed, so their staleness is benign).
+        with_io_scratch(4, |buf| buf.copy_from_slice(&[1, 2, 3, 4]));
+        with_io_scratch(8, |buf| {
+            assert_eq!(&buf[..4], &[1, 2, 3, 4], "prefix preserved across grow");
+            assert_eq!(&buf[4..], &[0, 0, 0, 0], "new tail zero-filled");
+        });
+    }
+
+    #[test]
+    fn io_scratch_is_thread_local() {
+        // Each thread owns an independent buffer: a write on one thread is not
+        // visible to another, so concurrent read0/write0 calls cannot alias.
+        with_io_scratch(4, |buf| buf.copy_from_slice(&[9, 9, 9, 9]));
+        let other = thread::spawn(|| {
+            with_io_scratch(4, |buf| {
+                // Freshly allocated on this thread — all zero, not [9,9,9,9].
+                buf.to_vec()
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other, vec![0, 0, 0, 0]);
     }
 }
