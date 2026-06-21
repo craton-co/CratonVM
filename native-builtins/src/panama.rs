@@ -21,39 +21,167 @@ const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
 
-/// Native-access gate for Panama downcalls.
+/// Native-access policy for Panama downcalls and raw-address memory access.
 ///
 /// A `validated_fn_ptr` call transmutes a Java-supplied raw address to an
 /// `extern "C" fn` and invokes it — arbitrary native code execution. Real
-/// JDK Panama gates this behind `--enable-native-access` / the module's
-/// `enableNativeAccess` permission. This crate has no module-permission
-/// plumbing reachable here, so this is a minimal coarse gate.
+/// JDK Panama gates this behind `--enable-native-access=<module-list>` /
+/// the module's `enableNativeAccess` permission, which is granted *per
+/// module* (a comma-separated list of module names, or `ALL-UNNAMED`).
 ///
-/// Default is `false` (secure-by-default, matching the JDK where native
-/// access is denied unless `--enable-native-access` grants it). A
-/// host/launcher that wants to permit Panama downcalls and raw-address
-/// memory access must call [`set_native_access_enabled(true)`] at startup
-/// (e.g. when the user passes `--enable-native-access`), and flip it on
-/// only for trusted modules granted native access.
+/// `NativeAccessPolicy` records that grant faithfully:
 ///
-/// TODO: wire this to a real per-module `--enable-native-access` check once
-/// `NativeContext` exposes the caller module's native-access permission.
-static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// * [`NativeAccessPolicy::None`] — no module has native access (the
+///   secure-by-default state, matching the JDK with no `--enable-native-access`).
+/// * [`NativeAccessPolicy::All`] — every module is granted (the launcher saw
+///   `--enable-native-access` with no argument, or `ALL-UNNAMED`/`ALL-MODULES`).
+/// * [`NativeAccessPolicy::Modules`] — only the named modules are granted.
+///   `None` (the unnamed module) is represented by the empty string `""`.
+///
+/// ### Why the gate is still consulted process-globally at the call sites
+///
+/// The native-method closures in this file receive only `ctx` (a
+/// [`NativeContext`]) and the Java `args`; there is **no reachable accessor
+/// for the *calling* class/module at the gate point** (the Panama API method
+/// itself lives in `java.base`, and the caller's frame is not exposed to a
+/// native callee here). `NativeContext::module_name_of_class` can name the
+/// module of a *given* `ClassId`, but the gate has no `ClassId` for the
+/// caller. So while the *policy* is now tracked per module, the gate
+/// helpers ([`require_native_access`]/[`validated_fn_ptr`]) currently answer
+/// the coarser question "is native access granted to *any* module?" via
+/// [`native_access_enabled`]. This is a deliberate, fail-closed
+/// approximation: it never *grants* access the launcher did not, but it
+/// cannot yet *distinguish* a denied module from a granted one. Once a
+/// caller-frame/module accessor is plumbed to the native dispatch boundary,
+/// the gate can call [`module_native_access_enabled`] with the real caller
+/// module to achieve full per-module fidelity; the policy plumbing here is
+/// the prerequisite half of that work.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NativeAccessPolicy {
+    /// No module is granted native access (secure default).
+    #[default]
+    None,
+    /// Every module is granted native access (unscoped `--enable-native-access`).
+    All,
+    /// Only the listed modules are granted. The unnamed module is `""`.
+    Modules(std::collections::BTreeSet<String>),
+}
+
+impl NativeAccessPolicy {
+    /// Whether *any* module is granted native access. Used by the coarse,
+    /// process-global gate (see the type docs for why the caller module is
+    /// not available at the gate point).
+    fn any_granted(&self) -> bool {
+        match self {
+            NativeAccessPolicy::None => false,
+            NativeAccessPolicy::All => true,
+            NativeAccessPolicy::Modules(m) => !m.is_empty(),
+        }
+    }
+
+    /// Whether the given module is granted native access. `None` denotes the
+    /// unnamed module. This is the per-module query the JDK actually performs;
+    /// it is exposed now so a future caller-module-aware gate can use it.
+    fn module_granted(&self, module: Option<&str>) -> bool {
+        match self {
+            NativeAccessPolicy::None => false,
+            NativeAccessPolicy::All => true,
+            NativeAccessPolicy::Modules(m) => m.contains(module.unwrap_or("")),
+        }
+    }
+}
+
+static NATIVE_ACCESS_POLICY: std::sync::RwLock<NativeAccessPolicy> =
+    std::sync::RwLock::new(NativeAccessPolicy::None);
+
+/// Replace the process native-access policy wholesale.
+fn store_policy(policy: NativeAccessPolicy) {
+    if let Ok(mut guard) = NATIVE_ACCESS_POLICY.write() {
+        *guard = policy;
+    }
+}
 
 /// Enable or disable Panama native downcalls process-wide.
 ///
-/// When disabled, every downcall through [`validated_fn_ptr`] fails with a
-/// thrown `java.lang.IllegalCallerException`, matching the JDK's
+/// `true` records an [`NativeAccessPolicy::All`] grant; `false` records
+/// [`NativeAccessPolicy::None`]. When no module is granted, every downcall
+/// through [`validated_fn_ptr`] fails with a thrown
+/// `java.lang.IllegalCallerException`, matching the JDK's
 /// `--enable-native-access` semantics. (Task #57: previously folded into
 /// `IllegalStateException` because `RuntimeError` lacked the variant.)
+///
+/// Retained for the bare/unscoped `--enable-native-access` launcher path and
+/// for callers (and tests) that only need the all-or-nothing behavior. For
+/// the scoped `--enable-native-access=<module-list>` form use
+/// [`set_native_access_modules`].
 pub fn set_native_access_enabled(enabled: bool) {
-    NATIVE_ACCESS_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    store_policy(if enabled {
+        NativeAccessPolicy::All
+    } else {
+        NativeAccessPolicy::None
+    });
 }
 
-/// Whether Panama native downcalls are currently permitted.
+/// Record the exact set of modules granted native access, parsed from the
+/// `--enable-native-access=<module-list>` argument (a comma-separated list).
+///
+/// The sentinels `ALL-UNNAMED`, `ALL-MODULES`, and an empty/whitespace-only
+/// list collapse to [`NativeAccessPolicy::All`] (the JDK treats `ALL-UNNAMED`
+/// as granting the unnamed module that hosts the classpath; this VM has no
+/// rich module graph at this layer, so it is approximated as a global grant
+/// — strictly no *narrower* than the JDK for the unnamed module that almost
+/// all application code lives in). Otherwise each named module is recorded
+/// individually so [`module_native_access_enabled`] can answer per module.
+pub fn set_native_access_modules<I, S>(modules: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = std::collections::BTreeSet::new();
+    let mut grant_all = false;
+    for m in modules {
+        let name = m.as_ref().trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("ALL-UNNAMED") || name.eq_ignore_ascii_case("ALL-MODULES") {
+            grant_all = true;
+            continue;
+        }
+        set.insert(name.to_string());
+    }
+    if grant_all {
+        store_policy(NativeAccessPolicy::All);
+    } else if set.is_empty() {
+        // A non-empty but all-blank argument is treated like the bare flag.
+        store_policy(NativeAccessPolicy::All);
+    } else {
+        store_policy(NativeAccessPolicy::Modules(set));
+    }
+}
+
+/// Whether Panama native downcalls are currently permitted for *any* module.
+///
+/// This is the coarse, process-global view the gate helpers use today
+/// because the calling module is not reachable at the gate point (see
+/// [`NativeAccessPolicy`]). It fails closed: it returns `false` whenever no
+/// module has been granted access.
 pub fn native_access_enabled() -> bool {
-    NATIVE_ACCESS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    NATIVE_ACCESS_POLICY
+        .read()
+        .map(|p| p.any_granted())
+        .unwrap_or(false)
+}
+
+/// Whether the named module is granted native access. `None` denotes the
+/// unnamed module. This is the per-module query the JDK performs; it is the
+/// intended entry point for a future caller-module-aware gate once the
+/// calling module is plumbed to the native dispatch boundary.
+pub fn module_native_access_enabled(module: Option<&str>) -> bool {
+    NATIVE_ACCESS_POLICY
+        .read()
+        .map(|p| p.module_granted(module))
+        .unwrap_or(false)
 }
 
 /// Defense-in-depth gate for the raw-address `MemorySegment` memory-access
@@ -69,6 +197,13 @@ pub fn native_access_enabled() -> bool {
 /// arena-backed segments; gating there would break legitimate allocation even
 /// when native access is off. Instead the gate is applied at each public JNI
 /// entry point (the methods a Java caller can reach directly).
+///
+/// PER-MODULE LIMITATION: this consults the *process-global* view
+/// ([`native_access_enabled`]) rather than the calling module's grant,
+/// because the caller's module is not reachable from a native callee at this
+/// point. The grant is tracked per module by [`NativeAccessPolicy`]; see its
+/// docs for why the gate cannot yet consult it per caller. The behavior fails
+/// closed (denies unless *some* module is granted).
 fn require_native_access(op: &str) -> Result<(), MethodCallFailed> {
     if !native_access_enabled() {
         return Err(RuntimeError::IllegalCallerException {
@@ -2863,6 +2998,79 @@ mod tests {
         for (name, size) in carriers {
             assert!(size > 0, "{name} must have positive size");
         }
+    }
+
+    /// Snapshot/restore helper for the per-module policy tests so they can
+    /// mutate the global `NATIVE_ACCESS_POLICY` without leaking state into the
+    /// rest of the suite. Acquires the shared serialization lock.
+    fn with_policy_isolated<F: FnOnce()>(f: F) {
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = NATIVE_ACCESS_POLICY
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or(NativeAccessPolicy::None);
+        f();
+        store_policy(prev);
+    }
+
+    #[test]
+    fn test_native_access_policy_none_denies_all() {
+        with_policy_isolated(|| {
+            set_native_access_enabled(false);
+            assert!(!native_access_enabled());
+            assert!(!module_native_access_enabled(None));
+            assert!(!module_native_access_enabled(Some("com.example.app")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_all_grants_every_module() {
+        with_policy_isolated(|| {
+            set_native_access_enabled(true);
+            assert!(native_access_enabled());
+            assert!(module_native_access_enabled(None));
+            assert!(module_native_access_enabled(Some("any.module")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_scoped_modules() {
+        with_policy_isolated(|| {
+            set_native_access_modules(["com.example.ffi", "org.foo.bar"]);
+            // Only the listed modules are granted.
+            assert!(module_native_access_enabled(Some("com.example.ffi")));
+            assert!(module_native_access_enabled(Some("org.foo.bar")));
+            // An unlisted module — and the unnamed module — are denied.
+            assert!(!module_native_access_enabled(Some("com.other")));
+            assert!(!module_native_access_enabled(None));
+            // The coarse process-global gate sees *some* grant.
+            assert!(native_access_enabled());
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_all_unnamed_sentinel_grants_all() {
+        with_policy_isolated(|| {
+            // The JDK `ALL-UNNAMED` sentinel collapses to a global grant here.
+            set_native_access_modules(["ALL-UNNAMED"]);
+            assert!(module_native_access_enabled(None));
+            assert!(module_native_access_enabled(Some("anything")));
+            // Case-insensitive and mixed with named modules.
+            set_native_access_modules(["com.x", "all-modules"]);
+            assert!(module_native_access_enabled(Some("unlisted")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_blank_list_grants_all_like_bare_flag() {
+        with_policy_isolated(|| {
+            // A whitespace-only / empty argument behaves like the bare flag.
+            set_native_access_modules(["", "   "]);
+            assert!(native_access_enabled());
+            assert!(module_native_access_enabled(Some("whatever")));
+        });
     }
 
     // FIX(test): regression for the MemorySegment.copy zero-size OOB hole.
