@@ -27,13 +27,12 @@ production-ready as of the 0.3.0 release. Specific limitations:
 - **AES / AES-GCM**: routed through the `aes`/`aes-gcm` RustCrypto
   crates (constant-time, AES-NI capable). Previous in-tree implementation
   used T-table SBOX lookups (cache-timing oracle).
-- **SecureRandom**: seeded from the OS CSPRNG (`BCryptGenRandom` on
-  Windows, `getrandom`/`/dev/urandom` elsewhere). An unseeded instance
-  draws bytes directly from the OS source; a per-instance DRBG (seeded
-  from OS entropy, mixed with any user `setSeed`) supplies the remaining
-  output paths. A time/PID/thread fallback is used only if the OS source
-  is entirely unavailable. The earlier constant `splitmix64`-only stub is
-  gone.
+- **SecureRandom**: every output byte is drawn directly from the OS
+  CSPRNG (`RtlGenRandom`/`SystemFunction036` on Windows, `/dev/urandom`
+  elsewhere). A ChaCha20 keystream re-keyed from OS entropy is used only
+  if the OS source is entirely unavailable. The earlier `splitmix64`
+  DRBG (an invertible 64-bit mixer that leaked the whole stream after a
+  few observed bytes) has been removed.
 - **JCA provider chain**: 13 provider names are advertised; only `SUN`,
   `SunJCE`, and `SunRsaSign` are backed by real Service maps. Others —
   including the `SunEC` *provider object* — return null on

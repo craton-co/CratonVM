@@ -51,12 +51,16 @@ provider chain, and classifies each one as:
 
 ## SecureRandom
 
-| Algorithm        | Status        | Backing                                |
-|------------------|---------------|----------------------------------------|
-| `SHA1PRNG`       | Implemented   | OS RNG (`getrandom`) for seed and fill |
-| `DRBG`           | Implemented   | OS RNG; algorithm parameter ignored    |
-| `NativePRNG*`    | Implemented   | OS RNG via `getrandom`                 |
-| `Windows-PRNG`   | Implemented   | OS RNG via `BCryptGenRandom`           |
+All variants draw every output byte directly from the OS CSPRNG
+(`RtlGenRandom`/`SystemFunction036` on Windows, `/dev/urandom` elsewhere),
+with a ChaCha20 software fallback if the OS source is unavailable.
+
+| Algorithm        | Status        | Backing                                       |
+|------------------|---------------|-----------------------------------------------|
+| `SHA1PRNG`       | Implemented   | OS RNG (`os_random_bytes`); ChaCha20 fallback |
+| `DRBG`           | Implemented   | OS RNG; algorithm parameter ignored           |
+| `NativePRNG*`    | Implemented   | OS RNG (`os_random_bytes`)                     |
+| `Windows-PRNG`   | Implemented   | OS RNG via `RtlGenRandom` (`SystemFunction036`)|
 
 ## Cipher (symmetric)
 
@@ -173,7 +177,8 @@ algorithm, or missing trust path rejects the JAR.
 CratonVM has no in-tree lattice crypto; instead, when `route_pqc_to_real()` is
 on (the default — opt out with `CRATONVM_SYNTHETIC_PQC=1`), these families are
 routed to the **real JDK 25 SPIs**: ML-KEM via SunJCE
-(`com.sun.crypto.provider.ML_KEM_Impls`) and ML-DSA via the SUN provider
+(`com.sun.crypto.provider.ML_KEM_Impls`, the `javax.crypto.KEM` SPI in
+`native-builtins/src/jca/kem.rs`) and ML-DSA via the SUN provider
 (`sun.security.provider.ML_DSA_Impls`). The keygen / KEM encaps-decaps /
 sign-verify run interpreted (slow but correct, matching HotSpot).
 
