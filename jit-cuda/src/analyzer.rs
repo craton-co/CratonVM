@@ -1110,7 +1110,7 @@ mod tests {
         assert_eq!(load_slot(&[0x2A], 0), None); // aload_0
         assert_eq!(load_slot(&[0x19, 0], 0), None); // aload <index>
         assert_eq!(load_slot(&[0x60], 0), None); // iadd
-        // Truncated two-byte operand decodes to None rather than panicking.
+                                                 // Truncated two-byte operand decodes to None rather than panicking.
         assert_eq!(load_slot(&[0x15], 0), None);
     }
 
@@ -1136,7 +1136,7 @@ mod tests {
         assert!(is_load_op(0x15)); // iload
         assert!(is_load_op(0x1A)); // iload_0
         assert!(is_load_op(0x29)); // dload_3
-        // aload family is intentionally excluded.
+                                   // aload family is intentionally excluded.
         assert!(!is_load_op(0x19)); // aload
         assert!(!is_load_op(0x2A)); // aload_0
         assert!(!is_load_op(0x2D)); // aload_3

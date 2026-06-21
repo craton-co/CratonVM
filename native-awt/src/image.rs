@@ -806,7 +806,10 @@ mod tests {
         // Over-budget create: both `a` and `b` are pinned, so neither is dropped.
         let c = reg.create(10, 10, ImageType::IntArgb).unwrap();
         assert!(reg.get(a).is_some());
-        assert!(reg.get(b).is_some(), "re-pinned image must survive eviction");
+        assert!(
+            reg.get(b).is_some(),
+            "re-pinned image must survive eviction"
+        );
         assert!(reg.get(c).is_some());
         assert_eq!(reg.len(), 3);
     }

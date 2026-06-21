@@ -77,11 +77,11 @@ use rustc_hash::FxHashMap;
 use crate::arena::Arena;
 use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 use crate::gc::{GcResult, GcStats};
-use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
     ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
 };
+use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
