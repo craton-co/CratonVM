@@ -17589,6 +17589,30 @@ fn try_osr(
         Err(_) => return None,
     };
 
+    // deopt-osr Step 8: OSR-exit safety. A frame-deopt taken inside the OSR'd
+    // code (e.g. the deopt-osr loop-boundary trigger, or any future guard) stashes
+    // a reconstructed frame in LAST_DEOPT and returns the i64::MIN sentinel. OSR is
+    // *same-frame* replacement, so unlike the `execute_jit_call` sink we must NOT
+    // push a new frame or treat the sentinel as the return value (i64::MIN as i32
+    // == 0 → the corrupt result this guards against). Reject the OSR (clear the
+    // stash, return None): the interpreter simply continues executing THIS frame
+    // from where it was — correct because the trigger bails at the loop header
+    // before committing any JIT loop iteration to the frame. (A true OSR-exit that
+    // transfers JIT-advanced loop state back into the live interpreter frame is a
+    // follow-up — it must overwrite the frame's locals/stack under GC-rooting,
+    // which is coupled to the OSR-frame shadow-stack tracking; see
+    // deopt-osr-steps789-handoff.md.) The non-OSR loop-bci resume path is fully
+    // wired + proven at the `execute_jit_call` sink.
+    if result_i64 == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+            );
+        }
+        return None;
+    }
+
     // Convert i64 result back to Value based on return type
     let ret_type = crate::jit::return_type(&method_descriptor);
     match ret_type {

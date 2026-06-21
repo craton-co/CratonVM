@@ -1005,6 +1005,15 @@ pub extern "C" fn x64_deopt_entry(
     let point = unsafe { &*point };
     let regs = unsafe { &*regs };
     let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
+    if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        // Resume-side trace: confirms the frame-deopt trampoline fired and at
+        // which bci/reason (deopt-osr Step 8 OSR-exit shows reason=OsrExit), with
+        // the RESOLVED locals/stack so a wrong reconstruction is visible.
+        eprintln!(
+            "[cratonvm-deopt] x64 frame-deopt entry reason={:?} at bci={} locals={:?} stack={:?}",
+            point.reason, point.bci, frame.locals, frame.stack,
+        );
+    }
     LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
     i64::MIN
 }

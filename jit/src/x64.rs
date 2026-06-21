@@ -6204,6 +6204,15 @@ struct Compiler {
     /// map and a guard snapshot at the same bci cannot collide on the key).
     osr_exit_box_ptr_by_bci:
         rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
+    /// deopt-osr Step 8 (test trigger): the loop-header bci at which to emit a
+    /// synthetic unconditional OSR-exit branch (→ the OSR-exit frame-deopt stub),
+    /// so a JIT'd loop bails to the interpreter at a loop bci and resumes the loop
+    /// body. `Some(_)` only under `CRATONVM_OSR_EXIT_TEST` + `CRATONVM_DEOPT_REAL`
+    /// (set after construction from the detected loops); `None` in production, so
+    /// no trigger is emitted and code is byte-identical. This is the deliberate
+    /// "instrument a rare branch" trigger from the handoff — proves the mechanism
+    /// pending a real speculation/counter trigger.
+    osr_exit_test_trigger_bci: Option<usize>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -6586,6 +6595,7 @@ impl Compiler {
             deopt_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
+            osr_exit_test_trigger_bci: None,
         }
     }
 
@@ -13535,15 +13545,24 @@ impl Compiler {
             let stub_off = self.buf.pos();
             stub_offsets.insert(key, stub_off);
 
-            // deopt-osr Step 2 — route ONLY the BCE pilot guard (reason 2) to the
-            // in-stub 3-arg frame-deopt trampoline, and only under
-            // CRATONVM_DEOPT_REAL with a recorded snapshot for this bci. Gate OFF
-            // (default) ⇒ false ⇒ the uncommon-trap path below emits byte-identically.
-            let frame_deopt = crate::deopt_real_enabled()
-                && reason == 2
-                && self.deopt_box_ptr_by_bci.contains_key(&bci);
-            if frame_deopt {
-                let box_ptr = *self.deopt_box_ptr_by_bci.get(&bci).unwrap();
+            // deopt-osr Step 2 — route the BCE pilot guard (reason 2) and the
+            // deopt-osr Step 8 OSR-exit trigger (reason 7) to the in-stub 3-arg
+            // frame-deopt trampoline, under CRATONVM_DEOPT_REAL with a recorded
+            // snapshot for this bci. Reason 2 bakes the guard snapshot
+            // (`deopt_box_ptr_by_bci`); reason 7 bakes the OSR-exit map
+            // (`osr_exit_box_ptr_by_bci`) — both reconstruct + resume at `bci`.
+            // Gate OFF (default) ⇒ None ⇒ the uncommon-trap path below emits
+            // byte-identically.
+            let frame_box_ptr = if crate::deopt_real_enabled() {
+                match reason {
+                    2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
+                    7 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(box_ptr) = frame_box_ptr {
                 let base = self.deopt_regs_base;
                 // 1) Spill all 16 GPRs (RAX=0..R15=15) into the SavedRegisters
                 //    region FIRST, before any arg-setup clobbers a register: the
@@ -14405,6 +14424,24 @@ impl Compiler {
             // Record mapping from bytecode PC to native offset
             // (AFTER hoisted/SIMD/speculative-BCE code, so back-edges skip the preheader)
             self.pc_to_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+
+            // deopt-osr Step 8 (test trigger): at the chosen loop header, emit a
+            // synthetic UNCONDITIONAL branch to the OSR-exit frame-deopt stub
+            // (reason 7) on the NORMAL loop path (right at `pc_to_native[pc]`, the
+            // back-edge/fall-through target — NOT the separate OSR-entry landing
+            // pad), so normal JIT execution bails to the interpreter at this loop
+            // bci on the first reach. `x64_deopt_entry` reconstructs the frame at
+            // this bci → the `execute_jit_call` sink resumes the loop body here
+            // instead of re-running from entry. Only when `osr_exit_test_trigger_bci`
+            // is set (CRATONVM_OSR_EXIT_TEST + DEOPT_REAL); absent in production ⇒
+            // no JMP ⇒ byte-identical. The OSR-exit map at this bci (emitted above)
+            // is the box the stub bakes via `osr_exit_box_ptr_by_bci`.
+            if self.osr_exit_test_trigger_bci == Some(pc) {
+                self.buf.emit_byte(0xE9); // JMP rel32
+                let patch_off = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                self.deopt_stubs.push((patch_off, pc, 7)); // 7 = OSR-exit
+            }
 
             // === LICM: Replace hoisted sequences with spill slot loads ===
             {
@@ -22035,6 +22072,16 @@ pub fn compile_with_param_slots(
     compiler.anewarray_info = anewarray_info;
     compiler.invoke_info = invoke_info;
     compiler.direct_calls = direct_calls;
+    // deopt-osr Step 8 (test trigger): under CRATONVM_OSR_EXIT_TEST + CRATONVM_DEOPT_REAL,
+    // pick the first (lowest-pc) detected loop header as the synthetic OSR-exit
+    // branch site. `None` in production (either gate off) ⇒ no trigger emitted ⇒
+    // byte-identical code. `detect_loops` returns (header, end) pairs.
+    compiler.osr_exit_test_trigger_bci =
+        if crate::osr_exit_test_enabled() && crate::deopt_real_enabled() {
+            loops.iter().map(|&(h, _)| h).min()
+        } else {
+            None
+        };
     if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!(
             "[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",

@@ -871,6 +871,18 @@ pub fn deopt_verify_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
 }
 
+/// deopt-osr Step 8 (test trigger): `CRATONVM_OSR_EXIT_TEST` (default-OFF,
+/// read-once). When ON *and* `deopt_real_enabled()`, the single-pass backend
+/// emits one synthetic unconditional OSR-exit branch at a loop header so a JIT'd
+/// loop bails to the interpreter at a loop bci and resumes the loop body — the
+/// deliberate "instrument a rare branch" trigger that exercises the OSR-exit
+/// resume end-to-end pending a real speculation trigger. OFF ⇒ no trigger
+/// emitted ⇒ byte-identical code (the production path).
+pub fn osr_exit_test_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TEST").is_some())
+}
+
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
 /// unless `CRATONVM_DBG_JIT_NAMES` is set.
 pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
