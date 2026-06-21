@@ -1278,7 +1278,7 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
         b'J' => match value {
             Value::Long(_) => value,
             Value::Double(d) => Value::Long(d.to_bits() as i64),
-            Value::Float(f) => Value::Long(f.to_bits() as u32 as i64),
+            Value::Float(f) => Value::Long(f.to_bits() as i64),
             Value::Int(i) => Value::Long(i as i64),
             Value::Object(None) | Value::Uninitialized => Value::Long(0),
             // An object pointer landing in a long slot is upstream drift;

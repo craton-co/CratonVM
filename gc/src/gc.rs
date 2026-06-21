@@ -413,7 +413,7 @@ fn try_forward_object(
     // `MAX_SANE_OBJECT_SIZE` guard in `gen_heap.rs::forward_object` — so a
     // bad header is surfaced as a recoverable GC error instead of being
     // converted into a hard process abort by the to-space OOM path below.
-    if total_size > MAX_SANE_OBJECT_SIZE || total_size < HEADER_SIZE {
+    if !(HEADER_SIZE..=MAX_SANE_OBJECT_SIZE).contains(&total_size) {
         return Err(GcError {
             message: format!(
                 "implausible object size {} bytes at {:p} (kind={:?}, \

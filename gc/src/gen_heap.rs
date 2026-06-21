@@ -2608,7 +2608,7 @@ impl GenerationalHeap {
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
-        Self::scan_dirty_cards(&card_table, &old_gen, &young_from, &mut extra_roots);
+        Self::scan_dirty_cards(card_table, &old_gen, &young_from, &mut extra_roots);
 
         // Phase 1: Forward all root objects
         for root in roots.iter_mut() {
@@ -3737,7 +3737,7 @@ impl GenerationalHeap {
                         // SAFETY: offset 4 lies within the >=8-byte gap.
                         let gap = unsafe { std::ptr::read((src as *const u8).add(4) as *const u32) }
                             as usize;
-                        if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                        if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                             cursor += gap;
                             continue;
                         }
@@ -3893,7 +3893,7 @@ impl GenerationalHeap {
                             let gap =
                                 unsafe { std::ptr::read((obj as *const u8).add(4) as *const u32) }
                                     as usize;
-                            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                                 cursor += gap;
                                 continue;
                             }
@@ -4263,7 +4263,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                     cursor += gap;
                     continue;
                 }
@@ -4363,8 +4363,7 @@ impl GenerationalHeap {
                     let probe_size = gen_object_total_size(probe_hdr);
                     let kind_byte = probe_hdr.kind as u8;
                     if kind_byte <= 1
-                        && probe_size >= HEADER_SIZE
-                        && probe_size <= MAX_PLAUSIBLE_OBJ_BYTES
+                        && (HEADER_SIZE..=MAX_PLAUSIBLE_OBJ_BYTES).contains(&probe_size)
                         && probe + probe_size <= used
                         && probe_hdr.num_slots <= (1 << 24)
                         && probe_hdr.array_length <= i32::MAX as u32
@@ -4657,7 +4656,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
                     cursor += gap;
                     continue;
                 }
@@ -4784,7 +4783,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
                     cursor += gap;
                     continue;
                 }
@@ -5635,7 +5634,7 @@ impl GenerationalHeap {
                     // SAFETY: offset 4 lies within the >=8-byte gap.
                     let gap =
                         unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                    if gap >= 8 && gap < HEADER_SIZE && offset + gap <= used {
+                    if (8..HEADER_SIZE).contains(&gap) && offset + gap <= used {
                         offset += gap;
                         continue;
                     }
@@ -5820,7 +5819,6 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
 /// Cached `CRATONVM_DBG_GCWRITE` gate (bc math-ec diagnostic). Cached in a
 /// `OnceLock` so the per-object-copy check in `forward_object` does NOT pay an
 /// `env::var_os` lookup on the hot GC path when the gate is off.
-#[inline]
 fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -6068,7 +6066,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
             // SAFETY: offset 4 lies within the >=8-byte gap.
             let gap =
                 unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                 cursor += gap;
                 continue;
             }
@@ -7186,7 +7184,7 @@ mod tests {
 
         for i in 0..1000 {
             let obj = heap.alloc_object(ClassId::new(0), 2);
-            heap.set_field(obj, 0, Value::Int(i as i32));
+            heap.set_field(obj, 0, Value::Int(i));
             // Keep every 20th object alive
             if i % 20 == 0 {
                 live_objs.push(obj);
@@ -7819,7 +7817,7 @@ mod tests {
         let mut roots: Vec<ObjectRef> = Vec::new();
         for i in 0..num_objects {
             let obj = heap.alloc_object(ClassId::new(0), 2); // field 0=tag, field 1=link
-            heap.set_field(obj, 0, Value::Int(i as i32));
+            heap.set_field(obj, 0, Value::Int(i));
             roots.push(obj);
         }
 

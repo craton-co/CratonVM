@@ -405,12 +405,11 @@ impl ConcurrentMarker {
 
         let mut count = 0;
         for &root_ptr in roots {
-            if !root_ptr.is_null() && old_gen.contains(root_ptr) {
-                if self.bitmap.try_mark(root_ptr as usize) {
+            if !root_ptr.is_null() && old_gen.contains(root_ptr)
+                && self.bitmap.try_mark(root_ptr as usize) {
                     self.queue.push(root_ptr);
                     count += 1;
                 }
-            }
         }
 
         // Activate SATB barrier for the concurrent phase.
@@ -473,22 +472,20 @@ impl ConcurrentMarker {
         // gate is allowed to go INACTIVE. See the closing block.
         let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8) {
-                if self.bitmap.try_mark(addr) {
+            if addr != 0 && old_gen.contains(addr as *const u8)
+                && self.bitmap.try_mark(addr) {
                     self.queue.push(addr as *mut u8);
                     discovered += 1;
                 }
-            }
         }
 
         // Re-scan roots (some may have changed during concurrent mark).
         for &root_ptr in roots {
-            if !root_ptr.is_null() && old_gen.contains(root_ptr) {
-                if self.bitmap.try_mark(root_ptr as usize) {
+            if !root_ptr.is_null() && old_gen.contains(root_ptr)
+                && self.bitmap.try_mark(root_ptr as usize) {
                     self.queue.push(root_ptr);
                     discovered += 1;
                 }
-            }
         }
 
         // Drain the queue fully (mark transitive closure from new roots),
@@ -520,12 +517,11 @@ impl ConcurrentMarker {
         // reaps the stragglers. Either way the bitmap is final on exit.
         let late_entries = self.satb_queue.deactivate_and_drain();
         for addr in late_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8) {
-                if self.bitmap.try_mark(addr) {
+            if addr != 0 && old_gen.contains(addr as *const u8)
+                && self.bitmap.try_mark(addr) {
                     self.queue.push(addr as *mut u8);
                     discovered += 1;
                 }
-            }
         }
         // Mark the transitive closure of any late entries (again with the
         // overflow fallback). The gate is INACTIVE now, but mutators are
@@ -754,7 +750,7 @@ mod tests {
         }
 
         // Allocate object B (1 slot, no refs)
-        let size_b = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size_b = HEADER_SIZE + SLOT_SIZE;
         let ptr_b = og.alloc(size_b, 8).unwrap();
         unsafe {
             let h = &mut *(ptr_b as *mut ObjectHeader);
@@ -786,7 +782,7 @@ mod tests {
         let mut og = OldGen::new(65536);
 
         // Allocate two objects
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
         let live_ptr = og.alloc(size, 8).unwrap();
         unsafe {
             let h = &mut *(live_ptr as *mut ObjectHeader);
@@ -817,7 +813,7 @@ mod tests {
     #[test]
     fn satb_prevents_lost_object() {
         let mut og = OldGen::new(65536);
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         // Object A (root)
         let ptr_a = og.alloc(size, 8).unwrap();
@@ -885,7 +881,7 @@ mod tests {
     #[test]
     fn satb_active_through_remark_closure() {
         let mut og = OldGen::new(65536);
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         // Object A (root, no live refs to B by remark time).
         let ptr_a = og.alloc(size, 8).unwrap();
@@ -962,7 +958,7 @@ mod tests {
     #[test]
     fn initial_mark_multiple_roots() {
         let mut og = OldGen::new(65536);
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         let ptrs: Vec<*mut u8> = (0..5)
             .map(|i| {
@@ -1158,7 +1154,7 @@ mod tests {
     #[test]
     fn large_object_graph_marking() {
         let mut og = OldGen::new(1 << 20); // 1 MB
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         // Build a chain: obj[0] -> obj[1] -> ... -> obj[N-1]
         let n = 50;
@@ -1197,7 +1193,7 @@ mod tests {
     #[test]
     fn marking_graph_with_cycle() {
         let mut og = OldGen::new(65536);
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         // Create A -> B -> C -> A (cycle)
         let ptr_a = og.alloc(size, 8).unwrap();
@@ -1267,7 +1263,7 @@ mod tests {
     #[test]
     fn sweep_all_unreachable() {
         let mut og = OldGen::new(65536);
-        let size = HEADER_SIZE + 1 * SLOT_SIZE;
+        let size = HEADER_SIZE + SLOT_SIZE;
 
         // Allocate 3 objects, none rooted
         for i in 0..3 {
