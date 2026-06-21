@@ -1783,6 +1783,10 @@ impl IrBuilder {
                             // lowering). `D`/`F` returns stay rejected by the
                             // shape gate until the XMM value tier exists.
                             b'J' => IrType::Long,
+                            // A `D` (double) return is a 64-bit value node (inc
+                            // 32); admitted by `static_call_shape`, the call-site
+                            // sentinel check already disambiguates it.
+                            b'D' => IrType::Double,
                             _ => IrType::Int,
                         };
                         let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1857,6 +1861,8 @@ impl IrBuilder {
                         // only admits `J` returns once the i64::MIN-sentinel
                         // collision is disambiguated at the call site.
                         b'J' => IrType::Long,
+                        // A `D` (double) return is a 64-bit value node (inc 32).
+                        b'D' => IrType::Double,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -1895,6 +1901,8 @@ impl IrBuilder {
                         // only admits `J` returns once the i64::MIN-sentinel
                         // collision is disambiguated at the call site.
                         b'J' => IrType::Long,
+                        // A `D` (double) return is a 64-bit value node (inc 32).
+                        b'D' => IrType::Double,
                         _ => IrType::Int,
                     };
                     let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
@@ -2032,6 +2040,30 @@ impl IrBuilder {
 
                 // lreturn
                 0xad => {
+                    let val = self.pop();
+                    let ret =
+                        self.graph
+                            .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
+                    self.graph.exit = ret;
+                    self.ctrl = NO_NODE;
+                    pc += 1;
+                }
+
+                // dreturn (inc 32) — a `double` return is a clean 64-bit value
+                // whose bits ride RAX (the JIT i64 return ABI); the interpreter's
+                // post-JIT path reads `result as u64` → `f64::from_bits`, and
+                // `lower_terminator`'s `Op::Return` already does `load_to_rax`
+                // from the value's slot (which holds the 64-bit double bits), so
+                // no XMM return marshalling is needed. Identical to `lreturn`.
+                // (`freturn` (0xae) is intentionally absent — a `float` return's
+                // 32 bits would ride RAX with garbage upper bits; deferred until
+                // the float-return slice. Such a method bails to single-pass.)
+                // Only reachable under the FP gate (`returns_double` ⇒ the
+                // `ir_emit_fp` clause); the `Long.MIN_VALUE`/`-0.0` ↔ `i64::MIN`
+                // deopt-sentinel collision on a `D` call result is handled by the
+                // item-1 `dispatch_threw` peek (the call site checks
+                // `IrType::Double`).
+                0xaf => {
                     let val = self.pop();
                     let ret =
                         self.graph

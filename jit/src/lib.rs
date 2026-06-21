@@ -4553,18 +4553,21 @@ fn try_compile_inner(
             || (ir_emit_long
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
-            // Scope (mirrors the long track's first increment): FP is used only
-            // INTERNALLY — the signature must be FP-free (`!fp_in_descriptor`),
-            // because FP params/returns ride XMM registers the prologue/epilogue
-            // do not yet marshal (a follow-on, the "also unlocks double call
-            // args + returns" item). Excludes int-div (would strand an FP value
-            // at the div deopt — whose resume can't yet reconstruct an FP slot,
-            // same discipline as the long gate) and `ldc2_w` (the builder does
-            // not yet disambiguate long-vs-double constant bits; such a method
-            // bails — a follow-up).
+            // Scope: FP PARAMS still ride XMM the prologue does not yet marshal,
+            // so `!fp_in_params`. inc 32 relaxes the RETURN side: a `double`
+            // return is admitted (`!returns_float` allows `D`/int/void/ref/long,
+            // excludes only `F`), because a `double` result's bits ride RAX (the
+            // i64 return ABI) — no XMM return marshalling — and the `dreturn`
+            // builder arm + the `Op::Return` `load_to_rax` already handle it. A
+            // `float` return (`returns_float`) stays excluded: its 32 bits would
+            // ride RAX with garbage upper bits (a follow-on). Excludes int-div
+            // (would strand an FP value at the div deopt — whose resume can't yet
+            // reconstruct an FP slot) and `ldc2_w` (the builder does not yet
+            // disambiguate long-vs-double constant bits).
             || (ir_emit_fp
                 && fp_in_body(code, code_len)
-                && !fp_in_descriptor(&cached.method_descriptor)
+                && !fp_in_params(&cached.method_descriptor)
+                && !returns_float(&cached.method_descriptor)
                 && !method_has_int_div(code, code_len)
                 && scan.ldc2w_ops.is_empty()))
     {
@@ -5936,6 +5939,53 @@ fn fp_in_descriptor(descriptor: &str) -> bool {
     false
 }
 
+/// inc 32: a `float`/`double` appears among the method's PARAMETERS (not the
+/// return). FP params ride XMM registers the IR prologue does not yet marshal, so
+/// such a method stays off the FP IR path. This is `fp_in_descriptor`'s parameter
+/// loop WITHOUT the return-type check — the return side is governed separately by
+/// `returns_float` (a `double` return is now admitted; see the FP gate clause).
+fn fp_in_params(descriptor: &str) -> bool {
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'F' | b'D' => return true,
+            b'L' => {
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// inc 32: the method returns `float` specifically. A `float` result's 32 bits
+/// would ride RAX with garbage upper bits (the JIT i64 return ABI), so float
+/// returns stay off the FP IR path for now; `double` returns (clean 64-bit in
+/// RAX) ARE admitted. `return_type` yields the descriptor's return byte.
+fn returns_float(descriptor: &str) -> bool {
+    return_type(descriptor) == b'F'
+}
+
 /// inc 30: the method uses `float`/`double` anywhere — signature OR body. Used by
 /// the int/long IR-path clauses to stay FP-free.
 fn method_uses_fp(code: &[u8], code_len: usize, descriptor: &str) -> bool {
@@ -6039,7 +6089,15 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
         // `ir_emit_long` (consuming a long result needs a category-2 opcode), so
         // inert for the default int/ref path.
         b'J' => Some((num_args, ret)),
-        // `D` / `F` return — still rejected (needs the XMM value tier).
+        // `D` (double) return: accepted (inc 32). The result rides RAX as a clean
+        // 64-bit bit pattern (the i64 return ABI); the IR builder types the
+        // `Op::Call` node `IrType::Double`, and the call-site post-invoke check
+        // disambiguates a real `-0.0`/other double whose bits == `i64::MIN` from
+        // the deopt sentinel via the out-of-band `dispatch_threw` peek (the check
+        // already matches `IrType::Double`). `D`/`F` *args* are still rejected
+        // (the arg loop above) — they ride XMM the marshaller does not yet emit.
+        b'D' => Some((num_args, ret)),
+        // `F` return — still rejected (32-bit-in-RAX subtlety, a follow-on).
         _ => None,
     }
 }

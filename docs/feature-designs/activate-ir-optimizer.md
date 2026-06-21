@@ -2039,10 +2039,22 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
      both variants; IR == single-pass == host) + E2E (all 5 relational operators
      on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
    - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
-   - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
-     FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).
-     This **also unlocks `double`/`float` call args + returns** (extend
-     `static_call_shape` to accept `D`/`F` once XMM marshalling exists).
+   - **FP params/returns + call-args** — *partially landed*.
+     - ✅ **`double` returns — DONE (inc 32).** A `double` result rides RAX as a
+       clean 64-bit bit pattern (the i64 return ABI; the interpreter reads
+       `result as u64` → `f64::from_bits`), so NO XMM return marshalling is
+       needed: a new `dreturn` (0xaf) builder arm → `Op::Return`, whose existing
+       `load_to_rax` from the value's slot already returns the bits. The FP gate
+       splits `!fp_in_descriptor` into `!fp_in_params && !returns_float` (admits a
+       `D` return, keeps FP *params* and `float` returns off). `static_call_shape`
+       accepts a `D` *return* (the builder types the `Op::Call` `IrType::Double`);
+       the `-0.0`/`i64::MIN`-bits ↔ deopt-sentinel collision on a `D` call result
+       is handled by the item-1 `dispatch_threw` peek. Validated: `ir_vs_singlepass`
+       `…_double_return` + `…_invokestatic_double_return`; E2E (incl. a `-0.0`
+       call-return → `1.0/-0.0 = -Infinity`) `== HotSpot`.
+     - **Remaining:** `float` returns (32-bit-in-RAX upper-bits subtlety), FP
+       *params* + `D`/`F` call-*args* (XMM prologue/epilogue marshalling + an
+       FP-aware VM→JIT call convention — FP args in XMM0-3/0-7).
    - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
      inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries
