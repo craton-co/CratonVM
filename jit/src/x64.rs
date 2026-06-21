@@ -96,6 +96,7 @@ const MAX_LOOKUPSWITCH_NPAIRS: usize = 1 << 20;
 /// Validate `high - low + 1` against signed-overflow AND a sane upper bound.
 /// Returns the count as `usize` if both checks pass.
 pub fn checked_tableswitch_count(low: i32, high: i32) -> Option<usize> {
+    // Widening: i32 -> i64 (sign-extended, avoids overflow in high-low+1)
     let span = (high as i64).checked_sub(low as i64)?;
     let count = span.checked_add(1)?;
     if count <= 0 {
@@ -114,6 +115,7 @@ pub fn checked_lookupswitch_npairs(npairs: i32) -> Option<usize> {
     if npairs < 0 {
         return None;
     }
+    // Cast: non-negative index/count to usize
     let n = npairs as usize;
     if n > MAX_LOOKUPSWITCH_NPAIRS {
         return None;
@@ -439,6 +441,7 @@ fn detect_int_array_sum(
     if code[pc] != 0x84 {
         return None;
     }
+    // Widening: u8 -> wider int (bytecode operand byte, value fits)
     if code[pc + 1] as usize != iv_local {
         // Widening: always safe
         return None;
@@ -465,10 +468,11 @@ fn detect_int_array_sum(
 /// Extract local index from an lload instruction at pc.
 fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x1e => Some(0),                               // lload_0
-        0x1f => Some(1),                               // lload_1
-        0x20 => Some(2),                               // lload_2
-        0x21 => Some(3),                               // lload_3
+        0x1e => Some(0), // lload_0
+        0x1f => Some(1), // lload_1
+        0x20 => Some(2), // lload_2
+        0x21 => Some(3), // lload_3
+        // Cast: non-negative index/count to usize
         0x16 => code.get(pc + 1).map(|&b| b as usize), // lload
         _ => None,
     }
@@ -477,10 +481,11 @@ fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from an lstore instruction at pc.
 fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x3f => Some(0),                               // lstore_0
-        0x40 => Some(1),                               // lstore_1
-        0x41 => Some(2),                               // lstore_2
-        0x42 => Some(3),                               // lstore_3
+        0x3f => Some(0), // lstore_0
+        0x40 => Some(1), // lstore_1
+        0x41 => Some(2), // lstore_2
+        0x42 => Some(3), // lstore_3
+        // Cast: non-negative index/count to usize
         0x37 => code.get(pc + 1).map(|&b| b as usize), // lstore
         _ => None,
     }
@@ -489,10 +494,11 @@ fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from a dload instruction at pc.
 fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x26 => Some(0),                               // dload_0
-        0x27 => Some(1),                               // dload_1
-        0x28 => Some(2),                               // dload_2
-        0x29 => Some(3),                               // dload_3
+        0x26 => Some(0), // dload_0
+        0x27 => Some(1), // dload_1
+        0x28 => Some(2), // dload_2
+        0x29 => Some(3), // dload_3
+        // Cast: non-negative index/count to usize
         0x18 => code.get(pc + 1).map(|&b| b as usize), // dload
         _ => None,
     }
@@ -501,10 +507,11 @@ fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from a dstore instruction at pc.
 fn extract_dstore_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x47 => Some(0),                               // dstore_0
-        0x48 => Some(1),                               // dstore_1
-        0x49 => Some(2),                               // dstore_2
-        0x4a => Some(3),                               // dstore_3
+        0x47 => Some(0), // dstore_0
+        0x48 => Some(1), // dstore_1
+        0x49 => Some(2), // dstore_2
+        0x4a => Some(3), // dstore_3
+        // Cast: non-negative index/count to usize
         0x39 => code.get(pc + 1).map(|&b| b as usize), // dstore
         _ => None,
     }
@@ -825,6 +832,7 @@ pub(crate) fn detect_int_array_element_wise(
     // iinc iv, 1 ; goto header
     if pc + 2 >= back_edge_end
         || code[pc] != 0x84
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         || code[pc + 1] as usize != iv_local
         || code[pc + 2] != 0x01
         || pc + 3 != back_edge
@@ -918,20 +926,27 @@ pub(crate) fn detect_loop_unswitch_candidates(
                 match code[pc] {
                     // istore/lstore/fstore/dstore/astore <local>
                     0x36..=0x3A if pc + 1 < code_len => {
+                        // Widening: u8 -> wider int (bytecode operand byte, value fits)
                         written |= 1u64 << (code[pc + 1] as usize & 0x3F);
                     }
                     // istore_0..istore_3
+                    // Widening: u8 -> usize (opcode-relative local index, value fits)
                     0x3B..=0x3E => written |= 1u64 << ((code[pc] - 0x3B) as usize),
                     // lstore_0..lstore_3
+                    // Widening: u8 -> usize (opcode-relative local index, value fits)
                     0x3F..=0x42 => written |= 1u64 << ((code[pc] - 0x3F) as usize),
                     // fstore_0..fstore_3
+                    // Widening: u8 -> usize (opcode-relative local index, value fits)
                     0x43..=0x46 => written |= 1u64 << ((code[pc] - 0x43) as usize),
                     // dstore_0..dstore_3
+                    // Widening: u8 -> usize (opcode-relative local index, value fits)
                     0x47..=0x4A => written |= 1u64 << ((code[pc] - 0x47) as usize),
                     // astore_0..astore_3
+                    // Widening: u8 -> usize (opcode-relative local index, value fits)
                     0x4B..=0x4E => written |= 1u64 << ((code[pc] - 0x4B) as usize),
                     // iinc <local>, _
                     0x84 if pc + 1 < code_len => {
+                        // Widening: u8 -> wider int (bytecode operand byte, value fits)
                         written |= 1u64 << (code[pc + 1] as usize & 0x3F);
                     }
                     _ => {}
@@ -947,7 +962,9 @@ pub(crate) fn detect_loop_unswitch_candidates(
         while pc < back_edge && pc < code_len {
             // Try to extract an iload and its local.
             let (iload_local, iload_len) = match code.get(pc).copied() {
+                // Widening: u8 -> usize (opcode-relative local index, value fits)
                 Some(0x1A..=0x1D) => (Some((code[pc] - 0x1A) as usize), 1usize),
+                // Widening: u8 -> wider int (bytecode operand byte, value fits)
                 Some(0x15) if pc + 1 < code_len => (Some(code[pc + 1] as usize), 2usize),
                 _ => (None, 0),
             };
@@ -2056,9 +2073,13 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
             // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
             0x99..=0xA8 | 0xC6 | 0xC7 => {
                 if pc + 2 < code_len {
+                    // Cast: signed offset to isize for pointer/index arithmetic
                     let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                    // Cast: signed offset to isize for pointer/index arithmetic
                     let t = pc as isize + off;
+                    // Cast: non-negative index/count to usize
                     if t >= 0 && (t as usize) < code_len {
+                        // Cast: non-negative index/count to usize
                         targets[t as usize] = true;
                     }
                 }
@@ -2072,9 +2093,13 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                         code[pc + 2],
                         code[pc + 3],
                         code[pc + 4],
+                        // Cast: signed offset to isize for pointer/index arithmetic
                     ]) as isize;
+                    // Cast: signed offset to isize for pointer/index arithmetic
                     let t = pc as isize + off;
+                    // Cast: non-negative index/count to usize
                     if t >= 0 && (t as usize) < code_len {
+                        // Cast: non-negative index/count to usize
                         targets[t as usize] = true;
                     }
                 }
@@ -2091,16 +2116,22 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                 }
                 let read_off = |code: &[u8], at: usize| -> isize {
                     i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        // Cast: signed offset to isize for pointer/index arithmetic
                         as isize
                 };
                 let mark = |targets: &mut Vec<bool>, off: isize| {
+                    // Cast: signed offset to isize for pointer/index arithmetic
                     let t = pc as isize + off;
+                    // Cast: non-negative index/count to usize
                     if t >= 0 && (t as usize) < code_len {
+                        // Cast: non-negative index/count to usize
                         targets[t as usize] = true;
                     }
                 };
                 mark(&mut targets, read_off(code, p)); // default
+                                                       // Cast: value to i32 (encoding immediate/displacement)
                 let low = read_off(code, p + 4) as i32;
+                // Cast: value to i32 (encoding immediate/displacement)
                 let high = read_off(code, p + 8) as i32;
                 let count = checked_tableswitch_count(low, high).unwrap_or(0);
                 let mut jp = p + 12;
@@ -2124,17 +2155,21 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
                 }
                 let read_off = |code: &[u8], at: usize| -> isize {
                     i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        // Cast: signed offset to isize for pointer/index arithmetic
                         as isize
                 };
                 let mark = |targets: &mut Vec<bool>, off: isize| {
+                    // Cast: signed offset to isize for pointer/index arithmetic
                     let t = pc as isize + off;
+                    // Cast: non-negative index/count to usize
                     if t >= 0 && (t as usize) < code_len {
+                        // Cast: non-negative index/count to usize
                         targets[t as usize] = true;
                     }
                 };
                 mark(&mut targets, read_off(code, p)); // default
-                let npairs =
-                    i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
+                let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
+                        // Cast: non-negative index/count to usize
                         as usize;
                 let mut jp = p + 8;
                 for _ in 0..npairs {
@@ -2165,6 +2200,7 @@ fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize
     let fallthrough = pc + bytecode_len_at(code, pc);
     let read_i16 = |at: usize| -> isize {
         if at + 1 < code_len {
+            // Cast: signed offset to isize for pointer/index arithmetic
             i16::from_be_bytes([code[at], code[at + 1]]) as isize
         } else {
             0
@@ -2172,14 +2208,18 @@ fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize
     };
     let read_i32 = |at: usize| -> isize {
         if at + 3 < code_len {
+            // Cast: signed offset to isize for pointer/index arithmetic
             i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
         } else {
             0
         }
     };
     let target = |off: isize| -> Option<usize> {
+        // Cast: signed offset to isize for pointer/index arithmetic
         let t = pc as isize + off;
+        // Cast: non-negative index/count to usize
         if t >= 0 && (t as usize) < code_len {
+            // Cast: non-negative index/count to usize
             Some(t as usize)
         } else {
             None
@@ -2227,7 +2267,9 @@ fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize
                 if let Some(t) = target(read_i32(p)) {
                     v.push(t);
                 }
+                // Cast: value to i32 (encoding immediate/displacement)
                 let low = read_i32(p + 4) as i32;
+                // Cast: value to i32 (encoding immediate/displacement)
                 let high = read_i32(p + 8) as i32;
                 let count = checked_tableswitch_count(low, high).unwrap_or(0);
                 let mut jp = p + 12;
@@ -2254,6 +2296,7 @@ fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize
                 if let Some(t) = target(read_i32(p)) {
                     v.push(t);
                 }
+                // Cast: non-negative index/count to usize
                 let npairs = read_i32(p + 4).max(0) as usize;
                 let mut jp = p + 8;
                 for _ in 0..npairs {
@@ -2303,19 +2346,29 @@ fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -
     };
     let op = code[pc];
     match op {
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x3A => set_oop(mask, code.get(pc + 1).copied().unwrap_or(0) as usize), // astore
-        0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize),                     // astore_0..3
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
+        0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize), // astore_0..3
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x36 | 0x38 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // istore/fstore
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x37 | 0x39 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 2), // lstore/dstore
-        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                            // istore_0..3
-        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                            // fstore_0..3
-        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                            // lstore_0..3
-        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                            // dstore_0..3
-        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),        // iinc
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
+        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1), // istore_0..3
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
+        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1), // fstore_0..3
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
+        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2), // lstore_0..3
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
+        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2), // dstore_0..3
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
+        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // iinc
         0xC4 => {
             // wide <store>/<iinc>: 2-byte index.
             let wop = code.get(pc + 1).copied().unwrap_or(0);
             let idx = if pc + 3 < code.len() {
+                // Cast: non-negative index/count to usize
                 u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize
             } else {
                 0
@@ -3027,10 +3080,12 @@ fn preceding_aload_nonnull_local(code: &[u8], pc: usize) -> Option<usize> {
     // aload_0..aload_3 — 1-byte opcode at pc-1.
     let prev1 = code[pc - 1];
     if (0x2A..=0x2D).contains(&prev1) {
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
         return Some((prev1 - 0x2A) as usize);
     }
     // aload <u8> — 2 bytes at pc-2.
     if pc >= 2 && code[pc - 2] == 0x19 {
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         return Some(code[pc - 1] as usize);
     }
     None
@@ -3182,11 +3237,13 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
 
     let aop = code[aload_pc];
     if (0x2A..=0x2D).contains(&aop) {
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
         return Some((aop - 0x2A) as usize);
     }
     // aload <u8> — the index byte is at aload_pc+1, which is strictly < idx_pc
     // because this instruction's forward length is 2 and it ends at idx_pc.
     if aop == 0x19 && aload_pc + 1 < idx_pc {
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         return Some(code[aload_pc + 1] as usize);
     }
     None
@@ -4250,11 +4307,13 @@ fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64 {
                 // Local index is 0..255; clamp the shift like every other
                 // shift-by-local site (a high local saturates to bit 63, which
                 // is conservatively treated as "some local >= 63 modified").
+                // Widening: u8 -> wider int (bytecode operand byte, value fits)
                 modified |= 1u64 << (code[pc + 1] as usize).min(63);
                 pc += 2;
             }
             // iinc
             0x84 => {
+                // Widening: u8 -> wider int (bytecode operand byte, value fits)
                 modified |= 1u64 << (code[pc + 1] as usize).min(63);
                 pc += 3;
             }
@@ -4456,18 +4515,22 @@ fn match_iarith_push(
 ) -> Option<(ArithStep, usize)> {
     match code[pc] {
         // iconst_m1..iconst_5
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x02..=0x08 => Some((ArithStep::PushConst(code[pc] as i32 - 3), pc + 1)),
         // bipush
         0x10 if pc + 1 < code_len => {
+            // Cast: value to i32 (encoding immediate/displacement)
             Some((ArithStep::PushConst(code[pc + 1] as i8 as i32), pc + 2))
         }
         // sipush
         0x11 if pc + 2 < code_len => {
+            // Cast: value to i32 (encoding immediate/displacement)
             let v = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
             Some((ArithStep::PushConst(v), pc + 3))
         }
         // iload_0..iload_3
         0x1a..=0x1d => {
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             let l = (code[pc] - 0x1a) as usize;
             if l < 64 && (modified & (1u64 << l)) == 0 {
                 Some((ArithStep::PushLocal(l), pc + 1))
@@ -4477,6 +4540,7 @@ fn match_iarith_push(
         }
         // iload (wide index)
         0x15 if pc + 1 < code_len => {
+            // Widening: u8 -> wider int (bytecode operand byte, value fits)
             let l = code[pc + 1] as usize;
             if l < 64 && (modified & (1u64 << l)) == 0 {
                 Some((ArithStep::PushLocal(l), pc + 1 + 1))
@@ -4608,7 +4672,9 @@ fn arith_expr_max_depth(steps: &[ArithStep]) -> usize {
 /// Decode `iload` / `iload_0..3` → (local index, next pc).
 fn decode_int_load(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
     match *code.get(pc)? {
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
         0x1a..=0x1d => Some(((code[pc] - 0x1a) as usize, pc + 1)),
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x15 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
         _ => None,
     }
@@ -4617,7 +4683,9 @@ fn decode_int_load(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, us
 /// Decode `istore` / `istore_0..3` → (local index, next pc).
 fn decode_int_store(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
     match *code.get(pc)? {
+        // Widening: u8 -> usize (opcode-relative local index, value fits)
         0x3b..=0x3e => Some(((code[pc] - 0x3b) as usize, pc + 1)),
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x36 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
         _ => None,
     }
@@ -4627,9 +4695,12 @@ fn decode_int_store(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, u
 /// (value, next pc).
 fn decode_int_const_push(code: &[u8], pc: usize, code_len: usize) -> Option<(i32, usize)> {
     match *code.get(pc)? {
+        // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x02..=0x08 => Some((code[pc] as i32 - 3, pc + 1)),
+        // Cast: value to i32 (encoding immediate/displacement)
         0x10 if pc + 1 < code_len => Some((code[pc + 1] as i8 as i32, pc + 2)),
         0x11 if pc + 2 < code_len => Some((
+            // Cast: value to i32 (encoding immediate/displacement)
             i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32,
             pc + 3,
         )),
@@ -4979,16 +5050,22 @@ fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize> {
     while pc < code_len {
         match code[pc] {
             // lload_0..lload_3
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             0x1e..=0x21 => mark((code[pc] - 0x1e) as usize, &mut hi),
             // dload_0..dload_3
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             0x26..=0x29 => mark((code[pc] - 0x26) as usize, &mut hi),
             // lstore_0..lstore_3
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             0x3f..=0x42 => mark((code[pc] - 0x3f) as usize, &mut hi),
             // dstore_0..dstore_3
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             0x47..=0x4a => mark((code[pc] - 0x47) as usize, &mut hi),
             // lload (0x16) / dload (0x18), wide index
+            // Widening: u8 -> wider int (bytecode operand byte, value fits)
             0x16 | 0x18 if pc + 1 < code_len => mark(code[pc + 1] as usize, &mut hi),
             // lstore (0x37) / dstore (0x39), wide index
+            // Widening: u8 -> wider int (bytecode operand byte, value fits)
             0x37 | 0x39 if pc + 1 < code_len => mark(code[pc + 1] as usize, &mut hi),
             _ => {}
         }
@@ -5126,6 +5203,7 @@ fn analyze_loop_bound(
             0x1b if induction_var == 1 => Some(1),
             0x1c if induction_var == 2 => Some(2),
             0x1d if induction_var == 3 => Some(3),
+            // Widening: u8 -> wider int (bytecode operand byte, value fits)
             0x15 if pc + 1 < back_edge_end && code[pc + 1] as usize == induction_var => {
                 // Widening: always safe
                 Some(induction_var)
@@ -5247,9 +5325,13 @@ fn analyze_array_access_operands(
         while pc < back_edge_end {
             let op = code[pc];
             if matches!(op, 0x99..=0xa6 | 0xc6 | 0xc7) && pc + 2 < code_len {
+                // Cast: value to i32 (encoding immediate/displacement)
                 let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                // Cast: value to i32 (encoding immediate/displacement)
                 let target = pc as i32 + off;
+                // Cast: non-negative index/count to usize
                 if target > pc as i32 && (target as usize) < back_edge_end {
+                    // Cast: non-negative index/count to usize
                     join_targets.insert(target as usize);
                 }
             }
@@ -5443,6 +5525,7 @@ fn extract_iload_local(code: &[u8], pc: usize) -> Option<usize> {
         0x1b => Some(1),
         0x1c => Some(2),
         0x1d => Some(3),
+        // Cast: non-negative index/count to usize
         0x15 => code.get(pc + 1).map(|&b| b as usize), // iload
         _ => None,
     }
@@ -5455,6 +5538,7 @@ fn extract_aload_local(code: &[u8], pc: usize) -> Option<usize> {
         0x2b => Some(1),
         0x2c => Some(2),
         0x2d => Some(3),
+        // Cast: non-negative index/count to usize
         0x19 => code.get(pc + 1).map(|&b| b as usize), // aload
         _ => None,
     }
@@ -6231,13 +6315,28 @@ mod deopt_snapshot_tests {
     #[test]
     fn frame_value_for_slot_maps_provenance() {
         // Register-resident wins (provenance is the GPR), oop-ness aside.
-        assert_eq!(frame_value_for_slot(Some(3), None, 16, false), FrameValue::Register(3));
-        assert_eq!(frame_value_for_slot(Some(3), None, 16, true), FrameValue::Register(3));
+        assert_eq!(
+            frame_value_for_slot(Some(3), None, 16, false),
+            FrameValue::Register(3)
+        );
+        assert_eq!(
+            frame_value_for_slot(Some(3), None, 16, true),
+            FrameValue::Register(3)
+        );
         // XMM-resident: not resolvable in Phase A.
-        assert_eq!(frame_value_for_slot(None, Some(9), 16, false), FrameValue::Unsupported);
+        assert_eq!(
+            frame_value_for_slot(None, Some(9), 16, false),
+            FrameValue::Unsupported
+        );
         // Spilled primitive vs spilled oop -> StackSlot vs StackSlotRef at [rbp-off].
-        assert_eq!(frame_value_for_slot(None, None, 16, false), FrameValue::StackSlot(-16));
-        assert_eq!(frame_value_for_slot(None, None, 24, true), FrameValue::StackSlotRef(-24));
+        assert_eq!(
+            frame_value_for_slot(None, None, 16, false),
+            FrameValue::StackSlot(-16)
+        );
+        assert_eq!(
+            frame_value_for_slot(None, None, 24, true),
+            FrameValue::StackSlotRef(-24)
+        );
     }
 }
 
@@ -6311,29 +6410,34 @@ impl Compiler {
         // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
         // slot (`[rbp - shadow_thread_slot_off]`), set once in the prologue.
         let shadow_thread_slot_off: i32 = if shadow_enabled {
+            // Cast: value to i32 (encoding immediate/displacement)
             (total_locals as i32).saturating_mul(8)
         } else {
             0
         };
         // Shadow-stack saved-`top` watermark slot: second-to-last reserved slot.
         let shadow_savetop_slot_off: i32 = if shadow_enabled {
+            // Cast: value to i32 (encoding immediate/displacement)
             (total_locals as i32 - 1).saturating_mul(8)
         } else {
             0
         };
         // Shadow-stack per-push saved-base slot: third-to-last reserved slot.
         let shadow_savebase_slot_off: i32 = if shadow_enabled {
+            // Cast: value to i32 (encoding immediate/displacement)
             (total_locals as i32 - 2).saturating_mul(8)
         } else {
             0
         };
         // Byte offset of the `ShadowStack` within `JvmThread` (from the helper
         // table), captured before `helpers` is moved into the struct below.
+        // Cast: value to i32 (encoding immediate/displacement)
         let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
         // The safepoint-id slot sits below the shadow slots when both gates are
         // on (so they never alias). Value at `[rbp - sp_id_slot_off]`. 0 when
         // `precise_maps` is off.
         let sp_id_slot_off: i32 = if precise_maps {
+            // Cast: value to i32 (encoding immediate/displacement)
             (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
         } else {
             0
@@ -6386,6 +6490,7 @@ impl Compiler {
         // overlaps the helper-call shadow space or the 6th stack-arg slot.
         let reg_spill_size = if safepoint_reg_spill_all {
             // Gap 9: one slot per GPR in the full file (caller- + callee-saved).
+            // Cast: buffer position/length to encoding offset (i32/u32)
             ALL_SPILL_GPRS.len() as i32 * 8
         } else if safepoint_reg_spill {
             callee_saved_size
@@ -6401,7 +6506,11 @@ impl Compiler {
         // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
         // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
         // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
-        let deopt_regs_size = if crate::deopt_real_enabled() { 16 * 8 } else { 0 };
+        let deopt_regs_size = if crate::deopt_real_enabled() {
+            16 * 8
+        } else {
+            0
+        };
         debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
         let deopt_regs_base = if deopt_regs_size != 0 {
             reg_spill_base + reg_spill_size + deopt_regs_size
@@ -6695,6 +6804,7 @@ impl Compiler {
     fn emit_deopt_snapshot_at_guard(&mut self, bci: usize) {
         use crate::deopt::{DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue};
 
+        // Cast: buffer position/length to encoding offset (i32/u32)
         let native_offset = self.buf.pos() as u32;
 
         // Locals: oop-ness from the intersection-dataflow mask (only when the
@@ -6739,12 +6849,14 @@ impl Compiler {
 
         let point = DeoptimizationPoint {
             native_offset,
+            // Cast: bytecode/native offset to u32 (non-negative, fits)
             bci: bci as u32,
             reason: DeoptReason::BoundsCheck,
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: FrameState {
                 method_key: String::new(),
+                // Cast: bytecode/native offset to u32 (non-negative, fits)
                 bci: bci as u32,
                 locals,
                 stack,
@@ -6759,8 +6871,7 @@ impl Compiler {
         // The Box payload does not move when `deopt_boxes` reallocs or when it is
         // moved into `CompiledMethod._deopt_point_boxes` at finalize (and is leaked
         // on Drop), so a baked imm64 of this pointer outlives the emitted code.
-        let box_ptr: *const crate::deopt::DeoptimizationPoint =
-            &**self.deopt_boxes.last().unwrap();
+        let box_ptr: *const crate::deopt::DeoptimizationPoint = &**self.deopt_boxes.last().unwrap();
         self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
         self.deopt_points.push(point);
     }
@@ -6978,6 +7089,9 @@ impl Compiler {
                     .invoke_info
                     .iter()
                     .find(|e| e.0 == prev)
+                    // SAFETY: e.1 is a *const JitInvokeInfo recorded during this same
+                    // compilation pass; it points at a live, owned JitInvokeInfo that
+                    // outlives this read, so the dereference is valid and aligned.
                     .map(|e| unsafe { (*e.1).return_type })?;
                 if rt == b'V' {
                     return None; // void leaves nothing on top — not a dup2 producer
@@ -7074,6 +7188,7 @@ impl Compiler {
             // Stage A.2 — this is a GC-capable safepoint that flushed its
             // register-locals and stored an sp-id; record it so finalize can
             // require a matching oop map (coverage = spilled ⊆ mapped).
+            // Cast: bytecode/native offset to u32 (non-negative, fits)
             self.safepoint_pcs.insert(self.cur_bc_pc as u32);
         }
         // Shadow-stack precise roots — push every live oop onto the thread's
@@ -7162,6 +7277,7 @@ impl Compiler {
                                                 // (null thread) and the slot kept the sentinel; 0xFFFF…FFFE ⇒ an EXTERNAL
                                                 // write overwrote the real top with -2; a valid buffer ptr ⇒ no corruption.
         if shadow_sentinel() && self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            // Cast: u64 -> i64 (same-width bit reinterpretation of a sentinel pattern)
             self.emit_mov_imm64_full(R11, 0x5151_5151_5151_5151u64 as i64);
             self.emit_store_local(self.shadow_savebase_slot_off, R11);
         }
@@ -7351,6 +7467,7 @@ impl Compiler {
                 self.emit_mov_reg_reg(R8, r); // arg2 = reloaded value
                 self.emit_mov_reg_reg(R9, R11); // arg3 = actual read address
                 self.emit_sub_rsp_imm(0x28); // shadow space + 16B align (after push rax)
+                                             // Cast: non-negative index/count to usize
                 self.emit_call_absolute(jit_dbg_shadow_reload_log as usize);
                 self.buf.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
                 self.buf.emit_byte(0x58); // pop rax
@@ -7446,6 +7563,7 @@ impl Compiler {
             {
                 let mut mask = self.local_oop_masks[pc];
                 while mask != 0 {
+                    // Cast: count/index to usize
                     let k = mask.trailing_zeros() as usize;
                     mask &= mask - 1; // clear lowest set bit
                     let off = self.local_offset(k);
@@ -7467,6 +7585,7 @@ impl Compiler {
         let push_map = !slots.is_empty() || self.precise_maps;
         if push_map {
             if self.precise_maps {
+                // Cast: bytecode/native offset to u32 (non-negative, fits)
                 self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
             }
             self.oop_maps.push(crate::OopMapEntry {
@@ -7513,6 +7632,7 @@ impl Compiler {
         }
         let mut mask = self.local_oop_masks[pc];
         while mask != 0 {
+            // Cast: count/index to usize
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1; // clear lowest set bit
             if let Some(Some(reg)) = self.local_assignments.get(k).copied() {
@@ -8301,6 +8421,7 @@ impl Compiler {
             self.emit_xor_reg_self(reg);
             return;
         }
+        // Widening: i32 bound -> i64 (range comparison)
         if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
             // Widening: always safe
             self.emit_mov_imm32_sx(reg, imm as i32); // Cast: x86-64 immediate encoding
@@ -8830,6 +8951,7 @@ impl Compiler {
     /// any other opcode.
     fn iload_short_local(op: u8) -> Option<usize> {
         if (0x1A..=0x1D).contains(&op) {
+            // Widening: u8 -> usize (opcode-relative local index, value fits)
             Some((op - 0x1A) as usize)
         } else {
             None
@@ -8863,11 +8985,14 @@ impl Compiler {
             return None;
         }
         // if_icmp branch offset
+        // Cast: value to i32 (encoding immediate/displacement)
         let off1 = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+        // Cast: value to i32 (encoding immediate/displacement)
         let l1_pc = (pc as i32).checked_add(off1)?;
         if l1_pc < 0 {
             return None;
         }
+        // Cast: non-negative index/count to usize
         let l1_pc = l1_pc as usize;
 
         // INSTR_A at pc+3 must be iload_0..3 (1 byte).
@@ -8882,11 +9007,14 @@ impl Compiler {
         if goto_pc + 3 > code.len() || code[goto_pc] != 0xa7 {
             return None;
         }
+        // Cast: value to i32 (encoding immediate/displacement)
         let goto_off = i16::from_be_bytes([code[goto_pc + 1], code[goto_pc + 2]]) as i32;
+        // Cast: value to i32 (encoding immediate/displacement)
         let l2_pc = (goto_pc as i32).checked_add(goto_off)?;
         if l2_pc < 0 {
             return None;
         }
+        // Cast: non-negative index/count to usize
         let l2_pc = l2_pc as usize;
 
         // INSTR_B at the if_icmp branch target. Must be exactly the
@@ -8967,6 +9095,7 @@ impl Compiler {
 
         // Map every consumed bytecode PC to the current native offset
         // so downstream PC-keyed lookups still find a valid destination.
+        // Cast: buffer position/length to encoding offset (i32/u32)
         let native = self.buf.pos() as i32;
         for p in pc..=l2_pc {
             if p < self.pc_to_native.len() {
@@ -9020,7 +9149,9 @@ impl Compiler {
             // Negative powers of two are intentionally left to the IMUL
             // path — SHL produces an unsigned shift, and emitting
             // SHL + NEG would not be smaller than IMUL imm8/imm32.
+            // Cast: bytecode/native offset to u32 (non-negative, fits)
             _ if val > 0 && (val as u32).is_power_of_two() => {
+                // Cast: bytecode/native offset to u32 (non-negative, fits)
                 let k = (val as u32).trailing_zeros() as u8;
                 // SHL EAX, k (32-bit shift; high bits zero anyway, then
                 // the MOVSXD below sign-extends, matching Java imul
@@ -9061,6 +9192,7 @@ impl Compiler {
         // RAX += c  (matches the const-arith peephole's add encoding)
         if c != 0 {
             if (-128..=127).contains(&c) {
+                // Truncation: wider int -> u8 (low 8 bits, intentional)
                 self.buf.emit(&[0x83, 0xC0, c as u8]); // ADD EAX, imm8
             } else {
                 self.buf.emit(&[0x81, 0xC0]); // ADD EAX, imm32
@@ -10001,6 +10133,7 @@ impl Compiler {
         self.buf.emit(&[0x49, 0x01, 0xC1]);
         // ADD R9, HEADER_SIZE  (49 81 C1 imm32)
         self.buf.emit(&[0x49, 0x81, 0xC1]);
+        // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // &B[i]: R12 = RCX + R10*4 + H
@@ -10008,6 +10141,7 @@ impl Compiler {
         self.buf.emit(&[0x49, 0xC1, 0xE4, 0x02]); // SHL R12, 2
         self.buf.emit(&[0x49, 0x01, 0xCC]); // ADD R12, RCX
         self.buf.emit(&[0x49, 0x81, 0xC4]); // ADD R12, imm32
+                                            // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // &OUT[i]: R13 = RDX + R10*4 + H
@@ -10015,6 +10149,7 @@ impl Compiler {
         self.buf.emit(&[0x49, 0xC1, 0xE5, 0x02]); // SHL R13, 2
         self.buf.emit(&[0x49, 0x01, 0xD5]); // ADD R13, RDX
         self.buf.emit(&[0x49, 0x81, 0xC5]); // ADD R13, imm32
+                                            // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         let simd_loop_start = self.buf.pos();
@@ -10092,11 +10227,13 @@ impl Compiler {
         // EAX = A[i] = [R8 + R10*4 + H]
         //   43 8B 84 90 <disp32> — REX.B selects R8 as the SIB base
         self.buf.emit(&[0x43, 0x8B, 0x84, 0x90]);
+        // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // ECX = B[i] = [R9 + R10*4 + H]
         //   43 8B 8C 91 <disp32> — REX.B selects R9 as the SIB base
         self.buf.emit(&[0x43, 0x8B, 0x8C, 0x91]);
+        // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // EAX = EAX OP ECX
@@ -10105,6 +10242,7 @@ impl Compiler {
         // [RDX + R10*4 + H] = EAX
         //   42 89 84 92 <disp32>  — MOV [RDX + R10*4 + disp32], EAX
         self.buf.emit(&[0x42, 0x89, 0x84, 0x92]);
+        // Cast: fixed struct/layout offset to i32 instruction displacement
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // INC R10D — 41 FF C2
@@ -10494,11 +10632,14 @@ impl Compiler {
     fn emit_call_absolute(&mut self, addr: usize) {
         // Reference point for the rel32 displacement is the byte after
         // the 5-byte E8 cd encoding.
+        // Cast: non-negative index/count to usize
         let call_pc = self.buf.as_ptr() as usize + self.buf.pos();
         let next_pc = call_pc.wrapping_add(5);
         // Signed delta from next_pc to target. Compute in i128 to keep
         // the comparison free of usize-subtraction wrap concerns.
+        // Widening: i64/usize -> i128 (no truncation, for range check)
         let delta: i128 = (addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
         if delta >= i32::MIN as i128 && delta <= i32::MAX as i128 {
             // E8 cd: CALL rel32 (5 bytes).
             self.buf.emit_byte(0xE8);
@@ -10798,6 +10939,7 @@ impl Compiler {
         self.buf.emit_byte(0x40 | ((dst & 7) << 3) | 0x04);
         // SIB: scale=00, index=idx_reg, base=val_reg.
         self.buf.emit_byte(((idx_reg & 7) << 3) | (val_reg & 7));
+        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
         self.buf.emit_byte(HEADER_SIZE as u8);
         let done = self.emit_jmp_rel32_patch();
 
@@ -10821,6 +10963,7 @@ impl Compiler {
         // SIB: scale=01 (*2), index=idx_reg, base=val_reg.
         self.buf
             .emit_byte(0x40 | ((idx_reg & 7) << 3) | (val_reg & 7));
+        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
         self.buf.emit_byte(HEADER_SIZE as u8);
         self.patch_rel32_to_here(done);
     }
@@ -10926,8 +11069,11 @@ impl Compiler {
     ) {
         // Object total size (header + fields*8). Computed at compile time.
         let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        // Cast: value to i32 (encoding immediate/displacement)
         let cursor_off = self.helpers.tlab_cursor_offset_in_thread as i32;
+        // Cast: value to i32 (encoding immediate/displacement)
         let end_off = self.helpers.tlab_end_offset_in_thread as i32;
+        // Cast: value to i32 (encoding immediate/displacement)
         let class_id_off = self.helpers.class_id_offset_in_obj as i32;
 
         // Step 1: fetch the JvmThread* via the small TLS helper.
@@ -12917,12 +13063,14 @@ impl Compiler {
             let prev = code[bc_pc - 1];
             // aload_0..aload_3 (0x2A..0x2D) — single-byte, receiver local n.
             if (0x2A..=0x2D).contains(&prev) {
+                // Widening: u8 -> usize (opcode-relative local index, value fits)
                 let local = (prev - 0x2A) as usize;
                 if self.is_local_nonnull(bc_pc, local) {
                     return;
                 }
             } else if bc_pc >= 2 && code[bc_pc - 2] == 0x19 {
                 // aload <u8> — two-byte, receiver local code[bc_pc-1].
+                // Widening: u8 -> wider int (bytecode operand byte, value fits)
                 let local = code[bc_pc - 1] as usize;
                 if self.is_local_nonnull(bc_pc, local) {
                     return;
@@ -13074,12 +13222,14 @@ impl Compiler {
             // fit in imm32. Load i64::MIN into R10 and CMP RAX, R10.
             // MOV R10, i64::MIN  (49 BA <imm64>)
             self.buf.emit(&[0x49, 0xBA]);
+            // Cast: non-negative value to u64
             self.buf.emit(&(i64::MIN as u64).to_le_bytes());
             // CMP RAX, R10  (4C 39 D0)
             self.buf.emit(&[0x4C, 0x39, 0xD0]);
         } else {
             // CMP EAX, imm32  (3D <imm32>)
             self.buf.emit_byte(0x3D);
+            // Cast: bytecode/native offset to u32 (non-negative, fits)
             self.buf.emit(&(i32::MIN as u32).to_le_bytes());
         }
         // JNE rel8 → :do_div (we'll patch after we know the size)
@@ -13121,7 +13271,9 @@ impl Compiler {
 
         // :do_div — patch JNE targets to here
         let do_div_off = self.buf.pos();
+        // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
         let rel1 = (do_div_off as i64) - (jne1_patch as i64 + 1);
+        // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
         let rel2 = (do_div_off as i64) - (jne2_patch as i64 + 1);
         // A rel8 displacement that does not fit in an i8 would silently
         // miscompile in release builds. `emit_safe_idiv` cannot signal a failure
@@ -13134,7 +13286,9 @@ impl Compiler {
             self.buf.mark_overflowed();
             return;
         }
+        // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
         self.buf.try_patch_byte(jne1_patch, rel1 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                                              // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
         self.buf.try_patch_byte(jne2_patch, rel2 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
 
         // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
@@ -13167,6 +13321,7 @@ impl Compiler {
 
         // :after_div — patch the JMP from the overflow path.
         let after_off = self.buf.pos();
+        // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
         let rel_jmp = (after_off as i64) - (jmp_after_patch as i64 + 1);
         // No-panic bail (see JNE patch checks above): a rel8 that does not fit in
         // an i8 would silently miscompile, so mark the buffer overflowed and let
@@ -13175,6 +13330,7 @@ impl Compiler {
             self.buf.mark_overflowed();
             return;
         }
+        // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
         self.buf.try_patch_byte(jmp_after_patch, rel_jmp as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
     }
 
@@ -13456,6 +13612,7 @@ impl Compiler {
                 //    trapping-instant value. gpr[r] -> [rbp - (base - r*8)], so
                 //    gpr[0]=RAX is the deepest slot and ascends with r.
                 for r in 0u8..16 {
+                    // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_store_local(base - (r as i32) * 8, r);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
@@ -13463,12 +13620,14 @@ impl Compiler {
                 //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0].
                 #[cfg(target_os = "windows")]
                 {
+                    // Cast: non-negative index/count to usize
                     self.emit_mov_imm64_full(RCX, box_ptr as usize as i64);
                     self.emit_mov_reg_reg(RDX, RBP);
                     self.emit_lea_frame_slot(R8, base);
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
+                    // Cast: non-negative index/count to usize
                     self.emit_mov_imm64_full(RDI, box_ptr as usize as i64);
                     self.emit_mov_reg_reg(RSI, RBP);
                     self.emit_lea_frame_slot(RDX, base);
@@ -13481,57 +13640,58 @@ impl Compiler {
                 //    the IR path's `emit_deopt_stub`. `emit_call_absolute`'s
                 //    imm64-via-RAX fallback clobbers RAX (already spilled, dead)
                 //    and leaves the 3 arg registers intact.
+                // Cast: fn pointer to usize helper address
                 self.emit_call_absolute(crate::deopt::x64_deopt_entry as *const () as usize);
                 // 4) Force the deopt sentinel (the entry returns it; explicit for
                 //    parity with the uncommon-trap stub) + epilogue.
                 self.rex_w();
                 self.buf.emit_byte(0xB8); // MOV RAX, imm64
+                                          // Cast: non-negative value to u64
                 self.buf.emit(&(i64::MIN as u64).to_le_bytes());
                 self.emit_epilogue();
             } else {
+                // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
+                // vm_ptr is in the heap_local (frame slot) — load it first
+                #[cfg(target_os = "windows")]
+                {
+                    // Windows x64: arg1=RCX, arg2=RDX, arg3=R8
+                    // Load vm_ptr from heap_local_offset into RCX
+                    self.emit_load_local(RCX, self.heap_local_offset);
+                    // MOV RDX, reason (immediate)
+                    self.rex_w();
+                    self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
+                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                                                                   // MOV R8, bci (immediate)
+                    self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
+                    self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // SysV: arg1=RDI, arg2=RSI, arg3=RDX
+                    // Load vm_ptr from heap_local_offset into RDI
+                    self.emit_load_local(RDI, self.heap_local_offset);
+                    // MOV RSI, reason (immediate)
+                    self.rex_w();
+                    self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
+                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                                                                   // MOV RDX, bci (immediate)
+                    self.rex_w();
+                    self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding
+                    self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
 
-            // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
-            // vm_ptr is in the heap_local (frame slot) — load it first
-            #[cfg(target_os = "windows")]
-            {
-                // Windows x64: arg1=RCX, arg2=RDX, arg3=R8
-                // Load vm_ptr from heap_local_offset into RCX
-                self.emit_load_local(RCX, self.heap_local_offset);
-                // MOV RDX, reason (immediate)
+                // CALL jit_uncommon_trap
+                self.emit_call_absolute(self.helpers.uncommon_trap);
+
+                // Return i64::MIN as deopt sentinel
+                // MOV RAX, i64::MIN
                 self.rex_w();
-                self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
-                self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                                                               // MOV R8, bci (immediate)
-                self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
-                self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                // SysV: arg1=RDI, arg2=RSI, arg3=RDX
-                // Load vm_ptr from heap_local_offset into RDI
-                self.emit_load_local(RDI, self.heap_local_offset);
-                // MOV RSI, reason (immediate)
-                self.rex_w();
-                self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
-                self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                                                               // MOV RDX, bci (immediate)
-                self.rex_w();
-                self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding
-                self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-            }
+                self.buf.emit_byte(0xB8); // MOV RAX, imm64
+                self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
 
-            // CALL jit_uncommon_trap
-            self.emit_call_absolute(self.helpers.uncommon_trap);
-
-            // Return i64::MIN as deopt sentinel
-            // MOV RAX, i64::MIN
-            self.rex_w();
-            self.buf.emit_byte(0xB8); // MOV RAX, imm64
-            self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-
-            // Epilogue: restore callee-saved regs and return
-            // This mirrors the standard method epilogue
-            self.emit_epilogue();
+                // Epilogue: restore callee-saved regs and return
+                // This mirrors the standard method epilogue
+                self.emit_epilogue();
             } // end else (uncommon-trap path)
 
             // Patch the branch to point here
@@ -13764,6 +13924,7 @@ impl Compiler {
                                 code[q + 2],
                                 code[q + 3],
                             ]);
+                            // Cast: signed offset to isize for pointer/index arithmetic
                             if let Some(t) = base.checked_add_signed(def as isize) {
                                 // Cast: address arithmetic
                                 if t < code_len {
@@ -13796,6 +13957,7 @@ impl Compiler {
                                         code[q + 2],
                                         code[q + 3],
                                     ]);
+                                    // Cast: signed offset to isize for pointer/index arithmetic
                                     if let Some(t) = base.checked_add_signed(off as isize) {
                                         // Cast: address arithmetic
                                         if t < code_len {
@@ -13821,6 +13983,7 @@ impl Compiler {
                                 code[q + 2],
                                 code[q + 3],
                             ]);
+                            // Cast: signed offset to isize for pointer/index arithmetic
                             if let Some(t) = base.checked_add_signed(def as isize) {
                                 // Cast: address arithmetic
                                 if t < code_len {
@@ -13840,6 +14003,7 @@ impl Compiler {
                                 code[q + 6],
                                 code[q + 7],
                             ]);
+                            // Cast: non-negative index/count to usize
                             let npairs = npairs_raw.max(0) as usize;
                             q += 8;
                             let max_pairs = (code_len - q) / 8;
@@ -13850,6 +14014,7 @@ impl Compiler {
                                     code[q + 6],
                                     code[q + 7],
                                 ]);
+                                // Cast: signed offset to isize for pointer/index arithmetic
                                 if let Some(t) = base.checked_add_signed(off as isize) {
                                     // Cast: address arithmetic
                                     if t < code_len {
@@ -16305,6 +16470,7 @@ impl Compiler {
                                 // `as_ptr()` is observed (see the safety note
                                 // on `emit_call_absolute`), so this base is the
                                 // same address every copy will resolve against.
+                                // Cast: non-negative index/count to usize
                                 let buf_base = self.buf.as_ptr() as usize;
 
                                 for _ in 0..extra_copies {
@@ -16366,11 +16532,13 @@ impl Compiler {
                                         let orig_next_pc =
                                             buf_base.wrapping_add(po).wrapping_add(4);
                                         let helper_addr =
+                                            // Widening: usize address & i32 rel32 -> i64 (no truncation; rel math)
                                             (orig_next_pc as i64).wrapping_add(orig_rel32 as i64);
                                         let copy_po = po + shift_us;
                                         let copy_next_pc =
                                             buf_base.wrapping_add(copy_po).wrapping_add(4);
                                         let delta: i128 =
+                                            // Widening: i64/usize -> i128 (no truncation, for range check)
                                             (helper_addr as i128) - (copy_next_pc as i128);
                                         // Helpers reachable in ±2GB at the
                                         // original site stay reachable at the
@@ -16380,6 +16548,7 @@ impl Compiler {
                                         // assert to catch any pathological
                                         // future code-cache layout.
                                         debug_assert!(
+                                            // Widening: i64/usize -> i128 (no truncation, for range check)
                                             delta >= i32::MIN as i128 && delta <= i32::MAX as i128,
                                             "unrolled helper rel32 out of range",
                                         );
@@ -16485,6 +16654,7 @@ impl Compiler {
                                         // (copy_start > body_start), so
                                         // saturate-add via usize for safe
                                         // arithmetic.
+                                        // Cast: non-negative index/count to usize
                                         copy.native_pc_offset = (e.native_pc_offset as usize)
                                             .wrapping_add(shift_us)
                                             as u32; // Cast: native_pc_offset width
@@ -16558,15 +16728,18 @@ impl Compiler {
                     if low > high {
                         return false;
                     }
+                    // Widening: i32 -> i64 (sign-extended so high-low+1 cannot overflow)
                     let count_i64 = (high as i64) - (low as i64) + 1;
                     pc += 12;
                     // The jump table is `count` i32 entries immediately after the
                     // header. Reject any count that does not fit the remaining
                     // bytes before allocating or reading it.
                     let remaining_entries = (code_len - pc) / 4;
+                    // Cast: non-negative value to u64
                     if count_i64 < 0 || count_i64 as u64 > remaining_entries as u64 {
                         return false;
                     }
+                    // Cast: non-negative index/count to usize
                     let count = count_i64 as usize;
 
                     // Collect all targets from the bytecode
@@ -16691,6 +16864,7 @@ impl Compiler {
                     if npairs_i32 < 0 {
                         return false;
                     }
+                    // Cast: non-negative index/count to usize
                     let npairs = npairs_i32 as usize;
                     let remaining_pairs = (code_len - pc) / 8;
                     if npairs > remaining_pairs {
@@ -17003,6 +17177,7 @@ impl Compiler {
                                 self.emit_mov_r64_mem_disp32(
                                     RAX,
                                     RAX,
+                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                 );
                             }
@@ -17011,6 +17186,7 @@ impl Compiler {
                                 self.emit_mov_r32_mem_disp32(
                                     RAX,
                                     RAX,
+                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
                             }
@@ -17020,6 +17196,7 @@ impl Compiler {
                                 self.emit_movsxd_r64_mem_disp32(
                                     RAX,
                                     RAX,
+                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
                             }
@@ -17980,6 +18157,7 @@ impl Compiler {
                                                                 // RAX = src ptr; EAX = src.length (zero-extended,
                                                                 // so the 64-bit value is non-negative).
                             self.emit_load_local(RAX, s_src);
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RAX+12]
                                                                                      // CMP R10, RAX  (srcPos+len vs src.length)
                             self.buf.emit(&[0x49, 0x39, 0xC2]);
@@ -17989,6 +18167,7 @@ impl Compiler {
                             self.buf.emit(&[0x49, 0x89, 0xD2]); // MOV R10, RDX
                             self.buf.emit(&[0x49, 0x01, 0xCA]); // ADD R10, RCX
                             self.emit_load_local(RAX, s_dst);
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RAX+12]
                             self.buf.emit(&[0x49, 0x39, 0xC2]); // CMP R10, RAX
                             bail_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG
@@ -18018,6 +18197,7 @@ impl Compiler {
                             self.buf.emit(&[0x48, 0xD3, 0xE6]); // SHL RSI, CL
                             self.emit_load_local(RAX, s_src);
                             self.buf.emit(&[0x48, 0x01, 0xC6]); // ADD RSI, RAX
+                                                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x48, 0x83, 0xC6, HEADER_SIZE as u8]); // ADD RSI, HEADER_SIZE
 
                             // dstAddr = dst + HEADER_SIZE + (dstPos << shift)
@@ -18026,6 +18206,7 @@ impl Compiler {
                             self.buf.emit(&[0x48, 0xD3, 0xE7]); // SHL RDI, CL
                             self.emit_load_local(RAX, s_dst);
                             self.buf.emit(&[0x48, 0x01, 0xC7]); // ADD RDI, RAX
+                                                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI, HEADER_SIZE
 
                             // byteCount = len << shift  → RDX (kept for the
@@ -18143,6 +18324,7 @@ impl Compiler {
                             self.buf.emit(&[0x49, 0x89, 0xC0]);
                             // Element count → ECX (zero-extends to RCX, the
                             // REP counter). MOV ECX, [RAX+12]  (8B 48 0C)
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8]);
 
                             // Fill value → RAX. STOSB/W/D/Q use AL/AX/EAX/
@@ -18155,6 +18337,7 @@ impl Compiler {
                             // PUSH RDI  (57)
                             self.buf.emit_byte(0x57);
                             // LEA RDI, [R8 + HEADER_SIZE]  (49 8D 78 28)
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x49, 0x8D, 0x78, HEADER_SIZE as u8]);
                             if callee_entry == super::JitIntrinsic::ArraysFill1.as_entry() {
                                 // REP STOSB  (F3 AA)
@@ -18237,9 +18420,11 @@ impl Compiler {
                             // Lengths: EAX = a.length, EDX = b.length.
                             // MOV EAX, [R8+12]  (41 8B 40 0C)
                             self.buf
+                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                 .emit(&[0x41, 0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]);
                             // MOV EDX, [R9+12]  (41 8B 51 0C)
                             self.buf
+                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                 .emit(&[0x41, 0x8B, 0x51, ARRAY_LENGTH_OFFSET as u8]);
                             // CMP EAX, EDX  (39 D0)
                             self.buf.emit(&[0x39, 0xD0]);
@@ -18275,8 +18460,10 @@ impl Compiler {
                             // PUSH RSI (56) ; PUSH RDI (57)
                             self.buf.emit(&[0x56, 0x57]);
                             // LEA RSI, [R8 + HEADER_SIZE]  (49 8D 70 28)
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
                             // LEA RDI, [R9 + HEADER_SIZE]  (49 8D 79 28)
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
                             // REP CMPSB  (F3 A6) — compares RCX bytes;
                             // stops early on the first mismatch. ZF=1 iff
@@ -18322,11 +18509,13 @@ impl Compiler {
                                 (jmp_done_1, done_label),
                                 (jmp_done_2, done_label),
                             ] {
+                                // Cast: signed offset to isize for pointer/index arithmetic
                                 let rel = target as isize - (patch as isize + 1);
                                 debug_assert!(
                                     (-128..=127).contains(&rel),
                                     "Arrays.equals intrinsic rel8 out of range: {rel}"
                                 );
+                                // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
                                 self.buf.try_patch_byte(patch, rel as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                             }
 
@@ -18399,7 +18588,9 @@ impl Compiler {
                             };
                             // HEADER_SIZE / ARRAY_LENGTH_OFFSET both fit in a
                             // signed disp8 (asserted in cratonvm_types).
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             let hdr = HEADER_SIZE as u8;
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             let len_off = ARRAY_LENGTH_OFFSET as u8;
 
                             // Pop the array reference, null-check it (reusing
@@ -18430,7 +18621,9 @@ impl Compiler {
                             // (RDX -> R10) and left the array unsorted.
                             let rex = |w: u8, r: u8, idx: u8| -> u8 {
                                 0x40 | (w << 3)
+                                    // Truncation: wider int -> u8 (low 8 bits, intentional)
                                     | (((r >= 8) as u8) << 2)
+                                    // Truncation: wider int -> u8 (low 8 bits, intentional)
                                     | (((idx >= 8) as u8) << 1)
                                     | 1 // REX.B: base = R8
                             };
@@ -18520,7 +18713,9 @@ impl Compiler {
                             self.buf.emit_byte(0xE9);
                             {
                                 let here = self.buf.pos();
+                                // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                 let rel = (inner_label as i64) - (here as i64 + 4);
+                                // Truncation: i64 -> i32 (rel32 branch displacement, range-checked)
                                 self.buf.emit(&(rel as i32).to_le_bytes());
                             }
 
@@ -18537,7 +18732,9 @@ impl Compiler {
                             self.buf.emit_byte(0xE9);
                             {
                                 let here = self.buf.pos();
+                                // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                 let rel = (outer_label as i64) - (here as i64 + 4);
+                                // Truncation: i64 -> i32 (rel32 branch displacement, range-checked)
                                 self.buf.emit(&(rel as i32).to_le_bytes());
                             }
 
@@ -19025,6 +19222,7 @@ impl Compiler {
                                 self.emit_mov_r64_mem_disp32(
                                     RCX,
                                     RAX,
+                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                 );
                                 self.emit_test_r64_r64(RCX);
@@ -19034,6 +19232,7 @@ impl Compiler {
                                 self.emit_movsxd_r64_mem_disp32(
                                     R10,
                                     RAX,
+                                    // Cast: fixed struct/layout offset to i32 instruction displacement
                                     layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                 );
 
@@ -19050,6 +19249,7 @@ impl Compiler {
                                         RAX,
                                         RAX,
                                         layout.hash_cell_offset
+                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
@@ -19059,6 +19259,7 @@ impl Compiler {
                                     // Recompute: char_count = value.len >> coder.
                                     // R11D = value.length (zero-extended).
                                     self.buf
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         .emit(&[0x44, 0x8B, 0x59, ARRAY_LENGTH_OFFSET as u8]); // MOV R11D,[RCX+12]
                                                                                                // MOV ECX, R10D ; SHR R11D, CL
                                     self.buf.emit(&[0x44, 0x89, 0xD1]);
@@ -19074,6 +19275,7 @@ impl Compiler {
                                         RDX,
                                         RDX,
                                         layout.value_cell_offset
+                                            // Cast: fixed struct/layout offset to i32 instruction displacement
                                             + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                                     );
                                     // h = 0 (EAX) ; i = 0 (R8D).
@@ -19094,6 +19296,7 @@ impl Compiler {
                                         0xB6,
                                         0x4C,
                                         0x02,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         HEADER_SIZE as u8,
                                     ]);
                                     let dec_done = self.emit_jmp_rel32_patch();
@@ -19105,6 +19308,7 @@ impl Compiler {
                                         0xB7,
                                         0x4C,
                                         0x42,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         HEADER_SIZE as u8,
                                     ]);
                                     self.patch_rel32_to_here(dec_done);
@@ -19118,6 +19322,7 @@ impl Compiler {
                                                                   // INC R8D ; JMP loop
                                     self.buf.emit(&[0x41, 0xFF, 0xC0]);
                                     let back = self.emit_jmp_rel32_patch();
+                                    // Cast: value to i32 (encoding immediate/displacement)
                                     let rel = loop_top as i32 - (back as i32 + 4);
                                     self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                     self.patch_rel32_to_here(loop_done);
@@ -19136,6 +19341,7 @@ impl Compiler {
                                     // R11D = value.length (zero-extended) —
                                     // read BEFORE freeing RCX.
                                     self.buf
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         .emit(&[0x44, 0x8B, 0x59, ARRAY_LENGTH_OFFSET as u8]); // MOV R11D,[RCX+12]
                                                                                                // R8 = value ptr (so CL can use RCX).
                                     self.buf.emit(&[0x49, 0x89, 0xC8]); // MOV R8,RCX
@@ -19159,6 +19365,7 @@ impl Compiler {
                                         0xB6,
                                         0x44,
                                         0x08,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         HEADER_SIZE as u8,
                                     ]);
                                     let dec_done = self.emit_jmp_rel32_patch();
@@ -19170,6 +19377,7 @@ impl Compiler {
                                         0xB7,
                                         0x44,
                                         0x48,
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         HEADER_SIZE as u8,
                                     ]);
                                     self.patch_rel32_to_here(dec_done);
@@ -19178,6 +19386,7 @@ impl Compiler {
                                 } else {
                                     // length()I (kind 0) / isEmpty()Z (kind 1).
                                     // EAX = value.length (zero-extended).
+                                    // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                     self.buf.emit(&[0x8B, 0x41, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RCX+12]
                                                                                              // MOV ECX,R10D ; SHR EAX,CL  → char count.
                                     self.buf.emit(&[0x44, 0x89, 0xD1]);
@@ -19265,11 +19474,13 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             // Null value array on either side → deopt.
@@ -19283,12 +19494,14 @@ impl Compiler {
                             self.emit_mov_r32_mem_disp32(
                                 RCX,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // CMP ECX,[RDX+disp32]: 3B /r, ModRM
                             // mod=10(disp32) reg=ECX(001) r/m=RDX(010) = 0x8A.
                             self.buf.emit(&[0x3B, 0x8A]);
                             self.buf.emit(
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 &(layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32)
                                     .to_le_bytes(),
                             );
@@ -19297,8 +19510,10 @@ impl Compiler {
                             // value-array length mismatch → result 0.
                             // MOV ECX,[R8+12] ; CMP ECX,[R9+12]
                             self.buf
+                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                 .emit(&[0x41, 0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8]);
                             self.buf
+                                // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                 .emit(&[0x41, 0x3B, 0x49, ARRAY_LENGTH_OFFSET as u8]);
                             let len_diff = self.emit_jcc_rel32_patch(0x85); // JNE
 
@@ -19310,8 +19525,10 @@ impl Compiler {
                             self.buf.emit(&[0x56, 0x57]);
                             // RSI = R8 + HEADER ; RDI = R9 + HEADER
                             // LEA RSI,[R8+40]
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
                             // LEA RDI,[R9+40]
+                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                             self.buf.emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
                             // RCX = length (ECX already holds it,
                             // zero-extended into RCX).
@@ -19393,6 +19610,7 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -19400,6 +19618,7 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
@@ -19408,11 +19627,13 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             self.emit_movsxd_r64_mem_disp32(
                                 R11,
                                 RDX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
@@ -19432,11 +19653,13 @@ impl Compiler {
                             self.emit_mov_r64_r64(R12, R10);
                             self.emit_mov_r64_r64(R13, R11);
                             // len1 = this.value.length >> coder1  → R14D.
+                            // Cast: fixed struct/layout offset to i32 instruction displacement
                             self.emit_mov_r32_mem_disp32(RAX, RSI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
                                                                    // len2 = other.value.length >> coder2 → R15D.
+                                                                   // Cast: fixed struct/layout offset to i32 instruction displacement
                             self.emit_mov_r32_mem_disp32(RAX, RDI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
@@ -19462,6 +19685,7 @@ impl Compiler {
                             // INC R8D ; JMP loop_top.
                             self.buf.emit(&[0x41, 0xFF, 0xC0]);
                             let back = self.emit_jmp_rel32_patch();
+                            // Cast: value to i32 (encoding immediate/displacement)
                             let rel = loop_top as i32 - (back as i32 + 4);
                             self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                                                     // loop_done: result = len1 - len2.
@@ -19516,6 +19740,7 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -19524,6 +19749,7 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             // R9D = needle = ch & 0xFFFF.
@@ -19532,6 +19758,7 @@ impl Compiler {
                             self.buf.emit(&[0x41, 0x81, 0xE1]);
                             self.buf.emit(&0xFFFFu32.to_le_bytes());
                             // len = this.value.length >> coder → R11D.
+                            // Cast: fixed struct/layout offset to i32 instruction displacement
                             self.emit_mov_r32_mem_disp32(RAX, R8, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R10); // MOV ECX,R10D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
@@ -19549,6 +19776,7 @@ impl Compiler {
                             // INC EDX ; JMP loop_top.
                             self.buf.emit(&[0xFF, 0xC2]);
                             let back = self.emit_jmp_rel32_patch();
+                            // Cast: value to i32 (encoding immediate/displacement)
                             let rel = loop_top as i32 - (back as i32 + 4);
                             self.buf.try_patch_i32(back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                                                     // found: result = i.
@@ -19605,6 +19833,7 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R8,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -19612,6 +19841,7 @@ impl Compiler {
                             self.emit_mov_r64_mem_disp32(
                                 R9,
                                 RDX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
@@ -19620,11 +19850,13 @@ impl Compiler {
                             self.emit_movsxd_r64_mem_disp32(
                                 R10,
                                 RAX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
                             self.emit_movsxd_r64_mem_disp32(
                                 R11,
                                 RDX,
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
 
@@ -19639,10 +19871,12 @@ impl Compiler {
                             self.emit_mov_r64_r64(R12, R10);
                             self.emit_mov_r64_r64(R13, R11);
                             // hlen → R14D, nlen → R15D.
+                            // Cast: fixed struct/layout offset to i32 instruction displacement
                             self.emit_mov_r32_mem_disp32(RAX, RSI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
                             self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
+                                                                   // Cast: fixed struct/layout offset to i32 instruction displacement
                             self.emit_mov_r32_mem_disp32(RAX, RDI, ARRAY_LENGTH_OFFSET as i32);
                             self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
                             self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
@@ -19682,12 +19916,14 @@ impl Compiler {
                             // INC R9D ; JMP inner_top.
                             self.buf.emit(&[0x41, 0xFF, 0xC1]);
                             let inner_back = self.emit_jmp_rel32_patch();
+                            // Cast: value to i32 (encoding immediate/displacement)
                             let rel = inner_top as i32 - (inner_back as i32 + 4);
                             self.buf.try_patch_i32(inner_back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                                                           // inner_break: INC R8D ; JMP outer_top.
                             self.patch_rel32_to_here(inner_break);
                             self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
                             let outer_back = self.emit_jmp_rel32_patch();
+                            // Cast: value to i32 (encoding immediate/displacement)
                             let rel = outer_top as i32 - (outer_back as i32 + 4);
                             self.buf.try_patch_i32(outer_back, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                                                           // match_found: result = i (R8D).
@@ -19793,8 +20029,11 @@ impl Compiler {
                                 // tag word at +0 and the 32-bit payload at
                                 // +FIELD_CELL_PAYLOAD32_OFFSET (see the
                                 // inline-getfield codegen for opcode 0xb4).
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 let cell_off = HEADER_SIZE as i32;
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 let tag_off = cell_off + FIELD_CELL_TAG_OFFSET as i32;
+                                // Cast: fixed struct/layout offset to i32 instruction displacement
                                 let pay_off = cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
 
                                 self.flush_scratch_registers();
@@ -19930,6 +20169,7 @@ impl Compiler {
                                                                         // RAX = arr.length (zero-extended 32-bit
                                                                         // load → non-negative 64-bit value).
                                     self.buf
+                                        // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                         .emit(&[0x41, 0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[R8+ARRAY_LENGTH_OFFSET]
                                                                                                // off + len > arr.length ? CMP R11,RAX;
                                                                                                // JG bail (signed >).
@@ -19955,6 +20195,7 @@ impl Compiler {
                                             0xB6,
                                             0x44,
                                             0x08,
+                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                             HEADER_SIZE as u8,
                                         ]);
                                         // CRC32 ECX, AL — hardware Castagnoli
@@ -19972,6 +20213,7 @@ impl Compiler {
                                             0xB6,
                                             0x54,
                                             0x08,
+                                            // Truncation: usize -> u8 (small fixed struct offset, fits in an instr disp byte)
                                             HEADER_SIZE as u8,
                                         ]);
                                         self.emit_crc32_ieee_fold_byte(CRC32_IEEE_REVERSED_POLY);
@@ -19981,7 +20223,9 @@ impl Compiler {
                                     self.buf.emit_byte(0xE9); // JMP rel32
                                     {
                                         let here = self.buf.pos();
+                                        // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                         let rel = (loop_label as i64) - (here as i64 + 4);
+                                        // Truncation: i64 -> i32 (rel32 branch displacement, range-checked)
                                         self.buf.emit(&(rel as i32).to_le_bytes());
                                     }
                                     // .done:
@@ -20550,6 +20794,7 @@ impl Compiler {
                                 // that every slot's start is known.
                                 for (jne_patch, target_slot) in &next_slot_patches {
                                     let slot_start = slot_starts[*target_slot];
+                                    // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                     let rel = (slot_start as i64) - (*jne_patch as i64 + 1);
                                     debug_assert!(
                                         (-128..=127).contains(&rel),
@@ -20571,8 +20816,10 @@ impl Compiler {
                                 // (patch + 4) to the target.
                                 let miss_off = self.buf.pos();
                                 for patch in &miss_patches_rel32 {
+                                    // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                     let rel = (miss_off as i64) - (*patch as i64 + 4);
                                     debug_assert!(
+                                        // Widening: i32 bound -> i64 (range comparison)
                                         (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
                                         "inline PIC miss branch overflowed rel32 ({} bytes)",
                                         rel
@@ -20682,6 +20929,7 @@ impl Compiler {
                                 // .miss: patch both rel8 sites here.
                                 let miss_off = self.buf.pos();
                                 for patch in &miss_patches {
+                                    // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                     let rel = (miss_off as i64) - (*patch as i64 + 1);
                                     debug_assert!(
                                         (-128..=127).contains(&rel),
@@ -20769,6 +21017,7 @@ impl Compiler {
                             //                       per cache slot)
                             let done_off = self.buf.pos();
                             if let Some(patch) = done_patch {
+                                // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                 let rel = (done_off as i64) - (patch as i64 + 1);
                                 debug_assert!(
                                     (-128..=127).contains(&rel),
@@ -20785,8 +21034,10 @@ impl Compiler {
                                 // precedes it by 1 byte. The displacement
                                 // is computed from the byte AFTER the
                                 // immediate (patch + 4) to the target.
+                                // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
                                 let rel = (done_off as i64) - (*patch as i64 + 4);
                                 debug_assert!(
+                                    // Widening: i32 bound -> i64 (range comparison)
                                     (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
                                     "inline PIC done jump overflowed rel32 ({} bytes)",
                                     rel
@@ -22371,6 +22622,8 @@ mod tests {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid, properly aligned `ObjectHeader` that has not been freed.
+    // SAFETY: obj_ptr points to a live, properly aligned ObjectHeader (repr(C)); reading the
+    // u32 num_slots field at its fixed offset is in-bounds and the object is not freed.
     unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
         let num_slots_offset = std::mem::offset_of!(cratonvm_types::ObjectHeader, num_slots);
         std::ptr::read(obj_ptr.add(num_slots_offset) as *const u32) // Cast: address arithmetic
@@ -22776,6 +23029,8 @@ mod tests {
             0
         );
         // n=1: 1 <= 1, return 1
+        // SAFETY: `compiled` is executable JIT code from valid bytecode; the single
+        // i64 argument matches the compiled method's one-parameter ABI.
         assert_eq!(
             unsafe { compiled.try_call(&[1]).expect("test JIT call") },
             1
@@ -22867,6 +23122,8 @@ mod tests {
             unsafe { compiled.try_call(&[0]).expect("test JIT call") },
             0
         );
+        // SAFETY: `compiled` is executable JIT code from valid bytecode; each call below
+        // passes a single i64 matching the compiled method's one-parameter ABI.
         assert_eq!(
             unsafe { compiled.try_call(&[1]).expect("test JIT call") },
             1
@@ -25633,6 +25890,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25644,6 +25902,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25699,6 +25958,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25753,6 +26013,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25811,6 +26072,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 99])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25824,6 +26086,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, -42])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -25878,6 +26141,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 123_456_789_012i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26017,6 +26281,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26031,6 +26296,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26084,6 +26350,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26140,6 +26407,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26151,6 +26419,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26207,6 +26476,7 @@ mod tests {
                                                   // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, float_bits])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26264,6 +26534,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -26358,6 +26629,7 @@ mod tests {
         };
         assert_eq!(
             r,
+            // Cast: object/array pointer to i64 for the JIT calling convention
             target.as_ptr() as i64,
             "inline ref getfield must return the raw object pointer"
         );
@@ -26369,6 +26641,7 @@ mod tests {
                 .try_call(&[obj.as_ptr() as i64])
                 .expect("test JIT call")
         };
+        // Cast: numeric conversion
         assert_eq!(r, 0, "Object(None) field must read as 0");
     }
 
@@ -27375,12 +27648,16 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr_ptr as i64, 0])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
         assert_eq!(result, 10);
+        // SAFETY: `compiled` is executable JIT code from valid bytecode; vm_ptr and
+        // arr_ptr reference live test objects and match the JIT calling convention.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr_ptr as i64, 4])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -27449,6 +27726,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42])
                 .expect("test JIT call")
         }; // Cast: address arithmetic
@@ -27732,6 +28010,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr_ptr as i64, 5])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -27802,6 +28081,9 @@ mod tests {
         let code_len = 5;
 
         // Create a JitInvokeInfo for the invokevirtual at pc=1
+        // LEAK(intentional): the JIT-compiled code stores a raw pointer to this
+        // JitInvokeInfo, so it must have 'static lifetime and outlive the compiled
+        // method; the test process owns it for its entire (short) lifetime.
         let info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
@@ -27856,6 +28138,9 @@ mod tests {
         ];
         let code_len = 7;
 
+        // LEAK(intentional): the compiled method holds a raw pointer into this
+        // JitInvokeInfo; it must be 'static and outlive the JIT code. Owned by the
+        // test process for its lifetime.
         let info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestInterface",
@@ -27910,6 +28195,9 @@ mod tests {
         ];
         let code_len = 5;
 
+        // LEAK(intentional): the compiled method holds a raw pointer into this
+        // JitInvokeInfo; it must be 'static and outlive the JIT code. Owned by the
+        // test process for its lifetime.
         let info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
@@ -27966,6 +28254,9 @@ mod tests {
         ];
         let code_len = 7;
 
+        // LEAK(intentional): the compiled method holds a raw pointer into this
+        // JitInvokeInfo; it must be 'static and outlive the JIT code. Owned by the
+        // test process for its lifetime.
         let info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: "TestClass",
@@ -28014,11 +28305,11 @@ mod tests {
         assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
         assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
         assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
-        // Defense-in-depth (same class as the missing-`ldc` desync): the other
-        // 5-byte ops. invokedynamic / goto_w / jsr_w are rejected by `jit_scan`
-        // today, but the length table must stay correct so a future acceptance
-        // can't silently desync every PC-stepping walk. Must match the
-        // regalloc.rs `bc_len` twin's `bc_len_five_byte_ops`.
+                                                                            // Defense-in-depth (same class as the missing-`ldc` desync): the other
+                                                                            // 5-byte ops. invokedynamic / goto_w / jsr_w are rejected by `jit_scan`
+                                                                            // today, but the length table must stay correct so a future acceptance
+                                                                            // can't silently desync every PC-stepping walk. Must match the
+                                                                            // regalloc.rs `bc_len` twin's `bc_len_five_byte_ops`.
         assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
         assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
         assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
@@ -28242,6 +28533,8 @@ mod tests {
         .unwrap();
 
         // Normal entry: addOnly(2000) = sum(0..1999) = 1999000
+        // SAFETY: `compiled` is freshly JIT-compiled from valid bytecode into an
+        // executable mmap; calling it with the matching one-arg ABI is sound.
         let result = unsafe { compiled.try_call(&[2000]).expect("test JIT call") };
         assert_eq!(result, 1999000, "normal entry");
 
@@ -28249,6 +28542,8 @@ mod tests {
         // Remaining sum 1000..1999 = 1499500; total = 1999000.
         // jit_locals layout: index 0=n, 1=(n high), 2=s, 3=(s high), 4=i, 5=(i high)
         let jit_locals: [i64; 6] = [2000, 0, 499500, 0, 1000, 0];
+        // SAFETY: `compiled` holds executable JIT code with a valid OSR entry at PC=5;
+        // jit_locals matches the compiler's slot layout, so OSR resume is sound.
         let osr_result = unsafe {
             compiled.osr_enter(0, &jit_locals, 5, /* thread_ptr */ 0)
         };
@@ -28905,6 +29200,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result1 = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr1_ptr as i64, 0])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -28923,6 +29219,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result2 = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -28941,6 +29238,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result3 = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -28962,6 +29260,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result4 = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -28974,6 +29273,7 @@ mod tests {
             .alloc_array(ClassId::new(0), ArrayElementType::Int, n5);
         let arr5_ptr = arr5.as_ptr();
         for i in 0..n5 {
+            // Cast: value to i32 (encoding immediate/displacement)
             let _ = shared.heap.set_array_element(arr5, i, Value::Int(i as i32));
             // Cast: x86-64 immediate encoding
         }
@@ -28982,6 +29282,7 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result5 = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -29113,12 +29414,18 @@ mod tests {
         // Stub: pretend there is no current thread (re-entrant or pre-init
         // state). The inline path must take the JE branch to the slow path
         // and we then short-circuit with a sentinel `new_object` return.
+        // SAFETY: extern "C" test stub with no arguments and no dereferences; it only
+        // returns a null pointer, so there are no preconditions for the caller to uphold.
         unsafe extern "C" fn null_thread() -> *mut std::ffi::c_void {
             std::ptr::null_mut()
         }
+        // SAFETY: extern "C" test stub; ignores all i64 arguments and dereferences nothing,
+        // returning a fixed sentinel value, so it cannot violate memory safety.
         unsafe extern "C" fn fake_new_object(_vm: i64, _cid: i64, _nf: i64) -> i64 {
             0xDEAD_BEEFi64
         }
+        // SAFETY: extern "C" test stub that immediately panics; it touches no arguments
+        // and performs no memory access, so it imposes no safety obligations on callers.
         unsafe extern "C" fn unimplemented_post_init(
             _vm: i64,
             _obj: i64,
@@ -29134,8 +29441,11 @@ mod tests {
         // null at runtime to force the slow path inside the emitted
         // inline cascade.
         let mut helpers = test_helpers();
+        // Cast: fn pointer to usize helper address
         helpers.get_current_thread = null_thread as *const () as usize;
+        // Cast: fn pointer to usize helper address
         helpers.tlab_post_init = unimplemented_post_init as *const () as usize;
+        // Cast: fn pointer to usize helper address
         helpers.new_object = fake_new_object as *const () as usize;
         // The offsets don't matter — they're only read when the
         // thread pointer is non-null.
@@ -29386,6 +29696,7 @@ mod tests {
         unsafe {
             compiled
                 .unwrap()
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 42])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -29456,6 +29767,7 @@ mod tests {
         unsafe {
             compiled
                 .unwrap()
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 10, 20])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -29692,6 +30004,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -29747,6 +30060,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30004,6 +30318,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[x.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30173,6 +30488,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30221,6 +30537,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30271,6 +30588,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30321,6 +30639,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
             compiled
+                // Cast: float/double bit pattern to i64 (bit-preserving, VM all-GPR ABI)
                 .try_call(&[a.to_bits() as i64, b.to_bits() as i64])
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
@@ -30407,6 +30726,9 @@ mod tests {
         // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
         let new_info = vec![(0usize, 1u32, 2usize, true, true)]; // 2 fields
                                                                  // Create invoke_info for <init>()V at PC=4
+                                                                 // LEAK(intentional): the compiled method references this JitInvokeInfo by raw
+                                                                 // pointer, so it must be 'static and outlive the JIT code; owned by the test
+                                                                 // process for its lifetime.
         let init_info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -30484,6 +30806,9 @@ mod tests {
         non_escaping.insert(0usize);
         // CRIT-2 tuple shape: see compiler struct doc.
         let new_info = vec![(0usize, 1u32, 2usize, true, true)];
+        // LEAK(intentional): the compiled method references this JitInvokeInfo by raw
+        // pointer, so it must be 'static and outlive the JIT code; owned by the test
+        // process for its lifetime.
         let init_info = Box::leak(Box::new(JitInvokeInfo {
             // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -30639,6 +30964,7 @@ mod tests {
             assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 20);
             assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 30);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
                 -1i64
             ); // Cast: JIT ABI convention
@@ -30658,6 +30984,7 @@ mod tests {
         unsafe {
             for i in 0..10 {
                 assert_eq!(
+                    // Cast: test value to i64 for the JIT calling convention
                     compiled.try_call(&[i as i64]).expect("test JIT call"),
                     ((i + 1) * 100) as i64, // Cast: JIT ABI convention
                     "case {} failed",
@@ -30665,6 +30992,7 @@ mod tests {
                 );
             }
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-1i32 as i64]).expect("test JIT call"),
                 -999i64
             ); // Cast: JIT ABI convention
@@ -30700,6 +31028,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-2i32 as i64]).expect("test JIT call"),
                 200
             ); // Cast: JIT ABI convention
@@ -30711,6 +31040,7 @@ mod tests {
             assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 203);
             assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 204);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-3i32 as i64]).expect("test JIT call"),
                 -1i64
             ); // Cast: JIT ABI convention
@@ -30770,6 +31100,7 @@ mod tests {
         unsafe {
             for &(key, val) in &pairs {
                 assert_eq!(
+                    // Cast: test value to i64 for the JIT calling convention
                     compiled.try_call(&[key as i64]).expect("test JIT call"),
                     val as i64, // Cast: JIT ABI convention
                     "key {} should return {}",
@@ -30804,7 +31135,9 @@ mod tests {
         unsafe {
             for &(key, val) in &pairs {
                 assert_eq!(
+                    // Cast: test value to i64 for the JIT calling convention
                     compiled.try_call(&[key as i64]).expect("test JIT call"),
+                    // Cast: test value to i64 for the JIT calling convention
                     val as i64
                 ); // Cast: JIT ABI convention
             }
@@ -30839,6 +31172,7 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..8 {
+                // Cast: test value to i64 for the JIT calling convention
                 assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), 77);
                 // Cast: JIT ABI convention
             }
@@ -30874,7 +31208,9 @@ mod tests {
         unsafe {
             for i in 0..20 {
                 assert_eq!(
+                    // Cast: test value to i64 for the JIT calling convention
                     compiled.try_call(&[i as i64]).expect("test JIT call"),
+                    // Cast: loop counter expression to i64 (expected return value)
                     (i * 11) as i64
                 ); // Cast: JIT ABI convention
             }
@@ -30985,6 +31321,7 @@ mod tests {
             assert_eq!(compiled.try_call(&[42]).expect("test JIT call"), 42);
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
                 -7
             ); // Cast: JIT ABI convention
@@ -31024,6 +31361,7 @@ mod tests {
             assert_eq!(compiled.try_call(&[3, 4]).expect("test JIT call"), 7);
             assert_eq!(
                 compiled
+                    // Widening: i32 -> i64 (sign-extended)
                     .try_call(&[100, -50i32 as i64])
                     .expect("test JIT call"),
                 50
@@ -31133,6 +31471,7 @@ mod tests {
         unsafe {
             assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 5);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-5i32 as i64]).expect("test JIT call"),
                 5
             ); // Cast: JIT ABI convention
@@ -31205,6 +31544,7 @@ mod tests {
             assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), 21);
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-3i32 as i64]).expect("test JIT call"),
                 -9
             ); // Cast: JIT ABI convention
@@ -31337,6 +31677,7 @@ mod tests {
         unsafe {
             assert_eq!(compiled.try_call(&[50]).expect("test JIT call"), 100);
             assert_eq!(
+                // Widening: i32 -> i64 (sign-extended)
                 compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
                 -14
             ); // Cast: JIT ABI convention
@@ -31466,7 +31807,9 @@ mod tests {
     /// can take the deopt path without panicking on an unimplemented stub.
     fn array_test_helpers() -> JitRuntimeHelpers {
         let mut h = test_helpers();
+        // Cast: fn pointer to usize helper address
         h.throw_aioobe = flagging_throw_aioobe as *const () as usize;
+        // Cast: fn pointer to usize helper address
         h.jit_npe_with_action = flagging_npe_with_action as *const () as usize;
         h
     }
@@ -31539,18 +31882,21 @@ mod tests {
         unsafe {
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr0.as_ptr() as i64])
                     .expect("test JIT call"),
                 0
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr5.as_ptr() as i64])
                     .expect("test JIT call"),
                 5
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr257.as_ptr() as i64])
                     .expect("test JIT call"),
                 257
@@ -31589,8 +31935,10 @@ mod tests {
                 // return register, so the expected value is `*v as i64`.
                 assert_eq!(
                     compiled
+                        // Cast: object/array pointer to i64 for the JIT calling convention
                         .try_call(&[arr.as_ptr() as i64, i as i64])
                         .expect("test JIT call"),
+                    // Cast: test value to i64 for the JIT calling convention
                     *v as i64,
                     "iaload mismatch at index {i}"
                 );
@@ -31627,24 +31975,28 @@ mod tests {
         unsafe {
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 0])
                     .expect("test JIT call"),
                 127
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 1])
                     .expect("test JIT call"),
                 -1
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 2])
                     .expect("test JIT call"),
                 -128
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 3])
                     .expect("test JIT call"),
                 1
@@ -31679,18 +32031,21 @@ mod tests {
         unsafe {
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 0])
                     .expect("test JIT call"),
                 65
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 1])
                     .expect("test JIT call"),
                 65535
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 2])
                     .expect("test JIT call"),
                 32768
@@ -31725,18 +32080,21 @@ mod tests {
         unsafe {
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 0])
                     .expect("test JIT call"),
                 32767
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 1])
                     .expect("test JIT call"),
                 -1
             );
             assert_eq!(
                 compiled
+                    // Cast: object/array pointer to i64 for the JIT calling convention
                     .try_call(&[arr.as_ptr() as i64, 2])
                     .expect("test JIT call"),
                 -32768
@@ -31772,6 +32130,7 @@ mod tests {
             for (i, v) in vals.iter().enumerate() {
                 assert_eq!(
                     compiled
+                        // Cast: object/array pointer to i64 for the JIT calling convention
                         .try_call(&[arr.as_ptr() as i64, i as i64])
                         .expect("test JIT call"),
                     *v,
@@ -31812,6 +32171,7 @@ mod tests {
         // JEP 358: the stub must thread the `arraylength` action code.
         assert_eq!(
             TEST_NPE_ACTION.with(|c| c.get()),
+            // Widening: narrower int -> i64
             npe_action::ARRAY_LENGTH as i64,
             "null arraylength must report the ARRAY_LENGTH action"
         );
@@ -31842,6 +32202,7 @@ mod tests {
         // proving the per-opcode threading, not the old fixed byte-store code.
         assert_eq!(
             TEST_NPE_ACTION.with(|c| c.get()),
+            // Widening: narrower int -> i64
             npe_action::ALOAD_INT as i64,
             "null iaload must report the ALOAD_INT action"
         );
@@ -31875,6 +32236,7 @@ mod tests {
         );
         assert_eq!(
             TEST_NPE_ACTION.with(|c| c.get()),
+            // Widening: narrower int -> i64
             npe_action::ASTORE_CHAR as i64,
             "null castore must report the ASTORE_CHAR action"
         );
@@ -32087,6 +32449,7 @@ mod tests {
         // Smaller trip count: 7 * 3 = 21.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 3])
                 .expect("test JIT call")
         };
@@ -32096,6 +32459,7 @@ mod tests {
         // (verifying the unrolled copies don't fault on cold entry).
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 0])
                 .expect("test JIT call")
         };
@@ -32224,6 +32588,7 @@ mod tests {
         // still be valid code).
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[obj.as_ptr() as i64, 0])
                 .expect("test JIT call")
         };
@@ -32283,7 +32648,13 @@ mod tests {
 
         // Caller-supplied invoke metadata. Strings are leaked for
         // 'static lifetime to match the production lib.rs path.
+        // LEAK(intentional): these &'static str names are stored in the JitInvokeInfo
+        // the compiled method dereferences by raw pointer, so they must outlive the JIT
+        // code; owned by the test process for its lifetime (matches the lib.rs path).
         let class_name: &'static str = Box::leak("Foo".to_string().into_boxed_str());
+        // LEAK(intentional): this &'static method name is read via raw pointer from the
+        // JitInvokeInfo by the compiled method, so it must outlive the JIT code; owned by
+        // the test process for its lifetime.
         let method_name: &'static str = Box::leak("inc".to_string().into_boxed_str());
         // Zero-param instance method: the loop body is
         //   s = s + obj.inc()  →  iload_2(s); aload_0(obj); invokevirtual;
@@ -32293,6 +32664,9 @@ mod tests {
         // the following `iadd`. A `(I)I` descriptor (num_jit_args=2)
         // would pop BOTH `s` and the receiver, underflowing the `iadd`
         // and failing compilation before the PIC-mint path is reached.
+        // LEAK(intentional): this &'static descriptor is referenced by the JitInvokeInfo
+        // the compiled method reads via raw pointer, so it must outlive the JIT code;
+        // owned by the test process for its lifetime.
         let desc: &'static str = Box::leak("()I".to_string().into_boxed_str());
         let info = Box::new(JitInvokeInfo {
             class_name,
@@ -32376,6 +32750,7 @@ mod tests {
         let mut ptrs: Vec<usize> = method
             ._jit_pic_slots
             .iter()
+            // Cast: non-negative index/count to usize
             .map(|b| b.as_ref() as *const _ as usize)
             .collect();
         ptrs.sort();
@@ -32494,6 +32869,7 @@ mod tests {
         // every copy + the original execute exactly once.
         let result = unsafe {
             compiled
+                // Cast: object/array pointer to i64 for the JIT calling convention
                 .try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 4])
                 .expect("test JIT call")
         };

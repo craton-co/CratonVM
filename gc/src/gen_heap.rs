@@ -728,11 +728,7 @@ impl GenerationalHeap {
     /// hard-aborting in [`alloc_young`]. Like `alloc_object` it performs no GC,
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
-    pub fn try_alloc_object_full(
-        &self,
-        class_id: ClassId,
-        num_fields: usize,
-    ) -> Option<ObjectRef> {
+    pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
@@ -1114,6 +1110,8 @@ impl GenerationalHeap {
             std::ptr::write(ptr as *mut ObjectHeader, header);
         }
         self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `ptr` points at the header just written above; it is a valid,
+        // fully-initialized, heap-owned object so wrapping it as an `ObjectRef` is sound.
         Some(unsafe { ObjectRef::from_raw(ptr) })
     }
 
@@ -1155,6 +1153,8 @@ impl GenerationalHeap {
             std::ptr::write(ptr as *mut ObjectHeader, header);
         }
         self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `ptr` points at the header just written above; it is a valid,
+        // fully-initialized, heap-owned object so wrapping it as an `ObjectRef` is sound.
         Some(unsafe { ObjectRef::from_raw(ptr) })
     }
 
@@ -1705,6 +1705,9 @@ impl GenerationalHeap {
                 // and a 4-byte u32 within that range, which is well-defined
                 // even when the byte values do not correspond to valid enum
                 // discriminants.
+                // SAFETY: `obj_ptr` was just dereferenced via `get_header` without
+                // faulting, so the header's bytes (offsets 0..16) are readable; raw
+                // byte/u32 reads are well-defined for any bit pattern.
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
                     let kind_byte = *obj_ptr.add(4);
@@ -2145,8 +2148,11 @@ impl GenerationalHeap {
         // primitive-array `{4, small}` data (the dominant young bytes in EC).
         let mut a = base_a;
         while a + 16 <= end_a {
+            // SAFETY: `a` is an 8-aligned address with `a + 16 <= end_a`, so this
+            // word and the following one are fully inside the live young-gen arena.
             let disc = unsafe { std::ptr::read(a as *const u64) };
             if disc == 4 {
+                // SAFETY: `a + 8` is in-bounds (loop guard ensures `a + 16 <= end_a`).
                 let payload = unsafe { std::ptr::read((a + 8) as *const u64) };
                 // Precise signature: the corruption payload is ALWAYS exactly 4
                 // (== the Value::Object discriminant landing on a field payload).
@@ -2166,6 +2172,9 @@ impl GenerationalHeap {
                             break;
                         }
                         let h_addr = a - off;
+                        // SAFETY: `h_addr = a - off` is `>= base_a` (checked above) and
+                        // `< a < end_a`, so a full `ObjectHeader` lies within the arena;
+                        // fields are read defensively before trusting the contents.
                         let h = unsafe { &*(h_addr as *const ObjectHeader) };
                         if (h.kind as u8) == 0
                             && h.array_length == 0
@@ -2192,6 +2201,8 @@ impl GenerationalHeap {
                         }
                     }
                     if let Some((h_addr, cid, fld)) = found {
+                        // SAFETY: `a + 16 <= end_a` (loop guard), so reading the
+                        // following word (the neighbour cell) stays inside the arena.
                         let nbr = unsafe { std::ptr::read((a + 16) as *const u64) };
                         return Some((h_addr, cid, fld, payload as usize, nbr));
                     }
@@ -2432,6 +2443,8 @@ impl GenerationalHeap {
             let mut misses = 0usize;
             let mut reported = 0usize;
             for (obj_ptr, _sz) in old_gen.walk_objects() {
+                // SAFETY: `walk_objects` yields the start of each live old-gen object,
+                // so `obj_ptr` targets a valid, fully-initialized `ObjectHeader`.
                 let hdr = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 let addr = obj_ptr as usize;
                 let card_idx = addr.wrapping_sub(cbase) / csize;
@@ -2439,6 +2452,9 @@ impl GenerationalHeap {
                 if hdr.kind == ObjectKind::Array {
                     if hdr.element_type == ArrayElementType::Reference {
                         for i in 0..hdr.array_length as usize {
+                            // SAFETY: `i < hdr.array_length`, so the element offset is
+                            // within the array's allocated payload; `obj_ptr.add(..)`
+                            // and the u64 read of that ref slot stay in-bounds.
                             let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                             let raw = unsafe { std::ptr::read(s_ptr as *const u64) };
                             if raw != 0 && raw < 0x1000 {
@@ -2471,6 +2487,9 @@ impl GenerationalHeap {
                     }
                 } else {
                     for slot_idx in 0..hdr.num_slots as usize {
+                        // SAFETY: `slot_idx < hdr.num_slots`, so the slot offset is
+                        // within the object's allocated field area; the pointer and the
+                        // `Value` read of that initialized slot are in-bounds.
                         let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                         let value = unsafe { std::ptr::read(s_ptr as *const Value) };
                         if let Value::Object(Some(ro)) = value {
@@ -2521,6 +2540,9 @@ impl GenerationalHeap {
             let mut ycur = 0usize;
             let mut found4 = 0usize;
             while ycur < yused {
+                // SAFETY: the young space is bump-allocated and contiguous; `ycur < yused`
+                // keeps `ybase + ycur` inside the live region, where a valid `ObjectHeader`
+                // begins (a bad header is detected by the size check below).
                 let h = unsafe { &*((ybase + ycur) as *const ObjectHeader) };
                 let size = gen_object_total_size(h);
                 if size == 0 || ycur + size > yused {
@@ -2533,6 +2555,9 @@ impl GenerationalHeap {
                 let optr = (ybase + ycur) as *mut u8;
                 if h.kind == ObjectKind::Object {
                     for si in 0..h.num_slots as usize {
+                        // SAFETY: `si < h.num_slots` and `ycur + size <= yused` was
+                        // checked, so this slot is within the object's field area in the
+                        // arena; the pointer and `Value` read of that slot are in-bounds.
                         let sp = unsafe { optr.add(HEADER_SIZE + si * SLOT_SIZE) };
                         let v = unsafe { std::ptr::read(sp as *const Value) };
                         if let Value::Object(Some(ro)) = v {
@@ -2569,6 +2594,9 @@ impl GenerationalHeap {
                                     );
                                     let mut a = lo & !7;
                                     while a < hi {
+                                        // SAFETY: `a` is 8-aligned and `lo`/`hi` are
+                                        // clamped to `[ybase, ybase+yused)`, so each word
+                                        // read stays within the live young arena.
                                         let w = unsafe { std::ptr::read(a as *const u64) };
                                         eprintln!(
                                             "[small4]   0x{a:x}: 0x{w:016x}{}{}",
@@ -2593,6 +2621,9 @@ impl GenerationalHeap {
                     && h.element_type == ArrayElementType::Reference
                 {
                     for i in 0..h.array_length as usize {
+                        // SAFETY: `i < h.array_length` and `ycur + size <= yused` was
+                        // checked, so this element offset is within the array payload in
+                        // the arena; the pointer and u64 read of that ref slot are in-bounds.
                         let sp = unsafe { optr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                         let raw = unsafe { std::ptr::read(sp as *const u64) } as usize;
                         if raw != 0 && raw < 0x1000 && found4 < 40 {
@@ -3612,6 +3643,9 @@ impl GenerationalHeap {
                 if oh.kind == ObjectKind::Array {
                     if oh.element_type == ArrayElementType::Reference {
                         for i in 0..oh.array_length as usize {
+                            // SAFETY: `i < oh.array_length`, so the element offset lies in
+                            // this live old-gen array's payload; the pointer and u64 read
+                            // of that ref slot are in-bounds.
                             let s = unsafe { op.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                             let raw: u64 = unsafe { std::ptr::read(s as *const u64) };
                             if raw != 0 {
@@ -3621,6 +3655,9 @@ impl GenerationalHeap {
                     }
                 } else {
                     for slot in 0..oh.num_slots as usize {
+                        // SAFETY: `slot < oh.num_slots`, so the offset lies in this live
+                        // old-gen object's field area; the pointer and `Value` read of
+                        // that initialized slot are in-bounds.
                         let s = unsafe { op.add(HEADER_SIZE + slot * SLOT_SIZE) };
                         let v = unsafe { std::ptr::read(s as *const Value) };
                         if let Value::Object(Some(r)) = v {
@@ -3998,6 +4035,8 @@ impl GenerationalHeap {
                         }
                     };
                     for (oaddr, _sz) in old_gen.walk_objects() {
+                        // SAFETY: `walk_objects` yields the start of each live old-gen
+                        // object, so `oaddr` targets a valid, initialized `ObjectHeader`.
                         let h = unsafe { &*(oaddr as *const ObjectHeader) };
                         missed_old += forwarded_ref_count(oaddr, h, &is_y);
                         for_each_ref(oaddr, h, &mut bump);
@@ -4016,6 +4055,9 @@ impl GenerationalHeap {
                             }
                         }
                         let o = (from_base + c) as *mut u8;
+                        // SAFETY: `c < used` and the free-block list skips reclaimed gaps,
+                        // so `from_base + c` is the start of a live object header inside
+                        // the from-space (a bad header is caught by the size check below).
                         let h = unsafe { &*(o as *const ObjectHeader) };
                         let ts = gen_object_total_size(h);
                         if ts < HEADER_SIZE || c + ts > used {
@@ -4090,6 +4132,8 @@ impl GenerationalHeap {
                 if is_unmarked_young(addr) {
                     root_to_unmarked += 1;
                     if root_to_unmarked <= 8 {
+                        // SAFETY: `addr` came from the root set (a live `ObjectRef`),
+                        // so it points at a valid, initialized `ObjectHeader`.
                         let h = unsafe { &*(addr as *const ObjectHeader) };
                         tracing::warn!(
                             "[sweep-edges] (1) ROOT @{:#x} -> UNMARKED young obj \
@@ -4118,6 +4162,9 @@ impl GenerationalHeap {
                 if h.kind == ObjectKind::Array {
                     if h.element_type == ArrayElementType::Reference {
                         for i in 0..h.array_length as usize {
+                            // SAFETY: `i < h.array_length`, so the element offset is in the
+                            // array payload of the valid object `obj_ptr`; pointer and u64
+                            // read of that ref slot are in-bounds.
                             let sp = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                             let raw: u64 = unsafe { std::ptr::read(sp as *const u64) };
                             if raw != 0 && is_unmarked_young(raw as usize) {
@@ -4127,6 +4174,9 @@ impl GenerationalHeap {
                     }
                 } else {
                     for si in 0..h.num_slots as usize {
+                        // SAFETY: `si < h.num_slots`, so the offset is in the field area of
+                        // the valid object `obj_ptr`; pointer and `Value` read of that
+                        // initialized slot are in-bounds.
                         let sp = unsafe { obj_ptr.add(HEADER_SIZE + si * SLOT_SIZE) };
                         let v = unsafe { std::ptr::read(sp as *const Value) };
                         if let Value::Object(Some(rf)) = v {
@@ -4157,6 +4207,9 @@ impl GenerationalHeap {
                         }
                     }
                     let optr = (from_base + c) as *mut u8;
+                    // SAFETY: `c < used_dbg` and the free-block list skips reclaimed gaps,
+                    // so `from_base + c` is the start of a live object header in the
+                    // from-space (a desynced/bad header is caught by the size check below).
                     let h = unsafe { &*(optr as *const ObjectHeader) };
                     let tot = gen_object_total_size(h);
                     if tot < HEADER_SIZE || c + tot > used_dbg {
@@ -4176,6 +4229,8 @@ impl GenerationalHeap {
                         scan_refs(optr, &mut |si, ta| {
                             survivor_to_unmarked += 1;
                             if survivor_to_unmarked <= 16 {
+                                // SAFETY: `ta` is a non-null young heap address read from a
+                                // live survivor's ref slot, so it points at a valid header.
                                 let th = unsafe { &*(ta as *const ObjectHeader) };
                                 tracing::warn!(
                                     "[sweep-edges] (2) SURVIVOR @{:#x} (class_id={}) field[{}] \
@@ -4206,10 +4261,14 @@ impl GenerationalHeap {
             let mut old_to_unmarked = 0usize;
             for (optr, _sz) in old_gen.walk_objects() {
                 let oaddr = optr as usize;
+                // SAFETY: `walk_objects` yields the start of each live old-gen object, so
+                // `optr` targets a valid, initialized `ObjectHeader` whose class_id we read.
                 let cid = unsafe { (*(optr as *const ObjectHeader)).class_id.as_u32() };
                 scan_refs(optr, &mut |si, ta| {
                     old_to_unmarked += 1;
                     if old_to_unmarked <= 16 {
+                        // SAFETY: `ta` is a non-null young heap address read from a live
+                        // old-gen object's ref slot, so it points at a valid header.
                         let th = unsafe { &*(ta as *const ObjectHeader) };
                         tracing::warn!(
                             "[sweep-edges] (3) OLD-GEN @{:#x} (class_id={}) field[{}] \
@@ -4277,6 +4336,9 @@ impl GenerationalHeap {
             // integer-to-pointer cast itself is safe; only the header deref
             // on the next line requires `unsafe`.
             let obj_ptr = (from_base + cursor) as *mut u8;
+            // SAFETY: `cursor < used`, so `from_base + cursor` is the start of a live
+            // object header inside mapped from-space memory; this walk holds the only
+            // mutable access during sweep, so the `&mut` is unique.
             let header = unsafe { &mut *(obj_ptr as *const ObjectHeader as *mut ObjectHeader) };
             // Bug-D fix (2026-06-12): a GAP-filler sentinel marks a
             // sub-`HEADER_SIZE` TLAB tail (`install_tail_filler`) that is too
@@ -5063,6 +5125,9 @@ impl GenerationalHeap {
         // scalar field individually through field-projected raw pointers, and
         // read `mark_word` via an explicit `AtomicU64::load`, then reconstruct
         // an owned header from those values.
+        // SAFETY: `old_ptr` points at a live young-gen object, so each field of its
+        // `ObjectHeader` is initialized and individually readable via addr_of! reads;
+        // no aliasing `&` is held while we later install the forwarding pointer.
         let header: ObjectHeader = unsafe {
             let h = old_ptr as *const ObjectHeader;
             let mut owned = ObjectHeader::new(
@@ -5327,12 +5392,16 @@ impl GenerationalHeap {
         if !is_array && gcw_enabled() {
             let ns = header.num_slots as usize;
             for si in 0..ns {
+                // SAFETY: `si < ns == header.num_slots`, so the slot lies in the freshly
+                // copied object's field area at `new_ptr`; the `Value` read is in-bounds.
                 let dv = unsafe {
                     std::ptr::read(new_ptr.add(HEADER_SIZE + si * SLOT_SIZE) as *const Value)
                 };
                 if let Value::Object(Some(r)) = dv {
                     let p = r.as_ptr() as usize;
                     if p != 0 && p < 0x1000 {
+                        // SAFETY: same `si < num_slots` bound applies to the source object
+                        // at `old_ptr`, so reading the matching slot is in-bounds.
                         let sv = unsafe {
                             std::ptr::read(old_ptr.add(HEADER_SIZE + si * SLOT_SIZE) as *const Value)
                         };
@@ -5741,10 +5810,15 @@ fn fixup_object_fields(
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length as usize {
+                // SAFETY: `i < header.array_length`, so the element offset lies within the
+                // valid object's array payload; pointer, u64 read, and (forwarded) u64
+                // write of that ref slot are in-bounds and unaliased under STW.
                 let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                 let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
                 if raw != 0 {
                     if let Some(nw) = fwd_of(raw as usize) {
+                        // SAFETY: `slot` is the in-bounds ref element computed above; STW
+                        // guarantees exclusive access for this forwarding-pointer write.
                         unsafe { std::ptr::write(slot as *mut u64, nw as u64) };
                     } else if let Some(p) = points_young.as_deref_mut() {
                         if in_young(raw as usize) {
@@ -5756,13 +5830,20 @@ fn fixup_object_fields(
         }
     } else {
         for si in 0..header.num_slots as usize {
+            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
+            // object's field area; pointer and `Value` read of that initialized slot are
+            // in-bounds and unaliased under STW.
             let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
             let value = unsafe { std::ptr::read(slot as *const Value) };
             if let Value::Object(Some(ref_obj)) = value {
                 let target = ref_obj.as_ptr() as usize;
                 if let Some(nw) = fwd_of(target) {
+                    // SAFETY: `nw` is the forwarded destination address of a live object,
+                    // so wrapping it as an `ObjectRef` is sound.
                     let new_value =
                         Value::Object(Some(unsafe { ObjectRef::from_raw(nw as *mut u8) }));
+                    // SAFETY: `slot` is the in-bounds field slot computed above; STW
+                    // guarantees exclusive access for this rewrite.
                     unsafe { std::ptr::write(slot as *mut Value, new_value) };
                 } else if let Some(p) = points_young.as_deref_mut() {
                     if in_young(target) {
@@ -5783,9 +5864,13 @@ fn forwarded_ref_count(obj: *mut u8, header: &ObjectHeader, is_y: &dyn Fn(usize)
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length as usize {
+                // SAFETY: `i < header.array_length`, so the element offset lies within the
+                // valid object's array payload; pointer and u64 read are in-bounds.
                 let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                 let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
                 if raw != 0 && is_y(raw as usize) {
+                    // SAFETY: `is_y` confirmed `raw` is a young-from-space heap address,
+                    // so it points at a valid `ObjectHeader`.
                     let h = unsafe { &*(raw as usize as *const ObjectHeader) };
                     if h.is_forwarded() {
                         n += 1;
@@ -5795,11 +5880,15 @@ fn forwarded_ref_count(obj: *mut u8, header: &ObjectHeader, is_y: &dyn Fn(usize)
         }
     } else {
         for si in 0..header.num_slots as usize {
+            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
+            // object's field area; pointer and `Value` read of that slot are in-bounds.
             let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
             let v = unsafe { std::ptr::read(slot as *const Value) };
             if let Value::Object(Some(rf)) = v {
                 let t = rf.as_ptr() as usize;
                 if is_y(t) {
+                    // SAFETY: `is_y` confirmed `t` is a young-from-space heap address,
+                    // so it points at a valid `ObjectHeader`.
                     let h = unsafe { &*(t as *const ObjectHeader) };
                     if h.is_forwarded() {
                         n += 1;
@@ -5818,6 +5907,8 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length as usize {
+                // SAFETY: `i < header.array_length`, so the element offset lies within the
+                // valid object's array payload; pointer and u64 read are in-bounds.
                 let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                 let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
                 if raw != 0 {
@@ -5827,6 +5918,8 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
         }
     } else {
         for si in 0..header.num_slots as usize {
+            // SAFETY: `si < header.num_slots`, so the slot offset lies in the valid
+            // object's field area; pointer and `Value` read of that slot are in-bounds.
             let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
             let v = unsafe { std::ptr::read(slot as *const Value) };
             if let Value::Object(Some(rf)) = v {
