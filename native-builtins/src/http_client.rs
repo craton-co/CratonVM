@@ -92,6 +92,11 @@ const REDIRECT_NORMAL: i32 = 1;
 const REDIRECT_ALWAYS: i32 = 2;
 
 const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
+/// Upper bound on a single HTTP/1.1 chunk size-line (the hex length plus any
+/// chunk extensions, up to the terminating CRLF) and on the trailer section of
+/// a chunked body. A hostile server could otherwise stream bytes that never
+/// contain a CRLF and force the reader to buffer without bound -> OOM DoS.
+const MAX_CHUNK_LINE: usize = 8 * 1024;
 /// Largest single HTTP/2 frame payload we will buffer. The HTTP/2 default
 /// `SETTINGS_MAX_FRAME_SIZE` is 16 KiB (RFC 7540 §6.5.2); we never advertise a
 /// larger value, so a server that sends a bigger frame is misbehaving. The
@@ -561,6 +566,11 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             if let Some(pos) = find_subslice(prefix, b"\r\n") {
                 break pos;
             }
+            // Bound the un-terminated size-line: a server that never emits a
+            // CRLF would otherwise force unbounded buffering here (DoS).
+            if prefix.len() > MAX_CHUNK_LINE {
+                return Err("chunked: size line exceeds MAX_CHUNK_LINE".into());
+            }
             let n = stream
                 .read(&mut tmp)
                 .map_err(|e| format!("chunked size: {e}"))?;
@@ -587,6 +597,12 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
         if size == 0 {
             // Read trailing CRLF (and any trailers up to CRLF CRLF).
             while find_subslice(prefix, b"\r\n").is_none() {
+                // Bound the trailer section: a server that streams trailer
+                // bytes without a terminating CRLF would otherwise force
+                // unbounded buffering here (DoS).
+                if prefix.len() > MAX_CHUNK_LINE {
+                    return Err("chunked: trailer exceeds MAX_CHUNK_LINE".into());
+                }
                 let n = stream
                     .read(&mut tmp)
                     .map_err(|e| format!("chunked trailer: {e}"))?;
@@ -839,6 +855,20 @@ fn http2_request(
             // HEADERS / CONTINUATION on our stream.
             0x1 if stream_id == 1 => {
                 let mut p = payload.as_slice();
+                // RFC 7540 §6.2 field order: Pad Length (if PADDED), then the
+                // 5-byte PRIORITY block (if PRIORITY), then the header block
+                // fragment, then the trailing padding. Process PADDED first so
+                // the pad-length byte is consumed from the front and the
+                // padding is trimmed from the back before PRIORITY is stripped.
+                let mut pad = 0usize;
+                if flags & 0x8 != 0 {
+                    // PADDED — first byte is pad length.
+                    if p.is_empty() {
+                        return Err("h2 HEADERS padding underflow".into());
+                    }
+                    pad = p[0] as usize;
+                    p = &p[1..];
+                }
                 if flags & 0x20 != 0 {
                     // PRIORITY flag: skip 5-byte priority block.
                     if p.len() < 5 {
@@ -846,6 +876,11 @@ fn http2_request(
                     }
                     p = &p[5..];
                 }
+                // Trim trailing padding (which follows the header block).
+                if pad > p.len() {
+                    return Err("h2 HEADERS padding overflow".into());
+                }
+                p = &p[..p.len() - pad];
                 if header_block.len() + p.len() > H2_MAX_HEADER_BLOCK {
                     return Err("h2 header block exceeds limit".into());
                 }
@@ -1077,6 +1112,7 @@ fn perform_request(
     let mut current_uri = uri.to_string();
     let mut current_method = method.to_string();
     let mut current_body = body.to_vec();
+    let mut current_headers = headers.to_vec();
     for _hop in 0..=10usize {
         let parsed = parse_uri(&current_uri)?;
         let key: PoolKey = (parsed.scheme.clone(), parsed.host.clone(), parsed.port);
@@ -1095,17 +1131,25 @@ fn perform_request(
         let mut conn = conn;
         let resp = match (&mut conn.kind, conn.is_http2) {
             (ConnKind::Tls(s), true) => {
-                let r = http2_request(s.as_mut(), &current_method, &parsed, headers, &current_body);
+                let r = http2_request(
+                    s.as_mut(),
+                    &current_method,
+                    &parsed,
+                    &current_headers,
+                    &current_body,
+                );
                 r
             }
             (ConnKind::Tls(s), false) => {
-                let req = build_http1_request(&current_method, &parsed, headers, &current_body);
+                let req =
+                    build_http1_request(&current_method, &parsed, &current_headers, &current_body);
                 s.write_all(&req).map_err(|e| format!("write: {e}"))?;
                 s.flush().map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(s.as_mut())
             }
             (ConnKind::Plain(t), _) => {
-                let req = build_http1_request(&current_method, &parsed, headers, &current_body);
+                let req =
+                    build_http1_request(&current_method, &parsed, &current_headers, &current_body);
                 t.write_all(&req).map_err(|e| format!("write: {e}"))?;
                 t.flush().map_err(|e| format!("flush: {e}"))?;
                 read_http1_response(t)
@@ -1145,6 +1189,21 @@ fn perform_request(
                         current_method = "GET".into();
                         current_body.clear();
                     }
+                    // On a redirect that crosses origins, strip sensitive
+                    // request headers before replaying them on the next hop.
+                    // Authorization, Proxy-Authorization, and Cookie carry
+                    // credentials scoped to the originating host; forwarding
+                    // them to a different host (or scheme/port) leaks them to
+                    // an unrelated server. This matches the JDK HttpClient
+                    // `RedirectFilter` behavior.
+                    if let Ok(next_parsed) = parse_uri(&absolute) {
+                        let same_origin = next_parsed.scheme == parsed.scheme
+                            && next_parsed.host.eq_ignore_ascii_case(&parsed.host)
+                            && next_parsed.port == parsed.port;
+                        if !same_origin {
+                            current_headers.retain(|(k, _)| !is_sensitive_redirect_header(k));
+                        }
+                    }
                     current_uri = absolute;
                     continue;
                 }
@@ -1154,6 +1213,14 @@ fn perform_request(
         }
     }
     Err("too many redirects".into())
+}
+
+/// Request headers that carry host-scoped credentials and must not be
+/// replayed across an origin change on a redirect.
+fn is_sensitive_redirect_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
 }
 
 // ---------------------------------------------------------------------------
@@ -1987,5 +2054,42 @@ mod http_client_tests {
         let (s, rest) = decode_hpack_string(&input).expect("huffman decode");
         assert_eq!(s, "www.example.com");
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_read_chunked_bounds_unterminated_size_line() {
+        // A size line that never contains a CRLF must be rejected once it grows
+        // past MAX_CHUNK_LINE instead of buffering without bound (DoS).
+        let mut prefix = Vec::new();
+        let stream_bytes = vec![b'0'; MAX_CHUNK_LINE + 4096];
+        let mut stream = std::io::Cursor::new(stream_bytes);
+        let err = read_chunked(&mut prefix, &mut stream).unwrap_err();
+        assert!(err.contains("size line"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_read_chunked_bounds_unterminated_trailer() {
+        // A zero chunk followed by trailer bytes that never terminate with a
+        // CRLF must be rejected once they exceed MAX_CHUNK_LINE.
+        let mut prefix = b"0\r\n".to_vec();
+        // No CRLF anywhere in the trailer stream.
+        let stream_bytes = vec![b'x'; MAX_CHUNK_LINE + 4096];
+        let mut stream = std::io::Cursor::new(stream_bytes);
+        let err = read_chunked(&mut prefix, &mut stream).unwrap_err();
+        assert!(err.contains("trailer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_is_sensitive_redirect_header() {
+        // Credential-bearing headers are flagged (case-insensitively) so they
+        // are stripped on a cross-origin redirect; ordinary headers are not.
+        assert!(is_sensitive_redirect_header("Authorization"));
+        assert!(is_sensitive_redirect_header("authorization"));
+        assert!(is_sensitive_redirect_header("Proxy-Authorization"));
+        assert!(is_sensitive_redirect_header("Cookie"));
+        assert!(is_sensitive_redirect_header("COOKIE"));
+        assert!(!is_sensitive_redirect_header("Accept"));
+        assert!(!is_sensitive_redirect_header("User-Agent"));
+        assert!(!is_sensitive_redirect_header("Content-Type"));
     }
 }
