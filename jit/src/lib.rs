@@ -5783,6 +5783,19 @@ pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
                 num_args += 1;
                 i += 1;
             }
+            // inc 28: a `long` arg is one i64 slot in the compact JIT ABI (the
+            // IR builder treats a long as one operand-stack node and the
+            // marshaller stores it as one i64), so it counts as one arg — same as
+            // an int/ref. Only reachable under `ir_emit_long` (producing a long
+            // requires a category-2 opcode → `method_uses_category2`), so this is
+            // inert for the default int/ref path. `double`/`float` args (XMM) are
+            // still rejected; a `long`/`double`/`float` RETURN is still rejected
+            // below (a `Long.MIN_VALUE` result would collide with the `i64::MIN`
+            // deopt sentinel — deferred to the out-of-band-signal fix).
+            b'J' => {
+                num_args += 1;
+                i += 1;
+            }
             b'L' => {
                 num_args += 1;
                 i += 1;
