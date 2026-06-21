@@ -1402,7 +1402,7 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
 }
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
-fn alloc_object_shared(
+pub(crate) fn alloc_object_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
     class_id: ClassId,

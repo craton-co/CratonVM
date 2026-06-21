@@ -849,6 +849,28 @@ pub fn jit_names_enabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_JIT_NAMES").is_some())
 }
 
+/// deopt-osr: master gate for *real* deopt-exit / OSR-exit resume
+/// (`CRATONVM_DEOPT_REAL`, default-OFF). Read-once cached. While OFF (the
+/// default) every guard/loop bail stays on the `i64::MIN` whole-method re-run,
+/// so the surface is inert. The interpreter deopt sinks and the OSR-exit sink
+/// consult this together with the per-method `can_deopt_resume` / `can_osr_exit`
+/// flags, so deopt-exit and OSR-exit can never run half-on
+/// (see `docs/feature-designs/deopt-osr.md`).
+pub fn deopt_real_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_REAL").is_some())
+}
+
+/// deopt-osr: CI/test gate for the eager-deopt differential verifier
+/// (`CRATONVM_DEOPT_VERIFY`, default-OFF). Read-once cached. When ON, every
+/// eligible guard/loop boundary deopts, reconstructs the interpreter frame, and
+/// compares the reconstructed-interpreter result against the JIT result — the
+/// mandatory check before any guard/loop family is flipped onto `deopt_real`.
+pub fn deopt_verify_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
+}
+
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
 /// unless `CRATONVM_DBG_JIT_NAMES` is set.
 pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
@@ -1025,6 +1047,27 @@ pub struct CompiledMethod {
     /// it is always safe to leave unset. Only ever consulted on the
     /// gated precise path (`CRATONVM_PRECISE_JIT_MAPS`).
     pub fully_oop_covered: bool,
+    /// deopt-osr scaffolding — `true` only once the deopt finalizer has
+    /// proven this method can rebuild a precise interpreter frame at a guard
+    /// bci and resume there (instead of the `i64::MIN` whole-method re-run).
+    /// `false` (the default) keeps the method on the safe re-run path; no
+    /// emitter populates it yet, so it is currently always `false`. Mirrors
+    /// the `fully_oop_covered` coverage-gate pattern: purely additive, no
+    /// behaviour change until the resume path is wired
+    /// (see `docs/feature-designs/deopt-osr.md`).
+    pub can_deopt_resume: bool,
+    /// deopt-osr scaffolding — `true` only once the OSR-exit map emitter has
+    /// proven this (OSR-compiled) method can leave a running JIT/OSR frame
+    /// mid-loop at a loop bci with the loop's live state, rather than the
+    /// `i64::MIN` re-run (which is *wrong* for an OSR'd frame entered partway
+    /// through). `false` by default; no emitter populates it yet.
+    pub can_osr_exit: bool,
+    /// deopt-osr scaffolding — monotonic compilation epoch for this artifact.
+    /// When `MakeNotEntrant` invalidation lands, boxed `DeoptimizationPoint`
+    /// pointers (baked into guard code) are versioned by this epoch so a
+    /// resume never follows a box belonging to a superseded compilation.
+    /// `0` for every artifact today (no invalidation consumer yet).
+    pub compilation_epoch: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1123,6 +1166,11 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            // deopt-osr scaffolding: default to the safe re-run path; no
+            // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
+            can_deopt_resume: false,
+            can_osr_exit: false,
+            compilation_epoch: 0,
         }
     }
 
@@ -1168,6 +1216,11 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            // deopt-osr scaffolding: default to the safe re-run path; no
+            // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
+            can_deopt_resume: false,
+            can_osr_exit: false,
+            compilation_epoch: 0,
         }
     }
 

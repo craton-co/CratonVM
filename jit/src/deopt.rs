@@ -49,6 +49,13 @@ pub enum DeoptReason {
     NotCompiled,
     /// Unreached code executed.
     UnreachedCode,
+    /// OSR-exit — a running JIT/OSR frame bailed mid-loop back to the
+    /// interpreter at a loop bci (not a guard bci). Distinct from
+    /// `UncommonTrap` so OSR-exit events are countable separately in the
+    /// `DeoptimizationLog`; for `recommend_action` policy it currently falls
+    /// through to the count-based default, exactly like `UncommonTrap`
+    /// (see `docs/feature-designs/deopt-osr.md`, scaffolding).
+    OsrExit,
 }
 
 /// What the runtime should do after a deopt.
@@ -91,6 +98,14 @@ pub enum FrameValue {
     StackSlotRef(i32),
     /// Scalar-replaced object that must be re-materialized.
     VirtualObject(VirtualObjectState),
+    /// A reference to another scalar-replaced object in the same deopt frame, by
+    /// its [`VirtualObjectState::id`]. Represents shared references and cycles:
+    /// each object is *defined* exactly once by its `VirtualObject(state)`
+    /// occurrence, and every other edge to it (including a back-edge that would
+    /// otherwise nest infinitely) is a `VirtualObjectRef(id)`. Materialization
+    /// resolves it to the shell allocated for that id in Phase 1; it never
+    /// resolves to a machine value, so `resolve_value` passes it through.
+    VirtualObjectRef(usize),
     /// Undefined / uninitialized.
     Undefined,
     /// A live slot whose precise value can't yet be reconstructed for resume
@@ -104,6 +119,11 @@ pub enum FrameValue {
 /// State of a scalar-replaced object that needs heap materialization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirtualObjectState {
+    /// Identity of this scalar-replaced object within its deopt frame. Distinct
+    /// objects have distinct ids; `FrameValue::VirtualObjectRef(id)` edges (and
+    /// the materializer's shell map) resolve against it, which is what lets the
+    /// two-phase materialization rebuild shared references and cycles.
+    pub id: usize,
     pub class_id: u32,
     pub num_fields: usize,
     pub field_values: Vec<FrameValue>,
@@ -744,7 +764,10 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
 /// deopt path before the GC-backed materialization above is implemented, this
 /// stub makes the mistake impossible to miss: it never returns a fabricated
 /// address — it panics. Replace it with the GC-allocating implementation
-/// described above when the live-deopt heap plumbing lands.
+/// described above when the live-deopt heap plumbing lands. The vm-side
+/// scaffolding (the `TempRootScope` GC-root primitive + the heap-threaded
+/// entry point) now lives in `cratonvm_vm::runtime::deopt_materialize`
+/// (deopt-osr Step 5/6).
 #[cfg(not(test))]
 pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
     // Hard guard: virtual-object re-materialization needs a live heap/allocator
@@ -1158,6 +1181,7 @@ mod tests {
     #[test]
     fn virtual_object_state_fields() {
         let vo = VirtualObjectState {
+            id: 0,
             class_id: 42,
             num_fields: 2,
             field_values: vec![FrameValue::Int(1), FrameValue::Object(0)],
@@ -1523,6 +1547,7 @@ mod tests {
             bci: 0,
             locals: vec![
                 FrameValue::VirtualObject(VirtualObjectState {
+                    id: 0,
                     class_id: 1,
                     num_fields: 1,
                     field_values: vec![FrameValue::Int(10)],
@@ -1530,6 +1555,7 @@ mod tests {
                 FrameValue::Int(5),
             ],
             stack: vec![FrameValue::VirtualObject(VirtualObjectState {
+                id: 1,
                 class_id: 2,
                 num_fields: 0,
                 field_values: Vec::new(),

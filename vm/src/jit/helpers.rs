@@ -4322,6 +4322,7 @@ impl DeoptimizationController {
                 cratonvm_jit::deopt::DeoptReason::SpeculationFailed => "SpeculationFailed",
                 cratonvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
                 cratonvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
+                cratonvm_jit::deopt::DeoptReason::OsrExit => "OsrExit",
             };
             let action_static: &'static str = match action {
                 cratonvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",

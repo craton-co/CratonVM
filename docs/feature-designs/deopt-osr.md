@@ -319,6 +319,46 @@ only); the **new** work in *this* doc is Steps 5–9.
    threshold is made not-entrant and the next call re-enters cleanly (no use of
    freed boxes); `DeoptimizationLog` reports the rate. *Risk:* med.
 
+## Progress (branch `feat/deopt-osr-scaffolding`)
+
+Landed and build-verified (`cargo check -p cratonvm-jit` + `-p cratonvm-vm`
+green; `cargo test -p cratonvm-vm --lib deopt_materialize` = 3 passed) on the
+feature branch. All additive and gated **unreachable in production**
+(`can_deopt_resume` stays `false`, so nothing resumes / OSR-exits yet):
+
+- **Scaffolding (partial).** `CompiledMethod` gains `can_deopt_resume` /
+  `can_osr_exit` / `compilation_epoch` (default `false`/`false`/`0`);
+  `DeoptReason::OsrExit`; the read-once `CRATONVM_DEOPT_REAL` /
+  `CRATONVM_DEOPT_VERIFY` gates (`jit::deopt_real_enabled` /
+  `deopt_verify_enabled`).
+- **Steps 5+6 — virtual-object re-materialization (two-phase, cycle-safe).** New
+  `vm/src/runtime/deopt_materialize.rs`: `TempRootScope` (RAII temporary GC-root
+  set over the thread's `native_pin_roots`) + `materialize_virtual_objects`.
+  *Phase 1* allocates + header-inits + **immediately-roots** a shell for every
+  distinct virtual object (by `VirtualObjectState::id`) reachable from the frame,
+  reading shell addresses back from the in-place-forwarded pin set after the
+  optional stress GC (correct under a moving collector). *Phase 2* fills each
+  shell's fields — primitive / already-real `Object` / nested `VirtualObject` /
+  `VirtualObjectRef` — GC-barrier-correct like `putfield` (SATB pre + post card
+  barrier), resolving shared/cyclic references via the Phase-1 shell map, then
+  rewrites the frame's top-level slots to real `Object`s. To make sharing/cycles
+  representable (the whole point of two-phase), the jit deopt model gained
+  `VirtualObjectState::id` + `FrameValue::VirtualObjectRef(id)`. The jit-crate
+  `materialize_virtual_objects` panic stub points here. Acceptance tests (live
+  VM): `shells_materialize_and_survive_forced_gc` (N shells survive a forced GC
+  while pinned), `materializes_primitive_and_object_fields` (field stores + frame
+  rewrite), `materializes_two_object_cycle` (A↔B materializes with the
+  cross-references wired, under stress GC).
+
+Not yet done: **Step 7+** (OSR-exit map emission + flip), the remaining
+scaffolding (the x64 `emit_osr_exit_map_at` / `osr_exit_points` emitter stub),
+and wiring materialization into the live resume path (flip `can_deopt_resume`
+for virtual-bearing frames behind `CRATONVM_DEOPT_REAL`). Steps 1–4 (the x64
+deopt-exit machinery in the companion x64-backport doc) remain the prerequisite
+for an *end-to-end* real deopt that would *produce* a virtual-bearing frame; the
+tests drive `materialize_virtual_objects` directly on synthetic frames rather
+than through a real guard deopt.
+
 ## Risks & open questions
 
 - **GC during materialization (Step 5/6).** A GC between shell allocations with
