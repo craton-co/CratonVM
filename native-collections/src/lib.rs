@@ -21080,9 +21080,25 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // `lhm_heap_backed` lock when there is nothing to walk. Behaviour is
     // identical: iterating an empty map invokes `f` zero times.
     //
+    // GC-CORRECTNESS (poison-recover): every overlay table lock below recovers
+    // its guard on a poisoned `Mutex` (`unwrap_or_else(|e| e.into_inner())`)
+    // rather than skipping the table on an `if let Ok(_)`. A `std::sync::Mutex`
+    // poisons when any thread panics while holding it; an `Ok`-only guard would
+    // then SILENTLY SKIP that overlay for the rest of the process. During a
+    // moving GC that means the table's backing-array `ObjectRef`s are neither
+    // rooted (root scan, `for_rooting=true`) NOR remapped (post-GC remap,
+    // `for_rooting=false`) — so the backing array is reclaimed or relocated out
+    // from under the still-live overlay → use-after-free on the next collection
+    // access. A GC must NEVER skip a root: a poisoned table's contents may be
+    // momentarily inconsistent, but a present (even stale) ref the collector can
+    // trace and relocate is categorically safer than a dropped root. `into_inner`
+    // always yields the protected map, so the scan/remap sees every table
+    // unconditionally.
+    //
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
-    if let Ok(mut ll) = ll_overlay().lock() {
+    {
+        let mut ll = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         for inner in ll.values_mut() {
             for v in inner.values_mut() {
                 if let Value::Object(Some(r)) = v {
@@ -21091,15 +21107,17 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
             }
         }
     }
-    if let Ok(mut lhm) = lhm_overlay().lock() {
+    {
+        let mut lhm = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if lhm.is_empty() {
             // Nothing to root/remap — skip without taking `lhm_heap_backed`.
         } else {
             // Hold the heap-backed set across the loop (lock order: heap_backed is
             // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
-            // sequentially, not nested — so this order can't deadlock).
+            // sequentially, not nested — so this order can't deadlock). Recover the
+            // guard on poison too, for the same reason as the outer tables.
             let hb = if for_rooting {
-                lhm_heap_backed().lock().ok()
+                Some(lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner()))
             } else {
                 None
             };
@@ -21118,7 +21136,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         } // end else (non-empty lhm)
     }
     // TreeMap array mode: backing `data` array + comparator.
-    if let Ok(mut tm) = tm_array_table().lock() {
+    {
+        let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in tm.values_mut() {
             if let Some(r) = &mut st.data {
                 f(r);
@@ -21131,7 +21150,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // TreeMap fast mode: the BTreeMap *is* the authoritative store (the array
     // slot is left empty), so its `Value::Object` values are reachable only
     // through this side-table.
-    if let Ok(mut tmf) = tm_fast_table().lock() {
+    {
+        let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
         for bt in tmf.values_mut() {
             for v in bt.values_mut() {
                 if let Value::Object(Some(r)) = v {
@@ -21141,7 +21161,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     // TreeSet array mode: backing `data` array + comparator.
-    if let Ok(mut ts) = ts_array_table().lock() {
+    {
+        let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in ts.values_mut() {
             if let Some(r) = &mut st.data {
                 f(r);
@@ -21155,7 +21176,10 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // held only in this side-table (the synthetic CSLM has no object slot for
     // it), so it is reachable only here — root + remap it like the TreeMap/
     // TreeSet comparators above so a moving GC keeps it live and repointed.
-    if let Ok(mut cmps) = cslm_comparator_table().lock() {
+    {
+        let mut cmps = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for r in cmps.values_mut() {
             f(r);
         }
