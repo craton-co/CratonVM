@@ -297,8 +297,56 @@ fn host_part(target: &str) -> &str {
 fn is_link_local_metadata_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_v4_link_local(v4),
-        IpAddr::V6(v6) => is_v6_link_local_or_metadata(v6),
+        IpAddr::V6(v6) => {
+            // SSRF FIX (2026-06-21): an IPv4-mapped IPv6 literal
+            // (`::ffff:a.b.c.d`) tunnels the v4 link-local block. Without
+            // unwrapping it here, `::ffff:169.254.169.254` (AWS IMDS) and
+            // `::ffff:169.254.170.2` (ECS task-role credentials) parse as
+            // `IpAddr::V6`, skip the v4 metadata check, and only reach
+            // `is_v6_link_local_or_metadata` — which matches fe80::/10 and
+            // `fd00:ec2::254` but NOT the mapped v4 range — so they reached
+            // the metadata service. Mirror `is_private_or_loopback_ip`:
+            // classify by the embedded v4 octets first. We also fold in the
+            // deprecated IPv4-compatible form (`::a.b.c.d`, RFC 4291
+            // §2.5.5.1) so that legacy representation can't slip the same
+            // block either.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_v4_link_local(&v4);
+            }
+            if let Some(v4) = v6_to_ipv4_compatible(v6) {
+                return is_v4_link_local(&v4);
+            }
+            is_v6_link_local_or_metadata(v6)
+        }
     }
+}
+
+/// Unwrap the deprecated IPv4-compatible IPv6 form `::a.b.c.d` (RFC 4291
+/// §2.5.5.1): the high 96 bits are zero and the low 32 bits hold an IPv4
+/// address. `std` has `to_ipv4_mapped` for `::ffff:a.b.c.d` but no direct
+/// accessor for the compatible form (`Ipv6Addr::to_ipv4` conflates the two
+/// and also matches `::1`/`::`), so we decode it explicitly here. Returns
+/// `None` for the unspecified (`::`) and loopback (`::1`) addresses, which
+/// are not link-local v4 tunnels and must fall through to the v6 classifier.
+fn v6_to_ipv4_compatible(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let segs = v6.segments();
+    // High 96 bits (segments 0..=5) must all be zero for the compatible form.
+    if segs[0..6].iter().any(|&s| s != 0) {
+        return None;
+    }
+    let v4 = Ipv4Addr::new(
+        (segs[6] >> 8) as u8,
+        (segs[6] & 0xff) as u8,
+        (segs[7] >> 8) as u8,
+        (segs[7] & 0xff) as u8,
+    );
+    // Exclude `::` (0.0.0.0) and `::1` (0.0.0.1) — these are the
+    // unspecified / loopback v6 addresses, not embedded v4 link-local
+    // tunnels; let the v6 classifier handle them.
+    if v4.is_unspecified() || v4 == Ipv4Addr::new(0, 0, 0, 1) {
+        return None;
+    }
+    Some(v4)
 }
 
 fn is_v4_link_local(v4: &Ipv4Addr) -> bool {
@@ -653,5 +701,76 @@ mod tests {
         let imds: IpAddr = "169.254.169.254".parse().unwrap();
         assert!(!is_private_or_loopback_ip(&imds));
         assert!(is_link_local_metadata_ip(&imds));
+    }
+
+    /// SSRF FIX (2026-06-21): IPv4-mapped IPv6 literals must NOT bypass the
+    /// always-on cloud-metadata / link-local block. `::ffff:169.254.169.254`
+    /// (AWS IMDS) and `::ffff:169.254.170.2` (ECS task-role creds) parse as
+    /// `IpAddr::V6` but tunnel a v4 link-local address — they previously
+    /// skipped the v4 check and were allowed through.
+    #[test]
+    fn link_local_block_unwraps_ipv4_mapped_v6() {
+        let blocked = [
+            "::ffff:169.254.169.254", // AWS / GCP / Azure IMDS
+            "::ffff:169.254.170.2",   // ECS task-role credentials
+            "::ffff:169.254.0.0",     // bottom of the /16
+            "::ffff:169.254.255.255", // top of the /16
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(
+                is_link_local_metadata_ip(&ip),
+                "IPv4-mapped link-local must be blocked: {s}"
+            );
+        }
+        // A mapped *public* v4 address must still be allowed (no false
+        // positive that would break legitimate IPv4-mapped connects).
+        let public_mapped: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_link_local_metadata_ip(&public_mapped));
+    }
+
+    /// The deprecated IPv4-compatible form `::a.b.c.d` (RFC 4291 §2.5.5.1)
+    /// must also be unwrapped — otherwise it is a second tunnel past the v4
+    /// link-local block. `::` and `::1` must NOT be misread as embedded v4.
+    #[test]
+    fn link_local_block_unwraps_ipv4_compatible_v6() {
+        // `::169.254.169.254` — note Rust formats embedded-v4 zeros-high as a
+        // bare v6 literal, so we build it from segments to be explicit.
+        let imds_compat = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe);
+        assert_eq!(
+            v6_to_ipv4_compatible(&imds_compat),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        assert!(is_link_local_metadata_ip(&IpAddr::V6(imds_compat)));
+
+        // A compatible *public* v4 (e.g. 8.8.8.8 == 0x0808:0808) is allowed.
+        let public_compat = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0808, 0x0808);
+        assert_eq!(
+            v6_to_ipv4_compatible(&public_compat),
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(public_compat)));
+
+        // `::` (unspecified) and `::1` (loopback) are not v4 tunnels.
+        assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::UNSPECIFIED), None);
+        assert_eq!(v6_to_ipv4_compatible(&Ipv6Addr::LOCALHOST), None);
+        // And they must not be classified as link-local metadata.
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!is_link_local_metadata_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    /// End-to-end: the default policy denies an IPv4-mapped IMDS literal in
+    /// both bracketed-with-port and bare forms — exactly the inputs that
+    /// previously slipped through the always-on block.
+    #[test]
+    fn default_policy_denies_ipv4_mapped_metadata() {
+        assert!(matches!(
+            default_policy("[::ffff:169.254.169.254]:80"),
+            PolicyDecision::Deny(_)
+        ));
+        assert!(matches!(
+            default_policy("::ffff:169.254.170.2"),
+            PolicyDecision::Deny(_)
+        ));
     }
 }
