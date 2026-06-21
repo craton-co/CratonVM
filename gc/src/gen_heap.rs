@@ -720,6 +720,53 @@ impl GenerationalHeap {
         }
     }
 
+    /// Fallible twin of [`alloc_object`]: walks the identical
+    /// young → old-gen spill path, but returns `None` instead of aborting the
+    /// process when both generations are exhausted (or the size overflows).
+    /// This lets a *native*/JIT caller surface a catchable
+    /// `java.lang.OutOfMemoryError` ("Java heap space") rather than the VM
+    /// hard-aborting in [`alloc_young`]. Like `alloc_object` it performs no GC,
+    /// so it is safe to call from a context holding unrooted local `ObjectRef`s
+    /// (the JIT object-alloc helper GC-and-retries before calling this).
+    pub fn try_alloc_object_full(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let num_slots_u32 = u32::try_from(num_fields).ok()?;
+
+        // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
+        // reporting OOM — mirrors `alloc_object`, but returns `None` instead of
+        // aborting in `alloc_young` when old gen is also full (the divergence).
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
+                    return Some(obj);
+                }
+                return None;
+            }
+        };
+
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            num_slots_u32,
+        );
+        // SAFETY: identical invariants to `alloc_object` — `ptr` is a freshly
+        // bump-allocated, exclusively-owned, zeroed region of `total_size` bytes
+        // with 8-byte alignment, so writing the header and wrapping it in an
+        // `ObjectRef` are sound.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
     /// Allocate a new Java object and initialize primitive-typed slots to
     /// their spec-mandated typed zero based on `descriptor_bytes`.
     ///

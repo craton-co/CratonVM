@@ -1138,17 +1138,20 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // 32 bits of a valid length are always 0 (or all-1 for negative, which becomes
     // a NegativeArraySizeException — JIT codegen ensures bounds-checked path).
     let length = length as i32 as i64;
-    if length < 0 {
-        // Negative length — would-be NegativeArraySizeException. JIT codegen
-        // is responsible for the proper throw; here we return 0 to prevent
-        // the GC abort from a huge cast-to-usize.
-        return 0;
-    }
     if vm_ptr == 0 {
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if length < 0 {
+        // Negative length → NegativeArraySizeException (JLS). Stash it in the
+        // pending-exception channel and return the 0/null sentinel; the
+        // `newarray` codegen's `emit_post_alloc_oom_check` bail then routes it
+        // through the method's exception table (catchable), matching the
+        // interpreter / HotSpot. The cast-to-usize below would otherwise turn
+        // a negative length into a huge allocation request.
+        return jit_negative_array_size(vm, length);
+    }
     let heap = &vm.heap;
     // Try allocation; if young gen exhausted, run GC and retry.
     //
@@ -1243,25 +1246,24 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
     jit_alloc_oom(vm, &format!("Java heap space (alloc_array length {})", length))
 }
 
-/// Shared OOM signal for a fallible JIT allocation helper (currently
-/// `jit_newarray` — the only one that allocates via the fallible
-/// `try_alloc_array` and so can report exhaustion rather than aborting). On heap
-/// exhaustion the helper stashes a `java/lang/OutOfMemoryError` in
-/// `JIT_PENDING_EXCEPTION` and returns the `0`/null sentinel; the `newarray`
-/// codegen site null-checks the result and bails to the shared exception stub
-/// (`emit_post_alloc_oom_check` in `x64.rs`, which also forces the method
-/// `has_dispatch`), after which the interpreter's general-exception drain on the
-/// dispatch-aware return path routes the OOME through the method's exception
-/// table — giving a JIT'd `newarray` the same catchable-OOM semantics as the
-/// interpreter's `gc_alloc_array`, instead of the old SIGSEGV (null deref of the
-/// result). If the OOME object itself cannot be constructed (heap too exhausted
-/// to even allocate the throwable), the flag is left unset and `0` returned —
-/// the legacy behaviour, never worse.
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
+/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
+/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
+/// returns the `0`/null sentinel; the alloc codegen site null-checks the result
+/// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
+/// `x64.rs`, which also forces the method `has_dispatch`), after which the
+/// interpreter's general-exception drain on the dispatch-aware return path routes
+/// the OOME through the method's exception table — giving a JIT'd allocation the
+/// same catchable-OOM semantics as the interpreter's `gc_alloc_array` /
+/// `gc_alloc_object`, instead of the old SIGSEGV (null deref of the result) or
+/// hard `alloc_young` abort. The object/array helpers go through the
+/// `*_full` fallible paths so the old-generation spill of the non-fallible
+/// `alloc_object` / `alloc_array` is preserved before OOM is reported.
 ///
-/// `jit_new_object` / `jit_anewarray_object` still allocate via the non-fallible
-/// `alloc_object` / `alloc_array` (which fall back to the old generation before a
-/// hard abort) — converting them to catchable OOM needs a fallible-with-old-gen
-/// path and is a separate follow-up; they are NOT wired to this helper.
+/// If the OOME object itself cannot be constructed (heap too exhausted to even
+/// allocate the throwable), the flag is left unset and `0` returned — the legacy
+/// behaviour, never worse.
 #[cold]
 fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
@@ -1270,6 +1272,31 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
             thread,
             "java/lang/OutOfMemoryError",
             Some(msg),
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    0
+}
+
+/// Negative-array-length signal for the fallible JIT array helpers
+/// (`jit_newarray` / `jit_anewarray_object`). JLS requires
+/// `java.lang.NegativeArraySizeException` (message = the offending length) for
+/// `new T[n]` with `n < 0`. Mirroring `jit_alloc_oom`, this stashes the
+/// exception in `JIT_PENDING_EXCEPTION` and returns the `0`/null sentinel; the
+/// shared `emit_post_alloc_oom_check` bail then routes it through the method's
+/// exception table (catchable), matching HotSpot and the interpreter. Reusing
+/// the same channel + bail means no extra codegen is needed for the negative
+/// case. As with OOM, if the exception object cannot be built the flag is left
+/// unset and `0` returned.
+#[cold]
+fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/NegativeArraySizeException",
+            Some(&length.to_string()),
         ) {
             set_jit_pending_exception(exc);
         }
@@ -1439,7 +1466,17 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         }
     }
 
-    let obj_ref = heap.alloc_object(class_id, num_fields as usize);
+    // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
+    // on exhaustion surface a catchable OutOfMemoryError instead of the hard
+    // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
+    // on the 0/null sentinel and routes the OOME through the method's exception
+    // table (matching the interpreter's gc_alloc_object).
+    let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) else {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
+        );
+    };
     // Initialize primitive-typed fields to proper JVM default values.
     // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
     jit_init_primitive_fields(vm, obj_ref, class_id);
@@ -1517,17 +1554,18 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // JLS only allows `int` array lengths; defensive against JIT slot patterns
     // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
     let length = length as i32 as i64;
-    if length < 0 {
-        // Negative length — would-be NegativeArraySizeException. JIT codegen
-        // is responsible for the proper throw; here we return 0 to prevent
-        // the GC abort from a huge cast-to-usize.
-        return 0;
-    }
     if vm_ptr == 0 {
         return 0;
     }
     // SAFETY: vm_ptr is a valid SharedVm pointer per the caller contract.
     let vm = &*(vm_ptr as *const SharedVm);
+    if length < 0 {
+        // Negative length → NegativeArraySizeException (JLS). See `jit_newarray`:
+        // stash it in the pending-exception channel + return the 0/null sentinel
+        // so the `anewarray` codegen's emit_post_alloc_oom_check bail routes it
+        // through the method's exception table (catchable).
+        return jit_negative_array_size(vm, length);
+    }
     let heap = &vm.heap;
     let class_id = ClassId::new(component_class_id_raw as u32);
 
@@ -1547,7 +1585,18 @@ pub unsafe extern "C" fn jit_anewarray_object(
         }
     }
 
-    let arr = heap.alloc_array(class_id, ArrayElementType::Reference, length as usize);
+    // Fallible young → humongous/old-gen alloc (preserves alloc_array's spill);
+    // on exhaustion surface a catchable OutOfMemoryError instead of the hard
+    // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
+    // bails on the 0/null sentinel and routes the OOME through the method's
+    // exception table (matching the interpreter's gc_alloc_array).
+    let Some(arr) = heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+    else {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+        );
+    };
     arr.as_ptr() as i64
 }
 
