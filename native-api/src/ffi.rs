@@ -570,6 +570,41 @@ impl UpcallTable {
             slot.generation = self.next_generation;
         }
     }
+
+    /// Collect every live entry's callback `target` as a GC root.
+    ///
+    /// MOVING-GC FIX: each occupied slot holds a `target: ObjectRef` to the Java
+    /// callback object. The legacy Java-side dispatch path (`pe_upcall_invoke`)
+    /// reads this `target` and invokes it, so it must be kept alive AND rewritten
+    /// across relocations. Without scanning it here (and remapping it in
+    /// [`update_after_gc`]) a moving collector could free or relocate the target
+    /// out from under a still-registered upcall, leaving the dispatch path
+    /// holding a stale/dangling pointer.
+    pub fn collect_roots(&self, out: &mut Vec<ObjectRef>) {
+        for slot in &self.slots {
+            if let Some(entry) = &slot.entry {
+                if entry.target.as_ptr() as usize != 0 {
+                    out.push(entry.target);
+                }
+            }
+        }
+    }
+
+    /// Apply a GC pointer map: rewrite each live entry's callback `target` to its
+    /// post-relocation address. Counterpart to [`collect_roots`](Self::collect_roots).
+    pub fn update_after_gc(&mut self, pointer_map: &std::collections::HashMap<usize, usize>) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        for slot in &mut self.slots {
+            if let Some(entry) = &mut slot.entry {
+                let old = entry.target.as_ptr() as usize;
+                if let Some(&new) = pointer_map.get(&old) {
+                    entry.target = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+        }
+    }
 }
 
 impl Default for UpcallTable {
@@ -1109,6 +1144,63 @@ mod tests {
     fn upcall_get_out_of_bounds_none() {
         let table = UpcallTable::new();
         assert!(table.get(100).is_none());
+    }
+
+    #[test]
+    fn upcall_collect_roots_yields_live_targets() {
+        let mut table = UpcallTable::new();
+        let a = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
+        let b = unsafe { ObjectRef::from_raw(0x2000 as *mut u8) };
+        let s0 = table.register(UpcallEntry {
+            target: a,
+            method_name: "a".into(),
+            method_descriptor: String::new(),
+            param_kinds: vec![],
+            return_kind: -1,
+        });
+        table.register(UpcallEntry {
+            target: b,
+            method_name: "b".into(),
+            method_descriptor: String::new(),
+            param_kinds: vec![],
+            return_kind: -1,
+        });
+        let mut roots = Vec::new();
+        table.collect_roots(&mut roots);
+        assert!(roots.contains(&a));
+        assert!(roots.contains(&b));
+        assert_eq!(roots.len(), 2);
+
+        // A removed (vacated) slot contributes no root.
+        table.remove(s0);
+        let mut roots2 = Vec::new();
+        table.collect_roots(&mut roots2);
+        assert_eq!(roots2, vec![b]);
+    }
+
+    #[test]
+    fn upcall_update_after_gc_remaps_target() {
+        // MOVING-GC FIX: a relocating collection must rewrite each live slot's
+        // callback target so the legacy `pe_upcall_invoke` dispatch resolves the
+        // object's CURRENT address, not the stale from-space pointer.
+        let mut table = UpcallTable::new();
+        let old = unsafe { ObjectRef::from_raw(0x3000 as *mut u8) };
+        let new_addr = 0x9000usize;
+        table.register(UpcallEntry {
+            target: old,
+            method_name: "moved".into(),
+            method_descriptor: String::new(),
+            param_kinds: vec![],
+            return_kind: -1,
+        });
+        let mut pm = std::collections::HashMap::new();
+        pm.insert(old.as_ptr() as usize, new_addr);
+        table.update_after_gc(&pm);
+        assert_eq!(table.get(0).unwrap().target.as_ptr() as usize, new_addr);
+
+        // An empty pointer map (non-moving collection) leaves the target intact.
+        table.update_after_gc(&std::collections::HashMap::new());
+        assert_eq!(table.get(0).unwrap().target.as_ptr() as usize, new_addr);
     }
 
     // -----------------------------------------------------------------------
