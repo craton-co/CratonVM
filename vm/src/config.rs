@@ -12,6 +12,30 @@ pub enum GcAlgorithm {
     G1,
 }
 
+/// Map a garbage-collector selector name to a supported [`GcAlgorithm`].
+///
+/// The input is the collector identifier from a HotSpot `-XX:+Use<name>GC`
+/// flag with the `Use`/`GC` wrapper already stripped (e.g. `"G1"`,
+/// `"Generational"`), matched case-insensitively with surrounding whitespace
+/// trimmed. Returns:
+///
+/// - `Some(GcAlgorithm::G1)` for `g1`,
+/// - `Some(GcAlgorithm::Generational)` for `generational`,
+/// - `None` for collectors CratonVM does not implement (`Serial`, `Parallel`,
+///   `Z`, `Shenandoah`, `Epsilon`) or any unrecognized name.
+///
+/// On `None` the launcher warns and falls back to the default `Generational`
+/// collector. HotSpot instead errors on an unknown `-XX:+Use*GC`; CratonVM is
+/// deliberately lenient so a `java` drop-in keeps booting — see
+/// `docs/feature-designs/concurrent-gc-maturation.md` §3.1.
+pub fn parse_gc_algorithm(name: &str) -> Option<GcAlgorithm> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "g1" => Some(GcAlgorithm::G1),
+        "generational" => Some(GcAlgorithm::Generational),
+        _ => None,
+    }
+}
+
 /// Configuration for the JVM instance.
 ///
 /// Mirrors common JVM `-X` flags and provides defaults suitable for development.
@@ -187,6 +211,17 @@ pub struct VmConfig {
     /// auto-size heap and thread pools inside Docker/Kubernetes.
     pub use_container_support: bool,
 
+    /// Effective processor count to report from `Runtime.availableProcessors()`
+    /// and the JMX `OperatingSystemMXBean`, derived from the cgroup CPU
+    /// quota/period when running under `-XX:+UseContainerSupport`.
+    ///
+    /// `None` (the default) means "report the host hardware thread count".
+    /// The launcher sets this from `container::detect_container()` only when
+    /// container support is enabled, so the `-XX:-UseContainerSupport` toggle is
+    /// honored transitively (disabled → left `None` → host count). Embedding-API
+    /// callers may set it directly to pin a count.
+    pub container_effective_processors: Option<u32>,
+
     /// HotSpot `-XX:±ShowCodeDetailsInExceptionMessages` (JEP 358). When
     /// `true`, the interpreter routes the *non-invoke* null-deref opcodes
     /// (getfield/putfield/arraylength/array-access/monitor/athrow) through the
@@ -350,6 +385,7 @@ impl Default for VmConfig {
             heap_dump_on_oom: false,
             heap_dump_path: None,
             use_container_support: true,
+            container_effective_processors: None,
             // JEP 358: default ON to match HotSpot (messages verified
             // byte-identical). Opt out via -XX:-ShowCodeDetailsInExceptionMessages.
             show_code_details_in_exception_messages: true,
@@ -913,6 +949,39 @@ mod tests {
         assert!(config.boot_classpath.is_empty());
         assert!(config.ext_classpath.is_empty());
         assert!(config.java_home.is_none());
+        // Generational is the default and the safety net during G1 maturation.
+        assert_eq!(config.gc_algorithm, GcAlgorithm::Generational);
+    }
+
+    #[test]
+    fn parse_gc_algorithm_supported() {
+        assert_eq!(parse_gc_algorithm("g1"), Some(GcAlgorithm::G1));
+        assert_eq!(parse_gc_algorithm("G1"), Some(GcAlgorithm::G1));
+        assert_eq!(
+            parse_gc_algorithm("Generational"),
+            Some(GcAlgorithm::Generational)
+        );
+        // Case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(
+            parse_gc_algorithm("  gEnErAtIoNaL  "),
+            Some(GcAlgorithm::Generational)
+        );
+    }
+
+    #[test]
+    fn parse_gc_algorithm_unsupported_is_none() {
+        // Known HotSpot collectors CratonVM does not implement → None so the
+        // launcher warns and falls back to Generational.
+        for name in ["Serial", "Parallel", "Z", "Shenandoah", "Epsilon"] {
+            assert_eq!(
+                parse_gc_algorithm(name),
+                None,
+                "{name} should be unsupported"
+            );
+        }
+        // Garbage / empty input is also None.
+        assert_eq!(parse_gc_algorithm("nonsense"), None);
+        assert_eq!(parse_gc_algorithm(""), None);
     }
 
     #[test]

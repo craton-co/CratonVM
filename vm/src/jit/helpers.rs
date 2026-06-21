@@ -1138,17 +1138,20 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // 32 bits of a valid length are always 0 (or all-1 for negative, which becomes
     // a NegativeArraySizeException — JIT codegen ensures bounds-checked path).
     let length = length as i32 as i64;
-    if length < 0 {
-        // Negative length — would-be NegativeArraySizeException. JIT codegen
-        // is responsible for the proper throw; here we return 0 to prevent
-        // the GC abort from a huge cast-to-usize.
-        return 0;
-    }
     if vm_ptr == 0 {
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if length < 0 {
+        // Negative length → NegativeArraySizeException (JLS). Stash it in the
+        // pending-exception channel and return the 0/null sentinel; the
+        // `newarray` codegen's `emit_post_alloc_oom_check` bail then routes it
+        // through the method's exception table (catchable), matching the
+        // interpreter / HotSpot. The cast-to-usize below would otherwise turn
+        // a negative length into a huge allocation request.
+        return jit_negative_array_size(vm, length);
+    }
     let heap = &vm.heap;
     // Try allocation; if young gen exhausted, run GC and retry.
     //
@@ -1208,6 +1211,12 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // StopTheWorldToken.)
         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
     }
+    // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
+    // full of live objects — surface OOM now instead of limping on slivers
+    // (death-spiral). Mirrors the interpreter's alloc paths.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_newarray_oom(vm, length as usize);
+    }
     // Retry after GC. On a second failure the heap is genuinely exhausted —
     // surface a catchable `java/lang/OutOfMemoryError` exactly as the
     // interpreter's `gc_alloc_array` does, instead of the old non-fallible
@@ -1222,16 +1231,17 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
 /// `java/lang/OutOfMemoryError`, mirroring the interpreter's `gc_alloc_array`
 /// (runtime/interpreter.rs:853) OOM arm.
 ///
-/// The `newarray` codegen site (`jit/src/x64.rs` ~16349) has no `i64::MIN`
-/// deopt guard — it pushes RAX straight onto the operand stack — so unlike
-/// the invoke-dispatch helpers we cannot signal via the deopt sentinel.
-/// Instead we use the same channel the void-return store helpers
-/// (`jit_iastore` etc.) use for null-array NPEs: stash the throwable in
-/// `JIT_PENDING_EXCEPTION` and return the `0`/null sentinel. The interpreter's
-/// post-JIT drain (runtime/interpreter.rs:14079) calls
-/// `take_jit_pending_exception()` on *every* JIT return path and routes the
+/// The `newarray` codegen site (`emit_post_alloc_oom_check` in `jit/src/x64.rs`)
+/// null-checks RAX and, on the `0`/null OOM sentinel, bails to the shared
+/// exception stub (returning the `i64::MIN` deopt sentinel + running the
+/// epilogue). We stash the throwable in `JIT_PENDING_EXCEPTION` (the same
+/// channel the void-return store helpers use for null-array NPEs) and the
+/// interpreter's post-JIT general-exception drain
+/// (`take_jit_pending_exception()` on the dispatch-aware return path) routes the
 /// OOME through the JIT'd method's own exception table, giving a JIT'd
-/// `newarray` identical catchable-OOM semantics to the interpreter.
+/// `newarray` identical catchable-OOM semantics to the interpreter. The bail
+/// also forces the method `has_dispatch` (`emitted_alloc_oom_check` in `x64.rs`)
+/// so that drain runs AND so `jit_thread_mut()` below is non-null.
 ///
 /// If the OOME object itself cannot be constructed (e.g. the heap is too
 /// exhausted to even allocate the throwable), we fall back to leaving the
@@ -1239,13 +1249,68 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
 /// purely additive and never makes a previously-handled case worse.
 #[cold]
 fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
+    jit_alloc_oom(vm, &format!("Java heap space (alloc_array length {})", length))
+}
+
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
+/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
+/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
+/// returns the `0`/null sentinel; the alloc codegen site null-checks the result
+/// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
+/// `x64.rs`, which also forces the method `has_dispatch`), after which the
+/// interpreter's general-exception drain on the dispatch-aware return path routes
+/// the OOME through the method's exception table — giving a JIT'd allocation the
+/// same catchable-OOM semantics as the interpreter's `gc_alloc_array` /
+/// `gc_alloc_object`, instead of the old SIGSEGV (null deref of the result) or
+/// hard `alloc_young` abort. The object/array helpers go through the
+/// `*_full` fallible paths so the old-generation spill of the non-fallible
+/// `alloc_object` / `alloc_array` is preserved before OOM is reported.
+///
+/// If a fresh OOME object cannot be constructed (heap too exhausted to even
+/// allocate the throwable / its message), fall back to the pre-allocated
+/// singleton `OutOfMemoryError` (`SharedVm::singleton_oom`) so the OOM stays
+/// catchable on a 100%-full heap instead of the materialization hard-aborting.
+/// If the singleton is also absent (pre-allocation hasn't run yet), the flag is
+/// left unset and `0` returned — the legacy behaviour, never worse.
+#[cold]
+fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
-        let msg = format!("Java heap space (alloc_array length {})", length);
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
             thread,
             "java/lang/OutOfMemoryError",
-            Some(&msg),
+            Some(msg),
+        ) {
+            set_jit_pending_exception(exc);
+            return 0;
+        }
+    }
+    // Fresh creation failed (or no JIT thread) — use the pre-allocated singleton.
+    if let Some(oom) = *vm.singleton_oom.read() {
+        set_jit_pending_exception(oom);
+    }
+    0
+}
+
+/// Negative-array-length signal for the fallible JIT array helpers
+/// (`jit_newarray` / `jit_anewarray_object`). JLS requires
+/// `java.lang.NegativeArraySizeException` (message = the offending length) for
+/// `new T[n]` with `n < 0`. Mirroring `jit_alloc_oom`, this stashes the
+/// exception in `JIT_PENDING_EXCEPTION` and returns the `0`/null sentinel; the
+/// shared `emit_post_alloc_oom_check` bail then routes it through the method's
+/// exception table (catchable), matching HotSpot and the interpreter. Reusing
+/// the same channel + bail means no extra codegen is needed for the negative
+/// case. As with OOM, if the exception object cannot be built the flag is left
+/// unset and `0` returned.
+#[cold]
+fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/NegativeArraySizeException",
+            Some(&length.to_string()),
         ) {
             set_jit_pending_exception(exc);
         }
@@ -1415,7 +1480,25 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         }
     }
 
-    let obj_ref = heap.alloc_object(class_id, num_fields as usize);
+    // GC-overhead limit (see jit_newarray): bail to catchable OOM if forced GCs
+    // keep freeing almost nothing, instead of death-spiralling on slivers.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
+        );
+    }
+    // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
+    // on exhaustion surface a catchable OutOfMemoryError instead of the hard
+    // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
+    // on the 0/null sentinel and routes the OOME through the method's exception
+    // table (matching the interpreter's gc_alloc_object).
+    let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) else {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
+        );
+    };
     // Initialize primitive-typed fields to proper JVM default values.
     // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
     jit_init_primitive_fields(vm, obj_ref, class_id);
@@ -1493,17 +1576,18 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // JLS only allows `int` array lengths; defensive against JIT slot patterns
     // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
     let length = length as i32 as i64;
-    if length < 0 {
-        // Negative length — would-be NegativeArraySizeException. JIT codegen
-        // is responsible for the proper throw; here we return 0 to prevent
-        // the GC abort from a huge cast-to-usize.
-        return 0;
-    }
     if vm_ptr == 0 {
         return 0;
     }
     // SAFETY: vm_ptr is a valid SharedVm pointer per the caller contract.
     let vm = &*(vm_ptr as *const SharedVm);
+    if length < 0 {
+        // Negative length → NegativeArraySizeException (JLS). See `jit_newarray`:
+        // stash it in the pending-exception channel + return the 0/null sentinel
+        // so the `anewarray` codegen's emit_post_alloc_oom_check bail routes it
+        // through the method's exception table (catchable).
+        return jit_negative_array_size(vm, length);
+    }
     let heap = &vm.heap;
     let class_id = ClassId::new(component_class_id_raw as u32);
 
@@ -1523,7 +1607,26 @@ pub unsafe extern "C" fn jit_anewarray_object(
         }
     }
 
-    let arr = heap.alloc_array(class_id, ArrayElementType::Reference, length as usize);
+    // GC-overhead limit (see jit_newarray): bail to catchable OOM if forced GCs
+    // keep freeing almost nothing, instead of death-spiralling on slivers.
+    if crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+        );
+    }
+    // Fallible young → humongous/old-gen alloc (preserves alloc_array's spill);
+    // on exhaustion surface a catchable OutOfMemoryError instead of the hard
+    // abort in alloc_young. The `anewarray` codegen's emit_post_alloc_oom_check
+    // bails on the 0/null sentinel and routes the OOME through the method's
+    // exception table (matching the interpreter's gc_alloc_array).
+    let Some(arr) = heap.try_alloc_array_full(class_id, ArrayElementType::Reference, length as usize)
+    else {
+        return jit_alloc_oom(
+            vm,
+            &format!("Java heap space (anewarray component {component_class_id_raw} length {length})"),
+        );
+    };
     arr.as_ptr() as i64
 }
 
@@ -2012,7 +2115,10 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         eprintln!("[JIT-PFI] obj=0x{:x} class_id={} field_index={} val=0x{:x} (val_as_i32={}) prev_value={:?}",
             obj_ptr as usize, cid, field_index, val as u64, val as i32, existing);
     }
-    std::ptr::write(ptr as *mut Value, Value::Int(val as i32));
+    // Atomic per-word store: the concurrent GC marker may read this 16-byte
+    // slot at the same time (it scans object fields concurrently). See
+    // `cratonvm_types::write_value_atomic`.
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Int(val as i32));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2029,7 +2135,9 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Long(val));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Long(val));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2046,7 +2154,9 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2063,7 +2173,9 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -2151,12 +2263,15 @@ pub unsafe extern "C" fn jit_putfield_object(
     // `GarbageCollector::write_barrier_pre` trait alias lands, this call
     // should migrate to it so the debug-build (pre, store, post) triad
     // assertion in `gc/src/vm_heap.rs` can validate slot-identity pairing.
-    let old_value: Value = std::ptr::read(ptr as *const Value);
+    // Atomic per-word read/write: the slot is read concurrently by the GC
+    // marker and (possibly) written by another mutator thread; pair both ends
+    // through the atomic helpers so the access is well-defined and tear-free.
+    let old_value: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
     if let Value::Object(Some(_)) = old_value {
         let heap = heap_from_vm(vm_ptr);
         heap.satb_barrier(old_value);
     }
-    std::ptr::write(ptr as *mut Value, value);
+    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
         heap.write_barrier(obj_ref, value);
@@ -4219,6 +4334,7 @@ impl DeoptimizationController {
                 cratonvm_jit::deopt::DeoptReason::SpeculationFailed => "SpeculationFailed",
                 cratonvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
                 cratonvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
+                cratonvm_jit::deopt::DeoptReason::OsrExit => "OsrExit",
             };
             let action_static: &'static str = match action {
                 cratonvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",

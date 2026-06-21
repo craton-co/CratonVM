@@ -476,6 +476,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratonvm-difftest"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cratonvm-embed"
 version = "0.3.0"
 dependencies = [

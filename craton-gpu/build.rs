@@ -234,7 +234,7 @@ fn resolve_java_root() -> PathBuf {
         if win_default.is_dir() {
             return win_default;
         }
-        return win_default;
+        win_default
     }
     // Non-Windows: return the portable sibling path (which does not exist
     // here, by the check above) so the warning names a sensible relative
@@ -263,11 +263,10 @@ fn collect_java(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
             collect_java(&path, out)?;
-        } else if ftype.is_file() {
-            if path.extension().map(|e| e == "java").unwrap_or(false) {
+        } else if ftype.is_file()
+            && path.extension().map(|e| e == "java").unwrap_or(false) {
                 out.push(path);
             }
-        }
     }
     Ok(())
 }

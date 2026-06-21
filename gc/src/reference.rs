@@ -320,8 +320,10 @@ impl ReferenceProcessor {
     /// Process all reference types in HotSpot order.
     ///
     /// This is the legacy entry point: it has no access to a heap-graph
-    /// tracing primitive, so it can only mark the *direct* finalizer referents
-    /// as live before clearing soft/weak refs (see
+    /// tracing primitive, so it can only keep the *direct* finalizer referents
+    /// (for soft+weak clearing) and the *direct* surviving soft referents (for
+    /// weak clearing, per the JLS soft > weak ordering) alive — the deeper
+    /// transitive cases need a caller-supplied tracer (see
     /// [`Self::process_references_with_finalizer_trace`] for the full
     /// transitive closure and a discussion of the residual gap).
     pub fn process_references(
@@ -339,7 +341,8 @@ impl ReferenceProcessor {
     }
 
     /// Process all reference types in HotSpot order, recomputing the
-    /// finalizer-reachable closure before soft/weak refs are cleared.
+    /// finalizer-reachable closure before soft/weak refs are cleared and the
+    /// soft-reachable closure before weak refs are cleared.
     ///
     /// SECURITY FIX (V18): spec-conformance. Previously, Phase 1 (soft) and
     /// Phase 2 (weak) cleared references using a single `is_marked` snapshot
@@ -348,6 +351,15 @@ impl ReferenceProcessor {
     /// in this same cycle could therefore observe an already-nulled
     /// weak/soft referent. HotSpot avoids this by treating the
     /// finalizer-reachable set as live during weak/soft processing.
+    ///
+    /// SPEC FIX (JLS reachability ordering): Phase 2 (weak) additionally
+    /// honours the *soft*-reachable closure. Per the JLS strength ordering
+    /// (strong > soft > weak > phantom), a weak reference must not be cleared
+    /// while its referent is still softly reachable — i.e. reachable from a
+    /// soft referent that Phase 1 chose to retain. Previously a weak ref to an
+    /// object kept alive only via a surviving soft reference was wrongly
+    /// cleared. We now re-trace from the surviving (uncleared) soft referents
+    /// after Phase 1 and fold that closure into the weak-clearing predicate.
     ///
     /// `trace_from`, when supplied, is the heap's "mark + trace from a set of
     /// roots" primitive: given the finalizer roots (the referents of finalizer
@@ -404,15 +416,53 @@ impl ReferenceProcessor {
             finalizer_roots.iter().copied().collect()
         };
 
-        // Augmented liveness predicate used for Phases 1-2 only: an object is
-        // "live" if the collector already marked it OR it is reachable from a
-        // to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
+        // Augmented liveness predicate used for Phase 1 (soft) only: an object
+        // is "live" if the collector already marked it OR it is reachable from
+        // a to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
         // snapshot so finalizers/phantoms are still discovered correctly.
-        let is_live = |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
+        let soft_is_live =
+            |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
 
-        // Phase 1-2 (soft, weak) honour the finalizer-reachable closure.
-        self.process_soft_refs(&is_live, free_heap_mb, current_time_ms);
-        self.process_weak_refs(&is_live);
+        // Phase 1 (soft) honours the finalizer-reachable closure.
+        self.process_soft_refs(&soft_is_live, free_heap_mb, current_time_ms);
+
+        // SPEC FIX (JLS reachability ordering, strong > soft > weak > phantom):
+        // weak references must NOT be cleared for a referent that is still
+        // softly reachable. A soft referent that survived Phase 1 keeps
+        // everything strongly reachable *from it* alive with respect to the
+        // weaker reference levels; clearing a weak ref to such an object
+        // (whether the object is itself a surviving soft referent, or is only
+        // reachable through one) would violate the ordering — HotSpot keeps the
+        // soft-reachable set live across weak processing.
+        //
+        // Roots are the referents of soft references that Phase 1 left
+        // uncleared (and which are not already enqueued/cleared from a prior
+        // cycle). With a tracer we fold the full transitive closure from those
+        // roots into the weak-clearing liveness predicate; without one we fall
+        // back to keeping the direct surviving soft referents alive (single
+        // hop), which still protects a weak ref pointing straight at a retained
+        // soft referent. The deeper, tracer-less transitive case is the same
+        // documented residual gap as the finalizer closure above.
+        let soft_survivor_roots: Vec<usize> = self
+            .soft_refs
+            .iter()
+            .filter(|e| !e.cleared && !e.enqueued)
+            .map(|e| e.referent)
+            .collect();
+        let soft_live: HashSet<usize> = if soft_survivor_roots.is_empty() {
+            HashSet::new()
+        } else if let Some(trace) = trace_from {
+            trace(&soft_survivor_roots).into_iter().collect()
+        } else {
+            soft_survivor_roots.iter().copied().collect()
+        };
+
+        // Phase 2 (weak) liveness folds in BOTH the finalizer-reachable closure
+        // and the soft-reachable closure computed above.
+        let weak_is_live = |addr: usize| -> bool {
+            is_marked(addr) || finalizer_live.contains(&addr) || soft_live.contains(&addr)
+        };
+        self.process_weak_refs(&weak_is_live);
         // Phase 3-4 (final, phantom) use the raw collector marking so that
         // the about-to-be-finalized objects are still discovered/enqueued and
         // phantom reachability is unaffected by the resurrection closure.
@@ -1340,10 +1390,13 @@ mod tests {
         proc.discover_reference(ReferenceType::Finalizer, 1, 100, None);
         proc.discover_reference(ReferenceType::Finalizer, 2, 200, None);
         proc.discover_reference(ReferenceType::Finalizer, 3, 300, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.dequeue_for_finalization(), Some(100));
-        assert_eq!(proc.dequeue_for_finalization(), Some(200));
-        assert_eq!(proc.dequeue_for_finalization(), Some(300));
+        let result = proc.process_references(&always_dead, 100, 0);
+        // Once-only emission (bc math-ec 0x4 fix, 2026-06-10): process_references
+        // now DRAINS the dead finalizers into the result in FIFO discovery order
+        // rather than leaving them in the internal queue, so the interpreter
+        // consumes them exactly once. The internal queue is therefore empty
+        // afterwards.
+        assert_eq!(result.to_finalize, vec![100, 200, 300]);
         assert_eq!(proc.dequeue_for_finalization(), None);
     }
 
@@ -1409,9 +1462,12 @@ mod tests {
     #[test]
     fn update_after_gc_finalization_queue() {
         let mut proc = ReferenceProcessor::new();
-        proc.discover_reference(ReferenceType::Finalizer, 1, 100, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.finalization_queue, vec![100]);
+        // process_references now DRAINS the finalization queue into its result
+        // (once-only emission, see finalization_queue_fifo), so populate the
+        // internal queue directly to isolate update_after_gc's relocation of a
+        // still-pending entry (an object moved by a GC between enqueue and
+        // consumption).
+        proc.finalization_queue.push_back(100);
         let mut map = HashMap::new();
         map.insert(100, 9999);
         proc.update_after_gc(&map);
@@ -1590,9 +1646,10 @@ mod tests {
     #[test]
     fn update_after_gc_finalization_null_skipped() {
         let mut proc = ReferenceProcessor::new();
-        proc.discover_reference(ReferenceType::Finalizer, 1, 0xBEEF, None);
-        let _result = proc.process_references(&always_dead, 100, 0);
-        assert_eq!(proc.finalization_queue, vec![0xBEEF]);
+        // Populate the queue directly — process_references now drains it (see
+        // finalization_queue_fifo) — to isolate update_after_gc's null-target
+        // skip behaviour.
+        proc.finalization_queue.push_back(0xBEEF);
         let mut map = HashMap::new();
         map.insert(0xBEEF, 0usize); // null target
         proc.update_after_gc(&map);
@@ -1892,5 +1949,99 @@ mod tests {
         proc.touch_soft_reference(0xCC, 1234);
         assert_eq!(proc.soft_refs[0].last_access_time_ms, 1234);
         assert!(proc.soft_ref_lru_index.contains_key(&(1234, 0)));
+    }
+
+    // ======================================================================
+    // JLS reachability ordering (strong > soft > weak): a weak ref must not be
+    // cleared while its referent is still softly reachable through a surviving
+    // soft reference.
+    // ======================================================================
+
+    // 62. A weak ref to an object reachable ONLY transitively (depth 2) through
+    //     a surviving soft referent must NOT be cleared (requires a tracer).
+    #[test]
+    fn weak_ref_kept_alive_by_surviving_soft_referent_transitive() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // Soft referent 0x200 is recently accessed, so Phase 1 retains it.
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
+        proc.touch_soft_reference(0x100, 5000);
+        // Weak referent 0x500 is reachable only via 0x200's fields (depth 2).
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x500, Some(0x400));
+
+        // Tracer: from the surviving soft referent 0x200 reach {0x200, 0x500}.
+        let trace = |roots: &[usize]| -> Vec<usize> {
+            let mut out = roots.to_vec();
+            if roots.contains(&0x200) {
+                out.push(0x500);
+            }
+            out
+        };
+
+        // free_heap large + recent access => soft ref survives Phase 1.
+        let result =
+            proc.process_references_with_finalizer_trace(&always_dead, Some(&trace), 64, 5000);
+
+        // The soft ref survived...
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert!(!proc.soft_refs[0].cleared);
+        // ...so the transitively-reachable weak referent must NOT be cleared.
+        assert_eq!(result.stats.weak_refs_cleared, 0);
+        assert!(!proc.weak_refs[0].cleared);
+    }
+
+    // 63. A weak ref pointing DIRECTLY at a surviving soft referent must not be
+    //     cleared even without a tracer (single-hop soft keep-alive).
+    #[test]
+    fn weak_ref_to_surviving_soft_referent_not_cleared_no_tracer() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // Soft referent 0x200 retained (recent access, plenty of free heap).
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
+        proc.touch_soft_reference(0x100, 5000);
+        // Weak ref points straight at the still-soft-reachable object 0x200.
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x200, Some(0x400));
+
+        let result = proc.process_references(&always_dead, 64, 5000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert_eq!(result.stats.weak_refs_cleared, 0);
+        assert!(!proc.weak_refs[0].cleared);
+    }
+
+    // 64. When the soft ref is itself CLEARED in Phase 1 (idle past the LRU
+    //     threshold), its dead referent must NOT protect a weak ref to it.
+    #[test]
+    fn weak_ref_not_protected_when_soft_ref_cleared() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // last_access_time_ms = 0, current = 5000, free = 1 MB => threshold
+        // 1000; idle 5000 > 1000 => soft ref cleared in Phase 1.
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x200, Some(0x400));
+
+        let result = proc.process_references(&always_dead, 1, 5000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 1);
+        assert!(proc.soft_refs[0].cleared);
+        // The soft ref no longer keeps 0x200 alive, so the weak ref clears.
+        assert_eq!(result.stats.weak_refs_cleared, 1);
+        assert!(proc.weak_refs[0].cleared);
+    }
+
+    // 65. The soft-survivor closure does not over-retain: an unrelated dead
+    //     weak referent is still cleared while a soft ref survives.
+    #[test]
+    fn unrelated_weak_ref_still_cleared_with_surviving_soft_ref() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
+        proc.touch_soft_reference(0x100, 5000); // soft ref survives
+                                                // Weak ref to a totally unrelated dead object, not reachable from 0x200.
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x999, Some(0x400));
+
+        let trace = |roots: &[usize]| -> Vec<usize> { roots.to_vec() }; // 0x200 -> {0x200}
+        let result =
+            proc.process_references_with_finalizer_trace(&always_dead, Some(&trace), 64, 5000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert_eq!(result.stats.weak_refs_cleared, 1);
+        assert!(proc.weak_refs[0].cleared);
     }
 }

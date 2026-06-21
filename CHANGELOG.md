@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-06 multi-agent review remediation
+
+A second, larger review-driven remediation pass (one Opus agent per finding, merged in
+severity order with a build gate) closed the full critical/high/medium tier plus perf and
+features. Highlights:
+
+#### Security
+- `SecureRandom` now draws from the OS CSPRNG (`BCryptGenRandom`/`getrandom`) instead of an invertible splitmix64 DRBG (`native-builtins/src/crypto_impl.rs`); RSA private-key ops gained base blinding.
+- SSRF: the always-on cloud-metadata/link-local block now unwraps IPv4-mapped/compatible IPv6 (`::ffff:169.254.169.254`) (`native-io/src/outbound_policy.rs`); optional outbound-hostname DNS resolution closes the alias/rebind bypass.
+- Built-in HTTP server honors `Transfer-Encoding: chunked` (request-smuggling/body-desync fix); HTTP client strips `Authorization`/`Cookie` on cross-host redirects (`native-builtins/src/{net_phase_e,http_client}.rs`).
+- `X509Certificate.verify` fails closed; `Class.forName` rejects control-byte/separator/`..` injection; AOT cache integrity moved to SHA-256.
+- New sandbox/egress knobs documented in `docs/SECURITY_HARDENING.md`.
+
+#### Soundness (GC / JIT / memory safety)
+- Closed the JIT/GC "register-resident root" use-after-free family: a uniform native-root registry (`vm/src/memory/native_roots.rs`) + per-subsystem scan/remap for native collections overlays, NIO selector keys, ScheduledThreadPoolExecutor runnables, XNIO IoFutures, the ClassFileTransformer chain, the `ObjectStreamClass` cache, and value-stack smuggled jobjects; JIT x64 now spills callee-saved operand-stack oops at safepoints.
+- JNI: implicit local-reference frame around native calls + a refcounted GC pin set for `GetPrimitiveArrayCritical`/`Get*ArrayElements` (`gc/src/pinned.rs`).
+- CompactHeader forwarding pointers no longer truncate above 4 GB; per-thread SATB buffers are drained at remark; concurrent-mark 16-byte slot reads are stripe-locked; ZGC backend runs reference processing.
+- `vm-exec` JNI TLS cleanup is RAII (panic-safe); `<clinit>` failure no longer leaks the init claim; libcratonvm hands out validated opaque handles instead of raw heap pointers.
+
+#### Correctness
+- Bytecode verifier rejects unverified `jsr`/`ret` by default; `ldc`/`invokespecial` verifier-model fixes.
+- `BigInteger.modPow`/`modInverse` honor signs and throw on non-invertible input; `AtomicXFieldUpdater` RMW ops no longer lose updates; `AbstractStringBuilder.getChars` bounds-checks; interpreter runs `finally`/catch-all on JIT-unknown-PC unwind.
+- JNI `DefineClass` defines from the supplied buffer; `Call*MethodV`/`Call*MethodA` implemented.
+
+#### Performance
+- Thread-local scratch buffer for socket read/write (no per-syscall `Vec`); O(1) maps for JNI global refs, unified-logging handles, and the regex cache; bounded JIT code-cache + deopt history; metaspace bump fast-path.
+
+#### Features
+- `cargo-llvm-cov` coverage CI job (`.github/workflows/coverage.yml`, `docs/COVERAGE.md`).
+- Container/cgroup-aware default heap sizing (`vm/src/runtime/container.rs`, `docs/CONTAINER.md`).
+- `README.md` for `libcratonvm` and `cratonvm-embed` (crates.io pages); embedding guide (`docs/EMBEDDING.md`).
+- Five L/XL design docs under `docs/feature-designs/` (precise-JIT-maps-default, deopt/OSR, concurrent-GC maturation, foreign-thread attach, differential fuzzer).
+
+#### Build / OSS
+- MSRV raised `1.77` → `1.80` (`Cargo.toml`, `clippy.toml`) to match the std APIs the code already uses; `gc`/`reader`/`craton-gpu` clippy cleaned.
+- Untracked the gitignored `bench/` build artifacts and stray `dd1.out` (kept on disk); test-fixture `.class` files retained.
+- Crate-count references corrected to **19** workspace members (`libcratonvm` + `cratonvm-embed` added); `docs/CRYPTO_STATUS.md` reclassified PBKDF2/ML-KEM/DESede as implemented.
+
+---
+
+### Earlier review round
+
 A cross-crate review-driven fix orchestrator landed 50+ commits across security, soundness, correctness, and OSS-distribution hygiene. Highlights:
 
 #### Security
@@ -25,7 +67,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - SATB pre-barrier wired at remaining `aastore`/`putfield` sites plus a real stop-the-world for `newarray` (`vm/src/runtime/interpreter.rs`, `jit/src/runtime_helpers.rs`).
 - `gc` mutating heap entry points now require a `StopTheWorldToken` witness (`gc/src/lib.rs`).
 - Async-signal-safe SIGSEGV handler installed on Unix (no allocations, no locks) (`vm/src/runtime/signals.rs`).
-- AArch64 icache flush on Linux and FreeBSD after JIT code emission (`jit/src/aarch64/mod.rs`).
+- AArch64 icache flush on Linux and FreeBSD after JIT code emission (`jit/src/aarch64.rs`).
 - `vm` hot locks reordered through `OrderedMutex` matching `docs/lock-order.md` (`vm/src/lock_order.rs`).
 - JIT switch-target offsets are now overflow-checked; `try_patch` replaces panicking `patch_i32`/`patch_byte` (`jit/src/buffer.rs`).
 - `reader::ByteView::try_new` returns `Result` on overflow / misalignment instead of UB (`reader/src/byte_view.rs`).
@@ -47,7 +89,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 
 #### OSS / Distribution
 - `vm-cli` produces the `cratonvm` binary by default; the `java[.exe]` alias is opt-in via `--features java-bin-alias` so `cargo install` does not shadow a real JDK (`vm-cli/Cargo.toml`).
-- Added `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `THIRD_PARTY_NOTICES.md`, `CITATION.cff`, and a GitHub issue-template config (top-level + `.github/`).
+- Added `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `THIRD-PARTY-NOTICES.md`, and a GitHub issue-template config (top-level + `.github/`).
 - SPDX `Apache-2.0` headers on every Rust source file across the workspace.
 - MSRV bumped to 1.77 and synchronized across `README.md`, `BUILD_GUIDE.md`, `CONTRIBUTING.md`, and `docs/INSTALL.md`.
 - Workspace version raised to `0.3.0`; every inter-crate `path = "../<crate>"` declaration now carries `version = "0.3.0"` so `cargo publish --dry-run` accepts the manifest.

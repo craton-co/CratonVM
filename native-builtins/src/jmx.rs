@@ -260,11 +260,10 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(cls, "getUptime0", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(uptime_ms() as i64)))
     });
-    r.register(cls, "getAvailableProcessors", "()I", |_ctx, _args| {
-        let n = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        Ok(Some(Value::Int(n as i32)))
+    r.register(cls, "getAvailableProcessors", "()I", |ctx, _args| {
+        // Container-aware (cgroup CPU quota under -XX:+UseContainerSupport),
+        // matching what Runtime.availableProcessors() reports.
+        Ok(Some(Value::Int(ctx.available_processor_count())))
     });
 
     // -- sun.management.MemoryImpl --
@@ -1250,7 +1249,7 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryMXBean", 6);
     // Wire to real heap stats
     let heap_used = ctx.heap_allocated_bytes() as i64;
-    let heap_max = 256 * 1024 * 1024_i64; // max is config-based, use default
+    let heap_max = ctx.max_heap_bytes(); // configured -Xmx (container-aware)
     let heap_committed = heap_used.max(64 * 1024 * 1024); // committed >= used
     ctx.set_field(obj, 0, Value::Long(heap_used)); // heapUsed (real)
     ctx.set_field(obj, 1, Value::Long(heap_max)); // heapMax
@@ -1620,9 +1619,8 @@ fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         .unwrap_or_else(|| String::from("unknown"));
     let version = ctx.create_string(&os_version);
     ctx.set_field(obj, 2, Value::Object(Some(version)));
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(1);
+    // Container-aware processor count (cgroup CPU quota under container support).
+    let cpus = ctx.available_processor_count();
     ctx.set_field(obj, 3, Value::Int(cpus));
     ctx.set_field(obj, 4, Value::Double(-1.0));
     obj
@@ -2398,10 +2396,8 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             // callers' existing AttributeNotFound / Throwable handlers cope.
             let response: Option<String> = match attr_name.as_str() {
                 "AvailableProcessors" => {
-                    let n = std::thread::available_parallelism()
-                        .map(|p| p.get())
-                        .unwrap_or(1);
-                    Some(n.to_string())
+                    // Container-aware (cgroup CPU quota under container support).
+                    Some(ctx.available_processor_count().to_string())
                 }
                 "Name" => Some(std::env::consts::OS.to_string()),
                 "Arch" => Some(std::env::consts::ARCH.to_string()),

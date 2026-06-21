@@ -25,14 +25,123 @@
 //! * **Varied (20-4):** Reserved / array-length low bits / forwarding bits.
 //! * **Flags (3-0):** GC flags or array element type.
 //!
-//! When the lock state is `11` (forwarded), bits 31-2 encode a forwarding
-//! pointer shifted right by 3 (object-aligned).
+//! When the lock state is `11` (forwarded), bits 31-25 and 22-0 encode a
+//! forwarding pointer shifted right by 3 (object-aligned). That inline field
+//! is 30 bits wide; its top bit (bit 29 of the shifted value) is reserved as
+//! an *overflow tag*. When clear, the remaining 29 bits hold `addr >> 3`
+//! directly, covering addresses up to 4 GB inline. When set, the remaining 29
+//! bits hold a *token* into the [`ForwardingOverflowTable`] side table, which
+//! stores the full (up to 64-bit) target address. This keeps the common case
+//! branch-free while never silently truncating a high (>4 GB, incl. >8 GB)
+//! forwarding target.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+
+// ---------------------------------------------------------------------------
+// ForwardingOverflowTable — side table for forwarding targets that do not fit
+// the inline 30-bit (post-tag: 29-bit) field of a compact header.
+// ---------------------------------------------------------------------------
+
+/// Global side table holding full forwarding-pointer targets that cannot be
+/// encoded inline in a [`CompactHeader`].
+///
+/// A compact header only has 30 bits for an object-aligned forwarding pointer.
+/// Reserving the top bit as an overflow tag leaves 29 bits, so addresses up to
+/// 4 GB encode inline. On a real 64-bit VM, heap arenas can be mmap'd far above
+/// that (well past 8 GB). For such targets the encoder stores the *full*
+/// `usize` address here, keyed by a process-unique 29-bit token, and writes the
+/// tag plus token inline. The decoder detects the tag and recovers the exact
+/// address from this table — no truncation, ever.
+///
+/// The table mirrors the [`HashCodeTable`] side-table pattern used for identity
+/// hashes (`RwLock<FxHashMap<..>>`). It is keyed by the inline token (which is
+/// itself carried inside the 64-bit header value), so any `Copy` of the header
+/// decodes to the same address.
+struct ForwardingOverflowTable {
+    /// token -> full forwarding target address.
+    table: RwLock<FxHashMap<u64, usize>>,
+    /// Monotonic source of fresh tokens. Starts at 1; token 0 is never handed
+    /// out (a zeroed inline field must never resolve to a real overflow entry).
+    next_token: AtomicU64,
+}
+
+impl ForwardingOverflowTable {
+    fn new() -> Self {
+        Self {
+            table: RwLock::new(FxHashMap::default()),
+            next_token: AtomicU64::new(1),
+        }
+    }
+
+    /// Intern a full address, returning a fresh token in `1..=MAX_TOKEN`.
+    ///
+    /// Panics if the 29-bit token space is exhausted, which would require more
+    /// than half a billion *simultaneously live* overflow forwardings — far
+    /// beyond any real GC pause. Panicking is strictly better than wrapping a
+    /// token and aliasing two unrelated objects to the same heap address.
+    fn intern(&self, addr: usize) -> u64 {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            token <= CompactHeader::FORWARD_MAX_TOKEN,
+            "forwarding overflow token space exhausted ({} live overflow forwardings)",
+            CompactHeader::FORWARD_MAX_TOKEN,
+        );
+        self.table.write().insert(token, addr);
+        token
+    }
+
+    /// Resolve a previously interned token to its full address.
+    ///
+    /// Returns `0` for an unknown token; callers only consult this for headers
+    /// already tagged as overflow, so a miss indicates the table was cleared
+    /// out from under a live forwarding (a logic error elsewhere).
+    fn resolve(&self, token: u64) -> usize {
+        self.table.read().get(&token).copied().unwrap_or(0)
+    }
+
+    /// Discard all interned forwardings. Safe to call once a GC cycle's
+    /// forwarding pointers are no longer needed (objects have been relocated
+    /// and references fixed up).
+    fn clear(&self) {
+        self.table.write().clear();
+    }
+
+    /// Number of interned overflow forwardings currently retained.
+    fn len(&self) -> usize {
+        self.table.read().len()
+    }
+}
+
+/// Process-wide overflow table for compact-header forwarding pointers.
+///
+/// Lazily initialized via [`OnceLock`] (mirrors the `OnceLock` pattern used
+/// elsewhere in this crate) so no `const` constructor is required.
+static FORWARDING_OVERFLOW: std::sync::OnceLock<ForwardingOverflowTable> =
+    std::sync::OnceLock::new();
+
+#[inline]
+fn forwarding_overflow() -> &'static ForwardingOverflowTable {
+    FORWARDING_OVERFLOW.get_or_init(ForwardingOverflowTable::new)
+}
+
+/// Clear the global forwarding-overflow side table.
+///
+/// The GC should call this after a moving collection has fully relocated
+/// objects and rewritten all references, so interned high-address forwardings
+/// do not accumulate across cycles.
+pub fn clear_forwarding_overflow_table() {
+    forwarding_overflow().clear();
+}
+
+/// Number of high-address forwarding pointers currently held in the global
+/// overflow side table (primarily for diagnostics/tests).
+pub fn forwarding_overflow_table_len() -> usize {
+    forwarding_overflow().len()
+}
 
 // ---------------------------------------------------------------------------
 // LockState
@@ -91,8 +200,25 @@ impl CompactHeader {
     pub const ELEM_TYPE_MASK: u64 = 0xF;
     /// Bits used for the forwarding pointer: bits 31-25 and 22-0 (excludes
     /// the lock-state bits 24-23 which are set to `11` as the forwarded tag).
-    /// 30 bits total; with 8-byte alignment (>> 3) this addresses 8 GB.
+    /// 30 bits total (the inline forwarding field).
     pub const FORWARD_MASK: u64 = 0xFE7F_FFFF; // bits 31-25 | bits 22-0
+
+    /// Number of bits in the inline forwarding field (split across the header).
+    pub const FORWARD_FIELD_BITS: u32 = 30;
+    /// The top bit of the inline forwarding field is reserved as an *overflow
+    /// tag*: when set, the remaining 29 bits hold a side-table token rather than
+    /// `addr >> 3` directly.
+    pub const FORWARD_OVERFLOW_TAG: u64 = 1 << (Self::FORWARD_FIELD_BITS - 1); // bit 29
+    /// Payload mask for the inline forwarding field below the overflow tag
+    /// (29 bits). Holds either the inline `addr >> 3` or an overflow token.
+    pub const FORWARD_PAYLOAD_MASK: u64 = Self::FORWARD_OVERFLOW_TAG - 1; // bits 28-0
+    /// Largest object-aligned address that fits inline (without the overflow
+    /// side table). 29 payload bits, shifted left by 3 for 8-byte alignment:
+    /// `(2^29 - 1) << 3` ≈ 4 GB. Targets at or below this encode inline; higher
+    /// targets (incl. anything above 8 GB) go through the overflow side table.
+    pub const FORWARD_INLINE_MAX_ADDR: usize = (Self::FORWARD_PAYLOAD_MASK as usize) << 3;
+    /// Largest token the overflow side table can mint (29-bit token space).
+    pub const FORWARD_MAX_TOKEN: u64 = Self::FORWARD_PAYLOAD_MASK;
 
     // -- Construction -------------------------------------------------------
 
@@ -203,30 +329,80 @@ impl CompactHeader {
         self.lock_state() == LockState::Forwarded
     }
 
+    /// Write a 30-bit value into the split inline forwarding field, set the
+    /// `Forwarded` lock tag, and preserve the upper 32 bits (klass).
+    ///
+    /// The field is split around the lock-state bits (24-23): the low 23 bits
+    /// of `field` land in header bits 22-0, the high 7 bits in header bits
+    /// 31-25. `field` must fit in 30 bits.
+    #[inline]
+    fn write_forward_field(&mut self, field: u64) {
+        debug_assert!(
+            field >> Self::FORWARD_FIELD_BITS == 0,
+            "forwarding field exceeds 30 bits"
+        );
+        let low = field & 0x7F_FFFF; // 23 bits -> header bits 22-0
+        let high = (field >> 23) & 0x7F; // 7 bits  -> header bits 31-25
+        let lock_bits = (LockState::Forwarded as u64) << Self::LOCK_SHIFT;
+        let upper = self.0 & 0xFFFF_FFFF_0000_0000;
+        self.0 = upper | (high << 25) | lock_bits | low;
+    }
+
+    /// Read the 30-bit value out of the split inline forwarding field.
+    #[inline]
+    fn read_forward_field(&self) -> u64 {
+        let low = self.0 & 0x7F_FFFF; // bits 22-0: 23 bits
+        let high = (self.0 >> 25) & 0x7F; // bits 31-25: 7 bits
+        (high << 23) | low
+    }
+
     /// Install a forwarding pointer. The address **must** be 8-byte aligned.
     ///
     /// This overwrites the lower 32 bits. The upper 32 bits (klass) are
     /// preserved so the GC can still identify the class of the forwarded
     /// object. The shifted address is split around the lock-state bits
     /// (24-23) which are set to `11` as the forwarded tag.
+    ///
+    /// Addresses up to [`FORWARD_INLINE_MAX_ADDR`](Self::FORWARD_INLINE_MAX_ADDR)
+    /// (~4 GB) are stored inline. Higher targets — which the 30-bit inline
+    /// field cannot represent and which a naive encoder would silently truncate
+    /// (corrupting the heap on 64-bit VMs whose arenas live above 8 GB) — are
+    /// interned in a global side table; the inline field then holds the overflow
+    /// tag plus a token. Either way [`forwarding_ptr`](Self::forwarding_ptr)
+    /// recovers the *exact* address.
     pub fn set_forwarding_ptr(&mut self, addr: usize) {
         debug_assert!(addr & 0x7 == 0, "forwarding address must be 8-byte aligned");
-        let shifted = (addr >> 3) as u64;
-        // Split the 30-bit shifted value into two parts around lock bits:
-        //   low part  = bits 22-0 of the shifted value -> header bits 22-0
-        //   high part = bits 29-23 of the shifted value -> header bits 31-25
-        let low = shifted & 0x7F_FFFF; // 23 bits
-        let high = (shifted >> 23) & 0x7F; // 7 bits
-        let lock_bits = (LockState::Forwarded as u64) << Self::LOCK_SHIFT;
-        let upper = self.0 & 0xFFFF_FFFF_0000_0000;
-        self.0 = upper | (high << 25) | lock_bits | low;
+        // Real range check (replaces the alignment-only debug_assert): the
+        // inline encoding can only represent 8-byte-aligned addresses, so an
+        // unaligned address would lose its low bits. Tolerate it in release by
+        // routing through the (full-width) side table rather than truncating.
+        let aligned = (addr & 0x7) == 0;
+        if aligned && addr <= Self::FORWARD_INLINE_MAX_ADDR {
+            // Fast path: representable inline. `shifted` fits in 29 bits, so the
+            // overflow tag (bit 29) stays clear.
+            let shifted = (addr >> 3) as u64;
+            debug_assert_eq!(shifted & Self::FORWARD_OVERFLOW_TAG, 0);
+            self.write_forward_field(shifted);
+        } else {
+            // Overflow path: stash the full address in the side table and store
+            // the overflow tag plus its token inline. Never truncates.
+            let token = forwarding_overflow().intern(addr);
+            debug_assert!(token <= Self::FORWARD_MAX_TOKEN);
+            self.write_forward_field(
+                Self::FORWARD_OVERFLOW_TAG | (token & Self::FORWARD_PAYLOAD_MASK),
+            );
+        }
     }
 
     /// Read the forwarding pointer. Only valid when [`is_forwarded`] is true.
     pub fn forwarding_ptr(&self) -> usize {
-        let low = self.0 & 0x7F_FFFF; // bits 22-0: 23 bits
-        let high = (self.0 >> 25) & 0x7F; // bits 31-25: 7 bits
-        let shifted = (high << 23) | low;
+        let field = self.read_forward_field();
+        if field & Self::FORWARD_OVERFLOW_TAG != 0 {
+            // Overflow: the payload is a side-table token, not an address.
+            let token = field & Self::FORWARD_PAYLOAD_MASK;
+            return forwarding_overflow().resolve(token);
+        }
+        let shifted = field;
         (shifted << 3) as usize
     }
 
@@ -882,6 +1058,12 @@ fn element_byte_size(et: crate::heap::ArrayElementType) -> usize {
 mod tests {
     use super::*;
 
+    /// Serializes the handful of tests that observe the *global* forwarding
+    /// overflow side table's length, so concurrent test threads cannot perturb
+    /// each other's count assertions. Per-header invariants (exact address
+    /// round-trip, tag bit) are deterministic regardless and don't need this.
+    static OVERFLOW_TABLE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // -- CompactHeader construction -----------------------------------------
 
     #[test]
@@ -1057,6 +1239,145 @@ mod tests {
         assert!(!h.is_forwarded());
         h.set_lock_state(LockState::Forwarded);
         assert!(h.is_forwarded());
+    }
+
+    // -- Forwarding pointer: high addresses (>4 GB / >8 GB) -----------------
+
+    /// Regression: a forwarding target above 8 GB must round-trip exactly.
+    ///
+    /// The old encoder masked `addr >> 3` to 30 bits and silently dropped every
+    /// bit above ~8 GB, returning a *truncated* (wrong) address — a moving GC
+    /// would then read/write the wrong memory and corrupt the heap. The fix
+    /// routes such targets through the overflow side table.
+    #[test]
+    fn forwarding_ptr_above_8gb_exact() {
+        // 16 GB, 8-byte aligned. addr >> 3 needs 31 bits, so the 30-bit inline
+        // field cannot hold it.
+        let addr: usize = 16usize * 1024 * 1024 * 1024;
+        assert!(addr & 0x7 == 0);
+        assert!(addr > CompactHeader::FORWARD_INLINE_MAX_ADDR);
+
+        let mut h = CompactHeader::new_object(0xABCD, 7);
+        h.set_forwarding_ptr(addr);
+        assert!(h.is_forwarded());
+        assert_eq!(h.forwarding_ptr(), addr, "must not truncate >8 GB target");
+        // Klass survives the overflow encoding.
+        assert_eq!(h.narrow_klass(), 0xABCD);
+
+        // Demonstrate that the OLD inline-only encoding *would* have truncated:
+        let truncated = ((addr >> 3) as u64 & 0x3FFF_FFFF) << 3;
+        assert_ne!(truncated as usize, addr, "old encoding loses high bits");
+    }
+
+    /// The overflow path survives a `raw()` / `from_raw()` round-trip, because
+    /// the token lives inside the 64-bit header value itself.
+    #[test]
+    fn forwarding_ptr_overflow_survives_raw_roundtrip() {
+        let addr: usize = 0x7_0000_0008; // 28 GB + 8, aligned
+        let mut h = CompactHeader::new_object(3, 0);
+        h.set_forwarding_ptr(addr);
+        let copy = CompactHeader::from_raw(h.raw());
+        assert!(copy.is_forwarded());
+        assert_eq!(copy.forwarding_ptr(), addr);
+    }
+
+    /// Two distinct high targets must not alias to the same address.
+    #[test]
+    fn forwarding_ptr_distinct_high_targets() {
+        let a: usize = 0x10_0000_0000; // 64 GB
+        let b: usize = 0x10_0000_0008; // 64 GB + 8
+        let mut ha = CompactHeader::new_object(1, 0);
+        let mut hb = CompactHeader::new_object(2, 0);
+        ha.set_forwarding_ptr(a);
+        hb.set_forwarding_ptr(b);
+        assert_eq!(ha.forwarding_ptr(), a);
+        assert_eq!(hb.forwarding_ptr(), b);
+        assert_ne!(ha.forwarding_ptr(), hb.forwarding_ptr());
+    }
+
+    /// Boundary: the largest inline-representable address stays on the fast
+    /// path (no overflow tag, no side-table entry) and round-trips exactly;
+    /// the next aligned address up tips into the overflow path.
+    #[test]
+    fn forwarding_ptr_inline_boundary() {
+        let max_inline = CompactHeader::FORWARD_INLINE_MAX_ADDR;
+        assert_eq!(max_inline & 0x7, 0, "inline max must be 8-byte aligned");
+
+        // Per-header invariants only (no global-count assertions) so this is
+        // robust under concurrent test execution.
+        let mut h = CompactHeader::new_object(9, 1);
+        h.set_forwarding_ptr(max_inline);
+        assert_eq!(h.forwarding_ptr(), max_inline);
+        // Fast path: the overflow tag is clear -> encoded inline, not in the table.
+        assert_eq!(
+            h.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG,
+            0
+        );
+
+        // One object slot (8 bytes) higher cannot be encoded inline.
+        let just_over = max_inline + 8;
+        let mut h2 = CompactHeader::new_object(9, 1);
+        h2.set_forwarding_ptr(just_over);
+        assert_eq!(h2.forwarding_ptr(), just_over);
+        assert_ne!(
+            h2.read_forward_field() & CompactHeader::FORWARD_OVERFLOW_TAG,
+            0
+        );
+    }
+
+    /// Sweep of representative addresses straddling the inline/overflow split,
+    /// including 0, small, near-boundary, and several multi-GB targets.
+    #[test]
+    fn forwarding_ptr_mixed_sweep() {
+        let addrs: Vec<usize> = vec![
+            0,
+            8,
+            0x1000,
+            0x0FFF_FFF8,
+            CompactHeader::FORWARD_INLINE_MAX_ADDR, // last inline
+            CompactHeader::FORWARD_INLINE_MAX_ADDR + 8, // first overflow
+            12usize * 1024 * 1024 * 1024,           // 12 GB
+            0xFF_FFFF_FFF8,                         // ~1 TB, aligned
+        ];
+        for &addr in &addrs {
+            let mut h = CompactHeader::new_object(0x5151, 4);
+            h.set_forwarding_ptr(addr);
+            assert!(h.is_forwarded(), "addr={addr:#x}");
+            assert_eq!(h.forwarding_ptr(), addr, "addr={addr:#x}");
+            assert_eq!(
+                h.narrow_klass(),
+                0x5151,
+                "klass clobbered at addr={addr:#x}"
+            );
+        }
+    }
+
+    /// The overflow side table can be cleared between GC cycles.
+    ///
+    /// Asserted via per-header round-trips (deterministic even under concurrent
+    /// test execution): tokens are monotonic and never reissued, so a token
+    /// dropped by `clear()` resolves to 0 afterwards regardless of any
+    /// concurrent interning by other tests. The `>= 1` length check is also
+    /// race-safe because other interners only *add* entries. The guard is held
+    /// for documentation/ordering; correctness does not depend on it.
+    #[test]
+    fn forwarding_overflow_table_clears() {
+        let _guard = OVERFLOW_TABLE_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let addr = 20usize * 1024 * 1024 * 1024; // 20 GB -> overflow path
+        let mut h = CompactHeader::new_object(1, 0);
+        h.set_forwarding_ptr(addr);
+        assert!(forwarding_overflow_table_len() >= 1);
+        // The freshly interned high target resolves before clearing.
+        assert_eq!(h.forwarding_ptr(), addr);
+
+        clear_forwarding_overflow_table();
+        // After clearing, this header's token is gone and never reissued, so it
+        // resolves to 0 (the "unknown token" sentinel) — independent of any
+        // concurrent interning.
+        assert_eq!(h.forwarding_ptr(), 0);
     }
 
     // -- Raw roundtrip ------------------------------------------------------

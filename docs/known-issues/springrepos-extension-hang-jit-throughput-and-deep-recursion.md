@@ -19,6 +19,57 @@ fix, commit `1d523351`). Three additional general JIT/classloader fixes landed o
 crash it surfaces is precisely diagnosed (a native stack overflow, design for the
 fix below).
 
+> **CHECKED 2026-06-21 against dev `0c904c04`.** All four load-bearing commits this
+> doc relies on are confirmed present on the current dev tip (git ancestry):
+> `1d523351` (root-snapshot/hang fix), `43f5fe03` (pdcache), `05b9622a`
+> (AssertionError preload), `2fbabc0b` (hashCode/equals-override compile). The doc's
+> account is accurate and the two residuals (§5 cold-path throughput, §6–§7
+> deep-recursion native stack overflow + stack-banging guard) remain **non-blockers /
+> open handoff**, unchanged. A fresh test-level re-run of
+> `SpringRepositoriesExtensionTests` was **not** repeated here — it uses the separate
+> `apps/spring-boot/buildSrc/runner` harness (~55 s Groovy bootstrap, watchdog must be
+> disabled) rather than the spring-framework KRun harness used for the other tickets
+> in this batch; the commit-level verification above is the check performed.
+>
+> **Cross-link / second reproducer:** the Spring `GroovyScriptEvaluator` cluster in
+> [[spring-bug-11]] hits this **same ANTLR ATN cold-path**. A standalone probe
+> (`new GroovyScriptEvaluator().evaluate(new StaticScriptSource("return 3 * 2"))`) —
+> a *trivial* script — returns instantly on HotSpot but on dev `0c904c04` **hangs >120 s
+> and trips the stack-dump watchdog**, frozen in
+> `GroovyParser.<clinit> → ATNDeserializer.deserialize → BitSet.get/<init>` (never
+> finishing the one-time ATN deserialize). So this cold-path throughput is not
+> buildSrc-specific — it gates *any* first Groovy parse, and is a more minimal repro
+> than `SpringRepositoriesExtensionTests` for the §5–§6 work.
+
+> **DEAD END (investigated 2026-06-21, do not repeat) — the compile-bail count is a
+> RED HERRING; class-loading is NOT the bottleneck.** A tempting hypothesis is "almost
+> nothing JIT-compiles during the Groovy/ANTLR bootstrap, so it runs interpreted and is
+> slow." `CRATONVM_DBG_JITC=1` shows ~173 `compile-bail`s on the trivial-script probe,
+> ~119 of them ANTLR. **But this is not a fixable signal.** Two experiments (each a full
+> release build, both reverted) prove it:
+> 1. **Prewarm `new`-site classes** at tier-up (load+init the classes a method's `new`
+>    sites construct, so `resolve_jit_new_site` stops returning `None`) → compile-bails
+>    **173 → 173**, ANTLR **119 → 119**. Zero change.
+> 2. **Prewarm *all* referenced classes** (walk the holder constant pool, load+init every
+>    `CONSTANT_Class` + every Field/Method/InterfaceMethod owner) → **173/119 → 174/118**
+>    (i.e. noise). Zero change. Wall-clock identical on/off.
+>
+> Why: `backend_attempted=false` is **not** an unresolved-class miss. The still-bailing
+> set includes `java/util/BitSet.get` (**native — no bytecode to compile**) and
+> `java/lang/String.compareTo` (**always loaded** — bootstrap). These bail for *intrinsic*
+> non-compilability (native / unsupported bytecode), and most of the 173 are legitimately
+> non-compilable and always interpreted — not a bottleneck. Loading classes can never help.
+>
+> Also: **wall-clock is machine-contention-dominated** here — the *same* probe measured
+> 33 s and 81 s on this multi-session box (on==off), so the bootstrap's true cost cannot be
+> measured reliably without a quiet machine.
+>
+> **Prerequisite for real progress (not done): a sampling profiler over the interpreter
+> dispatch loop (a frame histogram), to find the genuinely hot method(s).** The single
+> watchdog stack snapshot (`deserialize → BitSet`) is one sample, not a profile — do not
+> treat it, or the compile-bail list, as the bottleneck. The reverted experiments used a
+> `CRATONVM_JIT_NO_PREWARM_NEW` gate; neither the gate nor the prewarm is on dev.
+
 ---
 
 ## 1. The test decomposes into THREE independent defects (earlier reports conflated them)

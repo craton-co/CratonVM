@@ -13,6 +13,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "C-ABI shared library for embedding CratonVM (JNI Invocation API + flat C API)"
+readme = "README.md"
 # Opt-in cbindgen header regeneration (no-op unless CRATONVM_REGEN_HEADER is set);
 # see build.rs. cbindgen is intentionally NOT a Cargo dependency so the default
 # build graph / Cargo.lock are untouched and offline builds are unaffected.

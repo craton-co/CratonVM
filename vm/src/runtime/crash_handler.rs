@@ -1181,28 +1181,86 @@ mod async_signal_safe {
     /// call per signal is a minor improvement and keeps the path obvious).
     pub static CACHED_PID: AtomicI32 = AtomicI32::new(0);
 
-    /// Write `bytes` to `fd` using raw `write(2)`. Retries on EINTR.
+    /// Read the calling thread's `errno`. Async-signal-safe: POSIX guarantees
+    /// `errno` is thread-local and that *reading* it is permitted from a signal
+    /// handler. We deliberately only ever READ it here (never set it), so there
+    /// is no reentrancy hazard — the pointer returned by `__errno_location` /
+    /// `__error` is a stable per-thread address obtained without allocation.
+    fn errno() -> i32 {
+        // The accessor symbol differs per libc:
+        //   glibc/musl (Linux)            -> __errno_location
+        //   macOS/iOS/FreeBSD/Dragonfly   -> __error
+        //   Android/NetBSD/OpenBSD        -> __errno
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location()
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
+        unsafe {
+            *libc::__error()
+        }
+        #[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
+        unsafe {
+            *libc::__errno()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "android",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
+        {
+            // Unknown Unix: we cannot read errno portably, so treat every
+            // short/failed write as non-retryable (return 0, never == EINTR).
+            0
+        }
+    }
+
+    /// Write the entire `bytes` slice to `fd` using raw `write(2)`, correctly
+    /// resuming from the unwritten offset on a short (partial) write and
+    /// retrying the remainder on `EINTR`.
     ///
-    /// Async-signal-safe: `write` is on the POSIX whitelist.
+    /// `write(2)` may return fewer bytes than requested (a short write) or fail
+    /// with `EINTR` if a signal interrupts it before any byte is transferred.
+    /// In both cases the loop advances `off` by the number of bytes ACTUALLY
+    /// written and re-issues the syscall for the remaining tail, so the crash
+    /// report is never truncated. Any other error (or a `write` returning 0)
+    /// is unrecoverable and we give up silently — a partial report is better
+    /// than spinning forever inside a crashing process.
+    ///
+    /// Async-signal-safe: `write` is on the POSIX whitelist, and [`errno`] is
+    /// read-only (see its doc).
     pub fn write_all(fd: i32, bytes: &[u8]) {
         let mut off = 0usize;
         while off < bytes.len() {
             let ptr = unsafe { bytes.as_ptr().add(off) } as *const libc::c_void;
             let want = bytes.len() - off;
             let r = unsafe { libc::write(fd, ptr, want) };
-            if r < 0 {
-                // EINTR -> retry; any other error -> give up silently.
-                // We cannot call `*libc::__errno_location()` portably without
-                // worrying about TLS reentrancy, so just retry once and bail.
-                let again = unsafe { libc::write(fd, ptr, want) };
-                if again <= 0 {
-                    return;
+            if r > 0 {
+                // Partial or full write: advance by exactly what was written
+                // and continue with the remaining tail.
+                off += r as usize;
+            } else if r < 0 {
+                // EINTR -> the syscall was interrupted before transferring any
+                // byte; retry the same remainder. Any other errno is a real,
+                // non-transient failure -> stop.
+                if errno() == libc::EINTR {
+                    continue;
                 }
-                off += again as usize;
-            } else if r == 0 {
                 return;
             } else {
-                off += r as usize;
+                // r == 0: no progress is possible (e.g. fd closed / zero-length
+                // device). Avoid an infinite loop.
+                return;
             }
         }
     }
@@ -2004,5 +2062,57 @@ mod tests {
         // 2024-01-01 is day 19723 since epoch.
         let (y, m, d) = days_to_ymd(19723);
         assert_eq!((y, m, d), (2024, 1, 1));
+    }
+
+    // The async-signal-safe `write_all` only exists on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn write_all_handles_short_writes_via_pipe() {
+        use super::async_signal_safe::write_all;
+        use std::io::Read;
+
+        // A pipe's kernel buffer is finite, so writing a payload larger than
+        // the buffer forces `write(2)` to return short — exactly the partial
+        // write the resume-from-offset loop must handle. A reader thread drains
+        // the pipe so the writes can complete.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // Build a payload comfortably larger than a typical 64 KiB pipe buffer
+        // and with a recognizable, position-dependent byte pattern so any
+        // dropped/duplicated/reordered chunk is detected.
+        let payload: Vec<u8> = (0..(512 * 1024)).map(|i| (i % 251) as u8).collect();
+
+        let reader = {
+            let expected_len = payload.len();
+            std::thread::spawn(move || {
+                let mut f = unsafe {
+                    <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(read_fd)
+                };
+                let mut got = Vec::with_capacity(expected_len);
+                f.read_to_end(&mut got).expect("read pipe");
+                got
+            })
+        };
+
+        write_all(write_fd, &payload);
+        // Close the write end so the reader sees EOF.
+        unsafe { libc::close(write_fd) };
+
+        let got = reader.join().expect("reader thread");
+        assert_eq!(got.len(), payload.len(), "byte count mismatch");
+        assert_eq!(got, payload, "payload corrupted across short writes");
+    }
+
+    // Writing to a closed/invalid fd must return promptly (real error, not
+    // EINTR) rather than spinning forever.
+    #[cfg(unix)]
+    #[test]
+    fn write_all_on_bad_fd_returns() {
+        use super::async_signal_safe::write_all;
+        // -1 is never a valid fd; `write` returns EBADF, which is not EINTR,
+        // so the loop must give up immediately.
+        write_all(-1, b"this should not hang");
     }
 }

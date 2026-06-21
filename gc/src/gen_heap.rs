@@ -720,6 +720,53 @@ impl GenerationalHeap {
         }
     }
 
+    /// Fallible twin of [`alloc_object`]: walks the identical
+    /// young → old-gen spill path, but returns `None` instead of aborting the
+    /// process when both generations are exhausted (or the size overflows).
+    /// This lets a *native*/JIT caller surface a catchable
+    /// `java.lang.OutOfMemoryError` ("Java heap space") rather than the VM
+    /// hard-aborting in [`alloc_young`]. Like `alloc_object` it performs no GC,
+    /// so it is safe to call from a context holding unrooted local `ObjectRef`s
+    /// (the JIT object-alloc helper GC-and-retries before calling this).
+    pub fn try_alloc_object_full(
+        &self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let num_slots_u32 = u32::try_from(num_fields).ok()?;
+
+        // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
+        // reporting OOM — mirrors `alloc_object`, but returns `None` instead of
+        // aborting in `alloc_young` when old gen is also full (the divergence).
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
+                    return Some(obj);
+                }
+                return None;
+            }
+        };
+
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            num_slots_u32,
+        );
+        // SAFETY: identical invariants to `alloc_object` — `ptr` is a freshly
+        // bump-allocated, exclusively-owned, zeroed region of `total_size` bytes
+        // with 8-byte alignment, so writing the header and wrapping it in an
+        // `ObjectRef` are sound.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
     /// Allocate a new Java object and initialize primitive-typed slots to
     /// their spec-mandated typed zero based on `descriptor_bytes`.
     ///
@@ -2270,12 +2317,43 @@ impl GenerationalHeap {
         // so the "incompatible with non-moving" concern does not apply. This keeps
         // bt18 = 68332206 while closing the kafka register-invisible reclamation.
         let _shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
-        if crate::gc_quiescence::is_active() && !force_moving {
+        // Promotion-OOM avoidance: a MOVING (Cheney) young collection aborts the
+        // PROCESS when it cannot relocate a survivor — old gen is full AND the
+        // young to-space overflowed while promotion fell back to it (see the
+        // `process::abort()` in the forward path, ~line 5255). That can only
+        // happen once the old generation can no longer absorb the surviving young
+        // set. When old gen cannot hold a full young's worth of survivors, run
+        // the NON-MOVING sweep instead: it never relocates (so it can never hit
+        // that abort), reclaims any dead young in place, and simply leaves
+        // un-promotable survivors in young (graceful `old_full = true`). A
+        // genuinely exhausted heap then surfaces a *catchable*
+        // `OutOfMemoryError` via the allocation paths / GC-overhead limit instead
+        // of aborting. The non-moving sweep is already the default (and superior)
+        // young collector while JIT frames are active, so this only widens when
+        // it runs. Opt out with `CRATONVM_NO_GC_PROMOTION_GUARD` (reverts to the
+        // moving collector, which may abort the process on a full heap).
+        let promotion_oom_risk = std::env::var_os("CRATONVM_NO_GC_PROMOTION_GUARD").is_none() && {
+            // The moving collector's promotion abort needs BOTH generations
+            // nearly full at once: old gen cannot absorb the aged survivors AND
+            // the young to-space cannot hold the (then unpromotable) surviving
+            // set. Gate on exactly that precondition (each ≥ 90% full). A large
+            // young object over a near-empty old gen — e.g. the
+            // `large_array_survives_gc` / `multiple_large_arrays_survive_gc`
+            // tests, where young is big and old is ~empty — must still use the
+            // moving (compacting) collector, so old-gen fullness is required too.
+            let old_cap = self.old_gen_capacity();
+            let young_cap = self.young_semi_capacity();
+            old_cap > 0
+                && young_cap > 0
+                && (self.old_gen_used() as u128) * 10 >= (old_cap as u128) * 9
+                && (self.young_from_used() as u128) * 10 >= (young_cap as u128) * 9
+        };
+        if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
             tracing::debug!(
-                "JIT frames are active (depth={}) — running non-moving \
-                 young-gen mark-sweep (compaction deferred until quiescence \
-                 ends).",
-                crate::gc_quiescence::depth(),
+                "running non-moving young-gen mark-sweep (jit_active={}, \
+                 promotion_oom_risk={}) — compaction deferred.",
+                crate::gc_quiescence::is_active(),
+                promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via
@@ -2561,7 +2639,7 @@ impl GenerationalHeap {
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
-        Self::scan_dirty_cards(&card_table, &old_gen, &young_from, &mut extra_roots);
+        Self::scan_dirty_cards(card_table, &old_gen, &young_from, &mut extra_roots);
 
         // Phase 1: Forward all root objects
         for root in roots.iter_mut() {
@@ -3690,7 +3768,7 @@ impl GenerationalHeap {
                         // SAFETY: offset 4 lies within the >=8-byte gap.
                         let gap = unsafe { std::ptr::read((src as *const u8).add(4) as *const u32) }
                             as usize;
-                        if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                        if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                             cursor += gap;
                             continue;
                         }
@@ -3846,7 +3924,7 @@ impl GenerationalHeap {
                             let gap =
                                 unsafe { std::ptr::read((obj as *const u8).add(4) as *const u32) }
                                     as usize;
-                            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                                 cursor += gap;
                                 continue;
                             }
@@ -4216,7 +4294,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                     cursor += gap;
                     continue;
                 }
@@ -4316,8 +4394,7 @@ impl GenerationalHeap {
                     let probe_size = gen_object_total_size(probe_hdr);
                     let kind_byte = probe_hdr.kind as u8;
                     if kind_byte <= 1
-                        && probe_size >= HEADER_SIZE
-                        && probe_size <= MAX_PLAUSIBLE_OBJ_BYTES
+                        && (HEADER_SIZE..=MAX_PLAUSIBLE_OBJ_BYTES).contains(&probe_size)
                         && probe + probe_size <= used
                         && probe_hdr.num_slots <= (1 << 24)
                         && probe_hdr.array_length <= i32::MAX as u32
@@ -4610,7 +4687,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
                     cursor += gap;
                     continue;
                 }
@@ -4737,7 +4814,7 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= young_from.used() {
                     cursor += gap;
                     continue;
                 }
@@ -5588,7 +5665,7 @@ impl GenerationalHeap {
                     // SAFETY: offset 4 lies within the >=8-byte gap.
                     let gap =
                         unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                    if gap >= 8 && gap < HEADER_SIZE && offset + gap <= used {
+                    if (8..HEADER_SIZE).contains(&gap) && offset + gap <= used {
                         offset += gap;
                         continue;
                     }
@@ -5773,7 +5850,6 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
 /// Cached `CRATONVM_DBG_GCWRITE` gate (bc math-ec diagnostic). Cached in a
 /// `OnceLock` so the per-object-copy check in `forward_object` does NOT pay an
 /// `env::var_os` lookup on the hot GC path when the gate is off.
-#[inline]
 fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -6021,7 +6097,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
             // SAFETY: offset 4 lies within the >=8-byte gap.
             let gap =
                 unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+            if (8..HEADER_SIZE).contains(&gap) && cursor + gap <= used {
                 cursor += gap;
                 continue;
             }
@@ -7139,7 +7215,7 @@ mod tests {
 
         for i in 0..1000 {
             let obj = heap.alloc_object(ClassId::new(0), 2);
-            heap.set_field(obj, 0, Value::Int(i as i32));
+            heap.set_field(obj, 0, Value::Int(i));
             // Keep every 20th object alive
             if i % 20 == 0 {
                 live_objs.push(obj);
@@ -7772,7 +7848,7 @@ mod tests {
         let mut roots: Vec<ObjectRef> = Vec::new();
         for i in 0..num_objects {
             let obj = heap.alloc_object(ClassId::new(0), 2); // field 0=tag, field 1=link
-            heap.set_field(obj, 0, Value::Int(i as i32));
+            heap.set_field(obj, 0, Value::Int(i));
             roots.push(obj);
         }
 

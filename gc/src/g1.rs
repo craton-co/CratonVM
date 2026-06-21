@@ -105,7 +105,16 @@ pub struct G1Region {
     /// Per-region remembered set.
     pub rset: RememberedSet,
     /// Whether this region is pinned (JEP 423: JNI critical region pinning).
+    /// Mirror of `pin_count > 0` — the CSet-selection filters read this flag.
     pub pinned: bool,
+    /// Number of live JNI-critical pins on this region (refcount). Overlapping
+    /// critical sections on arrays in the same region — or nested checkouts of
+    /// one array — must refcount: a single bool would let an inner `Release`
+    /// clear the pin while an outer section is still live, re-admitting the
+    /// region to the collection set and relocating an array a native pointer's
+    /// copy-back still depends on. Maintained by [`G1Collector::pin_region`] /
+    /// [`G1Collector::unpin_region`].
+    pub pin_count: u32,
     /// Survivor age (number of young GCs survived).
     pub age: u8,
     /// Per-region mark bitmap for concurrent marking.
@@ -138,6 +147,7 @@ impl G1Region {
             gc_efficiency: 0.0,
             rset: RememberedSet::default(),
             pinned: false,
+            pin_count: 0,
             age: 0,
             mark_bitmap,
         }
@@ -156,6 +166,7 @@ impl G1Region {
         self.gc_efficiency = 0.0;
         self.rset.clear();
         self.pinned = false;
+        self.pin_count = 0;
         self.age = 0;
         // Round-2 fix (HIGH — GC #5): clear stale mark bits so they don't
         // pollute the next concurrent-mark cycle. The Vec is never
@@ -1859,8 +1870,13 @@ impl G1Collector {
                 } else {
                     // SAFETY: slot_idx < num_slots, within the allocated object.
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
-                    // SAFETY: slot_ptr is a properly aligned Value within the object.
-                    unsafe { std::ptr::read(slot_ptr as *const Value) }
+                    // Concurrent-mark torn-read fix: this scan runs concurrently
+                    // with JIT-compiled field stores, which write the 16-byte
+                    // slot directly (bypassing the regions-lock-serialized
+                    // `set_field`). Read the slot as two atomic words so the
+                    // access is well-defined and cannot splice a garbage pointer.
+                    // SAFETY: slot_ptr is a properly aligned live Value slot.
+                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
                 };
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
@@ -1955,6 +1971,33 @@ impl G1Collector {
                 push_with_cap(&mut worklist, addr);
             }
         }
+
+        // 2) SATB completeness (finding #18): before draining the global
+        //    shards, pull in every live mutator's partially-full per-thread
+        //    buffer. The fast-path barrier only spills a thread's local buffer
+        //    into the shards when it fills (~256 entries) or when that thread
+        //    self-flushes; references a thread overwrote since its last spill
+        //    live only in its local buffer, invisible to the shard `drain()`
+        //    below. Excluded from the remark snapshot, the still-live objects
+        //    they point at are swept while reachable (use-after-free).
+        //
+        //    G1's remark uses `drain()` (not `deactivate_and_drain()`, which
+        //    runs only at end-of-cycle `cleanup` where stragglers are
+        //    discarded), so this is the one place that must drain the registry.
+        //    Sound only because `remark` runs at the STW safepoint (final
+        //    remark; and the initial-mark call, where buffers are typically
+        //    empty): no mutator is mid-barrier, so nothing re-fills a buffer
+        //    after we drain it. Draining every buffer here from the collector
+        //    removes the dependence on each mutator self-flushing at the
+        //    safepoint — the external, unenforced contract finding #18 flagged.
+        //
+        //    No `debug_assert!` that all registered buffers are now empty: the
+        //    registry is process-global and this crate cannot observe the VM's
+        //    STW state, so such a check races with any concurrent SATB user
+        //    (notably the parallel test harness) and would flake. The contract
+        //    is instead verified deterministically by
+        //    `satb::tests::flush_all_captures_every_parked_mutator_buffer`.
+        crate::satb::flush_all_thread_satb_buffers(&self.satb_queue);
 
         // 2) SATB — every overwritten reference becomes a root.
         let satb_entries = self.satb_queue.drain();
@@ -2095,20 +2138,49 @@ impl G1Collector {
     // Region Pinning (JEP 423)
     // -----------------------------------------------------------------------
 
-    /// Pin a region, preventing it from being evacuated during GC.
+    /// Pin a region, preventing it from being evacuated during GC. Refcounted:
+    /// each `pin_region` must be balanced by exactly one [`unpin_region`], so
+    /// overlapping JNI critical sections on the same region pin/unpin
+    /// independently.
     pub fn pin_region(&self, region_idx: usize) {
         let mut regions = self.regions.lock();
         if region_idx < regions.len() {
-            regions[region_idx].pinned = true;
+            let r = &mut regions[region_idx];
+            r.pin_count = r.pin_count.saturating_add(1);
+            r.pinned = true;
         }
     }
 
-    /// Unpin a region, allowing it to be collected again.
+    /// Unpin a region, allowing it to be collected again once its pin count
+    /// returns to zero. Tolerant of an unbalanced call (count already zero), so
+    /// a stray double-`Release` from native code cannot wrongly clear a pin
+    /// another section still holds.
     pub fn unpin_region(&self, region_idx: usize) {
         let mut regions = self.regions.lock();
         if region_idx < regions.len() {
-            regions[region_idx].pinned = false;
+            let r = &mut regions[region_idx];
+            r.pin_count = r.pin_count.saturating_sub(1);
+            if r.pin_count == 0 {
+                r.pinned = false;
+            }
         }
+    }
+
+    /// Pin the region backing the object at `addr` (a JNI critical section) and
+    /// return its index for the matching [`unpin_region`], or `None` if `addr`
+    /// is not in any region. Refcounted via [`pin_region`].
+    ///
+    /// G1's only object-moving paths — `young_collection` and
+    /// `mixed_collection` — exclude pinned regions from the collection set, and
+    /// no full-GC compaction path exists, so this guarantees the object stays
+    /// at `addr` until every pin is released. That is what lets
+    /// `GetPrimitiveArrayCritical`'s detached copy be copied back to the *same*
+    /// object at `Release` (its Get-time handle would otherwise go stale once
+    /// the array was evacuated). See the design doc §3.2.5.
+    pub fn pin_region_for_addr(&self, addr: usize) -> Option<usize> {
+        let idx = self.lookup_region_for_addr(addr)?;
+        self.pin_region(idx);
+        Some(idx)
     }
 
     /// Check if a region is pinned.
@@ -4140,11 +4212,7 @@ mod tests {
         // the exact calculation so future rounding tweaks don't break.
         let expected = cfg.heap_size * 70 / 100;
         let actual = gc.marking_threshold_bytes();
-        let diff = if actual > expected {
-            actual - expected
-        } else {
-            expected - actual
-        };
+        let diff = actual.abs_diff(expected);
         assert!(
             diff * 100 <= expected,
             "ihop threshold {actual} deviates from {expected} by more than 1 %"
@@ -4218,6 +4286,66 @@ mod tests {
         let gc = make_collector();
         gc.pin_region(9999); // should not panic
         assert!(!gc.is_pinned(9999));
+    }
+
+    #[test]
+    fn pin_region_for_addr_keeps_jni_critical_array_in_place() {
+        // Step 6 (JEP 423): GetPrimitiveArrayCritical pins the backing array's
+        // region so a moving young/mixed collection cannot relocate it before
+        // the copy-back at Release. Without the pin the object is evacuated and
+        // its Get-time address goes stale (copy-back to a vacated/recycled slot
+        // — data loss or corruption).
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(123));
+        let addr = obj.as_ptr() as usize;
+
+        let idx = gc
+            .pin_region_for_addr(addr)
+            .expect("freshly allocated object must live in a region");
+        // Resolves to the same region `region_for_ptr` would.
+        let expected = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+        assert_eq!(idx, expected);
+        assert!(gc.is_pinned(idx));
+
+        // A young GC must NOT relocate the pinned array.
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "pinned region must be excluded from the collection set"
+        );
+        assert_eq!(
+            roots[0].as_ptr(),
+            obj.as_ptr(),
+            "pinned JNI-critical array must not move"
+        );
+        // The data the copy-back would read is intact and at the same address.
+        assert_eq!(gc.get_field(obj, 0).as_int(), Some(123));
+
+        gc.unpin_region(idx);
+        assert!(!gc.is_pinned(idx));
+    }
+
+    #[test]
+    fn region_pin_refcount_balances() {
+        // Overlapping critical sections on arrays in the same region (or nested
+        // checkouts of one array) must refcount: one Release cannot unpin while
+        // another section is still live.
+        let gc = make_collector();
+        gc.pin_region(0);
+        gc.pin_region(0);
+        assert!(gc.is_pinned(0));
+        gc.unpin_region(0);
+        assert!(gc.is_pinned(0), "still pinned after 1 of 2 unpins");
+        gc.unpin_region(0);
+        assert!(!gc.is_pinned(0), "unpinned after the final unpin");
+        // An extra (unbalanced) unpin is tolerated and stays unpinned.
+        gc.unpin_region(0);
+        assert!(!gc.is_pinned(0));
     }
 
     // -- String deduplication --

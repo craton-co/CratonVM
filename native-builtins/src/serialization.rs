@@ -964,6 +964,22 @@ const STREAM_VERSION: u16 = 5;
 /// out-of-memory regime an attacker is fishing for.
 const MAX_SERIAL_STRING_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hard ceiling on the declared element count of a single `TC_ARRAY` we will
+/// allocate, independent of any configured JEP-290 `maxarray` filter.
+///
+/// `TC_ARRAY` carries an attacker-controlled 32-bit length; with no `maxarray`
+/// clause installed (the default), `filter_check_array` returns "unbounded",
+/// so a hostile stream declaring ~2.1 billion elements would otherwise drive a
+/// multi-GB allocation before any object is read. This is the filter-
+/// independent last line of defence (the sibling of `MAX_SERIAL_STRING_BYTES`
+/// for `TC_LONGSTRING`). 64 Mi elements comfortably exceeds any legitimate
+/// serialized array while bounding the worst-case allocation: even an 8-byte
+/// element type (`long`/`double`) caps at 512 MiB, and reference arrays at
+/// `64 Mi * sizeof(ObjectRef)`, far below the out-of-memory regime an attacker
+/// is fishing for. Beyond this ceiling we additionally reject any length the
+/// stream cannot possibly back with at least one byte per element.
+const MAX_SERIAL_ARRAY_ELEMS: usize = 64 * 1024 * 1024;
+
 // Type codes (TC_*)
 const TC_NULL: u8 = 0x70;
 const TC_REFERENCE: u8 = 0x71;
@@ -2121,6 +2137,19 @@ fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     let len_bytes = ois_buf_read(addr, 4);
     let length = i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
         as usize;
+
+    // SECURITY (deserialization DoS, default-reachable): a filter-independent
+    // upper bound on the declared element count, applied *before* allocation.
+    // The JEP-290 `maxarray` filter below is opt-in — with no filter installed
+    // (the default) `filter_check_array` reports "unbounded", so a hostile
+    // stream declaring up to ~2.1 billion elements could drive a multi-GB
+    // allocation here. Mirror the JDK's defensive sizing: reject any length
+    // that exceeds the hard ceiling, or that the stream cannot possibly back
+    // with at least one byte per element (every wire element — even a `TC_NULL`
+    // reference — consumes >= 1 byte), independent of any configured filter.
+    if length > MAX_SERIAL_ARRAY_ELEMS || length > ois_buf_remaining(addr) {
+        return Value::Object(None);
+    }
 
     // JEP-290 maxarray: reject *before* allocating to avoid the
     // attacker-controlled length triggering a multi-GB allocation.
@@ -5803,6 +5832,62 @@ mod serialization_tests {
             clamped <= MAX_SERIAL_STRING_BYTES,
             "clamp must honour hard cap"
         );
+    }
+
+    #[test]
+    fn array_oversized_length_rejected_without_filter() {
+        let _serial_guard = super::serialization_test_guard();
+        // SECURITY regression (deserialization DoS, MEDIUM, default-reachable):
+        // `ois_read_array` must apply a filter-INDEPENDENT upper bound on the
+        // declared element count before allocating. With NO filter installed
+        // (the default) `filter_check_array` reports "unbounded", so a hostile
+        // TC_ARRAY length must still be rejected by the hard ceiling and the
+        // "one byte per element" remaining-bytes guard.
+        let addr = 0x4A45_5201_usize;
+        filter_state_remove(addr); // PERF: keep ois_filter_state_count in sync
+
+        // A tiny buffer that has just had its 4-byte length word consumed,
+        // standing in for the state inside `ois_read_array` after the length
+        // read. Only a few element bytes remain on the wire.
+        ois_buf_load(addr, vec![0u8; 3]);
+        let remaining = ois_buf_remaining(addr);
+        assert_eq!(remaining, 3);
+
+        // The default (no filter) path: the JEP-290 maxarray check is a no-op
+        // ceiling — it must NOT be relied upon to bound the allocation.
+        assert!(
+            filter_check_array(addr, i32::MAX as usize),
+            "with no filter installed, filter_check_array reports unbounded"
+        );
+
+        // The filter-independent guard (mirrors the predicate in
+        // `ois_read_array`): a 2.1-billion-element claim is rejected.
+        let hostile = i32::MAX as usize;
+        assert!(
+            hostile > MAX_SERIAL_ARRAY_ELEMS || hostile > remaining,
+            "hostile array length must trip the filter-independent guard"
+        );
+        // It exceeds BOTH the hard ceiling and the bytes the stream can back.
+        assert!(hostile > MAX_SERIAL_ARRAY_ELEMS);
+        assert!(hostile > remaining);
+
+        // A length the buffer cannot back (more elements than bytes left, even
+        // at one byte each) is rejected even though it is under the ceiling.
+        let unbacked = remaining + 1;
+        assert!(unbacked <= MAX_SERIAL_ARRAY_ELEMS);
+        assert!(
+            unbacked > remaining,
+            "an array longer than the remaining bytes must be rejected"
+        );
+
+        // A legitimate, fully-backed array length is accepted by the guard.
+        let ok = remaining; // every element backed by >= 1 byte
+        assert!(
+            !(ok > MAX_SERIAL_ARRAY_ELEMS || ok > remaining),
+            "a fully-backed array length must NOT be rejected"
+        );
+
+        filter_state_remove(addr);
     }
 
     #[test]

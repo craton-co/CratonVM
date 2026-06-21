@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "host": "multi",
+  "captured_at": "2026-06-21",
+  "jdk": "java version \"25.0.1\" 2025-10-21 LTS",
+  "entries": [
+    {
+      "id": "div-0001",
+      "class": "ExceptionId",
+      "repro_path": "difftest/seeds\\ExceptionId.java",
+      "classification": "universal",
+      "cratonvm": {
+        "stdout": "AE: / by zero\nCCE: java/lang/String cannot be cast to java/lang/Integer\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: null\ndone",
+        "stderr": "[cratonvm] stack-dump watchdog armed: will dump + abort after 120s\n[cratonvm] main-vm run() returned Ok \u2014 VM main exiting normally",
+        "exit_code": 0,
+        "exception": null,
+        "timed_out": false,
+        "wall_ms": 0
+      },
+      "hotspot": {
+        "stdout": "AE: / by zero\nCCE: class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: Index 9 out of bounds for length 3\ndone",
+        "stderr": "",
+        "exit_code": 0,
+        "exception": null,
+        "timed_out": false,
+        "wall_ms": 0
+      },
+      "status": "known",
+      "first_seen": "2026-06-21",
+      "linked_doc": "ExceptionId residual known divergences after the JEP-358 NPE fix (vm exceptions.rs block-start reconstruction): CCE lacks HotSpot module/loader detail + uses slashed names; charAt SIOOBE has no detail message. NPE now byte-identical."
+    }
+  ]
+}

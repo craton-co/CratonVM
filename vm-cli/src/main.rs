@@ -239,6 +239,16 @@ struct Args {
     #[arg(long = "XX:-UseContainerSupport")]
     disable_container_support: bool,
 
+    /// Garbage-collector selector. Carries the collector name from a HotSpot
+    /// `-XX:+Use<name>GC` flag (with the `Use`/`GC` wrapper stripped by
+    /// `normalize_java_launcher_argv`), e.g. `G1` for `-XX:+UseG1GC`. CratonVM
+    /// honours `G1` and the default `Generational`; any other collector warns
+    /// and falls back to Generational. Repeated flags follow HotSpot last-wins
+    /// (`overrides_with` self → no `ArgumentConflict` on a second occurrence).
+    /// See docs/feature-designs/concurrent-gc-maturation.md §3.1.
+    #[arg(long = "XX:UseGc", value_name = "NAME", overrides_with = "gc_selector")]
+    gc_selector: Option<String>,
+
     /// Unified logging spec (-Xlog:tag[+tag]*[=level][:output[:decorators]]).
     /// Example: --Xlog gc*=info:stdout:time,level,tags
     #[arg(long = "Xlog", value_name = "SPEC")]
@@ -531,6 +541,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--java-home",
     "--Xverify",
     "--XX:SharedArchiveFile",
+    "--XX:UseGc",
     "--Xshare",
     "--XX:AOTMode",
     "--XX:AOTCache",
@@ -969,13 +980,39 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
                 i += 1;
             }
         }
+        // GC selector: `-XX:+Use<Name>GC` -> `--XX:UseGc <Name>`. The collector
+        // name (`<Name>` between `Use` and `GC`) is forwarded verbatim; the
+        // config-apply step (`parse_gc_algorithm`) honours `G1` / `Generational`
+        // and warns-and-falls-back for any other collector. Emitting a value
+        // option (rather than acting here) means a later `-XX:+Use...GC`
+        // overrides an earlier one via clap last-wins, matching HotSpot.
+        //
+        // `-XX:-UseG1GC` explicitly turns G1 off -> revert to the default
+        // Generational. Other `-XX:-Use<Name>GC` ("do not use collector X")
+        // select nothing and fall through to the silent-ignore arm below.
+        //
+        // Guarded so `-XX:+UseStringDeduplication`, `-XX:+UseCompressedOops`,
+        // etc. (no `GC` suffix) do NOT match and keep their existing handling.
+        else if let Some(name) = a
+            .strip_prefix("-XX:+Use")
+            .and_then(|core| core.strip_suffix("GC"))
+            .filter(|core| !core.is_empty())
+        {
+            out.push("--XX:UseGc".into());
+            out.push(name.to_string());
+            i += 1;
+        } else if a == "-XX:-UseG1GC" {
+            out.push("--XX:UseGc".into());
+            out.push("Generational".into());
+            i += 1;
+        }
         // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
         // implement (`-XX:MetaspaceSize`, `-XX:MaxMetaspaceSize`,
-        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`,
-        // GC selectors, …). Recognized `-XX:` flags are rewritten by the
-        // branches above; everything else is silently ignored so a Maven
-        // Surefire / Gradle fork — which passes these unconditionally —
-        // launches instead of clap aborting with "unexpected argument '-X'".
+        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`, …).
+        // Recognized `-XX:` flags are rewritten by the branches above;
+        // everything else is silently ignored so a Maven Surefire / Gradle
+        // fork — which passes these unconditionally — launches instead of clap
+        // aborting with "unexpected argument '-X'".
         else if a.starts_with("-XX:") {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
                 eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
@@ -1611,18 +1648,41 @@ fn run() -> Result<()> {
         config = config.with_java_home(jh.clone());
     }
 
+    // Container/cgroup awareness (HotSpot's `-XX:+UseContainerSupport`, on by
+    // default). When enabled, read the cgroup memory/CPU limits once so the
+    // ergonomic default heap is sized off the container limit and
+    // `Runtime.availableProcessors()` honors the CPU quota. `-XX:-UseContainer
+    // Support` skips detection entirely, so every limit reverts to host values.
+    // On non-Linux hosts `detect_container()` reports "not containerized" with
+    // all limits `None`, so this is a no-op there.
+    let container_info = if args.disable_container_support {
+        None
+    } else {
+        Some(cratonvm_vm::runtime::container::detect_container())
+    };
+    let container_mem_limit = container_info.as_ref().and_then(|i| i.memory_limit);
+    // CPU count for Runtime.availableProcessors() / the JMX OS bean. Only set
+    // when a cgroup quota was actually detected; `None` ⇒ report host count.
+    config.container_effective_processors =
+        container_info.as_ref().and_then(|i| i.effective_cpu_count);
+
     if let Some(max_heap_str) = &args.max_heap {
         let size = parse_size(max_heap_str)
             .with_context(|| format!("Invalid heap size: {max_heap_str}"))?;
         config = config.with_max_heap_size(size);
-    } else if let Some(ergo) = ergonomic_default_max_heap() {
-        // No explicit -Xmx: size the heap like a stock JDK (1/4 physical RAM)
-        // instead of the fixed 256 MB library default, so Spring/Mockito/JUnit
-        // workloads don't thrash GC into a pseudo-hang. See
-        // `ergonomic_default_max_heap`.
+    } else if let Some(ergo) = ergonomic_default_max_heap(container_mem_limit) {
+        // No explicit -Xmx: size the heap like a stock JDK (1/4 of host RAM, or
+        // of the cgroup limit inside a container) instead of the fixed 256 MB
+        // library default, so Spring/Mockito/JUnit workloads don't thrash GC
+        // into a pseudo-hang. See `ergonomic_default_max_heap`.
         if args.verbose_gc {
+            let basis = if container_mem_limit.is_some() {
+                "1/4 container memory limit"
+            } else {
+                "1/4 physical RAM"
+            };
             eprintln!(
-                "[cratonvm] ergonomic default max heap: {} MB (1/4 physical RAM; \
+                "[cratonvm] ergonomic default max heap: {} MB ({basis}; \
                  set -Xmx or CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 to override)",
                 ergo / (1024 * 1024)
             );
@@ -1697,6 +1757,29 @@ fn run() -> Result<()> {
     }
     if let Some(output_path) = &args.aot_cache_output {
         config.aot_cache_output = Some(output_path.clone());
+    }
+
+    // Garbage-collector selection (`-XX:+UseG1GC` / `-XX:-UseG1GC` / any other
+    // `-XX:+Use*GC`, normalized to `--XX:UseGc <name>`). Absent → keep the
+    // default (`Generational`, the safety net during G1 maturation). A
+    // recognized selector (`g1` | `generational`) sets `gc_algorithm`; an
+    // unsupported collector (Serial/Parallel/Z/Shenandoah/Epsilon) warns and
+    // falls back to Generational so a `java` drop-in keeps booting. G1 is
+    // already wired into the `GcBackend` dispatch (vm_init.rs) and the
+    // safepoint driver; this is the missing reachability edge. See
+    // docs/feature-designs/concurrent-gc-maturation.md §3.1.
+    if let Some(sel) = &args.gc_selector {
+        match cratonvm_vm::config::parse_gc_algorithm(sel) {
+            Some(algo) => config.gc_algorithm = algo,
+            None => {
+                eprintln!(
+                    "Warning: unsupported garbage collector -XX:+Use{sel}GC; CratonVM \
+                     implements G1 (-XX:+UseG1GC) and the default Generational collector. \
+                     Falling back to Generational."
+                );
+                config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
+            }
+        }
     }
 
     // Missing native audit. NEW-10: `--dump-missing-natives FILE` and
@@ -2264,6 +2347,14 @@ fn run() -> Result<()> {
                 anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)")
             })?;
     }
+
+    // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
+    // still fresh, so a later 100%-full-heap OOM (in either user code or a
+    // premain) can be thrown without allocating the throwable — which would
+    // otherwise hard-abort in the non-fallible String allocator. Idempotent and
+    // best-effort: if the class isn't loadable yet it leaves the slot empty and
+    // the OOM paths keep their prior behaviour.
+    cratonvm_vm::runtime::exceptions::ensure_singleton_oom(&vm.shared, &mut vm.main_thread);
 
     // WP2.4-C — run every `-javaagent:` agent's `premain(String,
     // Instrumentation)` hook BEFORE the application's `main`. Per the
@@ -3470,28 +3561,102 @@ fn physical_ram_bytes() -> Option<u64> {
 /// enough room. (If the heap is ever made lazily-committed, the cap can grow
 /// or be removed to fully match HotSpot.)
 ///
+/// When running under `-XX:+UseContainerSupport` inside a memory-constrained
+/// container, the basis for the fraction is the **cgroup memory limit** rather
+/// than host RAM — HotSpot's `MaxRAMPercentage` applies to the container limit,
+/// not the host total, so on a 64 GB host with `--memory=512m` the default heap
+/// is sized off 512 MB, not 64 GB. `container_mem_limit` is the detected cgroup
+/// limit (or `None` when uncontained / container support is off); the basis is
+/// then `min(physical RAM, cgroup limit)`.
+///
 /// Opt out with `CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` (fixed 256 MB default), or
 /// override the cap with `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>`. An explicit `-Xmx`
 /// always wins over all of this.
-fn ergonomic_default_max_heap() -> Option<usize> {
+fn ergonomic_default_max_heap(container_mem_limit: Option<u64>) -> Option<usize> {
     if std::env::var("CRATONVM_DEFAULT_HEAP_ERGONOMICS").as_deref() == Ok("0") {
         return None;
     }
-    const FLOOR: u64 = 256 * 1024 * 1024;
-    const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
     let cap = std::env::var("CRATONVM_DEFAULT_HEAP_MAX_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
         .unwrap_or(MAX_ERGONOMIC_HEAP);
     let phys = physical_ram_bytes()?;
-    let chosen = (phys / 4).clamp(FLOOR, cap.max(FLOOR));
-    usize::try_from(chosen).ok()
+    // Inside a memory-constrained container, size from the smaller of host RAM
+    // and the cgroup limit so the default heap never overshoots the container.
+    let basis = match container_mem_limit {
+        Some(limit) => phys.min(limit),
+        None => phys,
+    };
+    Some(clamp_ergonomic_heap(basis, cap))
+}
+
+/// Floor for the ergonomic default heap (the historical 256 MB baseline).
+const ERGONOMIC_HEAP_FLOOR: u64 = 256 * 1024 * 1024;
+/// Default cap for the ergonomic default heap (4 GiB). See
+/// [`ergonomic_default_max_heap`] for why the cap exists (eager arena commit).
+const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Pure clamp for the ergonomic default heap: take 1/4 of `basis`, cap it at
+/// `cap` (itself floored so a tiny `CRATONVM_DEFAULT_HEAP_MAX_MB` can't drop
+/// below the 256 MB floor), floor it at 256 MB, and finally bound it by `basis`
+/// itself so a tiny container is never handed more than its whole limit.
+fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
+    let quarter = basis / 4;
+    let capped = quarter.min(cap.max(ERGONOMIC_HEAP_FLOOR));
+    let floored = capped.max(ERGONOMIC_HEAP_FLOOR);
+    let bounded = floored.min(basis);
+    usize::try_from(bounded).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Ergonomic default-heap clamp — pure math, exercised directly so the
+    // container-vs-host basis logic is covered without a real cgroupfs.
+    // -----------------------------------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn ergo_clamp_quarter_of_large_host() {
+        // 16 GiB basis → 1/4 = 4 GiB, exactly the default cap.
+        assert_eq!(clamp_ergonomic_heap(16 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_capped_for_huge_host() {
+        // 64 GiB basis → 1/4 = 16 GiB, capped to the 4 GiB default.
+        assert_eq!(clamp_ergonomic_heap(64 * GIB, MAX_ERGONOMIC_HEAP), 4 * GIB as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_floored_small_basis() {
+        // 4 GiB basis → 1/4 = 1 GiB (above the 256 MiB floor).
+        assert_eq!(clamp_ergonomic_heap(4 * GIB, MAX_ERGONOMIC_HEAP), GIB as usize);
+        // 512 MiB basis → 1/4 = 128 MiB, raised to the 256 MiB floor.
+        assert_eq!(clamp_ergonomic_heap(512 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_never_exceeds_basis() {
+        // A 256 MiB container: 1/4 = 64 MiB, the floor would push it to
+        // 256 MiB — but it must never exceed the basis itself, so it stays
+        // at exactly 256 MiB (not above), and a 200 MiB basis stays at 200.
+        assert_eq!(clamp_ergonomic_heap(256 * MIB, MAX_ERGONOMIC_HEAP), (256 * MIB) as usize);
+        assert_eq!(clamp_ergonomic_heap(200 * MIB, MAX_ERGONOMIC_HEAP), (200 * MIB) as usize);
+    }
+
+    #[test]
+    fn ergo_clamp_custom_cap_floored() {
+        // A tiny cap override can't drop the result below the 256 MiB floor.
+        assert_eq!(clamp_ergonomic_heap(16 * GIB, 64 * MIB), (256 * MIB) as usize);
+        // A 2 GiB cap bites on a big host (8 GiB → 1/4 = 2 GiB).
+        assert_eq!(clamp_ergonomic_heap(8 * GIB, 2 * GIB), (2 * GIB) as usize);
+    }
 
     // -----------------------------------------------------------------------
     // insert_program_args_separator tests — `java`-launcher positional
@@ -4141,6 +4306,68 @@ mod tests {
         // `-XX:+UseContainerSupport` is the default; gets dropped.
         let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseContainerSupport", "Main"]));
         assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_useg1gc_normalizes_to_selector() {
+        // `-XX:+UseG1GC` -> `--XX:UseGc G1` (value option, adjacent value).
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:+UseG1GC", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:UseGc", "G1", "Main"]));
+        // `-XX:-UseG1GC` explicitly reverts to the default Generational.
+        let out = normalize_java_launcher_argv(argv(&["java", "-XX:-UseG1GC", "Main"]));
+        assert_eq!(out, argv(&["java", "--XX:UseGc", "Generational", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_unsupported_gc_is_forwarded_not_dropped() {
+        // Unsupported collectors are forwarded verbatim; the warn-and-fallback
+        // happens at config-apply time (`parse_gc_algorithm`), not here.
+        for (flag, name) in [
+            ("-XX:+UseParallelGC", "Parallel"),
+            ("-XX:+UseSerialGC", "Serial"),
+            ("-XX:+UseZGC", "Z"),
+            ("-XX:+UseShenandoahGC", "Shenandoah"),
+        ] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "--XX:UseGc", name, "Main"]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn hotspot_xx_non_gc_use_flags_not_mistaken_for_selector() {
+        // `-XX:+Use*` flags that do NOT end in `GC` must keep their existing
+        // handling (silently ignored) and must not become a GC selector.
+        for flag in ["-XX:+UseStringDeduplication", "-XX:+UseCompressedOops"] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "Main"]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn hotspot_useg1gc_reaches_clap_as_selector_after_pipeline() {
+        // End-to-end: `-XX:+UseG1GC` survives the full pre-clap pipeline and
+        // lands in `Args::gc_selector`, the field the config-apply step reads.
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseG1GC", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept -XX:+UseG1GC");
+        assert_eq!(parsed.gc_selector.as_deref(), Some("G1"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn hotspot_repeated_gc_flags_last_wins() {
+        // HotSpot honours the last `-XX:+Use*GC`; clap's `Set` action keeps the
+        // last value, so a `-XX:+UseParallelGC -XX:+UseG1GC` pair selects G1.
+        let argv0: Vec<String> = argv(&["java", "-XX:+UseParallelGC", "-XX:+UseG1GC", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept repeated GC flags");
+        assert_eq!(parsed.gc_selector.as_deref(), Some("G1"));
     }
 
     #[test]

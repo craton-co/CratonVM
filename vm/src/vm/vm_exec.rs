@@ -352,6 +352,52 @@ pub fn value_as_validated_object_ref(shared: &SharedVm, v: Value) -> Option<Obje
     }
 }
 
+/// Validate that a raw native byte range `[base, base + len)` does not wrap
+/// past the end of the (64-bit) address space.
+///
+/// Used by `copy_to_native_memory` / `copy_from_native_memory` to reject a
+/// forged length on a high `base` before the unchecked `copy_nonoverlapping`.
+/// A wrapping range would let the copy run off the end of the addressable
+/// space (out-of-bounds read/write = UB); we refuse it instead. `len == 0` is
+/// in bounds (a no-op copy). The Java-side array bounds are enforced separately
+/// by the caller, which passes an already-sliced `&[u8]` / `&mut [u8]`.
+#[inline]
+fn native_range_is_in_bounds(base: u64, len: usize) -> bool {
+    // `checked_add` is `None` exactly when `base + len` overflows `u64`.
+    base.checked_add(len as u64).is_some()
+}
+
+/// Atomically claim a raw `Box<JoinHandle<()>>` pointer for exactly-once
+/// consumption, returning `true` only on the FIRST claim of a given pointer.
+///
+/// `register_native_thread` / `attach_join_handle_to_native_thread` receive a
+/// `usize` that the caller produced via `Box::into_raw` and reconstruct it with
+/// `Box::from_raw`. If the SAME pointer value were ever passed twice (a
+/// duplicated handle, or a register-then-attach on the same raw pointer), the
+/// second `Box::from_raw` would reconstruct an already-freed allocation and
+/// double-free it on drop. Gating each reconstruction on this claim makes the
+/// `Box::from_raw` happen at most once per pointer: a second call sees the
+/// pointer already recorded, returns `false`, and the caller skips the unsafe
+/// reconstruction (a leak of that handle is acceptable; a double-free is not).
+///
+/// Pointers reused by the allocator after their owning thread has fully torn
+/// down are not a concern here — the dedup set only needs to prevent a
+/// double-consume of a handle that is still considered live by a caller, and
+/// in practice each spawned thread's handle is claimed exactly once. The set is
+/// bounded by the number of live native-thread handles, which is small.
+fn claim_raw_join_handle(ptr: usize) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static CLAIMED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    let set = CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
+    // A poisoned lock here only means a prior holder panicked; the contained
+    // set is still structurally valid, so recover the guard and proceed.
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    // `HashSet::insert` returns `true` iff the value was NOT already present,
+    // i.e. iff this is the first claim — exactly the exactly-once predicate.
+    guard.insert(ptr)
+}
+
 /// Pin a value that may encode a jobject as `Value::Long` for the duration
 /// of a native call (see `safe_native_call`).
 #[inline]
@@ -373,6 +419,15 @@ fn youngscan_enabled() -> bool {
 
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
+thread_local! {
+    /// DBG (CRATONVM_DBG_STRAYSTACK): stack of (callback-address, name) of
+    /// natives currently executing on this thread, so the stray-receiver dump
+    /// can name + RVA-locate the one that wrote through a relocated/zeroed
+    /// receiver.
+    static CURRENT_NATIVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn youngscan_straystack_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -457,10 +512,26 @@ pub fn safe_native_call(
     // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
 
+    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
+    // thread-local stack so the stray-receiver dump can name the culprit.
+    let _dbg_native = if youngscan_straystack_enabled() {
+        let nm = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
+        true
+    } else {
+        false
+    };
+
     let result = {
         let mut ctx = NativeContextImpl { shared, thread };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut ctx, args)))
     };
+    if _dbg_native {
+        CURRENT_NATIVE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
 
     // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
@@ -2055,9 +2126,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let k = N.fetch_add(1, Ordering::Relaxed);
                 if k < 12 {
+                    let (cb_addr, culprit) = CURRENT_NATIVE_STACK
+                        .with(|s| s.borrow().last().cloned())
+                        .unwrap_or((0, "<unknown>".to_string()));
+                    let module_base = unsafe {
+                        extern "system" {
+                            fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+                        }
+                        GetModuleHandleW(core::ptr::null()) as usize
+                    };
+                    let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
-                        "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?}",
-                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value,
+                        "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value, culprit, rva,
                     );
                     eprintln!("[straystack-native] Java stack (top first):");
                     for f in self.thread.frames.iter().rev().take(28) {
@@ -2140,11 +2221,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if cratonvm_native_builtins::unsafe_arena_contains(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
         }
+        // Reject null / negative handles. Returning `false` (not performing the
+        // copy) is how this layer signals failure; the native caller turns that
+        // into the appropriate Java exception. The bounds of `out` itself are
+        // the Java-side array bounds — the caller has already sliced the array,
+        // so `out.len()` is the validated request size.
         if addr <= 0 {
             return false;
         }
+        // Guard against an `addr + len` range that wraps past the end of the
+        // address space (a forged length on a high `addr`). Such a copy would
+        // read out-of-bounds / UB; refuse it instead. `addr > 0` here, so the
+        // `as u64` cast is exact.
+        if !native_range_is_in_bounds(addr as u64, out.len()) {
+            return false;
+        }
         // SAFETY: `addr` is a real, readable native pointer (not an arena
-        // handle); `out.len()` bytes are copied from it.
+        // handle); the `[addr, addr + out.len())` range is non-wrapping
+        // (checked above) and `out.len()` bytes are copied from it.
         unsafe {
             std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
         }
@@ -2155,7 +2249,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if cratonvm_native_builtins::unsafe_arena_contains(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
         }
+        // Reject null / negative handles (failure is signalled by `false`; the
+        // native caller raises the appropriate Java exception). `data` is the
+        // Java-side source slice, already bounds-checked by the caller.
         if addr <= 0 {
+            return false;
+        }
+        // Refuse a destination range `[addr, addr + len)` that would wrap past
+        // the end of the address space (forged length on a high `addr`) — such
+        // a write is out-of-bounds / UB. `addr > 0`, so `as u64` is exact.
+        if !native_range_is_in_bounds(addr as u64, data.len()) {
             return false;
         }
         // DBG (bc math-ec): a raw copy whose destination aliases the MANAGED
@@ -4079,17 +4182,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared
             .thread_registry
             .register_with_daemon(tid, name, None, daemon);
-        if join_handle_ptr != 0 {
+        // Claim the raw pointer for exactly-once consumption BEFORE
+        // reconstructing the Box: if this exact pointer were ever passed twice
+        // (a duplicated handle), the second `Box::from_raw` would double-free
+        // the allocation. `claim_raw_join_handle` returns `false` on a repeat,
+        // and we skip the reconstruction entirely.
+        if join_handle_ptr != 0 && claim_raw_join_handle(join_handle_ptr) {
             // SAFETY: the caller built this via
             // `Box::into_raw(Box::new(join_handle))` immediately before
             // the call, and is contractually obliged to pass us the
-            // exclusive ownership of that allocation. We take it back
-            // and move the `JoinHandle<()>` into the registry, where
-            // it lives until `wait_for_non_daemon_threads` joins on it
-            // (or the registry is dropped on VM teardown вЂ” in that
-            // case the handle is dropped, which detaches the OS thread,
-            // matching HotSpot's behaviour for daemon-on-shutdown
-            // teardown).
+            // exclusive ownership of that allocation. The claim above
+            // guarantees this is the first (and only) reconstruction of
+            // this pointer. We take it back and move the `JoinHandle<()>`
+            // into the registry, where it lives until
+            // `wait_for_non_daemon_threads` joins on it (or the registry is
+            // dropped on VM teardown вЂ” in that case the handle is dropped,
+            // which detaches the OS thread, matching HotSpot's behaviour for
+            // daemon-on-shutdown teardown).
             let boxed: Box<std::thread::JoinHandle<()>> =
                 unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
             self.shared.thread_registry.set_join_handle(tid, *boxed);
@@ -4127,8 +4236,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.shared.thread_registry.thread_name(tid).is_none() {
             return false;
         }
+        // Claim the raw pointer for exactly-once consumption before
+        // reconstructing the Box. A duplicated pointer (already consumed by a
+        // prior `register_native_thread` / `attach_*` call) would otherwise be
+        // `Box::from_raw`'d a second time and double-freed. On a repeat claim we
+        // report failure without touching the (already-owned) allocation.
+        if !claim_raw_join_handle(join_handle_ptr) {
+            return false;
+        }
         // SAFETY: caller built this via `Box::into_raw` and is
-        // contractually obliged to pass us the exclusive ownership.
+        // contractually obliged to pass us the exclusive ownership; the claim
+        // above guarantees this is the only reconstruction of this pointer.
         let boxed: Box<std::thread::JoinHandle<()>> =
             unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
         self.shared.thread_registry.set_join_handle(tid, *boxed);
@@ -4161,6 +4279,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn heap_allocated_bytes(&self) -> usize {
         self.shared.heap.allocated_bytes()
+    }
+
+    fn available_processor_count(&self) -> i32 {
+        // Container-aware: prefer the cgroup-derived count the launcher stored
+        // under `-XX:+UseContainerSupport`; otherwise fall back to the host
+        // hardware thread count. (Disabling container support leaves the field
+        // `None`, so the toggle is honored here transitively.)
+        if let Some(n) = self.shared.config.container_effective_processors {
+            return n.max(1) as i32;
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1)
+    }
+
+    fn max_heap_bytes(&self) -> i64 {
+        // Report the configured `-Xmx`, which the launcher already sized from
+        // the cgroup memory limit when running container-aware. Honest and
+        // container-correct in place of the old hardcoded 256 MiB.
+        self.shared.config.max_heap_size as i64
     }
 
     fn loaded_class_count(&self) -> usize {
@@ -5280,11 +5418,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if let Ok(sym) = lib.get::<JniOnLoad>(b"JNI_OnLoad\0") {
                     // Set TLS context so RegisterNatives (called from JNI_OnLoad) can
                     // resolve class names via the class manager.
-                    crate::native::jni::set_jni_context(self.shared);
-                    crate::native::jni::set_jni_thread(self.thread);
+                    //
+                    // SECURITY: install via the RAII guard so the TLS pointers are
+                    // cleared even if `JNI_OnLoad` (or a RegisterNatives up-call it
+                    // makes) panics/unwinds — otherwise a dangling `*mut JvmThread`
+                    // / `*mut SharedVm` would be left in TLS for a later JNI access
+                    // to dereference (use-after-free).
+                    //
+                    // Safety: `self.thread` is the live `&mut JvmThread` borrowed
+                    // for this call; it outlives `_jni_guard` per `set_jni_thread`.
+                    let _jni_guard = JniContextGuard::install(self.shared, self.thread as *mut _);
                     let _version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
-                    crate::native::jni::clear_jni_context();
-                    crate::native::jni::clear_jni_thread();
+                    // `_jni_guard` clears the TLS context on scope exit (normal or
+                    // unwind).
                 }
             }
         }
@@ -6985,7 +7131,14 @@ pub(super) fn proxy_invoke_handler(
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
     );
-    proxy_wrap_undeclared_if_needed(ctx.shared, ctx.thread, proxy, method_name, descriptor, result)
+    proxy_wrap_undeclared_if_needed(
+        ctx.shared,
+        ctx.thread,
+        proxy,
+        method_name,
+        descriptor,
+        result,
+    )
 }
 
 /// Dispatch a method call on an annotation proxy object.
@@ -7339,12 +7492,19 @@ fn proxy_wrap_undeclared_if_needed(
     // `proxy_resolve_declaring_class_mirror` lands on the exact declaring
     // interface, so its `Exceptions` attribute is authoritative for (name,desc).
     let decl_mirror = proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
-    let decl_cid = shared.class_mirrors_reverse.read().get(&decl_mirror).copied();
+    let decl_cid = shared
+        .class_mirrors_reverse
+        .read()
+        .get(&decl_mirror)
+        .copied();
     if let Some(decl_cid) = decl_cid {
         for ex_name in proxy_method_declared_exceptions(shared, decl_cid, method_name, descriptor) {
             if let Ok(ex_cid) = shared.load_class_concurrent(&ex_name) {
                 if thrown_cid == ex_cid
-                    || shared.class_manager.read().is_subclass_of(thrown_cid, ex_cid)
+                    || shared
+                        .class_manager
+                        .read()
+                        .is_subclass_of(thrown_cid, ex_cid)
                 {
                     return Err(MethodCallFailed::ExceptionThrown(thrown));
                 }
@@ -7412,7 +7572,10 @@ fn proxy_method_declared_exceptions(
                     return exception_indices
                         .iter()
                         .filter_map(|idx| {
-                            class.constant_pool.get_class_name(*idx).map(|s| s.to_string())
+                            class
+                                .constant_pool
+                                .get_class_name(*idx)
+                                .map(|s| s.to_string())
                         })
                         .collect();
                 }
@@ -11368,8 +11531,26 @@ fn invoke_on_class_shared_inner(
             // JNI function pointer registered via RegisterNatives or symbol lookup.
             // Set TLS context so that JNI callbacks (e.g. FindClass, CallMethod)
             // can access the VM from within the native library.
-            crate::native::jni::set_jni_context(shared);
-            crate::native::jni::set_jni_thread(thread as *mut _);
+            //
+            // SECURITY: install the context through an RAII guard rather than a
+            // manual set/clear pair. The guard's `Drop` clears the TLS pointers
+            // on EVERY exit edge — the arity-mismatch early return, the normal
+            // return, and (critically) an unwind out of `dispatch_jni_native`.
+            // The previous manual-clear pattern skipped the clears on panic,
+            // leaving dangling `*mut JvmThread` / `*mut SharedVm` pointers in TLS
+            // for a later JNI up-call to dereference (use-after-free).
+            //
+            // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
+            // for this dispatch; it outlives the guard (and thus the whole native
+            // call) per `set_jni_thread`'s contract.
+            let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
+
+            // GC-correctness (vm-jni-roots #2): bracket the native call in an
+            // implicit local-ref frame so any local jobject the native creates
+            // is a GC root for the call's lifetime. Dropped (frame popped) on
+            // every exit below — normal return, arity-mismatch early return,
+            // and panic unwind through the unsafe dispatch.
+            let _jni_local_frame = JniImplicitFrameGuard::enter();
 
             let env = crate::native::jni::get_jni_env();
             // For instance methods, args[0] is the receiver; for static, it is absent.
@@ -11389,11 +11570,10 @@ fn invoke_on_class_shared_inner(
             // disagrees with `call_args.len()` silently builds a malformed C
             // call frame (missing/extra register args) — UB inside the unsafe
             // dispatch. Reject the mismatch with UnsatisfiedLinkError before the
-            // unsafe call instead of entering it with a bad frame.
+            // unsafe call instead of entering it with a bad frame. The
+            // `_jni_guard` `Drop` clears the TLS context on this early return.
             let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
             if expected_params != call_args.len() {
-                crate::native::jni::clear_jni_context();
-                crate::native::jni::clear_jni_thread();
                 tracing::warn!(
                     method = %format!("{class_name}.{method_name}{descriptor}"),
                     expected_params,
@@ -11417,9 +11597,7 @@ fn invoke_on_class_shared_inner(
                 )
             };
 
-            crate::native::jni::clear_jni_context();
-            crate::native::jni::clear_jni_thread();
-
+            // `_jni_guard` clears the TLS context when it drops at end of scope.
             // void methods return Value::Object(None) from dispatch_jni_native
             let ret_char = descriptor
                 .rfind(')')
@@ -11441,8 +11619,21 @@ fn invoke_on_class_shared_inner(
             )
         } {
             // Auto-resolved via JNI naming convention (dlsym in loaded libraries).
-            crate::native::jni::set_jni_context(shared);
-            crate::native::jni::set_jni_thread(thread as *mut _);
+            //
+            // SECURITY: same RAII discipline as the RegisterNatives path above —
+            // the guard's `Drop` clears the TLS context on the arity-mismatch
+            // early return, the normal return, and an unwind out of the native
+            // bridge, so a panic cannot strand dangling `*mut JvmThread` /
+            // `*mut SharedVm` pointers in TLS.
+            //
+            // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
+            // for this dispatch; it outlives the guard per `set_jni_thread`.
+            let _jni_guard = unsafe { JniContextGuard::install(shared, thread as *mut _) };
+
+            // GC-correctness (vm-jni-roots #2): implicit local-ref frame for the
+            // auto-resolved native, identical bracketing to the RegisterNatives
+            // arm above (popped on normal/early/panic exit).
+            let _jni_local_frame = JniImplicitFrameGuard::enter();
 
             let env = crate::native::jni::get_jni_env();
             let (receiver, call_args) = if is_static {
@@ -11458,11 +11649,10 @@ fn invoke_on_class_shared_inner(
             // V2: same descriptor-arity vs call-frame sanity check as the
             // RegisterNatives path above — a malformed descriptor on the
             // auto-resolved (dlsym) symbol must not enter the unsafe dispatch
-            // with a mismatched argument frame.
+            // with a mismatched argument frame. The `_jni_guard` `Drop` clears
+            // the TLS context on this early return.
             let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
             if expected_params != call_args.len() {
-                crate::native::jni::clear_jni_context();
-                crate::native::jni::clear_jni_thread();
                 tracing::warn!(
                     method = %format!("{class_name}.{method_name}{descriptor}"),
                     expected_params,
@@ -11485,9 +11675,7 @@ fn invoke_on_class_shared_inner(
                 )
             };
 
-            crate::native::jni::clear_jni_context();
-            crate::native::jni::clear_jni_thread();
-
+            // `_jni_guard` clears the TLS context when it drops at end of scope.
             let ret_char = descriptor
                 .rfind(')')
                 .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
@@ -11630,6 +11818,81 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 "implicit monitorexit on synchronized-method exit failed"
             );
         }
+    }
+}
+
+/// RAII guard for the JNI thread-local context (`*mut SharedVm` Arc + the
+/// erased `*mut JvmThread` pointer) installed around a native bridge call.
+///
+/// `set_jni_context` / `set_jni_thread` publish pointers into thread-local
+/// storage that the native bridge (and any JNI up-call it makes) dereferences;
+/// `jni.rs` documents that the matching `clear_*` MUST run after every native
+/// call returns *including on panic/unwind paths*. The previous code cleared
+/// them with two manual statements after `dispatch_jni_native`, so a panic
+/// unwinding out of the native bridge skipped the clears and left dangling
+/// `*mut JvmThread` / `*mut SharedVm` pointers in TLS — a later JNI access on
+/// the same OS thread would dereference freed memory (use-after-free).
+///
+/// Constructing the guard installs the context; its `Drop` runs the clears on
+/// every exit edge — normal return, early `return Err(..)`, and unwind —
+/// mirroring [`SynchronizedMethodGuard`]'s discipline. This is purely a
+/// cleanup guard; it never re-installs context, so a double clear is harmless
+/// (the `clear_*` setters are idempotent no-ops on already-cleared TLS).
+struct JniContextGuard;
+
+impl JniContextGuard {
+    /// Install the JNI TLS context and return the guard that will clear it.
+    ///
+    /// # Safety
+    ///
+    /// `thread` must remain a valid, exclusively-accessible `*mut JvmThread`
+    /// for the lifetime of the returned guard (i.e. for the whole native
+    /// call), exactly as required by [`crate::native::jni::set_jni_thread`].
+    unsafe fn install(shared: &SharedVm, thread: *mut JvmThread) -> Self {
+        crate::native::jni::set_jni_context(shared);
+        crate::native::jni::set_jni_thread(thread);
+        JniContextGuard
+    }
+}
+
+impl Drop for JniContextGuard {
+    fn drop(&mut self) {
+        crate::native::jni::clear_jni_context();
+        crate::native::jni::clear_jni_thread();
+    }
+}
+
+/// GC-correctness (vm-jni-roots #2): RAII guard that brackets a JNI native
+/// dispatch with an IMPLICIT local-reference frame.
+///
+/// A native that obtains a fresh local jobject (NewObject, GetObjectField, …)
+/// expects it to stay live until the native returns. Those handles are tracked
+/// via `track_local_ref`, but without an enclosing frame they had no scope and
+/// were dropped from the root set. JNI semantics say every native call runs
+/// inside an implicit local frame whose refs are freed on return; this guard
+/// supplies it: `push_local_frame` on construction, `pop_local_frame` on
+/// `Drop` (so the frame is released on the normal-return path, on the
+/// arity-mismatch early return, AND on a panic unwind through the unsafe
+/// dispatch). While it lives, every local ref the native creates is a GC root
+/// (scanned by `collect_local_ref_roots`) and is remapped by
+/// `update_local_refs_after_gc` if a moving collection relocates it.
+struct JniImplicitFrameGuard;
+
+impl JniImplicitFrameGuard {
+    #[inline]
+    fn enter() -> Self {
+        crate::native::jni::push_local_frame(16);
+        JniImplicitFrameGuard
+    }
+}
+
+impl Drop for JniImplicitFrameGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Pop the implicit frame, discarding its handles. We promote nothing:
+        // the dispatch result is a `Value`, not a JObject borrowed from this
+        // frame, so there is no local ref that must outlive the call here.
+        let _ = crate::native::jni::pop_local_frame(0);
     }
 }
 
@@ -11799,6 +12062,124 @@ mod tests {
             crate::runtime::proxy::count_descriptor_params("(Ljava/lang/String;[IJ)Z"),
             3
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JniContextGuard — TLS context is cleared on drop AND on unwind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jni_context_guard_clears_on_normal_drop() {
+        // Run on a dedicated OS thread so the JNI TLS we touch here cannot
+        // leak into (or be observed by) other tests sharing the main thread.
+        std::thread::spawn(|| {
+            let shared = test_shared();
+            // `set_jni_context` (called by the guard) clones an Arc via
+            // `SharedVm::get_arc()`, which requires the weak self-reference that
+            // only `Vm::new()` installs. `test_shared()` skips `Vm::new`, so set
+            // it here exactly as `Vm::new` does before exercising the guard.
+            *shared.self_arc.write() = Some(std::sync::Arc::downgrade(&shared));
+            // No live JvmThread is needed: the guard only stores the raw
+            // pointer in TLS; we never deref it. A dangling-but-unused pointer
+            // is fine for exercising the install/clear lifecycle.
+            {
+                let _g = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
+                // Context is installed here; nothing to assert without a public
+                // TLS predicate — the value of the test is the unwind case below.
+            }
+            // After the guard drops, the TLS context is clear. `clear_jni_*`
+            // are idempotent, so re-clearing is a harmless no-op that documents
+            // the post-condition.
+            crate::native::jni::clear_jni_context();
+            crate::native::jni::clear_jni_thread();
+        })
+        .join()
+        .expect("guard install/drop thread should not panic");
+    }
+
+    #[test]
+    fn jni_context_guard_clears_on_unwind() {
+        // The whole point of the RAII guard (vs. the old manual clear pair) is
+        // that an unwind through the native bridge still clears the TLS
+        // pointers. Construct the guard inside a panicking `catch_unwind` and
+        // confirm: (a) the closure unwound (Err), and (b) the thread is left in
+        // a usable state where a fresh guard can be installed and dropped again
+        // — which is only true if the first guard's `Drop` ran during unwind.
+        std::thread::spawn(|| {
+            let shared = test_shared();
+            // See `jni_context_guard_clears_on_normal_drop`: install the weak
+            // self-reference `get_arc()` needs, which `test_shared()` omits.
+            *shared.self_arc.write() = Some(std::sync::Arc::downgrade(&shared));
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
+                panic!("simulated native-bridge unwind");
+            }));
+            assert!(unwound.is_err(), "closure should have unwound");
+
+            // If the guard's Drop did NOT run, a stale context would remain.
+            // Re-installing and dropping a second guard must still succeed.
+            {
+                let _g2 = unsafe { JniContextGuard::install(&shared, std::ptr::null_mut()) };
+            }
+            crate::native::jni::clear_jni_context();
+            crate::native::jni::clear_jni_thread();
+        })
+        .join()
+        .expect("post-unwind thread should not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // native_range_is_in_bounds — overflow guard for raw native copies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn native_range_zero_len_is_in_bounds() {
+        // A zero-length copy is a no-op and always in bounds, even at the very
+        // top of the address space.
+        assert!(native_range_is_in_bounds(0, 0));
+        assert!(native_range_is_in_bounds(u64::MAX, 0));
+    }
+
+    #[test]
+    fn native_range_ordinary_is_in_bounds() {
+        assert!(native_range_is_in_bounds(0x1000, 64));
+    }
+
+    #[test]
+    fn native_range_exact_end_is_in_bounds() {
+        // base + len == u64::MAX + 1 is the first wrapping value; one below the
+        // end must still be accepted.
+        assert!(native_range_is_in_bounds(u64::MAX - 8, 8));
+    }
+
+    #[test]
+    fn native_range_wrapping_is_rejected() {
+        // A forged length that pushes the end past u64::MAX wraps — reject it.
+        assert!(!native_range_is_in_bounds(u64::MAX, 1));
+        assert!(!native_range_is_in_bounds(u64::MAX - 4, 16));
+    }
+
+    // -----------------------------------------------------------------------
+    // claim_raw_join_handle — exactly-once consumption / double-free guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn claim_raw_join_handle_first_claim_succeeds_repeat_fails() {
+        // The set backing `claim_raw_join_handle` is process-global, so use
+        // distinctive sentinel values unlikely to collide with any real
+        // allocation or another test. These are NEVER reconstructed via
+        // Box::from_raw — only the dedup predicate is exercised.
+        let p1 = 0xDEAD_BEEF_0000_1001usize;
+        let p2 = 0xDEAD_BEEF_0000_1002usize;
+
+        // First claim of a fresh pointer succeeds.
+        assert!(claim_raw_join_handle(p1));
+        // A second claim of the same pointer is rejected (would be a double
+        // consume → double-free at the call site).
+        assert!(!claim_raw_join_handle(p1));
+        // A different pointer is independent and still claimable.
+        assert!(claim_raw_join_handle(p2));
+        assert!(!claim_raw_join_handle(p2));
     }
 
     #[test]

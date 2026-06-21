@@ -1,8 +1,8 @@
 # GC: rs_cache-presence-triggered GC-STW-vs-reactor-shutdown timing race (reactor worker leak)
 
 **Status:** 🔴 **OPEN** (root cause); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`).
-Found/characterized 2026-06-20 (branch `fix/es-restclient-gc-safety`). Supersedes the analysis in
-[reactor-worker-thread-leak-at-shutdown.md](reactor-worker-thread-leak-at-shutdown.md) (kept for history).
+Found/characterized 2026-06-20 (branch `fix/es-restclient-gc-safety`). Supersedes an earlier
+investigation pass (the former `reactor-worker-thread-leak-at-shutdown.md`, now removed — see git history).
 `--nojit` (moving young collector), GC-pressure-dependent.
 
 ## Symptom
@@ -71,6 +71,6 @@ arriving at the STW barrier, vs. one that finished `run()` but hasn't reached `m
 
 ## Related
 
-- Prior (superseded) investigation passes: [reactor-worker-thread-leak-at-shutdown.md](reactor-worker-thread-leak-at-shutdown.md).
+- Prior (superseded) investigation passes: the former `reactor-worker-thread-leak-at-shutdown.md` (removed; see git history).
 - The co-occurring benign corruption: [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md).
 - `Thread.getState()` fix (predecessor): commit `16d23e7b`.

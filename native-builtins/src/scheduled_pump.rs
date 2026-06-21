@@ -21,7 +21,7 @@
 //! state machine that vm-internal benchmarks can exercise without going
 //! through native dispatch.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -31,15 +31,18 @@ use cratonvm_native_api::NativeContext;
 use cratonvm_types::{ObjectRef, Value};
 
 /// One periodic registration. `runnable_ptr` is the raw `ObjectRef`
-/// pointer kept as `usize` so the registration is `Send`+`Sync`. The
-/// pump reconstructs the `ObjectRef` only while it holds a live
-/// `NativeContext`, so the GC cannot have moved or freed the runnable
-/// between calls — the `ScheduledThreadPoolExecutor` holds a strong
-/// reference to the runnable, and the pump runs synchronously inside
-/// the same Java thread that submitted the task.
+/// pointer kept as an `AtomicUsize` so the registration is `Send`+`Sync`
+/// *and* relocatable: the runnable is a live Java object that a moving
+/// GC may compact, so the pointer is published as a GC root via
+/// [`gc_scan_scheduled_roots`] and rewritten in place by
+/// [`gc_update_scheduled_refs`] after every relocation. The pump always
+/// reads the *current* value before reconstructing the `ObjectRef`, so
+/// it can never invoke a stale or freed object.
 pub struct ScheduledTask {
     pub id: u64,
-    pub runnable_ptr: usize,
+    /// Raw `ObjectRef` pointer of the runnable, as a relocatable GC root.
+    /// `0` means "no runnable" (used by unit tests / synthetic tasks).
+    pub runnable_ptr: AtomicUsize,
     pub start: Instant,
     pub initial_delay_ms: u64,
     pub period_ms: u64,
@@ -119,7 +122,7 @@ impl ScheduledRegistry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let task = Arc::new(ScheduledTask {
             id,
-            runnable_ptr: runnable.as_ptr() as usize,
+            runnable_ptr: AtomicUsize::new(runnable.as_ptr() as usize),
             start: Instant::now(),
             initial_delay_ms,
             period_ms,
@@ -160,11 +163,12 @@ impl ScheduledRegistry {
             }
             let to_fire = (due - fired).min(64); // safety cap per pump
                                                  // Reconstruct the runnable ObjectRef from the stored raw
-                                                 // pointer. SAFETY: the `ScheduledThreadPoolExecutor` holds
-                                                 // a strong reference to the runnable, and the pump runs
-                                                 // inside the same Java thread that submitted, so the GC
-                                                 // cannot have moved or freed the object.
-            let runnable_ptr = task.runnable_ptr as *mut u8;
+                                                 // pointer. We read the *current* value (it may have been
+                                                 // remapped by `gc_update_scheduled_refs` after a moving GC)
+                                                 // and the pointer is kept live across collections by
+                                                 // `gc_scan_scheduled_roots`, so it is neither stale nor
+                                                 // freed.
+            let runnable_ptr = task.runnable_ptr.load(Ordering::Acquire) as *mut u8;
             if runnable_ptr.is_null() {
                 continue;
             }
@@ -223,6 +227,52 @@ pub fn registry() -> &'static ScheduledRegistry {
     REG.get_or_init(ScheduledRegistry::default)
 }
 
+/// GC root scan: push every live scheduled runnable into `roots` so a
+/// moving collector keeps it alive and records it for relocation.
+///
+/// Called by the VM's root-scan phase. Locks the process-wide registry
+/// and emits one `ObjectRef` per task whose `runnable_ptr` is non-null.
+/// `parking_lot::Mutex` does not poison, so a panicking holder cannot
+/// make us skip a root; a GC must never miss a live root.
+pub fn gc_scan_scheduled_roots(roots: &mut Vec<ObjectRef>) {
+    let tasks = registry().tasks.lock();
+    for task in tasks.iter() {
+        let ptr = task.runnable_ptr.load(Ordering::Acquire);
+        if ptr == 0 {
+            continue;
+        }
+        // SAFETY: `ptr` is the raw address of a live Java object that the
+        // registry is keeping reachable; reconstructing the `ObjectRef`
+        // hands it to the collector as a root.
+        let obj = unsafe { ObjectRef::from_raw(ptr as *mut u8) };
+        roots.push(obj);
+    }
+}
+
+/// GC remap: after a moving collection relocates objects, rewrite each
+/// stored `runnable_ptr` from its old address to the new one.
+///
+/// `map` maps old raw address → new raw address. For each task whose
+/// current `runnable_ptr` appears in `map`, the pointer is updated in
+/// place; tasks not present in `map` (and null pointers) are left
+/// untouched. Locks the process-wide registry; `parking_lot::Mutex`
+/// does not poison.
+pub fn gc_update_scheduled_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let tasks = registry().tasks.lock();
+    for task in tasks.iter() {
+        let old = task.runnable_ptr.load(Ordering::Acquire);
+        if old == 0 {
+            continue;
+        }
+        if let Some(&new) = map.get(&old) {
+            task.runnable_ptr.store(new, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +289,7 @@ mod tests {
     fn cancel_returns_true_only_first_time() {
         let task = Arc::new(ScheduledTask {
             id: 0,
-            runnable_ptr: 0,
+            runnable_ptr: AtomicUsize::new(0),
             start: Instant::now(),
             initial_delay_ms: 0,
             period_ms: 50,
@@ -257,7 +307,7 @@ mod tests {
     fn fixed_rate_due_ticks_grow_with_time() {
         let task = ScheduledTask {
             id: 0,
-            runnable_ptr: 0,
+            runnable_ptr: AtomicUsize::new(0),
             start: Instant::now() - Duration::from_millis(150),
             initial_delay_ms: 0,
             period_ms: 50,
@@ -275,7 +325,7 @@ mod tests {
     fn one_shot_caps_at_one_tick() {
         let task = ScheduledTask {
             id: 0,
-            runnable_ptr: 0,
+            runnable_ptr: AtomicUsize::new(0),
             start: Instant::now() - Duration::from_secs(1),
             initial_delay_ms: 50,
             period_ms: 0,
@@ -294,7 +344,7 @@ mod tests {
         let id_a = {
             let task_a = Arc::new(ScheduledTask {
                 id: 100,
-                runnable_ptr: 0,
+                runnable_ptr: AtomicUsize::new(0),
                 start: Instant::now(),
                 initial_delay_ms: 0,
                 period_ms: 50,
@@ -309,7 +359,7 @@ mod tests {
         };
         let task_b = Arc::new(ScheduledTask {
             id: 101,
-            runnable_ptr: 0,
+            runnable_ptr: AtomicUsize::new(0),
             start: Instant::now(),
             initial_delay_ms: 0,
             period_ms: 50,
@@ -326,12 +376,103 @@ mod tests {
     }
 
     #[test]
+    fn gc_update_remaps_runnable_ptr() {
+        // The remap helper rewrites stored runnable pointers old->new and
+        // leaves unmapped / null pointers untouched. This is the relocation
+        // path that prevents the stale-pointer UAF under a moving GC. We
+        // assert directly on the per-task pointer (no ObjectRef deref).
+        let task_moved = Arc::new(ScheduledTask {
+            id: 300,
+            runnable_ptr: AtomicUsize::new(0x1000),
+            start: Instant::now(),
+            initial_delay_ms: 0,
+            period_ms: 50,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay: false,
+            last_fire: Mutex::new(None),
+        });
+        let task_stable = Arc::new(ScheduledTask {
+            id: 301,
+            runnable_ptr: AtomicUsize::new(0x2000),
+            start: Instant::now(),
+            initial_delay_ms: 0,
+            period_ms: 50,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay: false,
+            last_fire: Mutex::new(None),
+        });
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(0x1000usize, 0x9000usize);
+        // 0x2000 deliberately absent.
+
+        // Apply the remap to a local task set (mirrors the global-lock loop
+        // body without touching the process-wide registry).
+        for task in [&task_moved, &task_stable] {
+            let old = task.runnable_ptr.load(Ordering::Acquire);
+            if old == 0 {
+                continue;
+            }
+            if let Some(&new) = map.get(&old) {
+                task.runnable_ptr.store(new, Ordering::Release);
+            }
+        }
+
+        assert_eq!(task_moved.runnable_ptr.load(Ordering::Acquire), 0x9000);
+        assert_eq!(task_stable.runnable_ptr.load(Ordering::Acquire), 0x2000);
+    }
+
+    #[test]
+    fn gc_update_global_registry_remaps_and_skips_null() {
+        // Drive the real public helper against the process-wide registry.
+        // Use a synthetic pointer value that is never dereferenced (the
+        // remap path only loads/stores the integer).
+        let reg = registry();
+        let synthetic = 0x5A5A_0000usize;
+        let task = Arc::new(ScheduledTask {
+            id: 400,
+            runnable_ptr: AtomicUsize::new(synthetic),
+            start: Instant::now(),
+            initial_delay_ms: 0,
+            period_ms: 50,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay: false,
+            last_fire: Mutex::new(None),
+        });
+        let null_task = Arc::new(ScheduledTask {
+            id: 401,
+            runnable_ptr: AtomicUsize::new(0),
+            start: Instant::now(),
+            initial_delay_ms: 0,
+            period_ms: 50,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay: false,
+            last_fire: Mutex::new(None),
+        });
+        reg.tasks.lock().push(task.clone());
+        reg.tasks.lock().push(null_task.clone());
+
+        let mut map = std::collections::HashMap::new();
+        let relocated = 0x5A5A_1000usize;
+        map.insert(synthetic, relocated);
+        gc_update_scheduled_refs(&map);
+
+        assert_eq!(task.runnable_ptr.load(Ordering::Acquire), relocated);
+        // Null pointer left untouched (no spurious remap).
+        assert_eq!(null_task.runnable_ptr.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn cancel_all_marks_every_task() {
         let reg = ScheduledRegistry::new();
         for i in 0..3 {
             reg.tasks.lock().push(Arc::new(ScheduledTask {
                 id: 200 + i,
-                runnable_ptr: 0,
+                runnable_ptr: AtomicUsize::new(0),
                 start: Instant::now(),
                 initial_delay_ms: 0,
                 period_ms: 50,

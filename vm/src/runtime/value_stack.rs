@@ -1270,13 +1270,22 @@ impl ValueStack {
 
     /// Update object references after GC using the pointer map.
     ///
-    /// Symmetric to [`Self::scan_object_refs`]: only tagged object slots are
-    /// remapped. Primitive `Long` slots are never treated as references — the
-    /// matching restriction in `scan_object_refs` means a primitive long bit
-    /// pattern would never have been rooted, so the GC pointer_map cannot legitimately
-    /// contain an entry for it. Untagged `Double` slots that happen to encode a
-    /// jlong-shaped pointer were rooted (filtered through `heap.is_object_address`)
-    /// and ARE remapped here so the post-GC slot points at the moved object.
+    /// Symmetric to [`Self::scan_object_refs`]: every slot the scan yields as a
+    /// root is rewritten here with its relocated address, and no slot is
+    /// rewritten that the scan would not have rooted. Three classes mirror the
+    /// scan exactly:
+    /// - NaN-boxed object slots (`is_object`) that are not kind-marked
+    ///   primitive: remapped via the `pointer_map`.
+    /// - Smuggled jobject references in tagged `Long` OR untagged `Double`
+    ///   slots (the JNI long-as-jobject pattern): rooted by the scan's O1
+    ///   hybrid branch only when they pass `heap.is_heap_addr`, so they are
+    ///   remapped here under the same heap-membership check (and skipped under
+    ///   the same `CRATONVM_LONGROOT_STRICT` kind-strict gate). The prior code
+    ///   had a `Double`-only arm, leaving a `Long`-tagged smuggle
+    ///   rooted-but-not-remapped → stale across a moving collection.
+    /// - Genuine primitive `Long`/`Double` values: never rooted, never
+    ///   rewritten — a bit-pattern that coincidentally matches a moved object's
+    ///   from-space address is left untouched so the value is not corrupted.
     pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];
@@ -1316,26 +1325,59 @@ impl ValueStack {
                         self.slots[i].update_object_ptr_unchecked(new_addr as u64);
                     }
                 }
-            } else if cv.tag() == CompactTag::Double {
+            } else if matches!(cv.tag(), CompactTag::Long | CompactTag::Double) {
+                // SCAN/UPDATE SYMMETRY (bc math-ec 0x4 follow-up): the
+                // `scan_object_refs` O1 hybrid branch roots a smuggled jobject
+                // out of BOTH a tagged `Long` and an untagged `Double` slot
+                // (JNI long-as-jobject, e.g. WildFly's jboss-modules
+                // bootloader). The previous update only had a `Double` arm, so
+                // a reference smuggled into a tagged-`Long` slot was
+                // rooted-but-never-remapped: it went STALE the instant the
+                // referent moved (UAF / wrong object). Mirror the scan's set
+                // exactly — same tags, same kind-strict gate, same
+                // heap-membership check — so every slot the scan yields as a
+                // root is rewritten here, and no other.
+                //
+                // Kind-strict parity: under `CRATONVM_LONGROOT_STRICT`, the
+                // scan skips rooting slots the kind side-array marks as genuine
+                // primitive long/double. Such a slot is never in `pointer_map`
+                // for the right reason, but skip the rewrite too so a primitive
+                // long/double whose bits coincidentally match a moved object's
+                // from-space address is never mutated.
+                if longroot_strict() && (self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE)
+                {
+                    continue;
+                }
                 let bits = cv.to_bits();
                 if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
                     if let Some(&new_addr) = pointer_map.get(&old_ptr) {
-                        // B10: distinguish the legitimate JNI long-as-jobject
-                        // smuggle path from a coincidental bit-pattern match.
-                        // `scan_object_refs` rooted this slot ONLY when
-                        // `heap.is_heap_addr(old_ptr)` succeeded — so the
-                        // pointer_map entry is only authoritative for slots
-                        // that pass the same heap-membership check. A plain
-                        // double whose bit pattern happens to fall in the
-                        // address range and also collides with a moved
-                        // object's old address must NOT be rewritten: doing
-                        // so corrupts a perfectly valid f64. Mirrors C7 in
-                        // interpreter.rs.
-                        if heap.is_heap_addr(old_ptr).is_some() {
-                            // Preserve the Double tag (untagged raw bits) so
-                            // the slot's type doesn't change across GC — the
-                            // interpreter dispatch on this slot expects the
-                            // same tag it had pre-GC.
+                        // B10 / Step 5 GAP A: distinguish a legitimate JNI
+                        // long-as-jobject smuggle from a coincidental bit-pattern
+                        // match — but probe the RELOCATION TARGET (`new_addr`),
+                        // not the from-space `old_ptr`. `old_ptr` is post-GC: the
+                        // generational collector leaves it resolvable (the
+                        // from-space semi-space is repurposed, never freed), but
+                        // G1 resets the evacuated CSet region to `Free`, so
+                        // `is_heap_addr(old_ptr)` returns None for precisely the
+                        // genuinely-moved jobjects that need rewriting — leaving
+                        // the smuggle STALE (UAF; e.g. WildFly jboss-modules). The
+                        // moved object's new address is always a live region for
+                        // both collectors, so gating on `is_heap_addr(new_addr)`
+                        // rewrites genuine smuggles under G1 too while still
+                        // preserving a coincidental long whose key maps to a
+                        // non-heap target. (A primitive long whose bits collide
+                        // with a *real* moved object's key is rewritten under both
+                        // collectors — a rare pre-existing ambiguity that
+                        // CRATONVM_LONGROOT_STRICT resolves precisely.) The object
+                        // arm above already gates on pointer_map membership for
+                        // the same reason (H2 stale-stack crash).
+                        if heap.is_heap_addr(new_addr).is_some() {
+                            // Preserve the slot's raw-bits encoding (the
+                            // smuggle stores the pointer verbatim as the slot's
+                            // bits, for both the tagged-`Long` and untagged-
+                            // `Double` cases) so the slot's type/dispatch
+                            // doesn't change across GC — only the address it
+                            // carries is relocated.
                             self.slots[i] = CompactValue::from_bits(new_addr as u64);
                         }
                     }
@@ -1696,6 +1738,107 @@ mod tests {
             stack.push_compact(local); // lload_N
             assert_eq!(stack.pop_long().unwrap(), v, "lload/pop {v:#018x}");
         }
+    }
+
+    /// SCAN/UPDATE SYMMETRY: a smuggled jobject reference (JNI long-as-jobject
+    /// convention) that `scan_object_refs` yields as a root MUST be rewritten
+    /// by `update_object_refs` to the relocated address after a moving GC.
+    ///
+    /// This pins the asymmetry fix: previously the scan rooted such a smuggle
+    /// out of the `CompactTag::Long | Double` hybrid branch, but the update
+    /// only had a `Double` arm — so the rooted slot was never remapped and the
+    /// reference went stale (UAF / wrong object) the instant the referent
+    /// moved. The test allocates two live heap objects, smuggles object A's
+    /// address into a long-marked slot, confirms the scan roots it, then
+    /// relocates A→B via the pointer_map and asserts the slot now carries B's
+    /// address.
+    #[test]
+    fn smuggled_jobject_is_rooted_and_remapped_symmetrically() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use cratonvm_types::ClassId;
+        use std::collections::HashMap;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        // Two real, live heap objects: A is the pre-GC referent, B stands in
+        // for A's post-compaction location. Both addresses pass `is_heap_addr`.
+        let a = heap.alloc_object(ClassId::new(0), 0);
+        let b = heap.alloc_object(ClassId::new(0), 0);
+        let old_addr = a.as_ptr() as u64;
+        let new_addr = b.as_ptr() as u64;
+        assert_eq!(old_addr & 0x7, 0, "heap objects are 8-byte aligned");
+        assert_eq!(new_addr & 0x7, 0, "heap objects are 8-byte aligned");
+        assert_ne!(old_addr, new_addr);
+
+        // Smuggle A's address into a slot via a genuine long producer (the
+        // JNI long-as-jobject contract: a heap pointer carried in a long
+        // slot). `push_long` marks the slot `KIND_LONG`; a low heap address is
+        // not NaN-tagged, so the slot reports `CompactTag::Double` raw bits —
+        // exactly the shape `scan_object_refs`'s hybrid branch roots.
+        let mut stack = ValueStack::new(4);
+        stack.push_long(old_addr as i64).unwrap();
+
+        // SCAN: the smuggle must be yielded as a root.
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert!(
+            roots.iter().any(|r| r.as_ptr() as u64 == old_addr),
+            "scan_object_refs must root the smuggled jobject (addr {old_addr:#x})"
+        );
+
+        // UPDATE: relocate A → B and assert the slot is rewritten — the half
+        // that was missing for the `Long`-classified arm.
+        let mut map = HashMap::new();
+        map.insert(old_addr as usize, new_addr as usize);
+        stack.update_object_refs(&map, &heap);
+
+        let slot = stack.peek_compact();
+        assert_eq!(
+            slot.to_bits(),
+            new_addr,
+            "update_object_refs must remap the rooted smuggle to the moved address"
+        );
+    }
+
+    #[test]
+    fn smuggled_jobject_remapped_when_old_region_freed_g1() {
+        // Step 5 GAP A regression: under G1 the evacuated CSet region is reset to
+        // `Free`, so post-GC `is_heap_addr(old_ptr)` returns None for a genuinely
+        // moved object. The remap must still rewrite the smuggle (gate on the live
+        // `new_addr`, not the freed `old_ptr`). Model the freed from-space with an
+        // `old_addr` that is not in any live region while `new_addr` is a real,
+        // live object — exactly the asymmetry G1's CSet-free creates.
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use cratonvm_types::ClassId;
+        use std::collections::HashMap;
+
+        let heap = VmHeap::new(GcBackend::G1, 16 * 1024 * 1024);
+        let b = heap.alloc_object(ClassId::new(0), 0);
+        let new_addr = b.as_ptr() as u64;
+        // A pointer-shaped (8-aligned, sub-2^48) address that is NOT in any live
+        // region — `is_heap_addr` returns None, as it would for a freed CSet slot.
+        let old_addr: u64 = 0x1_0000;
+        assert!(
+            heap.is_heap_addr(old_addr as usize).is_none(),
+            "old_addr must look freed (not in a live region)"
+        );
+        assert!(
+            heap.is_heap_addr(new_addr as usize).is_some(),
+            "new_addr must be a live relocated object"
+        );
+
+        let mut stack = ValueStack::new(4);
+        stack.push_long(old_addr as i64).unwrap();
+        let mut map = HashMap::new();
+        map.insert(old_addr as usize, new_addr as usize);
+        stack.update_object_refs(&map, &heap);
+
+        assert_eq!(
+            stack.peek_compact().to_bits(),
+            new_addr,
+            "smuggle must be remapped even though old_addr's region was freed (G1)"
+        );
     }
 
     // B12: `*_unchecked` guards are now `debug_assert!`, so the panic only

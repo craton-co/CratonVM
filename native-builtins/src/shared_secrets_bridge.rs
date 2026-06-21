@@ -670,8 +670,7 @@ fn jlia_make_class_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     // have weak Class references, but the map is only used for
     // caching and the leak surface is bounded by the number of
     // loaded classes (GC eventually evicts both).
-    ctx.invoke("java/util/HashMap", "<init>", "()V", &[])?;
-    ctx.new_object("java/util/HashMap")
+    ctx.new_object_initialized("java/util/HashMap", "()V", &[])
 }
 
 fn register_java_lang_invoke_access(registry: &mut NativeMethodRegistry) {
@@ -1551,8 +1550,7 @@ fn jnhc_parse_cookie(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             &[Value::Object(Some(*header))],
         )
     } else {
-        ctx.invoke("java/util/ArrayList", "<init>", "()V", &[])?;
-        ctx.new_object("java/util/ArrayList")
+        ctx.new_object_initialized("java/util/ArrayList", "()V", &[])
     }
 }
 

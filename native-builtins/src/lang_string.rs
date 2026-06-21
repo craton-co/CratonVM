@@ -1141,22 +1141,12 @@ pub(crate) fn native_string_value_of_int(
 
 /// Format a double like Java does (no trailing zeros for integers, etc.)
 pub(crate) fn format_double(v: f64) -> String {
-    if v == f64::INFINITY {
-        "Infinity".to_string()
-    } else if v == f64::NEG_INFINITY {
-        "-Infinity".to_string()
-    } else if v.is_nan() {
-        "NaN".to_string()
-    } else {
-        // Java uses minimal representation
-        let s = format!("{v}");
-        // Ensure there's always a decimal point (Java does "1.0" not "1")
-        if !s.contains('.') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    // Java's `Double.toString` layout (incl. the 10^-3..10^7 scientific-notation
+    // threshold) lives in the shared `cratonvm_types` formatter so every copy
+    // stays correct. The old local `format!("{v}")` never used E-notation, so
+    // large/small magnitudes (1e7, 1e-4, 1e300, Double.MAX_VALUE) printed in
+    // full decimal instead of "1.0E7"/"1.0E-4"/... .
+    cratonvm_types::java_double_to_string(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,8 +1657,14 @@ pub(crate) fn invoke_to_string(
                 return Ok(formatted);
             }
             Value::Long(v) => return Ok(v.to_string()),
-            Value::Float(v) => return Ok(format!("{}", v)),
-            Value::Double(v) => return Ok(format!("{}", v)),
+            // Use the Java-spec formatters (NOT raw `{}`), so a boxed Double/Float
+            // rendered via String.valueOf(Object) / StringBuilder.append(Object) /
+            // object string-concat matches `Double.toString` — incl. the
+            // 10^-3..10^7 scientific-notation threshold, "Infinity", and "-0.0".
+            // Raw `format!("{}")` dropped the ".0", printed "inf"/"-0", and never
+            // used E-notation (e.g. boxed 1e7 -> "10000000.0", -0.0 -> "-0").
+            Value::Float(v) => return Ok(format_float(v)),
+            Value::Double(v) => return Ok(format_double(v)),
             _ => {} // Not a primitive wrapper
         }
     }
@@ -1839,9 +1835,18 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // `dst` is dereferenced (`dst.length`, element stores) — a null array is a
+    // NullPointerException per the JDK, not a silent no-op.
     let dst = match args.get(3) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot store to null char[] in AbstractStringBuilder.getChars".to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let dst_begin = match args.get(4) {
         Some(Value::Int(v)) => *v,
@@ -1849,6 +1854,9 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
 
     let (buf, count) = sb_state(ctx, this);
+    // Source-range check: `AbstractStringBuilder.getChars` first validates the
+    // [srcBegin, srcEnd) window against the builder length via
+    // `checkRangeSIOOBE`, throwing StringIndexOutOfBoundsException.
     if src_begin < 0 || src_end > count || src_begin > src_end {
         return Err(
             cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
@@ -1857,14 +1865,43 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
             .into(),
         );
     }
+    let n = (src_end - src_begin) as usize;
+    // Destination-range check: the underlying `System.arraycopy` into `dst`
+    // throws (Array)IndexOutOfBoundsException when `dstBegin < 0` or the copied
+    // window `[dstBegin, dstBegin + n)` would run past `dst.length`. Previously
+    // this was silently ignored, dropping the out-of-bounds writes.
+    let dst_len = ctx.array_length(dst) as i64;
+    // Use widening i64 arithmetic so `dstBegin + n` cannot wrap (n is bounded by
+    // the validated source window, so it fits in i32, but stay defensive).
+    let copy_end = i64::from(dst_begin) + (n as i64);
+    if dst_begin < 0 || copy_end > dst_len {
+        // The first offending destination index, matching JDK arraycopy
+        // semantics: a negative dstBegin reports dstBegin; an overrun reports
+        // the last index written.
+        let bad_index = if dst_begin < 0 {
+            dst_begin
+        } else {
+            (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        return Err(
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: bad_index,
+            }
+            .into(),
+        );
+    }
     let buf = match buf {
         Some(b) => b,
+        // No backing buffer means a length-0 builder; the source check above
+        // already guarantees `n == 0`, so there is nothing to copy.
         None => return Ok(None),
     };
-    let n = (src_end - src_begin) as usize;
+    // `set_array_element` is infallible (returns no Result), so every store is
+    // guarded by the explicit destination-range check above rather than relying
+    // on a downstream bounds error.
     for i in 0..n {
         let ch = ctx.get_array_element(buf, src_begin as usize + i);
-        let _ = ctx.set_array_element(dst, dst_begin as usize + i, ch);
+        ctx.set_array_element(dst, dst_begin as usize + i, ch);
     }
     Ok(None)
 }
@@ -2415,20 +2452,8 @@ pub(crate) fn native_sb_ensure_cap(
 
 /// Format a float like Java does.
 pub(crate) fn format_float(v: f32) -> String {
-    if v == f32::INFINITY {
-        "Infinity".to_string()
-    } else if v == f32::NEG_INFINITY {
-        "-Infinity".to_string()
-    } else if v.is_nan() {
-        "NaN".to_string()
-    } else {
-        let s = format!("{v}");
-        if !s.contains('.') {
-            format!("{s}.0")
-        } else {
-            s
-        }
-    }
+    // See `format_double` — shared with the scientific-notation threshold fix.
+    cratonvm_types::java_float_to_string(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -4025,13 +4050,15 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             'f' => format!("{:.6}", v),
             'e' => format!("{:e}", *v as f64),
             'E' => format!("{:E}", *v as f64),
-            _ => format!("{}", v),
+            // `%s`/no-spec of a float -> Java Double.toString form, not raw `{}`.
+            _ => format_float(*v),
         },
         Value::Double(v) => match spec {
             'f' => format!("{:.6}", v),
             'e' => format!("{:e}", v),
             'E' => format!("{:E}", v),
-            _ => format!("{}", v),
+            // `%s`/no-spec of a double -> Java Double.toString form, not raw `{}`.
+            _ => format_double(*v),
         },
         _ => "?".to_string(),
     }
@@ -4714,6 +4741,7 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+    use cratonvm_types::ArrayElementType;
 
     // -----------------------------------------------------------------------
     // Pure helper functions (no context needed)
@@ -5586,5 +5614,162 @@ mod tests {
         let err = native_string_code_point_at(&mut ctx, &[Value::Object(Some(s)), Value::Int(99)])
             .unwrap_err();
         assert_eq!(err_kind(&err), "sioobe");
+    }
+
+    // -----------------------------------------------------------------------
+    // AbstractStringBuilder.getChars(srcBegin, srcEnd, dst, dstBegin) — must
+    // validate BOTH the source window (SIOOBE) and the destination window
+    // (NPE on null dst, AIOOBE on negative dstBegin / overrun) before copying,
+    // instead of silently dropping out-of-bounds writes.
+    // -----------------------------------------------------------------------
+
+    /// Build a StringBuilder pre-loaded with `text` for getChars tests.
+    fn make_sb_with(ctx: &mut dyn NativeContext, text: &str) -> cratonvm_types::ObjectRef {
+        let sb = make_sb(ctx);
+        let chars: Vec<u16> = text.encode_utf16().collect();
+        let buf = ctx.new_array(ArrayElementType::Char, chars.len().max(1));
+        for (i, &c) in chars.iter().enumerate() {
+            ctx.set_array_element(buf, i, Value::Int(i32::from(c)));
+        }
+        ctx.set_field(sb, 0, Value::Object(Some(buf)));
+        ctx.set_field(sb, 1, Value::Int(chars.len() as i32));
+        sb
+    }
+
+    #[test]
+    fn sb_get_chars_valid_copy() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "hello");
+        let dst = ctx.new_array(ArrayElementType::Char, 8);
+        // Copy "ell" (indices 1..4) into dst starting at offset 2.
+        let r = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Int(4),
+                Value::Object(Some(dst)),
+                Value::Int(2),
+            ],
+        );
+        assert!(r.unwrap().is_none());
+        let read = |i: usize| match ctx.get_array_element(dst, i) {
+            Value::Int(v) => v as u16,
+            _ => 0,
+        };
+        assert_eq!(read(2), u16::from(b'e'));
+        assert_eq!(read(3), u16::from(b'l'));
+        assert_eq!(read(4), u16::from(b'l'));
+        // Untouched slots stay zero.
+        assert_eq!(read(0), 0);
+        assert_eq!(read(5), 0);
+    }
+
+    #[test]
+    fn sb_get_chars_null_dst_throws_npe() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abc");
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(3),
+                Value::Object(None),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { .. }
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn sb_get_chars_negative_dst_begin_throws_aioobe() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abc");
+        let dst = ctx.new_array(ArrayElementType::Char, 8);
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(3),
+                Value::Object(Some(dst)),
+                Value::Int(-1),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&err), "aioobe");
+    }
+
+    #[test]
+    fn sb_get_chars_dst_overrun_throws_aioobe() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abcde");
+        let dst = ctx.new_array(ArrayElementType::Char, 4);
+        // Copying 5 chars starting at offset 2 would write through index 6 > len 4.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(5),
+                Value::Object(Some(dst)),
+                Value::Int(2),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&err), "aioobe");
+        // The out-of-bounds store must NOT have silently written anything past
+        // the array; in-range slots remain at their zero default.
+        for i in 0..ctx.array_length(dst) {
+            assert_eq!(ctx.get_array_element(dst, i), Value::Int(0));
+        }
+    }
+
+    #[test]
+    fn sb_get_chars_bad_src_range_throws_sioobe() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abc");
+        let dst = ctx.new_array(ArrayElementType::Char, 8);
+        // srcEnd (9) exceeds the builder length (3) -> SIOOBE, not AIOOBE.
+        let err = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(0),
+                Value::Int(9),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err_kind(&err), "sioobe");
+    }
+
+    #[test]
+    fn sb_get_chars_empty_window_at_dst_end_is_valid() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "abc");
+        let dst = ctx.new_array(ArrayElementType::Char, 4);
+        // Zero-length copy with dstBegin == dst.length is exactly in bounds.
+        let r = native_sb_get_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Int(1),
+                Value::Int(1),
+                Value::Object(Some(dst)),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.unwrap().is_none());
     }
 }

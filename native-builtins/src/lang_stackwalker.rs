@@ -39,6 +39,30 @@ use cratonvm_types::Value;
 
 use crate::alloc_concurrent_synthetic;
 
+thread_local! {
+    /// Stack of the *clean*, ordered frame lists captured by each in-progress
+    /// `callStackWalk` on this thread (one entry per active walk; walks can
+    /// nest when frame resolution re-enters `StackWalker.walk`).
+    ///
+    /// `fetchStackFrames` MUST index into this cached list rather than
+    /// re-capturing the live stack: by the time the JDK's lazy stream asks for
+    /// the next batch, the thread is paused *deeper* inside
+    /// `doStackWalk → consumeFrames → <stream pipeline> → lambda`, so a fresh
+    /// `capture_stack_trace` returns a stack polluted with
+    /// `java.util.stream.*` and `StackStreamFactory$*` frames that
+    /// `ordered_stack_walk_frames` does not fully strip. Indexing the
+    /// re-captured (polluted) list with the `callStackWalk`-relative cursor
+    /// feeds the user function walker-internal frames. For log4j2's
+    /// `getCallerClass` (which keys its `LoggerContext` cache on the resolved
+    /// caller class) a wrong/internal caller means the cache never hits, so
+    /// each log call re-creates a context and re-logs → unbounded
+    /// context-creation recursion → native-stack/value-stack corruption
+    /// (Hibernate `ByteArrayMappingTests` SIGSEGV). Caching the clean list
+    /// keeps every batch the user sees identical to HotSpot's.
+    static SW_FRAME_CACHE: std::cell::RefCell<Vec<Vec<StackTraceEntry>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Decode a `long` JVM argument that may reach natives as `Value::Long` or,
 /// due to interpreter tagging quirks, as `Value::Double` holding the same
 /// 8-byte pattern (e.g. small integer anchors appear as denormal `f64`
@@ -68,28 +92,82 @@ const SF_BCI: usize = 4;
 const SF_DECL_INTERNAL: usize = 5;
 
 /// Populate a StackFrameInfo from a `StackTraceEntry`.
+///
+/// GC-SAFETY: this allocates **eight** heap objects (four strings, the class
+/// mirror, the `StackFrameInfo`, and the `StackTraceElement`). Under the moving
+/// collector every `create_string` / `alloc_*` / `get_class_mirror` call can
+/// trigger a young-gen GC that relocates *or collects* any of the earlier,
+/// still-unrooted objects (see [`NativeContext::pin_native_root`]). The previous
+/// version held all of them in bare locals and then wrote them into `sf`/`ste`
+/// with `set_field` — a use-after-move/free that corrupted the heap (zeroed
+/// `ClassId(0)` headers, wild `ValueStack::push` reads) when a GC landed in the
+/// middle. This is exercised relentlessly by log4j2's `StackWalker`-based
+/// `getCallerClass` during Hibernate's deep startup, which is why
+/// `ByteArrayMappingTests` SIGSEGV'd. Allocate everything first under pins, read
+/// every reference back through its pin, then set the (allocation-free) fields.
 fn populate_sfi(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
 ) -> cratonvm_types::ObjectRef {
-    let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
     // Reuse the shared `dotted_class_name` cache (lang_class) so repeat
     // frames for the same class do not re-run `.replace('/', '.')` and
     // allocate a fresh `String` per frame. The cache returns an
     // `Arc<str>` keyed by `ClassId`; first touch computes the dotted
-    // form, subsequent reads clone the `Arc`.
-    let dotted = match ctx.class_id_by_name(&entry.class_name) {
-        Some(cid) => crate::lang_class::dotted_class_name(cid, &entry.class_name),
+    // form, subsequent reads clone the `Arc`. (Rust-side, no Java alloc.)
+    let cid = ctx.class_id_by_name(&entry.class_name);
+    let dotted = match cid {
+        Some(c) => crate::lang_class::dotted_class_name(c, &entry.class_name),
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
     };
-    let cls_str = ctx.create_string(&dotted);
-    let meth_str = ctx.create_string(&entry.method_name);
-    let file_str = match &entry.source_file {
-        Some(f) => Value::Object(Some(ctx.create_string(f))),
-        None => Value::Object(None),
-    };
-    let decl_internal = ctx.create_string(&entry.class_name);
 
+    // ---- Allocate everything, pinning each object as it is created so the
+    // next allocation cannot move/collect it. Pins return sequential handles;
+    // `base` (the first) releases the whole batch. ----
+    let mut cls_str = ctx.create_string(&dotted);
+    let base = ctx.pin_native_root(cls_str);
+    let mut meth_str = ctx.create_string(&entry.method_name);
+    let h_meth = ctx.pin_native_root(meth_str);
+    let (mut file_str, h_file) = match &entry.source_file {
+        Some(f) => {
+            let s = ctx.create_string(f);
+            let h = ctx.pin_native_root(s);
+            (Some(s), Some(h))
+        }
+        None => (None, None),
+    };
+    let mut decl_internal = ctx.create_string(&entry.class_name);
+    let h_decl = ctx.pin_native_root(decl_internal);
+    let (mut class_mirror, h_mirror) = match cid {
+        Some(c) => {
+            let m = ctx.get_class_mirror(c);
+            let h = ctx.pin_native_root(m);
+            (Some(m), Some(h))
+        }
+        None => (None, None),
+    };
+    let mut sf =
+        alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
+    let h_sf = ctx.pin_native_root(sf);
+    let mut ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+    let h_ste = ctx.pin_native_root(ste);
+
+    // ---- All allocations done. Read every reference back through its pin so
+    // we use the *current* (post-GC, possibly forwarded) location. ----
+    cls_str = ctx.read_native_pin(base, cls_str);
+    meth_str = ctx.read_native_pin(h_meth, meth_str);
+    if let (Some(s), Some(h)) = (file_str, h_file) {
+        file_str = Some(ctx.read_native_pin(h, s));
+    }
+    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
+    if let (Some(m), Some(h)) = (class_mirror, h_mirror) {
+        class_mirror = Some(ctx.read_native_pin(h, m));
+    }
+    sf = ctx.read_native_pin(h_sf, sf);
+    ste = ctx.read_native_pin(h_ste, ste);
+
+    // ---- Set fields. These are pure heap writes — no allocation — so no GC
+    // can intervene between them. ----
+    //
     // Real-JDK layout (jdk-25):
     //   class ClassFrameInfo { Object classOrMemberName; int flags; }
     //   class StackFrameInfo extends ClassFrameInfo {
@@ -109,21 +187,17 @@ fn populate_sfi(
     // Resolve fields by NAME so the right slot is hit on whichever real
     // class layout is present, and pre-fill them with the values our
     // own native overrides would also return.
-    let class_mirror = ctx
-        .class_id_by_name(&entry.class_name)
-        .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
-        .unwrap_or(Value::Object(None));
-
-    // Real `java.lang.StackFrameInfo` layout (`ClassFrameInfo` prefix):
-    //   (0) classOrMemberName, (1) flags, (2) name, (3) type, (4) bci,
-    //   (5) contScope, (6) ste, …
     //
     // Do **not** reuse the old 6-field `StackWalker$StackFrame` indices here:
     // SF_FILENAME was written to slot 2, which is JDK `name`, so
     // `getMethodName()` (wired to `name`) returned null, Spring's
     // `deduceMainApplicationClass` never saw `"main"`, and
     // `StartupInfoLogger` NPE'd on `sourceClass.getPackage()`.
-    ctx.set_field_by_name(sf, "classOrMemberName", class_mirror);
+    let class_mirror_val = match class_mirror {
+        Some(m) => Value::Object(Some(m)),
+        None => Value::Object(None),
+    };
+    ctx.set_field_by_name(sf, "classOrMemberName", class_mirror_val);
     ctx.set_field_by_name(sf, "flags", Value::Int(0));
     ctx.set_field_by_name(sf, "name", Value::Object(Some(meth_str)));
     ctx.set_field_by_name(sf, "bci", Value::Int(entry.byte_code_index));
@@ -131,10 +205,13 @@ fn populate_sfi(
     // Pre-cache `ste` so real JDK `toStackTraceElement()` / `getFileName()` /
     // `getLineNumber()` paths see a populated element without running
     // `StackTraceElement.of`.
-    let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
     ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
     ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(ste, 2, file_str);
+    ctx.set_field(
+        ste,
+        2,
+        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
+    );
     ctx.set_field(ste, 3, Value::Int(entry.line_number));
     ctx.set_field_by_name(sf, "ste", Value::Object(Some(ste)));
 
@@ -142,6 +219,8 @@ fn populate_sfi(
     // real class this aliases `contScope` (slot 5); we stash the '/'-form
     // internal name there for class mirror lookup.
     ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
+
+    ctx.unpin_native_roots(base);
     sf
 }
 
@@ -251,8 +330,15 @@ pub(crate) fn native_call_stack_walk(
     }
     let mut written = 0usize;
     let mut pos = skip.min(ordered.len());
+    // GC-SAFETY: `populate_sfi` allocates, so a moving GC can relocate the
+    // `frame_buffer` array (and the SFI elements already stored in it — they
+    // stay reachable through the pinned array). Pin it and re-read the
+    // forwarded reference before every `set_array_element`.
+    let fb_pin = ctx.pin_native_root(frame_buffer);
+    let mut frame_buffer = frame_buffer;
     while written < capacity && pos < ordered.len() {
         let sfi = populate_sfi(ctx, &ordered[pos]);
+        frame_buffer = ctx.read_native_pin(fb_pin, frame_buffer);
         ctx.set_array_element(
             frame_buffer,
             start_index + written,
@@ -261,6 +347,7 @@ pub(crate) fn native_call_stack_walk(
         pos += 1;
         written += 1;
     }
+    ctx.unpin_native_roots(fb_pin);
     let consumed = pos;
 
     // Real-JDK contract: `callStackWalk` is supposed to invoke
@@ -292,7 +379,13 @@ pub(crate) fn native_call_stack_walk(
         // Encode the trace cursor in the anchor so a follow-up
         // `fetchStackFrames` invocation knows how many trace entries we
         // already consumed and can resume from the next frame.
-        return ctx.invoke(
+        // Cache the clean ordered frame list for the duration of this walk so
+        // `fetchStackFrames` (invoked while the lazy stream drains, with the
+        // thread paused deeper inside `doStackWalk`) indexes it instead of
+        // re-capturing a polluted live stack. Pushed/popped as a stack to
+        // tolerate nested walks (walks can re-enter during frame resolution).
+        SW_FRAME_CACHE.with(|c| c.borrow_mut().push(ordered.clone()));
+        let r = ctx.invoke(
             "java/lang/StackStreamFactory$AbstractStackWalker",
             "doStackWalk",
             "(JIIII)Ljava/lang/Object;",
@@ -305,6 +398,10 @@ pub(crate) fn native_call_stack_walk(
                 Value::Int(end_index),
             ],
         );
+        SW_FRAME_CACHE.with(|c| {
+            c.borrow_mut().pop();
+        });
+        return r;
     }
     Ok(Some(Value::Object(None)))
 }
@@ -374,15 +471,28 @@ pub(crate) fn native_fetch_stack_frames(
     }
 
     let cursor = anchor.max(0) as usize;
-    let trace = ctx.capture_stack_trace(0);
-    let ordered = ordered_stack_walk_frames(&trace);
+    // Prefer the clean frame list cached by the enclosing `callStackWalk`.
+    // Re-capturing here would observe a deeper, polluted stack (we are paused
+    // inside `doStackWalk → <stream pipeline> → lambda`), shifting the cursor
+    // onto `java.util.stream.*` / `StackStreamFactory$*` frames and feeding the
+    // user function garbage — see `SW_FRAME_CACHE`. Fall back to a fresh
+    // capture only when no walk is active (a stray/unmatched fetch).
+    let cached = SW_FRAME_CACHE.with(|c| c.borrow().last().cloned());
+    let from_cache = cached.is_some();
+    let ordered = match cached {
+        Some(o) => o,
+        None => {
+            let trace = ctx.capture_stack_trace(0);
+            ordered_stack_walk_frames(&trace)
+        }
+    };
     if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!(
-            "[SW-DBG] fetchStackFrames anchor={} start_index={} ordered_len={} trace_len={}",
+            "[SW-DBG] fetchStackFrames anchor={} start_index={} ordered_len={} from_cache={}",
             cursor,
             start_index,
             ordered.len(),
-            trace.len()
+            from_cache
         );
     }
     let buf_len = ctx.array_length(buffer);
@@ -390,16 +500,23 @@ pub(crate) fn native_fetch_stack_frames(
     let slack = buf_len.saturating_sub(start);
     let mut written = 0usize;
     let mut new_cursor = cursor;
-    let entries: Vec<_> = ordered.iter().skip(cursor).collect();
-    for entry in entries {
+    // GC-SAFETY: see `native_call_stack_walk` — pin the buffer across the
+    // allocating `populate_sfi` loop and re-read the forwarded reference.
+    let buf_pin = ctx.pin_native_root(buffer);
+    let mut buffer = buffer;
+    let entries: Vec<cratonvm_native_api::StackTraceEntry> =
+        ordered.iter().skip(cursor).cloned().collect();
+    for entry in &entries {
         if written >= slack {
             break;
         }
         let sfi = populate_sfi(ctx, entry);
+        buffer = ctx.read_native_pin(buf_pin, buffer);
         ctx.set_array_element(buffer, start + written, Value::Object(Some(sfi)));
         written += 1;
         new_cursor += 1;
     }
+    ctx.unpin_native_roots(buf_pin);
     // Persist the new cursor back into `this.anchor` so a subsequent
     // `fetchStackFrames` call resumes from the next trace frame.
     if let Some(Value::Object(Some(this_ref))) = args.first() {

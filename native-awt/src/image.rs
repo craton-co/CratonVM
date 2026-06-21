@@ -311,12 +311,19 @@ impl Clone for BufferedImageData {
 /// succeeds). Every `get`/`get_mut`/`create` refreshes the touched image's
 /// stamp, so any image an app is actively reading or drawing stays hot.
 ///
-/// Tradeoff: the budget is deliberately large (default 256 MiB) so that under
-/// realistic workloads only truly idle rasters are reclaimed. A pathological
-/// app that holds live references to more than the budget of simultaneously
-/// idle images could see a long-untouched-but-still-referenced raster blanked
-/// (subsequent `getRGB` reads 0); this is the documented cost of having no GC
-/// end-of-life hook. The previous unbounded leak was strictly worse.
+/// Liveness / pinning (review fix — never evict a still-referenced image):
+///
+/// Eviction must NEVER discard the raster of a `BufferedImage` that is still
+/// live on the Java side — doing so silently blanks pixels an app may still
+/// read or draw (corruption). Because this crate has no GC end-of-life hook,
+/// we treat every registered image as PINNED (live) from the moment it is
+/// created until something explicitly releases it. The LRU now only ever
+/// reclaims entries that have been [`unpin`](ImageRegistry::unpin)ned — i.e.
+/// proven dead by an explicit `dispose`/`flush`-style release. If the registry
+/// is over budget but every remaining entry is still pinned, eviction SKIPS
+/// rather than dropping a live raster: the registry simply grows past the soft
+/// budget until live images are released. This trades a soft, bounded budget
+/// for never losing live pixels — the correct precedence per Java semantics.
 pub struct ImageRegistry {
     images: FxHashMap<u64, ImageEntry>,
     next_id: u64,
@@ -342,6 +349,12 @@ struct ImageEntry {
     /// Cached raster size in bytes (`width * height * 4`), so eviction can
     /// maintain the running `total_bytes` without recomputing.
     byte_len: usize,
+    /// Liveness pin: `true` while a Java `BufferedImage` still references this
+    /// raster. Pinned entries are NEVER evicted (evicting one would silently
+    /// blank a still-referenced image). Set on `create`, cleared by an explicit
+    /// [`ImageRegistry::unpin`] when the Java object is released. `Cell` so a
+    /// shared-borrow path can flip it if ever needed.
+    pinned: Cell<bool>,
 }
 
 /// Soft ceiling on total raster bytes held by the registry before LRU
@@ -387,17 +400,25 @@ impl ImageRegistry {
             .saturating_mul(4)
     }
 
-    /// Evict least-recently-touched entries until total raster bytes fit
-    /// within [`RASTER_BUDGET_BYTES`], never touching `protect` (the image we
-    /// just inserted — evicting it would defeat the create). Bug
-    /// awt-font-image #2.
+    /// Evict least-recently-touched *unpinned* entries until total raster bytes
+    /// fit within [`RASTER_BUDGET_BYTES`], never touching `protect` (the image
+    /// we just inserted) and never touching a PINNED entry — a pinned entry is
+    /// still referenced by a live Java `BufferedImage`, and dropping its raster
+    /// would silently blank pixels the app may still read or draw.
+    ///
+    /// Only entries that have been explicitly [`unpin`](Self::unpin)ned are
+    /// eligible victims. If every remaining entry is still pinned (or is the
+    /// protected one), eviction SKIPS: the registry is allowed to grow past the
+    /// soft budget rather than discard live pixels. Bug awt-font-image #2 +
+    /// review fix (never evict a still-referenced image).
     fn evict_until_within_budget(&mut self, protect: u64) {
         while self.total_bytes > self.budget_bytes {
-            // Find the oldest (smallest last_touch) entry other than `protect`.
+            // Find the oldest (smallest last_touch) UNPINNED entry that isn't
+            // the just-inserted `protect` image.
             let victim = self
                 .images
                 .iter()
-                .filter(|(id, _)| **id != protect)
+                .filter(|(id, e)| **id != protect && !e.pinned.get())
                 .min_by_key(|(_, e)| e.last_touch.get())
                 .map(|(id, _)| *id);
             match victim {
@@ -406,9 +427,11 @@ impl ImageRegistry {
                         self.total_bytes = self.total_bytes.saturating_sub(e.byte_len);
                     }
                 }
-                // Nothing left to evict but the protected image — stop (a
-                // single image larger than the whole budget is kept rather
-                // than dropped, so the create still works).
+                // No evictable (unpinned, unprotected) entry remains: every
+                // other raster is still live. Keep them all and let the
+                // registry exceed the soft budget — losing a live raster is
+                // never acceptable. A single image larger than the whole
+                // budget is likewise kept so the create still works.
                 None => break,
             }
         }
@@ -432,12 +455,53 @@ impl ImageRegistry {
                 data,
                 last_touch: Cell::new(touch),
                 byte_len,
+                // A freshly-created image is referenced by the Java
+                // `BufferedImage` that triggered this `create`, so it starts
+                // pinned (live) and is never an eviction victim until released.
+                pinned: Cell::new(true),
             },
         );
-        // Bug awt-font-image #2: reclaim idle rasters so total memory stays
-        // bounded. Protect the image we just inserted.
+        // Bug awt-font-image #2: reclaim idle (unpinned) rasters so total
+        // memory stays bounded. Protect the image we just inserted; pinned
+        // entries are skipped inside `evict_until_within_budget`.
         self.evict_until_within_budget(id);
         Some(ImageId(id))
+    }
+
+    /// Mark an image as released by Java — it no longer has an outstanding
+    /// `BufferedImage` reference, so its raster may be reclaimed by LRU
+    /// eviction when the registry is over budget. Returns `false` if the id is
+    /// unknown. Idempotent.
+    ///
+    /// Wire this to a `BufferedImage` end-of-life signal (e.g. an explicit
+    /// dispose/flush-with-release hook) once one exists; until then images stay
+    /// pinned for the VM lifetime, which is the safe (never-corrupt) default.
+    pub fn unpin(&mut self, id: ImageId) -> bool {
+        match self.images.get(&id.0) {
+            Some(e) => {
+                e.pinned.set(false);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Re-pin a previously [`unpin`](Self::unpin)ned image as live again (e.g.
+    /// it was handed back out to Java). Returns `false` if the id is unknown.
+    pub fn pin(&mut self, id: ImageId) -> bool {
+        match self.images.get(&id.0) {
+            Some(e) => {
+                e.pinned.set(true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the image is currently pinned (live / non-evictable). `None` if
+    /// the id is unknown. Mainly for tests / diagnostics.
+    pub fn is_pinned(&self, id: ImageId) -> Option<bool> {
+        self.images.get(&id.0).map(|e| e.pinned.get())
     }
 
     /// Look up an image by ID (immutable). Refreshes the entry's LRU stamp so
@@ -695,14 +759,67 @@ mod tests {
         let mut reg = ImageRegistry::with_budget(900);
         let a = reg.create(10, 10, ImageType::IntArgb).unwrap();
         let b = reg.create(10, 10, ImageType::IntArgb).unwrap();
-        // Touch `a` so `b` becomes the least-recently-used.
+        // `b` is released by Java (no live BufferedImage), so it becomes an
+        // eligible eviction victim; `a` stays pinned (live).
+        assert!(reg.unpin(b));
+        // Touch `a` so `b` is also the least-recently-used.
         assert!(reg.get(a).is_some());
-        // Third create pushes total to 1200 > 900: the idle one (`b`) is evicted.
+        // Third create pushes total to 1200 > 900: the idle, unpinned one
+        // (`b`) is evicted; the live ones (`a`, `c`) are not.
         let c = reg.create(10, 10, ImageType::IntArgb).unwrap();
-        assert!(reg.get(a).is_some(), "recently-touched image must survive");
+        assert!(reg.get(a).is_some(), "live (pinned) image must survive");
         assert!(reg.get(c).is_some(), "just-created image must survive");
-        assert!(reg.get(b).is_none(), "least-recently-used image is evicted");
+        assert!(reg.get(b).is_none(), "released, idle image is evicted");
         assert!(reg.total_bytes() <= 900);
+    }
+
+    #[test]
+    fn registry_never_evicts_pinned_live_image() {
+        // Review fix: a still-referenced (pinned) image is NEVER evicted, even
+        // when that pushes the registry well past the soft budget. Losing live
+        // pixels is never acceptable.
+        let mut reg = ImageRegistry::with_budget(900);
+        let a = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        let b = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        // Everything stays pinned (the default): a third create overshoots the
+        // budget but must not drop either live raster.
+        let c = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        assert!(reg.get(a).is_some(), "pinned image a must survive");
+        assert!(reg.get(b).is_some(), "pinned image b must survive");
+        assert!(reg.get(c).is_some(), "just-created image c must survive");
+        assert_eq!(reg.len(), 3);
+        // The registry is allowed to exceed the soft budget rather than corrupt
+        // a live image.
+        assert!(reg.total_bytes() > 900);
+    }
+
+    #[test]
+    fn registry_unpin_then_repin_protects_again() {
+        let mut reg = ImageRegistry::with_budget(900);
+        let a = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        let b = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        // Release then re-acquire `b`: it is live again and must not be evicted.
+        assert!(reg.unpin(b));
+        assert_eq!(reg.is_pinned(b), Some(false));
+        assert!(reg.pin(b));
+        assert_eq!(reg.is_pinned(b), Some(true));
+        // Over-budget create: both `a` and `b` are pinned, so neither is dropped.
+        let c = reg.create(10, 10, ImageType::IntArgb).unwrap();
+        assert!(reg.get(a).is_some());
+        assert!(
+            reg.get(b).is_some(),
+            "re-pinned image must survive eviction"
+        );
+        assert!(reg.get(c).is_some());
+        assert_eq!(reg.len(), 3);
+    }
+
+    #[test]
+    fn registry_pin_helpers_on_unknown_id() {
+        let mut reg = ImageRegistry::new();
+        assert!(!reg.unpin(ImageId(999)));
+        assert!(!reg.pin(ImageId(999)));
+        assert_eq!(reg.is_pinned(ImageId(999)), None);
     }
 
     #[test]

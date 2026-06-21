@@ -10,10 +10,11 @@ use std::collections::HashMap;
 
 use super::ir::{Graph, IrType, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
-use super::{CompiledMethod, ExecutableBuffer};
+use super::{CompiledMethod, ExecutableBuffer, JitRuntimeHelpers};
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
 };
+use cratonvm_types::{FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
 // Argument registers for the deopt trampoline's call to `ir_deopt_entry`
 // (`fn(point, rbp)`), per platform ABI.
@@ -38,6 +39,18 @@ const RAX: u8 = 0;
 const RCX: u8 = 1;
 #[allow(dead_code)]
 const RDX: u8 = 2;
+#[allow(dead_code)]
+const R10: u8 = 10;
+
+// Platform C-ABI integer argument registers for the `invoke_dispatch` helper
+// call (Gap B `Op::Call`). The helper's 4 args (vm_ptr, info_ptr, args_ptr,
+// num_args) are all integer, so all four fit in registers on both ABIs — no
+// stack args, only the 32-byte Win64 shadow space (already budgeted in the
+// frame). Mirrors x64.rs `ARG_REGS`.
+#[cfg(target_os = "windows")]
+const CALL_ARG_REGS: [u8; 4] = [1, 2, 8, 9]; // RCX, RDX, R8, R9
+#[cfg(not(target_os = "windows"))]
+const CALL_ARG_REGS: [u8; 4] = [7, 6, 2, 1]; // RDI, RSI, RDX, RCX
 
 // ── Lowering state ───────────────────────────────────────────────────
 
@@ -70,6 +83,26 @@ struct Lowerer<'a> {
     /// as imm64 into guard code. Moved into the `CompiledMethod` so the code's
     /// raw pointers stay valid for the method's (retained) lifetime.
     deopt_boxes: Vec<Box<DeoptimizationPoint>>,
+    // ── Gap B: Op::Call (invokestatic via the dispatch helper) ───────────
+    /// Address of the `jit_invoke_dispatch` runtime helper (baked into each
+    /// `Op::Call` site as `MOV RAX,imm64 ; CALL RAX`). 0 if no calls.
+    invoke_dispatch: usize,
+    /// True iff the graph contains an `Op::Call` — then the method takes the VM
+    /// context pointer as a hidden first argument (`try_call_with_context`), and
+    /// the prologue stores it to `context_slot_off` + shifts the Java params.
+    needs_context: bool,
+    /// Frame offset of the saved VM context pointer (valid iff `needs_context`).
+    context_slot_off: i32,
+    /// Frame offset of `arg[0]` in the Java-argument staging region a call
+    /// marshals its args into; `arg[i]` lives at `args_stage_top_off - i*8`
+    /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
+    args_stage_top_off: i32,
+    /// Upper bound (inclusive) for a spill slot's frame offset — excludes the
+    /// shadow space AND the arg-staging region so spills never overlap them.
+    spill_cap_off: i32,
+    /// Native offsets of `JE rel32` instructions emitted after each dispatch
+    /// call (the exception sentinel check) that jump to the shared bail stub.
+    call_exc_patches: Vec<usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -80,26 +113,58 @@ impl<'a> Lowerer<'a> {
         num_params: usize,
         num_locals: usize,
         max_nodes: usize,
+        helpers: &JitRuntimeHelpers,
     ) -> Self {
-        // Frame layout: [RBP-8] = first slot, etc.
-        // Reserve slots for locals + max_nodes spill slots + shadow space.
-        // The 16-byte tail above the shadow region holds in-frame stack args
-        // for any helper called without `emit_stack_arg_setup`; see the
-        // matching comment in `x64.rs` (Compiler::new) for the worst-case
-        // 6-arg `jit_invoke_virtual_mic` site that motivates 16 (not 8).
+        // Gap B: scan for `Op::Call` to size the call-related frame regions.
+        // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
+        // and reserves a context slot. `max_call_args` sizes the Java-argument
+        // staging region a call marshals its args into before dispatching.
+        let mut needs_context = false;
+        let mut max_call_args = 0usize;
+        for n in &graph.nodes {
+            if matches!(n.op, Op::Call { .. }) {
+                needs_context = true;
+                // inputs = [ctrl, mem, args…]
+                max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
+            }
+        }
+
+        // Frame layout (rbp downward): locals, [context slot], spills, [args
+        // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
+        // locals + max_nodes spills + shadow. The 16-byte tail above the shadow
+        // region holds in-frame stack args for any helper called without
+        // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
+        // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
+        let context_size = if needs_context { 8 } else { 0 };
         let spill_size = (max_nodes as i32) * 8;
+        let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total = locals_size + spill_size + shadow + stack_arg_reserve;
+        let total =
+            locals_size + context_size + spill_size + args_stage_size + shadow + stack_arg_reserve;
         let frame_size = (total + 15) & !15;
+
+        // The context slot is the first slot after the locals; spills start
+        // after it. `arg[0]` of the staging region sits at offset
+        // `frame_size - shadow` (the byte just above the shadow space); for a
+        // no-call method `args_stage_size == 0` so the cap stays `frame_size -
+        // shadow`, unchanged from before this slice.
+        let context_slot_off = if needs_context {
+            (num_locals as i32 + 1) * 8
+        } else {
+            0
+        };
+        let first_spill = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
+        let args_stage_top_off = frame_size - shadow;
+        let spill_cap_off = frame_size - shadow - args_stage_size;
 
         Lowerer {
             graph,
             schedule,
             buf,
             node_slot: vec![0; graph.nodes.len()],
-            next_spill: (num_locals as i32 + 1) * 8,
+            next_spill: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
             num_params,
@@ -108,6 +173,12 @@ impl<'a> Lowerer<'a> {
             bci_native: HashMap::new(),
             deopt_stub_patches: Vec::new(),
             deopt_boxes: Vec::new(),
+            invoke_dispatch: helpers.invoke_dispatch,
+            needs_context,
+            context_slot_off,
+            args_stage_top_off,
+            spill_cap_off,
+            call_exc_patches: Vec::new(),
         }
     }
 
@@ -124,13 +195,17 @@ impl<'a> Lowerer<'a> {
     /// a method the old `o < frame_size` bound accepted.
     fn alloc_slot(&mut self, id: NodeId) -> i32 {
         let offset = self.next_spill;
+        // `spill_cap_off` excludes the 32-byte shadow space AND (Gap B) the
+        // Java-arg staging region, so a spill never overlaps either. For a
+        // no-call method it equals `frame_size - DEOPT_SHADOW_SPACE` — the
+        // historical bound, unchanged.
         assert!(
-            offset <= self.frame_size - DEOPT_SHADOW_SPACE,
+            offset <= self.spill_cap_off,
             "JIT lowerer: spill offset {} exceeds frame capacity {} \
-             (less {}-byte deopt-call shadow reserve)",
+             (cap {}, less shadow + arg-staging reserve)",
             offset,
             self.frame_size,
-            DEOPT_SHADOW_SPACE,
+            self.spill_cap_off,
         );
         self.next_spill += 8;
         self.node_slot[id as usize] = offset;
@@ -259,35 +334,78 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&self.frame_size.to_le_bytes());
 
         // Store params from ABI registers to local frame slots.
-        // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX.
+        // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX, R8, R9.
         #[cfg(target_os = "windows")]
         let abi_regs: &[u8] = &[RCX, RDX, 8, 9]; // RCX, RDX, R8, R9
         #[cfg(not(target_os = "windows"))]
         let abi_regs: &[u8] = &[7, 6, RDX, RCX, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 
-        for i in 0..self.num_params.min(abi_regs.len()) {
-            let reg = abi_regs[i];
-            let offset = ((i as i32) + 1) * 8; // local_offset(i)
-            let neg = -(offset as i32);
-            // MOV [RBP - offset], reg
-            let mut prefix = 0x48u8; // REX.W
-            if reg >= 8 {
-                prefix |= 0x04; // REX.R
+        // Gap B: a `needs_context` method receives the VM context pointer in
+        // ABI[0] (the `try_call_with_context` convention), with the Java params
+        // shifted to ABI[1..]. Store the context to its slot, then the params to
+        // their local slots. `lower()` bails (single-pass) before reaching here
+        // if `1 + num_params` would exceed the register args, so every param
+        // below comes from a register.
+        let base = if self.needs_context {
+            self.store_abi_reg(abi_regs[0], self.context_slot_off);
+            1
+        } else {
+            0
+        };
+        for i in 0..self.num_params {
+            let abi_idx = base + i;
+            if abi_idx >= abi_regs.len() {
+                break;
             }
-            self.buf.emit_byte(prefix);
-            self.buf.emit_byte(0x89);
-            // Prefer the shorter disp8 form when neg fits in i8 — for the
-            // first 16 params we know neg ∈ [-128, -8], well within range.
-            if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-                // mod=01, reg=reg&7, r/m=RBP(101) → 0x45 | (reg<<3)
-                self.buf.emit_byte(0x45 | ((reg & 7) << 3));
-                self.buf.emit_byte(neg as u8);
-            } else {
-                // mod=10, disp32 fallback
-                self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-                self.buf.emit(&neg.to_le_bytes());
-            }
+            self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+    }
+
+    /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
+    /// Prefers the disp8 ModRM form when `-offset` fits in a signed byte.
+    fn store_abi_reg(&mut self, reg: u8, offset: i32) {
+        let neg = -offset;
+        let mut prefix = 0x48u8; // REX.W
+        if reg >= 8 {
+            prefix |= 0x04; // REX.R
+        }
+        self.buf.emit_byte(prefix);
+        self.buf.emit_byte(0x89);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
+            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+            self.buf.emit_byte(neg as u8);
+        } else {
+            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+            self.buf.emit(&neg.to_le_bytes());
+        }
+    }
+
+    /// MOV reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). General form of
+    /// `load_to_rax`/`load_to_rcx` for an arbitrary (possibly extended) dest.
+    fn load_reg_from_frame(&mut self, reg: u8, offset: i32) {
+        let neg = -offset;
+        let mut prefix = 0x48u8;
+        if reg >= 8 {
+            prefix |= 0x04;
+        }
+        self.buf.emit_byte(prefix);
+        self.buf.emit_byte(0x8B);
+        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+        self.buf.emit(&neg.to_le_bytes());
+    }
+
+    /// LEA reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). Used to compute
+    /// the `args_ptr` the dispatch helper reads the marshalled Java args from.
+    fn lea_reg_from_frame(&mut self, reg: u8, offset: i32) {
+        let neg = -offset;
+        let mut prefix = 0x48u8;
+        if reg >= 8 {
+            prefix |= 0x04;
+        }
+        self.buf.emit_byte(prefix);
+        self.buf.emit_byte(0x8D);
+        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+        self.buf.emit(&neg.to_le_bytes());
     }
 
     fn emit_epilogue(&mut self) {
@@ -634,6 +752,23 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x0F, 0xB6, 0xC0]);
                 self.store_rax(slot);
             }
+            // inc 27: `lcmp` 3-way signed compare of two longs → int {-1,0,1}.
+            // result = (a > b) − (a < b), using signed SETcc on a 64-bit CMP, then
+            // sign-extended to 64 bits so a 32- or 64-bit consumer both read it
+            // correctly (the typical consumer is an `if<cond>` against 0).
+            Op::LCmp => {
+                let slot = self.alloc_slot(id);
+                self.load_to_rax(self.slot_of(node.inputs[0])); // a
+                self.load_to_rcx(self.slot_of(node.inputs[1])); // b
+                self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX (signed, 64-bit)
+                self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL  (a > b)
+                self.buf.emit(&[0x0F, 0x9C, 0xC2]); // SETL DL  (a < b)
+                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX  → {-1,0,1}
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
+                self.store_rax(slot);
+            }
             Op::I2L => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
@@ -700,6 +835,122 @@ impl<'a> Lowerer<'a> {
                 self.buf
                     .try_patch_i32(jnz_patch, rel)
                     .expect("guard JNZ patch in-bounds");
+            }
+            // getfield read — `Op::Load`. The IR builder emits only
+            // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
+            // of the field/call frontier), so this lowers the single-pass
+            // inline-getfield ABI exactly: null receiver → 0, else MOVSXD the
+            // 32-bit `Value::Int` payload. inputs = [ctrl, mem, base, offset]
+            // where `offset` is a `Const(field_index)`.
+            Op::Load(_) => {
+                let slot = self.alloc_slot(id);
+                let base = node.inputs[2];
+                let offset_node = node.inputs[3];
+                let field_index = match self.graph.nodes[offset_node as usize].op {
+                    Op::Const(v) => v,
+                    _ => 0,
+                };
+                // Byte displacement of the field's 32-bit Int payload within
+                // the object: HEADER_SIZE + field_index*SLOT_SIZE +
+                // FIELD_CELL_PAYLOAD32_OFFSET (the same arithmetic the
+                // single-pass inline getfield uses).
+                let disp = HEADER_SIZE as i32
+                    + (field_index as i32) * SLOT_SIZE as i32
+                    + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+                // Receiver pointer → RAX (64-bit; a Param slot holds the full
+                // pointer the prologue stored from the argument register).
+                self.load_to_rax(self.slot_of(base));
+                // TEST RAX,RAX ; JE +9 → null path (the trailing XOR EAX,EAX).
+                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                self.buf.emit(&[0x74, 0x09]);
+                // MOVSXD RAX, [RAX + disp32]  (sign-extend the Int payload).
+                self.buf.emit(&[0x48, 0x63, 0x80]);
+                self.buf.emit(&disp.to_le_bytes());
+                // JMP +2 → done (skip the null path).
+                self.buf.emit(&[0xEB, 0x02]);
+                // null path: RAX := 0, matching `jit_getfield`'s null guard.
+                self.buf.emit(&[0x31, 0xC0]);
+                // done: spill the result.
+                self.store_rax(slot);
+            }
+            // putfield write — `Op::Store`. The IR builder emits only
+            // `Op::Store(MemKind::Int)` (int-category instance fields). Inline
+            // the `jit_putfield_int` heap write: null receiver → no-op, else
+            // write a `Value::Int(value)` cell (discriminant 0 + the 32-bit
+            // payload, high qword cleared so no stale ref/garbage survives —
+            // mirroring the scalar-replace store and the real helper).
+            // inputs = [ctrl, mem, base, offset, value]; produces no value
+            // (a pure memory-ordering token), so no slot is allocated.
+            Op::Store(_) => {
+                let base = node.inputs[2];
+                let offset_node = node.inputs[3];
+                let value = node.inputs[4];
+                let field_index = match self.graph.nodes[offset_node as usize].op {
+                    Op::Const(v) => v,
+                    _ => 0,
+                };
+                let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
+                let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+                let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
+                                            // Receiver → RAX, value → RCX. Both loaded BEFORE the null
+                                            // check so the guarded body is a fixed size (the value load is
+                                            // variable-width; doing it here keeps the JE displacement
+                                            // constant). The value load on the null path is harmless.
+                self.load_to_rax(self.slot_of(base));
+                self.load_to_rcx(self.slot_of(value));
+                // TEST RAX,RAX ; JE +27 → skip (null receiver = no-op).
+                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                self.buf.emit(&[0x74, 27]);
+                // MOV dword [RAX + tag_off], 0   (Value::Int discriminant) — 10 bytes.
+                self.buf.emit(&[0xC7, 0x80]);
+                self.buf.emit(&tag_off.to_le_bytes());
+                self.buf.emit(&0u32.to_le_bytes());
+                // MOV dword [RAX + pay_off], ECX (Int payload) — 6 bytes.
+                self.buf.emit(&[0x89, 0x88]);
+                self.buf.emit(&pay_off.to_le_bytes());
+                // MOV qword [RAX + high_off], 0  (clear high qword) — 11 bytes.
+                self.buf.emit(&[0x48, 0xC7, 0x80]);
+                self.buf.emit(&high_off.to_le_bytes());
+                self.buf.emit(&0u32.to_le_bytes());
+                // skip:  (10 + 6 + 11 = 27 bytes guarded — matches the JE rel8)
+            }
+            // invokestatic — dispatch via the `jit_invoke_dispatch` helper
+            // (Gap B). inputs = [ctrl, mem, arg0, arg1, …]. The IR builder emits
+            // this only for an oop-free method, so no object reference is ever
+            // live across the call → no GC oop map needed. ABI (mirrors x64.rs):
+            //   i64 helper(vm_ptr, info_ptr, args_ptr, num_args)
+            // The Java args are marshalled contiguously into the frame staging
+            // region (`args_ptr` → arg0, increasing addresses). A returned
+            // `i64::MIN` means the callee threw: jump to the shared bail stub,
+            // which returns the sentinel unchanged so the VM takes the pending
+            // exception (the same protocol single-pass uses).
+            Op::Call { info_ptr } => {
+                let slot = self.alloc_slot(id);
+                let num_args = node.inputs.len().saturating_sub(2);
+                // 1. Marshal each Java arg into the staging region.
+                for i in 0..num_args {
+                    let arg = node.inputs[2 + i];
+                    self.load_to_rax(self.slot_of(arg));
+                    self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+                }
+                // 2. Load the helper's four register arguments.
+                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[1], *info_ptr as u64); // info_ptr
+                self.lea_reg_from_frame(CALL_ARG_REGS[2], self.args_stage_top_off); // args_ptr
+                self.emit_mov_reg_imm64(CALL_ARG_REGS[3], num_args as u64); // num_args
+                                                                            // 3. MOV RAX, invoke_dispatch ; CALL RAX.
+                self.emit_mov_reg_imm64(RAX, self.invoke_dispatch as u64);
+                self.buf.emit(&[0xFF, 0xD0]);
+                // 4. Exception sentinel: CMP RAX, i64::MIN ; JE bail_stub.
+                self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+                self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+                self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
+                let patch = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                self.call_exc_patches.push(patch);
+                // 5. Spill the return value (harmless for a void call: the slot
+                //    is allocated but never read).
+                self.store_rax(slot);
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
@@ -1060,6 +1311,30 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Gap B: emit the single shared call-exception bail stub (if any `Op::Call`
+    /// emitted a sentinel check) and patch every dispatch site's `JE` to it. On
+    /// entry `RAX` already holds the `i64::MIN` sentinel the helper returned when
+    /// the callee threw; the stub just runs the epilogue, returning the sentinel
+    /// so the VM's post-JIT path takes the pending exception (the same protocol
+    /// the single-pass backend uses).
+    fn emit_call_exc_stub(&mut self) {
+        if self.call_exc_patches.is_empty() {
+            return;
+        }
+        let stub_off = self.buf.pos();
+        self.buf.emit(&[0x48, 0x81, 0xC4]); // add rsp, frame_size
+        self.buf.emit(&self.frame_size.to_le_bytes());
+        self.buf.emit_byte(0x5D); // pop rbp
+        self.buf.emit_byte(0xC3); // ret
+        let patches = std::mem::take(&mut self.call_exc_patches);
+        for p in patches {
+            let rel = stub_off as i32 - (p as i32 + 4);
+            self.buf
+                .try_patch_i32(p, rel)
+                .expect("call-exc JE patch in-bounds");
+        }
+    }
+
     /// Build the interpreter `FrameState` for one safepoint snapshot.
     ///
     /// `method_key` is left to the VM caller to fill (the lowerer does not
@@ -1146,6 +1421,7 @@ pub fn lower(
     schedule: &Schedule,
     num_params: usize,
     num_locals: usize,
+    helpers: &JitRuntimeHelpers,
 ) -> Option<CompiledMethod> {
     let estimated_size = graph.nodes.len() * 32 + 256;
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
@@ -1157,7 +1433,23 @@ pub fn lower(
         num_params,
         num_locals,
         graph.nodes.len(),
+        helpers,
     );
+
+    // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
+    // VM pointer as a hidden first arg, but only `abi_regs.len()` integer
+    // registers carry incoming args. If `1 + num_params` would spill a param to
+    // the stack, the prologue can't load it — bail to single-pass (the safety
+    // net) rather than mis-read the param. `abi_regs` is 4 on Win64, 6 on SysV.
+    if lowerer.needs_context {
+        #[cfg(target_os = "windows")]
+        let abi_len = 4usize;
+        #[cfg(not(target_os = "windows"))]
+        let abi_len = 6usize;
+        if 1 + num_params > abi_len {
+            return None;
+        }
+    }
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
     // block is lowered — a forward branch's edge copies (emit_phi_copies)
@@ -1174,6 +1466,9 @@ pub fn lower(
     // real-frame-deopt (step 3): emit the shared deopt stub after the method
     // body so failed guards can jump to it, then patch in-method branches.
     lowerer.emit_deopt_stub();
+    // Gap B: emit the shared call-exception bail stub after the body so each
+    // dispatch site's sentinel `JE` reaches it.
+    lowerer.emit_call_exc_stub();
 
     lowerer.patch_branches();
 
@@ -1182,6 +1477,9 @@ pub fn lower(
     // Emit-and-discard: nothing reads these yet, so codegen is unchanged.
     let deopt_points = lowerer.build_deopt_points();
     let deopt_boxes = std::mem::take(&mut lowerer.deopt_boxes);
+    // Gap B: a method containing an `Op::Call` takes the VM context pointer as a
+    // hidden first arg, so it must be invoked via `try_call_with_context`.
+    let needs_context = lowerer.needs_context;
 
     let buf = lowerer.buf;
     let _code_size = buf.pos();
@@ -1189,6 +1487,9 @@ pub fn lower(
     let mut cm = CompiledMethod::new(buf);
     cm.deopt_points = deopt_points;
     cm._deopt_point_boxes = deopt_boxes;
+    if needs_context {
+        cm.needs_context = true;
+    }
     Some(cm)
 }
 
@@ -1201,6 +1502,13 @@ mod tests {
     use crate::ir_optimize;
     use crate::ir_schedule;
 
+    /// All-zero helpers for tests that contain no `Op::Call` (no helper pointer
+    /// is ever dereferenced). SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with
+    /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
+    fn no_helpers() -> JitRuntimeHelpers {
+        unsafe { std::mem::zeroed() }
+    }
+
     fn compile_via_ir(
         code: &[u8],
         code_len: usize,
@@ -1211,7 +1519,7 @@ mod tests {
         let mut graph = builder.build(code, code_len)?;
         ir_optimize::optimize(&mut graph);
         let schedule = ir_schedule::schedule(&graph);
-        lower(&graph, &schedule, num_params, num_locals)
+        lower(&graph, &schedule, num_params, num_locals, &no_helpers())
     }
 
     /// Build → schedule → lower WITHOUT the optimizer, so safepoint NodeIds
@@ -1226,7 +1534,7 @@ mod tests {
         let builder = IrBuilder::new(num_params, num_locals);
         let graph = builder.build(code, code_len).expect("IR build");
         let schedule = ir_schedule::schedule(&graph);
-        lower(&graph, &schedule, num_params, num_locals).expect("lower")
+        lower(&graph, &schedule, num_params, num_locals, &no_helpers()).expect("lower")
     }
 
     // ── real-frame-deopt step 2: deopt points + lookup ───────────────────
@@ -1302,7 +1610,7 @@ mod tests {
         });
 
         let schedule = ir_schedule::schedule(&graph);
-        let method = lower(&graph, &schedule, 2, 2).expect("lower guarded method");
+        let method = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower guarded method");
 
         // Guard passes (cond != 0): normal return of `val`.
         let _ = take_last_deopt(); // clear any stale state
@@ -1444,7 +1752,7 @@ mod tests {
         graph.exit = ret;
 
         let schedule = ir_schedule::schedule(&graph);
-        let method = lower(&graph, &schedule, 2, 2).expect("lower cmp graph");
+        let method = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower cmp graph");
 
         // a < b  → 1
         let r_true = unsafe { method.try_call(&[3, 7]).expect("test JIT call") };

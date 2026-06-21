@@ -1424,7 +1424,16 @@ impl SoftwareRenderer {
                         let sy = src_yf.round() as u32;
                         let sx = sx.min(src_w - 1);
                         let sy = sy.min(src_h - 1);
-                        src[(sy * src_w + sx) as usize]
+                        // The clamps above bound `sx`/`sy` to the logical
+                        // `src_w`/`src_h` extent, but `src.len()` is the caller's
+                        // contract, not an invariant here. A short/untrusted slice
+                        // (`src.len() < src_w*src_h`, or `src_w*src_h` overflowing
+                        // u32) would make `sy*src_w + sx` index past the end and
+                        // panic. Fail closed like `bilinear_sample`: out-of-range
+                        // samples read as transparent black so a bogus buffer can
+                        // never read past the slice.
+                        let idx = sy as usize * src_w as usize + sx as usize;
+                        src.get(idx).copied().unwrap_or(0)
                     }
                 };
 
@@ -2173,6 +2182,25 @@ mod tests {
         assert_eq!(r.pixels()[0], 0xFF_FF0000);
         let mid = r.pixels()[(1 * 10 + 1) as usize];
         assert_eq!(argb_a(mid), 255);
+    }
+
+    #[test]
+    fn test_blit_image_scaled_nearest_short_src_no_oob() {
+        // The Nearest path indexes `src` by the geometrically-clamped
+        // (sx, sy). When the caller supplies a slice shorter than
+        // `src_w * src_h`, the computed linear index can exceed
+        // `src.len()`. The blit must read those samples as transparent
+        // black instead of panicking with an out-of-bounds index.
+        // Source declared 4x4 (16 px) but only 2 pixels supplied.
+        let src = vec![0xFF_FF0000, 0xFF_00FF00];
+        let mut r = SoftwareRenderer::new(8, 8);
+        // Upscale 4x4 -> 8x8 with Nearest; most samples map past src.len().
+        r.blit_image_scaled(&src, 4, 4, 0, 0, 8, 8, InterpolationKind::Nearest);
+        // The (0,0) output samples src[0] (in range) -> red.
+        assert_eq!(r.pixels()[0], 0xFF_FF0000);
+        // A far output pixel maps to an out-of-range source index and must
+        // read as transparent black (fail-closed), never panic.
+        assert_eq!(r.pixels()[(7 * 8 + 7) as usize], 0x00000000);
     }
 
     #[test]

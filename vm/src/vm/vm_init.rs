@@ -375,6 +375,14 @@ pub struct SharedVm {
     /// so it can't run during `SharedVm::new`.
     pub main_thread_group: RwLock<Option<ObjectRef>>,
 
+    /// Pre-allocated singleton `java.lang.OutOfMemoryError`, thrown when the
+    /// heap is too full to even materialize a fresh exception object (the
+    /// OOM-during-OOM case — see `runtime::exceptions::ensure_singleton_oom`,
+    /// which fills this once before user `main`). Kept alive permanently by the
+    /// GC root scan (`memory::roots`). `None` until pre-allocated; the OOM-throw
+    /// sites fall back to their prior behaviour while it is empty.
+    pub singleton_oom: RwLock<Option<ObjectRef>>,
+
     /// System properties: populated with platform defaults + user overrides.
     pub system_properties: RwLock<HashMap<String, String>>,
 
@@ -627,6 +635,15 @@ pub struct SharedVm {
     /// allocation-storm regression tests to assert that GC frequency
     /// stays below the 0.2 Hz target under synthetic 25 MB/s load.
     pub gc_cycle_count: std::sync::atomic::AtomicU64,
+
+    /// Consecutive allocation-failure GCs that freed almost nothing (post-GC
+    /// heap still ≥98% full). When this reaches the GC-overhead limit
+    /// (`runtime::interpreter::gc_overhead_limit_exceeded`), the allocation
+    /// paths surface a catchable `OutOfMemoryError` (the pre-allocated
+    /// `singleton_oom`) instead of spinning in an O(n²) GC death-spiral on a
+    /// heap that is full of live (retained) objects. Reset to 0 by any
+    /// productive forced GC. Mirrors HotSpot's `UseGCOverheadLimit`.
+    pub gc_unproductive_streak: std::sync::atomic::AtomicU32,
 
     /// T19.3.G1 — total bytes allocated across all TLAB and
     /// slow-path heap allocations since VM start.
@@ -1934,12 +1951,18 @@ impl SharedVm {
                 native_methods.len()
             );
         }
-        // T7: Register AWT/Swing/Java2D native methods for desktop support
-        cratonvm_native_awt::register_awt_natives(&mut native_methods);
-        tracing::info!(
-            "AWT/Swing native methods registered (total: {})",
-            native_methods.len()
-        );
+        // T7: Register AWT/Swing/Java2D native methods for desktop support.
+        // Gated behind the (default-on) `awt` feature: `cratonvm-native-awt`
+        // sets `publish = false`, so it is an optional dependency. The default
+        // build enables `awt` and registers these natives exactly as before.
+        #[cfg(feature = "awt")]
+        {
+            cratonvm_native_awt::register_awt_natives(&mut native_methods);
+            tracing::info!(
+                "AWT/Swing native methods registered (total: {})",
+                native_methods.len()
+            );
+        }
         // Build system properties from platform defaults + user overrides.
         //
         // WP1.11 (2026-04-24) — System property fidelity: populate the full
@@ -2323,6 +2346,7 @@ impl SharedVm {
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
             main_thread_group: RwLock::new(None),
+            singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
             lambda_proxies: RwLock::new(FxHashMap::default()),
             lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
@@ -2376,6 +2400,7 @@ impl SharedVm {
             tlab_refill_count: std::sync::atomic::AtomicU64::new(0),
             tlab_hit_count: std::sync::atomic::AtomicU64::new(0),
             gc_cycle_count: std::sync::atomic::AtomicU64::new(0),
+            gc_unproductive_streak: std::sync::atomic::AtomicU32::new(0),
             bytes_allocated_total: std::sync::atomic::AtomicU64::new(0),
             // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
             field_descriptor_cache: parking_lot::RwLock::new(
@@ -4112,16 +4137,24 @@ mod ranked_locks {
         use crate::runtime::lock_order::LockOrderViolation;
         use std::cell::Cell;
 
-        const COUNT: usize = 6;
+        // One slot per `LockLevel` discriminant (Scratch=0 .. ClassManager=10).
+        // MUST equal the discriminant count of `runtime::lock_order::LockLevel`;
+        // the array is indexed directly by `level as u8`, so an undersized COUNT
+        // panics with an out-of-bounds index instead of a lock-order message.
+        const COUNT: usize = 11;
 
         thread_local! {
             static HELD: Cell<[bool; COUNT]> = const { Cell::new([false; COUNT]) };
         }
 
-        fn highest_held() -> Option<LockLevel> {
+        /// The LOWEST-ranked level currently held. The canonical
+        /// `lock_order::OrderedMutex` enforces DESCENDING acquisition (each new
+        /// level must be strictly less than the minimum already held), so the
+        /// rank check compares the candidate against the lowest held level.
+        fn lowest_held() -> Option<LockLevel> {
             HELD.with(|cell| {
                 let arr = cell.get();
-                for i in (0..COUNT).rev() {
+                for i in 0..COUNT {
                     if arr[i] {
                         return Some(level_from_u8(i as u8));
                     }
@@ -4131,22 +4164,29 @@ mod ranked_locks {
         }
 
         fn level_from_u8(v: u8) -> LockLevel {
+            // Array indices ARE `LockLevel` discriminants (see runtime::lock_order).
             match v {
-                0 => LockLevel::ClassManager,   // L10 — highest
-                1 => LockLevel::NativeMethods,  // L9
-                2 => LockLevel::RefProcessor,   // L7
-                3 => LockLevel::Monitors,       // L6
-                4 => LockLevel::ThreadRegistry, // L5
-                5 => LockLevel::FlightRecorder, // L4
-                6 => LockLevel::NativeMemory,   // L2
+                0 => LockLevel::Scratch,
+                1 => LockLevel::JvmThread,
+                2 => LockLevel::NativeMemory,
+                3 => LockLevel::CleanerActions,
+                4 => LockLevel::FlightRecorder,
+                5 => LockLevel::ThreadRegistry,
+                6 => LockLevel::Monitors,
+                7 => LockLevel::RefProcessor,
+                8 => LockLevel::Heap,
+                9 => LockLevel::NativeMethods,
+                10 => LockLevel::ClassManager,
                 _ => unreachable!("level discriminant out of range: {v}"),
             }
         }
 
         pub(super) fn check_and_acquire(level: LockLevel) {
-            if let Some(held) = highest_held() {
+            // Descending order: the new level must be strictly less than the
+            // minimum level already held (mirrors lock_order::check_and_acquire).
+            if let Some(held) = lowest_held() {
                 assert!(
-                    level > held,
+                    level < held,
                     "{}",
                     LockOrderViolation {
                         attempted: level,

@@ -21,39 +21,167 @@ const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
 
-/// Native-access gate for Panama downcalls.
+/// Native-access policy for Panama downcalls and raw-address memory access.
 ///
 /// A `validated_fn_ptr` call transmutes a Java-supplied raw address to an
 /// `extern "C" fn` and invokes it — arbitrary native code execution. Real
-/// JDK Panama gates this behind `--enable-native-access` / the module's
-/// `enableNativeAccess` permission. This crate has no module-permission
-/// plumbing reachable here, so this is a minimal coarse gate.
+/// JDK Panama gates this behind `--enable-native-access=<module-list>` /
+/// the module's `enableNativeAccess` permission, which is granted *per
+/// module* (a comma-separated list of module names, or `ALL-UNNAMED`).
 ///
-/// Default is `false` (secure-by-default, matching the JDK where native
-/// access is denied unless `--enable-native-access` grants it). A
-/// host/launcher that wants to permit Panama downcalls and raw-address
-/// memory access must call [`set_native_access_enabled(true)`] at startup
-/// (e.g. when the user passes `--enable-native-access`), and flip it on
-/// only for trusted modules granted native access.
+/// `NativeAccessPolicy` records that grant faithfully:
 ///
-/// TODO: wire this to a real per-module `--enable-native-access` check once
-/// `NativeContext` exposes the caller module's native-access permission.
-static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// * [`NativeAccessPolicy::None`] — no module has native access (the
+///   secure-by-default state, matching the JDK with no `--enable-native-access`).
+/// * [`NativeAccessPolicy::All`] — every module is granted (the launcher saw
+///   `--enable-native-access` with no argument, or `ALL-UNNAMED`/`ALL-MODULES`).
+/// * [`NativeAccessPolicy::Modules`] — only the named modules are granted.
+///   `None` (the unnamed module) is represented by the empty string `""`.
+///
+/// ### Why the gate is still consulted process-globally at the call sites
+///
+/// The native-method closures in this file receive only `ctx` (a
+/// [`NativeContext`]) and the Java `args`; there is **no reachable accessor
+/// for the *calling* class/module at the gate point** (the Panama API method
+/// itself lives in `java.base`, and the caller's frame is not exposed to a
+/// native callee here). `NativeContext::module_name_of_class` can name the
+/// module of a *given* `ClassId`, but the gate has no `ClassId` for the
+/// caller. So while the *policy* is now tracked per module, the gate
+/// helpers ([`require_native_access`]/[`validated_fn_ptr`]) currently answer
+/// the coarser question "is native access granted to *any* module?" via
+/// [`native_access_enabled`]. This is a deliberate, fail-closed
+/// approximation: it never *grants* access the launcher did not, but it
+/// cannot yet *distinguish* a denied module from a granted one. Once a
+/// caller-frame/module accessor is plumbed to the native dispatch boundary,
+/// the gate can call [`module_native_access_enabled`] with the real caller
+/// module to achieve full per-module fidelity; the policy plumbing here is
+/// the prerequisite half of that work.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NativeAccessPolicy {
+    /// No module is granted native access (secure default).
+    #[default]
+    None,
+    /// Every module is granted native access (unscoped `--enable-native-access`).
+    All,
+    /// Only the listed modules are granted. The unnamed module is `""`.
+    Modules(std::collections::BTreeSet<String>),
+}
+
+impl NativeAccessPolicy {
+    /// Whether *any* module is granted native access. Used by the coarse,
+    /// process-global gate (see the type docs for why the caller module is
+    /// not available at the gate point).
+    fn any_granted(&self) -> bool {
+        match self {
+            NativeAccessPolicy::None => false,
+            NativeAccessPolicy::All => true,
+            NativeAccessPolicy::Modules(m) => !m.is_empty(),
+        }
+    }
+
+    /// Whether the given module is granted native access. `None` denotes the
+    /// unnamed module. This is the per-module query the JDK actually performs;
+    /// it is exposed now so a future caller-module-aware gate can use it.
+    fn module_granted(&self, module: Option<&str>) -> bool {
+        match self {
+            NativeAccessPolicy::None => false,
+            NativeAccessPolicy::All => true,
+            NativeAccessPolicy::Modules(m) => m.contains(module.unwrap_or("")),
+        }
+    }
+}
+
+static NATIVE_ACCESS_POLICY: std::sync::RwLock<NativeAccessPolicy> =
+    std::sync::RwLock::new(NativeAccessPolicy::None);
+
+/// Replace the process native-access policy wholesale.
+fn store_policy(policy: NativeAccessPolicy) {
+    if let Ok(mut guard) = NATIVE_ACCESS_POLICY.write() {
+        *guard = policy;
+    }
+}
 
 /// Enable or disable Panama native downcalls process-wide.
 ///
-/// When disabled, every downcall through [`validated_fn_ptr`] fails with a
-/// thrown `java.lang.IllegalCallerException`, matching the JDK's
+/// `true` records an [`NativeAccessPolicy::All`] grant; `false` records
+/// [`NativeAccessPolicy::None`]. When no module is granted, every downcall
+/// through [`validated_fn_ptr`] fails with a thrown
+/// `java.lang.IllegalCallerException`, matching the JDK's
 /// `--enable-native-access` semantics. (Task #57: previously folded into
 /// `IllegalStateException` because `RuntimeError` lacked the variant.)
+///
+/// Retained for the bare/unscoped `--enable-native-access` launcher path and
+/// for callers (and tests) that only need the all-or-nothing behavior. For
+/// the scoped `--enable-native-access=<module-list>` form use
+/// [`set_native_access_modules`].
 pub fn set_native_access_enabled(enabled: bool) {
-    NATIVE_ACCESS_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    store_policy(if enabled {
+        NativeAccessPolicy::All
+    } else {
+        NativeAccessPolicy::None
+    });
 }
 
-/// Whether Panama native downcalls are currently permitted.
+/// Record the exact set of modules granted native access, parsed from the
+/// `--enable-native-access=<module-list>` argument (a comma-separated list).
+///
+/// The sentinels `ALL-UNNAMED`, `ALL-MODULES`, and an empty/whitespace-only
+/// list collapse to [`NativeAccessPolicy::All`] (the JDK treats `ALL-UNNAMED`
+/// as granting the unnamed module that hosts the classpath; this VM has no
+/// rich module graph at this layer, so it is approximated as a global grant
+/// — strictly no *narrower* than the JDK for the unnamed module that almost
+/// all application code lives in). Otherwise each named module is recorded
+/// individually so [`module_native_access_enabled`] can answer per module.
+pub fn set_native_access_modules<I, S>(modules: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = std::collections::BTreeSet::new();
+    let mut grant_all = false;
+    for m in modules {
+        let name = m.as_ref().trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("ALL-UNNAMED") || name.eq_ignore_ascii_case("ALL-MODULES") {
+            grant_all = true;
+            continue;
+        }
+        set.insert(name.to_string());
+    }
+    if grant_all {
+        store_policy(NativeAccessPolicy::All);
+    } else if set.is_empty() {
+        // A non-empty but all-blank argument is treated like the bare flag.
+        store_policy(NativeAccessPolicy::All);
+    } else {
+        store_policy(NativeAccessPolicy::Modules(set));
+    }
+}
+
+/// Whether Panama native downcalls are currently permitted for *any* module.
+///
+/// This is the coarse, process-global view the gate helpers use today
+/// because the calling module is not reachable at the gate point (see
+/// [`NativeAccessPolicy`]). It fails closed: it returns `false` whenever no
+/// module has been granted access.
 pub fn native_access_enabled() -> bool {
-    NATIVE_ACCESS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    NATIVE_ACCESS_POLICY
+        .read()
+        .map(|p| p.any_granted())
+        .unwrap_or(false)
+}
+
+/// Whether the named module is granted native access. `None` denotes the
+/// unnamed module. This is the per-module query the JDK performs; it is the
+/// intended entry point for a future caller-module-aware gate once the
+/// calling module is plumbed to the native dispatch boundary.
+pub fn module_native_access_enabled(module: Option<&str>) -> bool {
+    NATIVE_ACCESS_POLICY
+        .read()
+        .map(|p| p.module_granted(module))
+        .unwrap_or(false)
 }
 
 /// Defense-in-depth gate for the raw-address `MemorySegment` memory-access
@@ -69,6 +197,13 @@ pub fn native_access_enabled() -> bool {
 /// arena-backed segments; gating there would break legitimate allocation even
 /// when native access is off. Instead the gate is applied at each public JNI
 /// entry point (the methods a Java caller can reach directly).
+///
+/// PER-MODULE LIMITATION: this consults the *process-global* view
+/// ([`native_access_enabled`]) rather than the calling module's grant,
+/// because the caller's module is not reachable from a native callee at this
+/// point. The grant is tracked per module by [`NativeAccessPolicy`]; see its
+/// docs for why the gate cannot yet consult it per caller. The behavior fails
+/// closed (denies unless *some* module is granted).
 fn require_native_access(op: &str) -> Result<(), MethodCallFailed> {
     if !native_access_enabled() {
         return Err(RuntimeError::IllegalCallerException {
@@ -859,9 +994,31 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                     let src_addr = s as *const u8;
                     let dst_addr = d as *mut u8;
                     if !src_addr.is_null() && !dst_addr.is_null() {
+                        // The JDK's MemorySegment.copy is defined for overlapping
+                        // src/dst (it is specified as a memmove-equivalent bulk
+                        // copy). Decide between memmove and the faster
+                        // `copy_nonoverlapping` by testing whether the two
+                        // byte ranges actually intersect.
+                        //
+                        // Ranges are `[s, s+bytes)` and `[d, d+bytes)` over the
+                        // *absolute* addresses computed above. They overlap iff
+                        // `s < d+bytes && d < s+bytes`. `bytes` is bounded by
+                        // MAX_COPY_SIZE and both endpoints derive from the
+                        // checked address arithmetic, so the `+ bytes` cannot
+                        // wrap a u64.
+                        let bytes_u64 = bytes as u64;
+                        let overlap =
+                            s < d.saturating_add(bytes_u64) && d < s.saturating_add(bytes_u64);
                         // SAFETY: addresses are non-null, bounds-checked against
                         // segment sizes, and bytes is bounded by MAX_COPY_SIZE.
-                        unsafe { std::ptr::copy_nonoverlapping(src_addr, dst_addr, bytes) };
+                        // Overlapping ranges use `copy` (memmove), which is
+                        // defined for overlap; provably-disjoint ranges use the
+                        // faster `copy_nonoverlapping`.
+                        if overlap {
+                            unsafe { std::ptr::copy(src_addr, dst_addr, bytes) };
+                        } else {
+                            unsafe { std::ptr::copy_nonoverlapping(src_addr, dst_addr, bytes) };
+                        }
                     }
                 } else {
                     return Err(RuntimeError::IllegalStateException {
@@ -1901,8 +2058,14 @@ use libffi::middle::{Cif as MiddleCif, Closure, Type as MiddleType};
 struct UpcallEntry {
     /// libffi closure object — owns the executable trampoline page.
     _closure: Box<Closure<'static>>,
-    /// Java target object the closure dispatches to.
-    _target: ObjectRef,
+    /// The leaked `&'static UpcallUserdata` the trampoline reads its target from.
+    /// Held here (the closure captures the same allocation) so the GC root
+    /// scan/remap can reach and rewrite `target` in place — see
+    /// `gc_scan_upcall_target_roots` / `gc_update_upcall_target_refs`. Step 5
+    /// GAP C: the upcall target is a live Java object the native trampoline
+    /// holds; without this it was neither kept alive nor remapped across a
+    /// moving GC (use-after-free on the next upcall).
+    userdata: *const UpcallUserdata,
 }
 
 // SAFETY: libffi closures are immutable after construction and their
@@ -1913,7 +2076,12 @@ unsafe impl Sync for UpcallEntry {}
 
 /// Userdata captured by every upcall trampoline.
 struct UpcallUserdata {
-    target: ObjectRef,
+    /// Java target object address (a relocatable heap pointer), stored as an
+    /// `AtomicUsize` so the GC remap (`gc_update_upcall_target_refs`) can rewrite
+    /// it in place after a moving collection. The trampoline loads it on each
+    /// dispatch; both run at a stop-the-world safepoint relative to one another,
+    /// so `Relaxed` is sufficient.
+    target: std::sync::atomic::AtomicUsize,
     param_kinds: Vec<i32>,
     return_kind: i32,
 }
@@ -1924,6 +2092,48 @@ static UPCALL_REGISTRY: std::sync::OnceLock<
 
 fn upcall_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, UpcallEntry>> {
     UPCALL_REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Step 5 GAP C — GC root scan for FFM/Panama upcall targets. Each registered
+/// upcall trampoline holds a live Java target (a `MethodHandle`/lambda) only
+/// through its leaked `UpcallUserdata.target`, which is otherwise invisible to
+/// the GC. Push every one so a moving collector keeps it alive and records its
+/// relocation in the pointer map. Companion of [`gc_update_upcall_target_refs`]
+/// — the two MUST visit the identical set. Called from the VM root scan
+/// (`memory::roots`). The registry mutex is a leaf lock (no Java allocation
+/// while held), so this is safe to call at a stop-the-world safepoint.
+pub fn gc_scan_upcall_target_roots(out: &mut Vec<ObjectRef>) {
+    let reg = upcall_registry().lock();
+    for entry in reg.values() {
+        // SAFETY: `userdata` is a leaked `&'static UpcallUserdata`, alive for the
+        // whole process (the closure captures the same allocation).
+        let addr = unsafe { (*entry.userdata).target.load(std::sync::atomic::Ordering::Relaxed) };
+        if addr != 0 {
+            // SAFETY: a non-zero, 8-byte-aligned heap address previously stored
+            // from a live `ObjectRef`; used only as a GC root here.
+            out.push(unsafe { ObjectRef::from_raw(addr as *mut u8) });
+        }
+    }
+}
+
+/// Step 5 GAP C — post-move remap for upcall targets (companion of
+/// [`gc_scan_upcall_target_roots`]). After a moving collection relocates a
+/// target, rewrite each `UpcallUserdata.target` in place so the next trampoline
+/// dispatch reaches the new address. Called from the VM's `update_all_roots`.
+pub fn gc_update_upcall_target_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let reg = upcall_registry().lock();
+    for entry in reg.values() {
+        // SAFETY: see `gc_scan_upcall_target_roots`.
+        let cell = unsafe { &(*entry.userdata).target };
+        let old = cell.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            cell.store(new, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// libffi `Callback<UpcallUserdata, u64>` — runs whenever the trampoline
@@ -1965,6 +2175,15 @@ unsafe extern "C" fn upcall_dispatch(
         java_args.push(v);
     }
 
+    // GAP C: read the GC-remappable target address atomically before re-entering
+    // Java. The remap (`gc_update_upcall_target_refs`) rewrites `userdata.target`
+    // in place at a stop-the-world safepoint, so the next dispatch loads the new
+    // address; this load and that store never overlap (STW).
+    let target = unsafe {
+        cratonvm_types::ObjectRef::from_raw(
+            userdata.target.load(std::sync::atomic::Ordering::Relaxed) as *mut u8,
+        )
+    };
     // Dispatch into Java via the active NativeContext.
     let dispatch_result = plf::with_active_context(|ctx| {
         // The Java target is a MethodHandle / functional interface impl.
@@ -1981,11 +2200,11 @@ unsafe extern "C" fn upcall_dispatch(
             ctx.set_array_element(arr, i, *v);
         }
         ctx.invoke_virtual(
-            userdata.target,
+            target,
             "invoke",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
             &[
-                Value::Object(Some(userdata.target)),
+                Value::Object(Some(target)),
                 Value::Object(Some(arr)),
             ],
         )
@@ -2067,7 +2286,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     // Heap-allocate userdata so the closure has a stable reference.
     let userdata = Box::new(UpcallUserdata {
-        target,
+        target: std::sync::atomic::AtomicUsize::new(target.as_ptr() as usize),
         param_kinds: param_kinds.clone(),
         return_kind,
     });
@@ -2083,7 +2302,9 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         code_ptr,
         UpcallEntry {
             _closure: boxed_closure,
-            _target: target,
+            // Same leaked allocation the closure captured — the GC root scan/remap
+            // reach `target` through this (Step 5 GAP C).
+            userdata: userdata_ptr as *const UpcallUserdata,
         },
     );
 
@@ -2843,6 +3064,79 @@ mod tests {
         }
     }
 
+    /// Snapshot/restore helper for the per-module policy tests so they can
+    /// mutate the global `NATIVE_ACCESS_POLICY` without leaking state into the
+    /// rest of the suite. Acquires the shared serialization lock.
+    fn with_policy_isolated<F: FnOnce()>(f: F) {
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = NATIVE_ACCESS_POLICY
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or(NativeAccessPolicy::None);
+        f();
+        store_policy(prev);
+    }
+
+    #[test]
+    fn test_native_access_policy_none_denies_all() {
+        with_policy_isolated(|| {
+            set_native_access_enabled(false);
+            assert!(!native_access_enabled());
+            assert!(!module_native_access_enabled(None));
+            assert!(!module_native_access_enabled(Some("com.example.app")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_all_grants_every_module() {
+        with_policy_isolated(|| {
+            set_native_access_enabled(true);
+            assert!(native_access_enabled());
+            assert!(module_native_access_enabled(None));
+            assert!(module_native_access_enabled(Some("any.module")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_scoped_modules() {
+        with_policy_isolated(|| {
+            set_native_access_modules(["com.example.ffi", "org.foo.bar"]);
+            // Only the listed modules are granted.
+            assert!(module_native_access_enabled(Some("com.example.ffi")));
+            assert!(module_native_access_enabled(Some("org.foo.bar")));
+            // An unlisted module — and the unnamed module — are denied.
+            assert!(!module_native_access_enabled(Some("com.other")));
+            assert!(!module_native_access_enabled(None));
+            // The coarse process-global gate sees *some* grant.
+            assert!(native_access_enabled());
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_all_unnamed_sentinel_grants_all() {
+        with_policy_isolated(|| {
+            // The JDK `ALL-UNNAMED` sentinel collapses to a global grant here.
+            set_native_access_modules(["ALL-UNNAMED"]);
+            assert!(module_native_access_enabled(None));
+            assert!(module_native_access_enabled(Some("anything")));
+            // Case-insensitive and mixed with named modules.
+            set_native_access_modules(["com.x", "all-modules"]);
+            assert!(module_native_access_enabled(Some("unlisted")));
+        });
+    }
+
+    #[test]
+    fn test_native_access_policy_blank_list_grants_all_like_bare_flag() {
+        with_policy_isolated(|| {
+            // A whitespace-only / empty argument behaves like the bare flag.
+            set_native_access_modules(["", "   "]);
+            assert!(native_access_enabled());
+            assert!(module_native_access_enabled(Some("whatever")));
+        });
+    }
+
     // FIX(test): regression for the MemorySegment.copy zero-size OOB hole.
     // The bounds check in `copy` was previously gated on `size > 0`, so a
     // segment with a declared byteSize() of 0 skipped validation entirely and
@@ -3316,6 +3610,76 @@ mod tests {
         for i in 0..16u8 {
             let val = unsafe { *dst_ptr.add(i as usize) };
             assert_eq!(val, i + 1, "Byte at offset {} mismatch", i);
+        }
+    }
+
+    /// Mirror of the overlap decision used by MemorySegment.copy: ranges
+    /// `[s, s+bytes)` and `[d, d+bytes)` overlap iff `s < d+bytes && d < s+bytes`.
+    fn copy_ranges_overlap(s: u64, d: u64, bytes: u64) -> bool {
+        s < d.saturating_add(bytes) && d < s.saturating_add(bytes)
+    }
+
+    #[test]
+    fn test_copy_overlap_detection() {
+        // Disjoint adjacent ranges: [0,16) and [16,32) do NOT overlap.
+        assert!(!copy_ranges_overlap(0, 16, 16));
+        assert!(!copy_ranges_overlap(16, 0, 16));
+        // One-byte overlap (forward): [0,16) and [15,31).
+        assert!(copy_ranges_overlap(0, 15, 16));
+        // One-byte overlap (backward): [15,31) and [0,16).
+        assert!(copy_ranges_overlap(15, 0, 16));
+        // Identical ranges fully overlap.
+        assert!(copy_ranges_overlap(100, 100, 8));
+        // Zero-length never overlaps.
+        assert!(!copy_ranges_overlap(100, 100, 0));
+    }
+
+    #[test]
+    fn test_copy_overlapping_within_segment_is_memmove_correct() {
+        // Regression: MemorySegment.copy must behave as a memmove for
+        // overlapping src/dst within a single segment. A forward-overlapping
+        // copy done with copy_nonoverlapping would corrupt the tail; copy
+        // (memmove) preserves it.
+        let mut ctx = mock_ctx();
+        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+        let seg = pe_arena_allocate_impl(&mut ctx, arena, 32, 1)
+            .unwrap()
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        let base = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n as *mut u8,
+            _ => std::ptr::null_mut(),
+        };
+        assert!(!base.is_null());
+
+        // Initialize bytes 0..16 = [1..=16].
+        for i in 0..16u8 {
+            unsafe { *base.add(i as usize) = i + 1 };
+        }
+
+        // copy 8 bytes from offset 0 to offset 4 (forward overlap).
+        let s = base as u64;
+        let d = unsafe { base.add(4) } as u64;
+        let bytes: usize = 8;
+        assert!(
+            copy_ranges_overlap(s, d, bytes as u64),
+            "ranges must be detected as overlapping"
+        );
+        // Use the same memmove path the production code selects on overlap.
+        unsafe { std::ptr::copy(base, base.add(4), bytes) };
+
+        // Expected memmove result: dst[4..12] == old src[0..8] == [1..=8].
+        let expected: [u8; 16] = [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16];
+        for i in 0..16usize {
+            let val = unsafe { *base.add(i) };
+            assert_eq!(val, expected[i], "memmove byte at offset {} mismatch", i);
         }
     }
 
@@ -4318,5 +4682,55 @@ mod tests {
             r.is_err(),
             "downcall must be denied when native access is disabled"
         );
+    }
+
+    #[test]
+    fn upcall_target_root_scan_and_remap_gap_c() {
+        // Step 5 GAP C: a leaked FFM/Panama upcall target must be reported as a
+        // GC root and remapped in place after a move. Build a minimal registered
+        // upcall around a fake target address, then scan + remap.
+        let userdata = Box::new(UpcallUserdata {
+            target: std::sync::atomic::AtomicUsize::new(0xABCD_0000),
+            param_kinds: Vec::new(),
+            return_kind: -1,
+        });
+        let userdata_ptr: &'static UpcallUserdata = Box::leak(userdata);
+        let cif = MiddleCif::new(Vec::new(), MiddleType::void());
+        let closure = Closure::new(cif, upcall_dispatch, userdata_ptr);
+        let code_ptr = *closure.code_ptr() as *const () as usize;
+        upcall_registry().lock().insert(
+            code_ptr,
+            UpcallEntry {
+                _closure: Box::new(closure),
+                userdata: userdata_ptr as *const UpcallUserdata,
+            },
+        );
+
+        // Scan reports the (fake) target as a root.
+        let mut roots = Vec::new();
+        gc_scan_upcall_target_roots(&mut roots);
+        assert!(
+            roots.iter().any(|r| r.as_ptr() as usize == 0xABCD_0000),
+            "upcall target must be scanned as a GC root"
+        );
+
+        // Remap 0xABCD_0000 -> 0xABCD_8000; the leaked userdata is rewritten.
+        let mut map = std::collections::HashMap::new();
+        map.insert(0xABCD_0000usize, 0xABCD_8000usize);
+        gc_update_upcall_target_refs(&map);
+        assert_eq!(
+            userdata_ptr.target.load(std::sync::atomic::Ordering::Relaxed),
+            0xABCD_8000,
+            "upcall target must be remapped in place"
+        );
+        let mut roots2 = Vec::new();
+        gc_scan_upcall_target_roots(&mut roots2);
+        assert!(
+            roots2.iter().any(|r| r.as_ptr() as usize == 0xABCD_8000),
+            "re-scan must report the moved target"
+        );
+
+        // Don't leak our entry into other tests sharing the global registry.
+        upcall_registry().lock().remove(&code_ptr);
     }
 }

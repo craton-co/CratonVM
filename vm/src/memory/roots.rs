@@ -179,6 +179,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
+    // 8c. Pre-allocated singleton OutOfMemoryError — thrown on a 100%-full heap
+    //     when a fresh exception cannot be materialized. Must survive every GC
+    //     permanently (it is held only by `SharedVm`, not any Java field), so a
+    //     moving collector cannot reclaim it and leave the OOM-fallback dangling.
+    {
+        if let Some(oom_ref) = *shared.singleton_oom.read() {
+            roots.push(oom_ref);
+        }
+    }
+
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
         shared.jni_global_refs.lock().collect_roots(&mut roots);
@@ -401,6 +411,32 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     would invoke a stale receiver (NoSuchMethodError java/lang/Object.handle).
     //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
     cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
+
+    //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
+    //     live only in `sk_table`; remap was already wired (gc.rs
+    //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key
+    //     reachable only through sk_table could be swept before the remap ran.
+    cratonvm_native_io::nio_selector::gc_scan_selector_roots(&mut roots);
+    //     ScheduledThreadPoolExecutor pending runnables (stored as relocatable
+    //     addresses; remap companion `scheduled_pump::gc_update_scheduled_refs`).
+    cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(&mut roots);
+    //     XNIO IoFuture notifier/attachment/result refs held across allocations
+    //     until the future settles (remap companion
+    //     `xnio_async::gc_update_xnio_future_refs`).
+    cratonvm_native_builtins::xnio_async::gc_scan_xnio_future_roots(&mut roots);
+    //     FFM/Panama upcall targets: the Java MethodHandle/lambda a libffi
+    //     trampoline dispatches to, reachable only through the leaked upcall
+    //     userdata (Step 5 GAP C; remap companion in `gc.rs`).
+    cratonvm_native_builtins::panama::gc_scan_upcall_target_roots(&mut roots);
+
+    // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
+    //     in a process-global side-table can register a scan callback here
+    //     instead of hand-wiring a new `gc_scan_*` call into this function (see
+    //     `crate::memory::native_roots`). Fans out to every registered source;
+    //     a no-op (byte-identical to baseline) until a subsystem registers, so
+    //     it is safe to land ahead of any adopter. The matching post-move remap
+    //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    crate::memory::native_roots::scan_all_native_roots(&mut roots);
 
     roots
 }

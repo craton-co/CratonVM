@@ -7,9 +7,11 @@
 //! fork-join scheduler, and the `VirtualThreadManager` coordinator that ties
 //! everything together.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
@@ -560,6 +562,204 @@ impl ForkJoinScheduler {
 }
 
 // ---------------------------------------------------------------------------
+// WakeupTimer
+// ---------------------------------------------------------------------------
+
+/// A registered timed wakeup: when `deadline` passes, `vt_id` is resubmitted to
+/// the scheduler unless its registration was cancelled or superseded.
+///
+/// `signal` is the same `Arc<(Mutex<bool>, Condvar)>` stored in the manager's
+/// `wakeup_signals` registry; the timer thread validates an entry on expiry by
+/// (a) confirming the registry still maps `vt_id` to *this exact* `Arc`
+/// (`Arc::ptr_eq`) and (b) checking the cancellation flag inside it. This makes
+/// re-schedule and cancellation races safe without a separate generation
+/// counter — a stale heap entry simply fails the identity check and is dropped.
+struct WakeupEntry {
+    deadline: Instant,
+    vt_id: u64,
+    signal: Arc<(Mutex<bool>, Condvar)>,
+}
+
+// Ordered by deadline (earliest first when wrapped in `Reverse`), with `vt_id`
+// as a deterministic tie-breaker. `Arc` is intentionally excluded from the
+// ordering — only the timing key matters for heap placement.
+impl PartialEq for WakeupEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.vt_id == other.vt_id
+    }
+}
+impl Eq for WakeupEntry {}
+impl Ord for WakeupEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.deadline
+            .cmp(&other.deadline)
+            .then_with(|| self.vt_id.cmp(&other.vt_id))
+    }
+}
+impl PartialOrd for WakeupEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Mutable state guarded by `WakeupTimer::state`.
+#[derive(Default)]
+struct TimerState {
+    /// Min-heap of pending wakeups keyed by deadline. `std::cmp::Reverse` turns
+    /// the max-heap `BinaryHeap` into a min-heap so `peek()` is the soonest.
+    heap: BinaryHeap<std::cmp::Reverse<WakeupEntry>>,
+    /// Whether the background timer thread has been spawned yet (lazy start).
+    started: bool,
+    /// Set on shutdown so the timer thread exits its loop.
+    shutdown: bool,
+}
+
+/// A single process-wide timer driven by ONE background OS thread. Replaces the
+/// previous "spawn a fresh OS thread per `Thread.sleep`" approach, which
+/// defeated the purpose of virtual threads (an OS-thread spawn + stack per
+/// sleeping VT, a resource/DoS hazard under many concurrent sleepers).
+///
+/// Sleeping virtual threads now cost one heap insertion each; the timer thread
+/// parks on the head deadline via `Condvar::wait_for` and resubmits expired VTs
+/// to the scheduler. Cancellation is a flag flip plus a `notify_one` so the
+/// timer recomputes its next deadline.
+struct WakeupTimer {
+    state: Mutex<TimerState>,
+    cvar: Condvar,
+    scheduler: Arc<ForkJoinScheduler>,
+    /// Shared with `VirtualThreadManager::wakeup_signals` so the timer can
+    /// validate entries by identity on expiry and so cancellation observed here
+    /// stays consistent with `get_wakeup_signal`.
+    wakeup_signals: Arc<Mutex<FxHashMap<u64, Arc<(Mutex<bool>, Condvar)>>>>,
+}
+
+impl WakeupTimer {
+    fn new(
+        scheduler: Arc<ForkJoinScheduler>,
+        wakeup_signals: Arc<Mutex<FxHashMap<u64, Arc<(Mutex<bool>, Condvar)>>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(TimerState::default()),
+            cvar: Condvar::new(),
+            scheduler,
+            wakeup_signals,
+        })
+    }
+
+    /// Register a wakeup for `vt_id` at `deadline`, carrying its registry
+    /// `signal`. Lazily starts the single timer thread on first use and wakes it
+    /// so it can re-evaluate the head deadline.
+    fn schedule(
+        self: &Arc<Self>,
+        vt_id: u64,
+        deadline: Instant,
+        signal: Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        let mut state = self.state.lock();
+        state.heap.push(std::cmp::Reverse(WakeupEntry {
+            deadline,
+            vt_id,
+            signal,
+        }));
+        if !state.started {
+            state.started = true;
+            let timer = self.clone();
+            std::thread::Builder::new()
+                .name("VirtualThread-wakeup-timer".to_string())
+                .spawn(move || timer.run())
+                .expect("failed to spawn virtual-thread wakeup timer");
+        }
+        // Wake the timer: the new entry may be earlier than its current target.
+        self.cvar.notify_one();
+    }
+
+    /// Wake the timer so it re-evaluates after a cancellation flipped a flag.
+    fn notify(&self) {
+        self.cvar.notify_one();
+    }
+
+    /// Stop the timer thread (best effort; entries are simply abandoned).
+    fn shutdown(&self) {
+        let mut state = self.state.lock();
+        state.shutdown = true;
+        self.cvar.notify_all();
+    }
+
+    /// Decide whether an expired entry is still valid and should resubmit:
+    /// the registry must still map `vt_id` to this exact `signal` and the
+    /// cancellation flag must be unset. On a valid fire we also drop the
+    /// registry entry (mirrors the old per-thread cleanup, by identity so a
+    /// newer `schedule_wakeup` for the same `vt_id` is never clobbered).
+    fn take_if_live(&self, entry: &WakeupEntry) -> bool {
+        let mut map = self.wakeup_signals.lock();
+        match map.get(&entry.vt_id) {
+            Some(existing) if Arc::ptr_eq(existing, &entry.signal) => {
+                let cancelled = *entry.signal.0.lock();
+                if cancelled {
+                    // A cancel that hasn't yet removed the entry (or removed a
+                    // different generation); leave the map to the canceller.
+                    false
+                } else {
+                    map.remove(&entry.vt_id);
+                    true
+                }
+            }
+            // Superseded by a newer registration or already removed/cancelled.
+            _ => false,
+        }
+    }
+
+    /// Timer thread body: park on the soonest deadline, resubmit on expiry.
+    fn run(self: Arc<Self>) {
+        loop {
+            let mut state = self.state.lock();
+            if state.shutdown {
+                return;
+            }
+            let now = Instant::now();
+            // Drain everything already due, collecting valid fires to resubmit
+            // after we release the lock (avoid calling into the scheduler while
+            // holding the timer mutex).
+            let mut due: Vec<WakeupEntry> = Vec::new();
+            loop {
+                // `Instant` is `Copy`, so read the head deadline and end the
+                // immutable borrow before popping (avoids a peek/pop borrow
+                // conflict on `state.heap`).
+                let head_deadline = state.heap.peek().map(|r| r.0.deadline);
+                match head_deadline {
+                    Some(deadline) if deadline <= now => {
+                        let std::cmp::Reverse(entry) =
+                            state.heap.pop().expect("peeked head exists");
+                        due.push(entry);
+                    }
+                    _ => break,
+                }
+            }
+            if due.is_empty() {
+                // Nothing due: wait until the next deadline, or indefinitely
+                // (until notified) if the heap is empty.
+                match state.heap.peek().map(|r| r.0.deadline) {
+                    Some(deadline) => {
+                        let wait = deadline.saturating_duration_since(now);
+                        self.cvar.wait_for(&mut state, wait);
+                    }
+                    None => {
+                        self.cvar.wait(&mut state);
+                    }
+                }
+                continue;
+            }
+            drop(state);
+            for entry in due {
+                if self.take_if_live(&entry) {
+                    self.scheduler.submit(entry.vt_id);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VirtualThreadManager
 // ---------------------------------------------------------------------------
 
@@ -573,22 +773,32 @@ pub struct VirtualThreadManager {
     _next_continuation_id: AtomicU64,
     /// Carrier OS thread join handles (populated by `start_carriers`).
     carrier_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// Per-virtual-thread wakeup condvar for timed park/sleep.
+    /// Per-virtual-thread wakeup signal for timed park/sleep cancellation.
     /// T10.9.B: FxHashMap — internal thread IDs.
-    /// Held behind an `Arc` so the per-wakeup timer thread can drop its own
-    /// entry on fire (see `schedule_wakeup`) without borrowing `&self`.
+    /// Held behind an `Arc` so the shared wakeup timer thread can validate and
+    /// drop entries on fire (see `WakeupTimer`) without borrowing `&self`. Each
+    /// signal is `(cancelled_flag, condvar)`; external callers obtain it via
+    /// `get_wakeup_signal` to cancel a pending sleep early.
     wakeup_signals: Arc<Mutex<FxHashMap<u64, Arc<(Mutex<bool>, Condvar)>>>>,
+    /// Single process-wide timer servicing all virtual-thread timed wakeups via
+    /// one background OS thread and a min-heap of deadlines (replaces the former
+    /// per-`Thread.sleep` OS-thread spawn).
+    wakeup_timer: Arc<WakeupTimer>,
 }
 
 impl VirtualThreadManager {
     pub fn new(parallelism: usize) -> Self {
+        let scheduler = Arc::new(ForkJoinScheduler::new(parallelism));
+        let wakeup_signals = Arc::new(Mutex::new(FxHashMap::default()));
+        let wakeup_timer = WakeupTimer::new(scheduler.clone(), wakeup_signals.clone());
         Self {
             threads: Mutex::new(FxHashMap::default()),
-            scheduler: Arc::new(ForkJoinScheduler::new(parallelism)),
+            scheduler,
             next_id: AtomicU64::new(1),
             _next_continuation_id: AtomicU64::new(1),
             carrier_handles: Mutex::new(Vec::new()),
-            wakeup_signals: Arc::new(Mutex::new(FxHashMap::default())),
+            wakeup_signals,
+            wakeup_timer,
         }
     }
 
@@ -629,6 +839,8 @@ impl VirtualThreadManager {
     /// Shut down the scheduler and join all carrier threads.
     pub fn shutdown(&self) {
         self.scheduler.shutdown();
+        // Stop the shared wakeup timer thread (if it was ever started).
+        self.wakeup_timer.shutdown();
         let mut handles = self.carrier_handles.lock();
         for handle in handles.drain(..) {
             let _ = handle.join();
@@ -812,60 +1024,36 @@ impl VirtualThreadManager {
     }
 
     /// Schedule a timed wakeup for a parked virtual thread (used by Thread.sleep
-    /// on virtual threads). Spawns a timer thread that unparks after `duration`.
+    /// on virtual threads). Registers the wakeup on the single shared
+    /// [`WakeupTimer`]; the dedicated timer thread resubmits the virtual thread
+    /// to the scheduler once `duration` elapses (unless cancelled first).
     ///
-    /// TODO(round-8 Bug 6): this spawns a brand-new OS thread per
-    /// `Thread.sleep` on a virtual thread, which defeats the entire
-    /// premise of virtual threads (millions of cheap lightweight tasks
-    /// multiplexed onto a small carrier pool). A `Thread.sleep(100ms)`
-    /// inside a hot VT loop currently costs an OS-thread spawn + stack
-    /// allocation per call. The correct fix is a single process-wide
-    /// timer wheel / min-heap of `(deadline, vt_id)` driven by ONE
-    /// dedicated timer thread that `park_timeout`s on the head of the
-    /// queue and resubmits expired VTs to the scheduler; cancellation
-    /// becomes a flag flip rather than a `Condvar::notify_one`. Until
-    /// that lands, sleep-heavy VT workloads see the same OS-thread cost
-    /// as platform threads — investing in VTs gains nothing for them.
+    /// This costs one heap insertion per sleeping virtual thread rather than an
+    /// OS-thread spawn, so millions of concurrently sleeping VTs remain cheap —
+    /// the whole point of virtual threads. (Previously a brand-new OS thread was
+    /// spawned per `Thread.sleep`, a resource/DoS hazard under many sleepers.)
     pub fn schedule_wakeup(&self, vt_id: u64, duration: std::time::Duration) {
+        let deadline = Instant::now() + duration;
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        // Replace any prior registration for this vt_id; the stale heap entry
+        // (if any) fails the identity check on expiry and is dropped.
         self.wakeup_signals.lock().insert(vt_id, signal.clone());
-        let scheduler = self.scheduler.clone();
-        let wakeup_signals = self.wakeup_signals.clone();
-        std::thread::spawn(move || {
-            let (lock, cvar) = &*signal;
-            let mut cancelled = lock.lock();
-            // Wait for the duration, but allow early cancellation
-            cvar.wait_for(&mut cancelled, duration);
-            let cancelled = *cancelled;
-            // Bug B3 (round-9): drop our own entry from the registry once the
-            // wait completes. Previously only `cancel_wakeup` removed entries,
-            // so every fired `Thread.sleep` on a virtual thread leaked one
-            // `(vt_id, Arc<..>)` pair forever. Remove by identity so we never
-            // clobber a newer registration for the same `vt_id` (a fresh
-            // `schedule_wakeup` may already have replaced our entry while we
-            // were waiting).
-            {
-                let mut map = wakeup_signals.lock();
-                if let Some(existing) = map.get(&vt_id) {
-                    if Arc::ptr_eq(existing, &signal) {
-                        map.remove(&vt_id);
-                    }
-                }
-            }
-            if !cancelled {
-                // Timer fired — resubmit the virtual thread
-                scheduler.submit(vt_id);
-            }
-        });
+        self.wakeup_timer.schedule(vt_id, deadline, signal);
     }
 
     /// Cancel a pending wakeup timer (e.g. on unpark before timer fires).
+    ///
+    /// Flips the cancellation flag and drops the registry entry; the timer
+    /// thread will observe the missing/identity-mismatched entry on expiry and
+    /// skip the resubmit. Any external waiter holding the signal (obtained via
+    /// `get_wakeup_signal`) is notified.
     pub fn cancel_wakeup(&self, vt_id: u64) {
         if let Some(signal) = self.wakeup_signals.lock().remove(&vt_id) {
             let (lock, cvar) = &*signal;
-            let mut cancelled = lock.lock();
-            *cancelled = true;
+            *lock.lock() = true;
             cvar.notify_one();
+            // Nudge the timer so it re-evaluates its next deadline promptly.
+            self.wakeup_timer.notify();
         }
     }
 
@@ -2076,6 +2264,102 @@ mod tests {
             Some(id),
             "timer should have resubmitted the virtual thread"
         );
+    }
+
+    #[test]
+    fn wakeup_cancel_prevents_resubmit() {
+        // A cancelled wakeup must NOT resubmit the virtual thread even after its
+        // original deadline passes.
+        let mgr = VirtualThreadManager::new(1);
+        let id = mgr.create_virtual_thread("cancelled");
+        {
+            let mut threads = mgr.threads.lock();
+            threads.get_mut(&id).unwrap().mount(0);
+        }
+        mgr.park_virtual(id);
+        mgr.schedule_wakeup(id, std::time::Duration::from_millis(80));
+        // Cancel well before the deadline.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mgr.cancel_wakeup(id);
+        // Wait past the original deadline.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            None,
+            "cancelled wakeup must not resubmit the virtual thread"
+        );
+        // Registry entry must be gone after cancellation.
+        assert!(mgr.get_wakeup_signal(id).is_none());
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn wakeup_many_sleepers_share_single_timer() {
+        // Many concurrent sleepers are serviced by ONE shared timer thread (no
+        // per-sleep OS-thread spawn); all of them must eventually be resubmitted.
+        let mgr = VirtualThreadManager::new(2);
+        let mut ids = Vec::new();
+        for i in 0..64u64 {
+            let id = mgr.create_virtual_thread(&format!("sleeper-{i}"));
+            {
+                let mut threads = mgr.threads.lock();
+                threads.get_mut(&id).unwrap().mount(0);
+            }
+            mgr.park_virtual(id);
+            // Staggered short deadlines exercise the min-heap ordering.
+            mgr.schedule_wakeup(id, std::time::Duration::from_millis(10 + (i % 8) * 5));
+            ids.push(id);
+        }
+
+        // Drain resubmitted tasks until all fire or we time out.
+        let mut fired = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while fired.len() < ids.len() && std::time::Instant::now() < deadline {
+            while let Some(t) = mgr.scheduler().next_task(0) {
+                fired.insert(t);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            fired.len(),
+            ids.len(),
+            "all sleeping virtual threads should be resubmitted by the shared timer"
+        );
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn wakeup_reschedule_supersedes_stale_entry() {
+        // Re-scheduling a wakeup for the same vt with a later deadline must
+        // supersede the earlier registration (the stale heap entry is dropped),
+        // and the thread is resubmitted exactly once at the new deadline.
+        let mgr = VirtualThreadManager::new(1);
+        let id = mgr.create_virtual_thread("resched");
+        {
+            let mut threads = mgr.threads.lock();
+            threads.get_mut(&id).unwrap().mount(0);
+        }
+        mgr.park_virtual(id);
+        mgr.schedule_wakeup(id, std::time::Duration::from_millis(30));
+        // Immediately re-schedule with a longer deadline (new signal Arc).
+        mgr.schedule_wakeup(id, std::time::Duration::from_millis(120));
+
+        // The stale 30ms entry must NOT resubmit early.
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            None,
+            "superseded early wakeup must not fire"
+        );
+
+        // The 120ms entry should fire.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            Some(id),
+            "the re-scheduled wakeup should resubmit the thread"
+        );
+        mgr.shutdown();
     }
 
     #[test]

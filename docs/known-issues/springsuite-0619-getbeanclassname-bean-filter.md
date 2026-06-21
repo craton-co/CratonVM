@@ -9,9 +9,39 @@
 | **Failing test(s)** | every method that instantiates the affected bean (e.g. `LookupMethodTests` 0/7) |
 | **CratonVM** | FAIL — `IllegalArgumentException: Target object must not be null` |
 | **HotSpot JDK 25** | OK (LookupMethodTests 7/7; instance is `…AbstractBean$$SpringCGLIB$$0`) |
-| **CratonVM HEAD** | found `c4536b94`; **FIXED on dev `3b16e985`+** (this session) |
-| **Status** | **FIXED** on dev — bean-filter now probes the classpath, not the loaded-set |
-| **Suggested owner** | done (landed on dev) |
+| **CratonVM HEAD** | found `c4536b94`; primary **FIXED on dev `3b16e985`+**; bug-B2 **FULLY FIXED on dev 2026-06-21** |
+| **Status** | ✅ **FIXED** — primary bean-filter FIXED; **bug-B2 (CGLIB method-injection) fully implemented**: `LookupMethodTests` **7/7** (JIT and `--nojit`), `LookupAnnotationTests` **10/10**. |
+| **Suggested owner** | done |
+
+> **bug-B2 FIX 2026-06-21** (commit `ffa71253`, → dev; `cratonvm-spring0620-b2`, JDK 25).
+> Method-injection (`<lookup-method>` / `@Lookup`) is fully implemented. The bean class is abstract,
+> so the `SimpleInstantiationStrategy.instantiate` shim (`s_instantiation_strategy_instantiate` →
+> `try_build_method_injection`) synthesises a concrete CGLIB-style subclass via
+> `cglib_enhancer::build_lookup_subclass`: a `$$beanFactory` field + an override per abstract method
+> (non-lookup abstract methods get a throwing stub so the subclass stays concrete). The owning factory
+> is stored into `$$beanFactory` right after `new_object`. Each override resolves the bean by:
+> - **by name, no args** → `(Ret) bf.getBean(name)`, then unwrap a `NullBean` result to `null`;
+> - **by name, args** → `(Ret) bf.getBean(name, boxedArgs)` (+ NullBean unwrap);
+> - **by type, no args** → `(Ret) bf.getBeanProvider(ResolvableType.forMethodReturnType(
+>   getClass().getSuperclass().getDeclaredMethod(name))).getObject()` — generic-aware, so
+>   `NumberStore<Double>` vs `NumberStore<Float>` disambiguate;
+> - **by type, args** → `(Ret) bf.getBean(Ret.class, boxedArgs)`.
+>
+> Override → method matching is **overload-aware** (keyed on `(methodName, paramCount)` from each
+> `@Lookup`'s stored `Method`) and matched in **reverse** so a child bean definition's override wins
+> over an inherited parent override (`extendedBean.getOneArgument` → `jedi`, not the parent's
+> `testBean`).
+>
+> **Results: `LookupMethodTests` 0/7 → 7/7, `LookupAnnotationTests` 0/10 → 10/10.**
+> (`FactoryBeanTests` 4/6 — unchanged; its 2 fails are an unrelated `${myName}` placeholder issue.)
+>
+> **Note — the "flaky JIT `invokeVoid`" was a self-inflicted emitter typo, not a VM defect.** An
+> earlier iteration emitted `0x99` (`IFEQ`, pops an int) where the NullBean suffix needed `0xC6`
+> (`IFNULL`), so every by-name lookup ran `dup; ifeq` on a ref → `expected int on stack, got ref`,
+> which propagated up and surfaced as `InternalError: JIT dispatch into …
+> InterceptingExecutableInvoker.invokeVoid`. Pinpointed via the new gated `CRATONVM_DBG_POPINT`
+> interpreter tripwire (mirrors `CRATONVM_DBG_UNDERFLOW`). Fixing the opcode resolved all of it; no
+> JIT defect exists here.
 
 > **FIX (landed):** both loaded-set-only bean filters in
 > `native-builtins/src/spring_startup_bootstrap.rs` — the `getBeanClassName()` override

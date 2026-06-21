@@ -624,6 +624,27 @@ impl PlatformBackend for CocoaBackend {
             };
         }
 
+        // Clamp the metrics-derived dimensions to a sane maximum and compute
+        // the pixel count with a checked multiply before they size the
+        // `vec![0u32; raster_px]` allocation below. A pathological glyph run
+        // (huge font size or an extremely long string) could otherwise drive
+        // `w * h` to overflow a `u32` — wrapping to a small allocation that
+        // the blit loop then writes past. The clamped dims keep the
+        // allocation, the `w`/`h` bounds checks in the blit loop, and the
+        // `py * w + px` index all mutually consistent. Mirrors the x11.rs
+        // hardening (its un-hardened twin lived here).
+        let (w, h, raster_px) = match clamp_raster_dims(w, h) {
+            Some(dims) => dims,
+            None => {
+                return TextRaster {
+                    pixels: vec![],
+                    width: 0,
+                    height: 0,
+                    baseline: 0.0,
+                };
+            }
+        };
+
         let baseline = max_ascent as f32;
         // Straight (non-premultiplied) ARGB to match the X11 path and the
         // `TextRaster` docstring at backend.rs ("ARGB pixels"). The
@@ -634,7 +655,7 @@ impl PlatformBackend for CocoaBackend {
         let b = (color & 0xFF) as u32;
         let rgb = (r << 16) | (g << 8) | b;
 
-        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut pixels = vec![0u32; raster_px];
 
         // Second pass: blit each cached alpha mask into the destination buffer.
         for (glyph, x_offset) in &glyphs {
@@ -740,6 +761,24 @@ impl Drop for CocoaBackend {
 // MainThreadMarker guarantees construction happens on the main thread,
 // and the EDT design ensures all subsequent calls are also on that thread.
 unsafe impl Send for CocoaBackend {}
+
+/// Maximum side length (in pixels) of a text raster. Bounds the
+/// `rasterize_text` pixel buffer so a hostile/extreme glyph run cannot drive
+/// `width * height` past `u32`/`usize` limits.
+const MAX_RASTER_DIM: u32 = 1 << 15; // 32768 px per side
+
+/// Clamp text-raster dimensions to `MAX_RASTER_DIM` per side and return the
+/// clamped `(width, height, pixel_count)` triple, computing the pixel count
+/// with a checked multiply. Returns `None` if the product still overflows a
+/// `usize` (impossible given the clamp, but the checked multiply is the
+/// safety net the security review asked for — never trust the product to a
+/// wrapping `as usize`).
+fn clamp_raster_dims(w: u32, h: u32) -> Option<(u32, u32, usize)> {
+    let w = w.min(MAX_RASTER_DIM);
+    let h = h.min(MAX_RASTER_DIM);
+    let px = (w as usize).checked_mul(h as usize)?;
+    Some((w, h, px))
+}
 
 // ---------------------------------------------------------------------------
 // fontdue helpers (mirrors x11.rs — see that file for the canonical impl)
@@ -879,5 +918,42 @@ mod core_graphics {
         pub fn CGContextDrawImage(c: CGContextRef, rect: CGRect, image: CGImageRef);
 
         pub fn CFRelease(cf: CFTypeRef);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_raster_dims, MAX_RASTER_DIM};
+
+    #[test]
+    fn clamp_raster_dims_passes_small_dims_through() {
+        assert_eq!(clamp_raster_dims(10, 20), Some((10, 20, 200)));
+        assert_eq!(clamp_raster_dims(1, 1), Some((1, 1, 1)));
+    }
+
+    #[test]
+    fn clamp_raster_dims_clamps_oversized_sides() {
+        // Each side is clamped to MAX_RASTER_DIM independently.
+        let (w, h, px) = clamp_raster_dims(u32::MAX, 4).unwrap();
+        assert_eq!(w, MAX_RASTER_DIM);
+        assert_eq!(h, 4);
+        assert_eq!(px, MAX_RASTER_DIM as usize * 4);
+
+        let (w, h, px) = clamp_raster_dims(u32::MAX, u32::MAX).unwrap();
+        assert_eq!((w, h), (MAX_RASTER_DIM, MAX_RASTER_DIM));
+        assert_eq!(px, MAX_RASTER_DIM as usize * MAX_RASTER_DIM as usize);
+    }
+
+    #[test]
+    fn clamp_raster_dims_no_u32_wrap_on_hostile_product() {
+        // 0x10000 * 0x10000 == 0x1_0000_0000 — wraps to 0 in a u32 multiply
+        // but must NOT here: the clamp caps both sides to 0x8000 so the
+        // pixel count is the (large but exact) clamped product, never 0.
+        let (w, h, px) = clamp_raster_dims(0x1_0000, 0x1_0000).unwrap();
+        assert_eq!((w, h), (MAX_RASTER_DIM, MAX_RASTER_DIM));
+        assert_ne!(px, 0);
+        assert_eq!(px, MAX_RASTER_DIM as usize * MAX_RASTER_DIM as usize);
+        // Sanity: the clamped product fits a u32 (1<<15 squared == 1<<30).
+        assert!(px <= u32::MAX as usize);
     }
 }

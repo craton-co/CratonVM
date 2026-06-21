@@ -733,14 +733,24 @@ impl Drop for SpscEventRing {
     ///           Arc<str>). We skip *exactly that one slot* — at most one
     ///           `EventInstance` is leaked per wedged-consumer shutdown.
     ///         - Every other initialised slot in `(tail, head)` is dropped
-    ///           in place: payload `Arc<str>` clones are released, slot
-    ///           storage is freed.
+    ///           in place: payload `Arc<str>` clones are released.
+    ///         - UAF fix (MED, 2026-06-20): the slot-array *storage* itself is
+    ///           deliberately **leaked** (not freed) on this path. A parked
+    ///           consumer will dereference `self.slots[idx]` at least once when
+    ///           it resumes; freeing the backing here would make that a
+    ///           use-after-free of freed (and possibly reallocated) memory.
+    ///           Leaking the box keeps the storage mapped for the rest of the
+    ///           process so the resume reads valid memory. This converts the
+    ///           prior "consumer may touch freed storage" UAF into a bounded
+    ///           one-shot leak of `capacity` slots — the acceptable
+    ///           wedged-shutdown trade-off.
     ///     A warning is logged to stderr so the wedged consumer is visible
     ///     to operators.
     ///
     ///   * May drop up to N - 1 buffered events on the wedged path, where N
     ///     is `head - tail` at drop time (i.e. `len()`); the single skipped
-    ///     slot is the only one that may leak.
+    ///     slot's payload may leak, and on the wedged path the slot-array
+    ///     backing is intentionally leaked to preserve memory safety.
     fn drop(&mut self) {
         let shutdown_timeout =
             Duration::from_nanos(self.shutdown_timeout_nanos.load(Ordering::Relaxed));
@@ -841,11 +851,49 @@ impl Drop for SpscEventRing {
             }
             tail = tail.wrapping_add(1);
         }
-        // `slots` (the Box) is freed by the auto-derived Drop after this
-        // function returns. In the wedged path, the consumer may briefly
-        // touch the skipped slot before observing the freed storage — that
-        // is the unavoidable residual risk of a wedged-consumer shutdown,
-        // bounded to one slot of memory.
+
+        // Slot-storage reclamation — UAF fix (MED, 2026-06-20).
+        //
+        // The slot backing is a `Box<[UnsafeCell<MaybeUninit<EventInstance>>]>`.
+        // `MaybeUninit` has no drop glue, so freeing the box only releases the
+        // *storage* — it never double-drops the payloads we just dropped in the
+        // loop above. The remaining question is purely *when* it is safe to free
+        // that storage.
+        //
+        //   * Happy path (`consumer_wedged == false`): the gate was observed
+        //     free under an Acquire load and `&mut self` blocks re-entry, so no
+        //     consumer can dereference `self.slots` after this point. Freeing
+        //     the storage now is sound. We let the auto-derived field drop do it.
+        //
+        //   * Wedged path (`consumer_wedged == true`): a consumer is parked
+        //     *inside* its `consumer_busy` critical section. When it resumes it
+        //     will dereference `self.slots[idx]` (e.g. the `assume_init_read` in
+        //     `try_pop` / `drain_into`) at least once before observing the gate
+        //     state again. If we freed the box here, that dereference would be a
+        //     use-after-free of freed-and-possibly-reallocated storage — memory
+        //     unsafety. The previous code took exactly that risk ("the consumer
+        //     may briefly touch the skipped slot before observing the freed
+        //     storage").
+        //
+        //     We close the UAF by *not freeing the backing at all* on the wedged
+        //     path: the slot array is intentionally leaked so it stays mapped
+        //     for the rest of the process lifetime. The parked consumer's resume
+        //     then reads valid (if logically stale) memory instead of a dangling
+        //     pointer. This trades a bounded one-shot leak (`capacity` slots for
+        //     a single wedged shutdown) for memory safety — the documented,
+        //     acceptable wedged-shutdown contract. The `eprintln!` above already
+        //     surfaces the wedge to operators.
+        if consumer_wedged {
+            // Replace `slots` with an empty boxed slice so the auto-derived
+            // field drop frees nothing, then leak the real backing. `Box::leak`
+            // returns a `&'static mut` we deliberately discard: the storage is
+            // never reclaimed, which is exactly the safety property we want
+            // while a consumer may still dereference it.
+            let leaked = std::mem::replace(&mut self.slots, Box::new([]));
+            let _: &'static mut [UnsafeCell<MaybeUninit<EventInstance>>] = Box::leak(leaked);
+        }
+        // Happy path: `slots` (the Box) is freed by the auto-derived Drop after
+        // this function returns — sound, because no consumer can reach it.
     }
 }
 
@@ -1898,6 +1946,66 @@ mod tests {
         let drained = registry.drain_all();
         assert_eq!(drained.len(), 1);
         assert_eq!(registry.registered_thread_count(), 0);
+    }
+
+    #[test]
+    fn drop_with_wedged_consumer_does_not_free_slot_backing() {
+        // UAF fix (MED, 2026-06-20): on the wedged-consumer path, the slot
+        // array storage must NOT be freed — a parked consumer will dereference
+        // its slot when it resumes, after `Drop` returns. We can't directly
+        // observe the leak/UAF without Miri/ASAN, but we can model the parked
+        // consumer's post-drop dereference: capture a raw pointer to a slot
+        // while the gate is latched, drop the ring, then read through that
+        // pointer. Under the old code (which freed the box) this is a
+        // use-after-free; under the fix the storage is leaked and stays mapped,
+        // so the read observes valid memory.
+        use crate::event::{EventFields, EventValue};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let ring = Arc::new(SpscEventRing::with_shutdown_timeout(
+            8,
+            Duration::from_millis(50),
+        ));
+        for i in 0..4u64 {
+            let ev = EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i,
+                end_time: i + 1,
+                thread_id: 1,
+                fields: smallvec![EventValue::String(Arc::from(format!("uaf-{}", i)))]
+                    as EventFields,
+            };
+            ring.push(ev).expect("not full");
+        }
+
+        // Latch the gate to simulate a wedged consumer, and capture a raw
+        // pointer to the slot at the current `tail` (the consumer's "active"
+        // slot — the one Drop must skip *and* must not free out from under us).
+        assert!(ring
+            .consumer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok());
+        let active_tail = ring.tail.load(Ordering::Acquire);
+        let active_idx = active_tail & ring.mask;
+        let slot_ptr: *const UnsafeCell<MaybeUninit<EventInstance>> =
+            &ring.slots[active_idx] as *const _;
+
+        // Drop the last Arc → `SpscEventRing::drop` runs the wedged path.
+        drop(ring);
+
+        // Model the parked consumer resuming and dereferencing its slot. With
+        // the fix the backing is leaked (still mapped), so this is a valid read
+        // of the producer-initialised `EventInstance`. We read it without moving
+        // it out (so we don't double-drop the skipped slot's payload).
+        let ev_ref: &EventInstance = unsafe { (*(*slot_ptr).get()).assume_init_ref() };
+        assert_eq!(ev_ref.start_time, active_tail as u64);
+        match &ev_ref.fields[0] {
+            EventValue::String(s) => {
+                assert_eq!(&**s, format!("uaf-{}", active_tail));
+            }
+            other => panic!("unexpected field variant: {:?}", other),
+        }
     }
 
     #[test]

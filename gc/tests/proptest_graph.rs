@@ -110,10 +110,8 @@ fn model_reachable(ops: &[Op], roots: &[usize]) -> HashSet<usize> {
         if !reached.insert(n) {
             continue;
         }
-        for slot in &edges[n] {
-            if let Some(target) = slot {
-                queue.push_back(*target);
-            }
+        for target in edges[n].iter().flatten() {
+            queue.push_back(*target);
         }
     }
     reached

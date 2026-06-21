@@ -12738,10 +12738,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let stream_id = {
-            let mut reg = s2_registry().lock();
-            s2_blocking_accept(&mut reg, lid)
-        };
+        let stream_id = s2_blocking_accept(lid);
         match stream_id {
             Some(sid) => {
                 let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);

@@ -1077,20 +1077,22 @@ pub(crate) fn native_runtime_get_runtime(
 }
 
 pub(crate) fn native_runtime_available_processors(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(1);
-    Ok(Some(Value::Int(cpus)))
+    // Container-aware: respects the cgroup CPU quota under
+    // `-XX:+UseContainerSupport` (falls back to the host thread count).
+    Ok(Some(Value::Int(ctx.available_processor_count())))
 }
 
 pub(crate) fn native_runtime_max_memory(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(256 * 1024 * 1024))) // 256 MB
+    // Report the configured `-Xmx` (container-aware once sized from a cgroup
+    // limit) instead of a hardcoded 256 MB, matching HotSpot's contract that
+    // `maxMemory()` reflects the actual heap ceiling.
+    Ok(Some(Value::Long(ctx.max_heap_bytes())))
 }
 
 pub(crate) fn native_runtime_total_memory(

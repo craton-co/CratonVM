@@ -1,6 +1,0 @@
-﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
-[2m2026-04-26T14:29:55.951483Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=jdk/internal/loader/ClassLoaders exc=java/lang/StringIndexOutOfBoundsException
-[2m2026-04-26T14:29:55.956044Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_exec[0m[2m:[0m Missing native method in real-JDK mode [3mmethod[0m[2m=[0mjava/io/Console.istty()Z
-[2m2026-04-26T14:29:55.956457Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=java/io/Console exc=java/lang/UnsatisfiedLinkError
-Exception in thread "main" java/lang/IllegalStateException: Unexpected object method: <java.lang.NullPointerException: Cannot invoke toString on null>
-

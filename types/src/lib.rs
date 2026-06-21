@@ -11,11 +11,13 @@ pub mod access_flags;
 mod class_id;
 pub mod compact_value;
 pub mod error;
+pub mod float_format;
 mod heap_types;
 pub mod intern;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
+pub use float_format::{java_double_to_string, java_float_to_string};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use heap_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
@@ -27,9 +29,9 @@ pub use heap_types::{
 };
 pub use intern::{intern, intern_arc, StringPool};
 pub use value::{
-    decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr, ObjectRef, Value,
-    VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR,
-    VTAG_UNINIT,
+    decode_value, encode_value, is_object_tag, jlong_bits_as_aligned_object_ptr,
+    read_value_atomic, write_value_atomic, ObjectRef, Value, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT,
+    VTAG_LONG, VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
 };
 
 #[cfg(test)]

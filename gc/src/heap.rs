@@ -847,12 +847,32 @@ impl Heap {
         let mut from = self.from_space.lock();
         let mut to = self.to_space.lock();
 
-        // Part F: walk pinned refs as additional roots. We splice them onto
+        // JNI critical-section pins (vm-jni-roots #2): an array whose elements
+        // are checked out by GetPrimitiveArrayCritical / Get<Type>ArrayElements
+        // is registered in the process-global `crate::pinned` set for the
+        // duration. Splice those addresses in as additional roots so a pinned
+        // array reachable ONLY through native code is not reclaimed here and is
+        // remapped to its post-GC address. Always compiled in (unlike the
+        // gpu-gated set below).
+        //
+        // This is KEEP-ALIVE only — it intentionally does NOT keep the object IN
+        // PLACE, and it does not need to: the JNI layer hands native code a
+        // detached COPY of the array body (is_copy=JNI_TRUE), never a direct
+        // heap pointer, so a relocation of the source array here is harmless (the
+        // copy is independent and the root is remapped). No per-object
+        // no-relocation enforcement in the collector is required. See the
+        // `crate::pinned` module doc.
+        let jni_pins: Vec<ObjectRef> = crate::pinned::pinned_addrs()
+            .into_iter()
+            // SAFETY: addresses come from the JNI pin set — live, pinned object
+            // addresses registered by Get*Critical and not yet released.
+            .map(|addr| unsafe { ObjectRef::from_raw(addr as *mut u8) })
+            .collect();
+
+        // Part F: walk GPU pinned refs as additional roots. We splice them onto
         // a combined buffer, run the collector, then copy the updated
         // ObjectRefs back into both the caller's slice and the pinned-refs
-        // set so the next pin/unpin sees post-GC addresses. The combined
-        // buffer is feature-gated; with the feature off we hand `roots`
-        // straight through, byte-identical to before.
+        // set so the next pin/unpin sees post-GC addresses.
         #[cfg(feature = "gpu-offload")]
         let result = {
             let pinned_snapshot: Vec<ObjectRef> = {
@@ -860,22 +880,24 @@ impl Heap {
                 guard.iter().copied().collect()
             };
 
-            if pinned_snapshot.is_empty() {
+            if pinned_snapshot.is_empty() && jni_pins.is_empty() {
                 crate::gc::collect(&mut from, &mut to, roots)
             } else {
                 let caller_len = roots.len();
+                let gpu_len = pinned_snapshot.len();
                 let mut combined: Vec<ObjectRef> =
-                    Vec::with_capacity(caller_len + pinned_snapshot.len());
+                    Vec::with_capacity(caller_len + gpu_len + jni_pins.len());
                 combined.extend_from_slice(roots);
                 combined.extend_from_slice(&pinned_snapshot);
+                combined.extend_from_slice(&jni_pins);
 
                 let result = crate::gc::collect(&mut from, &mut to, &mut combined);
 
                 // Copy the (possibly-updated) caller roots back.
                 roots.copy_from_slice(&combined[..caller_len]);
 
-                // Rewrite the pinned-refs set with their new addresses.
-                let new_pinned = &combined[caller_len..];
+                // Rewrite the GPU pinned-refs set with their new addresses.
+                let new_pinned = &combined[caller_len..caller_len + gpu_len];
                 let mut guard = self.gpu_pinned_refs.lock();
                 guard.clear();
                 for r in new_pinned {
@@ -887,7 +909,18 @@ impl Heap {
         };
 
         #[cfg(not(feature = "gpu-offload"))]
-        let result = crate::gc::collect(&mut from, &mut to, roots);
+        let result = if jni_pins.is_empty() {
+            crate::gc::collect(&mut from, &mut to, roots)
+        } else {
+            let caller_len = roots.len();
+            let mut combined: Vec<ObjectRef> = Vec::with_capacity(caller_len + jni_pins.len());
+            combined.extend_from_slice(roots);
+            combined.extend_from_slice(&jni_pins);
+            let result = crate::gc::collect(&mut from, &mut to, &mut combined);
+            // Copy the (possibly-relocated) caller roots back.
+            roots.copy_from_slice(&combined[..caller_len]);
+            result
+        };
 
         // Remap monitor table keys using the pointer mapping
         monitors.remap_after_gc(&result.pointer_map);
@@ -920,6 +953,16 @@ impl Heap {
         let mut from = self.from_space.lock();
         let mut to = self.to_space.lock();
 
+        // JNI critical-section pins (vm-jni-roots #2): see `collect_garbage`.
+        // Splice the process-global pin set in as additional roots so a pinned
+        // array is not reclaimed and is remapped to its post-GC address.
+        let jni_pins: Vec<ObjectRef> = crate::pinned::pinned_addrs()
+            .into_iter()
+            // SAFETY: addresses come from the JNI pin set — live, pinned object
+            // addresses registered by Get*Critical and not yet released.
+            .map(|addr| unsafe { ObjectRef::from_raw(addr as *mut u8) })
+            .collect();
+
         #[cfg(feature = "gpu-offload")]
         let (result, dead_finalizers) = {
             let pinned_snapshot: Vec<ObjectRef> = {
@@ -927,14 +970,16 @@ impl Heap {
                 guard.iter().copied().collect()
             };
 
-            if pinned_snapshot.is_empty() {
+            if pinned_snapshot.is_empty() && jni_pins.is_empty() {
                 crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs)
             } else {
                 let caller_len = roots.len();
+                let gpu_len = pinned_snapshot.len();
                 let mut combined: Vec<ObjectRef> =
-                    Vec::with_capacity(caller_len + pinned_snapshot.len());
+                    Vec::with_capacity(caller_len + gpu_len + jni_pins.len());
                 combined.extend_from_slice(roots);
                 combined.extend_from_slice(&pinned_snapshot);
+                combined.extend_from_slice(&jni_pins);
 
                 let (result, dead_finalizers) = crate::gc::collect_with_finalizers(
                     &mut from,
@@ -945,7 +990,7 @@ impl Heap {
 
                 roots.copy_from_slice(&combined[..caller_len]);
 
-                let new_pinned = &combined[caller_len..];
+                let new_pinned = &combined[caller_len..caller_len + gpu_len];
                 let mut guard = self.gpu_pinned_refs.lock();
                 guard.clear();
                 for r in new_pinned {
@@ -957,8 +1002,22 @@ impl Heap {
         };
 
         #[cfg(not(feature = "gpu-offload"))]
-        let (result, dead_finalizers) =
-            crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs);
+        let (result, dead_finalizers) = if jni_pins.is_empty() {
+            crate::gc::collect_with_finalizers(&mut from, &mut to, roots, finalizer_addrs)
+        } else {
+            let caller_len = roots.len();
+            let mut combined: Vec<ObjectRef> = Vec::with_capacity(caller_len + jni_pins.len());
+            combined.extend_from_slice(roots);
+            combined.extend_from_slice(&jni_pins);
+            let (result, dead_finalizers) = crate::gc::collect_with_finalizers(
+                &mut from,
+                &mut to,
+                &mut combined,
+                finalizer_addrs,
+            );
+            roots.copy_from_slice(&combined[..caller_len]);
+            (result, dead_finalizers)
+        };
 
         monitors.remap_after_gc(&result.pointer_map);
         std::mem::swap(&mut *from, &mut *to);
@@ -1278,7 +1337,7 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
         b'J' => match value {
             Value::Long(_) => value,
             Value::Double(d) => Value::Long(d.to_bits() as i64),
-            Value::Float(f) => Value::Long(f.to_bits() as u32 as i64),
+            Value::Float(f) => Value::Long(f.to_bits() as i64),
             Value::Int(i) => Value::Long(i as i64),
             Value::Object(None) | Value::Uninitialized => Value::Long(0),
             // An object pointer landing in a long slot is upstream drift;

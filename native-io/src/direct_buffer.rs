@@ -134,8 +134,60 @@ const POOL_BUCKETS: usize = 16;
 const POOL_BASE_SHIFT: u32 = 6; // 1 << 6 = 64 bytes
 const POOL_PER_BUCKET: usize = 256;
 
+/// Fixed alignment for every direct-buffer backing allocation.  8 bytes is
+/// sufficient for any primitive `Unsafe.put*` write through the buffer.
+const DBB_ALIGN: usize = 8;
+
+/// Canonical *allocation size* for a logical byte count.
+///
+/// LAYOUT-SAFETY (Global-allocator contract): `GlobalAlloc::dealloc` is UB
+/// unless the `Layout` passed exactly matches the one used to `alloc` — both
+/// size *and* align. The pool reuses a block allocated for one request to
+/// satisfy a *different* request whose size merely shares the same bucket
+/// (`pool_take` accepts any `entry.size >= size`), so the raw logical size at
+/// free time generally differs from the size the block was minted with.
+/// Reconstructing a `Layout` from that free-time size would dealloc with the
+/// wrong size → UB.
+///
+/// To make the `Layout` a pure function of the *block* (not of whichever
+/// request happens to be holding it), every block is allocated at — and freed
+/// with — the canonical size for its bucket: `next_power_of_two`, floored at
+/// the pool's base bucket size (64 B). Any two logical sizes that map to the
+/// same bucket therefore round to the identical canonical size, so the
+/// `Layout` recomputed on *any* free path is byte-identical to the one used at
+/// allocation. Sizes above the largest bucket (`bucket_for == None`) are not
+/// pooled — they round to their own power of two and are alloc'd/dealloc'd at
+/// exactly that size on both ends, which is likewise self-consistent.
+///
+/// Returns `None` only when rounding would overflow `usize` (size never
+/// allocatable anyway).
+#[inline]
+fn canonical_alloc_size(size: usize) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let rounded = size.checked_next_power_of_two()?;
+    Some(rounded.max(1usize << POOL_BASE_SHIFT))
+}
+
+/// The exact `Layout` used to allocate (and therefore the only `Layout` legal
+/// to deallocate) a block sized for `size` logical bytes. Always built from
+/// the canonical size so `alloc`/`dealloc` Layouts are identical regardless of
+/// which request a pooled block is serving. Returns `None` for sizes that
+/// cannot be laid out (zero, or overflowing).
+#[inline]
+fn dbb_layout(size: usize) -> Option<Layout> {
+    let canon = canonical_alloc_size(size)?;
+    Layout::from_size_align(canon, DBB_ALIGN).ok()
+}
+
 #[derive(Copy, Clone)]
 struct PoolEntry {
+    /// Canonical allocation size of this block (see `canonical_alloc_size`),
+    /// i.e. the size the backing memory was actually `alloc`'d at — NOT the
+    /// logical request that last used it. This is the size that reconstructs
+    /// the original allocation `Layout`, so it is what must be used on the
+    /// dealloc path when the block is evicted to the OS.
     size: usize,
     addr: usize, // *mut u8 stored as usize for Send safety in Mutex
 }
@@ -187,8 +239,12 @@ fn pool_take(size: usize) -> Option<(usize, *mut u8)> {
         // the block enters the pool, and `dbb_allocate` re-reserves it
         // on the way back out. So evicting a stale pooled block to the
         // OS here needs no accounting change.
+        //
+        // LAYOUT-SAFETY: `entry.size` is the block's *canonical* allocation
+        // size (recorded by `pool_put`), so this `Layout` is byte-identical to
+        // the one used to `alloc` it — never the logical request size.
         unsafe {
-            if let Ok(layout) = Layout::from_size_align(entry.size, 8) {
+            if let Ok(layout) = Layout::from_size_align(entry.size, DBB_ALIGN) {
                 dealloc(entry.addr as *mut u8, layout);
             }
         }
@@ -200,6 +256,14 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
     let Some(idx) = bucket_for(size) else {
         return false;
     };
+    // Store the *canonical* allocation size, not the logical request size, so
+    // that if this block is later evicted to the OS (`pool_take`) the
+    // reconstructed `Layout` matches the one it was minted with. Every block
+    // that reaches the pool was allocated by `dbb_allocate`, which always uses
+    // the canonical size; `bucket_for(size) == Some(_)` here guarantees the
+    // round succeeds, but fall back to the raw size defensively rather than
+    // panic.
+    let canon = canonical_alloc_size(size).unwrap_or(size);
     let Ok(mut bucket) = pool().buckets[idx].lock() else {
         return false;
     };
@@ -207,7 +271,7 @@ fn pool_put(size: usize, addr: *mut u8) -> bool {
         return false;
     }
     bucket.push(PoolEntry {
-        size,
+        size: canon,
         addr: addr as usize,
     });
     true
@@ -247,10 +311,13 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     let addr: *mut u8 = match pool_take(usize_size) {
         Some((_, p)) => p,
         None => {
+            // Allocate at the block's *canonical* size (see `dbb_layout`) so
+            // every later dealloc — pool eviction or direct free — reconstructs
+            // the identical `Layout`, honouring the global-allocator contract.
             // 8-byte align suffices for j{byte,short,int,long,float,double}.
-            let layout = match Layout::from_size_align(usize_size, 8) {
-                Ok(l) => l,
-                Err(_) => {
+            let layout = match dbb_layout(usize_size) {
+                Some(l) => l,
+                None => {
                     release(size);
                     return Err(oom(format!("invalid direct buffer layout: {size}")));
                 }
@@ -297,8 +364,12 @@ fn dbb_free(addr: u64, size: i64) {
     // paired (one reserve per live block, one release per free).
     if !pool_put(usize_size, p) {
         // Pool full or unbucketable — return to OS.
+        //
+        // LAYOUT-SAFETY: dealloc with the *canonical*-size `Layout`
+        // (`dbb_layout`), identical to the one `dbb_allocate` used to mint this
+        // block, regardless of the logical `size` this free was issued with.
         unsafe {
-            if let Ok(layout) = Layout::from_size_align(usize_size, 8) {
+            if let Some(layout) = dbb_layout(usize_size) {
                 dealloc(p, layout);
             }
         }
@@ -1175,5 +1246,67 @@ mod tests {
         assert_eq!(bucket_for(4096), Some(6)); // 2^12, idx = 12-6 = 6
                                                // Beyond 2 MiB falls through to direct system free.
         assert_eq!(bucket_for(8 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn wp35_canonical_alloc_size_floors_at_bucket_base() {
+        // Sub-64-B requests round up to the 64-B base bucket size.
+        assert_eq!(canonical_alloc_size(1), Some(64));
+        assert_eq!(canonical_alloc_size(60), Some(64));
+        assert_eq!(canonical_alloc_size(64), Some(64));
+        // Above base: plain next-power-of-two.
+        assert_eq!(canonical_alloc_size(65), Some(128));
+        assert_eq!(canonical_alloc_size(100), Some(128));
+        assert_eq!(canonical_alloc_size(4096), Some(4096));
+        assert_eq!(canonical_alloc_size(4097), Some(8192));
+        assert_eq!(canonical_alloc_size(0), None);
+        // Overflowing round must not panic — it reports unallocatable.
+        assert_eq!(canonical_alloc_size(usize::MAX), None);
+    }
+
+    #[test]
+    fn wp35_layout_is_pure_function_of_bucket() {
+        // The core invariant this fix protects: any two logical sizes that
+        // share a bucket must produce the IDENTICAL allocation `Layout`, so a
+        // pooled block minted for one request and freed under a different
+        // (same-bucket) request always deallocs with the size+align it was
+        // allocated with — never a mismatched `Layout` (global-allocator UB).
+        let a = dbb_layout(60).expect("layout 60");
+        let b = dbb_layout(64).expect("layout 64");
+        let c = dbb_layout(1).expect("layout 1");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a.size(), 64);
+        assert_eq!(a.align(), DBB_ALIGN);
+
+        // A request that the pool serves from a larger same-bucket block:
+        // size 100 and size 128 both canonicalise to 128.
+        assert_eq!(dbb_layout(100), dbb_layout(128));
+        // Different buckets => different Layouts (sanity).
+        assert_ne!(dbb_layout(64), dbb_layout(128));
+    }
+
+    #[test]
+    fn wp35_pool_records_canonical_size_for_layout_safe_eviction() {
+        let _g = bits_test_lock();
+        // Allocate a block whose logical size (100) is smaller than its
+        // canonical allocation size (128), free it (parks in the pool), then
+        // confirm the parked entry carries the canonical size — the value used
+        // to rebuild the original `Layout` on eviction. Without this, eviction
+        // would dealloc 100 bytes against a 128-byte allocation (UB).
+        let addr = dbb_allocate(100).expect("alloc 100");
+        assert_ne!(addr, 0);
+        dbb_free(addr, 100);
+        let idx = bucket_for(100).expect("bucket");
+        let bucket = pool().buckets[idx].lock().expect("lock");
+        let parked = bucket
+            .iter()
+            .find(|e| e.addr == addr as usize)
+            .expect("parked entry present");
+        assert_eq!(
+            parked.size,
+            canonical_alloc_size(100).unwrap(),
+            "pooled entry must record canonical alloc size, not logical request"
+        );
     }
 }

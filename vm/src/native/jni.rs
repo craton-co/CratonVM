@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
@@ -81,6 +81,71 @@ pub const JNI_FUNCTION_COUNT: usize = 234;
 pub const JNI_INVOKE_FUNCTION_COUNT: usize = 8;
 
 // ---------------------------------------------------------------------------
+// Descriptor cache (bounded LRU)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of parsed descriptors retained in the thread-local cache.
+const DESCRIPTOR_CACHE_CAPACITY: usize = 1024;
+
+/// A small bounded LRU cache for parsed method descriptors.
+///
+/// Previously this was a plain `HashMap` capped at [`DESCRIPTOR_CACHE_CAPACITY`]
+/// that was `clear()`ed wholesale once full, which caused a periodic full-flush:
+/// every entry — including hot, frequently-reused descriptors — was discarded at
+/// once, re-incurring a parse storm. This LRU instead evicts only a single
+/// (least-recently-used) entry when at capacity, so hot descriptors survive.
+///
+/// Recency is tracked with a monotonic tick stamped on each access. The eviction
+/// scan is O(n) but runs only on insertion-while-full, not on every lookup.
+struct DescriptorCache {
+    /// descriptor string → (parsed param-type tags, last-access tick)
+    map: HashMap<String, (Vec<u8>, u64)>,
+    /// Monotonically increasing access counter; larger = more recently used.
+    tick: u64,
+}
+
+impl DescriptorCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// Look up `descriptor`, marking it most-recently-used on a hit.
+    fn get(&mut self, descriptor: &str) -> Option<&[u8]> {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        match self.map.get_mut(descriptor) {
+            Some(entry) => {
+                entry.1 = tick;
+                Some(&entry.0)
+            }
+            None => None,
+        }
+    }
+
+    /// Insert `descriptor → types`, evicting the single least-recently-used
+    /// entry first if the cache is at capacity.
+    fn insert(&mut self, descriptor: &str, types: Vec<u8>) {
+        if self.map.len() >= DESCRIPTOR_CACHE_CAPACITY && !self.map.contains_key(descriptor) {
+            // Evict exactly one entry: the least-recently-used (smallest tick).
+            if let Some(lru_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&lru_key);
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        self.map.insert(descriptor.to_owned(), (types, tick));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Thread-Local VM Context
 // ---------------------------------------------------------------------------
 
@@ -131,11 +196,24 @@ thread_local! {
     /// Entries are keyed by the returned pointer (`buf.as_mut_ptr() as usize`).
     static JNI_CRITICAL_COPIES: std::cell::RefCell<HashMap<usize, CriticalCopy>> =
         std::cell::RefCell::new(HashMap::new());
+    /// GC-correctness (vm-jni-roots #2): maps a copy-buffer pointer we handed
+    /// back to native code -> the base address of the backing array object that
+    /// we PINNED in `cratonvm_gc::pinned` for KEEP-ALIVE during the handout.
+    /// `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements` always hand out a
+    /// detached copy (never a heap pointer), so a GC must not RECLAIM the source
+    /// array before the copy-back at `Release`; we pin the object base to keep it
+    /// alive. (Relocation of the source is harmless — native code holds the copy,
+    /// not a heap pointer — so this is keep-alive only, not no-relocation.) The
+    /// matching `Release` only receives the buffer pointer, not the array object,
+    /// so we record `buffer_ptr -> object_base` here and look it up to UNPIN.
+    /// Refcounted in `pinned`, so overlapping checkouts of the same array are safe.
+    static JNI_CRITICAL_PINS: std::cell::RefCell<HashMap<usize, usize>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Thread-local cache for parsed method descriptors.
     /// Maps descriptor string → parsed parameter type tags, avoiding
     /// repeated parsing of the same descriptor in hot JNI call paths.
-    static JNI_DESCRIPTOR_CACHE: std::cell::RefCell<HashMap<String, Vec<u8>>> =
-        std::cell::RefCell::new(HashMap::new());
+    static JNI_DESCRIPTOR_CACHE: std::cell::RefCell<DescriptorCache> =
+        std::cell::RefCell::new(DescriptorCache::new());
 }
 
 /// Set the JNI thread-local context before entering native code.
@@ -283,14 +361,12 @@ fn parse_param_types_cached(descriptor: &str) -> Vec<u8> {
     JNI_DESCRIPTOR_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(cached) = cache.get(descriptor) {
-            return cached.clone();
+            return cached.to_vec();
         }
         let types = parse_param_types_inner(descriptor);
-        // Cap cache size to avoid unbounded growth in long-running JVMs
-        if cache.len() >= 1024 {
-            cache.clear();
-        }
-        cache.insert(descriptor.to_owned(), types.clone());
+        // Bounded LRU: evicts a single least-recently-used entry when full,
+        // avoiding the periodic full-flush thrash of a wholesale clear().
+        cache.insert(descriptor, types.clone());
         types
     })
 }
@@ -518,8 +594,11 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
 
 pub struct JniGlobalRefs {
     /// Raw `Box<ObjectRef>` pointers (stored as usize for Send/Sync).
-    /// Each entry owns its allocation until `remove` is called.
-    entries: Vec<usize>,
+    /// Each entry owns its allocation until `remove` is called. Keyed by the
+    /// pointer itself so `resolve`/`remove` are O(1) on this hot path (the
+    /// handle is just `raw | 1`, so the untagged pointer is a unique key —
+    /// distinct `Box` allocations never collide).
+    entries: HashSet<usize>,
 }
 
 // Safety: `JniGlobalRefs` is stored behind `parking_lot::Mutex<>` in `SharedVm`.
@@ -534,7 +613,7 @@ unsafe impl Sync for JniGlobalRefs {}
 impl JniGlobalRefs {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashSet::new(),
         }
     }
 
@@ -542,7 +621,7 @@ impl JniGlobalRefs {
     pub fn add(&mut self, obj: ObjectRef) -> JObject {
         let boxed: Box<ObjectRef> = Box::new(obj);
         let raw = Box::into_raw(boxed) as usize; // OWNERSHIP: transferred to self.entries, freed by JniGlobalRefs::remove() or Drop impl
-        self.entries.push(raw);
+        self.entries.insert(raw);
         (raw | 1) as JObject
     }
 
@@ -552,8 +631,7 @@ impl JniGlobalRefs {
             return false; // not a global ref handle
         }
         let raw = (handle & !1) as usize;
-        if let Some(pos) = self.entries.iter().position(|&e| e == raw) {
-            self.entries.swap_remove(pos);
+        if self.entries.remove(&raw) {
             // Safety: raw was created by Box::into_raw and we own it.
             unsafe { drop(Box::from_raw(raw as *mut ObjectRef)) };
             true
@@ -614,7 +692,7 @@ impl Default for JniGlobalRefs {
 
 impl Drop for JniGlobalRefs {
     fn drop(&mut self) {
-        for raw in self.entries.drain(..) {
+        for raw in self.entries.drain() {
             // Safety: raw was created by Box::into_raw and we own it.
             unsafe { drop(Box::from_raw(raw as *mut ObjectRef)) };
         }
@@ -654,13 +732,28 @@ pub fn pop_local_frame(result: JObject) -> JObject {
 }
 
 /// Record a local ref in the current top frame.
-/// If there is no active frame, the ref is untracked (still valid; auto-freed on JNI return).
+///
+/// GC-correctness (vm-jni-roots #2): previously, if there was no active frame
+/// the ref was silently DROPPED ("untracked") and therefore was NOT a GC root —
+/// a local ref a native obtained (NewObject, GetObjectField, …) outside any
+/// explicit `PushLocalFrame` was invisible to `collect_local_ref_roots` and
+/// could be reclaimed (or left dangling under a moving GC) mid-native-call.
+/// The native dispatch path now pushes an IMPLICIT top-level local frame for
+/// the duration of every JNI native call (see `vm_exec`), but we additionally
+/// synthesize a frame here so a `track_local_ref` that races ahead of (or runs
+/// without) an enclosing frame still roots the handle rather than leaking it.
 pub fn track_local_ref(jobj: JObject) {
     if jobj == 0 {
         return;
     }
     JNI_LOCAL_FRAMES.with(|f| {
         let mut stack = f.borrow_mut();
+        if stack.last().is_none() {
+            // No active frame: synthesize an implicit top-level frame so the
+            // handle is tracked (and thus a GC root) instead of being dropped.
+            stack.push(Vec::with_capacity(16));
+        }
+        // Safe: we just ensured a top frame exists.
         if let Some(top) = stack.last_mut() {
             top.push(jobj);
         }
@@ -735,6 +828,49 @@ pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize,
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// JNI critical-section array pinning (vm-jni-roots #2)
+// ---------------------------------------------------------------------------
+
+/// Pin the source array object `oref` for **keep-alive** — so a GC will not
+/// reclaim it while native code holds the copy we handed out — and remember the
+/// copy-buffer `data_ptr` so the matching `Release` can find and unpin it.
+/// Called on every `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements`
+/// handout.
+///
+/// NOTE: this is keep-alive ONLY. Data-movement safety is provided by handing
+/// native code a detached COPY (never a direct heap pointer), so the pin is NOT
+/// relied upon for no-relocation — see the `cratonvm_gc::pinned` module doc.
+///
+/// `data_ptr` is the copy-buffer pointer returned to the native caller (the key
+/// the matching `Release` passes back), while the pin is keyed on the OBJECT
+/// BASE (`oref.as_ptr()`), the address a collector tests against the pin set.
+fn pin_critical_array(oref: ObjectRef, data_ptr: usize) {
+    let base = oref.as_ptr() as usize;
+    if base == 0 || data_ptr == 0 {
+        return;
+    }
+    cratonvm_gc::pinned::pin(base);
+    JNI_CRITICAL_PINS.with(|c| {
+        c.borrow_mut().insert(data_ptr, base);
+    });
+}
+
+/// Undo a [`pin_critical_array`] for the buffer at `data_ptr`. Looks up the
+/// pinned object base recorded at Get time and unpins it (refcounted, so an
+/// overlapping Get on the same array keeps it pinned until its own Release).
+/// A `data_ptr` we never handed out (foreign pointer / double-release) is
+/// absent from the map and ignored.
+fn unpin_critical_array(data_ptr: usize) {
+    if data_ptr == 0 {
+        return;
+    }
+    let base = JNI_CRITICAL_PINS.with(|c| c.borrow_mut().remove(&data_ptr));
+    if let Some(base) = base {
+        cratonvm_gc::pinned::unpin(base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2323,41 +2459,36 @@ new_prim_array!(jni_new_float_array, ArrayElementType::Float); // 181
 new_prim_array!(jni_new_double_array, ArrayElementType::Double); // 182
 
 // ---- Indices 183-190: Get<Type>ArrayElements ----
-// Returns a pointer to the raw array data.
+// Returns a pointer to a native-endian COPY of the array data.
 //
-// PERF (jni-arrayelems-perf): the previous implementation ALWAYS materialised a
-// full per-element copy (a `get_array_element` + `match` loop over the whole
-// array) and reported `is_copy = JNI_TRUE` — an O(n) copy on every call, even
-// for ordinary contiguous primitive arrays whose in-heap layout is already a
-// flat native-endian block. The heap stores primitives exactly as the C side
-// expects them: `write_prim_element`/`read_prim_element` use native-endian
-// widths (boolean/byte=1, char/short=2, int/float=4, long/double=8) that match
-// the `JBoolean/JByte/JChar/JShort/JInt/JLong/JFloat/JDouble` typedefs
-// one-for-one, so a `*mut $rust_type` view over the array body is bit-identical
-// to the copy the old loop produced.
+// GC-correctness (vm-jni-roots #2): we ALWAYS hand native code a detached copy
+// of the array body and report `is_copy = JNI_TRUE` — never a raw pointer into
+// the live, in-heap array. This VM ships *moving* collectors (the generational
+// young-gen copy and the G1 evacuator both relocate live objects); a direct
+// body pointer handed to C would dangle the instant a GC fired while native
+// code held it — a use-after-free / heap-corruption hole. The JNI spec
+// explicitly permits returning a copy (`is_copy = JNI_TRUE`), so a copy is the
+// only collector-agnostic correct choice for this heap. (HotSpot can return a
+// direct pointer because it pins the array's page/region for the window; this
+// VM closes the same gap with the copy instead. A prior revision handed out the
+// direct `array_data_ptr` for ordinary arrays on a "heap never moves" premise
+// the VM does not actually hold — that was the bug this restores.)
 //
-// We therefore hand out a DIRECT pointer into the (pinned, non-moving) array
-// body with `is_copy = JNI_FALSE` whenever the array is contiguous, avoiding the
-// copy entirely. This mirrors the long-established `GetPrimitiveArrayCritical`
-// fast path (see `jni_get_primitive_array_critical`), which already returns the
-// same `array_data_ptr` directly: ordinary arrays live in the non-moving
-// generational heap / a single G1 region and are not relocated across a GC while
-// native code holds the pointer (the codebase's "our heap doesn't move objects
-// between GC" contract, cf. `GetStringCritical`).
+// The copy is built via the region-safe per-element accessor, so it works
+// uniformly for ordinary contiguous arrays AND G1 *humongous* arrays (whose
+// payload spans non-contiguous regions and have no flat data pointer). It is
+// registered in `JNI_ARRAY_ELEM_BUFFERS` so the matching
+// `Release<Type>ArrayElements` copies any mutations back and frees it.
 //
-// GC SAFETY / Release semantics: a direct pointer is deliberately NOT recorded
-// in `JNI_ARRAY_ELEM_BUFFERS`. `Release<Type>ArrayElements` looks the pointer up
-// and, finding no entry, treats it as a no-op — which is exactly right: native
-// writes already landed in the live array body (nothing to copy back) and there
-// is no separate buffer to free. Consistent with the JNI spec, when
-// `is_copy == JNI_FALSE` the `JNI_ABORT` release mode cannot undo in-place
-// writes, identical to the critical-section direct path.
-//
-// The COPY path is preserved verbatim for the one case that genuinely requires
-// it: a G1 *humongous* array, whose payload spans non-contiguous regions and so
-// has no flat data pointer (`array_data_ptr` returns `None`). There we still
-// build a contiguous buffer, register it, and report `is_copy = JNI_TRUE` so
-// Release copies any mutations back and frees it.
+// Keep-alive: while the copy is outstanding the SOURCE array is pinned in the
+// process-global `cratonvm_gc::pinned` set (refcounted) so it cannot be
+// reclaimed before the copy-back at Release. The pin provides ONLY keep-alive —
+// data-movement safety already comes from the copy — so no per-object
+// no-relocation enforcement in the collectors is required (see the
+// `cratonvm_gc::pinned` module doc). The array is also independently kept alive
+// for the duration of the native call by `native_pin_roots` (when it is a
+// method argument) or the implicit JNI local frame (a ref the native created),
+// so the pin is belt-and-suspenders for collectors that scan the pin set.
 macro_rules! get_array_elements {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
         extern "C" fn $name(
@@ -2368,24 +2499,19 @@ macro_rules! get_array_elements {
             if array == 0 {
                 return std::ptr::null_mut();
             }
-            // `(ptr, is_copy_flag)` — `is_copy_flag` is JNI_FALSE for the direct
-            // (no-copy) pointer and JNI_TRUE for the humongous copy buffer.
             let result = with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
-                // FAST PATH: ordinary contiguous array → hand out the live body
-                // pointer, no copy. `array_data_ptr` returns `None` only for a
-                // G1 humongous array (non-contiguous payload), which falls
-                // through to the copy path below.
-                if let Some(base) = shared.heap.array_data_ptr(oref) {
-                    // The data region is a native-endian block of `$rust_type`
-                    // (see `write_prim_element`), so this reinterpretation is the
-                    // same bit pattern the per-element copy loop would have built.
-                    return Some((base as *mut $rust_type, JNI_FALSE));
-                }
-                // SLOW PATH (G1 humongous): materialise a contiguous copy via the
-                // region-safe per-element accessor, register it for Release.
+                // Materialise a detached, native-endian copy via the region-safe
+                // per-element accessor (works for ordinary AND G1-humongous
+                // arrays). See the module comment above for why a copy — not a
+                // direct heap pointer — is what we hand to native code.
                 let len = shared.heap.array_length(oref);
-                let mut buf: Vec<$rust_type> = Vec::with_capacity(len);
+                // `len.max(1)` guarantees a real, uniquely-addressed allocation
+                // even for a zero-length array, so its buffer pointer is never a
+                // shared dangling sentinel that would collide in the maps below.
+                // Release uses the STORED capacity (not `len`), so over-allocating
+                // by one element for the empty case stays sound.
+                let mut buf: Vec<$rust_type> = Vec::with_capacity(len.max(1));
                 for i in 0..len {
                     let val = match shared.heap.get_array_element(oref, i) {
                         Ok(v) => v,
@@ -2398,19 +2524,20 @@ macro_rules! get_array_elements {
                     buf.push(elem);
                 }
                 let ptr = buf.as_mut_ptr();
-                // BUG FIX (vm-jni-roots #2): record (ptr -> (len, cap)) so
-                // Release uses the EXACT layout we allocated. `buf` was created
-                // with `Vec::with_capacity(len)` then filled via `push`, so its
-                // capacity is `len` and its initialised count is `buf.len()`
-                // (== len unless an element fetch broke early). We store BOTH:
-                // `buf.len()` bounds the copy-back (never read uninitialised
-                // tail) and `buf.capacity()` is the size `Vec::from_raw_parts`
-                // requires for a sound free.
+                // Record (ptr -> (len, cap)) so Release uses the EXACT layout we
+                // allocated. `buf.len()` bounds the copy-back (never read an
+                // uninitialised tail) and `buf.capacity()` is the size
+                // `Vec::from_raw_parts` requires for a sound free.
                 let buf_len = buf.len();
                 let buf_cap = buf.capacity();
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| {
                     c.borrow_mut().insert(ptr as usize, (buf_len, buf_cap));
                 });
+                // Keep-alive ONLY (not no-relocation): pin the source array so it
+                // cannot be reclaimed before the copy-back at Release; unpinned by
+                // `Release<Type>ArrayElements`. Data-movement safety comes from
+                // the copy above.
+                pin_critical_array(oref, ptr as usize);
                 std::mem::forget(buf); // OWNERSHIP: buffer transferred to native caller, freed by Release<Type>ArrayElements via Vec::from_raw_parts
                 Some((ptr, JNI_TRUE))
             })
@@ -2447,6 +2574,13 @@ macro_rules! release_array_elements {
             if elems.is_null() {
                 return;
             }
+            // GC-correctness (vm-jni-roots #2): release the keep-alive pin taken
+            // on the source array at Get time (every handout is a copy and was
+            // pinned for keep-alive). Refcounted, so an overlapping Get on the
+            // same array keeps it pinned until its own Release. Tolerant of an
+            // unknown `elems` (double-release / foreign pointer) — see
+            // `unpin_critical_array`.
+            unpin_critical_array(elems as usize);
             // BUG FIX (vm-jni-roots #2): look up the (initialised_len, capacity)
             // recorded for THIS buffer at Get time. Never re-derive the length
             // from the array handle — the array may have moved/realloc'd under a
@@ -2763,22 +2897,96 @@ extern "C" fn jni_define_class(
     _env: JNIEnv,
     name: *const c_char,
     _loader: JObject,
-    _buf: *const u8,
-    _len: JSize,
+    buf: *const u8,
+    len: JSize,
 ) -> JClass {
-    // DefineClass from raw bytes: parse the name and load the class via the
-    // standard class manager path. Full bytecode injection is not yet supported.
-    let class_name = match unsafe { cstr_to_str(name) } {
-        Some(s) => s.replace('.', "/"),
-        None => return 0,
-    };
-    with_shared_vm(|shared| {
+    // DefineClass from raw bytes: define the class from the caller-supplied
+    // `buf[..len]` bytecode via the same `define_class` path the interpreter
+    // uses for `ClassLoader.defineClass` / agent retransform, so JNI/agent code
+    // that synthesises classes at runtime gets the bytes it actually passed —
+    // not a same-named class loaded from the classpath.
+    //
+    // Per JNI, `name` may be NULL (the name is then taken from the class file);
+    // when supplied it is the expected binary name. The bytecode buffer is
+    // mandatory: a NULL/empty/negative-length buffer is a hard error.
+    if buf.is_null() || len <= 0 {
+        raise_jni_no_class_def_found("DefineClass called with a null or empty bytecode buffer");
+        return 0;
+    }
+    // The class name may be NULL (JNI allows deriving it from the class file).
+    let class_name = unsafe { cstr_to_str(name) }.map(|s| s.replace('.', "/"));
+
+    // SAFETY: the caller guarantees `buf` points to `len` readable bytes for
+    // the duration of the call (standard JNI DefineClass contract). We copy the
+    // bytes out immediately so the slice does not outlive this borrow.
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(buf, len as usize) }.to_vec();
+
+    let result = with_shared_vm(|shared| {
+        // If the caller did not supply a name, the class manager will derive it
+        // from the class file's `this_class` entry; use the empty string as a
+        // placeholder that `define_class` overrides from the bytes.
+        let define_name = class_name.as_deref().unwrap_or("");
         let mut cm = shared.class_manager.write();
-        let class_id = cm.load_class(&class_name).ok()?;
-        Some(class_id.as_u32() as JClass)
+        let cid = cm
+            .define_class(
+                define_name,
+                &bytes,
+                cratonvm_types::ClassLoaderId::Application,
+            )
+            .ok()?;
+        drop(cm);
+        // Mirror the interpreter's defineClass path: invalidate any JIT code
+        // that may have inlined from a previously-loaded class of this name so
+        // a redefinition is honoured rather than served stale.
+        if let Some(n) = class_name.as_deref() {
+            let _ = shared.jit_cache.write().invalidate_for_class(n);
+            let _ = shared.invalidate_jit_for_class(n);
+        }
+        Some(cid.as_u32() as JClass)
     })
-    .flatten()
-    .unwrap_or(0)
+    .flatten();
+
+    match result {
+        Some(c) => c,
+        None => {
+            // Defining from the supplied bytes failed (malformed class file,
+            // linkage error, or no VM context). Surface it as a real Java
+            // exception instead of silently substituting a classpath class.
+            let label = class_name.as_deref().unwrap_or("<unnamed>");
+            raise_jni_no_class_def_found(&format!(
+                "DefineClass failed to define class {label} from the supplied bytecode"
+            ));
+            0
+        }
+    }
+}
+
+/// Raise a `NoClassDefFoundError` on the current thread so a failed
+/// `DefineClass` surfaces as a real Java exception rather than a fabricated
+/// null/0 return. Mirrors [`raise_jni_aioobe`].
+fn raise_jni_no_class_def_found(msg: &str) {
+    let raised =
+        with_jni_context(
+            |shared, thread| match crate::runtime::exceptions::create_exception_object(
+                shared,
+                thread,
+                "java/lang/NoClassDefFoundError",
+                Some(msg),
+            ) {
+                Ok(exc) => {
+                    let handle = obj_to_jobject(exc);
+                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .unwrap_or(false);
+    if !raised {
+        // No thread context or allocation failed: flag the pending-exception
+        // sentinel so the condition is not silently swallowed.
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
+    }
 }
 
 // ---- Index 7: FromReflectedMethod ----
@@ -3002,6 +3210,11 @@ struct CriticalCopy {
     len: usize,
     /// Bytes per element (the contiguous buffer is `len * stride` bytes).
     stride: usize,
+    /// G1 region(s) pinned for this critical section (Step 6 / JEP 423) so the
+    /// backing array cannot be relocated before the copy-back at `Release`.
+    /// Empty under the generational collector. Released on the final
+    /// `ReleasePrimitiveArrayCritical` (not on `JNI_COMMIT`).
+    pinned_regions: Vec<usize>,
 }
 
 /// Bytes per stored element for a primitive array element type.
@@ -3089,7 +3302,9 @@ fn critical_decode_element(et: ArrayElementType, src: &[u8]) -> Value {
 }
 
 // ---- Index 222: GetPrimitiveArrayCritical ----
-// Returns a direct pointer to the array data (no copy if possible).
+// Returns a pointer to a native-endian COPY of the array data (is_copy=JNI_TRUE);
+// see the `Get<Type>ArrayElements` module comment for why we never hand out a
+// direct heap pointer under this VM's moving collectors.
 extern "C" fn jni_get_primitive_array_critical(
     _env: JNIEnv,
     array: JArray,
@@ -3100,61 +3315,63 @@ extern "C" fn jni_get_primitive_array_critical(
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(array)?;
-        match shared.heap.array_data_ptr(oref) {
-            // Ordinary (single-region) array: hand out the live, contiguous
-            // payload pointer — no copy, release is a no-op.
-            Some(ptr) => {
-                if !is_copy.is_null() {
-                    unsafe {
-                        *is_copy = JNI_FALSE;
-                    } // Direct pointer, no copy
-                }
-                Some(ptr as *mut std::ffi::c_void)
-            }
-            // G1 humongous array: the payload spans non-contiguous regions, so
-            // the JNI contract's "direct pointer" cannot be honoured. Fall
-            // back to the same copy-out / copy-back scheme the non-critical
-            // `Get<Type>ArrayElements` path uses: materialise a contiguous
-            // buffer via the region-safe accessor, hand it out, and register
-            // it so `ReleasePrimitiveArrayCritical` copies any mutations back
-            // and frees it.
-            None => {
-                let element_type = shared.heap.array_element_type(oref)?;
-                let stride = critical_stride(element_type);
-                if stride == 0 {
-                    return None; // reference array — not a primitive critical
-                }
-                let len = shared.heap.array_length(oref);
-                let mut buf: Vec<u8> = vec![0u8; len * stride];
-                for i in 0..len {
-                    let v = match shared.heap.get_array_element(oref, i) {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let off = i * stride;
-                    critical_encode_element(v, element_type, &mut buf[off..off + stride]);
-                }
-                let ptr = buf.as_mut_ptr();
-                std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
-                JNI_CRITICAL_COPIES.with(|c| {
-                    c.borrow_mut().insert(
-                        ptr as usize,
-                        CriticalCopy {
-                            array,
-                            element_type,
-                            len,
-                            stride,
-                        },
-                    );
-                });
-                if !is_copy.is_null() {
-                    unsafe {
-                        *is_copy = JNI_TRUE;
-                    } // Copy, not a direct pointer
-                }
-                Some(ptr as *mut std::ffi::c_void)
-            }
+        // FORCE-COPY (vm-jni-roots #2): never hand out a raw pointer into the
+        // live array body. The VM's moving collectors would relocate the array
+        // out from under the native critical pointer (UAF). Materialise a
+        // detached, native-endian copy via the region-safe per-element accessor,
+        // register it for copy-back, and report `is_copy = JNI_TRUE`. The JNI
+        // spec permits returning a copy from GetPrimitiveArrayCritical; it is the
+        // only collector-agnostic correct choice for this heap. Works uniformly
+        // for ordinary AND G1-humongous arrays.
+        let element_type = shared.heap.array_element_type(oref)?;
+        let stride = critical_stride(element_type);
+        if stride == 0 {
+            return None; // reference array — not a primitive critical
         }
+        let len = shared.heap.array_length(oref);
+        let mut buf: Vec<u8> = vec![0u8; len * stride];
+        for i in 0..len {
+            let v = match shared.heap.get_array_element(oref, i) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let off = i * stride;
+            critical_encode_element(v, element_type, &mut buf[off..off + stride]);
+        }
+        let ptr = buf.as_mut_ptr();
+        std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
+
+        // Step 6 (JEP 423): pin the array's G1 region for the critical section so
+        // a moving young/mixed collection cannot relocate it before the copy-back
+        // at Release. The copy-back re-resolves the Get-time array handle
+        // (`jobject_to_obj(copy.array)`); if the array had been evacuated that raw
+        // address would be stale (data loss / write to a recycled object). Empty
+        // (no-op) under the generational collector. Released by
+        // `ReleasePrimitiveArrayCritical`.
+        let pinned_regions = shared.heap.pin_critical_region(oref);
+        JNI_CRITICAL_COPIES.with(|c| {
+            c.borrow_mut().insert(
+                ptr as usize,
+                CriticalCopy {
+                    array,
+                    element_type,
+                    len,
+                    stride,
+                    pinned_regions,
+                },
+            );
+        });
+        // Keep-alive ONLY (not no-relocation): pin the source array so it cannot
+        // be reclaimed before the copy-back at Release. Unpinned by
+        // `ReleasePrimitiveArrayCritical`. Data safety comes from the copy; the
+        // region pin above additionally keeps the array in place under G1.
+        pin_critical_array(oref, ptr as usize);
+        if !is_copy.is_null() {
+            unsafe {
+                *is_copy = JNI_TRUE;
+            } // Always a copy under this VM's moving GC
+        }
+        Some(ptr as *mut std::ffi::c_void)
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -3170,13 +3387,18 @@ extern "C" fn jni_release_primitive_array_critical(
     if carray.is_null() {
         return;
     }
-    // Fast path: for ordinary arrays we handed out a direct pointer and
-    // recorded nothing, so there is nothing to copy back or free.
+    // GC-correctness (vm-jni-roots #2): release the keep-alive pin taken on the
+    // source array at Get time. Refcounted; tolerant of an unknown `carray`
+    // (double-release / foreign pointer) — see `unpin_critical_array`.
+    unpin_critical_array(carray as usize);
+    // Every GetPrimitiveArrayCritical handout is a registered copy buffer. If
+    // `carray` is not one we handed out (foreign pointer / already released),
+    // there is nothing to copy back or free.
     let copy = JNI_CRITICAL_COPIES.with(|c| c.borrow_mut().remove(&(carray as usize)));
     let Some(copy) = copy else {
         return;
     };
-    // Humongous fallback buffer. mode 0 = copy back + free, JNI_COMMIT (1) =
+    // Copy buffer. mode 0 = copy back + free, JNI_COMMIT (1) =
     // copy back, don't free, JNI_ABORT (2) = free without copy back.
     if mode != 2 {
         with_shared_vm(|shared| {
@@ -3195,6 +3417,16 @@ extern "C" fn jni_release_primitive_array_critical(
         });
     }
     if mode != 1 {
+        // Step 6 (JEP 423): release the G1 region pin(s) taken at Get. Done on
+        // the FINAL release only — NOT on JNI_COMMIT (mode 1), whose section
+        // continues and must keep the array pinned in place. No-op / empty under
+        // the generational collector.
+        if !copy.pinned_regions.is_empty() {
+            with_shared_vm(|shared| {
+                shared.heap.unpin_critical_regions(&copy.pinned_regions);
+                Some(())
+            });
+        }
         // Reconstruct the `Vec<u8>` with its original layout and drop it.
         let byte_len = copy.len * copy.stride;
         // SAFETY: `carray` was produced by `Vec::<u8>::as_mut_ptr` +
@@ -3205,7 +3437,8 @@ extern "C" fn jni_release_primitive_array_critical(
         }
     } else {
         // JNI_COMMIT: we kept the buffer alive but already removed it from the
-        // map; re-insert so a later release can still find it.
+        // map; re-insert so a later release can still find it (the region pin
+        // taken at Get also stays held for the continuing section).
         JNI_CRITICAL_COPIES.with(|c| {
             c.borrow_mut().insert(carray as usize, copy);
         });
@@ -3273,6 +3506,26 @@ extern "C" fn jni_get_object_ref_type(_env: JNIEnv, obj: JObject) -> JInt {
 /// Stub for unimplemented JNI functions. Logs a warning and returns 0.
 extern "C" fn jni_stub() -> usize {
     tracing::warn!("unimplemented JNI function called");
+    0
+}
+
+/// Stub for the bare C-varargs (`...`) JNI call slots — `CallObjectMethod`,
+/// `CallStatic<Type>Method`, `CallNonvirtual<Type>Method`, etc.
+///
+/// The `...`-taking forms cannot be dispatched in stable Rust: there is no
+/// portable way to walk a platform `va_list` that the caller assembled inline
+/// (the V/`*MethodV` form receives an explicit `va_list` and the A/`*MethodA`
+/// form receives a `jvalue[]`, both of which *are* implemented and wired).
+///
+/// Rather than silently fabricating a `0`/null result (which a native would
+/// mistake for a real return value — an empty string, a null object, a zero
+/// count), this raises an `UnsatisfiedLinkError` so the unsupported call fails
+/// loudly. Native callers should use the `*MethodV` / `*MethodA` variants.
+extern "C" fn jni_varargs_unsupported() -> usize {
+    jni_throw_unsatisfied_link(
+        "bare C-varargs JNI call form (CallXxxMethod(...)) is not supported on this VM; \
+         use the CallXxxMethodV (va_list) or CallXxxMethodA (jvalue[]) variant instead",
+    );
     0
 }
 
@@ -5034,7 +5287,13 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[33] = jni_get_method_id as *const () as usize;
 
     // Call<Type>Method/V/A — virtual instance (groups of 3: varargs, va_list, array)
-    // varargs slots (34,37,40,...) left as stubs — not implementable in stable Rust
+    // Bare-varargs `...` slots (34,37,40,...) can't be dispatched in stable
+    // Rust; wire them to a stub that raises UnsatisfiedLinkError so a native
+    // calling them fails loudly instead of getting a fabricated 0/null. The
+    // V (va_list) and A (jvalue[]) forms below are fully implemented.
+    for slot in [34, 37, 40, 43, 46, 49, 52, 55, 58, 61] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[35] = jni_call_object_method_v as *const () as usize;
     t[36] = jni_call_object_method_a as *const () as usize;
     t[38] = jni_call_boolean_method_v as *const () as usize;
@@ -5057,6 +5316,10 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[63] = jni_call_void_method_a as *const () as usize;
 
     // CallNonvirtual<Type>Method/V/A (groups of 3)
+    // Bare-varargs `...` slots (64,67,70,...) raise UnsatisfiedLinkError; V/A wired below.
+    for slot in [64, 67, 70, 73, 76, 79, 82, 85, 88, 91] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[65] = jni_call_nonvirtual_object_method_v as *const () as usize;
     t[66] = jni_call_nonvirtual_object_method_a as *const () as usize;
     t[68] = jni_call_nonvirtual_boolean_method_v as *const () as usize;
@@ -5079,6 +5342,10 @@ fn build_function_table() -> Box<[usize; JNI_FUNCTION_COUNT]> {
     t[93] = jni_call_nonvirtual_void_method_a as *const () as usize;
 
     // CallStatic<Type>Method/V/A (groups of 3)
+    // Bare-varargs `...` slots (114,117,120,...) raise UnsatisfiedLinkError; V/A wired below.
+    for slot in [114, 117, 120, 123, 126, 129, 132, 135, 138, 141] {
+        t[slot] = jni_varargs_unsupported as *const () as usize;
+    }
     t[115] = jni_call_static_object_method_v as *const () as usize;
     t[116] = jni_call_static_object_method_a as *const () as usize;
     t[118] = jni_call_static_boolean_method_v as *const () as usize;
@@ -5741,6 +6008,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jni_bare_varargs_slots_raise_unsatisfied_link() {
+        // The bare C-varargs `...` call slots cannot be dispatched in stable
+        // Rust. They must be wired to `jni_varargs_unsupported` (which raises
+        // UnsatisfiedLinkError), NOT to the silent `jni_stub` (which would
+        // fabricate a 0/null return that a native would mistake for a result).
+        let env = get_jni_env();
+        let stub_ptr = jni_stub as *const () as usize;
+        let varargs_ptr = jni_varargs_unsupported as *const () as usize;
+        // Instance, nonvirtual, and static bare-varargs slot bases.
+        let bare_varargs_slots = [
+            34, 37, 40, 43, 46, 49, 52, 55, 58, 61, // CallXxxMethod(...)
+            64, 67, 70, 73, 76, 79, 82, 85, 88, 91, // CallNonvirtualXxxMethod(...)
+            114, 117, 120, 123, 126, 129, 132, 135, 138, 141, // CallStaticXxxMethod(...)
+        ];
+        for slot in bare_varargs_slots {
+            let func_ptr = unsafe { *(*env).add(slot) };
+            assert_ne!(
+                func_ptr, stub_ptr,
+                "bare-varargs slot {slot} must not be the silent stub"
+            );
+            assert_eq!(
+                func_ptr, varargs_ptr,
+                "bare-varargs slot {slot} must raise UnsatisfiedLinkError"
+            );
+        }
+    }
+
+    #[test]
+    fn jni_va_list_and_jvalue_array_call_slots_are_wired() {
+        // The V (va_list) and A (jvalue[]) call forms ARE implemented; their
+        // slots must point at real functions, not the stub.
+        let env = get_jni_env();
+        let stub_ptr = jni_stub as *const () as usize;
+        let varargs_ptr = jni_varargs_unsupported as *const () as usize;
+        // V/A slots for instance / nonvirtual / static Object-returning calls
+        // plus NewObjectV / NewObjectA.
+        let va_list_and_array_slots = [
+            29, 30, // NewObjectV / NewObjectA
+            35, 36, // CallObjectMethodV / CallObjectMethodA
+            65, 66, // CallNonvirtualObjectMethodV / ...A
+            115, 116, // CallStaticObjectMethodV / ...A
+        ];
+        for slot in va_list_and_array_slots {
+            let func_ptr = unsafe { *(*env).add(slot) };
+            assert_ne!(func_ptr, stub_ptr, "V/A slot {slot} must be implemented");
+            assert_ne!(
+                func_ptr, varargs_ptr,
+                "V/A slot {slot} must not be the varargs-unsupported stub"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // M3: Global/Local reference management tests
     // -----------------------------------------------------------------------
@@ -6254,6 +6574,57 @@ mod tests {
                 "cached hit disagree on {desc}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DescriptorCache (bounded LRU)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn descriptor_cache_get_hit_and_miss() {
+        let mut cache = DescriptorCache::new();
+        assert_eq!(cache.get("(I)V"), None);
+        cache.insert("(I)V", vec![b'I']);
+        assert_eq!(cache.get("(I)V"), Some(&[b'I'][..]));
+        assert_eq!(cache.get("(J)V"), None);
+    }
+
+    #[test]
+    fn descriptor_cache_evicts_one_not_all_when_full() {
+        let mut cache = DescriptorCache::new();
+        // Fill to capacity with unique descriptors.
+        for i in 0..DESCRIPTOR_CACHE_CAPACITY {
+            cache.insert(&format!("(I{i})V"), vec![b'I']);
+        }
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+
+        // Touch every entry except the first so it becomes the LRU victim.
+        for i in 1..DESCRIPTOR_CACHE_CAPACITY {
+            assert!(cache.get(&format!("(I{i})V")).is_some());
+        }
+
+        // Insert one more: exactly one entry is evicted (the untouched LRU),
+        // NOT the whole cache — hot entries survive.
+        cache.insert("(NEW)V", vec![b'L']);
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+        assert_eq!(cache.get("(I0)V"), None, "LRU entry should be evicted");
+        assert!(cache.get("(NEW)V").is_some(), "new entry present");
+        assert!(
+            cache.get("(I1)V").is_some(),
+            "recently-used entry must survive (no full flush)"
+        );
+    }
+
+    #[test]
+    fn descriptor_cache_reinsert_existing_key_no_eviction() {
+        let mut cache = DescriptorCache::new();
+        for i in 0..DESCRIPTOR_CACHE_CAPACITY {
+            cache.insert(&format!("(I{i})V"), vec![b'I']);
+        }
+        // Re-inserting an existing key must not evict — it overwrites in place.
+        cache.insert("(I0)V", vec![b'J']);
+        assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
+        assert_eq!(cache.get("(I0)V"), Some(&[b'J'][..]));
     }
 
     // -----------------------------------------------------------------------

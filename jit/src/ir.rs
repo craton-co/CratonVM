@@ -171,6 +171,10 @@ pub enum Op {
     // ── Comparison ───────────────────────────────────────────────────
     /// Integer compare.  Inputs: `[left, right]`.  Result: `Int` (0/1).
     Cmp(CmpOp),
+    /// Long 3-way compare (`lcmp`). Inputs: `[left, right]` (both `Long`).
+    /// Result: `Int` ∈ {-1, 0, 1} = sign(left − right), signed. Typically feeds
+    /// an `if<cond>` against zero (`lcmp; iflt` ⇒ `left < right`).
+    LCmp,
 
     // ── Type conversion ──────────────────────────────────────────────
     I2L,
@@ -213,8 +217,17 @@ pub enum Op {
 
     // ── Method calls ─────────────────────────────────────────────────
     /// Method call.  Inputs: `[ctrl, mem, args…]`.
-    /// Produces (ctrl, mem, retval) via Proj nodes.
-    Call,
+    ///
+    /// The node is BOTH the new memory token (a call is a hard memory barrier
+    /// — it consumes the prior token and produces a new one) AND, for a
+    /// non-void call, the return value (in `node_slot`, like `Op::Load`).
+    /// `info_ptr` is the address of a leaked `JitInvokeInfo` (kept alive by the
+    /// `CompiledMethod`'s `_jit_invoke_infos`) baked into the dispatch call as
+    /// the helper's `info_ptr` argument. Only emitted for `invokestatic`
+    /// (Gap B slice) in an oop-free method — see `ir_lower`'s `Op::Call` arm.
+    Call {
+        info_ptr: usize,
+    },
 
     // ── Speculation guard (real-frame-deopt) ─────────────────────────
     /// Speculative guard. Inputs: `[ctrl, cond]`. If `cond` is zero at
@@ -457,6 +470,41 @@ pub struct IrBuilder {
     /// Loop-carried phis per loop-header PC, recorded at activation so the
     /// backward branch can fill each phi's back-edge input.
     loop_phis: HashMap<usize, LoopPhis>,
+    /// Resolved instance-field layout, keyed by bytecode pc:
+    /// `pc → (field_index, type_tag)`. Populated by the caller
+    /// ([`Self::set_field_info`]) from the constant-pool field resolver before
+    /// [`Self::build`]; empty for hand-built / test graphs. A `getfield` whose
+    /// pc is absent — or whose tag is not int-category — makes `build` bail
+    /// (`None` → single-pass), the existing safety net.
+    field_info: HashMap<usize, (usize, u8)>,
+    /// Resolved allocation layout for `new`, keyed by bytecode pc:
+    /// `pc → (class_id, num_fields)`. Set by [`Self::set_new_info`]; only the
+    /// allocations the caller admits (non-escaping-eligible: no primitive field
+    /// initialisers, no finalizer) are present. A `new` whose pc is absent
+    /// makes `build` bail (`None` → single-pass).
+    new_info: HashMap<usize, (u32, usize)>,
+    /// Bytecode pcs of `invokespecial` calls to a trivial no-arg void
+    /// constructor (`<init>()V`) that may be **elided** (the receiver is a
+    /// fresh, non-escaping object whose fields are zero-initialised and set by
+    /// the visible `putfield`s). Set by [`Self::set_trivial_init_pcs`]. An
+    /// `invokespecial` whose pc is NOT here makes `build` bail.
+    trivial_init_pcs: HashSet<usize>,
+    /// Gap B: resolved `invokestatic` call sites the builder lowers into an
+    /// `Op::Call`. `pc → (info_ptr, num_args, ret_type)` where `info_ptr` is the
+    /// address of a leaked `JitInvokeInfo` (the dispatch helper's 2nd argument),
+    /// `num_args` the JVM arg-slot count, and `ret_type` the JVM return-type byte
+    /// (`V` → no value; `L`/`[` → a reference result, typed `IrType::Ref`; any
+    /// int-category byte → `IrType::Int`). Set by [`Self::set_invoke_info`]. The
+    /// caller (`lib.rs`) restricts which methods get this (inc 22: oops may be
+    /// live across the call — found by the conservative GC scan of the spilled
+    /// frame, sound because GC is non-moving while a JIT frame is active).
+    invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// inc 26: resolved `ldc2_w` (0x14) long-constant values (`pc → i64`). Set by
+    /// [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to single-pass.
+    /// Only long constants are admitted — a double `ldc2_w` is excluded upstream
+    /// (its consuming double opcode trips `method_uses_double`), so a present
+    /// value is always the `long` bit pattern.
+    ldc2w_info: HashMap<usize, i64>,
 }
 
 impl IrBuilder {
@@ -494,7 +542,109 @@ impl IrBuilder {
             merges: HashMap::new(),
             loop_headers: HashSet::new(),
             loop_phis: HashMap::new(),
+            field_info: HashMap::new(),
+            new_info: HashMap::new(),
+            trivial_init_pcs: HashSet::new(),
+            invoke_info: HashMap::new(),
+            ldc2w_info: HashMap::new(),
         }
+    }
+
+    /// inc 26: supply resolved `ldc2_w` long-constant values (`pc → i64`). Must
+    /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
+    pub fn set_ldc2w_info(&mut self, info: HashMap<usize, i64>) {
+        self.ldc2w_info = info;
+    }
+
+    /// inc 27: the data type for a merge / loop-carried `Op::Phi`, derived from
+    /// its value inputs (`inputs[0]` is the region/merge control). A `long`
+    /// (or `double`) value makes the phi that type, so `frame_value_for`
+    /// resolves the correct 64-bit width on a deopt-frame resume — the phi was
+    /// historically hardcoded `Int`, which would truncate a long on resume.
+    /// Codegen is unaffected (phi copies are unconditionally 64-bit `MOV`s and
+    /// every consumer picks width from its own `node.ty`); only the (currently
+    /// unwired) deopt-resume path reads the phi's own type. Scoped to category-2
+    /// (long/double) to avoid perturbing `Ref`/`Float` phi handling; defaults to
+    /// `Int` otherwise (the prior behaviour).
+    fn phi_data_type(&self, inputs: &[NodeId]) -> IrType {
+        for &n in inputs.iter().skip(1) {
+            if n != NO_NODE {
+                if let Some(node) = self.graph.nodes.get(n as usize) {
+                    if matches!(node.ty, IrType::Long | IrType::Double) {
+                        return node.ty;
+                    }
+                }
+            }
+        }
+        IrType::Int
+    }
+
+    /// Re-lay-out the parameter locals with the JVM category-2 two-slot
+    /// convention and type each `Param` node. inc 25: [`Self::new`] packs every
+    /// parameter one-per-slot typed `Int`, which is only correct for an
+    /// all-category-1 signature. A `long`/`double` parameter occupies **two**
+    /// JVM local slots, so a following parameter's value node sits two slots
+    /// higher — e.g. `(long a, long b)` puts `a` at slot 0 and `b` at slot 2,
+    /// matching `lload_2` for `b`. The `Param` node *index* stays the JIT-arg
+    /// index (the lowerer reads param `i` from prologue slot `(i+1)*8`, one
+    /// register per parameter); only the `locals` placement and the node type
+    /// change. `param_types` is in JIT-arg order (one entry per parameter).
+    /// Must be called before [`Self::build`].
+    pub fn set_param_types(&mut self, param_types: &[IrType]) {
+        let cat2 = |t: &IrType| matches!(t, IrType::Long | IrType::Double);
+        // Clear the parameter region so a stale one-per-slot placement (from
+        // `new`) cannot shadow a now-two-slot-wide layout.
+        let total: usize = param_types
+            .iter()
+            .map(|t| if cat2(t) { 2 } else { 1 })
+            .sum();
+        for s in 0..total.min(self.locals.len()) {
+            self.locals[s] = NO_NODE;
+        }
+        let mut jvm_slot = 0usize;
+        for (i, &ty) in param_types.iter().enumerate() {
+            if let Some(pid) = self
+                .graph
+                .nodes
+                .iter()
+                .position(|n| matches!(n.op, Op::Param(idx) if idx as usize == i))
+            {
+                self.graph.nodes[pid].ty = ty;
+                if jvm_slot < self.locals.len() {
+                    self.locals[jvm_slot] = pid as NodeId;
+                }
+            }
+            jvm_slot += if cat2(&ty) { 2 } else { 1 };
+        }
+    }
+
+    /// Supply the resolved instance-field layout (`pc → (field_index,
+    /// type_tag)`) the builder uses to lower `getfield` into an `Op::Load`.
+    /// Must be called before [`Self::build`]; absent / non-int-category
+    /// entries make the corresponding `getfield` bail to single-pass.
+    pub fn set_field_info(&mut self, info: HashMap<usize, (usize, u8)>) {
+        self.field_info = info;
+    }
+
+    /// Supply the allocation layout (`pc → (class_id, num_fields)`) and the set
+    /// of elidable trivial-`<init>` pcs the builder uses to lower `new` into an
+    /// `Op::New` (for escape-analysis scalar replacement). Must be called before
+    /// [`Self::build`]; an absent `new`/`invokespecial` pc bails to single-pass.
+    pub fn set_new_info(
+        &mut self,
+        new_info: HashMap<usize, (u32, usize)>,
+        trivial_init_pcs: HashSet<usize>,
+    ) {
+        self.new_info = new_info;
+        self.trivial_init_pcs = trivial_init_pcs;
+    }
+
+    /// Gap B: supply the resolved `invokestatic` call sites (`pc → (info_ptr,
+    /// num_args, ret_type)`) the builder lowers into `Op::Call`. Must be called
+    /// before [`Self::build`]; an `invokestatic` pc not present bails the build
+    /// to single-pass. `ret_type` is the JVM return-type byte (see the field doc).
+    pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, u8)>) {
+        self.invoke_info = info;
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -622,9 +772,8 @@ impl IrBuilder {
             for snap in &state.local_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self
-                .graph
-                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi_ty = self.phi_data_type(&inputs);
+            let phi = self.graph.add(Op::Phi, phi_ty, inputs, Some(target_pc));
             local_phis[i] = phi;
             self.locals[i] = phi;
         }
@@ -638,9 +787,8 @@ impl IrBuilder {
             for snap in &state.stack_snapshots {
                 inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
             }
-            let phi = self
-                .graph
-                .add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            let phi_ty = self.phi_data_type(&inputs);
+            let phi = self.graph.add(Op::Phi, phi_ty, inputs, Some(target_pc));
             stack_phis[i] = phi;
             self.stack[i] = phi;
         }
@@ -736,9 +884,8 @@ impl IrBuilder {
                     for snap in &state.local_snapshots {
                         phi_inputs.push(snap.get(local_idx).copied().unwrap_or(NO_NODE));
                     }
-                    let phi = self
-                        .graph
-                        .add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
+                    let phi_ty = self.phi_data_type(&phi_inputs);
+                    let phi = self.graph.add(Op::Phi, phi_ty, phi_inputs, Some(target_pc));
                     self.locals[local_idx] = phi;
                 }
             }
@@ -864,6 +1011,50 @@ impl IrBuilder {
                     self.push(self.locals[idx]);
                     pc += 1;
                 }
+                // lload (wide index) — inc 26. A long is one NodeId slot; the
+                // value lives at `locals[idx]` (the high half slot `idx+1` is
+                // never read by valid bytecode). Long-only, so inert for the int
+                // path.
+                0x16 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
+                // aload — push an object reference local (same node-graph
+                // mechanics as iload: a reference is just a NodeId on the
+                // abstract stack; its only consumer in the IR slice we lower is
+                // a `getfield` base).
+                0x19 => {
+                    let idx = code[pc + 1] as usize;
+                    self.push(self.locals[idx]);
+                    pc += 2;
+                }
+                // aload_0..3
+                0x2a..=0x2d => {
+                    let idx = (op - 0x2a) as usize;
+                    self.push(self.locals[idx]);
+                    pc += 1;
+                }
+                // astore — store an object reference into a local. Same
+                // node-graph mechanics as istore: a reference is just a NodeId
+                // slot in the abstract locals array (mirrors the `aload`
+                // comment above). Real javac stores a `new` object into a local
+                // (`new; dup; invokespecial; astore_N`), so without this the IR
+                // builder bails on every allocation method and scalar
+                // replacement never fires on production bytecode.
+                0x3a => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
+                }
+                // astore_0..3
+                0x4b..=0x4e => {
+                    let idx = (op - 0x4b) as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 1;
+                }
                 // istore
                 0x36 => {
                     let idx = code[pc + 1] as usize;
@@ -884,6 +1075,14 @@ impl IrBuilder {
                     let val = self.pop();
                     self.locals[idx] = val;
                     pc += 1;
+                }
+                // lstore (wide index) — inc 26. Stores the long NodeId at
+                // `locals[idx]` (high half slot `idx+1` untouched). Long-only.
+                0x37 => {
+                    let idx = code[pc + 1] as usize;
+                    let val = self.pop();
+                    self.locals[idx] = val;
+                    pc += 2;
                 }
                 // iadd
                 0x60 => {
@@ -1011,6 +1210,71 @@ impl IrBuilder {
                     self.push(r);
                     pc += 1;
                 }
+                // inc 27: long shifts + bitwise. The shift count is an `int` (one
+                // slot) on top of the `long` value; the lowerer's `Op::Shl/Shr/
+                // UShr` are width-aware (64-bit shift masks the count to 6 bits,
+                // matching `lshl`'s `count & 0x3f`), and `Op::And/Or/Xor` are
+                // already 64-bit (correct for both Int and Long). These are
+                // 1-byte opcodes (the length walkers' default arm sizes them
+                // correctly). Long-only → inert for the int path.
+                // lshl
+                0x79 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shl, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lshr
+                0x7b => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Shr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lushr
+                0x7d => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::UShr, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // land
+                0x7f => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::And, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lor
+                0x81 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Or, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lxor
+                0x83 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::Xor, IrType::Long, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
+                // lcmp — inc 27. 3-way signed compare of two longs → int
+                // {-1,0,1}; usually feeds an `if<cond>` against 0 (the existing
+                // 0x99..0x9e arm), so `lcmp; iflt` becomes `left < right`.
+                0x94 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let r = self.add_data(Op::LCmp, IrType::Int, vec![a, b], pc);
+                    self.push(r);
+                    pc += 1;
+                }
                 // iinc
                 0x84 => {
                     let idx = code[pc + 1] as usize;
@@ -1064,6 +1328,242 @@ impl IrBuilder {
                     let r = self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc);
                     self.push(r);
                     pc += 1;
+                }
+                // getfield — read an instance field as an `Op::Load`.
+                //
+                // Slice 1 (read-only) of the field/call IR frontier: only
+                // int-category fields (`I`/`Z`/`B`/`C`/`S`) are lowered. They
+                // all read the 32-bit `Value::Int` payload sign-extended — the
+                // exact ABI the single-pass backend's inline getfield emits
+                // (`MOVSXD` from `HEADER_SIZE + field_index*SLOT_SIZE +
+                // FIELD_CELL_PAYLOAD32_OFFSET`). The cell-offset operand is a
+                // `Const(field_index)`; the lowerer derives the byte
+                // displacement. Float/long/double/reference fields and any pc
+                // without resolved layout bail (`None` → single-pass), as does
+                // every `putfield` (no IR `Op::Store` lowering yet — writes
+                // need scheduler memory ordering, a separate slice).
+                0xb4 => {
+                    let (field_index, type_tag) = match self.field_info.get(&pc) {
+                        Some(&fi) => fi,
+                        None => return None,
+                    };
+                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                        return None;
+                    }
+                    let base = self.pop();
+                    let offset = self.iconst(field_index as i64);
+                    let load = self.graph.add(
+                        Op::Load(MemKind::Int),
+                        IrType::Int,
+                        vec![self.ctrl, self.mem, base, offset],
+                        Some(pc),
+                    );
+                    // The load advances the memory token: a subsequent store to
+                    // a possibly-aliasing location must be ordered AFTER this
+                    // read (WAR), and the scheduler enforces ordering only via
+                    // the input-edge dependency this creates. (For a getfield-
+                    // only method this merely serialises reads — harmless.)
+                    self.mem = load;
+                    self.push(load);
+                    pc += 3;
+                }
+                // putfield — write an instance field as an `Op::Store`.
+                //
+                // Slice 2 (read/write) of the field/call IR frontier: only
+                // int-category fields lower. The store consumes the current
+                // memory token and produces a new one (the store node itself),
+                // so the scheduler serialises it after every prior memory op and
+                // before every later one (RAW/WAR/WAW all preserved by the
+                // input-edge topological sort). Non-int fields and any pc without
+                // resolved layout bail (`None` → single-pass).
+                0xb5 => {
+                    let (field_index, type_tag) = match self.field_info.get(&pc) {
+                        Some(&fi) => fi,
+                        None => return None,
+                    };
+                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                        return None;
+                    }
+                    let value = self.pop();
+                    let base = self.pop();
+                    let offset = self.iconst(field_index as i64);
+                    let store = self.graph.add(
+                        Op::Store(MemKind::Int),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, base, offset, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 3;
+                }
+                // new — allocate an object as an `Op::New`. Emitted so escape
+                // analysis can scalar-replace it when it does not escape (no
+                // heap allocation, fields become SSA values). The lowerer has
+                // no allocation path, so an `Op::New` that SURVIVES escape
+                // analysis (escaping) makes the whole compile bail to
+                // single-pass — enforced by the caller after `optimize`.
+                0xbb => {
+                    let (class_id, num_fields) = match self.new_info.get(&pc) {
+                        Some(&ci) => ci,
+                        None => return None,
+                    };
+                    let newobj = self.graph.add(
+                        Op::New {
+                            class_id,
+                            num_fields,
+                        },
+                        IrType::Ref,
+                        vec![self.ctrl, self.mem],
+                        Some(pc),
+                    );
+                    self.push(newobj);
+                    pc += 3;
+                }
+                // invokespecial — only a trivial `<init>()V` on a fresh object
+                // is handled, by ELISION: pop the receiver (the `dup`'d new
+                // object) and emit nothing. Sound only because the caller
+                // admits the pc to `trivial_init_pcs` exclusively when the
+                // object is a non-escaping `new` whose class has no primitive
+                // field initialisers (its fields are zero-initialised and set
+                // by the visible `putfield`s — the constructor adds nothing the
+                // scalar-replaced slots don't already model). Any other
+                // `invokespecial` bails to single-pass.
+                0xb7 => {
+                    // inc 24 (Gap B): a resolved non-`<init>` `invokespecial`
+                    // lowered to `Op::Call` — identical to the `invokestatic`
+                    // arm except the receiver is arg0 (the caller's
+                    // `invoke_info` entry already counts it in `num_args`, and
+                    // the leaked `JitInvokeInfo` carries `invoke_kind == 1` so
+                    // `invoke_dispatch` does the non-virtual dispatch to the
+                    // statically-resolved target). GC-safe by the same
+                    // conservative IR-frame scan that roots reference args
+                    // (inc 22). Only populated when the special-call gate is on;
+                    // otherwise `invoke_info` has no entry for this pc and we
+                    // fall through to the elidable-`<init>` path below.
+                    if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                        let mut args = Vec::with_capacity(num_args);
+                        for _ in 0..num_args {
+                            args.push(self.pop());
+                        }
+                        args.reverse();
+                        let mut inputs = Vec::with_capacity(2 + num_args);
+                        inputs.push(self.ctrl);
+                        inputs.push(self.mem);
+                        inputs.extend(args);
+                        let returns_value = ret_type != b'V';
+                        let ty = match ret_type {
+                            b'V' => IrType::Void,
+                            b'L' | b'[' => IrType::Ref,
+                            _ => IrType::Int,
+                        };
+                        let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                        self.mem = call;
+                        if returns_value {
+                            self.push(call);
+                        }
+                        pc += 3;
+                    } else {
+                        // Elidable-`<init>` path (scalar-new): elide a trivial
+                        // `<init>()V` on a fresh object.
+                        if !self.trivial_init_pcs.contains(&pc) {
+                            return None;
+                        }
+                        // Defence in depth: only elide when the receiver (top of
+                        // stack for a no-arg `<init>`) is a fresh `Op::New` we
+                        // emitted. Eliding a `<init>` whose receiver is `this` or
+                        // a parameter would skip a real superclass constructor
+                        // (and hide any escape it performs).
+                        let recv = self.peek();
+                        let recv_is_new = recv != NO_NODE
+                            && matches!(
+                                self.graph.nodes.get(recv as usize).map(|n| &n.op),
+                                Some(Op::New { .. })
+                            );
+                        if !recv_is_new {
+                            return None;
+                        }
+                        self.pop();
+                        pc += 3;
+                    }
+                }
+                // invokestatic (0xb8) and invokevirtual (0xb6) — lower a resolved
+                // call to `Op::Call` (Gap B). `invokestatic` has no receiver;
+                // `invokevirtual` marshals the receiver as arg0 (the caller's
+                // `invoke_info` entry already counts it in `num_args`, and the
+                // leaked `JitInvokeInfo` carries `invoke_kind == 0` so
+                // `invoke_dispatch` resolves the actual target on the receiver's
+                // runtime class — full virtual dispatch through the generic helper,
+                // no inline cache in the emitted code). GC-safe by the same
+                // conservative IR-frame scan that roots reference args (inc 22).
+                // Both are 3-byte instructions. A pc not in `invoke_info` (gate
+                // off, or a non-emittable invoke present) bails to single-pass.
+                0xb6 | 0xb8 => {
+                    let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
+                        Some(&t) => t,
+                        None => return None,
+                    };
+                    // Pop args (deepest-first on the abstract stack) and restore
+                    // source order so inputs are [ctrl, mem, arg0, arg1, …].
+                    let mut args = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        args.push(self.pop());
+                    }
+                    args.reverse();
+                    let mut inputs = Vec::with_capacity(2 + num_args);
+                    inputs.push(self.ctrl);
+                    inputs.push(self.mem);
+                    inputs.extend(args);
+                    // A call is a hard memory barrier: it consumes the current
+                    // memory token and BECOMES the new one (serialising every
+                    // prior memory op before it and every later one after). The
+                    // same node also carries the return value (like `Op::Load`).
+                    // Result type from the descriptor: `V` → no value; `L`/`[` →
+                    // a reference result (`IrType::Ref`); else int-category.
+                    let returns_value = ret_type != b'V';
+                    let ty = match ret_type {
+                        b'V' => IrType::Void,
+                        b'L' | b'[' => IrType::Ref,
+                        _ => IrType::Int,
+                    };
+                    let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                    self.mem = call;
+                    if returns_value {
+                        self.push(call);
+                    }
+                    pc += 3;
+                }
+                // invokeinterface (0xb9) — identical to the invokevirtual path
+                // (receiver arg0, `invoke_kind == 2`, dynamic dispatch via the
+                // helper) except it is a FIVE-byte instruction (opcode, cp_hi,
+                // cp_lo, count, 0). The trailing count/0 bytes are not consumed by
+                // the builder (the descriptor was resolved from the cp index by
+                // the caller); only the pc advance differs.
+                0xb9 => {
+                    let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
+                        Some(&t) => t,
+                        None => return None,
+                    };
+                    let mut args = Vec::with_capacity(num_args);
+                    for _ in 0..num_args {
+                        args.push(self.pop());
+                    }
+                    args.reverse();
+                    let mut inputs = Vec::with_capacity(2 + num_args);
+                    inputs.push(self.ctrl);
+                    inputs.push(self.mem);
+                    inputs.extend(args);
+                    let returns_value = ret_type != b'V';
+                    let ty = match ret_type {
+                        b'V' => IrType::Void,
+                        b'L' | b'[' => IrType::Ref,
+                        _ => IrType::Int,
+                    };
+                    let call = self.graph.add(Op::Call { info_ptr }, ty, inputs, Some(pc));
+                    self.mem = call;
+                    if returns_value {
+                        self.push(call);
+                    }
+                    pc += 5;
                 }
                 // dup
                 0x59 => {
@@ -1222,6 +1722,21 @@ impl IrBuilder {
                     let c = self.lconst(1);
                     self.push(c);
                     pc += 1;
+                }
+                // ldc2_w (long constant from the constant pool) — inc 26. The
+                // resolved long value comes from `set_ldc2w_info` (`pc → i64`);
+                // an absent pc bails to single-pass. A double `ldc2_w` is
+                // excluded upstream (its consuming double opcode trips
+                // `method_uses_double`), so a present value is the long bits.
+                // (`ldc2_w` is 3 bytes: opcode + 2-byte CP index.)
+                0x14 => {
+                    let val = match self.ldc2w_info.get(&pc) {
+                        Some(&v) => v,
+                        None => return None,
+                    };
+                    let c = self.lconst(val);
+                    self.push(c);
+                    pc += 3;
                 }
 
                 // tableswitch / lookupswitch — lower as a CMP-equality chain
@@ -1409,18 +1924,27 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             | 0x85
             | 0x88
             | 0x91..=0x93
+            | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => {
                 pc += 1;
             }
-            // 2-byte opcodes
-            0x10 | 0x15 | 0x36 => {
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
+            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => {
                 pc += 2;
             }
-            // 3-byte opcodes
-            0x11 | 0x84 => {
+            // 3-byte opcodes (the 3-byte method invokes: invokevirtual 0xb6,
+            // invokespecial 0xb7, invokestatic 0xb8; inc 26: + 0x14 ldc2_w)
+            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => {
                 pc += 3;
+            }
+            // 5-byte opcodes: invokeinterface (0xb9) — opcode, cp_hi, cp_lo,
+            // count, 0. The trailing count/0 bytes MUST be skipped or a later
+            // branch target would be mis-located (the builder now lowers 0xb9).
+            0xb9 => {
+                pc += 5;
             }
             _ => {
                 // Unknown opcode — skip (builder will also bail)
@@ -1496,13 +2020,19 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             | 0x85
             | 0x88
             | 0x91..=0x93
+            | 0x2a..=0x2d
+            | 0x4b..=0x4e
             | 0xac
             | 0xad
             | 0xb1 => pc += 1,
-            // 2-byte opcodes
-            0x10 | 0x15 | 0x36 => pc += 2,
-            // 3-byte opcodes
-            0x11 | 0x84 => pc += 3,
+            // 2-byte opcodes (inc 26: + 0x16 lload, 0x37 lstore)
+            0x10 | 0x15 | 0x16 | 0x19 | 0x36 | 0x37 | 0x3a => pc += 2,
+            // 3-byte opcodes (invokevirtual 0xb6 / invokespecial 0xb7 /
+            // invokestatic 0xb8 — the 3-byte method invokes; inc 26: + 0x14 ldc2_w)
+            0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,
+            // 5-byte: invokeinterface (0xb9) — skip its count/0 trailer so a
+            // backward branch target after it is located correctly.
+            0xb9 => pc += 5,
             _ => pc += 1,
         }
     }
@@ -1671,6 +2201,106 @@ mod tests {
         assert!(has_if, "Should contain an If node");
         let has_cmp = graph.nodes.iter().any(|n| matches!(n.op, Op::Cmp(_)));
         assert!(has_cmp, "Should contain a Cmp node");
+    }
+
+    #[test]
+    fn test_ir_getfield_emits_load() {
+        // static int get(Corpus o) { return o.x; }
+        // aload_0; getfield #2; ireturn
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'I'));
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 5).expect("IR build failed");
+        let has_load = graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        assert!(has_load, "getfield should emit an Op::Load node");
+        // The Load's base must be the Param(0) receiver and its offset operand a
+        // Const(0) (field index 0).
+        let load = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Load(_)))
+            .unwrap();
+        assert_eq!(
+            load.inputs.len(),
+            4,
+            "Load inputs = [ctrl, mem, base, offset]"
+        );
+        assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
+        assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
+    }
+
+    #[test]
+    fn test_ir_putfield_emits_store_and_threads_memory() {
+        // static void set(Corpus o, int v) { o.x = v; }
+        // aload_0; iload_1; putfield #2; return
+        let code = [0x2a, 0x1b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+        let mut builder = IrBuilder::new(2, 2);
+        let mut fi = HashMap::new();
+        fi.insert(2usize, (0usize, b'I'));
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 6).expect("IR build failed");
+        let store = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Store(_)))
+            .expect("putfield should emit an Op::Store");
+        // inputs = [ctrl, mem, base, offset, value]
+        assert_eq!(store.inputs.len(), 5);
+        assert_eq!(graph.nodes[store.inputs[2] as usize].op, Op::Param(0)); // base = o
+        assert_eq!(graph.nodes[store.inputs[3] as usize].op, Op::Const(0)); // field index
+        assert_eq!(graph.nodes[store.inputs[4] as usize].op, Op::Param(1)); // value = v
+        assert_eq!(store.ty, IrType::Memory);
+    }
+
+    #[test]
+    fn test_ir_putfield_store_after_load_in_memory_chain() {
+        // static int swap(Corpus o, int v) { int t = o.x; o.x = v; return t; }
+        // The store's memory input must be the load (so the scheduler orders the
+        // store AFTER the read — WAR), not the initial Start memory token.
+        // aload_0; getfield #2; istore_2; aload_0; iload_1; putfield #2; iload_2; ireturn
+        let code = [
+            0x2a, 0xb4, 0x00, 0x02, 0x3d, 0x2a, 0x1b, 0xb5, 0x00, 0x02, 0x1c, 0xac, 0, 0,
+        ];
+        let mut builder = IrBuilder::new(2, 3);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'I')); // getfield pc 1
+        fi.insert(7usize, (0usize, b'I')); // putfield pc 7
+        builder.set_field_info(fi);
+        let graph = builder.build(&code, 12).expect("IR build failed");
+        let store = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Store(_)))
+            .expect("putfield emits a Store");
+        // store.inputs[1] (memory) must be the Load node, not the Start Proj(1).
+        let mem_in = store.inputs[1];
+        assert!(
+            matches!(graph.nodes[mem_in as usize].op, Op::Load(_)),
+            "store's memory input must be the prior load (WAR ordering), got {:?}",
+            graph.nodes[mem_in as usize].op
+        );
+    }
+
+    #[test]
+    fn test_ir_getfield_bails_without_field_info() {
+        // Same method but no field layout supplied → build must bail (None),
+        // the single-pass safety net.
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let builder = IrBuilder::new(1, 1);
+        assert!(builder.build(&code, 5).is_none());
+    }
+
+    #[test]
+    fn test_ir_getfield_bails_on_non_int_field() {
+        // A reference field (`L…;`) is not int-category → build bails.
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut fi = HashMap::new();
+        fi.insert(1usize, (0usize, b'L'));
+        builder.set_field_info(fi);
+        assert!(builder.build(&code, 5).is_none());
     }
 
     #[test]

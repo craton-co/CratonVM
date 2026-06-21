@@ -93,7 +93,7 @@ jobs:
 
       - name: Build CratonVM
         if: steps.jck-check.outputs.skip != 'true'
-        run: cargo build --release -p vm-cli
+        run: cargo build --release -p cratonvm-cli
 
       - name: Configure JCK environment
         if: steps.jck-check.outputs.skip != 'true'
@@ -103,7 +103,7 @@ jobs:
           echo "JCK_HOME=${JCK_HOME}" >> "$GITHUB_ENV"
 
           # Path to the CratonVM binary
-          echo "CRATONVM_BIN=$(pwd)/target/release/vm-cli" >> "$GITHUB_ENV"
+          echo "CRATONVM_BIN=$(pwd)/target/release/cratonvm" >> "$GITHUB_ENV"
 
           # Optional: restrict to specific modules
           if [ -n "${{ github.event.inputs.jck_modules }}" ]; then

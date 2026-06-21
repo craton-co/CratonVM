@@ -1,6 +1,18 @@
 # Activate the IR Optimizer (GVN / const-fold / DSE / LICM + scalar replacement)
 
-Status: design / partially-built-mostly-dormant. L. The Sea-of-Nodes IR and its
+Status: **largely landed (increments 1–29).** The Sea-of-Nodes IR + passes are
+live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Call`
+emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
+built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
+inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
+arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
+inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
+on in **inc 29** (each with a `=0` opt-out). See the per-increment sections below
+and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for
+what is left (long/double call returns, `ldiv`/`lrem`, and the `double`/`float`
+XMM tier). Original plan text follows.
+
+The Sea-of-Nodes IR and its
 optimization passes exist and are unit-tested, but the live JIT path only
 exercises them on a **narrow gated subset** of methods. This plan turns the
 passes on broadly behind safety gates, and opens the escape-analysis →
@@ -669,6 +681,1253 @@ Implementation (`jit/src/ir.rs`):
 and `lookupswitch` (sparse keys 10/20 + default), each checked on hits and
 out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
 
+## Increment 14 (step 3 — IR gate relaxation: int-category `getfield` → `Op::Load`) landed
+
+Status: **landed** on `dev`. **First slice of "THE NEXT FRONTIER"** (field / call /
+alloc emission). The IR builder now lowers an int-category `getfield` into the
+first real `Op::Load` the production IR path emits — so a method whose only heap
+op is an int-field read takes the optimizing IR pipeline, where before it bailed
+to single-pass.
+
+**Scope — read-only, sound without a memory scheduler.** Only `getfield` of an
+int-category field (`I`/`Z`/`B`/`C`/`S`) lowers. Crucially this needs **no**
+scheduler memory-ordering work: a getfield-only method has no `Store`/`Call`, so
+there is nothing for the (still memory-unaware) scheduler to mis-order against —
+loads of immutable memory may freely float / GVN / DCE. `putfield`, `new`, array
+ops, `invoke*`, and float/long/double/reference fields all still bail (`build()`
+→ `None` → single-pass), the existing safety net. (Writes need real scheduler
+memory ordering + lowerer helper access — a separate slice.)
+
+**Implementation**
+- **`jit/src/ir.rs`** — the builder gained `set_field_info(pc → (field_index,
+  type_tag))` (an `IrBuilder` field set by the caller before `build`; absent for
+  hand-built/test graphs). The `getfield` (0xb4) arm looks up the pc, bails on an
+  unresolved or non-int-category field, then emits
+  `Op::Load(MemKind::Int)` with inputs `[ctrl, mem, base, Const(field_index)]`
+  (the offset operand is the field index as a `Const`, keeping it visible to a
+  future field-sensitive alias oracle). `aload`/`aload_0..3` were added (a
+  getfield base is just a `NodeId` on the abstract stack). Both bytecode length
+  walkers list `0xb4` (3-byte), `0x19` (2-byte), `0x2a..=0x2d` (1-byte) — without
+  this a branchy/looping getfield method mis-parses the field index as opcodes.
+- **`jit/src/ir_lower.rs`** — a new `Op::Load(_)` arm emits the single-pass inline
+  getfield ABI byte-faithfully: receiver → RAX, `TEST/JE` null guard (null → 0,
+  matching `jit_getfield`'s early return), else `MOVSXD RAX, [RAX +
+  HEADER_SIZE + field_index*SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET]`
+  (sign-extend the 32-bit `Value::Int` payload). Constants come from
+  `cratonvm_types` (same source the single-pass backend uses).
+- **`jit/src/lib.rs`** — the IR branch builds the `pc → (field_index, type_tag)`
+  map from `scan.field_ops` + `cp_field_resolver` and calls `set_field_info`
+  before `build`; an unresolved field is omitted → that getfield bails.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — the harness gained a synthetic-heap-object
+  builder (`make_object`, VM-faithful header + 16-byte `Value` cells) and a field
+  resolver, then **executes** four getfield methods through both backends against
+  real objects: `getfield_simple` (getter), `getfield_two_fields_sum`,
+  `getfield_branch` (field read feeding a conditional + two returns), and
+  `getfield_loop` (getfield in both the loop condition and body, re-read each
+  iteration under loop-carried + memory phis). IR == single-pass == host for all.
+- `jit/src/ir.rs` — `test_ir_getfield_emits_load` (Load with the right base/offset
+  operands) + bail tests (no field info; non-int field).
+- `jit/src/lib.rs` — `step3_getfield_int_routes_through_ir` proves via
+  `IR_LOWER_COMPILES` that an int getfield method actually takes the IR pipeline
+  (not a vacuous single-pass fall-through), and bails without a resolver.
+
+jit lib 794/794, harness 16/16, `cratonvm-vm` builds clean.
+
+**Next** (the rest of the frontier): `putfield` → `Op::Store` (needs scheduler
+memory ordering so a store can't be re-ordered past an aliasing load, plus a
+lowerer helper-call path or an inline tag+payload write), then `new` / `Op::Call`
+— which is also what finally de-latents the inc-4–9 DSE/escape/LICM passes on
+production IR (they only fire once `Store`/`New` exist).
+
+## Increment 15 (step 3 — IR gate relaxation: int-category `putfield` → `Op::Store`) landed
+
+Status: **landed** on `dev`. Second slice of the field/call frontier: an
+int-category `putfield` now lowers to the first real `Op::Store` the production
+IR path emits. Together with inc 14 (`Op::Load`) the IR pipeline now does both
+reads and writes of int fields.
+
+**Memory ordering — the keystone, solved without a new scheduler.** The IR
+threads a single memory-token chain: *every* memory op consumes the current
+token and produces a new one. A `getfield` `Op::Load` now also advances the
+token (`self.mem = load`), and a `putfield` `Op::Store` consumes the prior token
+and becomes the new one. Because the scheduler's within-block order is a
+post-order DFS over **input edges** (`ir_schedule::topo_sort_block`), this chain
+is exactly the dependency that serialises memory ops in program order — RAW
+(load sees a prior store), WAR (a store waits for a prior load of a possibly-
+aliasing location), and WAW are all preserved with no memory-aware scheduler
+pass. (No alias precision yet: the chain is total, conservatively serialising
+even provably-independent accesses; the inc-4–9 alias oracle can refine this
+later.)
+
+**Implementation**
+- **`jit/src/ir.rs`** — `putfield` (0xb5) emits `Op::Store(MemKind::Int)` with
+  inputs `[ctrl, mem, base, Const(field_index), value]`, typed `IrType::Memory`,
+  and sets `self.mem = store`; the `getfield` `Op::Load` now also advances
+  `self.mem`. `0xb5` added to both length walkers. Non-int fields / unresolved
+  layout bail.
+- **`jit/src/ir_optimize.rs`** — `eliminate_dead_nodes` now roots from every
+  `Op::Store` as well as every `Op::Return`. A store is an observable side
+  effect whose memory-token result may be consumed by no one (a pure-write
+  `o.x = v; return v;`), so rooting only from returns would delete it. Strictly
+  additive (a DSE-removed store is already `Op::Dead`).
+- **`jit/src/ir_lower.rs`** — an `Op::Store(_)` arm inlines the
+  `jit_putfield_int` heap write: null receiver → no-op (matching the helper),
+  else write a `Value::Int` cell (discriminant 0 + 32-bit payload, high qword
+  cleared so no stale ref survives — the scalar-replace precedent). The receiver
+  and value are loaded before the null check so the guarded body is a fixed 27
+  bytes (a constant `JE` displacement). Produces no value, so no slot is
+  allocated.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` gains a `putfield_int` stub (so the
+single-pass backend, which lowers an int putfield to `CALL jit_putfield_int`, can
+execute) and a read/write differential that runs **each backend against its own
+fresh object** and compares the return value AND the post-call object state:
+`putfield_then_getfield` (RAW), `getfield_then_putfield` (WAR — proves the store
+waits for the read), `putfield_pure_write` (the store's memory result is unused —
+proves DCE keeps it), and `putfield_two_fields` (WAW + two fields). IR ==
+single-pass == host for all. `jit/src/ir.rs` adds builder tests for store
+emission and for the store's memory input being the prior load.
+
+**Trap recorded** (cost an investigation): a single-pass `putfield` method is
+`needs_heap` (`x64.rs` sets it unconditionally for 0xb5, since a *ref* putfield
+needs the VM pointer for write barriers), which makes the compiled body
+`needs_context` — it takes a hidden VM-context pointer as its first argument. The
+differential harness must invoke single-pass putfield via
+`try_call_with_context(dummy, [obj, …])`, not `try_call([obj, …])`, or the
+receiver lands in the context slot and every arg shifts by one (manifested as a
+`STATUS_ACCESS_VIOLATION` writing through `obj == value`). The inline IR store
+needs no context (`needs_context() == false`), so the harness dispatches on
+`needs_context()`. The int putfield path never dereferences the context pointer,
+so a zeroed dummy buffer suffices.
+
+jit lib 796/796, harness 20/20, `cratonvm-vm` builds clean.
+
+**Next**: `new` / `Op::Call` emission (needs the lowerer to gain
+`JitRuntimeHelpers` access for the allocation/dispatch helper calls), which also
+finally de-latents the inc-4–9 DSE/escape/LICM passes on production IR.
+
+## Increment 16 (Front 3 — EA bridge handles the full-layout Load/Store) landed
+
+Status: **landed** on `dev`. The foundational first piece of the `new`/`Op::Call`
+frontier: the IR→escape-analysis bridge now correctly translates the
+**production** field-access layout, which is the prerequisite for escape analysis
+to ever scalar-replace a non-escaping allocation on real IR.
+
+**The bug it fixes.** `escape_analysis_from_ir` (`lib.rs`) used to copy an IR
+node's inputs verbatim into the EA graph. But the EA graph reads memory operands
+in a **compact** layout (`Store [holder, value]`, `Load [holder]`) keyed by a
+real **field index**, while the production `Op::Load`/`Op::Store` the builder now
+emits (inc 14/15) are **full-layout** (`[ctrl, mem, base, offset, value]`)
+carrying a `MemKind`. Forwarded verbatim, EA read the *holder* from input[0] (the
+control edge) and the field index from the `MemKind` discriminant (always
+`Int`=0). So EA could never match a field store/load to its allocation → it never
+scalar-replaced anything on real IR (silently conservative, hence sound but
+inert).
+
+**What landed** (`jit/src/lib.rs`):
+- `ir_load_store_field_index` recovers the real field index from the `Const`
+  offset operand (input[3]); `escape_analysis_from_ir`'s first pass uses it for
+  the EA `Load`/`Store` op, and the second pass emits the compact operands
+  (`holder = input[2]`, `value = input[4]`). Non-Load/Store nodes are forwarded
+  verbatim; a malformed/compact node yields empty operands EA treats
+  conservatively.
+- `apply_ea_to_ir` now derives the load's field index the same way (real index,
+  `MemKind` fallback) so its `field_values` lookup agrees with the bridge.
+
+**Why this is sound and inert today**: the only full-layout Load/Store in
+production come from int getfield/putfield whose base is a `Param` (escaping), so
+EA still finds nothing scalar-replaceable there — no behaviour change. The fix
+only *enables* scalar replacement for the not-yet-emitted `Op::New` case.
+
+**Tests** (`jit/src/lib.rs`): `ea_bridge_scalar_replaces_full_layout_new_store_
+load` builds a by-hand `o = new Foo(); o.f1 = 42; return o.f1` graph in the
+production layout (field index 1, distinct from `MemKind::Int`=0) and asserts EA
+kills the New/Store/Load and redirects the return to the stored `Const(42)`;
+`ea_bridge_keeps_escaping_new` asserts a returned-by-reference New is NOT
+scalar-replaced (the kafka bug-25 escape rule is preserved). jit lib 798/798,
+field harness 20/20.
+
+**Remaining for the `new` scalar-replacement slice**: see increment 17 (the
+mechanism) below.
+
+## Increment 17 (Front 3 — `Op::New` emission + scalar-replacement mechanism) landed
+
+Status: **landed** on `dev`; **inert in production** (not yet wired — see the
+soundness analysis). The IR builder can now lower `new` to `Op::New` and the EA
+scalar-replaces a non-escaping allocation end-to-end, but the production caller
+does not yet feed the builder the allocation metadata, because eliding a
+constructor soundly needs a signal that does not yet exist.
+
+**What landed** (`jit/src/ir.rs`, `jit/src/lib.rs`):
+- The builder gained `set_new_info(pc → (class_id, num_fields), trivial_init_pcs)`.
+  `new` (0xbb) emits `Op::New { class_id, num_fields }` (inputs `[ctrl, mem]`);
+  `invokespecial` (0xb7) is **elided** iff its pc is in `trivial_init_pcs` AND
+  the receiver on the abstract stack is a fresh `Op::New` we emitted (defence in
+  depth — eliding a `<init>` on `this`/a parameter would skip a real superclass
+  constructor and hide any escape it performs). Any other `invokespecial`, or a
+  `new`/`<init>` without resolved metadata, bails to single-pass. `0xbb`/`0xb7`
+  added to both length walkers.
+- **Surviving-New gate** (`lib.rs`): after escape analysis, if any `Op::New`/
+  `Op::NewArray` is still live (it escaped → was not scalar-replaced), bail to
+  single-pass — the lowerer has no allocation path, so emitting nothing for it
+  would leave a garbage object reference. (Scalar-replaced News are `Op::Dead`.)
+
+**Tests**: `ir_new_scalar_replaces_end_to_end` drives the whole path from
+bytecode (`Foo o = new Foo(); o.x = 42; return o.x`): the builder emits the New
++ elides the `<init>`, `optimize` + EA + `apply_ea_to_ir` scalar-replace it, and
+the return resolves to `Const(42)` with no live New. `ir_new_bails_on_init_of_
+nonfresh_receiver` proves a `super.<init>()` on `this` bails. jit lib 800/800,
+field harness 20/20 (no regression; the gate is inert with no News emitted).
+
+**The `<init>`-soundness analysis (why production wiring is DEFERRED).** Eliding
+`new Foo(); dup; invokespecial Foo.<init>` is sound only if `Foo.<init>` is
+provably **effect-free and does not escape its receiver**. Three hazards, none
+visible from the call site:
+1. **Field initialisers** — `Foo(){ x = 5; }` is a `()V` `<init>` that sets a
+   field; eliding it leaves the scalar slot at the zero default. (For int fields
+   the builder only admits a `new` whose `has_primitive_init == false`, i.e. no
+   non-zero primitive initialiser — but that is a *future* wiring constraint, and
+   reference-field initialisers are irrelevant only because a non-escaping object's
+   unread ref fields are dead.)
+2. **Escape inside the constructor** — `Foo(){ GLOBAL.add(this); }` escapes the
+   object *through the elided body*, which the caller's EA cannot see, so it would
+   wrongly scalar-replace a live, escaped object (the kafka bug-25 class). The
+   surviving-New gate does **not** catch this (the escape is hidden in the elided
+   `<init>`).
+3. **Arbitrary side effects** — a `()V` `<init>` may call other methods / do I/O.
+
+Single-pass treats **any** `()V` `<init>` as trivial (`is_trivial_void_init`,
+`x64.rs`) — an approximation that holds for its targeted patterns but is not
+provably sound. The only `<init>` provably safe to elide from the descriptor/name
+alone is `java/lang/Object.<init>()V` (empty), which scalar-replaces nothing
+useful (no fields). **A sound *and* useful production policy needs either (a) a
+VM-side "trivial constructor" signal — `<init>` only calls `super.<init>()` and
+does zero/default field stores, no escape, no other call — added to
+`cp_new_resolver`, or (b) constructor inlining so the `<init>` body's effects
+become visible IR.** Until one lands, `set_new_info` stays unwired in production
+(the mechanism is proven and ready; activating it on an unsound policy would
+reintroduce exactly the miscompile class this project guards against).
+
+**Next**: the VM-side trivial-constructor signal (smallest sound unlock) OR
+`Op::Call` for real `invoke*` (needs the lowerer to gain `JitRuntimeHelpers`
+access + VM-level differential validation per `wire-tiered-manager`).
+
+## Increment 18 (Front 3 — `apply_ea_to_ir` zero-default for an un-stored field) landed
+
+Status: **landed** on `dev`. A soundness prerequisite for activating scalar
+replacement. `find_scalar_replacements` records `field_values[idx] = None` for a
+field that is **loaded but never stored** (the design intent — "use the object's
+zero default", per `escape_analysis.rs::test_uninitialized_field_returns_none`),
+but `apply_ea_to_ir` only redirected a load when `field_values` was `Some` and
+then killed the load **unconditionally** — so a load of an un-stored field was
+marked `Dead` with **no replacement**, leaving its consumers reading a dead node.
+Fix: when `field_values[idx]` is `None`, materialise a `Const(0)` (the correct
+default for a zero-initialised object's int field) and redirect the load to it.
+Sound only when the object is genuinely zero-initialised — which the eventual
+production caller must enforce (only admit allocations whose constructor sets no
+non-zero field). Test: `ea_unstored_field_load_resolves_to_zero_default`. jit lib
+801/801, field harness 20/20.
+
+## The VM-side trivial-constructor signal — actionable plan (the next sound unlock)
+
+The `Op::New` mechanism (inc 17) + the EA bridge (inc 16) + the zero-default fix
+(inc 18) are all in place; production scalar replacement is one signal away. The
+signal must answer: *is it sound to elide `new C(); dup; invokespecial C.<init>()V`
+and zero-initialise the scalar slots?*
+
+**Do NOT reuse `classify_init_complexity`** (`vm/src/jit/skip_list.rs`). Its
+`Trivial` means "no putfield/putstatic/monitor/invokedynamic" — sound for
+JIT-*compiling* the `<init>`, but it **admits regular calls** (`invokevirtual`/
+`invokestatic`/…). A `()V` ctor `C(){ register(this); }` is `Trivial` by that
+classifier yet escapes the receiver — eliding it would scalar-replace a live,
+escaped object (the surviving-New gate can't see the escape; it's hidden in the
+elided body).
+
+**Sound + simple + useful definition** — an *elidable construction*:
+`C.<init>()V`'s body is exactly `aload_0; invokespecial java/lang/Object.<init>()V;
+return` (bytes `2a b7 XX XX b1`, with `XX XX` resolving to `Object.<init>()V`).
+That is the default empty constructor of a direct `Object` subclass — no field
+stores (object stays zero-initialised → the inc-18 zero-default is correct), no
+escape of `this`, no side effects. Covers the common POJO/data-class case
+(`class Point { int x, y; }`). (A later refinement can recurse the super chain to
+admit non-`Object` supers whose `<init>` is itself elidable.)
+
+**Wiring** (cross-crate; production-activating → needs a soak):
+1. **VM**: an `is_elidable_construction(class_id) -> bool` in
+   `vm/src/runtime/interpreter.rs` near `resolve_jit_new_site` (it has CP +
+   hierarchy access) that checks the `<init>()V` body shape + resolves the
+   `invokespecial` target to `Object.<init>()V`.
+2. **Thread it** as a 5th field of the `cp_new_resolver` tuple
+   (`(class_id, num_fields, has_prim_init, has_finalizer, is_elidable)`) — the
+   least-disruptive option (one closure signature, ~3 call sites: interpreter.rs,
+   tiered.rs, the lib.rs consumer + the harness/in-crate test pass dummies).
+3. **lib.rs** (IR branch): build `new_info` from `scan.new_ops` (all news), and
+   `trivial_init_pcs` by linking each `new` (pc P, `is_elidable`) to the
+   `invokespecial <init>` that consumes its receiver — the canonical
+   `new@P; dup; invokespecial@P+? ` pair (match by the invoke immediately
+   following the new+dup, or resolve the invoke's class == the new's class).
+   Call `builder.set_new_info(new_info, trivial_init_pcs)`.
+4. **Gate behind a default-OFF soak flag** (e.g. `CRATONVM_JIT_SCALAR_NEW`, like
+   `CRATONVM_JIT_LICM`) so it lands inert and the production flip waits on a
+   **bt18 (== 68332206) + gauntlet soak** — it changes production scalar
+   replacement, the kafka-bug-25-sensitive area.
+5. **Validation**: the differential harness already validates scalar replacement
+   (a non-escaping `new` folds to pure-int → IR == single-pass == host); add a
+   `new`-bearing case once the resolver is wired. The surviving-New gate (inc 17)
+   + the zero-default (inc 18) + the receiver-is-New check (inc 17) are the
+   safety net.
+
+## Increment 19 (Front 3 — VM-side trivial-constructor signal wired, soak-gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_SCALAR_NEW`**.
+Production scalar replacement of `new` is now fully wired end-to-end (VM analysis →
+resolver → `lib.rs` → builder → EA), but stays inert until the soak flag is set,
+because flipping it on changes production scalar replacement (the
+kafka-bug-25-sensitive area) and must clear a bt18 + gauntlet soak first.
+
+**What landed**
+- **VM** (`vm/src/runtime/interpreter.rs`): `is_elidable_construction(cm,
+  class_id)` — true iff the class's `<init>()V` body is exactly `aload_0;
+  invokespecial java/lang/Object.<init>()V; return` (the empty default
+  constructor of a direct `Object` subclass: no field initialiser → object stays
+  zero-initialised, no escape of `this`, no side effect). `resolve_jit_elidable_
+  init(cm, holder, invoke_cp_idx)` resolves an `invokespecial` methodref and
+  applies that check. Deliberately stricter than `classify_init_complexity`'s
+  `Trivial` (which admits calls that can escape the receiver — unsound to elide).
+- **JIT** (`jit/src/lib.rs`): a new `try_compile` parameter
+  `cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>`. When supplied, the
+  IR branch builds `new_info` (from `cp_new_resolver`) + `trivial_init_pcs` (the
+  `invokespecial` pcs the resolver marks elidable) and calls
+  `builder.set_new_info`. `None` (the default) leaves it off — the builder bails
+  on `new`/`invokespecial`, single-pass as before.
+- **VM call sites**: each of the three `try_compile` sites builds the elidable
+  resolver and passes it **only when `CRATONVM_JIT_SCALAR_NEW` is set**, else
+  `None`. So production is inert by default.
+
+**Tests**: `scalar_new_wiring_routes_through_ir_only_with_resolver` (a
+`new Foo(); o.x=42; return o.x` method routes through the IR pipeline —
+`IR_LOWER_COMPILES==1` — only with the resolver; without it, counter stays 0).
+jit lib 802/802, field harness 20/20, `cratonvm-vm` builds clean. (Combined with
+the inc-17 end-to-end builder test proving the graph folds to `Const(42)` and the
+inc-18 zero-default, the path is covered down to the machine-code level.)
+
+**To soak / flip on** (the remaining production-validation step):
+1. Run with `CRATONVM_JIT_SCALAR_NEW=1` on the app gauntlet (kafka / spring /
+   tomcat / hibernate suites) + `bt18` (must stay `== 68332206`; bintrees' own
+   `TreeNode(left,right)` ctor is arg-bearing so NOT elidable → bt18 only checks
+   the flag-on path doesn't regress, it doesn't exercise scalar-new). A targeted
+   probe (`new`-heavy default-ctor POJOs, non-escaping) exercises the new path —
+   compare its output to HotSpot.
+2. Watch for the kafka-bug-25 class: an object that escapes via an elided
+   constructor body. The `Object.<init>`-only restriction makes the elided body
+   provably empty, so this is structurally excluded — but the soak is the proof.
+3. Once clean, default the flag on (or remove it) and re-run the gauntlet +
+   bt10/14/16/18 checksums, per step 8.
+
+**Next refinements** (after the flag flips clean):
+- Recurse the super chain in `is_elidable_construction` to admit non-`Object`
+  supers whose `<init>` is itself elidable (covers deeper hierarchies).
+- `Op::Call` for real `invoke*` — the remaining big lever (lowerer needs
+  `JitRuntimeHelpers` access + VM-level differential validation per
+  `wire-tiered-manager`).
+
+## Increment 20 (Front 3 — `astore` gap fixed + `new` scalar replacement default-ON) landed
+
+Status: **landed** on `dev`. Closes Gap A of the scalar-new handoff, but the
+headline is a **latent-bug fix**: `new` scalar replacement (inc 17–19) was
+**completely inert on real bytecode** — it never fired once outside the unit
+tests — and the soak that was supposed to prove it (inc 19's "POJO probe ==
+HotSpot") was **vacuous**: a non-escaping POJO produces the same result whether
+or not it is scalar-replaced, so "== HotSpot" passed while the optimization did
+nothing.
+
+**Root cause (the `astore` gap).** The IR builder (`jit/src/ir.rs`) lowered
+`aload`/`aload_0..3` (read a reference local) but had **no `astore` handler**.
+Real javac compiles `Foo o = new Foo()` as `new; dup; invokespecial <init>;
+astore_N` — it stores the fresh object into a local. With no `astore` arm, the
+builder hit its `_ => return None` catch-all on *every* allocation method and
+bailed to single-pass — so `Op::New` was emitted, the `<init>` elided, but the
+method never reached escape analysis. The inc-17 end-to-end unit test passed
+only because it hand-builds bytecode that keeps the ref on the *stack* via `dup`
+(`new; dup; invokespecial; dup; …`), never exercising `astore`. **Lesson: a
+"== reference output" probe cannot validate an optimization whose presence is
+output-invariant; assert the optimization *fired* (here via a
+`CRATONVM_DBG_SCALAR_NEW` live-fire diagnostic), not just that the result
+matches.**
+
+**What landed**
+- **`jit/src/ir.rs`** — the builder now lowers `astore` (0x3a) and
+  `astore_0..3` (0x4b..=0x4e), mirroring `istore` exactly (a reference is just a
+  `NodeId` slot in the abstract locals array, per the existing `aload` comment).
+  Both bytecode length walkers (`find_branch_targets`, `find_loop_headers`) list
+  `0x4b..=0x4e` (1-byte) and `0x3a` (2-byte). This widens the IR path generally
+  (it also un-bails the already-default-on int `getfield`/`putfield` path when a
+  ref base arrives via a local), not just scalar-new.
+- **`vm/src/runtime/interpreter.rs`** — `CRATONVM_JIT_SCALAR_NEW` flipped from
+  opt-in to **default-ON** at all three `try_compile` sites
+  (`std::env::var(..).map_or(true, |v| v != "0")`); `CRATONVM_JIT_SCALAR_NEW=0`
+  is the opt-out safety net (restores single-pass for `new`-bearing methods). The
+  noisy debugging `is_elidable_construction` print was removed.
+- **`jit/src/lib.rs`** — a focused `CRATONVM_DBG_SCALAR_NEW` diagnostic: for an
+  allocation method it reports `scalar-replaced N/M alloc(s)` (proves the path is
+  non-vacuously exercised) and flags an allocation method that bailed the IR
+  builder (the signal that surfaced this very gap).
+
+**Soundness of the widening**: `astore` itself is a trivial slot assignment; the
+builder still bails (`None` → single-pass) on any opcode it can't lower, so the
+newly-admitted methods are exactly those whose every op is already validated
+(int arithmetic/branches/loops + int `getfield`/`putfield` + elidable-`new`).
+The escape rules (Return→GlobalEscape, Call-arg→ArgEscape, store-value→bail) and
+the surviving-`New` gate are unchanged.
+
+**Tests**
+- `jit/src/lib.rs::ir_new_scalar_replaces_through_astore_local` — the inc-17
+  end-to-end fold, but through an `astore`/`aload` local (the real javac shape):
+  `new Foo(); o.x=42; return o.x` folds to `Const(42)`. This is the regression
+  guard the inc-17 dup-only test could not be.
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_getfield_via_astore_local` —
+  an `astore`/`aload` round-trip on the int-field path executes identically
+  (IR == single-pass == host).
+
+**Validation** (worktree `CratonVM-irnew`, branch `feat/ir-scalar-new-flip`,
+binary `cratonvm-irnew.exe`):
+- jit lib 803/803, differential harness 21/21; `cratonvm-vm` builds clean; clippy
+  neutral (the 10 pre-existing jit clippy errors are all in `deopt.rs`/`x64.rs`,
+  none in the changed files).
+- bt10/14/16/18 == HotSpot (`135854 / 3222190 / 14985902 / 68332206`) with the
+  flag default-ON **and** with `CRATONVM_JIT_SCALAR_NEW=0`; no timing regression
+  (a controlled bt16 A/B vs the old dev binary was within noise — the new
+  binary, opt-out, and old dev binary all ~6.9 s).
+- `scratch/scalarnew/ScalarNew.java` (pure-int POJO probe: straight-line,
+  loop, conditional-alloc, escaping-via-return) == HotSpot, **and** the
+  `CRATONVM_DBG_SCALAR_NEW` diagnostic confirms `oneShot`/`sumPoints`/`sumBoxes`
+  scalar-replace `1/1`, while the escaping helper correctly bails. (Pure-int is
+  mandatory: a `long` accumulator makes the whole method category-2 →
+  single-pass, which is what made the *original* probe vacuous twice over.)
+
+**Next**: recurse the super chain in `is_elidable_construction` (deeper
+hierarchies than direct-`Object` POJOs); `Op::Call` for real `invoke*`
+(Gap B — the remaining big lever).
+
+## Increment 21 (Gap B — `Op::Call` for int `invokestatic`, gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_CALL`**. The
+remaining big lever — the IR builder emits a real method call. This first slice
+covers **`invokestatic` with int-only args + an int/void return, in an oop-free
+method**, dispatched through the existing `jit_invoke_dispatch` helper (the same
+ABI single-pass uses). It lands inert (gated off) + validated; flipping it on is
+a soak follow-up (like inc 19→20 for scalar-new).
+
+**The GC-safety insight that scopes the slice.** The IR path was GC-safe only
+because it had **no calls and no real allocations → no safepoints → GC never
+runs mid-method**, so the lowerer needs no oop maps (it has none). A call is a
+safepoint (GC can run in the callee), so any object reference live across it
+would need a GC root map. Rather than build oop maps, this slice restricts to a
+**provably oop-free method**: no getfield/putfield (a ref receiver), no
+getstatic/putstatic, no `new`, no array allocation, all parameters primitive,
+and every invoke an int-only `invokestatic`. Then *no* object reference exists in
+the frame at all, so a GC at the call has no roots here to find — sound without
+an oop map. (Virtual/special/interface dispatch — inline caches — and
+oop-across-call GC maps are the follow-ups.)
+
+**What landed**
+- **`jit/src/ir.rs`** — `Op::Call { info_ptr }` carries the leaked
+  `JitInvokeInfo` address. The builder lowers `invokestatic` (0xb8) to `Op::Call`
+  (inputs `[ctrl, mem, args…]`), pops the args, pushes the result for a non-void
+  call, and threads the memory token (a call is a hard barrier — it consumes the
+  prior token and becomes the new one, like `Op::Load`/`Store`). `0xb8` added to
+  both length walkers. `set_invoke_info(pc → (info_ptr, num_args, returns_value))`
+  is the wiring hook; an `invokestatic` pc not present bails to single-pass.
+- **`jit/src/ir_lower.rs`** — the lowerer gained `JitRuntimeHelpers` access and an
+  `Op::Call` arm that marshals the Java args into a frame staging region, sets the
+  four helper register args `(vm_ptr, info_ptr, args_ptr, num_args)`, `CALL`s
+  `invoke_dispatch`, and emits the `i64::MIN` exception sentinel check (`JE` →
+  a shared bail stub that returns the sentinel so the VM takes the pending
+  exception — the single-pass protocol). A method with an `Op::Call` is
+  `needs_context`: the prologue takes the VM pointer in ABI[0] and shifts the
+  Java params; `cm.needs_context` + `cm.has_dispatch` are set (the latter makes
+  the VM wrap the call in `set_jit_thread` + `catch_unwind` and drain the pending
+  exception). Bails (single-pass) if `1 + num_params` exceeds the ABI registers.
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_calls`. When on,
+  the IR branch checks the oop-free gate (`descriptor_has_ref_params` +
+  `static_call_int_shape` + empty field/static/new/array scans), builds the leaked
+  `JitInvokeInfo` boxes for the invokestatic sites, calls `set_invoke_info`, and
+  attaches the boxes/strings to the returned `CompiledMethod` (so the baked
+  `info_ptr`s outlive the code) + sets `has_dispatch`. `CRATONVM_DBG_IR_CALL`
+  reports the emitted-call count per method.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_calls` from `CRATONVM_JIT_IR_CALL` (default-OFF). No other VM change
+  needed: the cache already populates `needs_heap` from `compiled.needs_heap()`,
+  so an `Op::Call` method is correctly invoked via `try_call_with_context`.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — a real stub `invoke_dispatch` (the handoff's
+  "direct static call" option) lets the IR-emitted call actually RUN:
+  `invokestatic_two_int_args` (order/count/value-sensitive marshalling +
+  `needs_context`), `invokestatic_three_args_and_arith` (3 args, result feeds
+  arithmetic), `invokestatic_exception_sentinel` (`i64::MIN` → bail).
+- `jit/src/lib.rs::ir_call_wiring_routes_through_ir_only_with_flag` — proves the
+  IR path FIRES (`IR_LOWER_COMPILES==1`) only with `ir_emit_calls`, and bails
+  (==0) without it. This guards against a **vacuous** validation: single-pass
+  ALSO dispatches `invokestatic` correctly, so result-equality alone (the harness)
+  would not prove the IR path ran — the inc-20 "vacuous soak" lesson applied.
+
+**Validation**: jit lib 804/804, differential harness 24/24, `cratonvm-vm` builds
+clean. Live probe `scratch/ircall/IrCall.java` (a hot oop-free method with three
+int `invokestatic` calls in a loop) == HotSpot (`23762906400000`) with the gate
+OFF **and** ON, and `CRATONVM_DBG_IR_CALL` confirms it emits 3 `Op::Call`s (the
+path fires). bt10/14/18 == HotSpot gate-OFF and gate-ON; 4 bench programs
+(`FieldCheck`/`IntegrationTest`/`GenPair`/`Benchmark`) == HotSpot gate-ON.
+
+**To soak / flip on** (the remaining production-validation step, like inc 19→20):
+1. Run `CRATONVM_JIT_IR_CALL=1` on the app gauntlet (kafka/spring/tomcat/
+   hibernate) + bt10/14/16/18, watching for any dispatch/exception/GC divergence.
+2. Flip the default (or remove the gate) once clean.
+
+**Next refinements** (after the flag flips clean): see increment 22 (oop-free
+restriction lifted), then `invokespecial`/virtual dispatch and category-2 args.
+
+## Increment 22 (Gap B — oop-free restriction lifted: oops live across `Op::Call`) landed
+
+Status: **landed** on `dev`, still under `CRATONVM_JIT_IR_CALL` (default-OFF).
+Removes the inc-21 "oop-free method only" gate: an `invokestatic` `Op::Call` may
+now have **reference parameters, reference call arguments, reference returns, and
+int field ops** (a ref receiver) — i.e. object references *live across the call*.
+
+**Why it's GC-sound without oop maps** (the key finding). The IR lowerer spills
+every value to a frame slot — it keeps **no oop in a register across a call**
+(unlike single-pass, the source of the A2/A3 register-root UAFs). `JitEntryGuard`
+**conservatively scans** the IR frame's slots `[rsp, entry_sp)` at every
+safepoint, and the GC is forced **non-moving while any JIT frame is active**
+(`gc_quiescence`), so a pointer found in a slot is **pinned, never relocated** —
+a false positive (an `i64` that looks like a pointer) is harmless, and a real
+reference live across the call is neither moved nor reclaimed. No precise oop map
+is required. (Single-pass needs precise maps because it keeps oops in registers;
+the IR lowerer's spill-everything model is exactly what makes the conservative
+scan sufficient here.)
+
+**What landed**
+- **`jit/src/lib.rs`** — the gate dropped from "oop-free" to just
+  `new_ops.is_empty() && anewarray_ops.is_empty()` (a surviving `New` still has
+  no lowering; array ops bail the builder). `static_call_int_shape` →
+  `static_call_shape`: accepts reference args (`L…`/`[…`, passed as the raw
+  pointer in one GPR slot) and an int/void/**reference** return; still rejects
+  `long`/`float`/`double` (category-2 / XMM). The per-call tuple now carries the
+  return-type byte. `descriptor_has_ref_params` removed.
+- **`jit/src/ir.rs`** — `set_invoke_info` carries `ret_type`; the `Op::Call`
+  result is typed `IrType::Ref` for an `L`/`[` return (so a returned reference
+  flows correctly into a following `astore`/field-load/next-call), else
+  `IrType::Int`.
+- No lowerer change: the existing `Op::Call` marshalling stores each arg (int or
+  pointer) as one i64 to the staging region; the conservative scan covers both
+  the spilled args and the live references.
+
+**Validation** (the GC-correctness claim is proven *empirically*, per the
+project's hard-won lesson that this area needs real GC stress, not theory):
+- jit lib 804/804, differential harness 25/25 (adds
+  `invokestatic_reference_arg`: a synthetic object passed as a ref arg, the stub
+  reads a field off the marshalled pointer).
+- **GC-stress probe** `scratch/ircall/IrCallGc.java`: `process(Node a, Node b)`
+  holds two references live across two `invokestatic` calls into an
+  allocation-heavy callee; `main` passes freshly-made nodes directly so a/b are
+  rooted **only** via the IR frame. == HotSpot (`2721637800000`) gate OFF and ON,
+  4× deterministic at 64m, **and under `CRATONVM_DBG_GC_STRESS=1`** (a young GC
+  on *every* allocation → GC fires constantly mid-call while a/b are live). The
+  references survive — the conservative IR-frame scan roots them correctly under
+  maximal GC frequency.
+- No regression: at every heap size the IR-call path is **GC-behavior-identical
+  to single-pass** (both complete ≥64m, both fault <64m — the sub-64m fault is a
+  *pre-existing, backend-independent* VM robustness gap: CratonVM faults instead
+  of throwing `OutOfMemoryError` at a too-small heap, where HotSpot's GC keeps up
+  at 32m; spun off as a separate task). bt14/18 == HotSpot gate-ON; the oop-free
+  `IrCall` probe == HotSpot gate-ON.
+
+**To soak / flip on**: same as inc 21 — run `CRATONVM_JIT_IR_CALL=1` on the app
+gauntlet + bt checksums, then flip. The widened scope (oops across calls) makes
+the gauntlet soak more important before flipping.
+
+**Next refinements**: `invokespecial` of a statically-resolved target (now
+unblocked — the receiver oop is handled by the same conservative scan);
+long/float/double args + return (category-2 / XMM marshalling — gated on the IR
+path handling category-2 values, which `method_uses_category2` currently
+excludes); virtual/special/interface dispatch via inline caches (the
+bug-24-sensitive area).
+
+## Increment 23 (Gap B — `CRATONVM_JIT_IR_CALL` flipped default-ON) landed
+
+Status: **landed** on `dev`. Closes Gap B's production-validation step: the
+`Op::Call` path for `invokestatic` (inc 21 + the oops-across-call widening of
+inc 22) is now the **default**, with `CRATONVM_JIT_IR_CALL=0` as the opt-out
+safety net (restores single-pass dispatch for `invokestatic`-bearing methods).
+This is the inc-19→20 pattern applied to Gap B: the feature landed inert and
+soak-gated; this increment is the soak + flip.
+
+**What landed** (`vm/src/runtime/interpreter.rs`): the three `try_compile` call
+sites that fed `ir_emit_calls` from `std::env::var_os("CRATONVM_JIT_IR_CALL")
+.is_some()` (default-OFF) now read
+`std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0")` (default-ON,
+`=0` opt-out) — byte-for-byte the scalar-new flip (inc 20). No other change; the
+inc-21/22 machinery (`Op::Call` lowering, the oop-free→oops-across-call gate, the
+conservative IR-frame GC scan) is unchanged.
+
+**The soak (the gating prerequisite).** Because the gate is a *runtime* env var,
+the post-flip default and the opt-out are the SAME binary toggled by the var, so
+one release build validated both. The decisive invariant is **gate-ON ≡ gate-OFF
+on every check** — the flip only changes a default, so any ON≠OFF would be the
+flip's fault, and there were none:
+
+- **bt10/14/16/18** == HotSpot (`135854 / 3222190 / 14985902 / 68332206`)
+  gate-ON (default) **and** gate-OFF (`=0`).
+- **IR-call probes** (`scratch/ircall/`, gitignored): `IrCall` ==
+  `23762906400000`, `IrCallGc` == `2721637800000` (including under
+  `CRATONVM_DBG_GC_STRESS=1` — a young GC on every allocation, the maximal
+  oops-across-call stress for inc 22), `IrCallGcCatch` large-heap == `completed
+  total=272016378000000` — all == HotSpot, gate-ON and gate-OFF.
+- **~20-program bench differential** (gate-ON vs gate-OFF, timing masked,
+  cross-checked to HotSpot): `binarytrees`, `fannkuch`, `IntegrationTest`,
+  `GenPair`, `FieldCheck`, `NBody3D`, `Benchmark` (all 10 kernel checksums),
+  `QuickBench`, `MatrixJIT`, `MatrixScale`, `IntrinsicBench` (checksums),
+  `FullStackBench`, `TestLambda`/`TestStream`/`TestSwitch`/`TestEnum`/
+  `TestGenerics` — all **ON==OFF==HotSpot**.
+- **jit lib 804/804**, **`ir_vs_singlepass` 25/25**, release VM build clean.
+
+**The one non-match is pre-existing and orthogonal.** `NBodyMini` prints a `double`
+in plain-decimal where HotSpot uses scientific notation
+(`0.000000000018033933843323614` vs `1.8033933843323614E-11`) — *value-identical*,
+reproduced by the pre-flip `dev` binary, and unrelated to `invokestatic` dispatch
+(it is a `Double.toString` notation gap). Gate-ON == gate-OFF on it, so the flip
+did not cause or change it.
+
+**Scope note (why the gauntlet risk is bounded).** The IR_CALL path fires only on
+`invokestatic` with int/ref (not category-2) args+return in a method with no
+`new`/`anewarray`. `long`/`float`/`double`-bearing hot methods (e.g.
+`QuickBenchLong`) bail via `method_uses_category2`, and virtual/special/interface
+dispatch never takes this path — so most real-app hot methods bypass it entirely.
+The full kafka/spring/tomcat/hibernate suites were **not** re-run here (heavy; the
+narrow slice rarely fires); the GC-stress oops-across-call probe is the targeted
+proof of the inc-22 risk, and `=0` remains the opt-out if a suite ever regresses.
+
+**Next refinements** (unchanged from inc 22, now the live frontier):
+`invokespecial` of a statically-resolved target; category-2 (long/float/double)
+args + return; virtual/special/interface dispatch via inline caches.
+
+## Increment 24 (Gap B — `invokespecial` → `Op::Call`, gated) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_CALL_SPECIAL`**.
+Extends the `Op::Call` lever from `invokestatic` (inc 21/22/23) to a resolved
+**non-`<init>` `invokespecial`** — a `super.m(…)` / private / otherwise
+non-virtual instance call. It lands inert + validated (unit + differential +
+live soak); flipping it on is a follow-up (like inc 21→23 for invokestatic),
+gated on the broader app-gauntlet soak since it would put a dispatch path live by
+default.
+
+**Why it's a small, sound extension.** `invokespecial` is *statically resolved*
+(no virtual dispatch), so it reuses the entire `invokestatic` machinery — the
+`Op::Call` node, the `ir_lower` `Op::Call` arm, the `invoke_dispatch` ABI, the
+leaked `JitInvokeInfo`, and the conservative IR-frame GC scan — with exactly two
+deltas: the **receiver is marshalled as arg0** (`num_jit_args = 1 + descriptor
+args`) and the `JitInvokeInfo` carries **`invoke_kind = 1`** so `invoke_dispatch`
+does the non-virtual dispatch to the resolved target. Both are precisely what the
+single-pass backend already does for `invokespecial` (`invoke_kind` 1, receiver
+included), so the IR path produces byte-identical dispatch arguments.
+
+**GC-safety** is the inc-22 argument unchanged: the IR lowerer spills every value
+to a frame slot (no oop in a register across a call), the GC is non-moving while a
+JIT frame is active, and `JitEntryGuard` conservatively scans the frame slots at
+every safepoint — so the receiver oop (and any reference args) live across the
+call are pinned, never reclaimed or relocated. No oop map needed.
+
+**What landed**
+- **`jit/src/ir.rs`** — the `invokespecial` (0xb7) arm gains an `Op::Call` path:
+  if the pc is in `invoke_info` (the caller populated it), lower exactly like
+  `invokestatic` (pop `num_args`, thread the memory token, push a non-void
+  result); otherwise fall through to the existing elidable-`<init>` elision. A pc
+  in neither bails to single-pass. (The two are mutually exclusive: a `<init>`
+  method has a `new` → not call-eligible.)
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_special_calls`.
+  The Gap-B gate now admits `invokestatic` (under `ir_emit_calls`) **and**
+  non-`<init>` `invokespecial` (under `ir_emit_special_calls`); for a special
+  call it sets `num_args = static_call_shape(desc) + 1` (the receiver) and
+  `invoke_kind = 1`. `static_call_shape` still rejects category-2 args/returns, so
+  only int/reference receivers+args+returns are admitted (the receiver is always a
+  reference → one GPR slot).
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_special_calls` from `CRATONVM_JIT_IR_CALL_SPECIAL` (default-OFF). No
+  other VM change (the cache already routes `Op::Call` methods via
+  `try_call_with_context`).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokespecial_instance_call` —
+  **executes** the IR-emitted call: `int f(Corpus o, int n){ return o.g(n); }`
+  via `invokespecial` to `g(I)I`, with a stub `invoke_dispatch` that reads field 0
+  off the marshalled receiver pointer and returns `recv.x + n`. IR == host across
+  sign/zero edge cases — proves receiver-first marshalling, `num_jit_args = 2`,
+  and `needs_context` at the machine-code level.
+- `jit/src/lib.rs::ir_special_call_wiring_routes_through_ir_only_with_flag` —
+  crosses the two flags (`ir_emit_calls` off, `ir_emit_special_calls` on, and vice
+  versa) to prove `invokespecial` routes through the IR pipeline (`IR_LOWER_
+  COMPILES == 1`) **iff** `ir_emit_special_calls` is on — independent of the
+  invokestatic gate. Guards against a vacuous validation (single-pass also
+  dispatches `invokespecial`).
+- jit lib **816/816**, differential harness **26/26**, `cratonvm-vm` builds clean.
+
+**Live soak** (worktree `CratonVM-irspecial`, `CRATONVM_JIT_IR_CALL_SPECIAL`
+toggled; the gate is a runtime env var so one build validates both paths):
+- `scratch/irspecial/IrSpecial.java` (a hot `f` whose only invokes are
+  `super.add`/`super.poly` → real `invokespecial`) == HotSpot (`1442980800000`)
+  gate-ON **and** gate-OFF, and `CRATONVM_DBG_IR_CALL` confirms the path fires
+  (non-vacuous — `super.*` is the reliable non-`<init>` `invokespecial` source
+  since modern javac compiles private-method calls as `invokevirtual`).
+- `scratch/irspecial/IrSpecialGc.java` (the receiver `this` + two `Node` refs live
+  across two allocation-heavy `super.consume` `invokespecial` calls, rooted only
+  via the IR frame) == HotSpot (`2721637800000`) gate-ON and gate-OFF at `-Xmx`
+  4g/8g **and** under `CRATONVM_DBG_GC_STRESS=1` at 2g (a young GC on every
+  allocation → constant GC mid-`invokespecial` while the refs are live). The
+  conservative IR-frame scan roots the receiver + ref args under maximal GC
+  frequency. (At `-Xmx 2g` without GC-stress the heavy allocator faults with empty
+  output **identically gate-ON and gate-OFF** — the inc-22-documented pre-existing
+  small-heap robustness gap, backend-independent, not from this change.)
+- No regression with `CRATONVM_JIT_IR_CALL_SPECIAL=1`: bt10/14/16/18 == HotSpot
+  (`135854 / 3222190 / 14985902 / 68332206`) and the invokestatic `IrCall` probe
+  == HotSpot (`23762906400000`) — the special gate does not perturb the
+  invokestatic path or the GC checksums.
+
+**To soak / flip on** (the remaining production step, like inc 21→23): run
+`CRATONVM_JIT_IR_CALL_SPECIAL=1` across the kafka/spring/tomcat/hibernate gauntlet
++ bt checksums, then default the flag on. The widened reach (every `super.`/
+non-virtual instance call, receiver oop live across the call) makes the gauntlet
+soak the gating step before the flip.
+
+**Next refinements**: category-2 (long/float/double) args + return (XMM
+marshalling, gated on the IR path handling category-2 values); virtual /
+interface dispatch via inline caches (the bug-24-sensitive area).
+
+## Increment 25 (category-2 foundation — `long` arithmetic on the IR path) landed
+
+Status: **landed** on `dev`, **default-OFF behind `CRATONVM_JIT_IR_LONG`**. The
+first slice of the category-2 (64-bit value) foundation the "next refinements"
+above are gated on. Until now the IR pipeline typed every value as 32-bit `Int`
+and `method_uses_category2` bailed the *whole* pipeline on any `long`/`double`
+opcode (so even pushing a long needed `lload`, which bailed). This slice admits
+**long-arithmetic leaf methods** to the optimizing IR path.
+
+**Key finding — most of the machinery already existed.** The IR builder already
+lowers `ladd`/`lsub`/`lmul`/`lneg`/`i2l`/`l2i`/`lconst`/`lload_0..3`/
+`lstore_0..3`/`lreturn` to `IrType::Long` nodes, and the lowerer already emits
+correct 64-bit code for them (`ADD/SUB/IMUL/NEG` with `REX.W`, `Op::I2L`=MOVSXD,
+`Op::L2I`=MOV EAX,EAX, `Op::Const(Long)`=`MOV RAX,imm64`, `Return`=RAX). It was
+**dammed** by two things, both fixed here:
+1. **The cat-2 gate** bailed before the builder ran.
+2. **The two-slot parameter layout was wrong.** `IrBuilder::new` types every
+   `Param` `Int` and packs them one-per-slot (`Param(i)` at `locals[i]`). But a
+   `long`/`double` occupies **two** JVM local slots, so `(long a, long b)` reads
+   `b` via `lload_2` — and `locals[2]` was empty (b had been placed at
+   `locals[1]`). The result was a silent miscompile of every multi-long-param
+   method.
+
+**What landed**
+- **`jit/src/ir.rs`** — `IrBuilder::set_param_types(&[IrType])` re-lays-out the
+  parameter locals with the JVM two-slot convention (a `long`/`double` param
+  advances the slot cursor by 2) and types each `Param` from the descriptor. The
+  `Param` node *index* stays the JIT-arg index (the lowerer reads param `i` from
+  prologue slot `(i+1)*8` — one register per parameter, unchanged); only the
+  `locals` placement and node type change.
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_long`. When on,
+  the gate is relaxed to admit a method that uses `long` **iff** it is (a)
+  double/float-free (`method_uses_double`) and (b) int-`idiv`/`irem`-free
+  (`method_has_int_div`). The latter keeps a `long` value off a deopt point
+  (the div guard's resume cannot yet reconstruct a `long` slot — a follow-up, the
+  same deferral the FP-slot resume already documents), so a `long` is only ever
+  live in a safepoint-free leaf. `ir_param_types(descriptor, is_static)` computes
+  the JIT-arg-order types fed to `set_param_types`. A `CRATONVM_DBG_IR_LONG`
+  diagnostic prints when a long method actually takes the IR path (the
+  non-vacuity proof for the live soak). Unhandled long opcodes (`ldiv`/`lrem`,
+  `lshl`/`land`/…, `lcmp`, `ldc2_w`, wide `lload`/`lstore`) still hit the
+  builder's catch-all and bail to single-pass — the safe fallback.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_long` from `CRATONVM_JIT_IR_LONG` (default-OFF).
+
+**Soundness.** `set_param_types` is only invoked when `ir_emit_long` is on, and
+for an all-category-1 signature it reproduces the existing one-slot layout
+exactly (inert). The relaxation is double/float- and int-div-free, so the only
+new methods admitted are long-arithmetic leaves the builder fully lowers; the
+64-bit lowering was already proven by the single-pass long path it mirrors.
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs` — four executing differentials (full i64):
+  `ir_vs_singlepass_long_add` (64-bit wrap + a genuinely-64-bit add a 32-bit op
+  would truncate), `…_long_two_slot_params` (`a*b-b` via `lload_2` — the layout
+  fix), `…_long_mixed_int_long_param` (`int a` at slot 0, `long b` at slots 1-2),
+  `…_long_to_int_return` (`l2i` truncation). IR == single-pass == host.
+- `jit/src/lib.rs::ir_long_wiring_routes_through_ir_only_with_flag` — proves a
+  long method routes through the IR pipeline (`IR_LOWER_COMPILES == 1`) **iff**
+  `ir_emit_long` is on (guards against a vacuous single-pass fall-through).
+- jit lib **819/819**, differential **30/30**, `cratonvm-vm` builds clean.
+
+**Live soak** (worktree `CratonVM-irlong`, `CRATONVM_JIT_IR_LONG` toggled):
+- `scratch/irlong/IrLong.java` (`mix` — a pure long leaf; `loop` — a long
+  accumulator with an int-counter loop, both slots 0-3 / short forms) == HotSpot
+  (`3588644437398634000`) gate-ON **and** gate-OFF, and `CRATONVM_DBG_IR_LONG`
+  confirms **both** methods take the IR path (2 emit lines — non-vacuous).
+- No regression with `CRATONVM_JIT_IR_LONG=1`: bt10/14/16/18 == HotSpot
+  (`135854 / 3222190 / 14985902 / 68332206` — bt is long-heavy, so a long
+  miscompile would move the checksum), and the invokestatic `IrCall` probe ==
+  HotSpot (`23762906400000`, no cross-gate interference).
+
+**Limitations (this is a first slice) / next sub-slices**, in rough order:
+wide `lload`/`lstore` (slots ≥ 4) and `ldc2_w` (long constants); `lcmp` +
+long-fed branches; `lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (need
+the long deopt-resume so a `long` can be live at the div guard); then the
+**`double`/`float`** half (XMM registers + FP-slot deopt resume); and finally
+**long/double *call* args + returns** (`static_call_shape` category-2 marshalling
+— the original "category-2 call args" item, now unblocked at the value level).
+## Increment 26 (Gap B — `invokevirtual`/`invokeinterface` → `Op::Call`, gated) landed
+
+Status: **landed**, **default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL`**. Extends
+the `Op::Call` lever from static (inc 21–23) + special (inc 24) to **dynamic
+dispatch** — `invokevirtual` (0xb6) and `invokeinterface` (0xb9). It lands inert
++ validated (unit + differential); flipping it on is a follow-up (like inc 21→23),
+gated on the broader app-gauntlet soak since it puts a *polymorphic* dispatch path
+live by default.
+
+**Why it is sound without an inline cache.** The crucial design point: the
+generic `jit_invoke_dispatch` helper (`vm/src/jit/helpers.rs`) — already baked
+into every `Op::Call` and already used by the static/special path — **already
+handles `invoke_kind` 0 (virtual) and 2 (interface)**. For those kinds it routes
+through `bail_to_interpreter` → `virtual_dispatch_class` (the receiver's *runtime*
+class) → `invoke_or_native`, i.e. a full vtable/itable resolution on the receiver.
+So the IR path emits **no inline cache** (MIC/PIC) in the generated code — it bakes
+the static call-site `class/name/descriptor` into the `JitInvokeInfo` and lets the
+helper resolve the real target each call. This **structurally sidesteps the bug-24
+inline-cache-slot UAF** (an inline-cache concern that does not exist on this path)
+at the cost of a per-call dispatch (an inline-cache fast path is a later perf
+refinement, not a correctness prerequisite). The deltas vs. inc 24 are exactly:
+`invoke_kind = 0`/`2`, and the receiver marshalled as arg0 (the single-pass
+backend does the identical thing, so dispatch args are byte-identical).
+
+**GC-safety** is unchanged from inc 22/24: the IR lowerer spills every value to a
+frame slot (no oop in a register across a call), the GC is non-moving while a JIT
+frame is active, and the conservative IR-frame scan roots the receiver + reference
+args live across the call — so no oop map is needed.
+
+**What landed**
+- **`jit/src/ir.rs`** — the `invokevirtual` (0xb6) arm joins the `invokestatic`
+  (0xb8) `Op::Call` arm (same body, both 3-byte); a new `invokeinterface` (0xb9)
+  arm emits the same `Op::Call` but advances **`pc += 5`** (the 0xb9 encoding is
+  opcode, cp_hi, cp_lo, count, 0). **Both length walkers** (`find_branch_targets`,
+  `find_loop_headers`) gained `0xb6` in the 3-byte arm and a new 5-byte `0xb9` arm
+  — previously 0xb6/0xb9 fell into `_ => pc += 1`, harmless only while the builder
+  bailed on them; now that they lower, a mis-walked length would mis-locate a
+  branch target (the §5 "both length walkers must agree" gotcha).
+- **`jit/src/lib.rs`** — a new `try_compile` parameter `ir_emit_virtual_calls`.
+  The Gap-B gate now admits `invokevirtual`/`invokeinterface` (under the new flag)
+  alongside static/special; for them it sets `num_args = static_call_shape(desc) +
+  1` (the receiver) and `invoke_kind = 0`/`2`. `static_call_shape` still rejects
+  category-2 args/returns, so only int/reference receivers+args+returns are
+  admitted.
+- **`vm/src/runtime/interpreter.rs`** — the 3 `try_compile` sites pass
+  `ir_emit_virtual_calls` from `CRATONVM_JIT_IR_CALL_VIRTUAL` (default-OFF).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokevirtual_instance_call` —
+  **executes** the IR-emitted virtual call (receiver arg0, `num_jit_args = 2`,
+  `needs_context`); IR == host across sign/zero edges.
+- `…::ir_vs_singlepass_invokeinterface_instance_call` — same, for the **5-byte**
+  `invokeinterface` encoding (the decisive extra coverage: a wrong `pc += 5` would
+  mis-locate the trailing `ireturn`).
+- `jit/src/lib.rs::ir_virtual_call_wiring_routes_through_ir_only_with_flag` —
+  crosses the flags to prove `invokevirtual` routes through the IR pipeline
+  (`IR_LOWER_COMPILES == 1`) **iff** `ir_emit_virtual_calls` is on (non-vacuous:
+  single-pass also dispatches invokevirtual).
+- jit lib **819/819**, differential harness **28/28**, `cratonvm-vm` builds clean.
+
+**To soak / flip on** (the remaining production step, like inc 21→23): the IR
+re-compile path fires only in a release build with the tiered/background C2
+recompiler active (the first-call path is single-pass), so the live soak is a
+**release** run of `CRATONVM_JIT_IR_CALL_VIRTUAL=1` across the
+kafka/spring/tomcat/hibernate gauntlet + bt10/14/16/18 checksums (must stay
+`135854 / 3222190 / 14985902 / 68332206`) with a polymorphic probe `==` HotSpot
+gate-ON and gate-OFF (and under `CRATONVM_DBG_GC_STRESS=1` for the receiver-live-
+across-dispatch GC path), then default the flag on. The widened reach (every
+virtual/interface call site, polymorphic receiver oop live across the call) makes
+the gauntlet soak the gating step before the flip.
+
+**Next refinements**: category-2 (long/float/double) args + return; an optional
+monomorphic/polymorphic inline-cache fast path for the IR virtual `Op::Call` (a
+perf, not correctness, item).
+
+## Increment 26 (long sub-slice — wide `lload`/`lstore` + `ldc2_w`) landed
+
+Status: **landed** on `dev`, under the existing **`CRATONVM_JIT_IR_LONG`**
+(default-OFF). Extends inc 25's long path with the two opcodes that block most
+real long methods: the **wide** `lload` (0x16) / `lstore` (0x37) forms (a long
+param/local at JVM slot ≥ 4 — inc 25 only had the short `lload_0..3`/
+`lstore_0..3`) and **`ldc2_w`** (0x14, a long constant from the constant pool).
+Both are long-only, so inert for the int path.
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `0x16`/`0x37` (read the 1-byte index,
+  push/pop the long NodeId at `locals[idx]`; the high-half slot `idx+1` is never
+  read by valid bytecode) and `0x14` (look up the resolved value in a new
+  `ldc2w_info: HashMap<pc, i64>` and emit `Op::Const(Long)` via the existing
+  `lconst` helper; an absent pc bails to single-pass). `set_ldc2w_info` is the
+  setter. **Both length walkers** (`find_branch_targets`, `find_loop_headers`)
+  gained `0x16`/`0x37` (2-byte) and `0x14` (3-byte) — without this a long method
+  with these opcodes would mis-parse its branch targets / loop headers.
+- **`jit/src/lib.rs`** — when `ir_emit_long` is on, build `ldc2w_info` from
+  `scan.ldc2w_ops` + the existing `cp_ldc2w_resolver` and call `set_ldc2w_info`.
+  A **double** `ldc2_w` cannot reach here: any double constant is consumed by a
+  double-typed opcode, which trips `method_uses_double` and bails the method —
+  so every resolved value is a `long` bit pattern (handled as a full 64-bit
+  `Op::Const`).
+
+**Tests**
+- `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_long_wide_load_store` —
+  `long f(long a, long b, long c){ long d=a+b; long e=c-d; return d*e; }` exercises
+  wide `lload 4`/`lload 6`/`lstore 6`/`lstore 8` (locals at slots 4/6/8); IR ==
+  single-pass == host over the full i64 (incl. a 64-bit-overflow case).
+- `…_long_ldc2w_constant` — `long f(long a){ return a*C1 + C2; }` with a resolver
+  supplying `C1`/`C2` (one a large constant with bit 63 set); IR == single-pass ==
+  host (proves the long const is loaded at full 64-bit width, no truncation).
+- jit lib **819/819**, differential **32/32**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong2.java`
+(`hash(long,long,long)` — 3 long params so `c` uses wide `lload 4`, a long local
+`h` at slot 6 using wide `lstore`/`lload`, and `ldc2_w` constants `1125899906842597L`
+/ `31L`) == HotSpot (`4898113815606063616`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_LONG` confirms it takes the IR path. No regression: the inc-25
+`IrLong` probe still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot
+(`135854 / 3222190 / 14985902 / 68332206`).
+
+**Remaining long sub-slices** (unchanged order): `lcmp` + long-fed branches;
+`lshl`/`lshr`/`lushr`/`land`/`lor`/`lxor`; `ldiv`/`lrem` (long deopt-resume);
+then `double`/`float` (XMM); then long/double call args + returns.
+
+## Increment 27 (long sub-slice — shifts/bitwise + `lcmp`/branches) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF). Adds
+the long compare/shift/bitwise opcodes, so long methods with comparisons,
+branches, and loops take the IR path. (Numbered 27 on the long track; the
+concurrent virtual-dispatch work independently also used "Increment 26" for
+`invokevirtual`/`invokeinterface` — a harmless parallel-authoring artifact.)
+
+**What landed**
+- **`jit/src/ir.rs`** — builder arms for `lshl`(0x79)/`lshr`(0x7b)/`lushr`(0x7d)
+  → `Op::Shl`/`Shr`/`UShr` typed `Long` (the lowerer is already width-aware: the
+  x86 64-bit shift masks the count to 6 bits, exactly `lshl`'s `count & 0x3f`),
+  `land`(0x7f)/`lor`(0x81)/`lxor`(0x83) → `Op::And`/`Or`/`Xor` typed `Long` (those
+  are already 64-bit), and `lcmp`(0x94) → a **new `Op::LCmp`** (3-way signed
+  compare of two longs → int {-1,0,1}). All are 1-byte opcodes (the length
+  walkers' default arm sizes them). `Op::LCmp` feeds the existing `if<cond>`
+  arm unchanged (`lcmp; iflt` ⇒ `a < b`).
+- **`jit/src/ir_lower.rs`** — `Op::LCmp` lowers to a 64-bit `CMP` + signed
+  `SETG`/`SETL` + `(a>b) − (a<b)`, sign-extended to 64 bits so a 32- or 64-bit
+  consumer both read the {-1,0,1} correctly.
+- **`jit/src/ir.rs` (phi typing fix)** — long/double merge & loop-carried
+  `Op::Phi` nodes are now typed from their inputs (`phi_data_type`) instead of
+  the historical hardcoded `Int`. **This closes a latent hole the inc-26
+  adversarial review found**: codegen was already correct (phi copies are
+  unconditionally 64-bit; consumers use their own `ty`), but `frame_value_for`
+  reads the phi's own type and would truncate a long to 32 bits on a deopt-frame
+  resume. Masked today (long-eligible methods have no deopt point and
+  `ir_deopt_entry` is unwired), but inc-27's long branches make long phis common,
+  so it is fixed now. Scoped to category-2 to avoid perturbing `Ref`/`Float` phis;
+  codegen-neutral.
+
+No gate change: these opcodes already trip `method_uses_category2`, so they were
+already admitted by `ir_emit_long` (double/float- and int-div-free); they just
+needed builder support. Unhandled long opcodes (`ldiv`/`lrem`, wide `iload`)
+still bail to single-pass.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs` (IR == single-pass == host, full i64):
+`ir_vs_singlepass_long_shifts` (lshl/lshr/lushr, count masked to 6 bits, incl.
+`i64::MIN`), `…_long_bitwise` (land/lor/lxor), `…_long_lcmp_branch` (lcmp + `ifge`
+long-min), and `…_long_loop_phi_lcmp` (a long accumulator loop with a long-fed
+condition — `lcmp` + a backward long branch + a **long loop phi** + wide
+`lload`/`lstore`, all together). jit lib **820/820**, differential **38/38**,
+`cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong3.java`
+(`mix` — shifts + bitwise + `ldc2_w` + `lcmp` min; `acc` — a `lcmp`-conditioned
+long accumulator loop) == HotSpot (`540002100000`) gate-ON and gate-OFF, both
+methods take the IR path (`CRATONVM_DBG_IR_LONG`, 2 emit lines). No regression:
+the inc-25 `IrLong` and inc-26 `IrLong2` probes still == HotSpot with the gate
+on, and bt10/14/16/18 == HotSpot.
+
+**Remaining long sub-slices**: `ldiv`/`lrem` (need the long deopt-resume — and
+the `i64::MIN`-return/sentinel collision, both spun off as separate tasks); then
+`double`/`float` (XMM); then long/double *call* args + returns.
+
+## Increment 28 (long *call args* — the original category-2-call-args goal) landed
+
+Status: **landed** on `dev`, under **`CRATONVM_JIT_IR_LONG`** (default-OFF).
+Delivers part of the roadmap's original "category-2 call args" item: an `Op::Call`
+may now take a **`long` argument**. This is the payoff of the inc-25..27 long
+value work — a long is now a first-class IR value, so passing one to a call is a
+marshalling question, and the answer is "one i64 slot."
+
+**What landed** (`jit/src/lib.rs`): `static_call_shape` accepts a `J` (long)
+parameter, counting it as **one** arg — the compact JIT ABI passes each parameter
+in one i64 register (`count_param_slots` already counts `J` as 1), the IR builder
+treats a long as one operand-stack node, and the `Op::Call` marshaller stores
+each arg as one i64. So **no lowerer change** was needed — a long arg is
+marshalled exactly like an int/ref. `double`/`float` args (XMM) stay rejected,
+and a `long`/`double`/`float` **return** stays rejected (a `Long.MIN_VALUE` result
+would collide with the `i64::MIN` deopt/exception sentinel — the spun-off
+out-of-band-signal task; long *returns* wait on it).
+
+**Why it's inert for the default path**: producing a long to pass requires a
+category-2 opcode (`lload`/`lconst`/`ldc2_w`/…), which trips
+`method_uses_category2`, so a long-arg-call method is only ever admitted under
+`ir_emit_long`. The `J`-arg acceptance is unreachable on the default int/ref path.
+
+**Tests** — `jit/tests/ir_vs_singlepass.rs::ir_vs_singlepass_invokestatic_long_arg`:
+`int f(long a, int n){ return g(a, n); }` executes through a stub `invoke_dispatch`
+that reads **both halves** of the long arg0 (a truncated marshalling would
+diverge) plus the int arg1. IR == host across sign/width edge cases (incl.
+`i64::MIN`, a constant with high bits set). jit lib **820/820**, differential
+**39/39**, `cratonvm-vm` builds clean.
+
+**Live soak** (`CRATONVM_JIT_IR_LONG` toggled): `scratch/irlong/IrLong4.java`
+(`f(long base)` passes `base + i` — a long — to `g(long,int)int` in a hot loop;
+both take the IR path) == HotSpot (`2336681890816`) gate-ON and gate-OFF, and
+`CRATONVM_DBG_IR_CALL` confirms the long-arg call lowers to `Op::Call`
+(non-vacuous). No regression: the inc-25/26/27 `IrLong`/`IrLong2`/`IrLong3`
+probes still == HotSpot with the gate on, and bt10/14/16/18 == HotSpot.
+
+**Remaining**: long/double call *returns* (gated on the `i64::MIN`-sentinel fix);
+`ldiv`/`lrem` (gated on long deopt-resume); then the `double`/`float` half (XMM
+registers + FP-slot deopt resume), which also unlocks `double` call args/returns.
+
+## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
+
+Status: **landed**, **default-OFF behind `CRATONVM_JIT_C2_FIRST_CALL`**. This is
+not a new optimizer increment — it is the change that makes increments **14–26
+actually run at runtime**. Until now they were correct (proven by the
+`ir_vs_singlepass` differential harness, which drives `try_compile` directly) but
+**latent**: in an ordinary run the optimizing IR pipeline (`jit::try_compile`,
+`optimize=true`) was essentially never invoked.
+
+**Root cause (by-design, NOT a regression — confirmed by git archaeology back to
+the initial open-source commit `a6dc911e`).** CratonVM compiles a method through
+several paths; only three reach `try_compile` (the warmup→`try_jit_upgrade_with_gate`
+sites at `interpreter.rs:17672/17788`, and the JIT-dispatch-helper path
+`try_jit_compile_callee_slow:18370`), and all pass `optimize=true`. But the
+**first-call compile block in `fn execute`** (`interpreter.rs` ~3132–3651) calls
+the single-pass backend `jit::x64::compile` **directly** on the first uncached
+invocation and publishes the body into `jit_cache`. Every other path (dispatcher
+warmup, OSR-reuse, background worker) probes `jit_cache` **first**, so any method
+first touched via `fn execute` is permanently single-pass-cached and the IR path
+is never reconsidered for it. OSR (`try_osr:16642`) is also single-pass. Net: the
+IR optimizer was unreached for the broad population of methods. **This also means
+the inc 21–25 "gate-ON ≡ gate-OFF" soaks were largely vacuous** — `ON==OFF` is the
+signature of the gated IR-call code never running for the benchmarked hot methods
+(their first-call single-pass artifact was cached first).
+
+**The fix.** In the `fn execute` first-call `or_else` (`interpreter.rs` ~3132),
+when `CRATONVM_JIT_C2_FIRST_CALL` is set: instead of eager single-pass, (a)
+invocation-count the method and, **below `CRATONVM_JIT_THRESHOLD` (default 500),
+return `None` so it interprets** — which *un-preempts* the dispatcher/OSR warmup
+paths already wired to `try_compile`; and (b) once hot, compile through
+`try_jit_compile_callee(…, optimize=true)` — which **subsumes single-pass** (its
+`try_compile_inner` falls back to `x64::compile_with_param_slots` internally for
+IR-incompatible bodies) — then re-fetch the cached body. The invocation gate is
+mandatory: the first-call block fires on call #1 of *every* uncached method, many
+run-once (class-load/reflection), so eager IR there would pay full C2 cost for
+zero benefit. Per-feature sub-gates are threaded identically to the upgrade path
+(`CRATONVM_JIT_IR_CALL` default-ON; `…_SPECIAL`/`…_LONG`/`…_CALL_VIRTUAL`
+default-OFF; `CRATONVM_JIT_SCALAR_NEW` default-ON). Default-OFF ⇒ the single-pass
+first-call path is byte-for-byte unchanged. (`c2_first_call_enabled()` +
+gated branch in `fn execute`; reuses `try_jit_compile_callee`.)
+
+**Validation — the IR path now fires at runtime, non-vacuously, and correctly:**
+- **Non-vacuous fire (the headline):** with the gate ON, `[cratonvm-ircall]`
+  (emitted only from `try_compile_inner`'s IR branch) fires for real methods —
+  `V.hot` (invokevirtual, +`CRATONVM_JIT_IR_CALL_VIRTUAL`), `IrCall.f`
+  (invokestatic), and `binarytrees.itemCheck` (recursive `invokestatic` +
+  `getfield`, allocation-heavy). With the gate **OFF the count is zero** — proving
+  the wiring, not a pre-existing path, is what makes IR reachable.
+- **Correct (IR == single-pass == HotSpot), gate-ON:** `V`=32961579424,
+  `IrCall`=1053069400800, `Cat2` (long params)=13500377993856, broad-JDK `Smoke`
+  (HashMap/ArrayList/sort/StringBuilder)=23033321990476 — all == HotSpot and ==
+  gate-OFF.
+- **GC-safe:** `binarytrees` bt10/14/16/18 == `135854 / 3222190 / 14985902 /
+  68332206` gate-ON (byte-exact; the canonical moving-GC stress, with `itemCheck`
+  on the IR path).
+- **P2 (category-2 params):** `Cat2`'s `long`-param method, which the eager
+  first-call path *refuses* (`count_param_slots_jvm_spec != count_param_slots`
+  guard), now compiles correctly via `try_compile`'s param-slot-aware path.
+- jit lib **820/820**, `ir_vs_singlepass` **34/34**, `cratonvm-vm` builds clean.
+
+**To soak / flip on.** This is the first time the IR optimizer becomes *broad* at
+runtime, so the gate stays OFF pending: (1) the full kafka/spring/tomcat/hibernate
+gauntlet with `CRATONVM_JIT_C2_FIRST_CALL=1` (GC-safety is the key risk — more
+methods carry `Op::Call`/deopt points; run under `CRATONVM_DBG_GC_STRESS` and an
+`-Xmx6g`-vs-`-Xmx1g` A/B); (2) a perf pass — IR virtual/interface dispatch has no
+inline cache yet, so per-call dispatch is slower; an invocation-count default and
+an MIC/PIC fast path are the likely follow-ups before any default flip.
+
+**Soak results (GC-safety micro soak — PASSED; full gauntlet still pending).**
+The headline GC-safety risk was soaked with allocation-heavy probes gate-ON vs
+gate-OFF vs HotSpot, at `-Xmx1g`/`-Xmx6g`, under max GC frequency:
+- **Non-vacuous:** a recursive linked-list probe `GcVirt.sum` (invokevirtual +
+  invokestatic + getfield over a receiver oop *live across* both `Op::Call`s — the
+  exact inc-26 oops-across-call risk) **fires IR gate-ON** (`[cratonvm-ircall]`)
+  and **zero gate-OFF**; output `664200000` == HotSpot.
+- **GC-safe under stress:** `GcVirt` with `CRATONVM_DBG_GC_STRESS=4096` (a young GC
+  on ~every allocation) == HotSpot gate-ON **and** gate-OFF at both `-Xmx1g` and
+  `-Xmx6g`; `CRATONVM_GC_VERIFY_STALE=1` emits zero stale/zeroed-header warnings.
+- **Checksums:** bt10/14/16/18 == `135854 / 3222190 / 14985902 / 68332206` gate-ON
+  (default heap); bt16 1g-vs-6g A/B identical gate-ON == gate-OFF.
+- **Pre-existing GC bug surfaced (NOT this change):** under the *extreme*
+  `CRATONVM_DBG_GC_STRESS=4096` knob at a tight heap, the **single-pass** path
+  intermittently miscomputes object-`binarytrees` (gate-OFF reproduces; a `println`
+  perturbs it away — a Heisenbug; gate-ON's IR path, which spills oops to frame
+  slots, is always correct). Filed as a separate task (likely a single-pass
+  register-resident missed root across the recursive allocating call; cf. the
+  reflrepro-A2 / kafka-25 family). The gate's own soak is clean.
+
+The remaining gating step before flipping the default is the **full app gauntlet**
+(kafka/spring/tomcat/hibernate) — a heavy multi-hour run via the per-suite
+`apps/*/...` harnesses; the GC-safety headline is validated by the above.
+
+**Follow-up feasibility (scoped).** (a) *IR `Op::Call` inline cache* (MIC/PIC fast
+path in `ir_lower`): **feasible-medium**, deferred to a post-flip perf pass (its
+ABI risk would muddy the soak; it only matters once the gate is ON). (b) *Route
+OSR through `try_compile`*: **infeasible without building IR-OSR from scratch** —
+the IR pipeline emits zero OSR-entry metadata (`ir_lower::lower` leaves all `osr_*`
+fields default), so it requires re-implementing the x64 OSR machinery
+(`x64.rs:21850-21923`, LICM-preheader rules, per-block live-in) in the IR backend.
+XL, high GC-safety risk; tracked as a separate epic. Until then OSR-dominated /
+loop-on-first-call kernels remain single-pass (see Scope below).
+
+**Scope (what this does and does NOT reach).** The dispatcher warmup path
+(`try_jit_upgrade_with_gate`) was *already* wired to `try_compile(optimize=true)`
+gate-OFF (`CRATONVM_JIT_IR_CALL` default-ON); what made the IR pipeline *de facto*
+dead was the **cache-precedence race** — `fn execute`'s eager first-call block
+single-pass-compiled on call #1 and published to `jit_cache` first, after which
+every later path's leading `jit_cache.get` returned the single-pass body. This fix
+removes that preemption for the `fn execute` population. It does **not** cover two
+populations: (a) methods reached only through the stackless dispatcher already use
+*its* warmup→`try_compile` once un-preempted (no change needed); (b) **OSR-dominated
+/ loop-on-first-call methods remain single-pass** — `try_osr` compiles via
+`x64::compile` directly (not `try_compile`) and fires at ~1000 back-edges *within a
+single invocation*, so a method whose first frame loops hot (stream pipelines,
+parsers, crypto inner loops) OSR-compiles and pins the cache before the c2
+invocation counter (500 *separate* invocations) ever crosses. Routing OSR through
+`try_compile(optimize=true)` is the natural follow-up to reach that slice. The
+three validated probes (V.hot / IrCall.f / itemCheck) are invoked >500× as separate
+calls before any single frame loops 1000×, which is exactly the shape this wiring
+targets — they are not representative of OSR-heavy loop kernels.
+
+**Caveats / follow-ups.** The bail-list becomes shared between the first-call and
+upgrade paths (`try_jit_compile_callee` uses the global `mark_jit_bail_listed`,
+vs the first-call path's local `jit_skip_set`) — bounded to genuine backend bails,
+which are path-independent. Below the warmup threshold the gated branch returns
+`None` WITHOUT sealing `jit_skip_set` (a `c2_not_hot` guard on the first-call seal),
+so the invocation counter survives across calls — without it an `execute`-only-hot
+method would be sealed on call #1 and never reach the counter. Trade-off vs gate-OFF:
+a method called 1–499× via `fn execute` then never again now interprets to completion
+where gate-OFF it single-pass-compiled on call #1 — a warmup-latency cost, acceptable
+for the gated soak.
+
+## Increment 29 (flip `CRATONVM_JIT_IR_LONG` + `CRATONVM_JIT_IR_CALL_SPECIAL` ON) landed
+
+Status: **landed** on `dev`. The production-validation step for the long track
+(inc 25–28) and `invokespecial` (inc 24): both gates flip from default-OFF to
+**default-ON**, with `=0` as the opt-out at each of the 6 VM `try_compile` sites
+(3 each). Mirrors the inc-23 `IR_CALL` flip. After this, long-using methods and
+`super.`/non-virtual `invokespecial` callers take the optimizing IR path by
+default.
+
+**What landed** (`vm/src/runtime/interpreter.rs`): the 6 gate reads change from
+`std::env::var_os("CRATONVM_JIT_IR_{LONG,CALL_SPECIAL}").is_some()` (default-OFF)
+to `std::env::var(..).map_or(true, |v| v != "0")` (default-ON, `=0` opt-out). No
+other change — the inc-24..28 machinery is unchanged.
+
+**Soak** (the gate is a runtime env var, so one flipped build validates both
+states: default = both ON, `CRATONVM_JIT_IR_LONG=0 CRATONVM_JIT_IR_CALL_SPECIAL=0`
+= both OFF). The decisive invariant is **ON ≡ OFF on every workload** (the flip
+only changes a default), confirmed across a broad, diverse set:
+- **bt10/14/16/18** (long-heavy) == HotSpot (`135854 / 3222190 / 14985902 /
+  68332206`), ON and OFF.
+- **Six targeted probes** — `IrLong`/`IrLong2`/`IrLong3`/`IrLong4` (long
+  arithmetic / wide load-store + `ldc2_w` / shifts-bitwise-`lcmp` / long call
+  arg), `IrSpecial` (`invokespecial`), `IrCall` (`invokestatic`) — all == HotSpot
+  ON and OFF.
+- **23 bench programs** (`binarytrees`, `fannkuch`, `IntegrationTest`,
+  `Benchmark`, `QuickBench`, `MatrixJIT`/`Scale`, `IntrinsicBench`,
+  `FullStackBench`, `NBody3D`/`Mini`, `TestLambda`/`Stream`/`Switch`/`Enum`/
+  `Generics`/`Sort`/`Interface`/`Varargs`/`Pair`, `SieveBench`, …) == HotSpot,
+  ON and OFF.
+- **`QuickBenchLong`** (long-heavy: a 1.5-billion-iteration `long` arithmetic
+  checksum `2812500002999999995`, Fibonacci(44), sieve, matrix) — ON ≡ OFF.
+
+**Scope of the soak (honest)**: the full kafka/spring/tomcat/hibernate gradle
+suites were **not** run (impractical in this environment — Linux-path harness
+scripts, heavy JUnit setup); the soak is bt + 6 targeted probes + 23 diverse
+bench programs + `QuickBenchLong`, all ON≡OFF==HotSpot — the same bar used to flip
+`IR_CALL` (inc 23). `IR_CALL_SPECIAL` is narrow (`super.`/non-virtual instance
+calls), and `IR_LONG` carries 39 differential tests + a 5-agent adversarial
+review behind it; `=0` remains the opt-out if a suite ever regresses.
+
+**Still gated-OFF / deferred** (unchanged): long/double call *returns*
+(`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
+`double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
+(the concurrent inc-26 track) has its own flag/soak.
+
+## Remaining roadmap (post-inc-29)
+
+The single consolidated to-do for whoever picks this up next. Increments 1–29
+are landed and (where flagged) default-ON. What remains, in dependency order:
+
+1. **`i64::MIN`-return / deopt-sentinel fix** *(unblocks long/double call returns;
+   own task)*. The JIT returns `i64::MIN` in RAX as the universal deopt/exception
+   sentinel (`x64.rs` epilogue + the `Op::Call` bail check; interpreter.rs post-JIT
+   dispatch does `CMP RAX, i64::MIN; JE`). A method that legitimately returns
+   `Long.MIN_VALUE` is misread as deoptimized → silently re-executed (side effects
+   can double). **Pre-existing in BOTH backends** (single-pass already compiles
+   long-returning methods), found by the inc-26 adversarial review. Fix: signal
+   deopt/exception **out-of-band** (a TLS flag the helper sets, checked *before*
+   inspecting RAX, like the pending-NPE/AIOOBE flags) for `J`/`D` returns. Spun
+   off as a background task (see commit history / `spawn_task`). Once fixed,
+   relax `static_call_shape` to accept `J`/`D` *returns* and the
+   `lreturn`/`dreturn` paths are fully safe.
+
+2. **`ldiv`/`lrem`** *(blocked on long deopt-resume)*. The IR `Op::Div`/`Op::Rem`
+   div-by-zero guard **deopts** (`emit_div_zero_guard` → `emit_deopt_if_zero`),
+   unlike single-pass's direct-throw. A `long` live at that deopt needs frame
+   reconstruction, but (a) `frame_value_for` maps `Long` to
+   `FrameValue::Unsupported` (`ir_lower.rs`), and (b) the IR deopt entry isn't
+   wired into VM dispatch (no `ir_deopt_entry`/`take_last_deopt` caller — emit-and
+   -discard). So the inc-25 gate bails any long method with int `idiv`/`irem`
+   (`method_has_int_div`) and the builder never lowers `ldiv`/`lrem`. To unlock:
+   wire the IR deopt entry into VM dispatch **and** make long (and double) a
+   real `FrameValue` width on resume; then add the `ldiv`/`lrem` builder arms
+   (the lowerer's `Op::Div`/`Rem` are already 64-bit-aware) and drop the
+   `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
+   phis correctly for that resume.)
+
+3. **`double`/`float` value tier (XMM)** *(the next major sub-project; unblocked)*.
+   The whole second half of category-2. Needs an XMM register class in
+   `ir_lower.rs` (the IR lowerer is currently GPR-only), the FP opcodes
+   (`fadd`/`dadd`/…, `fcmpl`/`dcmpg`/…, `f2d`/`i2d`/`d2l`/…, `fconst`/`dconst`,
+   the `double` half of `ldc2_w`, `fload`/`dload`/`faload`/…), FP-slot deopt
+   resume, and `method_uses_double` flipped from a bail to a gate. This **also
+   unlocks `double` call args + returns** (extend `static_call_shape` to accept
+   `D`/`F` once XMM marshalling exists). Mirror the long track's increment
+   discipline (value ops → constants → load/store → compare/branches → call
+   args), each gated behind a new `CRATONVM_JIT_IR_FP` flag + differential/probe
+   soak.
+
+**Adjacent (separate tracks, not this doc's to finish):** virtual/interface
+dispatch via inline caches (`CRATONVM_JIT_IR_CALL` for `invokevirtual`/
+`invokeinterface`, the concurrent inc-26 work — bug-24-sensitive); the deopt/OSR
+machinery (`real-frame-deopt*.md`) whose completion is what items 1–2 above
+ultimately lean on.
+
 ## Implementation steps (ordered)
 
 1. **φ/branch lowering repro + fix** (Front 1.1) — unblocks everything.
@@ -682,10 +1941,12 @@ out-of-range keys. IR == single-pass == host. jit lib 790/790, harness 12/12.
 3. **Relax the IR gate** branch-free → branchy → calls → loops, each behind a
    soak flag (Front 1.2). **In progress**: branch-free / branchy / early-return /
    loop int methods all take the IR path and pass the harness; increment 12 added
-   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`.
-   **Remaining**: methods with `invoke*` / field / array ops — the builder bails
-   on those today, so this needs builder emission of those ops + a real-helper
-   (or VM-level) differential harness. ← next.
+   `i2b`/`i2c`/`i2s`, increment 13 added `tableswitch`/`lookupswitch`, increment 14
+   added int-category `getfield` (the first real `Op::Load`, with a synthetic-heap
+   real-execution harness).
+   **Remaining**: `putfield`→`Op::Store` (needs scheduler memory ordering), then
+   `new` / `invoke*` / array ops — builder emission of those + the rest of the
+   real-helper harness. ← next.
 4. **Add DSE** to `ir_optimize::optimize` (Front 2.1).
 5. **SCEV-gated LICM + unroll** (Front 2.2).
 6. **Broaden escape analysis** once the gate is open; enforce the

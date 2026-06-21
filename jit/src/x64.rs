@@ -1701,7 +1701,19 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         | 0xc7 => 3,
         0xbb => 3, // new
         0xc5 => 4,
-        0xb9 => 5, // invokeinterface: opcode, cp_hi, cp_lo, count, 0
+        // 5-byte instructions. invokeinterface (0xb9: opcode, cp_hi, cp_lo,
+        // count, 0) is the only one reachable today; invokedynamic (0xba:
+        // opcode, cp_hi, cp_lo, 0, 0) and the wide-offset branches goto_w
+        // (0xc8) / jsr_w (0xc9: opcode + 4-byte signed offset) are rejected by
+        // `jit_scan` (catch-all → `None`), so no compiled method contains them
+        // — but, like `wide` (0xc4) below, the length table must stay correct
+        // as defense-in-depth so every PC-stepping consumer (branch-target
+        // precompute, DCE, OSR/unroll, instruction-start map, oop-map dataflow)
+        // stays in lockstep if any is ever accepted. A missing entry
+        // under-counts by 4 bytes and misaligns the walk — the same class of
+        // bug as the previously-absent `ldc`. Keep the regalloc.rs `bc_len`
+        // twin in sync.
+        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
         // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
@@ -2008,6 +2020,32 @@ fn safepoint_reg_spill_all() -> bool {
 const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
+
+/// Register-only operand-stack-oop soundness — whether `flush_scratch_registers`
+/// (the standard pre-call / pre-backward-branch / pre-return flush) ALSO spills
+/// `StackSlot::CalleeSaved` operand-stack entries that hold an object reference
+/// to a canonical frame slot.
+///
+/// **DEFAULT ON** (opt out with `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`). Closes a JIT
+/// GC-root soundness hole that is *independent* of the env-gated
+/// `CRATONVM_JIT_SAFEPOINT_REG_SPILL` family: a callee-saved register pushed onto
+/// the operand stack as a "zero-cost push" (no code emitted until the value is
+/// consumed) survives a GC-capable call un-spilled by ABI, so a live oop residing
+/// ONLY in that register at the safepoint is invisible to the conservative
+/// `[scanner_sp, entry_sp)` frame scan → the object can be reclaimed → use-after-
+/// free. `flush_scratch_registers` already spills the `Scratch`/`Xmm` operand
+/// entries before every call; this extends the same flush to the `CalleeSaved`
+/// reference entries it previously left in registers (exactly the register homes
+/// `collect_live_oop_homes` already recognizes, but which the default
+/// conservative scan — shadow stack off — never sees). The spill is value-
+/// preserving and consumers transparently read the new `StackSlot::Frame` home,
+/// so it can only ADD a root, never remove one or change a computed value. When
+/// off, the legacy (unsound) flush is restored for A/B bisection only.
+fn flush_callee_saved_oops_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
+}
 
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
@@ -5688,6 +5726,20 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
+    /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
+    /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
+    /// Forces `has_dispatch` for the SAME thread-availability reason as
+    /// `direct_calls` above: the fallible alloc helpers (`jit_newarray` /
+    /// `jit_anewarray_object` / `jit_new_object`) read the per-thread
+    /// `JIT_THREAD` TLS (via `jit_thread_mut()`) BOTH to run the
+    /// allocation-failure STW GC and to construct the catchable
+    /// `OutOfMemoryError` / `NegativeArraySizeException`. The `!has_dispatch`
+    /// fast entry path skips `set_jit_thread`, so without this a JIT'd
+    /// allocating method would run the helper with a null thread — no GC on
+    /// young-gen pressure, and on genuine exhaustion the throwable is never
+    /// created so the `i64::MIN` bail sentinel leaks as the method's (truncated)
+    /// return value (e.g. `new int[N]` silently yields 0) instead of throwing.
+    emitted_alloc_oom_check: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -5977,6 +6029,16 @@ struct Compiler {
     /// NO stores — isolates the effect of the stores from the effect of the
     /// frame-size perturbation (the SB-CRASH-04 "FIX == NOSTORE" methodology).
     safepoint_reg_spill_nostore: bool,
+    /// Register-only operand-stack-oop soundness (DEFAULT ON; opt out with
+    /// `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`) — whether `flush_scratch_registers`
+    /// also spills `StackSlot::CalleeSaved` operand-stack entries marked as
+    /// references to a frame slot before each pre-call/branch/return flush, so a
+    /// live oop that lives ONLY in a callee-saved register across a GC-capable
+    /// call is on the stack and visible to the conservative root scan. Distinct
+    /// from `safepoint_reg_spill` (which blind-spills register-mapped *locals*
+    /// and is env-gated off): this targets register-resident operand-stack
+    /// *temporaries* and is on by default. See `flush_callee_saved_oops_enabled`.
+    flush_callee_saved_oops: bool,
     /// Frame offset (positive; first slot at `[rbp - reg_spill_base]`) of the
     /// reserved callee-saved-register spill area: one 8-byte slot per entry in
     /// `alloc_used_regs`, same order. 0 when `safepoint_reg_spill` is off.
@@ -6110,6 +6172,73 @@ struct Compiler {
     /// zero-initialization so a `long`/`double` parameter's slot is never
     /// clobbered. `0` ⇒ fall back to `num_params`.
     param_slot_span: usize,
+
+    /// deopt-osr Step 1: precise deopt-exit snapshots (machine-state -> interpreter
+    /// frame) recorded at eligible guards (currently the speculative-BCE loop-header
+    /// guard), transferred to `CompiledMethod::deopt_points` at finalize.
+    /// Emit-and-discard for now — no live path consumes them until the in-stub
+    /// trampoline + resume land (`real-frame-deopt-x64-backport.md` Steps 2-4).
+    deopt_points: Vec<crate::deopt::DeoptimizationPoint>,
+    /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
+    /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
+    deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
+    /// deopt-osr Step 2: frame offset (positive depth-from-RBP) of the DEEPEST
+    /// qword of the always-reserved 128-byte `SavedRegisters{gpr:[u64;16]}`
+    /// region the frame-deopt stub spills into. `gpr[r]` is stored at
+    /// `[rbp - (deopt_regs_base - r*8)]`, so `gpr[0]=RAX` is the deepest/lowest
+    /// address and `LEA [rbp - deopt_regs_base] == &gpr[0]`. 0 unless
+    /// `deopt_real_enabled()` reserved the region at construction.
+    deopt_regs_base: i32,
+    /// deopt-osr Step 2: bci → stable pointer to the boxed `DeoptimizationPoint`
+    /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
+    /// by `emit_deopt_snapshot_at_guard`.
+    deopt_box_ptr_by_bci: rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
+}
+
+/// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
+/// `FrameValue` for a deopt snapshot. Pure (no `&self`) so it is unit-testable
+/// without a live compile.
+///
+/// `spill_off` is the positive `[rbp - spill_off]` frame offset; the resolver
+/// reads `*(rbp + off)`, so a spilled slot is encoded with the negated offset.
+/// A register-resident slot is `Register(r)` regardless of oop-ness — typing a
+/// register slot oop-vs-primitive is the deferred width/type source (Phase A
+/// `can_deopt_resume` excludes the ambiguous cases). XMM-resident slots have no
+/// resolver in Phase A (`SavedRegisters` is `gpr[16]` only) -> `Unsupported`.
+fn frame_value_for_slot(
+    reg: Option<u8>,
+    xmm: Option<u8>,
+    spill_off: i32,
+    is_oop: bool,
+) -> crate::deopt::FrameValue {
+    use crate::deopt::FrameValue;
+    if let Some(r) = reg {
+        FrameValue::Register(r)
+    } else if xmm.is_some() {
+        FrameValue::Unsupported
+    } else if is_oop {
+        FrameValue::StackSlotRef(-spill_off)
+    } else {
+        FrameValue::StackSlot(-spill_off)
+    }
+}
+
+#[cfg(test)]
+mod deopt_snapshot_tests {
+    use super::frame_value_for_slot;
+    use crate::deopt::FrameValue;
+
+    #[test]
+    fn frame_value_for_slot_maps_provenance() {
+        // Register-resident wins (provenance is the GPR), oop-ness aside.
+        assert_eq!(frame_value_for_slot(Some(3), None, 16, false), FrameValue::Register(3));
+        assert_eq!(frame_value_for_slot(Some(3), None, 16, true), FrameValue::Register(3));
+        // XMM-resident: not resolvable in Phase A.
+        assert_eq!(frame_value_for_slot(None, Some(9), 16, false), FrameValue::Unsupported);
+        // Spilled primitive vs spilled oop -> StackSlot vs StackSlotRef at [rbp-off].
+        assert_eq!(frame_value_for_slot(None, None, 16, false), FrameValue::StackSlot(-16));
+        assert_eq!(frame_value_for_slot(None, None, 24, true), FrameValue::StackSlotRef(-24));
+    }
 }
 
 impl Compiler {
@@ -6160,6 +6289,11 @@ impl Compiler {
         let safepoint_reg_spill = safepoint_reg_spill_enabled();
         let safepoint_reg_spill_all = safepoint_reg_spill_all();
         let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
+        // Register-only operand-stack-oop soundness (DEFAULT ON): flush
+        // `CalleeSaved` operand-stack reference entries in `flush_scratch_
+        // registers` so a live oop held only in a callee-saved register across a
+        // GC-capable call is visible to the conservative root scan.
+        let flush_callee_saved_oops = flush_callee_saved_oops_enabled();
         // Shadow stack reserves TWO frame slots: the cached thread pointer and
         // a saved `top` watermark (restored in the epilogue to unwind any
         // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
@@ -6260,14 +6394,31 @@ impl Compiler {
         };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
+        // deopt-osr Step 2 — 128-byte SavedRegisters{gpr:[u64;16]} region for the
+        // frame-deopt stub's in-stub 16-GPR spill. Reserved only under
+        // CRATONVM_DEOPT_REAL so the default frame is byte-identical. Placed just
+        // BELOW (deeper than) the per-safepoint reg-spill region and above the
+        // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
+        // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
+        // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
+        let deopt_regs_size = if crate::deopt_real_enabled() { 16 * 8 } else { 0 };
+        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
+        let deopt_regs_base = if deopt_regs_size != 0 {
+            reg_spill_base + reg_spill_size + deopt_regs_size
+        } else {
+            0
+        };
+
         // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs
         //             + per-safepoint reg-spill (SB-CRASH-04)
+        //             + frame-deopt SavedRegisters region (deopt-osr Step 2)
         //             + shadow space + room for in-frame stack args.
         let total = locals_size
             + spill_size
             + callee_saved_size
             + xmm_saved_size
             + reg_spill_size
+            + deopt_regs_size
             + shadow_space
             + stack_arg_reserve;
 
@@ -6320,6 +6471,7 @@ impl Compiler {
             dbg_last_pc: 0,
             dbg_last_op: 0,
             emitted_athrow: false,
+            emitted_alloc_oom_check: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -6384,6 +6536,7 @@ impl Compiler {
             safepoint_reg_spill,
             safepoint_reg_spill_all,
             safepoint_reg_spill_nostore,
+            flush_callee_saved_oops,
             reg_spill_base,
             safepoint_pcs: FxHashSet::default(),
             mapped_safepoint_pcs: FxHashSet::default(),
@@ -6416,6 +6569,10 @@ impl Compiler {
             // here preserves legacy "arg index == slot" behavior.
             param_jvm_slots: Vec::new(),
             param_slot_span: 0,
+            deopt_points: Vec::new(),
+            deopt_boxes: Vec::new(),
+            deopt_regs_base,
+            deopt_box_ptr_by_bci: FxHashMap::default(),
         }
     }
 
@@ -6516,6 +6673,96 @@ impl Compiler {
     /// Offset for local variable `idx`: [rbp - (idx+1)*8]
     fn local_offset(&self, idx: usize) -> i32 {
         (idx as i32 + 1) * 8 // Cast: x86-64 immediate encoding
+    }
+
+    /// deopt-osr Step 1: record a precise deopt-exit snapshot (the interpreter
+    /// frame state — locals + operand stack as `FrameValue`s — reconstructable
+    /// from live machine state) at an eligible guard whose loop-header/canonical
+    /// bytecode index is `bci`.
+    ///
+    /// Provenance comes from the current register allocation (`reg_for_local` /
+    /// `xmm_for_local`, else the spilled frame slot) and the positive oop source
+    /// (`local_oop_masks`/`local_oop_reached` for locals, `stack_oop_marks` for
+    /// the operand stack — `Object`/ref iff the bit is SET *and* reached). The
+    /// primitive width/type source is a deferred follow-up; a register-resident
+    /// slot is recorded by provenance only and the `can_deopt_resume` gate (a
+    /// later step) excludes the ambiguous cases, so nothing resumes on a mistyped
+    /// slot.
+    ///
+    /// EMIT-AND-DISCARD: the point is recorded into `deopt_points` / `deopt_boxes`
+    /// (transferred to `CompiledMethod` at finalize) but no live path consumes it
+    /// yet, so this does not change the `i64::MIN` re-run behaviour.
+    fn emit_deopt_snapshot_at_guard(&mut self, bci: usize) {
+        use crate::deopt::{DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue};
+
+        let native_offset = self.buf.pos() as u32;
+
+        // Locals: oop-ness from the intersection-dataflow mask (only when the
+        // forward dataflow reached this PC; otherwise treat as non-oop). A slot
+        // beyond bit 63, or in an unmapped method, reads as non-oop here — sound
+        // only because `can_deopt_resume` (later) gates such methods off.
+        let oop_reached = self.local_oop_reached.get(bci).copied().unwrap_or(false);
+        let oop_mask = if oop_reached {
+            self.local_oop_masks.get(bci).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let mut locals = Vec::with_capacity(self.num_locals);
+        for i in 0..self.num_locals {
+            let is_oop = i < 64 && (oop_mask & (1u64 << i)) != 0;
+            locals.push(frame_value_for_slot(
+                self.reg_for_local(i),
+                self.xmm_for_local(i),
+                self.local_offset(i),
+                is_oop,
+            ));
+        }
+
+        // Operand stack (canonically empty at a BCE loop header, but handle the
+        // general case): map each live entry's StackSlot location to a FrameValue.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        let mut stack = Vec::with_capacity(n);
+        for i in 0..n {
+            let is_oop = self.stack_oop_marks[i];
+            stack.push(match &self.stack[i] {
+                StackSlot::Frame(off) => {
+                    if is_oop {
+                        FrameValue::StackSlotRef(-*off)
+                    } else {
+                        FrameValue::StackSlot(-*off)
+                    }
+                }
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => FrameValue::Register(*r),
+                StackSlot::Xmm(_) => FrameValue::Unsupported,
+            });
+        }
+
+        let point = DeoptimizationPoint {
+            native_offset,
+            bci: bci as u32,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: bci as u32,
+                locals,
+                stack,
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
+        // the by-value point (find_deopt_point / iteration).
+        self.deopt_boxes.push(Box::new(point.clone()));
+        // deopt-osr Step 2 — stash the Box's stable payload address keyed by bci.
+        // The Box payload does not move when `deopt_boxes` reallocs or when it is
+        // moved into `CompiledMethod._deopt_point_boxes` at finalize (and is leaked
+        // on Drop), so a baked imm64 of this pointer outlives the emitted code.
+        let box_ptr: *const crate::deopt::DeoptimizationPoint =
+            &**self.deopt_boxes.last().unwrap();
+        self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
+        self.deopt_points.push(point);
     }
 
     /// Push a value onto the simulated operand stack.
@@ -12292,6 +12539,47 @@ impl Compiler {
             self.emit_movq_mem_rbp_from_xmm(off, xmm);
             self.stack[idx] = StackSlot::Frame(off);
         }
+        // GC-root soundness (DEFAULT ON; opt out `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`)
+        // — also flush `CalleeSaved` operand-stack entries that hold an object
+        // reference to a frame slot. A `CalleeSaved` push is a "zero-cost push":
+        // the value stays in a callee-saved register (which survives a call by
+        // ABI) until consumed, so the `Scratch`/`Xmm` flushes above leave a live
+        // oop residing ONLY in a register across a GC-capable call. That oop is
+        // invisible to the conservative `[scanner_sp, entry_sp)` frame scan (the
+        // default path: shadow stack off, `safepoint_reg_spill` env-gated off) →
+        // the object can be reclaimed → use-after-free. Spilling it to its frame
+        // home (and retargeting the slot to `Frame`, exactly as the Scratch/Xmm
+        // passes do) puts it on the scanned stack. The spill is value-preserving
+        // and every consumer reads the slot's recorded home, so this can only ADD
+        // a root, never change a computed value. Only entries marked as oops are
+        // spilled (the parallel `stack_oop_marks`); a non-oop callee-saved temp is
+        // ABI-preserved across the call and needs no spill. Pre-call flush only —
+        // this runs at every `flush_scratch_registers` site, which is the project's
+        // canonical pre-call/branch/return flush point.
+        if self.flush_callee_saved_oops {
+            let callee_oop_slots: Vec<(usize, u8)> = self
+                .stack
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    if let StackSlot::CalleeSaved(reg) = *slot {
+                        // Only reference entries need to be made GC-visible; the
+                        // parallel mark vector stays valid after we retarget the
+                        // slot to `Frame` (a frame home is just as much an oop).
+                        if self.stack_oop_marks.get(i).copied().unwrap_or(false) {
+                            return Some((i, reg));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            for (idx, reg) in callee_oop_slots {
+                let off = self.next_spill_offset;
+                self.next_spill_offset += 8;
+                self.emit_store_local(off, reg);
+                self.stack[idx] = StackSlot::Frame(off);
+            }
+        }
         // Clear scratch XMM tracking — all flushed
         self.scratch_xmm_in_use = 0;
     }
@@ -13066,6 +13354,36 @@ impl Compiler {
         self.exception_check_stubs.push(patch_offset);
     }
 
+    /// Emit the post-allocation OOM guard, immediately after an allocation
+    /// helper (`newarray` / `new_object` / `anewarray_object`) returns with its
+    /// result still in RAX. Those helpers return the `0`/null sentinel on heap
+    /// exhaustion (after stashing a `java/lang/OutOfMemoryError` in
+    /// `JIT_PENDING_EXCEPTION` — see `jit_alloc_oom`). A successful allocation is
+    /// never null, so `TEST RAX,RAX; JZ` distinguishes the OOM case.
+    ///
+    /// Without this guard the JIT pushed the null result onto the operand stack
+    /// and kept executing — the very next `arraylength` / `getfield` / array
+    /// store dereferenced it and SIGSEGV'd (read at `[null + offset]`) before
+    /// the method could return and drain the pending OOME. Branching to the same
+    /// shared stub the invoke guard uses (`emit_exception_check_stub`) loads the
+    /// `i64::MIN` deopt sentinel and runs the epilogue; the interpreter's
+    /// post-JIT drain then throws the stashed OOME through the method's
+    /// exception table (catchable, matching the interpreter's allocation paths).
+    fn emit_post_alloc_oom_check(&mut self) {
+        // TEST RAX, RAX  (48 85 C0)
+        self.buf.emit(&[0x48, 0x85, 0xC0]);
+        // JZ rel32 → shared exception-check stub (patched later)
+        self.buf.emit(&[0x0F, 0x84]);
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        self.exception_check_stubs.push(patch_offset);
+        // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
+        // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
+        // allocation-failure GC and to construct the OOME — which only the
+        // dispatch-aware entry path (`set_jit_thread`) provides.
+        self.emitted_alloc_oom_check = true;
+    }
+
     /// Emit the single shared out-of-line stub for post-invoke exception
     /// guards. Loads the `i64::MIN` deopt sentinel into RAX and runs the
     /// standard method epilogue. All `CMP/JE` guards emitted by
@@ -13122,6 +13440,56 @@ impl Compiler {
             let stub_off = self.buf.pos();
             stub_offsets.insert(key, stub_off);
 
+            // deopt-osr Step 2 — route ONLY the BCE pilot guard (reason 2) to the
+            // in-stub 3-arg frame-deopt trampoline, and only under
+            // CRATONVM_DEOPT_REAL with a recorded snapshot for this bci. Gate OFF
+            // (default) ⇒ false ⇒ the uncommon-trap path below emits byte-identically.
+            let frame_deopt = crate::deopt_real_enabled()
+                && reason == 2
+                && self.deopt_box_ptr_by_bci.contains_key(&bci);
+            if frame_deopt {
+                let box_ptr = *self.deopt_box_ptr_by_bci.get(&bci).unwrap();
+                let base = self.deopt_regs_base;
+                // 1) Spill all 16 GPRs (RAX=0..R15=15) into the SavedRegisters
+                //    region FIRST, before any arg-setup clobbers a register: the
+                //    guard `JB` reaches here with every GPR still holding its
+                //    trapping-instant value. gpr[r] -> [rbp - (base - r*8)], so
+                //    gpr[0]=RAX is the deepest slot and ascends with r.
+                for r in 0u8..16 {
+                    self.emit_store_local(base - (r as i32) * 8, r);
+                }
+                // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
+                //    arg1 = rbp (live, never clobbered until the epilogue),
+                //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0].
+                #[cfg(target_os = "windows")]
+                {
+                    self.emit_mov_imm64_full(RCX, box_ptr as usize as i64);
+                    self.emit_mov_reg_reg(RDX, RBP);
+                    self.emit_lea_frame_slot(R8, base);
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    self.emit_mov_imm64_full(RDI, box_ptr as usize as i64);
+                    self.emit_mov_reg_reg(RSI, RBP);
+                    self.emit_lea_frame_slot(RDX, base);
+                }
+                // 3) CALL the jit-crate 3-arg entry BEFORE the epilogue (rbp + the
+                //    spill region are still live; reconstruction reads gpr[r]
+                //    synchronously inside the entry before the epilogue's
+                //    callee-saved restore overwrites the live registers). The
+                //    entry stashes LAST_DEOPT and returns i64::MIN in RAX — mirrors
+                //    the IR path's `emit_deopt_stub`. `emit_call_absolute`'s
+                //    imm64-via-RAX fallback clobbers RAX (already spilled, dead)
+                //    and leaves the 3 arg registers intact.
+                self.emit_call_absolute(crate::deopt::x64_deopt_entry as *const () as usize);
+                // 4) Force the deopt sentinel (the entry returns it; explicit for
+                //    parity with the uncommon-trap stub) + epilogue.
+                self.rex_w();
+                self.buf.emit_byte(0xB8); // MOV RAX, imm64
+                self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+                self.emit_epilogue();
+            } else {
+
             // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
             // vm_ptr is in the heap_local (frame slot) — load it first
             #[cfg(target_os = "windows")]
@@ -13164,6 +13532,7 @@ impl Compiler {
             // Epilogue: restore callee-saved regs and return
             // This mirrors the standard method epilogue
             self.emit_epilogue();
+            } // end else (uncommon-trap path)
 
             // Patch the branch to point here
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
@@ -13892,6 +14261,7 @@ impl Compiler {
                     .get(&pc)
                     .cloned()
                     .unwrap_or_default();
+                let had_guards = !guards.is_empty();
                 for guard in guards {
                     // Load array reference into RAX
                     if let Some(reg) = self.reg_for_local(guard.array_local) {
@@ -13917,6 +14287,12 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
                     self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                }
+                // deopt-osr Step 1: record a precise deopt snapshot for this
+                // BCE loop-header guard (emit-and-discard; nothing reads it yet,
+                // so the i64::MIN re-run via deopt_stubs above is unchanged).
+                if had_guards {
+                    self.emit_deopt_snapshot_at_guard(pc);
                 }
             }
 
@@ -17484,16 +17860,36 @@ impl Compiler {
                             let s_dst = self.next_spill_offset + 16;
                             let s_dst_pos = self.next_spill_offset + 24;
                             let s_len = self.next_spill_offset + 32;
+                            // ALIASING HAZARD: these scratch homes can overlap
+                            // the operands' OWN frame homes. `flush_scratch_
+                            // registers()` above spills any CalleeSaved *oop*
+                            // operand (here src and dst) to frame slots taken
+                            // from `next_spill_offset`; the five pops then rewind
+                            // `next_spill_offset` back over those very slots, so
+                            // e.g. `src_slot`/`dst_slot` may be `Frame(s_src)` /
+                            // `Frame(s_src_pos)`. Writing the scratch homes in
+                            // operand order would corrupt a not-yet-read operand:
+                            // storing s_src_pos (=srcPos) overwrites dst's spilled
+                            // home BEFORE s_dst reads it, leaving s_dst = srcPos
+                            // (a small int) — guard-2 then bails to native when
+                            // srcPos==0, or dereferences the bogus pointer and
+                            // SIGSEGVs when srcPos!=0. Defeat the aliasing by
+                            // loading ALL five operands into distinct scratch
+                            // GPRs FIRST, then storing. RAX/RCX/RDX/R10/R11 are
+                            // never local-mapped (LOCAL_REGS is RBX/R12..R15
+                            // [+RSI/RDI on SysV]) and hold no deferred-Scratch
+                            // value after the flush, so no load can clobber an
+                            // operand still pending a read.
                             self.load_slot_to_reg(RAX, src_slot);
+                            self.load_slot_to_reg(RCX, src_pos_slot);
+                            self.load_slot_to_reg(RDX, dst_slot);
+                            self.load_slot_to_reg(R10, dst_pos_slot);
+                            self.load_slot_to_reg(R11, len_slot);
                             self.emit_store_local(s_src, RAX);
-                            self.load_slot_to_reg(RAX, src_pos_slot);
-                            self.emit_store_local(s_src_pos, RAX);
-                            self.load_slot_to_reg(RAX, dst_slot);
-                            self.emit_store_local(s_dst, RAX);
-                            self.load_slot_to_reg(RAX, dst_pos_slot);
-                            self.emit_store_local(s_dst_pos, RAX);
-                            self.load_slot_to_reg(RAX, len_slot);
-                            self.emit_store_local(s_len, RAX);
+                            self.emit_store_local(s_src_pos, RCX);
+                            self.emit_store_local(s_dst, RDX);
+                            self.emit_store_local(s_dst_pos, R10);
+                            self.emit_store_local(s_len, R11);
 
                             // Collect every "bail to native" branch patch
                             // here; they are all wired to one shared deopt
@@ -20462,6 +20858,10 @@ impl Compiler {
                     self.emit_call_absolute(self.helpers.newarray);
                     // T1.1.a — `newarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Heap-exhaustion guard: a null result means OOM (the helper
+                    // stashed an OutOfMemoryError). Bail before the null is pushed
+                    // and dereferenced by a following `arraylength`/store.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // A primitive array header is still an object reference.
                     self.mark_top_as_oop();
@@ -20565,6 +20965,13 @@ impl Compiler {
                         // finalizer queue and the slow path obviously
                         // can young-GC.
                         self.emit_oop_map_for_safepoint();
+                        // Heap-exhaustion guard: both the inline-TLAB slow path
+                        // and the slow-path helper return the 0/null sentinel on
+                        // OOM (jit_new_object -> jit_alloc_oom). Bail before the
+                        // null is pushed and dereferenced by a following
+                        // getfield/putfield. (Scalar-replaced `new` never reaches
+                        // here, so its dummy-zero push is unaffected.)
+                        self.emit_post_alloc_oom_check();
                         self.push_from_rax();
                         // The result is an object reference.
                         self.mark_top_as_oop();
@@ -20595,6 +21002,11 @@ impl Compiler {
                     self.emit_call_absolute(self.helpers.anewarray_object);
                     // T1.1.a — `anewarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Heap-exhaustion / negative-length guard: jit_anewarray_object
+                    // returns the 0/null sentinel on OOM (-> jit_alloc_oom) or on
+                    // a negative length (-> jit_negative_array_size). Bail before
+                    // the null is pushed and dereferenced.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array — an object reference.
                     self.mark_top_as_oop();
@@ -21644,7 +22056,10 @@ pub fn compile_with_param_slots(
         // `!has_dispatch` fast entry paths return the raw value WITHOUT
         // draining it, which would leak the exception (and mis-read the
         // sentinel as a return value). Force the dispatch-aware route.
-        || compiler.emitted_athrow;
+        || compiler.emitted_athrow
+        // A fallible `newarray` OOM bail needs the per-thread TLS set so the
+        // helper can GC + construct the OOME (same rationale as direct_calls).
+        || compiler.emitted_alloc_oom_check;
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
@@ -21750,6 +22165,13 @@ pub fn compile_with_param_slots(
     // to the conservative stack scan for that frame — always a
     // correct super-set of the precise coverage.
     cm.oop_maps = compiler.oop_maps;
+    // deopt-osr Step 1: transfer precise deopt-exit snapshots collected at
+    // eligible guards (currently the speculative-BCE loop-header guard). No live
+    // path consumes these yet — emit-and-discard until the in-stub trampoline +
+    // resume land (real-frame-deopt-x64-backport Steps 2-4) — so this is inert
+    // (find_deopt_point has no live caller; the i64::MIN re-run is unchanged).
+    cm.deopt_points = compiler.deopt_points;
+    cm._deopt_point_boxes = compiler.deopt_boxes;
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
@@ -27592,6 +28014,14 @@ mod tests {
         assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
         assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
         assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
+        // Defense-in-depth (same class as the missing-`ldc` desync): the other
+        // 5-byte ops. invokedynamic / goto_w / jsr_w are rejected by `jit_scan`
+        // today, but the length table must stay correct so a future acceptance
+        // can't silently desync every PC-stepping walk. Must match the
+        // regalloc.rs `bc_len` twin's `bc_len_five_byte_ops`.
+        assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
+        assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
+        assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
     }
 
     #[test]

@@ -343,6 +343,12 @@ impl ExecutableBuffer {
     /// Allocate a new executable buffer with the given capacity.
     pub fn new(capacity: usize) -> Option<Self> {
         let ptr = platform::alloc_executable(capacity)?;
+        // Account the committed executable memory. `COMMITTED_JIT_CODE_BYTES`
+        // tracks currently-mapped code and is the quantity the code-cache cap
+        // bounds; the `try_compile` gate reads it to decide whether to keep
+        // compiling. Bumped here (not in `Drop`, which fires only on the rare
+        // free path) so the figure reflects live mappings.
+        COMMITTED_JIT_CODE_BYTES.fetch_add(capacity, std::sync::atomic::Ordering::Relaxed);
         // Register this region for code pointer validation.
         if let Ok(mut regions) = jit_code_regions().lock() {
             regions.register(ptr, capacity);
@@ -561,6 +567,103 @@ impl ExecutableBuffer {
 pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// JIT code-cache cap (bounded growth)
+// ---------------------------------------------------------------------------
+//
+// Compiled code is intentionally RETAINED for the process lifetime (see
+// `ExecutableBuffer`'s `Drop`): baked-in direct `CALL rel32` targets and cached
+// MIC/PIC entry pointers have no back-reference mechanism, so reclamation would
+// dangle them. That makes the code cache monotonically growing — a long-running
+// workload that compiles many methods (or repeatedly re-compiles via OSR /
+// deopt churn) keeps mapping new executable regions with no upper bound.
+//
+// Since safe reclamation isn't feasible here, we apply a CAP-AND-STOP policy:
+// once the retained code (committed via `ExecutableBuffer::new`) reaches the
+// cap, `try_compile` refuses further compilation and the affected methods stay
+// in the interpreter. This bounds executable-memory growth at the cost of some
+// lost throughput past the cap; correctness is unaffected because the
+// interpreter can always run any method.
+
+/// Bytes of JIT code currently committed (mapped) by live `ExecutableBuffer`s.
+///
+/// Bumped in [`ExecutableBuffer::new`] and decremented only when a region is
+/// actually returned to the OS (the `CRATONVM_JIT_FREE_CODE=1` path). Because
+/// code is normally retained for the process lifetime, this rises monotonically
+/// in the default configuration and is the quantity the code-cache cap bounds.
+/// Distinct from [`RETAINED_JIT_CODE_BYTES`], which only counts buffers whose
+/// owner was dropped (cache eviction) but whose memory was leaked.
+pub static COMMITTED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Default code-cache cap, in bytes (256 MiB). HotSpot's default
+/// `ReservedCodeCacheSize` is ~240 MiB on 64-bit, so this is a comparable,
+/// deliberately generous bound that real workloads rarely approach.
+const DEFAULT_JIT_CODE_CACHE_CAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// Number of `try_compile` calls refused because the code-cache cap was hit.
+static JIT_CODE_CACHE_CAP_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set once, the first time the cap is hit, so the warning is logged exactly once.
+static JIT_CODE_CACHE_CAP_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Configured upper bound (in bytes) on total retained JIT code.
+///
+/// Overridable via `CRATONVM_JIT_CODE_CACHE_MAX_MB` (an integer number of
+/// mebibytes); `0` disables the cap entirely (unbounded growth, the legacy
+/// behaviour). An unparseable value falls back to the default. Cached on first
+/// read so the env lookup happens at most once.
+pub fn jit_code_cache_cap_bytes() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            // `0` is an explicit "disable the cap" sentinel (treated as
+            // `usize::MAX` so the at-capacity check is always false).
+            Ok(0) => usize::MAX,
+            // Saturate the MiB→bytes multiply so a huge value can't wrap.
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+            Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+        },
+        Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+    })
+}
+
+/// Number of compilations refused so far because the code-cache cap was hit.
+/// Diagnostic only.
+pub fn jit_code_cache_cap_refusals() -> u64 {
+    JIT_CODE_CACHE_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns `true` if retained JIT code has reached the configured cap, meaning
+/// new compilation should be refused (the method stays in the interpreter).
+///
+/// We compare against `COMMITTED_JIT_CODE_BYTES`, which `ExecutableBuffer::new`
+/// bumps for every committed allocation (method bodies, OSR trampolines, deopt
+/// stubs) — the same quantity the cap is meant to bound. Logs a one-time warning
+/// the first time the cap is reached.
+fn jit_code_cache_at_capacity() -> bool {
+    let cap = jit_code_cache_cap_bytes();
+    if cap == usize::MAX {
+        return false; // cap disabled
+    }
+    let used = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if used < cap {
+        return false;
+    }
+    // At/over the cap: warn exactly once, then keep refusing silently.
+    if !JIT_CODE_CACHE_CAP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[cratonvm-jit] code-cache cap reached: {} bytes retained >= cap {} bytes; \
+             new methods will stay in the interpreter. \
+             Raise the limit with CRATONVM_JIT_CODE_CACHE_MAX_MB (0 disables it).",
+            used, cap
+        );
+    }
+    true
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() {
@@ -595,6 +698,9 @@ impl Drop for ExecutableBuffer {
             if let Ok(mut regions) = jit_code_regions().lock() {
                 regions.deregister(self.ptr);
             }
+            // This region is being returned to the OS, so it no longer counts
+            // against the code-cache cap.
+            COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
             platform::free_executable(self.ptr, self.capacity);
             return;
         }
@@ -741,6 +847,28 @@ fn jit_name_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, String)>> {
 pub fn jit_names_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_JIT_NAMES").is_some())
+}
+
+/// deopt-osr: master gate for *real* deopt-exit / OSR-exit resume
+/// (`CRATONVM_DEOPT_REAL`, default-OFF). Read-once cached. While OFF (the
+/// default) every guard/loop bail stays on the `i64::MIN` whole-method re-run,
+/// so the surface is inert. The interpreter deopt sinks and the OSR-exit sink
+/// consult this together with the per-method `can_deopt_resume` / `can_osr_exit`
+/// flags, so deopt-exit and OSR-exit can never run half-on
+/// (see `docs/feature-designs/deopt-osr.md`).
+pub fn deopt_real_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_REAL").is_some())
+}
+
+/// deopt-osr: CI/test gate for the eager-deopt differential verifier
+/// (`CRATONVM_DEOPT_VERIFY`, default-OFF). Read-once cached. When ON, every
+/// eligible guard/loop boundary deopts, reconstructs the interpreter frame, and
+/// compares the reconstructed-interpreter result against the JIT result — the
+/// mandatory check before any guard/loop family is flipped onto `deopt_real`.
+pub fn deopt_verify_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
 }
 
 /// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
@@ -919,6 +1047,27 @@ pub struct CompiledMethod {
     /// it is always safe to leave unset. Only ever consulted on the
     /// gated precise path (`CRATONVM_PRECISE_JIT_MAPS`).
     pub fully_oop_covered: bool,
+    /// deopt-osr scaffolding — `true` only once the deopt finalizer has
+    /// proven this method can rebuild a precise interpreter frame at a guard
+    /// bci and resume there (instead of the `i64::MIN` whole-method re-run).
+    /// `false` (the default) keeps the method on the safe re-run path; no
+    /// emitter populates it yet, so it is currently always `false`. Mirrors
+    /// the `fully_oop_covered` coverage-gate pattern: purely additive, no
+    /// behaviour change until the resume path is wired
+    /// (see `docs/feature-designs/deopt-osr.md`).
+    pub can_deopt_resume: bool,
+    /// deopt-osr scaffolding — `true` only once the OSR-exit map emitter has
+    /// proven this (OSR-compiled) method can leave a running JIT/OSR frame
+    /// mid-loop at a loop bci with the loop's live state, rather than the
+    /// `i64::MIN` re-run (which is *wrong* for an OSR'd frame entered partway
+    /// through). `false` by default; no emitter populates it yet.
+    pub can_osr_exit: bool,
+    /// deopt-osr scaffolding — monotonic compilation epoch for this artifact.
+    /// When `MakeNotEntrant` invalidation lands, boxed `DeoptimizationPoint`
+    /// pointers (baked into guard code) are versioned by this epoch so a
+    /// resume never follows a box belonging to a superseded compilation.
+    /// `0` for every artifact today (no invalidation consumer yet).
+    pub compilation_epoch: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1017,6 +1166,11 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            // deopt-osr scaffolding: default to the safe re-run path; no
+            // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
+            can_deopt_resume: false,
+            can_osr_exit: false,
+            compilation_epoch: 0,
         }
     }
 
@@ -1062,6 +1216,11 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            // deopt-osr scaffolding: default to the safe re-run path; no
+            // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
+            can_deopt_resume: false,
+            can_osr_exit: false,
+            compilation_epoch: 0,
         }
     }
 
@@ -3569,6 +3728,21 @@ impl std::fmt::Debug for JitCache {
 // Escape analysis: IR graph → EA graph conversion
 // ---------------------------------------------------------------------------
 
+/// The instance-field index a full-layout `Op::Load`/`Op::Store` accesses,
+/// recovered from its `Const(field_index)` offset operand (input[3]). Returns
+/// `None` for a compact / malformed node (no constant offset), letting the
+/// caller fall back to the `MemKind`-derived index. This is the single place
+/// the EA bridge interprets a production field access's index, so the EA
+/// graph's field edges and `apply_ea_to_ir`'s `field_values` lookup agree.
+fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    let offset_node = *node.inputs.get(3)?;
+    match ir_graph.nodes.get(offset_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
 /// Convert an `ir::Graph` to an `escape_analysis::Graph` for standalone
 /// escape analysis.  The two modules define independent `Op` / `Node` /
 /// `Graph` types, so we translate node-by-node.  Returns both the EA graph
@@ -3605,7 +3779,24 @@ fn escape_analysis_from_ir(
             continue;
         }
         let ir_node = &ir_graph.nodes[i];
-        let ea_op = ir_op_to_ea_op(&ir_node.op);
+        // The production builder emits full-layout `Op::Load`/`Op::Store`
+        // (`[ctrl, mem, base, offset, (value)]`) carrying a `MemKind`, but the
+        // EA graph keys field edges by a real **field index**. Recover it from
+        // the `Const(field_index)` offset operand (input[3]); fall back to the
+        // `MemKind`-derived index (`ir_op_to_ea_op`) only when the offset isn't
+        // a constant (a malformed/compact node EA already treats
+        // conservatively).
+        let ea_op = match &ir_node.op {
+            ir::Op::Load(_) => match ir_load_store_field_index(ir_graph, i as ir::NodeId) {
+                Some(f) => escape_analysis::Op::Load(f),
+                None => ir_op_to_ea_op(&ir_node.op),
+            },
+            ir::Op::Store(_) => match ir_load_store_field_index(ir_graph, i as ir::NodeId) {
+                Some(f) => escape_analysis::Op::Store(f),
+                None => ir_op_to_ea_op(&ir_node.op),
+            },
+            _ => ir_op_to_ea_op(&ir_node.op),
+        };
         // Don't wire inputs yet — we need all id_map entries populated.
         let ea_id = ea.add_node(ea_op, vec![]);
         id_map[i] = ea_id;
@@ -3619,11 +3810,22 @@ fn escape_analysis_from_ir(
         }
         let ea_id = id_map[i];
         let ir_node = &ir_graph.nodes[i];
-        let ea_inputs: Vec<escape_analysis::NodeId> = ir_node
-            .inputs
-            .iter()
-            .map(|&inp| id_map[inp as usize])
-            .collect();
+        // The EA graph reads memory-access operands positionally in a *compact*
+        // layout (`Store [holder, value]`, `Load [holder]`); the full-layout IR
+        // node places the holder at input[2] and the store value at input[4].
+        // Translate those two shapes; everything else is forwarded verbatim.
+        // (A node whose expected operand is missing yields an empty input list,
+        // which EA's `store_holder`/`load_holder` treat conservatively.)
+        let map_id = |inp: ir::NodeId| -> escape_analysis::NodeId {
+            id_map.get(inp as usize).copied().unwrap_or(usize::MAX)
+        };
+        let ea_inputs: Vec<escape_analysis::NodeId> = match &ir_node.op {
+            ir::Op::Store(_) if ir_node.inputs.len() >= 5 => {
+                vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
+            }
+            ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            _ => ir_node.inputs.iter().map(|&inp| map_id(inp)).collect(),
+        };
         ea.nodes[ea_id].inputs = ea_inputs.clone();
         // Rebuild use-edges for the targets.
         for &inp_ea in &ea_inputs {
@@ -3662,7 +3864,7 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         ir::Op::NewArray { element_type } => EaOp::NewArray {
             element_type: *element_type,
         },
-        ir::Op::Call => EaOp::Call,
+        ir::Op::Call { .. } => EaOp::Call,
         ir::Op::ArrayLength => EaOp::ArrayLength,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
@@ -3708,36 +3910,49 @@ fn apply_ea_to_ir(
                 continue;
             }
 
-            // Determine the field index from the EA Load op so we can look
-            // up the replacement value in field_values.
-            let ea_field_idx = match &info.field_values.len() {
-                0 => continue,
-                _ => {
-                    // The EA graph's Load(field_idx) carries the field index.
-                    // We need to read it from the EA op, but we only have the
-                    // EA node ID.  Instead, we can derive it: the IR Load's
-                    // MemKind was mapped to the EA field index via
-                    // `*mk as usize` in ir_op_to_ea_op.
-                    if let ir::Op::Load(mk) = &ir_graph.nodes[idx].op {
-                        *mk as usize
-                    } else {
-                        continue;
-                    }
-                }
+            // Determine the field index of this load so we can look up the
+            // replacement value in `field_values`. It must match the index the
+            // EA bridge keyed field edges by: the real field index from the
+            // `Const` offset operand (full-layout production load), falling back
+            // to the `MemKind`-derived index for a compact/hand-built node.
+            if info.field_values.is_empty() {
+                continue;
+            }
+            let ea_field_idx = match ir_load_store_field_index(ir_graph, ir_load) {
+                Some(f) => f,
+                None => match &ir_graph.nodes[idx].op {
+                    ir::Op::Load(mk) => *mk as usize,
+                    _ => continue,
+                },
             };
 
-            if ea_field_idx < info.field_values.len() {
-                if let Some(ea_val) = info.field_values[ea_field_idx] {
-                    if let Some(&ir_val) = reverse_map.get(&ea_val) {
-                        // Redirect: replace all references to ir_load with ir_val
-                        // across the entire IR graph.
-                        let load_id = ir_load;
-                        for node in ir_graph.nodes.iter_mut() {
-                            for inp in node.inputs.iter_mut() {
-                                if *inp == load_id {
-                                    *inp = ir_val;
-                                }
-                            }
+            // The value the load resolves to: the stored field value, or — when
+            // the field was never stored (`field_values[idx] == None`) — the
+            // freshly-allocated object's zero default. WITHOUT the latter, a
+            // load of an un-stored field was killed below with NO replacement,
+            // leaving its consumers reading a dead node (a miscompile that was
+            // latent only because scalar replacement does not yet fire on
+            // production IR). A `Const(0)` is the correct default for a
+            // zero-initialised object's int field. (Soundness depends on the
+            // object being genuinely zero-initialised — the caller must only
+            // admit allocations whose constructor sets no non-zero field.)
+            let replacement: Option<ir::NodeId> = if ea_field_idx < info.field_values.len() {
+                match info.field_values[ea_field_idx] {
+                    Some(ea_val) => reverse_map.get(&ea_val).copied(),
+                    None => Some(ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None)),
+                }
+            } else {
+                None
+            };
+
+            if let Some(ir_val) = replacement {
+                // Redirect: replace all references to ir_load with ir_val
+                // across the entire IR graph.
+                let load_id = ir_load;
+                for node in ir_graph.nodes.iter_mut() {
+                    for inp in node.inputs.iter_mut() {
+                        if *inp == load_id {
+                            *inp = ir_val;
                         }
                     }
                 }
@@ -3903,10 +4118,52 @@ pub fn try_compile(
     // (resolver absent, or it returns `None` for a given site) makes the
     // CRC32 intrinsic at that site bail to normal dispatch.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // activate-ir-optimizer (scalar-new wiring): given an `invokespecial`
+    // constant-pool index, returns `true` iff it targets a constructor whose
+    // *construction* is elidable for escape-analysis scalar replacement — a
+    // no-arg `<init>()V` of a direct `java/lang/Object` subclass whose body is
+    // exactly `aload_0; invokespecial Object.<init>()V; return` (no field
+    // initialiser, no escape, no side effect). `None` (the production default
+    // unless the soak flag is set) leaves scalar-replacement of `new` OFF: the
+    // IR builder bails on every `invokespecial`, so allocation-bearing methods
+    // take the single-pass backend exactly as before.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
     // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
     // function doc above.
     optimize: bool,
+    // Gap B (activate-ir-optimizer): `true` lets the IR builder lower an
+    // int-only `invokestatic` in an oop-free method to `Op::Call` (dispatched
+    // via `invoke_dispatch`). `false` (the default) keeps every invoke on
+    // single-pass. Gated default-OFF behind `CRATONVM_JIT_IR_CALL` at the VM
+    // call sites until it soaks.
+    ir_emit_calls: bool,
+    // inc 24 (Gap B): `true` additionally lets the IR builder lower a resolved
+    // non-`<init>` `invokespecial` (private / `super.` / non-virtual instance
+    // call) to `Op::Call`, with the receiver marshalled as arg0 and
+    // `invoke_kind == 1`. `false` (the default) keeps every `invokespecial`
+    // on single-pass (the builder bails). Gated default-OFF behind
+    // `CRATONVM_JIT_IR_CALL_SPECIAL` at the VM call sites until it soaks.
+    ir_emit_special_calls: bool,
+    // inc 25 (category-2 foundation): `true` lets the optimizing IR path take
+    // **long**-using methods (the `method_uses_category2` gate otherwise bails
+    // the whole pipeline on any long/double opcode). Only long is admitted —
+    // double/float and int div/rem still bail (the latter to keep a `long`
+    // off a deopt point, since long deopt-resume is a follow-up). `false` (the
+    // default) preserves the int/ref-only IR path. Gated default-OFF behind
+    // `CRATONVM_JIT_IR_LONG` at the VM call sites until it soaks.
+    ir_emit_long: bool,
+    // inc 26 (Gap B): `true` additionally lets the IR builder lower a resolved
+    // `invokevirtual` (0xb6) / `invokeinterface` (0xb9) to `Op::Call`, with the
+    // receiver marshalled as arg0 and `invoke_kind == 0` (virtual) / `2`
+    // (interface). Dispatch is fully dynamic: the baked `JitInvokeInfo` carries
+    // the static call-site class/name/descriptor and `invoke_dispatch` resolves
+    // the actual target on the receiver's RUNTIME class (no inline cache in the
+    // emitted code — the generic helper does the vtable/itable lookup). `false`
+    // (the default) keeps every virtual/interface invoke on single-pass. Gated
+    // default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL` at the VM call sites
+    // until it soaks.
+    ir_emit_virtual_calls: bool,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -3918,6 +4175,19 @@ pub fn try_compile(
         &cached.method_descriptor,
     ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
+    // Code-cache cap (bounded growth). Compiled code is retained for the
+    // process lifetime with no safe reclamation path (see the cap notes near
+    // `COMMITTED_JIT_CODE_BYTES`), so once the retained code reaches the
+    // configured cap we refuse further compilation and let the method run in
+    // the interpreter. This is checked here — before any scan/IR/lowering — so
+    // a saturated cache spends no work on methods it won't emit. Not bail-
+    // listed: the refusal is capacity-driven, not a permanent backend bail, so
+    // if headroom later reappears (a region is freed) the method may compile.
+    if jit_code_cache_at_capacity() {
+        JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
 
@@ -3942,7 +4212,12 @@ pub fn try_compile(
         inline_resolver,
         string_layout_resolver,
         cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
         optimize,
+        ir_emit_calls,
+        ir_emit_special_calls,
+        ir_emit_long,
+        ir_emit_virtual_calls,
         &mut backend_attempted,
     );
 
@@ -4064,10 +4339,26 @@ fn try_compile_inner(
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
     // Maps an invoke* CP index to its declared class id — see `try_compile`.
     cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // Elidable-`<init>` resolver for scalar-replacement of `new` — see
+    // `try_compile`. `None` keeps `new` scalar replacement off.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
     // wire-tiered-manager Step 3: when `false`, the optimizing IR pipeline is
     // skipped entirely and compilation falls through to the single-pass
     // `x64::compile` backend (the fast C1 tier). See `try_compile`.
     optimize: bool,
+    // Gap B: enable lowering of int-only `invokestatic` in oop-free methods to
+    // `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_calls: bool,
+    // inc 24 (Gap B): additionally lower resolved non-`<init>` `invokespecial`
+    // to `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_special_calls: bool,
+    // inc 25: admit long-using methods to the IR path. See `try_compile`.
+    // Default-OFF at the VM call sites.
+    ir_emit_long: bool,
+    // inc 26 (Gap B): additionally lower resolved `invokevirtual`/
+    // `invokeinterface` to `Op::Call` (dynamic dispatch via the helper). See
+    // `try_compile`. Default-OFF at the VM call sites.
+    ir_emit_virtual_calls: bool,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -4216,13 +4507,240 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
-        && !method_uses_category2(code, code_len, &cached.method_descriptor)
+        && (!method_uses_category2(code, code_len, &cached.method_descriptor)
+            // inc 25: admit a long-using method when the long gate is on, as
+            // long as it is double/float-free AND int-div/rem-free. The latter
+            // keeps a `long` value off a deopt point (div emits a guard whose
+            // resume cannot yet reconstruct a `long` slot — a follow-up), so a
+            // long is only ever live in a leaf with no safepoint.
+            || (ir_emit_long
+                && !method_uses_double(code, code_len, &cached.method_descriptor)
+                && !method_has_int_div(code, code_len)))
     {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
-        let builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
-        if let Some(mut graph) = builder.build(code, code_len) {
+        let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // Type each `Param` node from the descriptor. Two consumers depend on
+        // this:
+        //   * inc 25 (long gate): re-lay-out the parameter locals with the JVM
+        //     two-slot category-2 convention (a `long`/`double` param occupies
+        //     two slots) so `lload`/`lstore` of a later long param reads the
+        //     right slot.
+        //   * real-frame-deopt type source: a ref-typed param (an instance
+        //     method's `this`, an object/array argument) must be `IrType::Ref`
+        //     so the deopt snapshot tags its slot `StackSlotRef` → `Value::Object`
+        //     on resume, instead of a truncated `Value::Int`. Without this the
+        //     receiver of an instance method that deopts at, e.g., a div-by-zero
+        //     guard would resume with a garbage `this`.
+        // For an all-category-1 signature this is layout-identical to `new`'s
+        // one-slot-per-param placement — only the node *type* changes, which is
+        // codegen-neutral (spill/reload are always 64-bit REX.W; ref operands
+        // are never width-sensitive arithmetic), so it is now applied
+        // unconditionally rather than only under the long gate.
+        let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
+        builder.set_param_types(&ptypes);
+        if ir_emit_long {
+            // inc 26: resolve `ldc2_w` long constants (pc → i64) so the builder
+            // can lower them to `Op::Const(Long)`. A double constant is excluded
+            // upstream (its consuming double opcode trips `method_uses_double`),
+            // so every resolved value here is a long bit pattern. An unresolved
+            // `ldc2_w` is omitted → that opcode bails to single-pass.
+            if !scan.ldc2w_ops.is_empty() {
+                if let Some(resolver) = cp_ldc2w_resolver {
+                    let mut lm = std::collections::HashMap::with_capacity(scan.ldc2w_ops.len());
+                    for &(pc, cp_idx) in &scan.ldc2w_ops {
+                        if let Some(v) = resolver(cp_idx) {
+                            lm.insert(pc, v);
+                        }
+                    }
+                    builder.set_ldc2w_info(lm);
+                }
+            }
+        }
+        // Thread the resolved instance-field layout (pc → (field_index,
+        // type_tag)) into the builder so it can lower an int-category
+        // `getfield` into `Op::Load`. A field the resolver can't resolve is
+        // simply omitted; the builder then bails that getfield to single-pass.
+        if !scan.field_ops.is_empty() {
+            if let Some(resolver) = cp_field_resolver {
+                let mut fm = std::collections::HashMap::with_capacity(scan.field_ops.len());
+                for &(pc, cp_idx) in &scan.field_ops {
+                    if let Some(fi) = resolver(cp_idx) {
+                        fm.insert(pc, fi);
+                    }
+                }
+                builder.set_field_info(fm);
+            }
+        }
+        // Scalar replacement of `new`: only when the elidable-`<init>` resolver
+        // is supplied (the production soak flag is on, or a test wires it
+        // directly) do we feed the builder the allocation layout for every `new`
+        // and the pcs of elidable `<init>()V` invokespecials. Without it, the
+        // builder bails on `new`/`invokespecial`, so allocation-bearing methods
+        // stay on the single-pass backend exactly as before (inert default).
+        if let (Some(elidable_resolver), Some(new_resolver)) =
+            (cp_elidable_init_resolver, cp_new_resolver)
+        {
+            if !scan.new_ops.is_empty() {
+                let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
+                for &(pc, cp_idx) in &scan.new_ops {
+                    if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
+                        new_info_map.insert(pc, (class_id, num_fields));
+                    }
+                }
+                let mut trivial_init_pcs = std::collections::HashSet::new();
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if opcode == 0xb7 && elidable_resolver(cp_idx) {
+                        trivial_init_pcs.insert(pc);
+                    }
+                }
+                builder.set_new_info(new_info_map, trivial_init_pcs);
+            }
+        }
+        // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
+        // is on AND the method has no `new`/array allocation (a surviving `New`
+        // would need the allocation path the lowerer lacks; array ops bail the
+        // builder anyway) AND every invoke is an `invokestatic` whose descriptor
+        // is GPR-marshallable (int/reference args + int/void/reference return —
+        // no long/float/double). Reference params, reference args, int field
+        // ops, and reference returns ARE allowed: any oop live across the call
+        // sits in a spilled frame slot, which the conservative GC root scan of
+        // the IR frame finds — sound because the GC is non-moving while a JIT
+        // frame is active (so a pinned pointer is never relocated). The leaked
+        // `JitInvokeInfo` boxes/strings are attached to the returned
+        // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
+        let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
+        let mut ir_call_strings: Vec<Box<str>> = Vec::new();
+        if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
+            && !scan.invoke_ops.is_empty()
+        {
+            if let Some(resolver) = cp_invoke_resolver {
+                let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+                if call_eligible {
+                    let mut info_map = std::collections::HashMap::new();
+                    let mut all_emittable = true;
+                    for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                        // Admit `invokestatic` (under `ir_emit_calls`), resolved
+                        // non-`<init>` `invokespecial` (inc 24, under
+                        // `ir_emit_special_calls`), and `invokevirtual` /
+                        // `invokeinterface` (inc 25, under `ir_emit_virtual_calls`).
+                        // Any invoke kind whose gate is disabled keeps the whole
+                        // method on single-pass — the builder bails on an invoke
+                        // with no `invoke_info` entry.
+                        let is_static = opcode == 0xb8;
+                        let is_special = opcode == 0xb7;
+                        let is_virtual = opcode == 0xb6;
+                        let is_interface = opcode == 0xb9;
+                        if !((is_static && ir_emit_calls)
+                            || (is_special && ir_emit_special_calls)
+                            || ((is_virtual || is_interface) && ir_emit_virtual_calls))
+                        {
+                            all_emittable = false;
+                            break;
+                        }
+                        let (cn, mn, desc) = match resolver(cp_idx) {
+                            Some(t) => t,
+                            None => {
+                                all_emittable = false;
+                                break;
+                            }
+                        };
+                        // A `<init>` `invokespecial` is never a real `Op::Call`
+                        // here: a constructor is only ever handled by the
+                        // scalar-new elision path (`trivial_init_pcs`), and
+                        // eliding vs. calling a ctor are different transforms.
+                        // (Belt-and-braces — a `<init>`-bearing method also has
+                        // a `new`, so `call_eligible` is already false.)
+                        if is_special && mn == "<init>" {
+                            all_emittable = false;
+                            break;
+                        }
+                        let (desc_args, ret) = match static_call_shape(&desc) {
+                            Some(t) => t,
+                            None => {
+                                all_emittable = false;
+                                break;
+                            }
+                        };
+                        // Every kind except `invokestatic` marshals the receiver
+                        // as arg0 (a reference → one GPR slot), so it carries one
+                        // more JIT arg than its descriptor lists. `invoke_kind`
+                        // matches the dispatch helper's encoding: 0 = virtual,
+                        // 1 = special (non-virtual dispatch to the resolved
+                        // target), 2 = interface, 3 = static. For virtual /
+                        // interface the helper dispatches on the receiver's
+                        // runtime class (the baked class/name/descriptor are the
+                        // static call-site signature it resolves against).
+                        let has_receiver = !is_static;
+                        let num_args = desc_args + if has_receiver { 1 } else { 0 };
+                        let invoke_kind: u8 = if is_special {
+                            1
+                        } else if is_virtual {
+                            0
+                        } else if is_interface {
+                            2
+                        } else {
+                            3
+                        };
+                        let class_box: Box<str> = cn.into_boxed_str();
+                        let method_box: Box<str> = mn.into_boxed_str();
+                        let desc_box: Box<str> = desc.into_boxed_str();
+                        let class_ref = &*class_box as *const str;
+                        let method_ref = &*method_box as *const str;
+                        let desc_ref = &*desc_box as *const str;
+                        ir_call_strings.push(class_box);
+                        ir_call_strings.push(method_box);
+                        ir_call_strings.push(desc_box);
+                        let info = Box::new(JitInvokeInfo {
+                            class_name: unsafe { &*class_ref },
+                            method_name: unsafe { &*method_ref },
+                            descriptor: unsafe { &*desc_ref },
+                            num_jit_args: num_args,
+                            return_type: ret,
+                            invoke_kind,
+                        });
+                        let info_ptr = &*info as *const JitInvokeInfo as usize;
+                        ir_call_infos.push(info);
+                        info_map.insert(pc, (info_ptr, num_args, ret));
+                    }
+                    if all_emittable && !info_map.is_empty() {
+                        if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                            eprintln!(
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s)",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                info_map.len(),
+                            );
+                        }
+                        builder.set_invoke_info(info_map);
+                    } else {
+                        // A non-emittable invoke is present → leave `invoke_info`
+                        // unset (the builder bails on every invoke → single-pass)
+                        // and drop the now-unreferenced boxes/strings.
+                        ir_call_infos.clear();
+                        ir_call_strings.clear();
+                    }
+                }
+            }
+        }
+        let built = builder.build(code, code_len);
+        // Soak diagnostic (CRATONVM_DBG_SCALAR_NEW): an allocation-bearing method
+        // that bailed the IR builder went single-pass, so `new` scalar
+        // replacement could not fire on it — the signal that the IR builder is
+        // missing an opcode the method uses (this is how the `astore` gap, which
+        // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        if built.is_none()
+            && !scan.new_ops.is_empty()
+            && std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
+        {
+            eprintln!(
+                "[cratonvm-scalarnew] IR builder bailed (single-pass) for allocation method {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+        if let Some(mut graph) = built {
             // History: the IR backend used to miscompile a *pure* (call-free)
             // method containing a conditional branch / φ merge — a tiny leaf
             // predicate like `static boolean f(int m){ return (m & K) != 0; }`
@@ -4256,23 +4774,94 @@ fn try_compile_inner(
                 {
                     let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                    // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
+                    // allocation-bearing method, report how many of its `new`s
+                    // escape analysis scalar-replaced. This proves the path is
+                    // actually exercised on real bytecode (a non-vacuous soak):
+                    // `scalar_replaceable < ir_news` means some `new` escaped and
+                    // the method will bail to single-pass via the surviving-New
+                    // gate below.
+                    if std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                        let ir_news = graph
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
+                            })
+                            .count();
+                        if ir_news > 0 {
+                            eprintln!(
+                                "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                ea_result.scalar_replaceable.len(),
+                                ir_news,
+                            );
+                        }
+                    }
                     if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
                     {
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
                     }
                 }
 
-                let schedule = ir_schedule::schedule(&graph);
-                if let Some(compiled) =
-                    ir_lower::lower(&graph, &schedule, num_params, cached.max_locals as usize)
-                {
-                    // wire-tiered-manager Step 3 telemetry (test-only): records
-                    // that the optimizing IR path — not the single-pass C1
-                    // backend — produced this body, so the per-call toggle test
-                    // can prove `optimize=false` skips it.
-                    #[cfg(test)]
-                    IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
-                    return Some(compiled);
+                // An `Op::New` that SURVIVED escape analysis (it escaped, so it
+                // was not scalar-replaced) has no IR lowering — `ir_lower` has
+                // no allocation path and would emit nothing for it, leaving a
+                // garbage object reference. Bail to single-pass rather than
+                // miscompile. (Scalar-replaced News are already `Op::Dead`.)
+                let has_live_new = graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
+                if !has_live_new {
+                    let schedule = ir_schedule::schedule(&graph);
+                    if let Some(mut compiled) = ir_lower::lower(
+                        &graph,
+                        &schedule,
+                        num_params,
+                        cached.max_locals as usize,
+                        helpers,
+                    ) {
+                        // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
+                        // so the `info_ptr`s baked into each `Op::Call` stay valid
+                        // for the code's lifetime, and mark the method as using
+                        // dispatch so the VM wraps the call in `set_jit_thread` +
+                        // `catch_unwind` and drains the pending exception (the
+                        // `lower` step already set `needs_context`). When no call
+                        // was emitted both Vecs are empty → no behaviour change.
+                        if !ir_call_infos.is_empty() {
+                            compiled._jit_invoke_infos = ir_call_infos;
+                            compiled._jit_strings = ir_call_strings;
+                            compiled.has_dispatch = true;
+                        }
+                        // wire-tiered-manager Step 3 telemetry (test-only):
+                        // records that the optimizing IR path — not the
+                        // single-pass C1 backend — produced this body, so the
+                        // per-call toggle test can prove `optimize=false` skips it.
+                        #[cfg(test)]
+                        IR_LOWER_COMPILES.with(|c| c.set(c.get() + 1));
+                        // inc 25 soak diagnostic: prove a long method actually
+                        // took the IR path at runtime (single-pass also compiles
+                        // longs, so a live "== HotSpot" probe alone is vacuous).
+                        if ir_emit_long
+                            && std::env::var_os("CRATONVM_DBG_IR_LONG").is_some()
+                            && method_uses_category2(
+                                code,
+                                code_len,
+                                &cached.method_descriptor,
+                            )
+                        {
+                            eprintln!(
+                                "[cratonvm-irlong] {}.{}{}: long method took the IR pipeline",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                            );
+                        }
+                        return Some(compiled);
+                    }
                 }
             } // end else (IR-lowering path)
         }
@@ -5085,6 +5674,228 @@ pub fn count_param_slots(descriptor: &str) -> usize {
     slots
 }
 
+/// inc 25: the IR-builder parameter types in JIT-arg order (one per parameter,
+/// `this` first for an instance method). Drives `IrBuilder::set_param_types`,
+/// which lays the params out across JVM local slots with the category-2 two-slot
+/// convention. Mirrors `count_param_slots`' one-slot-per-parameter counting.
+fn ir_param_types(descriptor: &str, is_static: bool) -> Vec<ir::IrType> {
+    let mut types = Vec::new();
+    if !is_static {
+        types.push(ir::IrType::Ref); // implicit `this`
+    }
+    let b = descriptor.as_bytes();
+    let mut i = 1; // skip '('
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'J' => {
+                types.push(ir::IrType::Long);
+                i += 1;
+            }
+            b'D' => {
+                types.push(ir::IrType::Double);
+                i += 1;
+            }
+            b'F' => {
+                types.push(ir::IrType::Float);
+                i += 1;
+            }
+            b'L' => {
+                types.push(ir::IrType::Ref);
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                types.push(ir::IrType::Ref);
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                types.push(ir::IrType::Int); // I Z B C S
+                i += 1;
+            }
+        }
+    }
+    types
+}
+
+/// inc 25: like `method_uses_category2`, but flags only **double** (the part the
+/// long slice does NOT yet handle). A `D` parameter/return or any double-typed
+/// opcode disqualifies the method; `long` and `float` do not (long is handled,
+/// float bails at the builder's opcode catch-all). Used to admit long-only
+/// methods to the IR path while keeping double/XMM on single-pass.
+fn method_uses_double(code: &[u8], code_len: usize, descriptor: &str) -> bool {
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'D' => return true,
+            b'L' => {
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(rp) = b.iter().position(|&c| c == b')') {
+        if matches!(b.get(rp + 1), Some(b'D')) {
+            return true;
+        }
+    }
+    let mut pc = 0;
+    while pc < code_len {
+        if is_double_opcode(code[pc]) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
+/// Double-typed opcodes (subset of `is_category2_opcode` that is double, not
+/// long). `ldc2_w` (0x14) is deliberately omitted — it is long/double-ambiguous,
+/// but the IR builder does not lower it (bails to single-pass), and any double
+/// *constant* must be consumed by a double opcode listed here, so a double
+/// `ldc2_w` method is caught regardless.
+fn is_double_opcode(op: u8) -> bool {
+    matches!(
+        op,
+        0x0e | 0x0f          // dconst_0, dconst_1
+        | 0x18 | 0x26..=0x29 // dload, dload_0..3
+        | 0x31 | 0x52        // daload, dastore
+        | 0x39 | 0x47..=0x4a // dstore, dstore_0..3
+        | 0x63 | 0x67 | 0x6b | 0x6f | 0x73 // dadd, dsub, dmul, ddiv, drem
+        | 0x77               // dneg
+        | 0x87 | 0x8a | 0x8d // i2d, l2d, f2d
+        | 0x8e | 0x8f | 0x90 // d2i, d2l, d2f
+        | 0x97 | 0x98        // dcmpl, dcmpg
+        | 0xaf               // dreturn
+    )
+}
+
+/// inc 25: an int `idiv`/`irem` in the body. Such a method gets a div guard
+/// whose deopt resume cannot yet reconstruct a `long` slot, so admitting a long
+/// method with an int division could strand a live `long` at the deopt — bail
+/// to single-pass until long deopt-resume lands. (Long `ldiv`/`lrem` already
+/// bail: the builder does not lower them.)
+fn method_has_int_div(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0;
+    while pc < code_len {
+        if matches!(code[pc], 0x6c | 0x70) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
+/// Gap B (inc 22): classify a static-call descriptor for the `Op::Call` slice.
+/// Returns `Some((num_args, ret_type))` iff EVERY parameter is a single-slot
+/// value the marshaller can pass as one i64 — an int-category primitive
+/// (`I`/`Z`/`B`/`C`/`S`) OR a reference (`L…`/`[…`, passed as the raw pointer) —
+/// and the return is int-category, `void`, or a reference. `None` for any
+/// `long`/`float`/`double` parameter or return (category-2 / XMM register, not
+/// handled by the int/pointer-only GPR marshalling), keeping the method on
+/// single-pass.
+///
+/// Reference args/returns are GC-sound across the call: while a JIT frame is
+/// active the GC is non-moving (`gc_quiescence`), and the conservative root
+/// scan of the IR spill frame finds (and pins) any pointer in a slot — so a
+/// reference live across the call is neither relocated nor reclaimed, with no
+/// precise oop map required (inc 22 — see `activate-ir-optimizer.md`).
+pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
+    let bytes = descriptor.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return None;
+    }
+    let mut i = 1;
+    let mut num_args = 0usize;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => {
+                num_args += 1;
+                i += 1;
+            }
+            // inc 28: a `long` arg is one i64 slot in the compact JIT ABI (the
+            // IR builder treats a long as one operand-stack node and the
+            // marshaller stores it as one i64), so it counts as one arg — same as
+            // an int/ref. Only reachable under `ir_emit_long` (producing a long
+            // requires a category-2 opcode → `method_uses_category2`), so this is
+            // inert for the default int/ref path. `double`/`float` args (XMM) are
+            // still rejected; a `long`/`double`/`float` RETURN is still rejected
+            // below (a `Long.MIN_VALUE` result would collide with the `i64::MIN`
+            // deopt sentinel — deferred to the out-of-band-signal fix).
+            b'J' => {
+                num_args += 1;
+                i += 1;
+            }
+            b'L' => {
+                num_args += 1;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1; // skip ';'
+            }
+            b'[' => {
+                num_args += 1;
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'L' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < bytes.len() {
+                    i += 1; // primitive array element type
+                }
+            }
+            // long / float / double — category-2 / XMM, not handled.
+            _ => return None,
+        }
+    }
+    let ret = return_type(descriptor);
+    match ret {
+        b'I' | b'Z' | b'B' | b'C' | b'S' | b'V' | b'L' | b'[' => Some((num_args, ret)),
+        // J / D / F return — not handled.
+        _ => None,
+    }
+}
+
 /// JVM-spec param slot count: longs and doubles take 2 slots each (per
 /// JVMS §2.6.1), unlike `count_param_slots` which counts each parameter
 /// as exactly one slot (matching our compact ABI representation where
@@ -5266,7 +6077,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, true,
+            None, None, true, false, false, false, false,
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -5279,7 +6090,7 @@ mod tests {
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
-            None, false,
+            None, None, false, false, false, false, false,
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -5294,6 +6105,885 @@ mod tests {
         // Both tiers produced runnable native code.
         assert!(!c1.unwrap().code_bytes().is_empty());
         assert!(!c2.unwrap().code_bytes().is_empty());
+    }
+
+    // ── activate-ir-optimizer step 3: int-category `getfield` → `Op::Load` ──
+    //
+    // A method whose only heap op is an int-field read must now take the
+    // optimizing IR pipeline (the builder lowers `getfield` to `Op::Load`).
+    // Proven via `IR_LOWER_COMPILES`: a vacuous fall-through to single-pass
+    // would leave the counter at 0. (The integration harness
+    // `ir_vs_singlepass.rs` proves the *executed* result is correct; this
+    // proves the IR path — not single-pass — produced the body.)
+    #[test]
+    fn step3_getfield_int_routes_through_ir() {
+        use std::sync::Arc;
+
+        // `static int get(Corpus o) { return o.x; }`
+        //   aload_0 (0x2a); getfield #2 (0xb4 0x00 0x02); ireturn (0xac)
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Corpus"),
+            method_name: Arc::from("get"),
+            method_descriptor: Arc::from("(Lpkg/Corpus;)I"),
+            source_file: None,
+            // Trailing 0x00 0x00: the VM pads bytecode with two bytes that
+            // `try_compile` strips via `code.len() - 2`; without them the
+            // `ireturn` is truncated away.
+            code: Arc::from([0x2a, 0xb4, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 1,
+            num_params: 1,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
+        // is valid and never called (the inline getfield emits no helper call,
+        // and this test does not execute the generated code).
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // Resolve cp index 2 → field index 0, int (`I`).
+        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+            if cp == 2 {
+                Some((0, b'I'))
+            } else {
+                None
+            }
+        };
+
+        // C2 — optimize=true → IR pipeline lowers `getfield` to `Op::Load`.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let c2 = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "an int getfield method must route through the IR pipeline"
+        );
+
+        // Without the field resolver the builder cannot resolve the field, so
+        // the IR path must bail (counter stays 0). The whole compile then
+        // returns None — single-pass also needs the resolver to build
+        // `field_info` — which is the expected, safe fallback.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _ = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, false, false,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "an unresolved getfield must NOT take the IR pipeline"
+        );
+    }
+
+    // ── activate-ir-optimizer inc 16: EA bridge handles full-layout ops ──
+    //
+    // Escape analysis scalar-replaces a non-escaping allocation by killing the
+    // `Op::New` and its field stores and redirecting field loads to the stored
+    // value. That only works if the IR→EA bridge translates the *production*
+    // full-layout `Op::Load`/`Op::Store` (`[ctrl, mem, base, offset, value]`,
+    // `MemKind`-tagged) into the EA's compact `[holder]`/`[holder, value]`
+    // layout with the real field index from the `Const` offset operand — the
+    // exact thing inc 16 fixed. This builds such a graph by hand (the builder
+    // does not emit `Op::New` yet) and proves the round-trip.
+    #[test]
+    fn ea_bridge_scalar_replaces_full_layout_new_store_load() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        // Object o = new Foo(); o.f1 = 42; return o.f1;  (single int field at
+        // index 1, to also exercise a non-zero field index vs MemKind::Int=0).
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(1), IrType::Int, vec![], None); // field index 1
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "a non-escaping New with a matching field store/load must be \
+             scalar-replaceable once the bridge resolves the full layout"
+        );
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+        assert_eq!(g.nodes[newobj as usize].op, Op::Dead, "New killed");
+        assert_eq!(g.nodes[store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(g.nodes[load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            g.nodes[ret as usize].inputs[1], val,
+            "the load result must be redirected to the stored value (Const 42)"
+        );
+    }
+
+    // A New that escapes (returned by reference) must NOT be scalar-replaced —
+    // the bridge fix preserves the escape rule (a missed escape would scalar-
+    // replace an object a real use still needs: the kafka bug-25 class).
+    #[test]
+    fn ea_bridge_keeps_escaping_new() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let _store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        // Return the *reference* — the object escapes globally.
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, newobj], None);
+        g.exit = ret;
+
+        let (ea, _id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "an escaping New must not be scalar-replaceable"
+        );
+    }
+
+    // A non-escaping New whose field is LOADED but never STORED is scalar-
+    // replaced, and the load of that field must resolve to the zero default
+    // (`Const(0)`) of the freshly-allocated object — NOT be killed without a
+    // replacement (the latent `apply_ea_to_ir` bug). Soundness rests on the
+    // object being zero-initialised (the caller only admits allocations whose
+    // constructor sets no non-zero field).
+    #[test]
+    fn ea_unstored_field_load_resolves_to_zero_default() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let off1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off0, val],
+            None,
+        );
+        // Load field 1 — never stored.
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off1],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "a non-escaping new is scalar-replaceable even with an un-stored field"
+        );
+        apply_ea_to_ir(&mut g, &id_map, &result);
+        assert!(
+            !g.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is scalar-replaced away"
+        );
+        let ret_node = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret_node.inputs[1];
+        assert_eq!(
+            g.nodes[retval as usize].op,
+            Op::Const(0),
+            "the un-stored field's load must resolve to the zero default"
+        );
+    }
+
+    // ── Op::New emission + scalar replacement, end-to-end via the builder ──
+    //
+    // The builder lowers `new` to `Op::New` and elides a trivial `<init>` on a
+    // fresh object; escape analysis then scalar-replaces the non-escaping
+    // allocation (no heap alloc, the field load becomes the stored value). This
+    // drives the FULL path (build -> optimize -> EA -> apply) from bytecode.
+    #[test]
+    fn ir_new_scalar_replaces_end_to_end() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — trivial, elided)
+        //   7: dup               59
+        //   8: bipush 42         10 2a
+        //  10: putfield #3       b5 00 03
+        //  13: getfield #3       b4 00 03
+        //  16: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03, 0xb4,
+            0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(10usize, (0usize, b'I')); // putfield field 0
+        fi.insert(13usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder.build(&code, 17).expect("IR build");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load must resolve to the stored value (42)"
+        );
+    }
+
+    // REGRESSION (astore gap): the same scalar-replacement end-to-end, but the
+    // fresh object is round-tripped through a LOCAL via `astore`/`aload` — the
+    // shape REAL javac emits (`new; dup; invokespecial; astore_N; aload_N; …`).
+    // The `ir_new_scalar_replaces_end_to_end` test above keeps the ref on the
+    // stack via `dup`, so it never exercised `astore` — and the builder had NO
+    // `astore` handler, so EVERY production allocation method bailed to
+    // single-pass and `new` scalar replacement NEVER fired live (inc 17/19's
+    // "== HotSpot" probe was vacuous: it matches whether or not SR fires). With
+    // `astore` lowered, this folds to `Const(42)` exactly like the dup form.
+    #[test]
+    fn ir_new_scalar_replaces_through_astore_local() {
+        use crate::ir::{IrBuilder, Op};
+        use std::collections::{HashMap, HashSet};
+
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }  (javac shape)
+        //   0: new #1            bb 00 01
+        //   3: dup               59
+        //   4: invokespecial #2  b7 00 02   (Foo.<init>()V — elided)
+        //   7: astore_0          4b
+        //   8: aload_0           2a
+        //   9: bipush 42         10 2a
+        //  11: putfield #3       b5 00 03
+        //  14: aload_0           2a
+        //  15: getfield #3       b4 00 03
+        //  18: ireturn           ac
+        let code = [
+            0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x4b, 0x2a, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+            0x2a, 0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+        ];
+        let mut builder = IrBuilder::new(0, 1);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(11usize, (0usize, b'I')); // putfield field 0
+        fi.insert(15usize, (0usize, b'I')); // getfield field 0
+        builder.set_field_info(fi);
+        let mut graph = builder
+            .build(&code, 19)
+            .expect("IR build must succeed with astore lowered");
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "builder must emit an Op::New for `new`"
+        );
+
+        ir_optimize::optimize(&mut graph);
+        let (ea, id_map) = escape_analysis_from_ir(&graph);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "the astore-local non-escaping new must be scalar-replaceable"
+        );
+        apply_ea_to_ir(&mut graph, &id_map, &result);
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New must be scalar-replaced away"
+        );
+        let ret = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Return))
+            .expect("a Return");
+        let retval = ret.inputs[1];
+        assert_eq!(
+            graph.nodes[retval as usize].op,
+            Op::Const(42),
+            "the field load (via astore/aload local) must resolve to the stored value (42)"
+        );
+    }
+
+    // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on
+    // `this`) must NOT be elided — the builder bails even if the pc is admitted.
+    #[test]
+    fn ir_new_bails_on_init_of_nonfresh_receiver() {
+        use crate::ir::IrBuilder;
+        use std::collections::{HashMap, HashSet};
+        // aload_0; invokespecial #2; return  — `super.<init>()` on `this`.
+        //   0: aload_0           2a
+        //   1: invokespecial #2  b7 00 02
+        //   4: return            b1
+        let code = [0x2a, 0xb7, 0x00, 0x02, 0xb1, 0x00, 0x00];
+        let mut builder = IrBuilder::new(1, 1);
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(1usize); // admit pc 1 — but receiver is `this`, not a New
+        builder.set_new_info(HashMap::new(), init_pcs);
+        assert!(
+            builder.build(&code, 5).is_none(),
+            "eliding a <init> on a non-fresh receiver must bail to single-pass"
+        );
+    }
+
+    // activate-ir-optimizer (scalar-new wiring): a `new`-bearing method whose
+    // construction is elidable routes through the IR pipeline (scalar-replaced)
+    // ONLY when the elidable-`<init>` resolver is supplied — the production soak
+    // gate. Without it the builder bails on the `invokespecial`, keeping `new`
+    // scalar replacement off by default.
+    #[test]
+    fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
+        use std::sync::Arc;
+        // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Mk"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("()I"),
+            source_file: None,
+            code: Arc::from(
+                [
+                    0xbb, 0x00, 0x01, 0x59, 0xb7, 0x00, 0x02, 0x59, 0x10, 0x2a, 0xb5, 0x00, 0x03,
+                    0xb4, 0x00, 0x03, 0xac, 0x00, 0x00,
+                ]
+                .as_slice(),
+            ),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 8,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        };
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
+            if cp == 1 {
+                Some((7, 1, false, false))
+            } else {
+                None
+            }
+        };
+        let field_resolver = |cp: u16| -> Option<(usize, u8)> {
+            if cp == 3 {
+                Some((0, b'I'))
+            } else {
+                None
+            }
+        };
+        let elidable = |cp: u16| -> bool { cp == 2 };
+
+        // With the elidable resolver → the IR pipeline scalar-replaces the new.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let r = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            Some(&elidable),
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(r.is_some(), "an elidable `new` method must compile via IR");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "the elidable `new` method must route through the IR pipeline"
+        );
+
+        // Without it → the builder bails on the `invokespecial` → not the IR path.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _ = try_compile(
+            &cached,
+            None,
+            Some(&field_resolver),
+            None,
+            None,
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without the elidable resolver, `new` must NOT take the IR pipeline"
+        );
+    }
+
+    // ── activate-ir-optimizer Gap B: int invokestatic → Op::Call routing ──
+    //
+    // A method whose only invoke is an int-only `invokestatic` in an oop-free
+    // body must route through the IR pipeline ONLY when `ir_emit_calls` is on
+    // (the production gate). This guards against a *vacuous* validation: the
+    // integration harness proves the executed result is correct, but single-pass
+    // ALSO dispatches `invokestatic` correctly, so result-equality alone would
+    // not prove the IR path fired. `IR_LOWER_COMPILES` proves it does (==1 with
+    // the flag) and does not (==0 without — the builder bails on the invoke).
+    #[test]
+    fn ir_call_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(int a, int b) { return g(a, b); }`
+        //   iload_0; iload_1; invokestatic #2; ireturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Caller"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(II)I"),
+            source_file: None,
+            code: Arc::from([0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes the body), so the baked `invoke_dispatch` is not called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let invoke_resolver = |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+            } else {
+                None
+            }
+        };
+
+        // ir_emit_calls = true → invokestatic lowers to Op::Call → IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true, // optimize
+            true, // ir_emit_calls
+            false, // ir_emit_special_calls (testing invokestatic, not special)
+            false, // ir_emit_long
+            false, // ir_emit_virtual_calls
+        );
+        assert!(
+            with.is_some(),
+            "int invokestatic must compile with ir_emit_calls"
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "int invokestatic must route through the IR pipeline when ir_emit_calls is on"
+        );
+        assert!(
+            with.as_ref().unwrap().needs_context(),
+            "an Op::Call method must be needs_context"
+        );
+
+        // ir_emit_calls = false → builder bails on the invoke → single-pass.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,  // optimize
+            false, // ir_emit_calls OFF
+            false, // ir_emit_special_calls OFF
+            false, // ir_emit_long OFF
+            false, // ir_emit_virtual_calls OFF
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_calls, invokestatic must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 24 (Gap B): a resolved non-`<init>` `invokespecial` routes through the
+    /// IR pipeline ONLY when `ir_emit_special_calls` is on — independent of
+    /// `ir_emit_calls` (which gates invokestatic). The two toggles are crossed
+    /// here to prove the SPECIAL flag alone admits invokespecial. Guards against
+    /// a vacuous validation: single-pass ALSO dispatches invokespecial, so
+    /// result-equality alone (the integration harness) would not prove the IR
+    /// path ran.
+    #[test]
+    fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(Obj o, int n) { return o.g(n); }`  (g private → invokespecial)
+        //   aload_0; iload_1; invokespecial #2; ireturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Caller"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(Lpkg/Obj;I)I"),
+            source_file: None,
+            code: Arc::from([0x2a, 0x1b, 0xb7, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes the body), so the baked `invoke_dispatch` is not called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // Target: the private instance method `g(I)I` — receiver implicit, so the
+        // IR builder marshals it as arg0 (num_jit_args = 1 desc + 1 receiver).
+        let invoke_resolver = |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("pkg/Obj".into(), "g".into(), "(I)I".into()))
+            } else {
+                None
+            }
+        };
+
+        // ir_emit_special_calls = true (ir_emit_calls OFF) → invokespecial lowers
+        // to Op::Call → IR pipeline. Crossing the flags proves SPECIAL is the gate.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            false, // ir_emit_calls (invokestatic) OFF
+            true,  // ir_emit_special_calls ON
+            false, // ir_emit_long
+            false, // ir_emit_virtual_calls OFF
+        );
+        assert!(
+            with.is_some(),
+            "invokespecial must compile with ir_emit_special_calls"
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "invokespecial must route through the IR pipeline when ir_emit_special_calls is on"
+        );
+        assert!(
+            with.as_ref().unwrap().needs_context(),
+            "an Op::Call method must be needs_context"
+        );
+
+        // ir_emit_special_calls = false (ir_emit_calls ON) → the builder bails on
+        // the invokespecial → single-pass. Proves invokestatic's gate does NOT
+        // admit invokespecial.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            true,  // ir_emit_calls (invokestatic) ON
+            false, // ir_emit_special_calls OFF
+            false, // ir_emit_long OFF
+            false, // ir_emit_virtual_calls OFF
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_special_calls, invokespecial must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 25: a long-using method routes through the IR pipeline ONLY with
+    /// `ir_emit_long` — otherwise `method_uses_category2` bails the whole
+    /// pipeline to single-pass. Guards against a vacuous validation: the
+    /// integration harness compiles `optimize=true` either way (single-pass is
+    /// the fall-through), so result-equality alone would not prove the IR path
+    /// ran — `IR_LOWER_COMPILES` does.
+    #[test]
+    fn ir_long_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static long add(long a, long b) { return a + b; }`
+        //   lload_0; lload_2; ladd; lreturn
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/L"),
+            method_name: Arc::from("add"),
+            method_descriptor: Arc::from("(JJ)J"),
+            source_file: None,
+            code: Arc::from([0x1e, 0x20, 0x61, 0xad, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 4,
+            max_locals: 4,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes), and a pure long-arithmetic method calls no helper.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+
+        // ir_emit_long = true → the long method takes the IR pipeline.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, true, false,
+        );
+        assert!(with.is_some(), "long method must compile with ir_emit_long");
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "a long method must route through the IR pipeline when ir_emit_long is on"
+        );
+
+        // ir_emit_long = false → method_uses_category2 bails → single-pass.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
+            None, None, true, false, false, false, false,
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_long, a long method must NOT take the IR pipeline"
+        );
+    }
+
+    /// inc 26 (Gap B): a resolved `invokevirtual` routes through the IR pipeline
+    /// ONLY when `ir_emit_virtual_calls` is on — independent of the invokestatic
+    /// (`ir_emit_calls`) and invokespecial (`ir_emit_special_calls`) gates. The
+    /// flags are crossed to prove the VIRTUAL flag alone admits invokevirtual.
+    /// Guards against a vacuous validation: single-pass ALSO dispatches
+    /// invokevirtual, so result-equality alone would not prove the IR path ran.
+    #[test]
+    fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
+        use std::sync::Arc;
+
+        // `static int f(Obj o, int n) { return o.g(n); }`  (g virtual → invokevirtual)
+        //   aload_0; iload_1; invokevirtual #2; ireturn
+        // Modelled as a `static` caller (receiver `o` is param 0) exactly like the
+        // invokespecial wiring test, so the local/param counts line up.
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Caller"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(Lpkg/Obj;I)I"),
+            source_file: None,
+            code: Arc::from([0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 2,
+            num_params: 2,
+            is_synchronized: false,
+            is_static: true,
+        };
+        // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
+        // (never executes the body), so the baked `invoke_dispatch` is not called.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let invoke_resolver = |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("pkg/Obj".into(), "g".into(), "(I)I".into()))
+            } else {
+                None
+            }
+        };
+
+        // ir_emit_virtual_calls = true (calls/special OFF) → invokevirtual lowers
+        // to Op::Call → IR pipeline. Crossing the flags proves VIRTUAL is the gate.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let with = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            false, // ir_emit_calls (invokestatic) OFF
+            false, // ir_emit_special_calls OFF
+            false, // ir_emit_long
+            true,  // ir_emit_virtual_calls ON
+        );
+        assert!(
+            with.is_some(),
+            "invokevirtual must compile with ir_emit_virtual_calls"
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "invokevirtual must route through the IR pipeline when ir_emit_virtual_calls is on"
+        );
+        assert!(
+            with.as_ref().unwrap().needs_context(),
+            "an Op::Call method must be needs_context"
+        );
+
+        // ir_emit_virtual_calls = false (calls + special ON) → the builder bails on
+        // the invokevirtual → single-pass. Proves the static/special gates do NOT
+        // admit invokevirtual.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let _without = try_compile(
+            &cached, None, None, None, Some(&invoke_resolver), None, None, None, None, None,
+            &helpers, None, None, None, None,
+            true,  // optimize
+            true,  // ir_emit_calls ON
+            true,  // ir_emit_special_calls ON
+            false, // ir_emit_long
+            false, // ir_emit_virtual_calls OFF
+        );
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_virtual_calls, invokevirtual must NOT take the IR pipeline"
+        );
     }
 
     // ── Stage A.4 (precise oop maps) — param oop mask ──────────────
@@ -6806,5 +8496,66 @@ mod tests {
         let code = vec![0xb1]; // return (void)
         let r = jit_scan(&code, code.len(), "()V");
         assert!(r.is_some(), "void return must scan");
+    }
+
+    // ── JIT code-cache cap tests ────────────────────────────────────
+    //
+    // These avoid mutating `CRATONVM_JIT_CODE_CACHE_MAX_MB`: `jit_code_cache_cap_bytes`
+    // caches its value in a process-wide `OnceLock`, so an env-var test would be
+    // order-dependent and could poison the cache for the rest of the suite. We
+    // exercise the observable behaviour through `COMMITTED_JIT_CODE_BYTES` and the
+    // public accessors instead.
+
+    #[test]
+    fn code_cache_cap_default_is_nonzero_and_below_disable_sentinel() {
+        let cap = jit_code_cache_cap_bytes();
+        // Whatever the env says, a sane cap is either a real byte bound or the
+        // explicit "disabled" sentinel — never an accidental 0 that would refuse
+        // all compilation.
+        assert!(cap > 0, "cap must never be zero");
+        // The compiled-in default is a generous, finite bound.
+        assert_eq!(DEFAULT_JIT_CODE_CACHE_CAP_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn code_cache_not_at_capacity_when_committed_is_small() {
+        // In the test process essentially no JIT code is committed, so with any
+        // realistic cap (or the disabled sentinel) we must be under capacity and
+        // therefore still willing to compile.
+        let cap = jit_code_cache_cap_bytes();
+        if cap == usize::MAX {
+            // Cap disabled in this environment: at-capacity is unconditionally false.
+            assert!(!jit_code_cache_at_capacity());
+            return;
+        }
+        let committed = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        // Sanity: the test process hasn't committed a quarter-gig of code.
+        assert!(committed < cap, "unexpectedly large committed code in test");
+        assert!(!jit_code_cache_at_capacity());
+    }
+
+    #[test]
+    fn code_cache_committed_counter_tracks_buffer_allocation() {
+        // Allocating a buffer bumps the committed counter by its capacity; the
+        // cap is enforced against exactly this quantity.
+        let before = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let buf = ExecutableBuffer::new(4096).expect("alloc failed");
+        let after = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 4096,
+            "committed counter must rise by at least the requested capacity"
+        );
+        // Default-config Drop leaks the region (no decrement), so the counter
+        // does not fall back here — that's the intended monotonic behaviour the
+        // cap bounds.
+        drop(buf);
+    }
+
+    #[test]
+    fn code_cache_cap_refusals_accessor_is_monotonic() {
+        // The accessor reads the global refusal counter; it never decreases.
+        let a = jit_code_cache_cap_refusals();
+        let b = jit_code_cache_cap_refusals();
+        assert!(b >= a);
     }
 }

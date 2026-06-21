@@ -1,14 +1,12 @@
+> Machine-specific / personal dev build scripts (e.g. `build-maindev*`,
+> `*-isolated`, `check-cv20`, `build-kcboot*`, `verify-oom-fix`) live under
+> `scripts/internal/`, which is gitignored and not part of the published repo.
+
 Build Scripts (Windows .bat)
 build-cpu.bat - Standard CPU build for cratonvm into the default target/release directory.
-build-cpu-isolated.bat - Isolated CPU build into target-fresh-cpu directory with single-threaded cargo build (-j 1) to avoid lock contention. Sets increased Rust stack size.
 build-cpu-java.bat - Builds the java.exe binary alias (same as cratonvm but with java name) using the java-bin-alias feature. Used as CPU binary after EC fixes to avoid locked cratonvm.exe.
 build-debug.bat - release-with-debug build (same codegen as release plus line-tables/symbols) for SEGV symbolization during debugging.
-build-devverify.bat - Development-verification build. Uses the standard cargo on PATH by default; a custom toolchain can be supplied via the CARGO/RUSTC environment variables.
 build-gpu.bat - GPU build with the gpu-driver feature into the target-gpu directory.
-build-gpu-isolated.bat - Isolated GPU build into target-fresh-gpu with single-threaded cargo build (-j 1), enabling the gpu-driver feature.
-
-Note: the repository root also carries build-cpu.bat and build-cpu-rwd.bat (the
-release-with-debug variant), which are convenience wrappers run from the repo root.
 
 Benchmark Scripts
 bench-4way.sh - 4-way vector-add benchmark comparing: HotSpot C2, CratonVM CPU (JIT on/off), CratonVM GPU, and TornadoVM. Reports best/mean nanoseconds and correctness.
@@ -28,7 +26,6 @@ H2 Database Test Scripts
 run-h2-nojit.bat - Runs H2 org.h2.test.TestAll --nojit on worktree build with 32m heap.
 run-h2-testall.bat - Runs H2 org.h2.test.TestAll on isolated build (target-h2). JIT mode controlled by caller env.
 run-one-test.bat - Runs a single H2 test class. Args: fully-qualified class name, extra flag (e.g. --nojit).
-run_decchurn_ab.bat - A/B test comparing DecChurn benchmark between baseline (target/release) and fixed (target/release-with-debug) builds.
 
 Utility Scripts
 capture-hotspot-baseline.sh - Captures HotSpot C2 median performance for 24 benchmark kernels used by bench_hotspot_compare.rs. Generates JSON baseline file with schema_version, host, captured_at, and metrics.

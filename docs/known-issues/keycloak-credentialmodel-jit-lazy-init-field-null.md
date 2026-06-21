@@ -1,7 +1,9 @@
 # JIT miscompile — lazy-init getter returns `null` (CredentialModelTest)
 
-**Status:** OPEN — CratonVM-only, **JIT-only** (passes `--nojit`). Handoff from the keycloak
-full-suite run (kcfull-2026-06-18 report 18, "Root C").
+**Status:** 🔴 **OPEN** — CratonVM-only, **JIT-only** (passes `--nojit`). Handoff from the keycloak
+full-suite run (kcfull-2026-06-18 report 18, "Root C"). **The original escape-analysis hypothesis is
+REFUTED (2026-06-21)** — see "Investigation 2026-06-21" below. Not standalone-reproducible; needs the
+real keycloak class + its Jackson-deserialization caller context.
 **Severity:** correctness. A `new`-stored-to-field-then-returned object is dropped under JIT,
 so a lazy-init accessor returns `null` where it can never legitimately do so.
 
@@ -47,30 +49,63 @@ method/caller context (the `MultivaluedHashMap` allocation, the surrounding Jack
 deserialization call chain that produces the `PasswordCredentialData`, and/or the specific
 register/escape state at the `getfield`/`putfield`/`areturn`).
 
-## Likely root cause
+## Original hypothesis (now refuted — kept for the trail)
 The `new MultivaluedHashMap()` escapes via `putfield additionalParameters` (store to an
-instance field) **and** `areturn`. If the JIT escape-analysis pass
-(`vm/src/jit/x64.rs::analyze_escapes`) fails to treat the value as escaping — i.e. it
-scalar-replaces / elides the allocation and the `putfield` — the field stays `null` and the
-method returns `null`. This is the **kafka bug-25 escape-analysis family**
-(`docs/kafka-suite-bugs/bug-25-*` / memory `reference_kafka_suite_bugs_09_12`): the catch-all
-arm of the escape pass forgetting operand provenance across un-modeled opcodes, leaving an
-escaping object mis-classified as non-escaping. Bug-25's fix covered primitive-load/const/
-getstatic; a store-to-instance-field-then-return path may be a sibling gap.
+instance field) **and** `areturn`. The theory was that JIT escape-analysis scalar-replaces /
+elides the allocation + `putfield`, so the field stays `null`. See the refutation below.
 
-Alternative (less likely): a null-check-elimination or `putfield`/`areturn` ordering bug that
-reads the field before the store is committed.
+Alternative (still open): a null-check-elimination or `putfield`/`areturn` ordering bug in the
+**single-pass** backend that reads the field before the store is committed, **specific to the
+register/escape state produced by the real Jackson-deser caller chain** (not the bare shape).
 
-## Fix direction
-1. Reproduce against the real class with JIT disasm:
-   `CRATONVM_DBG_JIT_DISASM=1` while running `CredentialModelTest.canCreateDefaultCredentialModel`
-   (or a harness that JIT-compiles `getAdditionalParameters`), and inspect whether the
-   `new MultivaluedHashMap` emits an allocation + `putfield` or is elided.
-2. In `analyze_escapes`, ensure a value consumed by `putfield` (store to a non-local/instance
-   field) **and** by `areturn` is marked escaping (cannot be scalar-replaced). Cross-check the
-   bug-25 provenance-tracking arms for the `getfield`→`new`→`putfield`→`areturn` window.
-3. Verify the bare-`Box` repro stays green and that bintrees18 checksum is unchanged
-   (`68332206`) — escape-analysis changes are throughput- and correctness-sensitive.
+## Investigation 2026-06-21 — escape-analysis hypothesis REFUTED
+
+Traced the actual JIT scalar-replacement path (`CRATONVM_JIT_SCALAR_NEW`, default-ON):
+`jit/src/escape_analysis.rs` + the IR bridge in `jit/src/lib.rs` + the elision admission in
+`vm/src/runtime/interpreter.rs::is_elidable_construction`.
+
+1. **`new MultivaluedHashMap<>()` is NOT an elidable construction.** Scalar replacement of a
+   `new` only happens when the constructor is *elidable*, and `is_elidable_construction` admits
+   **only a direct `java/lang/Object` subclass** whose `<init>()V` is exactly the canonical
+   5-byte `aload_0; invokespecial Object.<init>()V; return`. `MultivaluedHashMap` extends
+   `HashMap`, so its `invokespecial <init>` is **never** added to `trivial_init_pcs`; the IR
+   builder bails the method to the single-pass backend (`jit/src/ir.rs` opcode `0xb7`). **The
+   getter never reaches the escape-analysis / scalar-new path at all.** This is also why the
+   bug-doc's bare `new Object()` `Box` repro never reproduced — `Object` is likewise not an
+   elidable subclass-of-Object.
+2. **The bare lazy-init shape compiles correctly on BOTH backends.** Standalone repros
+   (`repros/keycloak-credentialmodel-jit/`): `LazyNull` (instance getters with a `HashMap`
+   subclass + a raw `HashMap`, single-pass) and `EaRepro` (a `Leaf` that *is* an elidable
+   Object-subclass, IR path) both print `RESULT=OK` on the pre-fix binary under JIT, `--nojit`,
+   and HotSpot — 3–5M iterations, zero null returns.
+3. **Conclusion:** the failure is **not** the escape pass and **not** the bare getter shape. It
+   needs the real `PasswordCredentialData`/`PasswordSecretData` classes reached through the
+   Jackson deserialization call chain (exactly the caller-context dependence the Symptom section
+   already flagged). Reproducing it requires the keycloak classpath (`kc-universal-cp.txt` /
+   `kc-runner`), which is not in-tree.
+
+### Side discovery + fix: escape-lattice `Op::Param` soundness hole (`jit/src/escape_analysis.rs`)
+While auditing the escape pass, found a real (if currently latent) bug: `Op::Param` nodes were
+never assigned an escape state, so they defaulted to `NoEscape`. The store-publish rule's own
+comment claims to "cover Param/Call holders", but with `this`/argument holders defaulting to
+`NoEscape` the rule never fired — a value published into `this.field` was not forced to escape,
+and `find_lock_elisions` (which gates purely on escape state) would wrongly elide a lock on a
+parameter. **Fixed:** parameters now initialise to `GlobalEscape` (a parameter reference is, by
+definition, reachable by the caller). Regression test `test_value_stored_into_param_field_escapes`.
+This is **behaviour-neutral for current production consumers** (scalar replacement is independently
+gated by the use-walk's `is_value`/holder-role check, and the IR builder never emits monitor nodes
+so lock elision never runs on real bytecode), so it does **not** explain keycloak — it is defensive
+hardening of the lattice (closes the violated invariant) carried alongside the investigation.
+
+## Fix direction (revised)
+1. Reproduce against the **real** class with the Jackson-deser caller chain (needs the kc
+   classpath), with `CRATONVM_DBG_JIT_DISASM=1` on the **single-pass** compile of
+   `getAdditionalParameters` / `getPasswordCredentialData`. The escape/scalar path is ruled out;
+   look at the single-pass `getfield`→null-branch→`putfield`→`getfield`→`areturn` codegen and
+   the register state under the deser allocation churn (could be a Family-A GC-root reclaim of
+   the freshly-stored field value, not a codegen bug — re-check under `--nojit` + GC stress).
+2. Keep the bare-`Box`/`LazyNull`/`EaRepro` repros green and `bintrees18` checksum unchanged
+   (`68332206`).
 
 ## Repro
 ```

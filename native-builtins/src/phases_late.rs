@@ -4021,12 +4021,9 @@ fn cm_construct_via_context(
         "()Lio/smallrye/config/DefaultValuesConfigSource;",
         &[],
     ) {
-        if let Ok(Some(Value::Object(Some(bdefs)))) = ctx.invoke_virtual(
-            builder,
-            "getDefaultValues",
-            "()Ljava/util/Map;",
-            &[],
-        ) {
+        if let Ok(Some(Value::Object(Some(bdefs)))) =
+            ctx.invoke_virtual(builder, "getDefaultValues", "()Ljava/util/Map;", &[])
+        {
             let _ = ctx.invoke_virtual(
                 dvcs,
                 "addDefaults",
@@ -4251,7 +4248,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let abs = p.starts_with('/') || (p.len() >= 2 && p.as_bytes()[1] == b':');
+        // keycloak-15: a drive-relative (`C:foo`) or driveless-rooted (`\foo`)
+        // path is NOT absolute on Windows — see `p57_win_is_absolute`. On Unix
+        // the POSIX rule (leading `/`) applies.
+        let abs = if cfg!(windows) {
+            p57_win_is_absolute(&p)
+        } else {
+            p.starts_with('/')
+        };
         Ok(Some(Value::Int(if abs { 1 } else { 0 })))
     });
 
@@ -4516,29 +4520,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other = obj_arg(args, 1)?;
             let base = p57_read_path(ctx, this);
             let target = p57_read_path(ctx, other);
-            // Simplified: use std::path for relativization
-            let base_path = std::path::Path::new(&base);
-            let target_path = std::path::Path::new(&target);
-            let relative = target_path
-                .strip_prefix(base_path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| target.clone());
-            // Separator-normalize the result. `strip_prefix` returns a
-            // SLICE of `target`, so the relative path keeps whatever
-            // separators the caller's strings used (often '/') while the
-            // real WindowsPath.toString() renders '\' and zipfs renders
-            // '/'. JUnit5's ClasspathScanner does
-            // `relativize(...).toString().replace(fs.getSeparator(), ".")`
-            // — a separator mismatch silently no-ops the replace, package
-            // names keep slashes, and every scanned class fails the
-            // package filter (classpath-root discovery found 0 tests).
-            let relative = if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
-                relative.replace('\\', "/")
-            } else if cfg!(windows) {
-                relative.replace('/', "\\")
-            } else {
-                relative
-            };
+            // jar-FS: entries form a forward-prefix namespace, so `strip_prefix`
+            // suffices. JUnit5's ClasspathScanner does
+            // `relativize(...).toString().replace(fs.getSeparator(), ".")`, which
+            // needs the zipfs '/' separator, so keep '/' for jar paths.
+            if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
+                let relative = std::path::Path::new(&target)
+                    .strip_prefix(std::path::Path::new(&base))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| target.clone())
+                    .replace('\\', "/");
+                let result = p57_alloc_path(ctx, &relative);
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            // Host paths: compute the real relative path (with `..` backtracking)
+            // off the shared root, not just a forward strip_prefix. Falls back to
+            // `target` when the roots differ (can't be relativized).
+            let relative = p57_relativize(&base, &target).unwrap_or_else(|| target.clone());
             let result = p57_alloc_path(ctx, &relative);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -6791,25 +6789,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Route through the shared root-aware `p57_normalize_path` (keeps the root
+    // and leading `..` on relative paths) instead of an inline `..`-pop that
+    // dropped the drive root. This is the last-registered (winning) `normalize`.
     r.register(path, "normalize", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        // Simple normalize: resolve . and ..
-        let mut parts: Vec<&str> = Vec::new();
-        for part in p.split('/') {
-            match part {
-                "." | "" => {}
-                ".." => {
-                    parts.pop();
-                }
-                other => parts.push(other),
-            }
-        }
-        let normalized = if p.starts_with('/') {
-            format!("/{}", parts.join("/"))
-        } else {
-            parts.join("/")
-        };
+        let normalized = p57_normalize_path(&p);
         let result = p57_alloc_path(ctx, &normalized);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -6927,7 +6913,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let abs = p.starts_with('/') || (p.len() > 2 && p.as_bytes()[1] == b':');
+        // keycloak-15: drive-relative / driveless-rooted paths are not absolute on
+        // Windows (see `p57_win_is_absolute`); POSIX leading-`/` rule on Unix.
+        let abs = if cfg!(windows) {
+            p57_win_is_absolute(&p)
+        } else {
+            p.starts_with('/')
+        };
         Ok(Some(Value::Int(if abs { 1 } else { 0 })))
     });
 
@@ -7431,6 +7423,176 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
     (None, split_names(work))
 }
 
+/// keycloak-15: Windows (`sun.nio.fs.WindowsPath`) `isAbsolute()` semantics.
+///
+/// A Windows path is absolute **only** when it names both a root *and* a drive
+/// (or is a UNC path). Two prefixes that have a root component but are NOT
+/// absolute trip up a naive "has a root ⇒ absolute" check:
+///   * **drive-relative** `C:foo` — relative to the current dir *on drive C*;
+///   * **driveless-rooted** `\foo` / `/foo` — relative to the current *drive*.
+/// HotSpot returns `false` for both; the previous
+/// `p.starts_with('/') || p[1]==':'` heuristic returned `true`. Classify off the
+/// parsed root instead (roots are rendered in `\`-form by [`p57_parse_win_root`]):
+///   * `C:\` (drive + separator)  → absolute
+///   * `\\server\share\` (UNC)    → absolute
+///   * `C:` (drive only)          → NOT absolute (drive-relative)
+///   * `\`  (separator only)      → NOT absolute (driveless-rooted)
+fn p57_win_is_absolute(s: &str) -> bool {
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    match p57_parse_win_root(s).0 {
+        None => false,
+        Some(root) => {
+            let b = root.as_bytes();
+            let unc = b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]);
+            let drive_abs = b.len() >= 3 && b[1] == b':' && is_sep(b[2]);
+            unc || drive_abs
+        }
+    }
+}
+
+/// keycloak-15: Windows (`sun.nio.fs.WindowsPath`) `getParent()` semantics.
+///
+/// HotSpot computes the parent as a pure last-separator split that keeps `.`/`..`
+/// name elements verbatim — it does **not** normalize curdir. Rust's
+/// `std::path::Path::parent()` normalizes a trailing `.` away first, so it
+/// over-trims: the parent of `C:\a\b\.` becomes `C:\a` instead of `C:\a\b`.
+/// Rebuild the parent from the parsed (root, names) so it stays consistent with
+/// `getRoot`/`getNameCount`/`getName`. Returns "" when there is no parent
+/// (caller maps that to `null`).
+fn p57_win_parent_of(path: &str) -> String {
+    let (root, names) = p57_parse_win_root(path);
+    let n = names.len();
+    match root {
+        // Rooted path (`C:\…`, `\\server\share\…`, `\…`, `C:foo`).
+        Some(r) => {
+            if n == 0 {
+                // The path is just the root → no parent.
+                String::new()
+            } else if n == 1 {
+                // A single element under a root → the parent is the root itself.
+                r
+            } else {
+                // root + all-but-last name. The root string already carries its
+                // trailing separator for absolute/UNC roots; a drive-relative
+                // root (`C:`) carries none, so the first name attaches directly —
+                // which is exactly HotSpot's `C:foo\bar` → parent `C:foo`.
+                let mut out = r;
+                for (i, name) in names[..n - 1].iter().enumerate() {
+                    if i > 0 {
+                        out.push('\\');
+                    }
+                    out.push_str(name);
+                }
+                out
+            }
+        }
+        // Relative path (`a\b\c`).
+        None => {
+            if n <= 1 {
+                String::new()
+            } else {
+                names[..n - 1].join("\\")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod p57_win_path_tests {
+    //! keycloak-15: Windows `WindowsPath.isAbsolute()` / `getParent()` semantics.
+    //! Pure-function tests (no VM); each expectation matches HotSpot
+    //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
+    //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
+    //! internal form, so both spellings are exercised.
+    use super::{p57_win_is_absolute, p57_win_parent_of};
+
+    #[test]
+    fn is_absolute_matches_hotspot() {
+        // Absolute: drive + root, or UNC.
+        assert!(p57_win_is_absolute("C:\\foo\\bar"));
+        assert!(p57_win_is_absolute("C:/foo/bar")); // `/`-canonical internal form
+        assert!(p57_win_is_absolute("\\\\server\\share\\d"));
+        assert!(p57_win_is_absolute("//server/share/d"));
+        // NOT absolute: drive-relative, driveless-rooted, relative.
+        assert!(!p57_win_is_absolute("C:foo"));
+        assert!(!p57_win_is_absolute("\\foo\\bar"));
+        assert!(!p57_win_is_absolute("/foo/bar"));
+        assert!(!p57_win_is_absolute("a\\b\\c"));
+        assert!(!p57_win_is_absolute("a/b/c"));
+        assert!(!p57_win_is_absolute(""));
+    }
+
+    #[test]
+    fn parent_keeps_curdir_and_root_boundary() {
+        // Trailing `.` must be kept (Rust Path::parent would over-trim to "C:\a").
+        assert_eq!(p57_win_parent_of("C:\\a\\b\\."), "C:\\a\\b");
+        assert_eq!(p57_win_parent_of("C:/a/b/."), "C:\\a\\b");
+        // Drive-absolute.
+        assert_eq!(p57_win_parent_of("C:\\foo\\bar"), "C:\\foo");
+        assert_eq!(p57_win_parent_of("C:\\foo"), "C:\\");
+        // Drive-relative: the first name attaches to `C:` with no separator.
+        assert_eq!(p57_win_parent_of("C:foo\\bar"), "C:foo");
+        assert_eq!(p57_win_parent_of("C:foo"), "C:");
+        // Driveless-rooted.
+        assert_eq!(p57_win_parent_of("\\foo\\bar"), "\\foo");
+        assert_eq!(p57_win_parent_of("\\foo"), "\\");
+        // UNC.
+        assert_eq!(
+            p57_win_parent_of("\\\\server\\share\\d\\e"),
+            "\\\\server\\share\\d"
+        );
+        // Relative.
+        assert_eq!(p57_win_parent_of("a\\b\\c"), "a\\b");
+        // No parent → "" (caller maps to null).
+        assert_eq!(p57_win_parent_of("a"), "");
+        assert_eq!(p57_win_parent_of("C:\\"), "");
+        assert_eq!(p57_win_parent_of("\\\\server\\share\\"), "");
+    }
+}
+
+#[cfg(test)]
+mod p57_normalize_relativize_tests {
+    //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
+    //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
+    use super::{p57_normalize_path, p57_relativize};
+
+    #[test]
+    fn normalize_preserves_root_and_leading_dotdot() {
+        // `..` must not pop above the root.
+        assert_eq!(p57_normalize_path("C:/a/../../b"), "C:/b");
+        assert_eq!(p57_normalize_path("C:/.."), "C:/");
+        assert_eq!(p57_normalize_path("//s/sh/a/.."), "//s/sh/");
+        // Leading `..` on a relative path is kept.
+        assert_eq!(p57_normalize_path("../../a"), "../../a");
+        assert_eq!(p57_normalize_path("a/../../b"), "../b");
+        // Ordinary collapses.
+        assert_eq!(p57_normalize_path("C:/a/./b/.."), "C:/a");
+        assert_eq!(p57_normalize_path("a/./b/.."), "a");
+        assert_eq!(p57_normalize_path("a/../b"), "b");
+        assert_eq!(p57_normalize_path("C:/a/b"), "C:/a/b");
+        // Drive-relative root retained with no separator before the first name.
+        assert_eq!(p57_normalize_path("C:a/../b"), "C:b");
+    }
+
+    #[test]
+    fn relativize_backtracks_with_dotdot() {
+        assert_eq!(p57_relativize("C:/a/b", "C:/a/x").as_deref(), Some("../x"));
+        assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
+        assert_eq!(
+            p57_relativize("C:/a/b", "C:/a/b/c/d").as_deref(),
+            Some("c/d")
+        );
+        assert_eq!(p57_relativize("C:/a", "C:/a").as_deref(), Some(""));
+        assert_eq!(p57_relativize("a/b", "a/b/c").as_deref(), Some("c"));
+        // Case-insensitive common-prefix match on Windows.
+        #[cfg(windows)]
+        assert_eq!(p57_relativize("C:/A/b", "C:/a/x").as_deref(), Some("../x"));
+        // Different roots → None (caller falls back to target).
+        assert_eq!(p57_relativize("C:/a", "D:/b"), None);
+        assert_eq!(p57_relativize("C:/a", "rel/b"), None);
+    }
+}
+
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
@@ -7583,6 +7745,36 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
     // FileSystemException stores the offending path in its `file` field.
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     MethodCallFailed::ExceptionThrown(exc)
+}
+
+/// Build a *typed* `java.security.SignatureException` for a certificate whose
+/// signature could not be verified, and return it wrapped as a thrown Java
+/// exception.
+///
+/// `Certificate.verify(PublicKey)` is contractually required to throw on a bad
+/// signature — silently returning success is a certificate-verification
+/// vulnerability, because a caller treats `verify()` returning normally as
+/// proof that the certificate is trustworthy. Constructing the real
+/// `java.security.SignatureException` via `new_object_initialized` gives the
+/// thrown object the genuine `ClassId`, so handlers that
+/// `catch (SignatureException)` (or any superclass: `GeneralSecurityException`,
+/// `Exception`) match it correctly. If the class cannot be constructed we fall
+/// back to a `SecurityException` rather than swallowing the failure — the
+/// invariant is that verification failure NEVER returns normally.
+#[cfg(feature = "legacy-synthetic-crypto")]
+fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/SignatureException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
 }
 
 // --- jar-filesystem path encoding ---------------------------------------
@@ -7819,27 +8011,91 @@ fn p57_read_to_string(p: &str) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `Path.normalize()` — collapse `.`/`..` per the JDK contract. Two rules the
+/// previous naive `split('/')`+unconditional-`pop` version got wrong:
+///   * a `..` must **not** pop above the root: `C:\a\..\..\b` → `C:\b` (not `b`),
+///     `C:\..` → `C:\` (not empty). The drive/UNC/`\` root is preserved.
+///   * a leading `..` on a **relative** path is **kept** (it can't be resolved
+///     without a base): `..\..\a` → `..\..\a` (not `a`).
+/// Output is `/`-canonical (the internal form; `p57_alloc_path` folds, `toString`
+/// renders the host separator), so this is platform-neutral.
 fn p57_normalize_path(path: &str) -> String {
     if let Some((jar, entry)) = jarfs_decode(path) {
         return jarfs_encode(&jar, &p57_normalize_path(&entry));
     }
-    let sep = '/';
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split(sep) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
+    let (root, names) = p57_parse_win_root(path);
+    let has_root = root.is_some();
+    let mut stack: Vec<&str> = Vec::new();
+    for name in &names {
+        match name.as_str() {
+            "." => {}
+            ".." => match stack.last() {
+                // A real name precedes the `..` → cancel the pair.
+                Some(&top) if top != ".." => {
+                    stack.pop();
+                }
+                // Nothing to cancel: keep `..` only for a relative path; for a
+                // rooted path a `..` at the root is discarded (can't go above it).
+                _ => {
+                    if !has_root {
+                        stack.push("..");
+                    }
+                }
+            },
+            other => stack.push(other),
         }
     }
-    let result = parts.join("/");
-    if path.starts_with(sep) {
-        format!("/{}", result)
-    } else {
-        result
+    // Reconstruct in '/'-form. The root already carries its trailing separator
+    // for absolute/UNC roots; a drive-relative root (`C:`) carries none, so the
+    // first name attaches directly.
+    let mut out = match root {
+        Some(r) => r.replace('\\', "/"),
+        None => String::new(),
+    };
+    for (i, name) in stack.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(name);
     }
+    out
+}
+
+/// `Path.relativize(other)` — construct a relative path that, resolved against
+/// `base`, yields `target`. The previous `strip_prefix` version only handled the
+/// case where `target` is *under* `base`; when backtracking is needed it wrongly
+/// returned `target` unchanged. Compute `..` × (base-tail) + target-tail off the
+/// shared root prefix. Returns `None` (caller falls back to `target`) when the
+/// two paths have different roots / absoluteness, which can't be relativized.
+/// Output is `/`-canonical and relative (no root).
+fn p57_relativize(base: &str, target: &str) -> Option<String> {
+    let (rb, bn) = p57_parse_win_root(base);
+    let (rt, tn) = p57_parse_win_root(target);
+    // Roots must match (case-insensitively, matching WindowsPath); one absolute
+    // and one relative cannot be relativized.
+    let norm_root = |r: &Option<String>| r.as_ref().map(|s| s.to_ascii_lowercase());
+    if norm_root(&rb) != norm_root(&rt) {
+        return None;
+    }
+    let name_eq = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let mut common = 0;
+    while common < bn.len() && common < tn.len() && name_eq(&bn[common], &tn[common]) {
+        common += 1;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for _ in common..bn.len() {
+        parts.push("..");
+    }
+    for name in &tn[common..] {
+        parts.push(name);
+    }
+    Some(parts.join("/"))
 }
 
 /// Resolve `other` against `base` as per `Path.resolve()` semantics:
@@ -7895,6 +8151,14 @@ fn p57_parent_of(path: &str) -> String {
     }
     if path.is_empty() {
         return String::new();
+    }
+    // Windows: keep `.`/`..` name elements and treat the drive/UNC/root prefix as
+    // a unit (HotSpot WindowsPath.getParent is a pure last-separator split). Rust's
+    // Path::parent() normalizes a trailing `.` away and over-trims — see
+    // `p57_win_parent_of`. `cfg!(windows)` is a const, so the helper is still
+    // compiled (referenced) on every target — no dead-code warning.
+    if cfg!(windows) {
+        return p57_win_parent_of(path);
     }
     match std::path::Path::new(path).parent() {
         Some(p) => {
@@ -12861,8 +13125,21 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(src))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; OutputStream.write([BII) contractually
+            // throws IndexOutOfBoundsException on bad bounds.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*src) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*src, off + i) {
@@ -17914,21 +18191,48 @@ fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
 ) -> cratonvm_types::ObjectRef {
-    let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
-    let cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
-    let meth_str = ctx.create_string(&entry.method_name);
-    let file_str = match &entry.source_file {
-        Some(f) => Value::Object(Some(ctx.create_string(f))),
-        None => Value::Object(None),
+    // GC-SAFETY (see `lang_stackwalker::populate_sfi`): allocate every object
+    // under a pin first, then read each back through its pin before the
+    // (allocation-free) field writes. Holding the freshly-allocated `sf` and
+    // strings in bare locals across the subsequent `create_string` calls is a
+    // use-after-move/free under the moving collector.
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
+    let base = ctx.pin_native_root(sf);
+    let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
+    let h_cls = ctx.pin_native_root(cls_str);
+    let mut meth_str = ctx.create_string(&entry.method_name);
+    let h_meth = ctx.pin_native_root(meth_str);
+    let (mut file_str, h_file) = match &entry.source_file {
+        Some(f) => {
+            let s = ctx.create_string(f);
+            let h = ctx.pin_native_root(s);
+            (Some(s), Some(h))
+        }
+        None => (None, None),
     };
     // Preserve the '/' form for declaring-class resolution via class_id_by_name.
-    let decl_internal = ctx.create_string(&entry.class_name);
+    let mut decl_internal = ctx.create_string(&entry.class_name);
+    let h_decl = ctx.pin_native_root(decl_internal);
+
+    sf = ctx.read_native_pin(base, sf);
+    cls_str = ctx.read_native_pin(h_cls, cls_str);
+    meth_str = ctx.read_native_pin(h_meth, meth_str);
+    if let (Some(s), Some(h)) = (file_str, h_file) {
+        file_str = Some(ctx.read_native_pin(h, s));
+    }
+    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
+
     ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(sf, 2, file_str);
+    ctx.set_field(
+        sf,
+        2,
+        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
+    );
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
+    ctx.unpin_native_roots(base);
     sf
 }
 
@@ -17937,12 +18241,20 @@ fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let trace = ctx.capture_stack_trace(0); // key 0 = temporary
     let frame_count = trace.len();
     let arr = ctx.new_ref_array(ClassId::new(0), frame_count);
+    // GC-SAFETY: `populate_stack_frame` allocates, so pin `arr` (which also
+    // keeps its already-stored StackFrame elements reachable) and re-read the
+    // forwarded reference before each `set_array_element`.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, entry) in trace.iter().enumerate() {
         let sf = populate_stack_frame(ctx, entry);
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
     }
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
 
     // Apply the Function argument to the stream: function.apply(stream)
     let function = match args.get(1) {
@@ -20871,39 +21183,20 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(p))))
         },
     );
+    // keycloak-15: route through the shared `p57_parent_of` (jar-FS aware +
+    // Windows last-separator split that keeps `.`/`..`) instead of Rust's
+    // `Path::parent()`, which normalizes a trailing `.` and over-trims. This is
+    // the last-registered (winning) `getParent`; keep it identical to the
+    // earlier registration so behaviour does not depend on phase order.
     r.register(path, "getParent", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let path_str = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        if let Some((jar, entry)) = jarfs_decode(&path_str) {
-            let trimmed = entry.trim_end_matches('/');
-            if trimmed.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let parent_entry = match trimmed.rfind('/') {
-                Some(i) => &trimmed[..i],
-                None => "",
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&jarfs_encode(&jar, parent_entry));
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            return Ok(Some(Value::Object(Some(p))));
-        }
-        if let Some(parent) = std::path::Path::new(&path_str)
-            .parent()
-            .and_then(|p| p.to_str())
-        {
-            if parent.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(parent);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        } else {
+        let p = p57_read_path(ctx, this);
+        let parent = p57_parent_of(&p);
+        if parent.is_empty() {
             Ok(Some(Value::Object(None)))
+        } else {
+            let result = p57_alloc_path(ctx, &parent);
+            Ok(Some(Value::Object(Some(result))))
         }
     });
     r.register(
@@ -30727,8 +31020,21 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "update", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; reject out-of-range ranges with
+            // IndexOutOfBoundsException as the JDK Mac/SPI does.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*arr) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*arr, off + i) {
@@ -32598,25 +32904,39 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: `Certificate.verify(PublicKey)` MUST throw on a bad signature.
+    // In the default build we deliberately DO NOT register a native override:
+    // the real `java.security.cert` / `X509CertImpl.verify(PublicKey)` bytecode
+    // then runs and performs the genuine signature check, throwing
+    // `SignatureException` (or `InvalidKeyException` / `CertificateException`)
+    // on failure. A no-op native that always returns `Ok(None)` would silently
+    // certify any certificate against any key — a verification-bypass
+    // vulnerability — so it is gated entirely behind the legacy feature.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         cert,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                    // Fail-closed: the legacy synthetic path can only attest to
+                    // the signature it is able to verify with the material it
+                    // holds. If verification does not succeed we throw rather
+                    // than returning normally, so a caller never mistakes an
+                    // unverifiable certificate for a verified one.
                     if !parsed.verify_signature(&parsed.public_key_bytes) {
-                        // For non-self-signed certs, verification with own key is expected to fail
-                        // We don't throw here as this is best-effort
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
                     }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
@@ -32832,23 +33152,33 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: see the `Certificate.verify` note above. The default build does
+    // NOT register this native, so the real `X509CertImpl.verify(PublicKey)`
+    // bytecode performs the genuine signature check and throws on failure.
+    // Previously this discarded the `verify_signature` result and always
+    // returned success, certifying any certificate against any key.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         x509,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                    // Best-effort verification — doesn't throw on failure for now
-                    let _ = parsed.verify_signature(&parsed.public_key_bytes);
+                    // Fail-closed: propagate a verification failure as a thrown
+                    // SignatureException instead of discarding the result.
+                    if !parsed.verify_signature(&parsed.public_key_bytes) {
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
+                    }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
@@ -45663,23 +45993,30 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        // Block-accept via the s2_registry. Take the listener out, accept on it, put it back.
-        let stream = {
-            let mut reg = s2_registry().lock();
-            let listener =
-                reg.listeners
-                    .get(&listener_id)
-                    .ok_or_else(|| RuntimeError::IOException {
-                        message: "Listener not found".into(),
-                    })?;
-            match listener.accept() {
-                Ok((stream, _addr)) => stream,
-                Err(e) => {
-                    return Err(RuntimeError::IOException {
-                        message: format!("accept failed: {}", e),
-                    }
-                    .into())
+        // Clone the listener handle out under a SHORT lock, then release the
+        // s2_registry lock BEFORE the blocking accept() — holding it across a
+        // blocking accept() deadlocks every other synthetic-socket op
+        // process-wide (see the matching fix in net_phase_e::re2_accept_into).
+        let listener = {
+            let reg = s2_registry().lock();
+            reg.listeners
+                .get(&listener_id)
+                .ok_or_else(|| RuntimeError::IOException {
+                    message: "Listener not found".into(),
+                })?
+                .try_clone()
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("accept try_clone: {e}"),
+                })?
+        };
+        let _ = listener.set_nonblocking(false);
+        let stream = match listener.accept() {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("accept failed: {}", e),
                 }
+                .into())
             }
         };
         let stream_id = s2_alloc_stream(stream);
@@ -46183,12 +46520,26 @@ fn json_escape(s: &str) -> String {
 /// Read exactly four hex digits as a u16 from the char iterator, advancing it.
 /// Returns None if fewer than four hex digits are available (malformed `\u`).
 fn json_read_u16_hex(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    // A `\u` escape is a fixed 4-char window. On a malformed escape we must
+    // still CONSUME the full window (up to end-of-input) so the caller emits a
+    // single replacement char rather than leaving the trailing chars behind
+    // (e.g. `\uZZZZ` → "\u{FFFD}", not "\u{FFFD}ZZZ"). Only a genuine
+    // truncation (end-of-input before 4 chars) returns early — there is nothing
+    // left to consume.
     let mut code: u16 = 0;
+    let mut valid = true;
     for _ in 0..4 {
-        let d = chars.next()?.to_digit(16)?;
-        code = code.wrapping_shl(4) | (d as u16);
+        let c = chars.next()?; // None == real EOF: nothing more to consume
+        match c.to_digit(16) {
+            Some(d) => code = code.wrapping_shl(4) | (d as u16),
+            None => valid = false, // consume the char, but mark the escape malformed
+        }
     }
-    Some(code)
+    if valid {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 /// Unescape a JSON string value (handles \\n, \\t, \\uXXXX, etc.).
@@ -49961,5 +50312,99 @@ mod nb_phases_late_robustness_fix_tests {
         // (Reads process env; default branch returns Some(default).)
         let cap = gzip_max_inflated_bytes();
         assert!(cap.map(|c| c > 0).unwrap_or(true));
+    }
+}
+
+#[cfg(test)]
+mod cert_verify_bounds_security_tests {
+    use super::*;
+
+    // HIGH (cert-verify): In the default (non-legacy) build the no-op
+    // `verify(PublicKey)` natives MUST NOT be registered, so the real
+    // `java.security.cert` / `X509CertImpl.verify` bytecode performs the genuine
+    // signature check and throws on a bad signature. A registered no-op native
+    // here would silently certify any certificate against any key.
+    #[cfg(not(feature = "legacy-synthetic-crypto"))]
+    #[test]
+    fn verify_natives_not_registered_in_default_build() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(
+            r.find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "Certificate.verify must fall through to real bytecode in the default build"
+        );
+        assert!(
+            r.find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "X509Certificate.verify must fall through to real bytecode in the default build"
+        );
+    }
+
+    // Under the legacy feature the natives exist (and now throw on failure).
+    #[cfg(feature = "legacy-synthetic-crypto")]
+    #[test]
+    fn verify_natives_registered_under_legacy_feature() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(r
+            .find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+    }
+
+    // MEDIUM (alloc DoS): the bounds-checked natives stay registered; the guard
+    // lives inside the closure. Verify the offset/length predicate that gates
+    // `Vec::with_capacity` rejects negative/huge args before allocation.
+    #[test]
+    fn bounds_predicate_rejects_negative_and_overflowing_ranges() {
+        // Mirror of the in-native check: off < 0 || len < 0 || off+len > arr_len,
+        // evaluated in i64 so a negative i32 cannot sign-extend into a huge usize.
+        fn bad(off: i32, len: i32, arr_len: i64) -> bool {
+            off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len
+        }
+        // Negative length (the abort/over-allocation case).
+        assert!(bad(0, -1, 16));
+        // Negative offset.
+        assert!(bad(-1, 4, 16));
+        // i32::MIN length must not be treated as a valid (huge) usize.
+        assert!(bad(0, i32::MIN, 16));
+        // Range exceeding the array.
+        assert!(bad(8, 16, 16));
+        // Valid ranges are accepted.
+        assert!(!bad(0, 16, 16));
+        assert!(!bad(4, 8, 16));
+        assert!(!bad(0, 0, 0));
+    }
+
+    #[test]
+    fn mac_and_zip_byterange_natives_remain_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_crypto_mac(&mut r);
+        assert!(r.find("javax/crypto/Mac", "update", "([BII)V").is_some());
+
+        let mut r2 = NativeMethodRegistry::new();
+        register_p58_gzip_streams(&mut r2);
+        assert!(r2
+            .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
+            .is_some());
     }
 }

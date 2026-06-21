@@ -2248,7 +2248,18 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(port)));
     }
-    Ok(Some(Value::Int(0)))
+    // No ServerSocketChannel back-ref: this is a PLAIN synthetic `java.net.ServerSocket`
+    // (bound by the net_phase_e re2 / phases_early phase53 path), not a channel adapter.
+    // This native is the last-registered `getLocalPort` and therefore shadows the plain
+    // ServerSocket too, so returning 0 here breaks every plain-socket caller that reads
+    // its bound port (e.g. Narayana's TransactionStatusManager advertises getLocalPort()
+    // and its recovery connector then connects to it → the Hibernate JTA cluster hang).
+    // The binding native records the actual OS-assigned port in the shared native-api
+    // registry keyed by identity hash (object fields can't carry it — the real layout's
+    // low slots are reference-typed, so an int does not round-trip). Read it back.
+    let p =
+        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
+    Ok(Some(Value::Int(p)))
 }
 
 fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

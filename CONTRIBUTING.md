@@ -12,7 +12,7 @@ By participating, you are expected to uphold this code.
 
 1. Fork the repository and clone your fork
 2. Install prerequisites (see [BUILD_GUIDE.md](BUILD_GUIDE.md)):
-   - Rust 1.77+ via [rustup.rs](https://rustup.rs)
+   - Rust 1.80+ via [rustup.rs](https://rustup.rs)
    - JDK 17+ (for compiling test Java classes)
    - Visual Studio Build Tools (Windows only)
 3. Build and run tests:
@@ -63,10 +63,12 @@ are planned but not yet enabled.
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
 | `classloading` | Class loading & bytecode verification |
-| `gc` | Generational GC (young/old; Cheney moving + non-moving sweep; experimental `zgc`-gated stub, no G1) |
+| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); feature-gated `zgc` stub |
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |
+| `libcratonvm` | C-ABI shared library for embedding (cdylib/staticlib `libjvm` substitute, JNI Invocation API) |
+| `cratonvm-embed` | Curated, semver-stable Rust facade for embedding CratonVM |
 
 ### Writing Tests
 

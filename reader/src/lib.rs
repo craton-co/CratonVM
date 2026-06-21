@@ -4,6 +4,14 @@
 // TODO: Re-enable missing_docs once the public API stabilises and doc comments
 // are added to all spec-derived types (struct fields, enum variants, etc.).
 #![allow(missing_docs)]
+// Pre-existing style/judgment clippy lints in this spec-derived parser; allowed
+// crate-wide so `clippy -D warnings` is green (reader is a build dep of gc, so
+// these otherwise block the gc clippy gate too). Not defects.
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::explicit_auto_deref,
+    clippy::identity_op
+)]
 
 //! Java `.class` file parser for the CratonVM project.
 //!

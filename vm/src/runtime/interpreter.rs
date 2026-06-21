@@ -611,6 +611,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // TLAB bugs. Surfaced as a SIGSEGV in the moving collector's post-copy
     // `pointer_map` walk under multi-threaded churn (TestFileStoreConcurrency).
     thread.tlab.retire();
+    // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
+    // so `note_gc_productivity` can compute how much this forced GC actually
+    // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
+    let before_live = shared.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -634,6 +638,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_gc_productivity(shared, before_live);
     } else {
         if shared.gc_barrier.request_stw(thread.thread_id, alive_count) {
             shared.gc_barrier.wait_for_all();
@@ -648,15 +653,94 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 .collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: remap the ec_watch corruption-watch table across this
+            // multi-threaded forced collection too. The single-threaded GC paths
+            // already do (mirrors the `update_all_roots` -> `ec_watch::remap`
+            // pairing at maybe_gc:419 / maybe_gc_forced:636); this multi-threaded
+            // initiator path was missing it, so a relocating G1 evacuation left
+            // ec_watch holders stale and the watchpoint read moved-away memory.
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_gc_productivity(shared, before_live);
         } else {
             safepoint_check(shared, thread);
         }
     }
+}
+
+/// Default number of consecutive unproductive allocation-failure GCs (each
+/// leaving the heap ≥98% full) after which the allocation paths declare OOM
+/// instead of continuing to GC-thrash. Overridable via
+/// `CRATONVM_GC_OVERHEAD_LIMIT` (set to `0` to disable the limit entirely).
+const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
+
+/// After a forced (allocation-failure) GC completes, record whether it was
+/// *productive* — i.e. whether it actually relieved heap pressure. Measured as
+/// the bytes it freed: `before - after` live bytes, where `before` is the live
+/// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
+/// once the collection finishes. A forced GC that freed < 2% of total heap
+/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+///
+/// The *freed-amount* signal (not post-GC fullness) is the right one for a
+/// generational heap: in a retained-allocation death-spiral the young semi-space
+/// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
+/// never looks exhausted), yet the GC frees ~nothing net because every survivor
+/// is promoted into an already-full old generation. `before - after` captures
+/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// Forced GCs only happen on genuine allocation failure (young full *and*
+/// promotion blocked), so this never fires during ordinary young-GC churn.
+fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+    let cap = shared.heap.heap_capacity();
+    if cap == 0 {
+        return;
+    }
+    let after_live = shared.heap.allocated_bytes();
+    let freed = before_live.saturating_sub(after_live);
+    // unproductive: freed < 2% of capacity
+    let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
+    let streak = if unproductive {
+        shared
+            .gc_unproductive_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    } else {
+        shared
+            .gc_unproductive_streak
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        0
+    };
+    if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+        eprintln!(
+            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+        );
+    }
+}
+
+/// Returns `true` when the heap has GC-thrashed past the overhead limit — i.e.
+/// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
+/// heap. The allocation-failure paths call this right after `maybe_gc_forced`
+/// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
+/// pre-allocated `singleton_oom`) instead of retrying into an O(n²) death-spiral
+/// on a heap full of live (retained) objects. Mirrors HotSpot's
+/// `UseGCOverheadLimit`. Disabled (always `false`) when
+/// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
+pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
+    let limit = match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(0) => return false, // explicitly disabled
+            Ok(n) => n,
+            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+        },
+        Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+    };
+    shared
+        .gc_unproductive_streak
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= limit
 }
 
 /// Force a GC cycle from a native method (e.g. System.gc()).
@@ -713,6 +797,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
+            // across this multi-threaded finalizer collection (single-threaded
+            // paths already remap it; this initiator path was missing the call).
+            crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
             }
@@ -1325,7 +1413,7 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
 }
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
-fn alloc_object_shared(
+pub(crate) fn alloc_object_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
     class_id: ClassId,
@@ -1346,6 +1434,18 @@ fn alloc_object_shared(
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit: if repeated forced GCs have freed almost nothing, the
+    // heap is full of live objects — declare OOM now rather than retrying into a
+    // death-spiral (a sliver freed each cycle would otherwise let allocation
+    // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_object with {} fields)", num_fields),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_object(class_id, num_fields)
@@ -1414,6 +1514,16 @@ fn gc_alloc_array(
     // Retire TLAB before GC
     thread.tlab.retire();
     maybe_gc_forced(shared, thread);
+    // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
+    // GC-thrashing rather than spinning on slivers.
+    if gc_overhead_limit_exceeded(shared) {
+        maybe_dump_heap_on_oom(shared);
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::OutOfMemoryError {
+                message: format!("Java heap space (alloc_array length {})", length),
+            },
+        )));
+    }
     shared
         .heap
         .try_alloc_array(class_id, element_type, length)
@@ -1822,6 +1932,20 @@ pub(crate) fn apply_pointer_map_to_thread(
             }
         }
     }
+    // Step 5 GAP B (precise-JIT remap, non-initiator half). The GC initiator's
+    // `update_all_roots` (memory/gc.rs:73) remaps this collection's precise JIT
+    // oop-map slots via `remap_active_jit_frames`, but a thread that was PARKED at
+    // the STW barrier reaches HERE instead and was missing that call. Under a
+    // moving collector this stranded a non-initiator's JIT-frame oops at their old
+    // addresses after a relocation — a use-after-free with CRATONVM_PRECISE_JIT_MAPS
+    // on. It is specifically a G1 hazard: G1 young/mixed move unconditionally,
+    // whereas the generational collector falls back to a non-moving sweep whenever
+    // any thread is in JIT (`gc_quiescence`), so its non-initiator JIT frames never
+    // see relocation. Mirror the initiator: remap THIS resuming thread's precise
+    // JIT oop slots before the shadow stack. Thread-local (walks this thread's JIT
+    // entry chain — sound because we run on the resuming thread itself) and inert
+    // unless a precise-map frame is live, so it is a no-op on the default path.
+    crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
     // relocated addresses in the JIT registers/slots it reloads from its shadow
@@ -2336,6 +2460,21 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
+
+/// activate-ir-optimizer (runtime wiring): cached `CRATONVM_JIT_C2_FIRST_CALL`
+/// flag. The `fn execute` first-call compile path uses the single-pass backend
+/// (`jit::x64::compile`) directly and caches a non-IR body on call #1, which
+/// preempts the optimizing IR pipeline (`jit::try_compile`) on every later path
+/// (dispatcher warmup, OSR, background worker all probe `jit_cache` first). When
+/// this flag is set, that eager first-call single-pass compile is replaced by an
+/// invocation-counted upgrade through `try_jit_compile_callee` →
+/// `jit::try_compile(optimize=true)` (which SUBSUMES single-pass), so hot methods
+/// actually reach the IR optimizer. Read once and cached (this is on the hot
+/// uncached-invocation path). Default-OFF → behaviour is byte-for-byte unchanged.
+fn c2_first_call_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some())
+}
 
 /// Execute a method on the given class.
 ///
@@ -3030,7 +3169,62 @@ pub fn execute(
                     let jit_cache = shared.jit_cache.read();
                     jit_cache.get(&class_name_str, method_name, method_descriptor)
                 };
+                // CRATONVM_JIT_C2_FIRST_CALL: set when the gated branch DEFERS a
+                // not-yet-hot method (returns None to interpret rather than compile).
+                // The first-call-failure seal below must NOT fire for that case —
+                // sealing inserts `skip_key` into `jit_skip_set`, which makes the next
+                // call's `already_skipped` gate skip the whole JIT block, permanently
+                // stopping the invocation counter from ever re-running (so an
+                // `execute`-only-reached hot method would never compile gate-ON). A
+                // genuine hot-path backend bail (try_jit_compile_callee → None) leaves
+                // this false and still seals, matching the gate-OFF semantics.
+                let mut c2_not_hot = false;
                 let compiled = compiled.or_else(|| {
+                    // activate-ir-optimizer (runtime wiring, CRATONVM_JIT_C2_FIRST_CALL,
+                    // default-OFF): replace the eager single-pass first-call compile
+                    // below with an invocation-counted upgrade through the optimizing
+                    // IR pipeline. The eager `x64::compile` (further down) caches a
+                    // non-IR body on call #1 and thereby preempts `jit::try_compile`
+                    // on every later path. Here we instead: (a) count invocations and,
+                    // below the warmup threshold, return None so the method INTERPRETS
+                    // — which ALSO un-preempts the dispatcher/OSR warmup paths that are
+                    // already wired to `try_compile(optimize=true)`, so a method that
+                    // goes hot through the stackless dispatcher still reaches IR there;
+                    // and (b) once hot, compile via `try_jit_compile_callee` →
+                    // `jit::try_compile(optimize=true)`, which SUBSUMES single-pass
+                    // (it falls back to `x64::compile_with_param_slots` internally for
+                    // IR-incompatible bodies), then re-fetch the cached body. The
+                    // single-pass block below is unreached while the flag is set.
+                    if c2_first_call_enabled() {
+                        let invoc_key = {
+                            let mut h = 0u32;
+                            for &b in method_name.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32);
+                            }
+                            for &b in method_descriptor.as_bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u32);
+                            }
+                            ((class_id.as_u32() as u64) << 32) | (h as u64)
+                        };
+                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        if n < crate::runtime::env_cache::jit_invocation_threshold() {
+                            c2_not_hot = true; // defer, do NOT seal (counter must keep running)
+                            return None; // not hot yet — interpret (dispatcher/OSR may reach IR)
+                        }
+                        return match try_jit_compile_callee(
+                            shared,
+                            &class_name_str,
+                            method_name,
+                            method_descriptor,
+                            true, // optimize = C2 / optimizing IR pipeline
+                        ) {
+                            Some(_) => {
+                                let jit_cache = shared.jit_cache.read();
+                                jit_cache.get(&class_name_str, method_name, method_descriptor)
+                            }
+                            None => None,
+                        };
+                    }
                     let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
                     let code_len = code_attr.code.len();
                     let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor)
@@ -3551,7 +3745,7 @@ pub fn execute(
                     cached_result
                 });
 
-                if compiled.is_none() {
+                if compiled.is_none() && !c2_not_hot {
                     // RBC.4 — seal first-call compile failures for the same
                     // reason as the scan-reject seal above: without it every
                     // uncached invocation of a backend-bailing method re-ran
@@ -3559,6 +3753,11 @@ pub fn execute(
                     // transient resolver miss can still be compiled later by
                     // the invocation-counter upgrade path; the cache fast-path
                     // then routes calls to it.)
+                    //
+                    // `!c2_not_hot`: under CRATONVM_JIT_C2_FIRST_CALL a not-yet-hot
+                    // method returned None on purpose (to interpret until its
+                    // invocation counter crosses the threshold) — sealing it here
+                    // would set `already_skipped` and permanently stop that counter.
                     shared.jit_skip_set.write().insert(skip_key.clone());
                 }
                 if let Some(compiled) = compiled {
@@ -3877,7 +4076,7 @@ pub fn execute(
     // regression suites (bc-asn1/crypto/crypto-prng went rc=0 -> rc=124).
     // The uncached invoke path is not a safe consumer of the thread-local
     // frame pools as-is; reverted to the proven `new_from_arcs` path.
-    let frame = Frame::new_from_arcs(
+    let mut frame = Frame::new_from_arcs(
         class_id,
         std::sync::Arc::from(class_name_str.as_str()),
         std::sync::Arc::from(method_name),
@@ -3889,6 +4088,22 @@ pub fn execute(
         code_attr.max_locals,
         args,
     );
+
+    // GC-safety: if the JIT early-compile path produced an exception, root its
+    // oop on the operand stack BEFORE `push_frame_and_fire_entry` fires the
+    // JVMTI MethodEntry callback. That callback may allocate Java heap and
+    // trigger a moving young-gen GC; an oop reachable only through the
+    // `jit_early_exception` Rust local across the fire would be unrooted and
+    // could be relocated, leaving a stale pointer for the handler walk /
+    // propagation below. The frame's operand stack is GC-scanned, so we read
+    // the (possibly relocated) reference back from it after the fire. The
+    // pre-fire push is best-effort (`let _ =`): if it does not take — e.g. a
+    // `max_stack == 0` method, which by definition has no operand-using
+    // handler — we fall back to the original local, no worse than before.
+    // Mirrors `route_jit_exception_through_method` / `resume_from_ir_deopt`.
+    if let Some(exc) = jit_early_exception {
+        let _ = frame.stack.push(Value::Object(Some(exc)));
+    }
 
     // Push frame onto thread
     if crate::runtime::env_cache::frame_trace() {
@@ -3904,9 +4119,17 @@ pub fn execute(
 
     // If the JIT early-compile path encountered a Java exception from a callee,
     // route it through this method's exception table before interpreter execution.
-    if let Some(exc) = jit_early_exception {
+    if jit_early_exception.is_some() {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
+        // Re-read the exception oop from the (GC-scanned) operand stack: a GC
+        // during the MethodEntry callback may have relocated it, and only the
+        // scanned frame slot was updated — not the original Rust local. Fall
+        // back to the local if the pre-fire push did not take.
+        let exc = match thread.frames[frame_idx].stack.pop() {
+            Ok(Value::Object(Some(r))) => r,
+            _ => jit_early_exception.expect("jit_early_exception is_some"),
+        };
         // The JIT executed the entire method body as native code, so there is
         // no live throw-site PC. Previously this passed the freshly-pushed
         // frame's `last_instr_pc` (always 0) to the PC-ranged search, which
@@ -6617,6 +6840,44 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             }
         }
 
+        // DIAG (gated `CRATONVM_DBG_POPINT=1`): pinpoint a `pop_int` type
+        // mismatch ("expected int on stack, got ref(...)") — log the offending
+        // method/bci/opcode + the Java frame chain the first time one surfaces.
+        if let Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NotImplemented { feature },
+        ))) = &exec_result
+        {
+            if feature.starts_with("expected int on stack, got")
+                && std::env::var("CRATONVM_DBG_POPINT").is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static FIRED_POPINT: AtomicBool = AtomicBool::new(false);
+                if !FIRED_POPINT.swap(true, Ordering::Relaxed) {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[DBG_POPINT] {} at {}.{}{} bci={} opcode={:?} stack_len={}",
+                        feature,
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        saved_pc,
+                        instruction,
+                        f.stack.len(),
+                    );
+                    for (i, fr) in thread.frames.iter().enumerate().rev() {
+                        eprintln!(
+                            "    [{}] {}.{}{} pc={}",
+                            i,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.method_descriptor(),
+                            fr.pc
+                        );
+                    }
+                }
+            }
+        }
+
         // Convert RuntimeErrors from native methods into catchable Java exceptions.
         let exec_result = match exec_result {
             Err(MethodCallFailed::InternalError(VmError::Runtime(runtime_err)))
@@ -7076,23 +7337,34 @@ fn find_exception_handler_any_pc(
 /// its own `catch (Throwable)` (Jetty `start.jar` launcher: the launcher's
 /// usage-error handling never ran, surfacing a misleading inner NPE instead).
 ///
-/// Mirroring `route_jit_exception_through_method`: skip catch-all
-/// (`catch_type == 0`, i.e. `finally`) entries — without a known PC they
-/// could swallow an exception thrown outside their region — but match typed
-/// handlers by exception class, which is sound regardless of throw site.
+/// Mirroring `route_jit_exception_through_method`: without a known PC we
+/// cannot range-check a handler, so a catch-all (`catch_type == 0`, i.e.
+/// `finally`) is only honoured when its protected region covers the **whole
+/// method** (`start_pc == 0 && end_pc >= code_len`) — such an entry catches a
+/// throw at any PC, so running it is sound regardless of the (unknown) throw
+/// site. This preserves `finally` / synchronized-monitor-exit cleanup for the
+/// dominant method-wide case instead of dropping it. Narrower catch-all
+/// regions are still skipped (they could swallow an out-of-region exception),
+/// and typed handlers match by exception class as before.
 fn find_exception_handler_pc_unknown(
     shared: &SharedVm,
     frame: &Frame,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
+    // `frame.code` is padded with 2 trailing bytes for the interpreter's
+    // speculative reads; the real bytecode length is `len() - 2`.
+    let code_len = frame.code.len().saturating_sub(2);
     let mut cm_guard = shared.class_manager.read();
     cm_guard.get_class(frame.class_id)?;
     for entry in frame.exception_table().iter() {
-        // PC unknown → cannot verify range membership; conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class.
+        // PC unknown → cannot verify range membership. Honour a catch-all only
+        // when it spans the entire method (always covers the throw site);
+        // otherwise skip it (it could catch an out-of-region exception).
         if entry.catch_type == 0 {
+            if entry.start_pc == 0 && entry.end_pc as usize >= code_len {
+                return Some((entry.handler_pc as usize, exc));
+            }
             continue;
         }
         let owning_class = cm_guard.get_class(frame.class_id)?;
@@ -7208,10 +7480,14 @@ fn find_exception_handler_impl(
 /// `throw_pc` is the bytecode PC of the throw site within the JIT'd method,
 /// if known. Pass `usize::MAX` when the throw-site PC cannot be recovered
 /// (the JIT currently does not record one in `JIT_PENDING_EXCEPTION`); in
-/// that case, catch-all (`catch_type == 0`, i.e. `finally`) entries are
-/// skipped because they would otherwise unconditionally swallow exceptions
-/// thrown from outside the protected region. Typed handlers still match by
-/// exception class since that is safe regardless of the throw site.
+/// that case a catch-all (`catch_type == 0`, i.e. `finally`) entry is honoured
+/// only when its protected region spans the **whole method**
+/// (`start_pc == 0 && end_pc >= code_len`) — such an entry covers any throw
+/// site, so running it is sound and preserves `finally` /
+/// synchronized-monitor-exit cleanup. Narrower catch-all regions are skipped
+/// (they could swallow an exception thrown outside the protected region).
+/// Typed handlers still match by exception class since that is safe regardless
+/// of the throw site.
 ///
 /// If a matching handler is found, a bytecode frame for the JIT'd method
 /// is pushed with `pc` at the handler and the exception on the operand
@@ -7232,6 +7508,10 @@ fn route_jit_exception_through_method(
     }
 
     let pc_unknown = throw_pc == usize::MAX;
+    // `cached.code` is padded with 2 trailing bytes for speculative reads;
+    // the real bytecode length is `len() - 2`. Used to recognise a catch-all
+    // whose region covers the whole method when the throw PC is unknown.
+    let code_len = cached.code.len().saturating_sub(2);
     let exc_class_id = shared.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
     // HIGH — same fast-path treatment as `find_exception_handler`:
@@ -7246,12 +7526,16 @@ fn route_jit_exception_through_method(
         // in the method (the original bug here).
         //
         // When the throw PC is unknown (`usize::MAX`, sentinel), we cannot
-        // verify range membership. In that case we conservatively skip
-        // catch-all entries (they would catch anything) but still allow
-        // typed handlers to match on exception class — wrong-type
-        // exceptions cannot be silently swallowed that way.
+        // verify range membership. A catch-all (`catch_type == 0`) is honoured
+        // only when its protected region spans the whole method
+        // (`start_pc == 0 && end_pc >= code_len`) — it then covers the
+        // (unknown) throw site, so running its `finally` / monitor-exit
+        // cleanup is sound. Narrower catch-all regions are skipped (they could
+        // catch an out-of-region exception); typed handlers still match on
+        // exception class — wrong-type exceptions cannot be silently swallowed.
         if pc_unknown {
-            if entry.catch_type == 0 {
+            if entry.catch_type == 0 && !(entry.start_pc == 0 && entry.end_pc as usize >= code_len)
+            {
                 continue;
             }
         } else if throw_pc < entry.start_pc as usize || throw_pc >= entry.end_pc as usize {
@@ -7333,7 +7617,7 @@ fn route_jit_exception_through_method(
         (cached.max_stack as usize).max(16) + 8,
     );
 
-    let frame = crate::runtime::frame::Frame::new_pooled(
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
         cached.declaring_class_id,
         cached.class_name.clone(),
         cached.method_name.clone(),
@@ -7347,6 +7631,20 @@ fn route_jit_exception_through_method(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
+    // GC-safety: push the live exception oop onto the handler frame's operand
+    // stack BEFORE `push_frame_and_fire_entry`. That helper fires a JVMTI
+    // MethodEntry callback (when a listener is active); the callback can
+    // allocate Java heap and trigger a young-gen GC that relocates live oops
+    // (gen_heap.rs selective promotion). If `exc` were pushed only AFTER the
+    // fire, it would be reachable solely through this Rust local across the
+    // callback — unrooted — and a relocation/collection would leave a stale
+    // pointer on the operand stack. Populating the GC-scanned frame slot first
+    // keeps it rooted across the callback. Mirrors the same ordering fix in
+    // `resume_from_ir_deopt`.
+    frame
+        .stack
+        .push(Value::Object(Some(exc)))
+        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
     if crate::runtime::env_cache::frame_trace() {
         eprintln!(
             "[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}",
@@ -7358,11 +7656,8 @@ fn route_jit_exception_through_method(
     }
     push_frame_and_fire_entry(thread, frame);
     let new_idx = thread.frames.len() - 1;
-    // Push exception onto operand stack; set PC to handler.
-    thread.frames[new_idx]
-        .stack
-        .push(Value::Object(Some(exc)))
-        .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+    // Exception is already on the operand stack (rooted before the fire above);
+    // just position the PC at the handler.
     thread.frames[new_idx].pc = handler_pc;
     // Silence unused parameter warning — caller_frame_idx is kept for
     // future extensions (e.g. return-value coercion into the caller).
@@ -7382,21 +7677,38 @@ fn ir_deopt_resume_enabled() -> bool {
 }
 
 /// Map a reconstructed frame's locals/stack `FrameValue`s to interpreter
-/// `Value`s. Conservative first cut: only integer slots are mapped (the IR
-/// path's deopt-eligible methods are integer-only). Any other variant —
-/// `Object`/`Float`/`VirtualObject`, or an unresolved `Register`/`StackSlot`
-/// (which should never reach here) — returns `None`, signalling the caller to
-/// fall back to the safe re-run path rather than materialise a mistyped slot.
+/// `Value`s. Handles the two type-source kinds the producer can emit today:
+/// a cat-1 `Int` slot and an object-reference slot (`StackSlotRef`, resolved
+/// in-stub to the raw heap-pointer word). Any other variant —
+/// `Float`/`Long`/`Double`/`Unsupported`/`VirtualObject`, or an unresolved
+/// `Register`/`StackSlot` (which should never reach here) — returns `None`,
+/// signalling the caller to fall back to the safe re-run path rather than
+/// materialise a mistyped or truncated slot.
 ///
-/// LIMITATION: a long/double resolves to `FrameValue::Int(bits)` and would be
-/// truncated by `Value::Int`; until per-slot width tags exist, methods with
-/// category-2 locals must not precise-resume. The all-`Int` requirement plus
-/// the default-OFF gate keep that case off the live path.
+/// `Object(w)` is the `real-frame-deopt` type source for ref-typed locals
+/// (e.g. an instance method's `this`): `w` is the raw heap pointer captured
+/// **in-stub** at the guard (0 == null). No Java allocation runs between that
+/// capture and the frame push (`refill_pools_from_shared` only recycles Rust
+/// buffers — see `resume_from_ir_deopt`), so the pointer stays valid and needs
+/// no temporary GC root here; once the frame is pushed its locals are scanned
+/// as roots. (A GC-backed `VirtualObject` materialisation — which *does*
+/// allocate — is Phase B and is still rejected via the `None` arm.)
+///
+/// LIMITATION: a `long`/`double` is tagged `Unsupported` by the producer (it
+/// occupies two interpreter slots and a single `Value` cannot be re-expanded
+/// 1:1 here), so any method with a category-2 slot live at a guard falls back
+/// to re-run. See `real-frame-deopt.md` (cat-2 two-slot expansion follow-up).
 fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
     use cratonvm_jit::deopt::FrameValue;
     vals.iter()
         .map(|v| match v {
             FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Object(w) => Some(match *w {
+                0 => Value::Object(None),
+                // SAFETY: `w` is a live, 8-byte-aligned heap pointer read
+                // synchronously at the guard; no GC has run since (see above).
+                p => Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) })),
+            }),
             FrameValue::Undefined => Some(Value::Int(0)),
             _ => None,
         })
@@ -7416,12 +7728,35 @@ fn resume_from_ir_deopt(
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<CachedCallResult> {
+    // CRATONVM_DBG_DEOPT: trace the resume decision (PRECISE mid-bci resume vs
+    // FALLBACK re-run, with the reason) so the type source can be validated
+    // live — e.g. an instance method's `this` resolving to `Value::Object(..)`
+    // rather than a truncated `Value::Int`. Cheap (only when the var is set).
+    let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
+    let bail = |why: &str| -> Option<CachedCallResult> {
+        if trace {
+            eprintln!(
+                "[cratonvm-deopt] FALLBACK re-run {}.{}{} at bci={} ({why})",
+                cached.class_name, cached.method_name, cached.method_descriptor, rframe.bci,
+            );
+        }
+        None
+    };
     // Phase-A scope: single non-inlined frame, no held monitors.
-    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
-        return None;
+    if !rframe.caller_frames.is_empty() {
+        return bail("inlined caller chain");
     }
-    let locals = ir_deopt_frame_values(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+    if !rframe.monitors.is_empty() {
+        return bail("held monitors");
+    }
+    let locals = match ir_deopt_frame_values(&rframe.locals) {
+        Some(l) => l,
+        None => return bail("unmappable local slot"),
+    };
+    let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
+        Some(s) => s,
+        None => return bail("unmappable stack slot"),
+    };
 
     thread.refill_pools_from_shared(
         &shared.operand_stack_pool,
@@ -7429,7 +7764,7 @@ fn resume_from_ir_deopt(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled(
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
         cached.declaring_class_id,
         cached.class_name.clone(),
         cached.method_name.clone(),
@@ -7443,13 +7778,382 @@ fn resume_from_ir_deopt(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    push_frame_and_fire_entry(thread, frame);
-    let idx = thread.frames.len() - 1;
+    // Populate the operand stack and resume pc BEFORE pushing the frame, so that
+    // when `push_frame_and_fire_entry` fires a JVMTI MethodEntry callback (which
+    // may allocate Java heap and trigger a GC) EVERY reconstructed oop — locals
+    // AND operand-stack refs — is already in a GC-scanned frame slot. (Review
+    // finding: a reconstructed stack ref held only in the Rust `stack_vals` Vec
+    // was momentarily unrooted across the fire; locals were already safe.)
     for v in stack_vals {
-        thread.frames[idx].stack.push(v).ok()?;
+        frame.stack.push(v).ok()?;
     }
-    thread.frames[idx].pc = rframe.bci as usize;
+    frame.pc = rframe.bci as usize;
+    if trace {
+        eprintln!(
+            "[cratonvm-deopt] PRECISE resume {}.{}{} at bci={} locals={:?}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            rframe.bci,
+            locals,
+        );
+    }
+    push_frame_and_fire_entry(thread, frame);
     Some(CachedCallResult::FramePushed)
+}
+
+/// real-frame-deopt Step 3 — Object-aware sibling of `ir_deopt_frame_values`.
+/// Maps reconstructed `FrameValue`s to interpreter `Value`s INCLUDING object
+/// references; refuses (returns `None`) on any variant the clean Step-3 pilot
+/// must not fabricate: `Float`, the unresolved machine forms
+/// (`Register`/`StackSlot`/`StackSlotRef` — these are resolved by the jit-crate
+/// `x64_deopt_entry` before stashing and must never reach the sink),
+/// `VirtualObject`/`VirtualObjectRef` (scalar-replaced; Steps 5-6), and
+/// `Unsupported` (the cat-2 `long`/`double` sentinel — never fabricate a cat-2
+/// slot). `Object(addr)` → `Value::Object(Some(ObjectRef::from_raw))` (or null
+/// for `addr == 0`); `Int`/`Undefined` map exactly as the int-only path.
+fn ir_deopt_frame_values_with_objects(
+    vals: &[cratonvm_jit::deopt::FrameValue],
+) -> Option<Vec<Value>> {
+    use cratonvm_jit::deopt::FrameValue;
+    vals.iter()
+        .map(|v| match v {
+            FrameValue::Int(i) => Some(Value::Int(*i as i32)),
+            FrameValue::Undefined => Some(Value::Int(0)),
+            FrameValue::Object(addr) => {
+                let obj = if *addr == 0 {
+                    None
+                } else {
+                    // SAFETY: `addr` is a live heap object address captured in
+                    // the deopt frame by `x64_deopt_entry`; `from_raw` only
+                    // debug-asserts non-null / alignment.
+                    Some(unsafe { ObjectRef::from_raw(*addr as usize as *mut u8) })
+                };
+                Some(Value::Object(obj))
+            }
+            // Cat-2 / unresolved / virtual / FP — bail to the safe re-run path.
+            _ => None,
+        })
+        .collect()
+}
+
+/// real-frame-deopt Step 3 — build the interpreter `Frame` for an Object-bearing
+/// deopt, GC-rooting the reconstructed oops across the pool refill. Returns the
+/// built `Frame` (NOT pushed onto `thread.frames`) with the oops still pinned in
+/// `thread.native_pin_roots` above the caller's watermark — the CALLER must
+/// `native_pin_roots.truncate(pin_base)` after discarding the frame (the
+/// wrapper [`build_validate_discard_ir_deopt`] does this unconditionally).
+/// `None` if the frame is out-of-scope (inlined caller chain / held monitors) or
+/// carries an unmappable slot (cat-2/Unsupported/virtual/FP/unresolved).
+///
+/// GC-rooting: the oops are pinned BEFORE `refill_pools_from_shared` (whose
+/// `acquire()` may GC). While pinned they are scanned (`memory/roots.rs`) and
+/// forwarded in place by a moving collector (`memory/gc.rs`); after refill each
+/// oop is RE-READ from its (forwarded) pin slot into the frame, so the frame
+/// never holds a stale pre-GC address. NO JVM allocation occurs between the
+/// re-read and the return (`Frame::new_pooled` / `ValueStack::push` are
+/// Rust-side only), so no GC can stale the built frame. `stress` forces a GC
+/// immediately before refill — the ONLY sanctioned injection point — to
+/// exercise the forward-in-place path (tests / `CRATONVM_GC_STRESS`).
+fn build_deopt_frame_inner(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    stress: bool,
+) -> Option<crate::runtime::frame::Frame> {
+    // Phase-A scope: single non-inlined frame, no held monitors (same guard as
+    // `resume_from_ir_deopt`).
+    if !rframe.caller_frames.is_empty() || !rframe.monitors.is_empty() {
+        return None;
+    }
+    let locals = ir_deopt_frame_values_with_objects(&rframe.locals)?;
+    let stack_vals = ir_deopt_frame_values_with_objects(&rframe.stack)?;
+
+    // ROOT the reconstructed oops BEFORE the GC-capable refill (locals then
+    // stack — the order the re-read below relies on).
+    let pin_base = thread.native_pin_roots.len();
+    for v in locals.iter().chain(stack_vals.iter()) {
+        if let Value::Object(Some(obj)) = v {
+            thread.native_pin_roots.push(*obj);
+        }
+    }
+
+    // Stress hook: the ONLY sanctioned GC injection point — before refill, while
+    // every reconstructed oop is pinned (a GC after the re-read would stale the
+    // unrooted `*_fwd` vecs / the un-pushed frame; there is none, by construction).
+    if stress {
+        maybe_gc_forced_pub(shared, thread);
+    }
+
+    thread.refill_pools_from_shared(
+        &shared.operand_stack_pool,
+        &shared.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+
+    // Re-read each oop from its (possibly forwarded) pin slot, in push order, so
+    // the frame carries the current address, never the stale `Object(u64)`.
+    let mut k = pin_base;
+    let mut locals_fwd = Vec::with_capacity(locals.len());
+    for v in &locals {
+        match v {
+            Value::Object(Some(_)) => {
+                let fwd = thread.native_pin_roots[k];
+                k += 1;
+                locals_fwd.push(Value::Object(Some(fwd)));
+            }
+            other => locals_fwd.push(*other),
+        }
+    }
+    let mut stack_fwd = Vec::with_capacity(stack_vals.len());
+    for v in &stack_vals {
+        match v {
+            Value::Object(Some(_)) => {
+                let fwd = thread.native_pin_roots[k];
+                k += 1;
+                stack_fwd.push(Value::Object(Some(fwd)));
+            }
+            other => stack_fwd.push(*other),
+        }
+    }
+
+    // Build the Frame as a LOCAL (never pushed onto thread.frames), so the
+    // subsequent re-run sees identical interpreter state after it is discarded.
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        &locals_fwd,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    for v in &stack_fwd {
+        // A clean pilot never overflows the padded stack. If it somehow did,
+        // recycle the frame's pooled buffers before bailing — `Frame` has no
+        // `Drop` impl (recycling is explicit), so a plain `?`-return would leak
+        // them. The caller then releases the pins and re-runs.
+        if frame.stack.push(*v).is_err() {
+            frame.recycle(&mut thread.locals_pool, &mut thread.stacks_pool);
+            return None;
+        }
+    }
+    frame.pc = rframe.bci as usize;
+    Some(frame)
+}
+
+/// real-frame-deopt Step 4 — RESUME a real (Object-bearing) deopt at the trapping
+/// bci instead of re-running the whole method from entry (the payoff that kills
+/// the side-effect double-execution).
+///
+/// Builds the interpreter `Frame` from the reconstructed locals/stack (oops
+/// GC-rooted across the pool refill — see [`build_deopt_frame_inner`]), then
+/// PUSHES it onto `thread.frames` so the interpreter resumes there.
+///
+/// The GC-rooting HANDOFF is the load-bearing invariant: the temporary
+/// `native_pin_roots` pins are held ACROSS `push_frame_and_fire_entry` (which may
+/// fire entry hooks that allocate / GC) and released only AFTER the push — once
+/// pushed, the frame's locals/stack are themselves GC roots (scanned by the
+/// normal interpreter-frame root walk), so the reconstructed oops are rooted by
+/// the pins, then by BOTH pins and frame, then by the frame alone, with no
+/// unrooted window. Returns `Some(FramePushed)` on a clean resume, or `None`
+/// (re-run) for an out-of-scope / unmappable frame — releasing any partial pins
+/// in both cases.
+///
+/// Gated by `CRATONVM_DEOPT_REAL` at the sink; the pre-existing
+/// `CRATONVM_IR_DEOPT_RESUME` int-only path (`resume_from_ir_deopt`) runs first
+/// and is left intact.
+fn resume_real_ir_deopt(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Option<CachedCallResult> {
+    let pin_base = thread.native_pin_roots.len();
+    match build_deopt_frame_inner(shared, thread, cached, rframe, false) {
+        Some(frame) => {
+            // Push FIRST, pins STILL installed: during the push the oops are
+            // rooted by the pins, and once pushed also by the frame. Only THEN
+            // release the pins — the frame roots them from here on.
+            push_frame_and_fire_entry(thread, frame);
+            thread.native_pin_roots.truncate(pin_base);
+            Some(CachedCallResult::FramePushed)
+        }
+        None => {
+            // Out-of-scope / unmappable: release any partial pins, fall back to
+            // the whole-method re-run.
+            thread.native_pin_roots.truncate(pin_base);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod deopt_step3_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::ThreadId;
+    use cratonvm_jit::deopt::{FrameValue, ReconstructedFrame};
+    use std::sync::Arc;
+
+    fn minimal_cached() -> Arc<CachedBytecodeMethod> {
+        Arc::new(CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(0),
+            class_name: Arc::from("T"),
+            method_name: Arc::from("m"),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(&[0xb1u8][..]), // return
+            exception_table: Arc::from(Vec::new().into_boxed_slice()),
+            max_stack: 8,
+            max_locals: 4,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+        })
+    }
+
+    fn rframe(locals: Vec<FrameValue>, stack: Vec<FrameValue>, bci: u32) -> ReconstructedFrame {
+        ReconstructedFrame {
+            method_key: "T.m".to_string(),
+            bci,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        }
+    }
+
+    /// Pure mapper: Int/Undefined/Object map; cat-2 `Unsupported` + virtual bail.
+    #[test]
+    fn maps_int_and_object_refuses_cat2_and_virtual() {
+        let got = ir_deopt_frame_values_with_objects(&[
+            FrameValue::Int(42),
+            FrameValue::Undefined,
+            FrameValue::Object(0x1000),
+            FrameValue::Object(0),
+        ]);
+        assert_eq!(
+            got,
+            Some(vec![
+                Value::Int(42),
+                Value::Int(0),
+                Value::Object(Some(unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) })),
+                Value::Object(None),
+            ])
+        );
+        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::Unsupported]).is_none());
+        assert!(ir_deopt_frame_values_with_objects(&[FrameValue::VirtualObjectRef(0)]).is_none());
+    }
+
+    /// Build a frame with an Int local, a real Object local, and an Int on the
+    /// operand stack; assert the built frame's locals/stack/pc.
+    #[test]
+    fn builds_int_and_object_frame() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(
+            vec![FrameValue::Int(42), FrameValue::Object(addr)],
+            vec![FrameValue::Int(7)],
+            5,
+        );
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, false)
+            .expect("clean pilot must build");
+        assert_eq!(frame.pc, 5);
+        assert_eq!(frame.get_local(0), Value::Int(42));
+        assert!(matches!(frame.get_local(1), Value::Object(Some(_))));
+        assert_eq!(frame.stack.len(), 1);
+        assert_eq!(frame.stack.peek_at(0), Value::Int(7));
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
+
+    /// An unmappable (cat-2 `Unsupported`) slot bails to `None` (re-run) and
+    /// leaks no pins / pushes no frame.
+    #[test]
+    fn refuses_unmappable_without_leaking_pins() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let rf = rframe(vec![FrameValue::Unsupported], vec![], 0);
+        assert!(resume_real_ir_deopt(&shared, &mut thread, &cached, &rf).is_none());
+        assert_eq!(thread.native_pin_roots.len(), 0);
+        assert_eq!(thread.frames.len(), 0);
+    }
+
+    /// Step-4 GC-rooting HANDOFF — the load-bearing invariant: after
+    /// `resume_real_ir_deopt` pushes the frame and releases the temporary pins,
+    /// a forced GC must STILL find the reconstructed oop — via the PUSHED FRAME
+    /// (its locals are the root now), not the released pins. A handoff mistake
+    /// here would be a production UAF under the gate.
+    #[test]
+    fn resumed_frame_roots_oops_after_pin_release() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(vec![FrameValue::Object(addr)], vec![], 3);
+
+        let pin_base = thread.native_pin_roots.len();
+        let r = resume_real_ir_deopt(&shared, &mut thread, &cached, &rf)
+            .expect("clean pilot must resume");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        // Pins released after the push; the pushed frame is the sole root now.
+        assert_eq!(thread.native_pin_roots.len(), pin_base);
+        assert_eq!(thread.frames.len(), 1);
+
+        // Force a GC: the oop must survive via the pushed frame (and be forwarded
+        // in place under a moving collector).
+        maybe_gc_forced_pub(&shared, &mut thread);
+
+        let frame = thread.frames.last().expect("resumed frame is on the stack");
+        assert_eq!(frame.pc, 3);
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must survive GC via the pushed frame, got {other:?}"),
+        }
+    }
+
+    /// The reconstructed Object survives a forced GC during the build (rooted via
+    /// `native_pin_roots`); the built frame holds the live (forwarded) ref.
+    #[test]
+    fn object_survives_forced_gc_during_build() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+
+        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let addr = obj.as_ptr() as usize as u64;
+        let rf = rframe(vec![FrameValue::Object(addr)], vec![], 0);
+
+        let pin_base = thread.native_pin_roots.len();
+        let frame = build_deopt_frame_inner(&shared, &mut thread, &cached, &rf, /* stress */ true)
+            .expect("must build under a forced GC");
+        match frame.get_local(0) {
+            Value::Object(Some(o)) => {
+                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+            }
+            other => panic!("local 0 must be a live object, got {other:?}"),
+        }
+        drop(frame);
+        thread.native_pin_roots.truncate(pin_base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -16342,7 +17046,13 @@ fn try_osr(
             {
                 if let Some((entry, needs_ctx)) =
                     // Eager direct-call callee compile — optimized (C2) tier.
-                    try_jit_compile_callee(shared, &callee_class, &callee_method, &callee_desc, true)
+                    try_jit_compile_callee(
+                        shared,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                        true,
+                    )
                 {
                     direct_calls2.push((
                         ipc,
@@ -16837,6 +17547,85 @@ fn resolve_jit_new_site(
     Some((target_id.as_u32(), num_fields, has_prim_init, has_finalizer))
 }
 
+/// Whether constructing `class_id` via its no-arg constructor is *elidable* for
+/// JIT escape-analysis scalar replacement — i.e. `new C(); dup; invokespecial
+/// C.<init>()V` may be replaced by a zero-initialised scalar object with no call.
+///
+/// SOUND only for the empty default constructor of a direct `java/lang/Object`
+/// subclass: `C.<init>()V`'s body is exactly `aload_0; invokespecial
+/// java/lang/Object.<init>()V; return` (bytes `2a b7 hi lo b1`). That guarantees
+/// the constructor (a) writes NO field (the object stays zero-initialised, so the
+/// scalar slots' zero defaults are correct), (b) does NOT escape its receiver,
+/// and (c) has NO other side effect (the only call is the empty `Object.<init>`).
+///
+/// This is deliberately narrower than `classify_init_complexity`'s `Trivial`,
+/// which admits arbitrary calls (e.g. `register(this)`) that escape the receiver
+/// — unsound to elide. (A future refinement may recurse the super chain to admit
+/// non-`Object` supers whose `<init>` is itself elidable.)
+fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: ClassId) -> bool {
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    let Some(init) = class.find_method("<init>", "()V") else {
+        return false;
+    };
+    let Some(code) = init.code() else {
+        return false;
+    };
+    let bc = &code.code;
+    // aload_0 (0x2a); invokespecial (0xb7) hi lo; return (0xb1) — exactly 5 bytes.
+    if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {
+        return false;
+    }
+    let mref_idx = ((bc[2] as u16) << 8) | bc[3] as u16;
+    let cp = &class.constant_pool;
+    let nat_idx = match cp.get(mref_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) => {
+            if cp.get_class_name(*class_index) != Some("java/lang/Object") {
+                return false;
+            }
+            *name_and_type_index
+        }
+        _ => return false,
+    };
+    matches!(cp.get_name_and_type(nat_idx), Some(("<init>", "()V")))
+}
+
+/// Shared body for the JIT `cp_elidable_init_resolver` closures: given the
+/// holder class `holder_cid` and an `invokespecial` constant-pool index, return
+/// `true` iff it targets a no-arg `<init>()V` whose construction is elidable for
+/// scalar replacement (see [`is_elidable_construction`]).
+fn resolve_jit_elidable_init(
+    cm: &crate::classloading::ClassManager,
+    holder_cid: ClassId,
+    cp_idx: u16,
+) -> bool {
+    let Some(holder) = cm.get_class(holder_cid) else {
+        return false;
+    };
+    let cp = &holder.constant_pool;
+    let (class_index, nat_index) = match cp.get(cp_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) => (*class_index, *name_and_type_index),
+        _ => return false,
+    };
+    if !matches!(cp.get_name_and_type(nat_index), Some(("<init>", "()V"))) {
+        return false;
+    }
+    let Some(target_name) = cp.get_class_name(class_index) else {
+        return false;
+    };
+    let Some(target_id) = cm.find_class_by_name(target_name) else {
+        return false;
+    };
+    is_elidable_construction(cm, target_id)
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -17118,6 +17907,16 @@ fn try_jit_upgrade_with_gate(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
+    // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
+    // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
+    // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
+    // is the opt-out safety net — when off, `None` is passed and the IR builder
+    // bails on `new`, restoring the single-pass backend for allocation methods.
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let elidable_init_resolver = |cp_idx: u16| -> bool {
+        let cm = shared.class_manager.read();
+        resolve_jit_elidable_init(&cm, class_id, cp_idx)
+    };
     // invoke class-id resolver: maps an invoke* CP index to the class id of
     // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
     // call-site intrinsics for the receiver class-id guard.
@@ -17391,6 +18190,14 @@ fn try_jit_upgrade_with_gate(
                 let cm = shared.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
+            // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+            // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+            let c_scalar_new_on =
+                std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+            let c_elidable_init_resolver = |cp_idx: u16| -> bool {
+                let cm = shared.class_manager.read();
+                resolve_jit_elidable_init(&cm, callee_cid, cp_idx)
+            };
             // invoke class-id resolver for the callee's constant pool — maps
             // an invoke* CP index to its declared class id, for the CRC32/
             // CRC32C `update` receiver class-id guard.
@@ -17465,9 +18272,28 @@ fn try_jit_upgrade_with_gate(
                 // loaded yet.
                 Some(&c_string_layout_resolver),
                 Some(&c_invoke_class_id_resolver),
+                if c_scalar_new_on {
+                    Some(&c_elidable_init_resolver)
+                } else {
+                    None
+                },
                 // Early-compile path is the optimized (C2-equivalent) tier — the
                 // tiered C1 routing only flows through the background worker.
                 true,
+                // Gap B: int-only invokestatic → Op::Call. Now default-ON
+                // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
+                // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
+                // opt-out — restores single-pass dispatch for invokestatic.
+                std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+                // inc 24/29: invokespecial → Op::Call. Now default-ON;
+                // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+                // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+                std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+                // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
+                // dispatch via the helper), gated default-OFF (its own soak).
+                // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
+                std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17564,8 +18390,23 @@ fn try_jit_upgrade_with_gate(
         // (bug-03). Mirrors the already-wired `try_jit_compile_callee_slow` path.
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        if scalar_new_on {
+            Some(&elidable_init_resolver)
+        } else {
+            None
+        },
         // Inline mutator compile path is the optimized (C2-equivalent) tier.
         true,
+        // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
+        // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
+        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+        // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
+        // the helper), gated default-OFF (its own soak). `=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18034,6 +18875,13 @@ fn try_jit_compile_callee_slow(
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
+    // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+    // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+    let scalar_new_on = std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0");
+    let elidable_init_resolver = |cp_idx: u16| -> bool {
+        let cm = shared.class_manager.read();
+        resolve_jit_elidable_init(&cm, cid, cp_idx)
+    };
     // invoke class-id resolver — maps an invoke* CP index to its declared
     // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.
     let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
@@ -18116,10 +18964,25 @@ fn try_jit_compile_callee_slow(
         Some(&inline_resolver),
         Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
+        if scalar_new_on {
+            Some(&elidable_init_resolver)
+        } else {
+            None
+        },
         // wire-tiered-manager Step 3: `optimize` selects the backend per call.
         // Inline JIT-dispatch callers pass `true` (optimized C2); the background
         // tiered worker passes the C1/C2 value derived from the task's tier.
         optimize,
+        // Gap B: int-only invokestatic → Op::Call. Now default-ON (inc 23);
+        // `CRATONVM_JIT_IR_CALL=0` is the opt-out (single-pass dispatch).
+        std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"),
+        // inc 24/29: invokespecial → Op::Call. Now default-ON; `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"),
+        // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+        std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"),
+        // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic dispatch via
+        // the helper), gated default-OFF (its own soak). `=1` opts in.
+        std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some(),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -19071,6 +19934,19 @@ fn execute_jit_call(
                     return Ok(r);
                 }
             }
+            // real-frame-deopt Step 4: under CRATONVM_DEOPT_REAL, RESUME the
+            // Object-bearing deopt at the trapping bci — build the interpreter
+            // frame (GC-rooting the oops across the pool refill AND the push
+            // handoff), push it, and resume there instead of re-running the whole
+            // method from entry. On an out-of-scope / unmappable frame this
+            // returns None and falls through to the re-run below. Gate-OFF
+            // (default): skipped → byte-identical; the int-only
+            // CRATONVM_IR_DEOPT_RESUME path above is untouched.
+            if cratonvm_jit::deopt_real_enabled() {
+                if let Some(r) = resume_real_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(r);
+                }
+            }
             for i in 0..np {
                 let (cv, is_long) = saved_args[i];
                 if is_long {
@@ -19381,16 +20257,29 @@ fn execute_jit_call_decoded(
         }
     }
 
-    // real-frame-deopt: IR-path deopt detection (see the matching block at the
-    // fast sink). `ir_deopt_entry` stashes `LAST_DEOPT` and returns `i64::MIN`
-    // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
-    // (clearing it) and re-run the method from entry. Precise mid-bci resume is
-    // wired at the fast sink; this slow path falls back to re-run, which is
-    // correct for the side-effect-free methods that deopt today. Gated on
-    // `result == i64::MIN` (a deopt always returns it) so the common path skips
-    // the thread-local access while never missing an IR deopt.
-    if result == i64::MIN && cratonvm_jit::deopt::take_last_deopt().is_some() {
-        return Ok(None);
+    // real-frame-deopt: IR-path deopt detection (mirrors the block in
+    // `execute_jit_call`). `ir_deopt_entry` stashes `LAST_DEOPT` and returns
+    // `i64::MIN` without setting `JIT_DEOPT_PENDING`, so consume the stashed
+    // frame here too (clearing it). When precise resume is enabled and the frame
+    // is mappable, resume the interpreter at the trapping bci (`Ok(Some(..))`);
+    // otherwise re-run the method from entry (`Ok(None)`), which the caller
+    // does from `args_slice` (the operand-stack args were popped by
+    // `execute_invokevirtual_cached` before this call). This is the path the
+    // instance-method invocation tier-up takes, so wiring resume here is what
+    // makes an instance method's ref receiver/locals precise-resume (the static
+    // MIC path goes through `execute_jit_call`). `resume_from_ir_deopt` bails
+    // (returns `None`) side-effect-free before any frame mutation, so falling
+    // through to re-run after a `None` is safe. Gated on `result == i64::MIN`
+    // (a deopt always returns it) so the common path skips the thread-local.
+    if result == i64::MIN {
+        if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            if ir_deopt_resume_enabled() {
+                if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(Some(r));
+                }
+            }
+            return Ok(None);
+        }
     }
 
     // Deopt sentinel → interpreter fallback. The operand stack was never
@@ -21645,6 +22534,51 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // real-frame-deopt — IR-path deopt frame-value mapping (type source)
+    // -----------------------------------------------------------------------
+
+    /// `ir_deopt_frame_values` maps the producer's type-source variants to the
+    /// right interpreter `Value`s: a cat-1 `Int` stays an `Int`, an object-ref
+    /// slot (`StackSlotRef` already resolved in-stub to a raw heap word) becomes
+    /// `Value::Object` (null word → `None`, non-null word → the pointer
+    /// verbatim — NOT a truncated `Int`), and `Undefined` is a zero slot. Any
+    /// not-yet-reconstructable variant (`Unsupported` cat-2, `Float`-in-slot,
+    /// or a `VirtualObject`) returns `None`, forcing the safe re-run path.
+    #[test]
+    fn ir_deopt_frame_values_maps_object_and_int() {
+        use cratonvm_jit::deopt::FrameValue;
+        // 8-byte aligned, never dereferenced — only wrapped in an `ObjectRef`.
+        let raw: u64 = 0x1000;
+        let mapped = ir_deopt_frame_values(&[
+            FrameValue::Object(0),
+            FrameValue::Object(raw),
+            FrameValue::Int(42),
+            FrameValue::Undefined,
+        ])
+        .expect("Int/Object/Undefined are all mappable");
+        assert_eq!(mapped[0], Value::Object(None), "null word → null ref");
+        match mapped[1] {
+            Value::Object(Some(r)) => assert_eq!(
+                r.as_ptr() as u64, raw,
+                "non-null ref slot must carry the heap pointer verbatim"
+            ),
+            other => panic!("expected a non-null object reference, got {other:?}"),
+        }
+        assert_eq!(mapped[2], Value::Int(42));
+        assert_eq!(mapped[3], Value::Int(0), "Undefined → zero slot");
+
+        // Not-yet-reconstructable variants force the safe re-run (None).
+        assert!(
+            ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
+            "a category-2 (long/double) slot must re-run, not resume"
+        );
+        assert!(
+            ir_deopt_frame_values(&[FrameValue::Float(0)]).is_none(),
+            "an FP-in-slot must re-run until XMM resolution lands"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // H6 — native-stack-aware re-entrant recursion ceiling
     // -----------------------------------------------------------------------
 
@@ -22832,6 +23766,75 @@ mod tests {
         let unwound_pc = post_invoke_pc.saturating_sub(1);
         assert!(unwound_pc >= entry.start_pc as usize);
         assert!(unwound_pc < entry.end_pc as usize);
+    }
+
+    // Regression guard for the JIT-unknown-PC unwind path
+    // (`find_exception_handler_pc_unknown` / `route_jit_exception_through_method`):
+    // when the throw-site PC cannot be recovered, a catch-all / `finally`
+    // entry must still be honoured *iff* its protected region spans the whole
+    // method (`start_pc == 0 && end_pc >= code_len`), so `finally` /
+    // synchronized-monitor-exit cleanup is not silently skipped. A narrower
+    // catch-all is rejected (it could swallow an out-of-region exception).
+    // This exercises the exact predicate both functions use; `code_len` is the
+    // *unpadded* bytecode length (`code.len() - 2`).
+    #[test]
+    fn pc_unknown_catch_all_honored_only_for_whole_method() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // Padded bytecode (real body is 40 bytes; +2 trailing padding bytes).
+        let padded_code_len = 42usize;
+        let code_len = padded_code_len.saturating_sub(2);
+        assert_eq!(code_len, 40);
+
+        // The predicate factored out of the unwind loop.
+        let honored = |e: &ExceptionTableEntry| {
+            e.catch_type == 0 && e.start_pc == 0 && e.end_pc as usize >= code_len
+        };
+
+        // Whole-method finally: start at 0, end at the code length → honored.
+        let whole = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(honored(&whole), "method-wide finally must run");
+
+        // `end_pc` past the body (e.g. equal to padded len) still covers it.
+        let whole_over = ExceptionTableEntry {
+            end_pc: 41,
+            ..whole
+        };
+        assert!(honored(&whole_over));
+
+        // Narrow catch-all that does NOT start at 0 → skipped (could catch an
+        // out-of-region throw when the PC is unknown).
+        let narrow_start = ExceptionTableEntry {
+            start_pc: 4,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_start));
+
+        // Catch-all that ends before the method end → skipped.
+        let narrow_end = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 20,
+            handler_pc: 20,
+            catch_type: 0,
+        };
+        assert!(!honored(&narrow_end));
+
+        // A *typed* handler (catch_type != 0) is never honored by this
+        // catch-all predicate; it matches by exception class elsewhere.
+        let typed = ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 40,
+            handler_pc: 40,
+            catch_type: 7,
+        };
+        assert!(!honored(&typed));
     }
 
     // -----------------------------------------------------------------------

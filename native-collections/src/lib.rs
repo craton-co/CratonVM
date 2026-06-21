@@ -52,49 +52,61 @@ use identity_hash::seed as ih_seed;
 // current raw pointer:
 //
 //   * pointer matches an existing slot           -> reuse that slot's gen
-//     (steady state: same object, same address);
+//     (steady state: same object, same address). In production a GC-relocated
+//     object is resolved here too: the post-GC remap
+//     (`gc_update_collection_overlay_refs`) advances every relocated slot's
+//     `last_ptr` to the new address before the object is next observed.
 //   * the hash bucket holds exactly one slot, the pointer differs, AND the
-//     stored class-id marker still matches         -> that lone object was
-//     relocated by a moving GC (the class word moves with the header, so the
-//     class id is invariant across relocation); rebind the slot to the new
-//     pointer and reuse its gen (preserves the GC-move-stability contract the
-//     overlays rely on);
-//   * the bucket holds several slots and none match, OR the lone slot's
-//     class-id marker DIFFERS from the incoming object -> either a genuine
-//     32-bit hash collision among simultaneously-live objects, or a brand-new
-//     object that recycled a dead object's identity hash (a different class
-//     proves it is NOT the original); allocate a fresh generation so the
-//     newcomer gets its own entry instead of inheriting the dead/colliding
-//     object's slot and stale side-table state (fix item 1).
+//     stored class-id marker still matches         -> treat as a relocation of
+//     that lone object (the class word moves with the header, so the class id is
+//     invariant across a move); rebind the slot to the new pointer and reuse its
+//     gen, preserving the GC-move-stability contract the overlays rely on. (A
+//     same-class identity *recycle* also lands here; it is contained by the
+//     comprehensive GC prune — see below — which removes the dead object's slot
+//     and ALL its overlay entries, so the recycler hits the empty-bucket case.)
+//   * the lone slot's class-id marker DIFFERS from the incoming object -> a
+//     different-class object recycled a dead object's 32-bit identity hash. It
+//     must NOT inherit the slot: re-key the slot to a fresh generation and clear
+//     the dead object's stale overlay entries so the newcomer can never alias
+//     the freed collection's backing store.
+//   * the bucket holds several slots and none match -> a genuine 32-bit hash
+//     collision among simultaneously-live objects; allocate a fresh generation
+//     so the newcomer gets its own entry instead of aliasing an existing one.
 //
-// Residual: a new object of the SAME class that recycles a dead object's
-// identity hash is still indistinguishable here by hash+class alone and would
-// inherit the lone slot. That window is closed by the GC-walk pruning (fix
-// item 2), which drops a dead object's registry slot when its overlay backing
-// is reclaimed, so the recycled identity no longer finds a stale lone slot to
-// inherit.
+// Generations are handed out monotonically (one past the max generation present
+// in the bucket), never as `slots.len()`: once any slot is replaced (a
+// different-class re-key) or removed (GC prune), `slots.len()` could re-issue a
+// generation a still-live slot already owns and silently alias two distinct
+// objects onto one key. The GC-walk prune (fix item 2) removes dead slots to
+// bound growth AND drops every overlay table keyed by the dead key (LinkedList,
+// LinkedHashMap/Set, TreeMap array+fast, TreeSet, CSLM comparator), so a later
+// same-hash recycle finds no stale state to inherit.
 //
-// The single-slot relocation fast path is what the `gc_relocation_harness`
-// integration test exercises (its mock hands out unique sequential hashes, so
-// every object is a one-slot bucket): the key stays stable across the simulated
-// move. The multi-slot path only fires under a true 32-bit collision, which is
-// astronomically rarer than — and never reintroduces — the aliasing corruption
+// The single-slot path is what the `gc_relocation_harness` integration test
+// exercises: its mock hands out unique sequential hashes (every object is a
+// one-slot bucket) and carries the class word across a simulated move, so each
+// moved object re-resolves via the class-id-matched rebind and its overlay key
+// stays stable. The multi-slot path only fires under a true 32-bit collision,
+// astronomically rarer than — and never reintroducing — the aliasing corruption
 // this fix removes.
 struct ObjKeyEntry {
-    /// The object's most-recently-observed raw pointer. Updated on a
-    /// single-slot relocation so a moved object re-resolves to its slot.
+    /// The object's most-recently-observed raw pointer, used to resolve the slot
+    /// by exact-pointer match. Advanced to the new address by the post-GC remap
+    /// when the object relocates, and (on the lone-slot relocation fast path)
+    /// when a same-class object re-presents under the recorded identity hash.
     last_ptr: usize,
     /// Per-(hash, object) disambiguator packed into the key's low 32 bits.
+    /// Handed out monotonically (see `next_generation`) so a replaced or pruned
+    /// slot never causes a later object to be issued a generation a live slot
+    /// still owns — the recycled-generation aliasing this fix removes.
     generation: u32,
-    /// GC-invariant identity marker (fix item 1): the object's class id. A
-    /// moving GC copies the class word with the object header, so a genuine
-    /// relocation keeps the SAME class id; a *recycled* 32-bit identity hash
-    /// handed to a brand-new object of a DIFFERENT class is therefore
-    /// distinguishable. The single-slot "relocation" fast path below only
-    /// rebinds when this marker still matches — otherwise it would silently
-    /// hand the newcomer the dead object's overlay slot (and its stale
-    /// side-table state). Stored as the raw `ClassId` numeric value so the
-    /// registry stays a plain `Send` struct.
+    /// GC-invariant identity marker: the object's class id. A moving GC copies
+    /// the class word with the header, so a genuine relocation keeps the SAME
+    /// class id; the lone-slot relocation fast path rebinds only on a class-id
+    /// match, so a brand-new object of a DIFFERENT class that recycled the dead
+    /// object's 32-bit identity hash is forced onto a fresh slot instead of
+    /// inheriting the dead object's overlay state. Stored as the raw `ClassId`
+    /// numeric value so the registry stays a plain `Send` struct.
     class_id: u32,
 }
 
@@ -132,6 +144,70 @@ fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
     &obj_key_shards()[((mixed >> 58) as usize) & (OBJ_KEY_SHARDS - 1)]
 }
 
+/// Drop every overlay / side-table entry keyed by the packed `widened_obj_key`
+/// `key`, leaving no state a later object could read through that key.
+///
+/// Used both by the GC liveness prune (for keys of reclaimed collections) and
+/// by `widened_obj_key`'s recycled-identity path: when a freshly allocated
+/// object reuses a dead object's identity hash and would otherwise inherit the
+/// dead object's overlay slot, the stale entries under the OLD packed key are
+/// cleared first so the newcomer can never alias onto them. The full table set
+/// here mirrors every site that keys an overlay by `widened_obj_key` (LinkedList,
+/// LinkedHashMap/Set, TreeMap array+fast, TreeSet, CSLM comparator) — broader
+/// than the historical prune block, which omitted the TreeMap/TreeSet tables.
+/// Locks are poison-recovered (`into_inner`) so a panic elsewhere can never
+/// leave stale state stranded and re-aliasable.
+fn clear_overlay_entries_for_key(key: usize) {
+    ll_overlay()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    lhm_overlay()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    lhm_heap_backed()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    tm_array_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    tm_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    ts_array_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    cslm_comparator_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    // `lhm_ptr_cache` maps raw pointer -> packed key; drop any entry pointing at
+    // the cleared key so a stale pointer can't resolve back to it.
+    lhm_ptr_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_ptr, packed| *packed != key);
+}
+
+/// Next never-recycled generation for a hash bucket: one past the maximum
+/// generation currently present. Unlike `slots.len()`, this does not hand out a
+/// value that a still-live (or just-removed) slot already owns once any slot has
+/// been replaced or pruned from the bucket — which would silently alias two
+/// distinct objects onto the same packed key. The `u32` space (4 billion
+/// generations *per identity hash*) cannot realistically be exhausted.
+fn next_generation(slots: &[ObjKeyEntry]) -> u32 {
+    slots
+        .iter()
+        .map(|s| s.generation)
+        .max()
+        .map_or(0, |m| m.wrapping_add(1))
+}
+
 /// GC-stable, collision-resistant side-table key. Replaces the former
 /// `identity_hash::obj_key` truncation at every overlay key site. Returns a
 /// full-width `usize` packing the 32-bit identity hash with a per-object
@@ -146,35 +222,54 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let mut reg = obj_key_shard_for(hash).lock().unwrap();
     let slots = reg.entry(hash).or_default();
 
-    // 1. Exact pointer match: same object at the same address.
+    // 1. Exact pointer match: same object at the same address (steady state). In
+    //    production a GC-relocated object is resolved here too — the post-GC
+    //    `gc_update_collection_overlay_refs` pass advances every relocated slot's
+    //    `last_ptr` to the new address before the object is next observed.
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
         return pack_obj_key(hash, slot.generation);
     }
 
-    // 2. Lone occupant of this hash bucket whose address changed. This is
-    //    AMBIGUOUS: either (a) a moving GC relocated the original object, or
-    //    (b) the original object died and a brand-new object was handed the
-    //    same recycled 32-bit identity hash. Case (b) must NOT inherit the
-    //    dead object's slot (fix item 1) — that would alias a new colliding
-    //    object onto a freed object's overlay/side-table state.
-    //
-    //    Disambiguate with the GC-invariant class-id marker: a relocation
-    //    preserves the class id (it moves with the header), so a class-id
-    //    match means it is safe to rebind the slot to the new pointer and
-    //    keep the generation (preserving the move-stability contract the
-    //    overlays rely on). A class-id MISMATCH proves a different object
-    //    recycled the hash → fall through to allocate it a fresh generation
-    //    instead of inheriting the slot.
-    if slots.len() == 1 && slots[0].class_id == class_id {
+    // 2. Lone occupant of this hash bucket whose recorded pointer differs.
+    //    AMBIGUOUS: either (a) a moving GC relocated the original object, or (b)
+    //    the original died and a brand-new object was handed its recycled 32-bit
+    //    identity hash. The class-id marker — GC-invariant, since the class word
+    //    moves with the header — disambiguates:
+    //      * MATCH: a relocation preserves the class id, so rebind the lone slot
+    //        to the new pointer and reuse its generation (the move-stability
+    //        contract the overlays rely on). A same-class *recycle* also matches
+    //        here; the recycle is contained by the comprehensive GC prune, which
+    //        drops the dead object's slot AND all its overlay entries, so the
+    //        recycler finds an empty bucket (case 3) rather than stale state.
+    //      * MISMATCH: a different-class object recycled the hash — it must NOT
+    //        inherit the dead object's slot. Re-key the slot to a fresh
+    //        generation and clear the dead object's stale overlay entries so the
+    //        newcomer starts clean and cannot alias the freed collection's state.
+    if slots.len() == 1 {
+        if slots[0].class_id == class_id {
+            slots[0].last_ptr = ptr;
+            return pack_obj_key(hash, slots[0].generation);
+        }
+        // Different-class recycle: re-key + clear the stale overlay state.
+        let stale_key = pack_obj_key(hash, slots[0].generation);
+        let generation = next_generation(slots);
         slots[0].last_ptr = ptr;
-        return pack_obj_key(hash, slots[0].generation);
+        slots[0].generation = generation;
+        slots[0].class_id = class_id;
+        // Release the shard lock before touching the overlay tables: overlay
+        // read/write paths take this shard lock (via `widened_obj_key`), never
+        // the reverse, so dropping it first keeps the lock order one-directional
+        // and cannot deadlock against a concurrent side-table op.
+        drop(reg);
+        clear_overlay_entries_for_key(stale_key);
+        return pack_obj_key(hash, generation);
     }
 
-    // 3. Genuine 32-bit collision among live objects, the first object seen
-    //    for this hash, or a recycled-identity newcomer that failed the
-    //    class-id check above: allocate a fresh generation so the newcomer
-    //    never aliases an existing entry.
-    let generation = slots.len() as u32;
+    // 3. Genuine 32-bit collision among several simultaneously-live objects, or
+    //    the first object seen for this hash: allocate a fresh, never-recycled
+    //    generation (NOT `slots.len()`, which could re-issue a generation a live
+    //    or just-pruned slot still owns) so the newcomer never aliases an entry.
+    let generation = next_generation(slots);
     slots.push(ObjKeyEntry {
         last_ptr: ptr,
         generation,
@@ -427,6 +522,45 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
 /// Allocate a reference array (Object[]) of the given length.
 fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
+}
+
+/// GC-SAFETY helper: pin every object-typed `Value` in `vals` so a subsequent
+/// allocating call cannot relocate/collect them while they sit in a bare Rust
+/// `Vec`. Returns the base handle for [`NativeContext::unpin_native_roots`]
+/// (`usize::MAX` if nothing was pinned) and a per-index handle vector
+/// (`usize::MAX` for non-object slots) for [`read_value_slice`]. Pair every call
+/// with `unpin_native_roots(base)` once the refs are safely stored.
+fn pin_value_slice(ctx: &mut dyn NativeContext, vals: &[Value]) -> (usize, Vec<usize>) {
+    let mut base = usize::MAX;
+    let handles = vals
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => {
+                let h = ctx.pin_native_root(*o);
+                if base == usize::MAX {
+                    base = h;
+                }
+                h
+            }
+            _ => usize::MAX,
+        })
+        .collect();
+    (base, handles)
+}
+
+/// Read back the (post-GC, forwarded) refs for a slice pinned with
+/// [`pin_value_slice`]. Non-object slots are returned verbatim.
+fn read_value_slice(ctx: &dyn NativeContext, handles: &[usize], orig: &[Value]) -> Vec<Value> {
+    handles
+        .iter()
+        .zip(orig)
+        .map(|(&h, v)| match v {
+            Value::Object(Some(o)) if h != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(h, *o)))
+            }
+            _ => *v,
+        })
+        .collect()
 }
 
 /// Allocate a hash-map bucket table of `cap` entries, **capping the eager
@@ -1161,7 +1295,16 @@ fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
 }
 
 /// Ensure the backing array has room for at least `min_cap` elements.
-fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) -> ObjectRef {
+/// Maximum backing-array length. Mirrors HotSpot's `ArrayList.MAX_ARRAY_SIZE`
+/// guard (a value safely below `Integer.MAX_VALUE`): a required capacity beyond
+/// this is unsatisfiable and yields `OutOfMemoryError`.
+const AL_MAX_CAPACITY: usize = 1 << 30; // ~1 billion elements
+
+fn al_ensure_capacity(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    min_cap: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     let (data, _size) = al_state(ctx, this);
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
 
@@ -1169,18 +1312,34 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
         // `old_cap == 0` implies the backing array is None (e.g. a freshly
         // constructed list asked to ensure capacity 0). Unwrapping would
         // panic, so allocate an empty array as the None-safe fallback.
-        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
+        return Ok(data.unwrap_or_else(|| alloc_ref_array(ctx, 0)));
+    }
+
+    // A required capacity past the max array length is unsatisfiable. HotSpot's
+    // `ArrayList.grow`/`newCapacity` throws `OutOfMemoryError` in this case; the
+    // previous code instead returned the OLD (undersized) buffer, after which the
+    // caller wrote at index `size >= old_cap` (out of bounds of the returned
+    // array — a dropped element) and still bumped `size`, leaving `size` larger
+    // than the backing array so a later `get` read uninitialized/stale storage.
+    // Throw the catchable OOM instead (same idiom as `native_al_init_capacity`).
+    if min_cap > AL_MAX_CAPACITY {
+        return Err(RuntimeError::OutOfMemoryError {
+            message: "Required array length too large".to_string(),
+        }
+        .into());
     }
 
     // Grow: max(old_cap * 1.5, min_cap) — matches Java's ArrayList strategy.
     // Use >> 1 for integer 1.5x, with minimum growth of 1 (handles old_cap == 0).
     let growth = std::cmp::max(old_cap >> 1, 1);
-    let new_cap = std::cmp::max(old_cap + growth, min_cap);
-    // Cap at a sane maximum to prevent OOM from absurd allocations.
-    const AL_MAX_CAPACITY: usize = 1 << 30; // ~1 billion elements
-    if new_cap > AL_MAX_CAPACITY {
-        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
-    }
+    // The 1.5x preferred growth may overshoot the max even though `min_cap`
+    // itself fits (large `old_cap`). Mirror HotSpot's `hugeLength`: clamp the
+    // preferred capacity down to the satisfiable `min_cap` rather than throwing
+    // — only an out-of-range *required* capacity (handled above) is an error.
+    let new_cap = std::cmp::min(
+        std::cmp::max(old_cap.saturating_add(growth), min_cap),
+        AL_MAX_CAPACITY,
+    );
     let new_buf = alloc_ref_array(ctx, new_cap);
 
     // Copy old content. Prefer the bulk intrinsic so the VM can use
@@ -1198,7 +1357,7 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
     }
 
     al_set_data(ctx, this, new_buf);
-    new_buf
+    Ok(new_buf)
 }
 
 fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
@@ -1446,7 +1605,7 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
-    let buf = al_ensure_capacity(ctx, this, size + 1);
+    let buf = al_ensure_capacity(ctx, this, size + 1)?;
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
     Ok(Some(Value::Int(1))) // returns true
@@ -1472,7 +1631,7 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         );
     }
     let index = index as usize;
-    let buf = al_ensure_capacity(ctx, this, size + 1);
+    let buf = al_ensure_capacity(ctx, this, size + 1)?;
     // Shift elements right
     for i in (index..size).rev() {
         let val = ctx.get_array_element(buf, i);
@@ -1876,7 +2035,7 @@ fn native_al_ensure_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(c)) => std::cmp::max(*c, 0) as usize,
         _ => return Ok(None),
     };
-    al_ensure_capacity(ctx, this, min_cap);
+    al_ensure_capacity(ctx, this, min_cap)?;
     Ok(None)
 }
 
@@ -1947,7 +2106,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if let (Some(other_data), true) = (other_data, other_size > 0) {
         let (_, my_size) = al_state(ctx, this);
         let my_size = my_size as usize;
-        let buf = al_ensure_capacity(ctx, this, my_size + other_size);
+        let buf = al_ensure_capacity(ctx, this, my_size + other_size)?;
         if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
             for i in 0..other_size {
                 let val = ctx.get_array_element(other_data, i);
@@ -1978,7 +2137,7 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
-    let buf = al_ensure_capacity(ctx, this, my_size + elems.len());
+    let buf = al_ensure_capacity(ctx, this, my_size + elems.len())?;
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(buf, my_size + i, *val);
     }
@@ -8902,9 +9061,19 @@ fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) {
         Some(s) => s,
         None => return,
     };
+    // GC-SAFETY: `drain_spliterator_to_array` drives the source spliterator,
+    // which for a `StackWalker` walk allocates heavily (one `StackFrameInfo` +
+    // `StackTraceElement` + strings per frame) and can trigger a moving GC that
+    // relocates `stream`. Writing the result back through the stale `stream`
+    // reference corrupts the heap (zeroed `ClassId(0)` headers / wild
+    // `Object.toArray` dispatch) — the `ByteArrayMappingTests` SIGSEGV. Pin
+    // `stream` across the drain and read the forwarded reference back.
+    let stream_pin = ctx.pin_native_root(stream);
     let arr = drain_spliterator_to_array(ctx, spl);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
     ctx.set_field(stream, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+    ctx.unpin_native_roots(stream_pin);
 }
 
 /// Create a Stream from a slice of values.
@@ -8924,6 +9093,17 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
 /// mutates `src`'s handlers, and `close()` only clears the per-stream field.
 fn stream_inherit_close_handlers(ctx: &mut dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
     if src == dst {
+        return;
+    }
+    // W1 fix: several ad-hoc synthetic-stream allocations use a 1-field
+    // (elements-only) layout with no close-handler slot. Guard slot-1 access the
+    // same way the LAZY_SPLITERATOR (slot 2) / OP_CHAIN (slot 3) readers already
+    // do — otherwise this intermediate-op propagation OOB-reads slot 1 on every
+    // chained op against such a source, flooding the GC out-of-bounds-field
+    // guard. A short-layout stream simply has no handlers to inherit.
+    if ctx.object_num_fields(src) <= STREAM_FIELD_CLOSE_HANDLERS
+        || ctx.object_num_fields(dst) <= STREAM_FIELD_CLOSE_HANDLERS
+    {
         return;
     }
     if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
@@ -9090,7 +9270,11 @@ fn stream_make_lazy_derived(
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source);
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
-    ctx.set_field(stream, STREAM_FIELD_OP_CHAIN, Value::Object(Some(new_chain)));
+    ctx.set_field(
+        stream,
+        STREAM_FIELD_OP_CHAIN,
+        Value::Object(Some(new_chain)),
+    );
     stream_inherit_close_handlers(ctx, src, stream);
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -9156,8 +9340,7 @@ where
                 }
                 LAZY_OP_FILTER => {
                     if let Some(l) = op.lambda {
-                        let t =
-                            ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
+                        let t = ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
                         if !matches!(t, Some(Value::Int(x)) if x != 0) {
                             continue 'outer;
                         }
@@ -9222,6 +9405,11 @@ fn stream_run_close_handlers(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // W1 fix: 1-field synthetic streams have no close-handler slot — nothing to
+    // run. Guard mirrors the slot-2/slot-3 presence checks elsewhere.
+    if ctx.object_num_fields(this) <= STREAM_FIELD_CLOSE_HANDLERS {
+        return Ok(());
+    }
     if let Value::Object(Some(arr)) = ctx.get_field(this, STREAM_FIELD_CLOSE_HANDLERS) {
         ctx.set_field(this, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
         let len = ctx.array_length(arr);
@@ -9245,6 +9433,14 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
     if !is_synthetic_stream(&cn) {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // W1 fix: a 1-field synthetic stream (e.g. Files.lines's eager array-backed
+    // stream) has no close-handler slot to attach to. Reading/writing slot 1
+    // would index past the receiver; behave as a no-op (return `this`) instead.
+    // CratonVM materialises such streams eagerly, so there is no live resource a
+    // close handler would need to release.
+    if ctx.object_num_fields(this) <= STREAM_FIELD_CLOSE_HANDLERS {
         return Ok(Some(Value::Object(Some(this))));
     }
     let handler = match args.get(1) {
@@ -9297,41 +9493,53 @@ fn stream_elements(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY: `materialize_lazy_stream` (and the `toArray()` fallback below)
+    // allocate / drive an allocating spliterator drain that can relocate
+    // `stream`. Every subsequent use of `stream` here (class lookup, field read,
+    // toArray dispatch) must see the forwarded reference, or we read a zeroed
+    // header and mis-dispatch (`Object.toArray()` / empty stream). Pin it.
+    let stream_pin = ctx.pin_native_root(stream);
     // Lazy streams (from `StreamSupport.stream(realSpliterator, false)`) hold
     // their source spliterator in slot 2 with no element array yet — drain it
     // now so EVERY non-forEach op sees the full element list. (`forEach` handles
     // the lazy case itself, driving the spliterator one element at a time.)
     materialize_lazy_stream(ctx, stream);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     // For our synthetic Stream object, field 0 holds an Object[] of elements.
     // But some streams are real JDK ReferencePipeline instances (returned by
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if is_synthetic_stream(&class_name) {
+    // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
+    let result: Result<Vec<Value>, MethodCallFailed> = if is_synthetic_stream(&class_name) {
         // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
         // ops onto slot 3 while sharing the upstream SOURCE array (slot 0). Apply
         // the chain here so every eager terminal/op sees the fully-transformed
         // elements. Gate-off (default) never has a chain, so this is inert.
         if lazy_streams_enabled() && stream_has_chain(ctx, stream) {
-            return stream_apply_chain_full(ctx, stream);
-        }
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-            let len = ctx.array_length(arr);
-            return Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect());
-        }
-        return Ok(Vec::new());
-    }
-    // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
-    // materialize via the object toArray. (Real PRIMITIVE pipelines don't reach
-    // here — `Arrays.stream(int[])` / `IntStream.of(...)` are intercepted to
-    // produce synthetic primitive streams; see register_essential_natives.)
-    match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[])? {
-        Some(Value::Object(Some(arr))) => {
+            stream_apply_chain_full(ctx, stream)
+        } else if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
             Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+        } else {
+            Ok(Vec::new())
         }
-        _ => Ok(Vec::new()),
-    }
+    } else {
+        // Real JDK object pipeline (e.g. Spring's MergedAnnotations.stream()):
+        // materialize via the object toArray. (Real PRIMITIVE pipelines don't
+        // reach here — `Arrays.stream(int[])` / `IntStream.of(...)` are
+        // intercepted to produce synthetic primitive streams.)
+        match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(arr)))) => {
+                let len = ctx.array_length(arr);
+                Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+            }
+            Ok(_) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    };
+    ctx.unpin_native_roots(stream_pin);
+    result
 }
 
 /// True for CratonVM's synthetic Stream / IntStream / LongStream / DoubleStream
@@ -9498,7 +9706,12 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // `spring.config.name` binding). native-collections registers after
     // native-builtins (last-writer-wins), so this override wins; it materialises
     // via the chain-aware `stream_elements` before iterating.
-    r.register(c, "iterator", "()Ljava/util/Iterator;", native_stream_iterator);
+    r.register(
+        c,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_stream_iterator,
+    );
     r.register(
         "java/util/stream/BaseStream",
         "iterator",
@@ -9517,14 +9730,27 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
         native_stream_to_array_gen,
     );
-    // Same override on ReferencePipeline so real-JDK code that dispatches
-    // virtual on the concrete class also hits us.
-    r.register(
-        "java/util/stream/ReferencePipeline",
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-        native_stream_to_array_gen,
-    );
+    // NOTE: we deliberately do NOT override `toArray(IntFunction)` on the
+    // concrete `java/util/stream/ReferencePipeline` class.
+    //
+    // A *real* JDK `ReferencePipeline`'s no-arg `toArray()` (real bytecode,
+    // `ReferencePipeline.java:658`) is `return toArray(Object[]::new)` — it
+    // delegates to the generator overload. `stream_elements()` materialises a
+    // real (non-synthetic) pipeline by calling that no-arg `toArray()` via
+    // `invoke_virtual`. If we shadow the generator overload with
+    // `native_stream_to_array_gen` (which itself calls `stream_elements`), the
+    // two bounce forever:
+    //   stream_elements → toArray() [real bytecode] → toArray(IntFunction)
+    //     [our native] → stream_elements → toArray() → …  ⇒ StackOverflowError.
+    // This was the open `MergedAnnotations.stream()` / bug-06 fam6 "~2 GB OOM"
+    // and it blocked the entire JUnit-Platform Spring suite (the launcher's
+    // TestPlan build calls `Stream.collect`/`toArray` on real pipelines).
+    //
+    // Synthetic CratonVM streams have class name `java/util/stream/Stream`, so
+    // their `toArray(IntFunction)` is still served by the interface-level
+    // registration above (the Kafka `Utils.enumOptions` typed-array case).
+    // Real pipelines run the real JDK `toArray(IntFunction)` bytecode, which is
+    // exactly what `stream_elements`' real-pipeline branch already relies on.
     // close() — BaseStream.close is abstract; synthetic Stream objects
     // (class `java/util/stream/Stream`) dispatch directly to the abstract
     // interface declaration and throw AbstractMethodError. Register a
@@ -9959,14 +10185,28 @@ fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     let elements = stream_elements_mut(ctx, this)?;
-    let arr = alloc_ref_array(ctx, elements.len());
+    let n = elements.len();
+    // GC-SAFETY: `elements` are bare refs; `alloc_ref_array` / `alloc_synthetic`
+    // below can trigger a moving GC that relocates them and `arr`. Pin every
+    // element (and then `arr`) and read each back before storing, or the
+    // spliterator ends up backed by stale/zeroed slots.
+    let (base, handles) = pin_value_slice(ctx, &elements);
+    let arr = alloc_ref_array(ctx, n);
+    let arr_pin = ctx.pin_native_root(arr);
+    let elements = read_value_slice(ctx, &handles, &elements);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     for (i, v) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
     let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
-    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    // Element pins (if any) precede `arr_pin`; release the whole batch from the
+    // earliest handle.
+    let unpin_from = if base != usize::MAX { base } else { arr_pin };
+    ctx.unpin_native_roots(unpin_from);
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -10023,6 +10263,10 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 .class_name_of_id(ctx.class_id_of_object(src))
                 .unwrap_or_default();
             if !is_synthetic_stream(&cn) {
+                continue;
+            }
+            // W1 fix: skip 1-field sources with no close-handler slot.
+            if ctx.object_num_fields(src) <= STREAM_FIELD_CLOSE_HANDLERS {
                 continue;
             }
             if let Value::Object(Some(arr)) = ctx.get_field(src, STREAM_FIELD_CLOSE_HANDLERS) {
@@ -21479,9 +21723,25 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // `lhm_heap_backed` lock when there is nothing to walk. Behaviour is
     // identical: iterating an empty map invokes `f` zero times.
     //
+    // GC-CORRECTNESS (poison-recover): every overlay table lock below recovers
+    // its guard on a poisoned `Mutex` (`unwrap_or_else(|e| e.into_inner())`)
+    // rather than skipping the table on an `if let Ok(_)`. A `std::sync::Mutex`
+    // poisons when any thread panics while holding it; an `Ok`-only guard would
+    // then SILENTLY SKIP that overlay for the rest of the process. During a
+    // moving GC that means the table's backing-array `ObjectRef`s are neither
+    // rooted (root scan, `for_rooting=true`) NOR remapped (post-GC remap,
+    // `for_rooting=false`) — so the backing array is reclaimed or relocated out
+    // from under the still-live overlay → use-after-free on the next collection
+    // access. A GC must NEVER skip a root: a poisoned table's contents may be
+    // momentarily inconsistent, but a present (even stale) ref the collector can
+    // trace and relocate is categorically safer than a dropped root. `into_inner`
+    // always yields the protected map, so the scan/remap sees every table
+    // unconditionally.
+    //
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
-    if let Ok(mut ll) = ll_overlay().lock() {
+    {
+        let mut ll = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         for inner in ll.values_mut() {
             for v in inner.values_mut() {
                 if let Value::Object(Some(r)) = v {
@@ -21490,15 +21750,17 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
             }
         }
     }
-    if let Ok(mut lhm) = lhm_overlay().lock() {
+    {
+        let mut lhm = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         if lhm.is_empty() {
             // Nothing to root/remap — skip without taking `lhm_heap_backed`.
         } else {
             // Hold the heap-backed set across the loop (lock order: heap_backed is
             // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
-            // sequentially, not nested — so this order can't deadlock).
+            // sequentially, not nested — so this order can't deadlock). Recover the
+            // guard on poison too, for the same reason as the outer tables.
             let hb = if for_rooting {
-                lhm_heap_backed().lock().ok()
+                Some(lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner()))
             } else {
                 None
             };
@@ -21517,7 +21779,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         } // end else (non-empty lhm)
     }
     // TreeMap array mode: backing `data` array + comparator.
-    if let Ok(mut tm) = tm_array_table().lock() {
+    {
+        let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in tm.values_mut() {
             if let Some(r) = &mut st.data {
                 f(r);
@@ -21530,7 +21793,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // TreeMap fast mode: the BTreeMap *is* the authoritative store (the array
     // slot is left empty), so its `Value::Object` values are reachable only
     // through this side-table.
-    if let Ok(mut tmf) = tm_fast_table().lock() {
+    {
+        let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
         for bt in tmf.values_mut() {
             for v in bt.values_mut() {
                 if let Value::Object(Some(r)) = v {
@@ -21540,7 +21804,8 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     // TreeSet array mode: backing `data` array + comparator.
-    if let Ok(mut ts) = ts_array_table().lock() {
+    {
+        let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
         for st in ts.values_mut() {
             if let Some(r) = &mut st.data {
                 f(r);
@@ -21554,7 +21819,10 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // held only in this side-table (the synthetic CSLM has no object slot for
     // it), so it is reachable only here — root + remap it like the TreeMap/
     // TreeSet comparators above so a moving GC keeps it live and repointed.
-    if let Ok(mut cmps) = cslm_comparator_table().lock() {
+    {
+        let mut cmps = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for r in cmps.values_mut() {
             f(r);
         }
@@ -21662,25 +21930,58 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     }
 
     // 2. Drop the dead objects' overlay/cache entries everywhere they are keyed
-    //    by the packed `widened_obj_key`.
-    if let Ok(mut lhm) = lhm_overlay().lock() {
+    //    by the packed `widened_obj_key`. This must cover EVERY table keyed by
+    //    `widened_obj_key`: a leftover entry under a reclaimed object's key is
+    //    both a leak and — once that 32-bit identity hash is recycled by a new
+    //    same-class object — stale state the newcomer could alias onto (the same
+    //    hazard the `widened_obj_key` recycle re-key closes). The TreeMap (array +
+    //    fast) and TreeSet tables were previously omitted here and are now
+    //    included. Locks are poison-recovered (`into_inner`) so a panic elsewhere
+    //    can't leave a table un-pruned and its stale state re-aliasable. Batched
+    //    (lock each table once, loop the keys inside) to keep the per-GC lock
+    //    count independent of the number of dead keys.
+    {
+        let mut lhm = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         for k in &dead_keys {
             lhm.remove(k);
         }
     }
-    if let Ok(mut hb) = lhm_heap_backed().lock() {
+    {
+        let mut hb = lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner());
         for k in &dead_keys {
             hb.remove(k);
         }
     }
-    if let Ok(mut ll) = ll_overlay().lock() {
+    {
+        let mut ll = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
         for k in &dead_keys {
             ll.remove(k);
         }
     }
+    {
+        let mut tm = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
+        for k in &dead_keys {
+            tm.remove(k);
+        }
+    }
+    {
+        let mut tmf = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
+        for k in &dead_keys {
+            tmf.remove(k);
+        }
+    }
+    {
+        let mut ts = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
+        for k in &dead_keys {
+            ts.remove(k);
+        }
+    }
     // CSLM custom-comparator side-table (fix item 5) is keyed by the same
     // packed `widened_obj_key`; drop the dead maps' comparators too.
-    if let Ok(mut cmps) = cslm_comparator_table().lock() {
+    {
+        let mut cmps = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for k in &dead_keys {
             cmps.remove(k);
         }
@@ -21688,7 +21989,8 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
     // `lhm_ptr_cache` is keyed by the *raw* object pointer (not the packed
     // key), mapping pointer -> packed key. Drop every entry whose mapped value
     // is now a dead packed key.
-    if let Ok(mut cache) = lhm_ptr_cache().lock() {
+    {
+        let mut cache = lhm_ptr_cache().lock().unwrap_or_else(|e| e.into_inner());
         let dead: std::collections::HashSet<usize> = dead_keys.iter().copied().collect();
         cache.retain(|_ptr, packed| !dead.contains(packed));
     }
@@ -32691,6 +32993,46 @@ mod tests {
         assert_eq!(b as u32, 1);
     }
 
+    // Fix item 1 follow-up: generations must be handed out monotonically, never
+    // recycled from `slots.len()`. Recycling would re-issue a generation a
+    // still-live (or just-removed) slot already owns, re-aliasing two distinct
+    // objects onto one packed key.
+    #[test]
+    fn next_generation_is_monotonic_and_never_recycles() {
+        use super::{next_generation, ObjKeyEntry};
+        // Empty bucket: first generation is 0.
+        assert_eq!(next_generation(&[]), 0);
+        // Two live slots, generations 0 and 1: next is 2 (not len()-derived 2 by
+        // coincidence — verify it tracks the max, not the count).
+        let two = [
+            ObjKeyEntry {
+                last_ptr: 0x10,
+                generation: 0,
+                class_id: 7,
+            },
+            ObjKeyEntry {
+                last_ptr: 0x20,
+                generation: 1,
+                class_id: 7,
+            },
+        ];
+        assert_eq!(next_generation(&two), 2);
+        // After the LOW slot (gen 0) is pruned, only gen 1 remains. `slots.len()`
+        // would now wrongly hand out generation 1 again — aliasing the live gen-1
+        // slot. `next_generation` returns max(1)+1 = 2, never recycling gen 1.
+        let after_prune = [ObjKeyEntry {
+            last_ptr: 0x20,
+            generation: 1,
+            class_id: 7,
+        }];
+        assert_eq!(after_prune.len(), 1);
+        assert_eq!(
+            next_generation(&after_prune),
+            2,
+            "must not recycle a live slot's generation after a lower one is pruned"
+        );
+    }
+
     #[test]
     fn map_bucket_index_power_of_two() {
         use super::map_bucket_index;
@@ -33060,6 +33402,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn scheduled_executor_registered() {
         let r = build_registry();
         let stpe = "java/util/concurrent/ScheduledThreadPoolExecutor";

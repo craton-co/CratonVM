@@ -1329,6 +1329,49 @@ fn wf7_synthesise_entry_class_if_missing(
     Some(ctx.get_class_mirror(cid))
 }
 
+/// Security hardening — reject `Class.forName` names that look like a
+/// class-load / path-traversal injection rather than a legitimate binary
+/// class name.
+///
+/// The `Class.forName(Module, String)` overload (`native_class_for_name_module`)
+/// already screens its input for control bytes and path separators; the
+/// primary `Class.forName(String)` and `Class.forName(String,boolean,ClassLoader)`
+/// overloads historically did not, so a hostile caller could smuggle NUL
+/// bytes, control characters, or `/`, `\`, `..` path segments straight into
+/// the loader and probe the host filesystem. This helper centralizes the
+/// check so both paths enforce the same rules.
+///
+/// A binary class name (JLS §13.1 / JVMS §4.2.1) never contains:
+///   * a NUL, any other control byte (`< 0x20`), or DEL (`0x7F`);
+///   * a forward slash `/` or backslash `\` in its *dotted* form (the dotted
+///     form uses `.` as the package separator — a literal `/`/`\` is a path
+///     character, not a package separator);
+///   * an empty package segment, i.e. a `..` run (which in dotted form means
+///     a zero-length identifier and is the canonical filesystem
+///     parent-directory traversal token).
+/// Empty names are likewise rejected.
+///
+/// On rejection we return `ClassNotFoundException(dotted_name)` — the same
+/// exception the primary overloads raise for any other unresolved name, so
+/// a rejected probe is indistinguishable from an ordinary miss and leaks no
+/// information about why it failed.
+fn validate_for_name_dotted(dotted_name: &str) -> Result<(), MethodCallFailed> {
+    let reject = dotted_name.is_empty()
+        || dotted_name.bytes().any(|b| b < 0x20 || b == 0x7F)
+        || dotted_name.contains('/')
+        || dotted_name.contains('\\')
+        || dotted_name.contains("..");
+    if reject {
+        return Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name.to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn native_class_for_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1343,6 +1386,10 @@ pub(crate) fn native_class_for_name(
         }
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
+    // Security hardening — screen the requested name for control bytes and
+    // path-traversal separators before it reaches any class loader. See
+    // `validate_for_name_dotted`.
+    validate_for_name_dotted(&dotted_name)?;
     let internal_name = dotted_name.replace('.', "/");
 
     // RKC16r23 — jboss-logging i18n localized-logger lookup short-circuit.
@@ -1614,7 +1661,20 @@ pub(crate) fn native_class_for_name_3(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Same as forName(String) but ignores initialize flag and classLoader
+    // Same as forName(String) but ignores initialize flag and classLoader.
+    //
+    // Security hardening — screen the requested name here as well, BEFORE any
+    // class loader sees it. Delegation to `native_class_for_name` already
+    // re-runs `validate_for_name_dotted`, but performing the check up-front
+    // keeps the guarantee local to this entry point and resilient to future
+    // changes in how the two overloads share code. (`read_string` on a null
+    // name yields the empty string, which `validate_for_name_dotted` rejects;
+    // a genuinely null `name` argument is still surfaced as the
+    // NullPointerException by the delegate below.)
+    if let Some(Value::Object(Some(name_obj))) = args.first() {
+        let dotted_name = ctx.read_string(*name_obj).unwrap_or_default();
+        validate_for_name_dotted(&dotted_name)?;
+    }
     native_class_for_name(ctx, args)
 }
 
@@ -4933,6 +4993,27 @@ pub(crate) fn native_method_invoke(
             );
         }
         match ctx.invoke_virtual(recv, &method_name, &descriptor, virtual_args) {
+            Ok(v) => v,
+            Err(failure) => {
+                return Err(wrap_as_invocation_target_exception(ctx, failure));
+            }
+        }
+    } else if is_private && !is_static && !is_init {
+        // Private instance methods bypass virtual dispatch AND must never be
+        // retargeted to a subclass's same-name method. `ctx.invoke`
+        // (invoke_on_class_shared) retargets a call whose declaring class is
+        // abstract/interface onto the receiver's concrete class — correct for
+        // an abstract/interface method with no Code, but WRONG for a private
+        // concrete method that merely lives in an abstract class. Reflectively
+        // invoking `AbstractSharedSessionContract.writeObject` (private, in an
+        // abstract class) on a `SessionImpl` receiver therefore ran
+        // `SessionImpl.writeObject`, so `ObjectStreamClass.invokeWriteObject`
+        // skipped the superclass slot's hook: Hibernate never wrote the
+        // SessionFactory UUID and deserialization reconnected a null factory
+        // → NPE (HIB-DEV-05). `invoke_special` resolves to the declaring class
+        // with no retarget — exactly the invokespecial semantics a private
+        // method requires.
+        match ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args) {
             Ok(v) => v,
             Err(failure) => {
                 return Err(wrap_as_invocation_target_exception(ctx, failure));
@@ -8607,10 +8688,7 @@ fn directly_and_indirectly_present(
     let mut indirect: Vec<cratonvm_native_api::AnnotationData> = Vec::new();
     let mut container_pos: Option<usize> = None;
     if let Some(cdesc) = container_desc {
-        if let Some(cpos) = annotations
-            .iter()
-            .position(|a| a.type_descriptor == cdesc)
-        {
+        if let Some(cpos) = annotations.iter().position(|a| a.type_descriptor == cdesc) {
             container_pos = Some(cpos);
             if let Some((_, AEV::Array(elems))) = annotations[cpos]
                 .elements
@@ -8649,10 +8727,7 @@ fn directly_and_indirectly_present(
 
 /// If the annotation type `ann_class_id` is `@Repeatable`, return the type
 /// descriptor of its container annotation (read from `@Repeatable`'s `value()`).
-fn repeatable_container_desc(
-    ctx: &mut dyn NativeContext,
-    ann_class_id: ClassId,
-) -> Option<String> {
+fn repeatable_container_desc(ctx: &mut dyn NativeContext, ann_class_id: ClassId) -> Option<String> {
     use cratonvm_native_api::AnnotationElementValue as AEV;
     let ann_type_annotations = ctx.class_annotations(ann_class_id);
     let repeatable = ann_type_annotations
@@ -8707,11 +8782,8 @@ fn class_annotations_by_type_impl(
     let container_desc = repeatable_container_desc(ctx, ann_class_id);
 
     let this_annotations = ctx.class_annotations(class_id);
-    let mut matching = directly_and_indirectly_present(
-        &this_annotations,
-        &target_desc,
-        container_desc.as_deref(),
-    );
+    let mut matching =
+        directly_and_indirectly_present(&this_annotations, &target_desc, container_desc.as_deref());
 
     // `getAnnotationsByType` follows the @Inherited chain when (and only when)
     // nothing is directly/indirectly present on this class.
@@ -8803,11 +8875,8 @@ pub(crate) fn native_method_get_annotations_by_type(
     // have no `@Inherited` semantics, so there is no superclass walk. The prior
     // code only unwrapped the container when no direct match existed, dropping
     // the contained annotations whenever a direct one was also present.
-    let matching = directly_and_indirectly_present(
-        &annotations,
-        &target_desc,
-        container_desc.as_deref(),
-    );
+    let matching =
+        directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
@@ -14379,5 +14448,65 @@ mod tests {
         volatile_load_fence(volatile_field);
         volatile_store_fence_pre(volatile_field);
         volatile_store_fence_post(volatile_field);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_for_name_dotted (Class.forName name hardening)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_name_accepts_normal_class_names() {
+        assert!(validate_for_name_dotted("java.lang.String").is_ok());
+        assert!(validate_for_name_dotted("com.acme.App").is_ok());
+        // Inner class ($), array-element binary names and single-segment
+        // names are all legitimate.
+        assert!(validate_for_name_dotted("java.util.Map$Entry").is_ok());
+        assert!(validate_for_name_dotted("App").is_ok());
+        assert!(validate_for_name_dotted("[Ljava.lang.String;").is_ok());
+    }
+
+    #[test]
+    fn for_name_rejects_empty_name() {
+        assert!(validate_for_name_dotted("").is_err());
+    }
+
+    #[test]
+    fn for_name_rejects_control_bytes() {
+        // NUL terminator — the classic class-load injection.
+        assert!(validate_for_name_dotted("java.lang.String\0extra").is_err());
+        // Other C0 control byte (newline) and DEL (0x7F).
+        assert!(validate_for_name_dotted("java.lang\n.String").is_err());
+        assert!(validate_for_name_dotted("java.lang.String\u{7F}").is_err());
+        // Low control byte at the very front.
+        assert!(validate_for_name_dotted("\u{1}Bad").is_err());
+    }
+
+    #[test]
+    fn for_name_rejects_path_separators() {
+        assert!(validate_for_name_dotted("java/lang/String").is_err());
+        assert!(validate_for_name_dotted("java\\lang\\String").is_err());
+        assert!(validate_for_name_dotted("com.acme/Evil").is_err());
+    }
+
+    #[test]
+    fn for_name_rejects_dotdot_segments() {
+        assert!(validate_for_name_dotted("..").is_err());
+        assert!(validate_for_name_dotted("java..lang.String").is_err());
+        assert!(validate_for_name_dotted("a..b").is_err());
+    }
+
+    #[test]
+    fn for_name_rejection_is_class_not_found() {
+        // Rejection must surface as ClassNotFoundException carrying the
+        // (dotted) name — indistinguishable from an ordinary miss.
+        match validate_for_name_dotted("java/lang/String") {
+            Err(MethodCallFailed::ExceptionThrown(_)) | Err(MethodCallFailed::InternalError(_)) => {
+                // The conversion of RuntimeError::ClassNotFoundException into
+                // MethodCallFailed is what the production path relies on; any
+                // error variant proves the name was rejected rather than
+                // forwarded to a loader.
+            }
+            Ok(()) => panic!("expected rejection for a path-separated name"),
+        }
     }
 }
