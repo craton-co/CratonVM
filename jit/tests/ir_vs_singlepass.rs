@@ -2127,6 +2127,68 @@ fn ir_vs_singlepass_fp_negation() {
     );
 }
 
+// ── FP 3-way compares (fcmpl/fcmpg/dcmpl/dcmpg) — item 3 next slice ──────────
+//
+// The compare yields int {-1,0,1} feeding the existing `if<cond>`. The
+// `ucomis`-based branchless lowering must agree with single-pass AND the host
+// IEEE anchor for the ordered cases, AND honour the JVMS NaN-unordered rule
+// (NaN → -1 for the `l` variants, +1 for the `g` variants), for a NaN in EITHER
+// operand position.
+
+#[test]
+fn ir_vs_singlepass_fcmp_ordered() {
+    // int f(int a, int b) { return Float.compare-ish: ((float)a) <cmp> ((float)b); }
+    //   iload_0; i2f; iload_1; i2f; fcmp{l,g}; ireturn
+    let ordered = &[
+        (vec![1i64, 2], -1i32),
+        (vec![2, 1], 1),
+        (vec![5, 5], 0),
+        (vec![-3, -3], 0),
+        (vec![-5, 2], -1),
+        (vec![2, -5], 1),
+    ];
+    // fcmpl (0x95) and fcmpg (0x96) are identical for ordered operands.
+    check_fp("fcmpl_ord", "(II)I", vec![0x1a, 0x86, 0x1b, 0x86, 0x95, 0xac], 2, 2, ordered);
+    check_fp("fcmpg_ord", "(II)I", vec![0x1a, 0x86, 0x1b, 0x86, 0x96, 0xac], 2, 2, ordered);
+}
+
+#[test]
+fn ir_vs_singlepass_dcmp_ordered() {
+    //   iload_0; i2d; iload_1; i2d; dcmp{l,g}; ireturn
+    let ordered = &[
+        (vec![1i64, 2], -1i32),
+        (vec![2, 1], 1),
+        (vec![7, 7], 0),
+        (vec![-9, 4], -1),
+        (vec![4, -9], 1),
+    ];
+    check_fp("dcmpl_ord", "(II)I", vec![0x1a, 0x87, 0x1b, 0x87, 0x97, 0xac], 2, 2, ordered);
+    check_fp("dcmpg_ord", "(II)I", vec![0x1a, 0x87, 0x1b, 0x87, 0x98, 0xac], 2, 2, ordered);
+}
+
+#[test]
+fn ir_vs_singlepass_fcmp_nan() {
+    // NaN is synthesized as 0.0f/0.0f (fconst_0 fconst_0 fdiv). fcmpl → -1 and
+    // fcmpg → +1 for a NaN in either position.
+    // int f() { return (0/0f) fcmpl 1f; }  — NaN as LEFT operand
+    check_fp("fcmpl_nan_lhs", "()I", vec![0x0b, 0x0b, 0x6e, 0x0c, 0x95, 0xac], 0, 0, &[(vec![], -1)]);
+    // int f() { return (0/0f) fcmpg 1f; }
+    check_fp("fcmpg_nan_lhs", "()I", vec![0x0b, 0x0b, 0x6e, 0x0c, 0x96, 0xac], 0, 0, &[(vec![], 1)]);
+    // int f() { return 1f fcmpl (0/0f); }  — NaN as RIGHT operand
+    check_fp("fcmpl_nan_rhs", "()I", vec![0x0c, 0x0b, 0x0b, 0x6e, 0x95, 0xac], 0, 0, &[(vec![], -1)]);
+    // int f() { return 1f fcmpg (0/0f); }
+    check_fp("fcmpg_nan_rhs", "()I", vec![0x0c, 0x0b, 0x0b, 0x6e, 0x96, 0xac], 0, 0, &[(vec![], 1)]);
+}
+
+#[test]
+fn ir_vs_singlepass_dcmp_nan() {
+    // NaN as 0.0/0.0 (dconst_0 dconst_0 ddiv). dcmpl → -1, dcmpg → +1.
+    check_fp("dcmpl_nan_lhs", "()I", vec![0x0e, 0x0e, 0x6f, 0x0f, 0x97, 0xac], 0, 0, &[(vec![], -1)]);
+    check_fp("dcmpg_nan_lhs", "()I", vec![0x0e, 0x0e, 0x6f, 0x0f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
+    check_fp("dcmpl_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x97, 0xac], 0, 0, &[(vec![], -1)]);
+    check_fp("dcmpg_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
+}
+
 #[test]
 fn ir_vs_singlepass_fp_constants() {
     // int f(int a) { return (int)((float)a + 2.0f); }  — fconst_2

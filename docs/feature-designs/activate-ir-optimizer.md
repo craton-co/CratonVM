@@ -2027,9 +2027,17 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    conversions** (`i2f`/`i2d`/`l2f`/`l2d`/`f2d`/`d2f` and the fixup-bearing
    `f2i`/`f2l`/`d2i`/`d2l`). `method_uses_fp` is the new admission gate (a
    bail→gate flip). What remains of the tier, in dependency order:
-   - **FP compares + branches** (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` via `ucomiss`/
-     `ucomisd` → the 3-way `{-1,0,1}` result feeding `if<cond>`, with the NaN
-     "unordered" rule distinguishing `cmpl` vs `cmpg`).
+   - ✅ **FP compares + branches** — **DONE (inc 31)**. `fcmpl`/`fcmpg`/`dcmpl`/
+     `dcmpg` lower to a new `Op::FCmp { double, nan_greater }` (builder, ir.rs)
+     producing an int `{-1,0,1}` that feeds the existing `if<cond>`-against-0
+     (the `Op::LCmp` path). Codegen (`ir_lower.rs`) is branchless `ucomiss`/
+     `ucomisd` + `SETA`/`SETB` − `SUB`: since `ucomis` raises CF on BOTH "below"
+     AND "unordered", `cmpl` (`UCOMIS a,b`; `SETA−SETB`) yields NaN→−1 for free,
+     and `cmpg` swaps the operands (`UCOMIS b,a`) so NaN→+1 — the JVMS rule with
+     no extra branch. Validated: `ir_vs_singlepass` `…_fcmp_ordered`/
+     `…_dcmp_ordered`/`…_fcmp_nan`/`…_dcmp_nan` (ordered + NaN in either operand,
+     both variants; IR == single-pass == host) + E2E (all 5 relational operators
+     on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
    - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
    - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
      FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).

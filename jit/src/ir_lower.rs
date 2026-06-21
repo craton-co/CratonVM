@@ -994,6 +994,46 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
                 self.store_rax(slot);
             }
+            Op::FCmp { double, nan_greater } => {
+                // FP 3-way compare → int {-1,0,1}, mirroring `Op::LCmp` but via
+                // `ucomis` with the JVMS NaN-unordered rule. Branchless:
+                // `result = AL - DL` where the operand order + SETcc choice put
+                // a NaN operand on +1 (`cmpg`) or -1 (`cmpl`). `ucomis` raises
+                // CF on BOTH "below" and "unordered", which is what makes the
+                // NaN case fall out for free:
+                //   cmpl: UCOMIS a,b ; AL=SETA(a>b) ; DL=SETB(a<b OR NaN)
+                //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:-1}.
+                //   cmpg: UCOMIS b,a ; AL=SETB((a>b) OR NaN) ; DL=SETA(a<b)
+                //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:+1}.
+                let is_d = *double;
+                let slot = self.alloc_slot(id);
+                self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
+                self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                if *nan_greater {
+                    // UCOMIS XMM1, XMM0 (compare b vs a) — ModRM C8.
+                    if is_d {
+                        self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC8]);
+                    } else {
+                        self.buf.emit(&[0x0F, 0x2E, 0xC8]);
+                    }
+                    self.buf.emit(&[0x0F, 0x92, 0xC0]); // SETB AL  ((a>b) OR NaN)
+                    self.buf.emit(&[0x0F, 0x97, 0xC2]); // SETA DL  (a<b)
+                } else {
+                    // UCOMIS XMM0, XMM1 (compare a vs b) — ModRM C1.
+                    if is_d {
+                        self.buf.emit(&[0x66, 0x0F, 0x2E, 0xC1]);
+                    } else {
+                        self.buf.emit(&[0x0F, 0x2E, 0xC1]);
+                    }
+                    self.buf.emit(&[0x0F, 0x97, 0xC0]); // SETA AL  (a>b)
+                    self.buf.emit(&[0x0F, 0x92, 0xC2]); // SETB DL  (a<b OR NaN)
+                }
+                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX  → {-1,0,1}
+                self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX (sign-extend)
+                self.store_rax(slot);
+            }
             Op::I2L => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
