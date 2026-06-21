@@ -1106,37 +1106,41 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // T6.3.1 — JVMTI GC-hook tests. `OnceLock` is process-wide so these
-    // tests share one installed hook; bodies tolerate repeat invocations.
-    // A shared static mutex serializes the two tests since they both
-    // observe the single pair of static counters.
+    // T6.3.1 — JVMTI GC-hook tests. The installed hook is process-wide
+    // (`OnceLock`): once the first test installs it, EVERY `collect()` in
+    // the whole test binary fires the shared callback. So global counters
+    // would race — any other gc test that collects between a test's
+    // before-load and after-assert would bump the same counter and break
+    // the exact "+1" check under parallel execution.
+    //
+    // Fix: the callbacks bump a THREAD-LOCAL counter. `collect()` fires
+    // the hook synchronously on the calling thread, and each libtest case
+    // runs on its own thread, so a test observes only the GCs it itself
+    // triggered — making "fires exactly once per collect()" robust to
+    // collections happening concurrently on other test threads. (Same
+    // idiom as jit/src/lib.rs's per-thread counter.)
     // ----------------------------------------------------------------
 
-    use std::sync::atomic::{AtomicU32, Ordering as CounterOrd};
-    static GC_HOOK_STARTS: AtomicU32 = AtomicU32::new(0);
-    static GC_HOOK_FINISHES: AtomicU32 = AtomicU32::new(0);
+    use std::cell::Cell;
+    thread_local! {
+        static GC_HOOK_STARTS: Cell<u32> = const { Cell::new(0) };
+        static GC_HOOK_FINISHES: Cell<u32> = const { Cell::new(0) };
+    }
 
     fn gc_hook_start_cb() {
-        GC_HOOK_STARTS.fetch_add(1, CounterOrd::SeqCst);
+        GC_HOOK_STARTS.with(|c| c.set(c.get() + 1));
     }
     fn gc_hook_finish_cb() {
-        GC_HOOK_FINISHES.fetch_add(1, CounterOrd::SeqCst);
-    }
-
-    fn gc_hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock as StdOnceLock};
-        static L: StdOnceLock<Mutex<()>> = StdOnceLock::new();
-        L.get_or_init(|| Mutex::new(())).lock().unwrap()
+        GC_HOOK_FINISHES.with(|c| c.set(c.get() + 1));
     }
 
     #[test]
     fn gc_hooks_fire_around_collect() {
-        let _guard = gc_hook_test_lock();
         install_gc_start_hook(gc_hook_start_cb);
         install_gc_finish_hook(gc_hook_finish_cb);
 
-        let before_start = GC_HOOK_STARTS.load(CounterOrd::SeqCst);
-        let before_finish = GC_HOOK_FINISHES.load(CounterOrd::SeqCst);
+        let before_start = GC_HOOK_STARTS.with(Cell::get);
+        let before_finish = GC_HOOK_FINISHES.with(Cell::get);
 
         // Trigger a real GC cycle on a tiny heap.
         let heap = small_heap();
@@ -1146,12 +1150,12 @@ mod tests {
         let _ = collect(&mut from, &mut to, &mut roots);
 
         assert_eq!(
-            GC_HOOK_STARTS.load(CounterOrd::SeqCst),
+            GC_HOOK_STARTS.with(Cell::get),
             before_start + 1,
             "GarbageCollectionStart must fire exactly once per collect()"
         );
         assert_eq!(
-            GC_HOOK_FINISHES.load(CounterOrd::SeqCst),
+            GC_HOOK_FINISHES.with(Cell::get),
             before_finish + 1,
             "GarbageCollectionFinish must fire exactly once per collect()"
         );
@@ -1159,12 +1163,11 @@ mod tests {
 
     #[test]
     fn gc_hooks_fire_around_collect_with_finalizers() {
-        let _guard = gc_hook_test_lock();
         install_gc_start_hook(gc_hook_start_cb);
         install_gc_finish_hook(gc_hook_finish_cb);
 
-        let before_start = GC_HOOK_STARTS.load(CounterOrd::SeqCst);
-        let before_finish = GC_HOOK_FINISHES.load(CounterOrd::SeqCst);
+        let before_start = GC_HOOK_STARTS.with(Cell::get);
+        let before_finish = GC_HOOK_FINISHES.with(Cell::get);
 
         let heap = small_heap();
         let obj = heap.alloc_object(cratonvm_types::ClassId::new(1), 1);
@@ -1172,7 +1175,7 @@ mod tests {
         let (mut from, mut to) = heap.lock_spaces();
         let _ = collect_with_finalizers(&mut from, &mut to, &mut roots, &[]);
 
-        assert_eq!(GC_HOOK_STARTS.load(CounterOrd::SeqCst), before_start + 1);
-        assert_eq!(GC_HOOK_FINISHES.load(CounterOrd::SeqCst), before_finish + 1);
+        assert_eq!(GC_HOOK_STARTS.with(Cell::get), before_start + 1);
+        assert_eq!(GC_HOOK_FINISHES.with(Cell::get), before_finish + 1);
     }
 }
