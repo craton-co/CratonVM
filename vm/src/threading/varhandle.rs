@@ -399,7 +399,11 @@ impl FenceOperations {
 /// concurrent CAS on the same field will not observe this op at all.
 ///
 /// (Round-9 concurrency CRIT-3 — `compare_and_set_int/long` were latent UB
-/// for any caller outside this file's own unit tests.)
+/// for any caller outside this file's own unit tests.) The
+/// `get_and_{set,add,or,and,xor}_{int,long}` read-modify-write helpers share
+/// the exact same defect: the RMW runs against a stack-local atomic, so the
+/// result is computed-and-discarded and the heap field is never updated (lost
+/// update). They are gated identically (see below).
 ///
 /// The real heap-CAS path is `crate::native_api::NativeContext::compare_and_swap_value`
 /// and the interpreter's `Putfield_Volatile` / `Unsafe.compareAndSet*` natives,
@@ -480,32 +484,98 @@ impl AtomicOperations {
         }
     }
 
-    /// Atomic get-and-set for `i32`. Returns old value.
-    pub fn get_and_set_int(current: i32, new_value: i32) -> i32 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.**
+    ///
+    /// Atomic get-and-set for `i32`. The RMW runs against a fresh `AtomicI32`
+    /// built from a snapshot, so the result is discarded and no heap slot is
+    /// updated (lost update). Same defect as the `compare_and_set_*` siblings
+    /// (round-9 CRIT-3) — gated to tests so it cannot be reached from
+    /// production. The real path is the `Unsafe.getAndSet*` natives
+    /// (`native_unsafe_get_and_set_{int,long}`), which RMW the actual field.
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use the `Unsafe.getAndSet*` natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_set_int(current: i32, new_value: i32) -> i32 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_set_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         atom.swap(new_value, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-add for `i32`. Returns old value.
-    pub fn get_and_add_int(current: i32, delta: i32) -> i32 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use the `Unsafe.getAndAdd*` natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_add_int(current: i32, delta: i32) -> i32 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_add_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         atom.fetch_add(delta, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-or for `i32`. Returns old value.
-    pub fn get_and_or_int(current: i32, mask: i32) -> i32 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_or_int(current: i32, mask: i32) -> i32 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_or_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         atom.fetch_or(mask, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-and for `i32`. Returns old value.
-    pub fn get_and_and_int(current: i32, mask: i32) -> i32 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_and_int(current: i32, mask: i32) -> i32 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_and_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         atom.fetch_and(mask, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-xor for `i32`. Returns old value.
-    pub fn get_and_xor_int(current: i32, mask: i32) -> i32 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_xor_int(current: i32, mask: i32) -> i32 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_xor_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         atom.fetch_xor(mask, Ordering::SeqCst)
     }
@@ -564,32 +634,93 @@ impl AtomicOperations {
         }
     }
 
-    /// Atomic get-and-set for `i64`. Returns old value.
-    pub fn get_and_set_long(current: i64, new_value: i64) -> i64 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`]. The real path is the `Unsafe.getAndSet*`
+    /// natives (`native_unsafe_get_and_set_long`).
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use the `Unsafe.getAndSet*` natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_set_long(current: i64, new_value: i64) -> i64 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_set_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         atom.swap(new_value, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-add for `i64`. Returns old value.
-    pub fn get_and_add_long(current: i64, delta: i64) -> i64 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use the `Unsafe.getAndAdd*` natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_add_long(current: i64, delta: i64) -> i64 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_add_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         atom.fetch_add(delta, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-or for `i64`. Returns old value.
-    pub fn get_and_or_long(current: i64, mask: i64) -> i64 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_or_long(current: i64, mask: i64) -> i64 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_or_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         atom.fetch_or(mask, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-and for `i64`. Returns old value.
-    pub fn get_and_and_long(current: i64, mask: i64) -> i64 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_and_long(current: i64, mask: i64) -> i64 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_and_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         atom.fetch_and(mask, Ordering::SeqCst)
     }
 
-    /// Atomic get-and-bitwise-xor for `i64`. Returns old value.
-    pub fn get_and_xor_long(current: i64, mask: i64) -> i64 {
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::get_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use the `Unsafe` bitwise-RMW natives instead. \
+                See round-9 CRIT-3."
+    )]
+    #[cfg(test)]
+    pub(crate) fn get_and_xor_long(current: i64, mask: i64) -> i64 {
+        assert!(
+            cfg!(test),
+            "AtomicOperations::get_and_xor_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         atom.fetch_xor(mask, Ordering::SeqCst)
     }
