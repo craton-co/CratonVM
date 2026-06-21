@@ -502,6 +502,54 @@ fn ir_vs_singlepass_long_lcmp_branch() {
 }
 
 #[test]
+fn ir_vs_singlepass_long_loop_phi_lcmp() {
+    // inc 27: a long loop-carried accumulator with a long-fed loop condition —
+    // exercises Op::LCmp + a backward long branch + a long loop phi (now typed
+    // Long, not Int) + wide lload/lstore, all together. No int counter (avoids
+    // the not-yet-handled wide iload), no idiv/call (stays safepoint-free).
+    //   long f(long a, long limit){ long s=0; while (s < limit) s = s + a; return s; }
+    //   a@0-1, limit@2-3, s@4-5
+    let code = vec![
+        0x09, // lconst_0
+        0x37, 0x04, // lstore 4 (s=0)
+        // LOOP (pc 3):
+        0x16, 0x04, // lload 4 (s)
+        0x20, // lload_2 (limit)
+        0x94, // lcmp
+        0x9c, 0x00, 0x0c, // ifge +12 -> END (pc 19) if s >= limit
+        0x16, 0x04, // lload 4 (s)
+        0x1e, // lload_0 (a)
+        0x61, // ladd
+        0x37, 0x04, // lstore 4 (s = s + a)
+        0xa7, 0xff, 0xf3, // goto -13 -> LOOP (pc 3)
+        // END (pc 19):
+        0x16, 0x04, // lload 4 (s)
+        0xad, // lreturn
+    ];
+    check_long(
+        "lloop",
+        "(JJ)J",
+        code,
+        6,
+        2,
+        &[
+            (vec![3, 10], {
+                let (a, limit) = (3i64, 10i64);
+                let mut s = 0i64;
+                while s < limit {
+                    s = s.wrapping_add(a);
+                }
+                s
+            }),
+            (vec![5, 5], 5),
+            (vec![1, 64], 64),
+            (vec![7, 50], 56),
+            (vec![100, 1], 100),
+        ],
+    );
+}
+
+#[test]
 fn ir_vs_singlepass_add() {
     // int add(int a, int b) { return a + b; }
     //   iload_0; iload_1; iadd; ireturn
