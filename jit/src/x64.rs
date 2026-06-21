@@ -17624,16 +17624,36 @@ impl Compiler {
                             let s_dst = self.next_spill_offset + 16;
                             let s_dst_pos = self.next_spill_offset + 24;
                             let s_len = self.next_spill_offset + 32;
+                            // ALIASING HAZARD: these scratch homes can overlap
+                            // the operands' OWN frame homes. `flush_scratch_
+                            // registers()` above spills any CalleeSaved *oop*
+                            // operand (here src and dst) to frame slots taken
+                            // from `next_spill_offset`; the five pops then rewind
+                            // `next_spill_offset` back over those very slots, so
+                            // e.g. `src_slot`/`dst_slot` may be `Frame(s_src)` /
+                            // `Frame(s_src_pos)`. Writing the scratch homes in
+                            // operand order would corrupt a not-yet-read operand:
+                            // storing s_src_pos (=srcPos) overwrites dst's spilled
+                            // home BEFORE s_dst reads it, leaving s_dst = srcPos
+                            // (a small int) — guard-2 then bails to native when
+                            // srcPos==0, or dereferences the bogus pointer and
+                            // SIGSEGVs when srcPos!=0. Defeat the aliasing by
+                            // loading ALL five operands into distinct scratch
+                            // GPRs FIRST, then storing. RAX/RCX/RDX/R10/R11 are
+                            // never local-mapped (LOCAL_REGS is RBX/R12..R15
+                            // [+RSI/RDI on SysV]) and hold no deferred-Scratch
+                            // value after the flush, so no load can clobber an
+                            // operand still pending a read.
                             self.load_slot_to_reg(RAX, src_slot);
+                            self.load_slot_to_reg(RCX, src_pos_slot);
+                            self.load_slot_to_reg(RDX, dst_slot);
+                            self.load_slot_to_reg(R10, dst_pos_slot);
+                            self.load_slot_to_reg(R11, len_slot);
                             self.emit_store_local(s_src, RAX);
-                            self.load_slot_to_reg(RAX, src_pos_slot);
-                            self.emit_store_local(s_src_pos, RAX);
-                            self.load_slot_to_reg(RAX, dst_slot);
-                            self.emit_store_local(s_dst, RAX);
-                            self.load_slot_to_reg(RAX, dst_pos_slot);
-                            self.emit_store_local(s_dst_pos, RAX);
-                            self.load_slot_to_reg(RAX, len_slot);
-                            self.emit_store_local(s_len, RAX);
+                            self.emit_store_local(s_src_pos, RCX);
+                            self.emit_store_local(s_dst, RDX);
+                            self.emit_store_local(s_dst_pos, R10);
+                            self.emit_store_local(s_len, R11);
 
                             // Collect every "bail to native" branch patch
                             // here; they are all wired to one shared deopt
