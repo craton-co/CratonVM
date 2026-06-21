@@ -5,15 +5,16 @@ live on the broad path; the φ/branch dam is fixed; `Op::Load`/`Store`/`New`/`Ca
 emission, escape→scalar-replacement, and a full **long (64-bit) value tier** are
 built and **default-ON** in production: `CRATONVM_JIT_IR_CALL` (invokestatic,
 inc 23), `CRATONVM_JIT_SCALAR_NEW` (inc 20), `CRATONVM_JIT_IR_LONG` (long
-arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args,
-inc 25–28) and `CRATONVM_JIT_IR_CALL_SPECIAL` (invokespecial, inc 24) all flipped
-on in **inc 29** (each with a `=0` opt-out). **Inc 30** opens the `double`/`float`
-XMM value tier (value arithmetic + constants + FP-local load/store + int/long⇄FP
-conversions) behind a new **`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the
-per-increment sections below and
-**["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what is
-left (long/double call returns, `ldiv`/`lrem`, and the rest of the `double`/`float`
-XMM tier — FP compares/branches, arrays, params/returns/call-args). Original plan
+arithmetic/constants/load-store/shifts/bitwise/compare/branches/call-args/div-rem,
+inc 25–28 + `ldiv`/`lrem` with long deopt-resume) and `CRATONVM_JIT_IR_CALL_SPECIAL`
+(invokespecial, inc 24) all flipped on in **inc 29** (each with a `=0` opt-out).
+**Inc 30** opens the `double`/`float` XMM value tier (value arithmetic + constants
++ FP-local load/store + int/long⇄FP conversions) behind a new
+**`CRATONVM_JIT_IR_FP`** flag (default-OFF). See the per-increment sections below
+and **["Remaining roadmap (post-inc-29)"](#remaining-roadmap-post-inc-29)** for what
+is left (long/double call returns, and the rest of the `double`/`float` XMM tier —
+FP compares/branches, arrays, params/returns/call-args; `ldiv`/`lrem` is now done).
+Original plan
 text follows.
 
 The Sea-of-Nodes IR and its
@@ -1954,9 +1955,10 @@ calls), and `IR_LONG` carries 39 differential tests + a 5-agent adversarial
 review behind it; `=0` remains the opt-out if a suite ever regresses.
 
 **Still gated-OFF / deferred** (unchanged): long/double call *returns*
-(`i64::MIN`-sentinel task), `ldiv`/`lrem` (long deopt-resume), and the entire
-`double`/`float` half (XMM). `CRATONVM_JIT_IR_CALL` virtual/interface dispatch
-(the concurrent inc-26 track) has its own flag/soak.
+(`i64::MIN`-sentinel task) and the entire `double`/`float` half (XMM).
+(`ldiv`/`lrem` is now done — long deopt-resume landed; see roadmap item #2.)
+`CRATONVM_JIT_IR_CALL` virtual/interface dispatch (the concurrent inc-26 track)
+has its own flag/soak.
 
 ## Remaining roadmap (post-inc-29)
 
@@ -1976,19 +1978,27 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    relax `static_call_shape` to accept `J`/`D` *returns* and the
    `lreturn`/`dreturn` paths are fully safe.
 
-2. **`ldiv`/`lrem`** *(blocked on long deopt-resume)*. The IR `Op::Div`/`Op::Rem`
-   div-by-zero guard **deopts** (`emit_div_zero_guard` → `emit_deopt_if_zero`),
-   unlike single-pass's direct-throw. A `long` live at that deopt needs frame
-   reconstruction, but (a) `frame_value_for` maps `Long` to
-   `FrameValue::Unsupported` (`ir_lower.rs`), and (b) the IR deopt entry isn't
-   wired into VM dispatch (no `ir_deopt_entry`/`take_last_deopt` caller — emit-and
-   -discard). So the inc-25 gate bails any long method with int `idiv`/`irem`
-   (`method_has_int_div`) and the builder never lowers `ldiv`/`lrem`. To unlock:
-   wire the IR deopt entry into VM dispatch **and** make long (and double) a
-   real `FrameValue` width on resume; then add the `ldiv`/`lrem` builder arms
-   (the lowerer's `Op::Div`/`Rem` are already 64-bit-aware) and drop the
-   `method_has_int_div` bail. (The inc-27 phi-typing fix already types long/double
-   phis correctly for that resume.)
+2. **`ldiv`/`lrem`** — ✅ **DONE**. The IR pipeline lowers `ldiv` (0x6d) /
+   `lrem` (0x71) and a `long` can be live at the div-by-zero deopt guard. Of the
+   two original sub-blockers, (b) "wire the IR deopt entry into VM dispatch" was
+   **already resolved** by the landed real-frame-deopt Steps 1–4
+   (`take_last_deopt()` is consumed on the `i64::MIN` return at both JIT-dispatch
+   sites); only (a) — make `long` a real `FrameValue` width on resume — remained.
+   The long-deopt-resume infrastructure (`FrameValue::Long` + `StackSlotLong`,
+   `frame_value_for`/`typed_stack_slot` mapping, the locals mapper collapsing the
+   cat-2 two-slot snapshot, `Long → Value::Long`) and the `ldiv`/`lrem` builder
+   arms landed alongside the inc-30 cat-2 work; the long-clause
+   `method_has_int_div` bail is now dropped (so a long method with *int* `idiv`/
+   `irem` is also admitted — the precise resume reconstructs the live `long`, or
+   an unmappable frame falls back to the safe re-run). Tests: `ir_vs_singlepass`
+   `…_long_ldiv`/`…_long_lrem` (full i64 + JVMS `MIN/-1` overflow), an
+   `ir_lower` deopt-resume test (`long` frame reconstructs as `FrameValue::Long`),
+   and a vm `long_locals_collapse_and_compact_stack` mapper test. Validated
+   gate-ON == HotSpot (incl. caught div-by-zero, `MIN/-1`) + bt10/14/16/18
+   unchanged. *Follow-up surfaced (separate bug):* the **single-pass** long-div
+   path SIGSEGVs on this workload (`--nojit` and the IR path both run clean) — a
+   pre-existing single-pass JIT bug, now masked on the default path because the IR
+   pipeline serves these methods; filed for separate fix.
 
 3. **`double`/`float` value tier (XMM)** *(the next major sub-project; **first
    increment landed — inc 30**)*. The whole second half of category-2. The XMM

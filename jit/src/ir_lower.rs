@@ -2294,4 +2294,45 @@ mod tests {
             "operands restored for re-execution",
         );
     }
+
+    #[test]
+    fn test_lower_ldiv_by_zero_reconstructs_long_frame() {
+        use crate::deopt::{take_last_deopt, FrameValue};
+        use crate::ir::{IrBuilder, IrType};
+        // long f(long a, long b){ return a / b; }
+        //   lload_0; lload_2; ldiv; lreturn   (+ 2 trailing padding bytes)
+        // Proves a `long` live at the div guard reconstructs as a full-64-bit
+        // FrameValue::Long (cat-2 width on resume), not a truncated Int.
+        let code = [0x1e, 0x20, 0x6d, 0xad, 0, 0];
+        let mut builder = IrBuilder::new(2, 4); // 2 long params (a@0-1, b@2-3)
+        builder.set_param_types(&[IrType::Long, IrType::Long]);
+        let mut graph = builder.build(&code, 4).expect("ldiv IR build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, 2, 4, &no_helpers()).expect("lower ldiv");
+
+        let _ = take_last_deopt(); // clear any stale state
+                                   // divisor != 0 → normal full-64-bit result, no deopt. A 32-bit IDIV
+                                   // would mishandle this dividend (> i32::MAX).
+        let ok = unsafe { cm.try_call(&[0x1_0000_0000, 2]).expect("call (b != 0)") };
+        assert_eq!(ok, 0x8000_0000, "0x1_0000_0000 / 2 (genuinely 64-bit)");
+        assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
+
+        // divisor == 0 → deopt; the reconstructed frame must carry the two LONG
+        // operands as FrameValue::Long (full 64 bits) so the interpreter resumes
+        // at the ldiv bci and re-executes it (throwing ArithmeticException).
+        let sentinel = unsafe { cm.try_call(&[0x7_0000_0000, 0]).expect("call (b == 0)") };
+        assert_eq!(sentinel, i64::MIN, "ldiv by zero → deopt sentinel");
+        let frame = take_last_deopt().expect("deopt reconstructed a frame");
+        assert_eq!(frame.bci, 2, "resume at the ldiv bci");
+        assert_eq!(
+            frame.stack,
+            vec![FrameValue::Long(0x7_0000_0000), FrameValue::Long(0)],
+            "long operands restored as full-64-bit FrameValue::Long",
+        );
+        // Locals: a@0 and b@2 are longs (StackSlotLong → Long); the high-half
+        // slots 1/3 are dummies (never read by the interpreter).
+        assert_eq!(frame.locals[0], FrameValue::Long(0x7_0000_0000));
+        assert_eq!(frame.locals[2], FrameValue::Long(0));
+    }
 }

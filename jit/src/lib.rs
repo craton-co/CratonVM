@@ -4529,14 +4529,17 @@ fn try_compile_inner(
                 // routes through the FP clause below (or bails to single-pass
                 // when the FP gate is off, exactly as it does today).
                 && !method_uses_fp(code, code_len, &cached.method_descriptor))
-            // inc 25: admit a long-using method when the long gate is on, as
-            // long as it is double/float-free AND int-div/rem-free. The latter
-            // keeps a `long` value off a deopt point (div emits a guard whose
-            // resume cannot yet reconstruct a `long` slot — a follow-up), so a
-            // long is only ever live in a leaf with no safepoint.
+            // inc 25/30(ldiv): admit a long-using method when the long gate is
+            // on, as long as it is double/float-free. (inc 25 also required
+            // int-div/rem-free, because a `long` live at a div guard's deopt
+            // could not be reconstructed; long deopt-resume now makes `long` a
+            // real `FrameValue` width — `StackSlotLong`/`Long` → `Value::Long`,
+            // the locals mapper collapsing the cat-2 two-slot snapshot — so a
+            // `long` may now be live at an `idiv`/`irem`/`ldiv`/`lrem` deopt.
+            // The precise resume reconstructs it; an unmappable frame falls back
+            // to the safe whole-method re-run.)
             || (ir_emit_long
-                && !method_uses_fp(code, code_len, &cached.method_descriptor)
-                && !method_has_int_div(code, code_len))
+                && !method_uses_fp(code, code_len, &cached.method_descriptor))
             // inc 30: admit a float/double-using method when the FP gate is on.
             // Scope (mirrors the long track's first increment): FP is used only
             // INTERNALLY — the signature must be FP-free (`!fp_in_descriptor`),

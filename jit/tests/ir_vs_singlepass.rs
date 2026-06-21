@@ -458,6 +458,60 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
 }
 
 #[test]
+fn ir_vs_singlepass_long_ldiv() {
+    // long signed division. long f(long a, long b) { return a / b; }
+    //   lload_0; lload_2; ldiv; lreturn
+    // Non-zero divisors only — a zero divisor deopts (returns the i64::MIN
+    // sentinel) and is validated live (the interpreter throws ArithmeticException).
+    let code = vec![0x1e, 0x20, 0x6d, 0xad];
+    check_long(
+        "ldiv",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![7, 2], 3),
+            (vec![-7, 2], -3), // Java truncates toward zero
+            (vec![7, -2], -3),
+            (vec![-7, -2], 3),
+            // genuinely 64-bit: a 32-bit IDIV would mis-divide these.
+            (vec![0x7FFF_FFFF_FFFF_FFFF, 3], 0x7FFF_FFFF_FFFF_FFFF / 3),
+            (vec![0x1_0000_0000, 2], 0x8000_0000),
+            // JVMS §6.5.ldiv overflow: LONG_MIN / -1 == LONG_MIN (no #DE / no
+            // exception). The lowerer's overflow guard must synthesise this.
+            (vec![i64::MIN, -1], i64::MIN),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_long_lrem() {
+    // long signed remainder (mirrors ldiv). long f(long a,long b){return a%b;}
+    //   lload_0; lload_2; lrem; lreturn
+    let code = vec![0x1e, 0x20, 0x71, 0xad];
+    check_long(
+        "lrem",
+        "(JJ)J",
+        code,
+        4,
+        2,
+        &[
+            (vec![7, 2], 1),
+            (vec![-7, 2], -1), // Java: remainder sign follows the dividend
+            (vec![7, -2], 1),
+            (vec![-7, -2], -1),
+            (
+                vec![0x7FFF_FFFF_FFFF_FFFF, 1_000_000_007],
+                0x7FFF_FFFF_FFFF_FFFF % 1_000_000_007,
+            ),
+            // JVMS §6.5.lrem overflow: LONG_MIN % -1 == 0 (no #DE / no exception).
+            (vec![i64::MIN, -1], 0),
+        ],
+    );
+}
+
+#[test]
 fn ir_vs_singlepass_long_shifts() {
     // inc 27: long shifts. long f(long a, int n){ return (a<<n) + (a>>n) + (a>>>n); }
     //   a@0-1, n@2.  lload_0; iload_2; lshl; lload_0; iload_2; lshr; ladd;
