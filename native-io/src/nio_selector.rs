@@ -2573,6 +2573,25 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "()Lsun/nio/ch/SelectorImpl;",
         selector_open_native,
     );
+    // JDK 21+ on Windows defaults to `sun.nio.ch.WEPollSelectorProvider`, whose
+    // `openSelector()` builds a `WEPollSelectorImpl` backed by the native
+    // `sun.nio.ch.WEPoll` (a wepoll/epoll-emulation layer) that CratonVM does
+    // not implement. Crucially, Netty's `NioEventLoop.openSelector()` calls
+    // `provider.openSelector()` DIRECTLY on its cached provider instance — it
+    // does NOT go through `java.nio.channels.Selector.open()` (handled above) —
+    // so without this the real `WEPollSelectorImpl.<init>` runs and dies with
+    // `UnsatisfiedLinkError: sun/nio/ch/WEPoll.eventSize()I`, taking the whole
+    // Vert.x/Netty event-loop group (and thus the Quarkus/Keycloak HTTP server)
+    // down. Route the provider's `openSelector()` to our own `SelectorImpl`
+    // (a `Selector`/`AbstractSelector`), bypassing the WEPoll path entirely.
+    // `selector_open_native` ignores its receiver arg, so the instance form is
+    // safe. (The matching `WEPollSelectorImpl` natives are never reached.)
+    r.register(
+        "sun/nio/ch/WEPollSelectorProvider",
+        "openSelector",
+        "()Ljava/nio/channels/spi/AbstractSelector;",
+        selector_open_native,
+    );
     r.register(sel, "close0", "()V", selector_close_native);
     r.register(sel, "wakeup0", "()V", selector_wakeup_native);
     r.register(sel, "select0", "(J)I", selector_select_native);
