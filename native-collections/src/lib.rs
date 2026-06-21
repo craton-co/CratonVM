@@ -18535,6 +18535,13 @@ fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let existing = ctx.get_field(node, LHM_NODE_VALUE);
+        // Map.putIfAbsent contract: a key "present with null value" counts as
+        // absent — associate the new value and return the old (null). Returning
+        // the null existing without storing left the mapping null
+        // (LinkedCaseInsensitiveMapTests.computeIfAbsentWithExistingValue).
+        if matches!(existing, Value::Object(None)) {
+            return native_lhm_put(ctx, args);
+        }
         Ok(Some(existing))
     } else {
         native_lhm_put(ctx, args)
@@ -25531,6 +25538,16 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // ConcurrentHashMap.remove(null) throws NPE per JDK spec (null keys are not
+    // permitted), mirroring the guard in native_chm_put. Without this, Spring's
+    // SimpleAliasRegistry.removeAlias(null) returned silently instead of NPE
+    // (SimpleAliasRegistryTests.removeNullAlias).
+    if matches!(key, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
