@@ -795,6 +795,33 @@ VM's real file layer).
 > (logmanager.rs, mirroring the JUL override + the constant `getUseParentHandlers`). Building + validating;
 > expect the boot to advance to the next RUNTIME_INIT gap (then iterate toward `Listening`). The boot is
 > now an iterative, VISIBLE gap-walk through RUNTIME_INIT, not a silent wall.
+>
+> **GAP-WALK PROGRESS (2026-06-21):**
+> - ✅ `setUseParentHandlers` fixed → boot advanced; the log now shows **Netty configuring its event
+>   loops** (`io.netty.channel.MultithreadEventLoopGroup -Dio.netty.eventLoopThreads: 64`,
+>   `NioEventLoop` `-Dio.netty.noKeySetOptimization`/`selectorAutoRebuildThreshold`) + the Quarkus
+>   thread-pool — i.e. RUNTIME_INIT is well underway.
+> - ⏳ NEXT GAP (now the active frontier): **Hibernate SessionFactory build fails** —
+>   *"[PersistenceUnit: keycloak-default] Unable to build Hibernate SessionFactory ... Cannot invoke
+>   `com.github.benmanes.caffeine.cache.LocalCacheFactory.newInstance(Caffeine, AsyncCacheLoader, boolean)`
+>   because `factory` is null"*. Caffeine 3.2.3's `LocalCacheFactory` is an INTERFACE that dynamically
+>   loads a generated per-feature cache-impl class via `MethodHandles.Lookup` (`LOOKUP.findClass` /
+>   `findConstructor`, cached in `FACTORIES` via `computeIfAbsent(name, ::newFactory)`); under CratonVM
+>   `loadFactory(name)` returns null (a `MethodHandles.Lookup.findClass`/`findConstructor` or
+>   `computeIfAbsent` gap on Caffeine's generated classes), so `factory.newInstance(...)` NPEs. NOT a
+>   no-op-stub; a real MethodHandles/reflection sub-investigation (lang_invoke.rs). Fix it, then continue
+>   the gap-walk (next likely: the H2 datasource connect, then the Vert.x HTTP listen — at which point the
+>   already-fixed serving chain should bind 8080).
+> - Benign/teardown noise seen (not the blocker): `SQLServerDriver`/`oracle.jdbc.OracleConnection`
+>   missing-driver clinit (unused drivers); a `VarHandleReferences$FieldInstanceReadWrite.<init>`
+>   NoSuchMethodError from `org.jboss.threads…clearThreadLocals` during teardown.
+>
+> **STATUS:** Gap 9 transformed from a silent wall into a visible, advancing RUNTIME_INIT gap-walk.
+> 8 fixes merged to `dev` (merge `498fae5f`): the Vert.x/Netty HTTP serving chain (4) + the
+> `CRATONVM_REAL_QUARKUS_START` gate + `setUseParentHandlers` + docs. Boot order now: STATIC_INIT
+> `<clinit>` (ArC/RESTEasy-metadata/Hibernate-metadata) → RUNTIME_INIT (logging ✅ → Netty event loops ✅
+> → Hibernate SessionFactory build ❌ Caffeine). Required gates: `CRATONVM_REAL_AGROAL` +
+> `CRATONVM_REAL_VERTX` + `CRATONVM_REAL_NET_SOCKETS` + `CRATONVM_REAL_QUARKUS_START` (all opt-in).
 
 ### Quarkus ArC (`CRATONVM_REAL_ARC`) — REACHED and running
 Real ArC bytecode RUNS during the boot — `Arc.initialize` → container →
