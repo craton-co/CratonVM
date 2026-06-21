@@ -33,6 +33,15 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # CONTRIBUTING.md / README claim CI enforces a "no debug/trace prints"
+      # gate. Honour that claim: forbid reintroduction of bring-up
+      # eprintln!/println! markers ([WP*], [DIAG*], [TRACE*], …) in landed code.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Forbid debug-trace prints
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-no-diag-prints.sh
+
       - name: Clippy
         # CONTRIBUTING.md / README claim CI enforces `-D warnings`. Honour
         # that claim. `[workspace.lints]` in Cargo.toml already silences the
