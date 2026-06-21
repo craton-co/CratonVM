@@ -1484,6 +1484,24 @@ fn compile_with_dispatch(
     )
 }
 
+/// Like [`compile_with_dispatch`] but with BOTH the call gate AND the FP gate on
+/// (inc 32) — for a caller that consumes a `double`-returning `Op::Call` result.
+fn compile_with_dispatch_fp(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm, None, None, None, Some(invoke_resolver), None, None, None, None, None, helpers, None,
+        None, None, None, true, // optimize
+        true,  // ir_emit_calls
+        true,  // ir_emit_special_calls
+        true,  // ir_emit_long
+        true,  // ir_emit_virtual_calls
+        true,  // ir_emit_fp (inc 32 — D call returns)
+    )
+}
+
 /// Stub `invoke_dispatch` that reads `num_args` i64 args from `args_ptr` and
 /// returns an order- AND count-sensitive function of them, so a marshalling bug
 /// (wrong order, wrong base, wrong count) produces a divergent result:
@@ -2187,6 +2205,266 @@ fn ir_vs_singlepass_dcmp_nan() {
     check_fp("dcmpg_nan_lhs", "()I", vec![0x0e, 0x0e, 0x6f, 0x0f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
     check_fp("dcmpl_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x97, 0xac], 0, 0, &[(vec![], -1)]);
     check_fp("dcmpg_nan_rhs", "()I", vec![0x0f, 0x0e, 0x0e, 0x6f, 0x98, 0xac], 0, 0, &[(vec![], 1)]);
+}
+
+// ── double RETURNS — method-level dreturn + D call returns (inc 32) ──────────
+//
+// A `double` result rides RAX as clean 64-bit bits (the JIT i64 return ABI; the
+// interpreter reads `result as u64` → `f64::from_bits`). The `dreturn` builder
+// arm + `Op::Return`'s `load_to_rax` need no XMM return marshalling, and a `D`
+// call result's `-0.0`/`i64::MIN` bit collision is disambiguated by the item-1
+// `dispatch_threw` peek (the call-site check matches `IrType::Double`).
+
+#[test]
+fn ir_vs_singlepass_double_return() {
+    // static double f(int x) { return (double)x + 1.0; }
+    //   iload_0; i2d; dconst_1; dadd; dreturn
+    let code = vec![0x1a, 0x87, 0x0f, 0x63, 0xaf];
+    let cm = cached("dret", "(I)D", code, 1, 1);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .expect("IR compile of double-returning method (FP gate)");
+    let sp =
+        compile_fp_opt(&cm, &helpers, false).expect("single-pass compile of double-returning method");
+    for x in [0i64, 5, -3, 100, -100, i32::MIN as i64] {
+        // SAFETY: both bodies take one int arg and return a double whose bits
+        // ride RAX; `try_call` returns that i64 (the f64 bit pattern).
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&[x]) }.unwrap() as u64);
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&[x]) }.unwrap() as u64);
+        let expected = x as f64 + 1.0;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR double-return for x={x}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass double-return for x={x}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_double_return() {
+    // static double f(int x) { return g(x) + 1.0; }   // g:(I)D
+    //   iload_0; invokestatic #2; dconst_1; dadd; dreturn
+    // The caller consumes a `double`-returning Op::Call result — exercises the
+    // `static_call_shape` D-return admission + `IrType::Double` call-result
+    // typing + the item-1 sentinel disambiguation on a D call result.
+    unsafe extern "C" fn dret_dispatch(_vm: i64, _i: i64, args_ptr: i64, _n: i64) -> i64 {
+        // g(x) = (double)x * 0.5, returned as raw f64 bits in RAX.
+        let x = unsafe { *(args_ptr as *const i64) } as i32;
+        ((x as f64) * 0.5).to_bits() as i64
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = dret_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0x0f, 0x63, 0xaf];
+    let cm = cached("f", "(I)D", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(I)D".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver)
+        .expect("IR compile of double-call-returning method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for x in [4i64, 5, -6, 0, 1000] {
+        let r = f64::from_bits(
+            unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[x]) }.unwrap() as u64,
+        );
+        let expected = (x as f64) * 0.5 + 1.0;
+        assert_eq!(r.to_bits(), expected.to_bits(), "D call-return for x={x}");
+    }
+}
+
+// ── float RETURNS — method-level freturn + F call returns (inc 33) ───────────
+//
+// A `float` result rides the LOW 32 of RAX; consumers read only the low 32
+// (interpreter `result as u32`; downstream `MOVSS`), so stale upper bits are
+// harmless EXCEPT the `+0.0f`/`i64::MIN`-bits collision on a call result, which
+// the call-site `dispatch_threw` peek (now `IrType::Float`) catches.
+
+#[test]
+fn ir_vs_singlepass_float_return() {
+    // static float f(int x) { return (float)x + 1.0f; }
+    //   iload_0; i2f; fconst_1; fadd; freturn
+    let code = vec![0x1a, 0x86, 0x0c, 0x62, 0xae];
+    let cm = cached("fret", "(I)F", code, 1, 1);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true)
+        .expect("IR compile of float-returning method (FP gate)");
+    let sp =
+        compile_fp_opt(&cm, &helpers, false).expect("single-pass compile of float-returning method");
+    for x in [0i64, 5, -3, 100, -100, i32::MIN as i64] {
+        // float bits ride the low 32 of RAX (stale upper bits are masked).
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&[x]) }.unwrap() as u32);
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&[x]) }.unwrap() as u32);
+        let expected = x as f32 + 1.0f32;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-return for x={x}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-return for x={x}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_float_return() {
+    // static float f(int x) { return g(x) + 1.0f; }   // g:(I)F
+    //   iload_0; invokestatic #2; fconst_1; fadd; freturn
+    unsafe extern "C" fn fret_dispatch(_vm: i64, _i: i64, args_ptr: i64, _n: i64) -> i64 {
+        let x = unsafe { *(args_ptr as *const i64) } as i32;
+        // g(x) = (float)x * 0.5f, returned as float bits.
+        ((x as f32) * 0.5f32).to_bits() as i64
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = fret_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0x0c, 0x62, 0xae];
+    let cm = cached("f", "(I)F", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(I)F".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver)
+        .expect("IR compile of float-call-returning method");
+    let dummy_vm = [0u8; 64];
+    for x in [4i64, 5, -6, 0, 1000] {
+        let r = f32::from_bits(
+            unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[x]) }.unwrap() as u32,
+        );
+        let expected = (x as f32) * 0.5f32 + 1.0f32;
+        assert_eq!(r.to_bits(), expected.to_bits(), "F call-return for x={x}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_return_min_bits_collision() {
+    // The float collision: a `+0.0f` call result whose RAX bits == i64::MIN (low
+    // 32 = 0 = +0.0f, upper 32 = 0x8000_0000 stale) must NOT be misread as the
+    // deopt sentinel. `dispatch_threw` reports no signal, the caller keeps it, and
+    // the low 32 (+0.0f) flows on → +0.0f + 1.0f = 1.0f. (i64::MIN has low-63 = 0,
+    // so ONLY +0.0f can ever collide for a float.)
+    unsafe extern "C" fn min_bits_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        i64::MIN // low 32 = 0 = +0.0f bits; upper 32 = stale 0x8000_0000
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = min_bits_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    // static float f(int x) { return g(x) + 1.0f; }
+    let code = vec![0x1a, 0xb8, 0x00, 0x02, 0x0c, 0x62, 0xae];
+    let cm = cached("f", "(I)F", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(I)F".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = f32::from_bits(
+        unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[7]) }.unwrap() as u32,
+    );
+    assert_eq!(
+        r.to_bits(),
+        1.0f32.to_bits(),
+        "a +0.0f call-return whose RAX bits == i64::MIN must be kept (→ +0.0f + 1.0f = 1.0f), not bailed"
+    );
+}
+
+// ── FP PARAMS + D/F call-ARGS (inc 34) ──────────────────────────────────────
+//
+// The VM uses the compact all-GPR i64 ABI: an FP param/arg arrives as bits in an
+// INTEGER register (`to_bits() as i64`), NOT XMM. The prologue stores it to the
+// param slot like any other param; `set_param_types` types it Float/Double (cat-2
+// two-slot layout for `D`), so a `dload`/`fload` reads it via `fp_load`. So a
+// method with an FP SIGNATURE (not just FP-internal) now takes the IR path.
+
+#[test]
+fn ir_vs_singlepass_double_param() {
+    // static double f(double a, int b) { return a + (double)b; }
+    //   dload_0; iload_2; i2d; dadd; dreturn   (a: D @ jvm 0-1, b: I @ jvm 2)
+    let code = vec![0x26, 0x1c, 0x87, 0x63, 0xaf];
+    let cm = cached("dparam", "(DI)D", code, 3, 2);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("IR double-param");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("single-pass double-param");
+    for (a, b) in [(1.5f64, 2i64), (-3.25, 7), (1e10, -5), (0.0, 0)] {
+        let args = [a.to_bits() as i64, b];
+        let r_ir = f64::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u64);
+        let r_sp = f64::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u64);
+        let expected = a + b as f64;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR double-param a={a},b={b}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass double-param a={a},b={b}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_param() {
+    // static float f(float a, int b) { return a + (float)b; }
+    //   fload_0; iload_1; i2f; fadd; freturn   (a: F @ jvm 0, b: I @ jvm 1)
+    let code = vec![0x22, 0x1b, 0x86, 0x62, 0xae];
+    let cm = cached("fparam", "(FI)F", code, 2, 2);
+    let helpers = dummy_helpers();
+    let ir = compile_fp_opt(&cm, &helpers, true).expect("IR float-param");
+    let sp = compile_fp_opt(&cm, &helpers, false).expect("single-pass float-param");
+    for (a, b) in [(1.5f32, 2i64), (-3.25, 7), (100.0, -5), (0.0, 0)] {
+        let args = [a.to_bits() as i64, b];
+        let r_ir = f32::from_bits(unsafe { ir.try_call(&args) }.unwrap() as u32);
+        let r_sp = f32::from_bits(unsafe { sp.try_call(&args) }.unwrap() as u32);
+        let expected = a + b as f32;
+        assert_eq!(r_ir.to_bits(), expected.to_bits(), "IR float-param a={a},b={b}");
+        assert_eq!(r_sp.to_bits(), expected.to_bits(), "single-pass float-param a={a},b={b}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_invokestatic_fp_args() {
+    // static double f(double a, float b) { return g(a, b); }   // g:(DF)D
+    //   dload_0; fload_2; invokestatic #2; dreturn   (a: D @ 0-1, b: F @ 2)
+    // Exercises a `double` arg + a `float` arg through `Op::Call` (marshalled as
+    // bits to the staging region) + the FP params of the caller + a `D` call return.
+    unsafe extern "C" fn dfarg_dispatch(_vm: i64, _i: i64, args_ptr: i64, n: i64) -> i64 {
+        assert_eq!(n, 2, "dfarg_dispatch expects (double, float)");
+        let p = args_ptr as *const i64;
+        let a = f64::from_bits(unsafe { *p } as u64); // arg0 = double (full 64 bits)
+        let b = f32::from_bits(unsafe { *p.add(1) } as u32); // arg1 = float (low 32)
+        (a + b as f64).to_bits() as i64
+    }
+    unsafe extern "C" fn never_threw() -> i64 {
+        0
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = dfarg_dispatch as *const () as usize;
+    helpers.dispatch_threw = never_threw as *const () as usize;
+    let code = vec![0x26, 0x24, 0xb8, 0x00, 0x02, 0xaf];
+    let cm = cached("f", "(DF)D", code, 3, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(DF)D".into()))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_dispatch_fp(&cm, &helpers, &resolver)
+        .expect("IR compile of FP-call-args method");
+    assert!(ir.needs_context());
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [(1.5f64, 2.5f32), (-3.0, 0.25), (1e9, -1.0), (0.0, 0.0)] {
+        let args = [a.to_bits() as i64, b.to_bits() as i64];
+        let r = f64::from_bits(
+            unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }.unwrap() as u64,
+        );
+        let expected = a + b as f64;
+        assert_eq!(r.to_bits(), expected.to_bits(), "FP call-args a={a},b={b}");
+    }
 }
 
 #[test]

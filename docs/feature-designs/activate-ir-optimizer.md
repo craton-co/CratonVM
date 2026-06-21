@@ -2039,10 +2039,50 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
      both variants; IR == single-pass == host) + E2E (all 5 relational operators
      on float/double incl. NaN) `== HotSpot` under `CRATONVM_JIT_IR_FP=1`.
    - **FP array load/store** (`faload`/`daload`/`fastore`/`dastore`).
-   - **FP params/returns + call-args** — XMM prologue/epilogue marshalling + an
-     FP-aware VM→JIT call convention (FP args in XMM0-3/0-7, FP return in XMM0).
-     This **also unlocks `double`/`float` call args + returns** (extend
-     `static_call_shape` to accept `D`/`F` once XMM marshalling exists).
+   - ✅ **FP params/returns + call-args — DONE (inc 32/33/34).** Key realization:
+     the VM uses the **compact all-GPR i64 ABI** — `execute_jit_call` /
+     `jit_invoke_dispatch` marshal every FP value as `to_bits() as i64` into an
+     INTEGER register, NOT XMM — so the doc's "FP args in XMM0-3/0-7" was wrong for
+     this VM and **no XMM register marshalling is needed anywhere** for the call
+     boundary. Returns landed in inc 32/33 (below); inc 34 finished params +
+     call-args:
+     - ✅ **FP params (inc 34).** Dropped the gate's `!fp_in_params` — the gate is
+       now FP-signature-agnostic (`fp_in_body` identifies FP methods). An FP param
+       arrives as bits in a GPR; the prologue stores it to the param slot like any
+       other param (`Op::Param` is a plain 64-bit copy from `(idx+1)*8`), and
+       `ir_param_types`/`set_param_types` already type it `Float`/`Double` (cat-2
+       two-slot layout for `D`, as for `J`), so a `dload`/`fload` reads the slot
+       via `fp_load`. Methods with FP SIGNATURES now take the IR path.
+     - ✅ **`D`/`F` call-args (inc 34).** `static_call_shape` admits `D`/`F` args
+       (one GPR slot each); the `Op::Call` marshaller stores the slot bits to the
+       staging region and `decode_dispatch_values` reads them back as
+       `Double`/`Float`.
+     - Validated: `ir_vs_singlepass` `…_double_param`/`…_float_param`/
+       `…_invokestatic_fp_args`; E2E (FpSig: FP-signature `hyp2`/`scalef`/`combine`
+       with FP params + FP call-args + FP call-returns) `== HotSpot`.
+     - ✅ **`double` returns — DONE (inc 32).** A `double` result rides RAX as a
+       clean 64-bit bit pattern (the i64 return ABI; the interpreter reads
+       `result as u64` → `f64::from_bits`), so NO XMM return marshalling is
+       needed: a new `dreturn` (0xaf) builder arm → `Op::Return`, whose existing
+       `load_to_rax` from the value's slot already returns the bits. The FP gate
+       splits `!fp_in_descriptor` into `!fp_in_params && !returns_float` (admits a
+       `D` return, keeps FP *params* and `float` returns off). `static_call_shape`
+       accepts a `D` *return* (the builder types the `Op::Call` `IrType::Double`);
+       the `-0.0`/`i64::MIN`-bits ↔ deopt-sentinel collision on a `D` call result
+       is handled by the item-1 `dispatch_threw` peek. Validated: `ir_vs_singlepass`
+       `…_double_return` + `…_invokestatic_double_return`; E2E (incl. a `-0.0`
+       call-return → `1.0/-0.0 = -Infinity`) `== HotSpot`.
+     - ✅ **`float` returns — DONE (inc 33).** A `float` result rides the LOW 32
+       of RAX; every consumer reads only the low 32 (interpreter `result as u32`
+       → `f32::from_bits`; downstream `MOVSS`), so the `load_to_rax`-from-slot
+       stale upper bits are harmless. The one hazard — a `+0.0f` whose stale upper
+       bits make RAX == `i64::MIN` on a `F` CALL result — is caught by the
+       call-site `dispatch_threw` peek (extended to `IrType::Float`/`b'F'` in both
+       backends; only `+0.0f` can collide since `i64::MIN` has low-63 = 0). The
+       gate dropped `!returns_float` (now just `!fp_in_params`); `freturn` (0xae)
+       joins `dreturn`; `static_call_shape` accepts a `F` return. Validated:
+       `ir_vs_singlepass` `…_float_return`/`…_invokestatic_float_return`/
+       `…_float_return_min_bits_collision`; E2E `== HotSpot`.
    - **`frem`/`drem`** (`fmod`-style remainder helper — no single instruction).
    - **FP-slot deopt resume** (let an FP value be live at a deopt — lifts the
      inc-30 int-div and `ldc2_w` exclusions). `typed_stack_slot` already carries

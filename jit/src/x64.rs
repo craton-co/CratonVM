@@ -13425,7 +13425,7 @@ impl Compiler {
         self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
                                                          // CMP RAX, R10  (4C 39 D0)
         self.buf.emit(&[0x4C, 0x39, 0xD0]);
-        if matches!(ret_type, b'J' | b'D') {
+        if matches!(ret_type, b'J' | b'D' | b'F') {
             // JNE .keep (0F 85 rel32) — common path: not the sentinel, keep RAX.
             self.buf.emit(&[0x0F, 0x85]);
             let keep_patch = self.buf.pos();
