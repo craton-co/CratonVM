@@ -248,10 +248,19 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     this is why the bogus first cut "passed" `bintrees18`@4g — that was gen; real
     G1 cannot fit it in 4g.
   - **App-suite no-regression on real G1**: **h2-testall-fast** PASS==PASS.
-    **hibernate-smoke** RED on **both** collectors (non-GC: ByteBuddy
-    `JavaDispatcher$DynamicClassLoader.proxy` `jsr/ret` verifier rejection, opt-out
-    `CRATONVM_ALLOW_JSR_RET=1`) — excluded, not G1. FieldStress (Step 4) stays
-    4495525842000 under G1.
+    **hibernate-smoke** was RED on **both** collectors (non-GC: ByteBuddy
+    `JavaDispatcher$DynamicClassLoader.proxy` `jsr/ret` verifier rejection) —
+    **now FIXED** and GREEN by default on both collectors. Root cause: the
+    HIGH-sec commit `ecfc3b30` made *every* `jsr/jsr_w/ret` method a hard
+    `VerifyError`, but that class is **major 49 (Java 5)** where the opcodes are
+    *legal* (JVMS §4.9.1 forbids them only at major ≥ 51) and HotSpot loads it.
+    Fix (`classloading/src/verifier.rs`): version-gate the rejection — accept
+    structurally-validated subroutines at major ≤ 50 (HotSpot's load decision),
+    keep the hard `VerifyError` at major ≥ 51 (genuinely malformed; HotSpot
+    rejects too). `CRATONVM_ALLOW_JSR_RET=1` is no longer needed for legal old
+    classes; it remains an any-version override. Verified: `HIB_SMOKE_OK` rc=0
+    under CratonVM **default flags** == HotSpot; 98/98 verifier unit tests green.
+    FieldStress (Step 4) stays 4495525842000 under G1.
   - **Throughput**: `matrix800` G1/gen = **1.05** (CV-G1 5410ms vs CV-default
     5163ms; CV-G1 ≈ 2.6× HotSpot-G1 2069ms — the interpreter+baseline-JIT gap).
   - **Pause-time**: NOT obtained. CratonVM's per-collection `[GC ...] pause=Nms`
