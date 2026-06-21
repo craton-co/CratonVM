@@ -21,6 +21,77 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+// ---------------------------------------------------------------------------
+// Shared-cache capacity bound
+// ---------------------------------------------------------------------------
+
+/// HIGH (security) — default upper bound on the number of entries held in each
+/// of the cross-thread shared maps (`global_methods`, `global_fields`,
+/// `promoted_invokes`).
+///
+/// The per-thread [`ThreadLocalResolveCache`] has always been bounded
+/// (`max_entries`, default 4096), but the shared maps grew without limit: an
+/// adversarial or dynamic-codegen workload that mints an unbounded number of
+/// distinct `(class, member, descriptor, loader)` keys — e.g. a class that
+/// emits fresh lambda / proxy / hidden-class names per call — would grow these
+/// maps until the process exhausts memory, a denial-of-service.
+///
+/// These maps are *pure caches*: every entry can be reconstructed by
+/// re-resolving against the class manager, so dropping an entry is always
+/// correctness-preserving (a miss simply re-resolves and re-promotes). That
+/// lets us pick the lowest-risk effective bound — a hard cap with approximate
+/// eviction — without touching the read path.
+///
+/// The default (65536 per map) is generous: a real application's live working
+/// set of resolved members is far smaller, so steady-state programs never hit
+/// the cap, while a key-minting adversary is held to a bounded footprint.
+const DEFAULT_SHARED_CACHE_CAP: usize = 65_536;
+
+/// Resolve the shared-cache capacity, honouring the `CRATONVM_RESOLVE_CACHE_CAP`
+/// environment override (mirrors the project's `CRATONVM_*` configuration
+/// convention). A value of `0`, an empty string, or an unparseable value falls
+/// back to [`DEFAULT_SHARED_CACHE_CAP`]; the cap can never be set below 1 so a
+/// freshly-inserted entry always survives.
+fn shared_cache_cap() -> usize {
+    match std::env::var("CRATONVM_RESOLVE_CACHE_CAP") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => DEFAULT_SHARED_CACHE_CAP,
+        },
+        Err(_) => DEFAULT_SHARED_CACHE_CAP,
+    }
+}
+
+/// Evict entries from a write-locked shared cache map until it can accept one
+/// more insert without exceeding `cap`, i.e. until `len < cap`.
+///
+/// This runs **only** while the caller already holds the map's write guard, so
+/// no reader or other writer can be touching the map concurrently — the
+/// eviction can never deadlock against the read path. Because the maps are pure
+/// caches, the eviction policy only needs to be *approximate*: we drop an
+/// arbitrary entry surfaced by the hash map's iteration order (cheap — no
+/// auxiliary ordering structure to maintain, unlike the thread-local FIFO). A
+/// wrongly-evicted entry costs at most one re-resolution.
+///
+/// Generic over the key/value so the same routine bounds all three shared maps.
+#[inline]
+fn evict_to_fit<K, V>(map: &mut FxHashMap<K, V>, cap: usize)
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    // Leave room for the imminent insert: shrink until `len < cap`. Guard on
+    // emptiness so a pathological `cap == 0` (already excluded by
+    // `shared_cache_cap`, but defended here for direct callers/tests) cannot
+    // spin forever.
+    while map.len() >= cap {
+        let victim = match map.keys().next() {
+            Some(k) => k.clone(),
+            None => break,
+        };
+        map.remove(&victim);
+    }
+}
+
 // Round-9 MED-1: doc cleanup. `SharedResolutionState` below holds three
 // `parking_lot::RwLock` maps (`global_methods`, `global_fields`,
 // `promoted_invokes`); the struct definition at the bottom of this file is the
@@ -483,8 +554,16 @@ impl SharedResolutionState {
     }
 
     /// Store a method resolution in the shared cache.  Acquires a write lock.
+    ///
+    /// HIGH (security) — the map is bounded at [`shared_cache_cap`] entries; if
+    /// inserting a *new* key would exceed the cap, an approximate eviction
+    /// drops an existing entry first so a key-minting workload cannot exhaust
+    /// memory. Re-caching an already-present key never evicts.
     pub fn cache_method(&self, key: ResolutionKey, target: ResolvedTarget) {
         let mut guard = self.global_methods.write();
+        if !guard.contains_key(&key) {
+            evict_to_fit(&mut guard, shared_cache_cap());
+        }
         guard.insert(key, target);
     }
 
@@ -497,8 +576,14 @@ impl SharedResolutionState {
     }
 
     /// Store a field resolution in the shared cache.  Acquires a write lock.
+    ///
+    /// HIGH (security) — bounded at [`shared_cache_cap`] entries; see
+    /// [`SharedResolutionState::cache_method`] for the rationale.
     pub fn cache_field(&self, key: ResolutionKey, field: ResolvedField) {
         let mut guard = self.global_fields.write();
+        if !guard.contains_key(&key) {
+            evict_to_fit(&mut guard, shared_cache_cap());
+        }
         guard.insert(key, field);
     }
 
@@ -541,8 +626,16 @@ impl SharedResolutionState {
     /// Promote a fully-built `CachedInvokeTarget` so sibling threads can
     /// populate their local invoke cache without repeating the slow
     /// resolution walk.  Acquires a write-lock.
+    ///
+    /// HIGH (security) — bounded at [`shared_cache_cap`] entries; a call site
+    /// minting unbounded distinct `(caller, cp_index, receiver)` keys cannot
+    /// grow this map without limit. Re-promoting an already-present call site
+    /// never evicts. See [`SharedResolutionState::cache_method`].
     pub fn insert_promoted_invoke(&self, key: PromotedInvokeKey, target: CachedInvokeTarget) {
         let mut guard = self.promoted_invokes.write();
+        if !guard.contains_key(&key) {
+            evict_to_fit(&mut guard, shared_cache_cap());
+        }
         guard.insert(key, target);
         self.promoted_inserts.fetch_add(1, Ordering::Relaxed);
     }
@@ -1177,5 +1270,152 @@ mod tests {
         // Both loaders' resolutions coexist; lookups don't cross over.
         assert_eq!(cache.get_method(&k_l1), Some(&l1_target));
         assert_eq!(cache.get_method(&k_l2), Some(&l2_target));
+    }
+
+    // -- HIGH security: shared-cache capacity bound -----------------------
+    //
+    // The cross-thread shared maps were previously unbounded — a workload
+    // minting unbounded distinct keys could exhaust memory (DoS). These
+    // tests prove the cap holds and that an evicted entry simply misses
+    // (re-resolution is correctness-preserving), never panics.
+
+    #[test]
+    fn evict_to_fit_keeps_map_under_cap() {
+        // Direct, env-independent test of the eviction core. Insert far more
+        // than `cap` entries, evicting before each insert, and assert the map
+        // never exceeds `cap`.
+        const CAP: usize = 8;
+        let mut map: FxHashMap<u64, u64> = fx_hashmap();
+        for i in 0..1000u64 {
+            evict_to_fit(&mut map, CAP);
+            map.insert(i, i);
+            assert!(
+                map.len() <= CAP,
+                "map exceeded cap: len={} cap={CAP}",
+                map.len()
+            );
+        }
+        // After the run the map is full but bounded.
+        assert_eq!(map.len(), CAP);
+    }
+
+    #[test]
+    fn evict_to_fit_zero_cap_does_not_spin_on_empty() {
+        // Defensive: a `cap == 0` against an empty map must terminate (the
+        // emptiness guard breaks the loop) rather than spin forever.
+        let mut map: FxHashMap<u64, u64> = fx_hashmap();
+        evict_to_fit(&mut map, 0);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn shared_cache_cap_parses_env_override() {
+        // Single test owns the env var across all its assertions so it does
+        // not race other tests on the process-global environment. Restored
+        // on every exit path.
+        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
+        let prev = std::env::var(VAR).ok();
+
+        std::env::set_var(VAR, "10");
+        assert_eq!(shared_cache_cap(), 10);
+
+        // Zero / empty / garbage all fall back to the generous default.
+        std::env::set_var(VAR, "0");
+        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        std::env::set_var(VAR, "");
+        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        std::env::set_var(VAR, "not-a-number");
+        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+
+        std::env::remove_var(VAR);
+        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+
+        // Restore whatever the harness had before.
+        match prev {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+
+    #[test]
+    fn shared_cache_method_field_promoted_stay_bounded_via_env_cap() {
+        // Drive the *public* insert paths through a small env cap and prove
+        // all three shared maps stay bounded while a key-minting workload
+        // floods distinct keys. Owns the env var for the whole test.
+        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
+        let prev = std::env::var(VAR).ok();
+        std::env::set_var(VAR, "16");
+
+        let state = SharedResolutionState::new();
+        for i in 0..500u64 {
+            // Distinct method, field, and promoted-invoke keys per iteration.
+            let mkey = key_from_parts(i, i, i);
+            state.cache_method(mkey, sample_target(i));
+
+            let fkey = key_from_parts(i ^ 0xFFFF, i, i);
+            state.cache_field(fkey, sample_field(i));
+
+            let pkey: PromotedInvokeKey =
+                (ClassId::new(i as u32), (i % 64) as u16, false, Some(ClassId::new((i + 1) as u32)));
+            state.insert_promoted_invoke(
+                pkey,
+                CachedInvokeTarget::VirtualBytecode {
+                    receiver_class_id: ClassId::new((i + 1) as u32),
+                    cached: sample_bytecode_method((i + 1) as u32),
+                    gate: crate::classloading::resolution::RedefineGate::never_stale(),
+                },
+            );
+
+            assert!(state.method_count() <= 16, "methods exceeded cap");
+            assert!(state.field_count() <= 16, "fields exceeded cap");
+            assert!(state.promoted_invoke_count() <= 16, "promoted exceeded cap");
+        }
+
+        // An early, long-since-evicted key now simply misses (no panic); a
+        // miss is correctness-preserving — the caller re-resolves.
+        let evicted = key_from_parts(0, 0, 0);
+        assert!(state.resolve_method(&evicted).is_none());
+
+        // Re-inserting that key works and is observable (still bounded).
+        state.cache_method(evicted.clone(), sample_target(0));
+        assert_eq!(state.resolve_method(&evicted), Some(sample_target(0)));
+        assert!(state.method_count() <= 16);
+
+        match prev {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+
+    #[test]
+    fn shared_cache_recache_existing_key_does_not_evict() {
+        // Re-caching an already-present key must not trigger eviction (the
+        // `contains_key` guard) — capacity is for *new* keys only.
+        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
+        let prev = std::env::var(VAR).ok();
+        std::env::set_var(VAR, "4");
+
+        let state = SharedResolutionState::new();
+        // Fill to exactly the cap with 4 distinct keys.
+        let keys: Vec<ResolutionKey> = (0..4u64).map(|i| key_from_parts(i, 7, 7)).collect();
+        for (i, k) in keys.iter().enumerate() {
+            state.cache_method(k.clone(), sample_target(i as u64));
+        }
+        assert_eq!(state.method_count(), 4);
+
+        // Re-cache an existing key with a new value: must update in place,
+        // not evict, and not grow.
+        state.cache_method(keys[1].clone(), sample_target(999));
+        assert_eq!(state.method_count(), 4);
+        assert_eq!(
+            state.resolve_method(&keys[1]),
+            Some(sample_target(999)),
+            "re-cache must update the value in place"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
     }
 }
