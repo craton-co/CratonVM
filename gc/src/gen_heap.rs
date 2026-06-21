@@ -2317,12 +2317,31 @@ impl GenerationalHeap {
         // so the "incompatible with non-moving" concern does not apply. This keeps
         // bt18 = 68332206 while closing the kafka register-invisible reclamation.
         let _shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
-        if crate::gc_quiescence::is_active() && !force_moving {
+        // Promotion-OOM avoidance: a MOVING (Cheney) young collection aborts the
+        // PROCESS when it cannot relocate a survivor — old gen is full AND the
+        // young to-space overflowed while promotion fell back to it (see the
+        // `process::abort()` in the forward path, ~line 5255). That can only
+        // happen once the old generation can no longer absorb the surviving young
+        // set. When old gen cannot hold a full young's worth of survivors, run
+        // the NON-MOVING sweep instead: it never relocates (so it can never hit
+        // that abort), reclaims any dead young in place, and simply leaves
+        // un-promotable survivors in young (graceful `old_full = true`). A
+        // genuinely exhausted heap then surfaces a *catchable*
+        // `OutOfMemoryError` via the allocation paths / GC-overhead limit instead
+        // of aborting. The non-moving sweep is already the default (and superior)
+        // young collector while JIT frames are active, so this only widens when
+        // it runs. Opt out with `CRATONVM_NO_GC_PROMOTION_GUARD` (reverts to the
+        // moving collector, which may abort the process on a full heap).
+        let promotion_oom_risk = std::env::var_os("CRATONVM_NO_GC_PROMOTION_GUARD").is_none() && {
+            let old_free = self.old_gen_capacity().saturating_sub(self.old_gen_used());
+            old_free < self.young_from_used()
+        };
+        if (crate::gc_quiescence::is_active() || promotion_oom_risk) && !force_moving {
             tracing::debug!(
-                "JIT frames are active (depth={}) — running non-moving \
-                 young-gen mark-sweep (compaction deferred until quiescence \
-                 ends).",
-                crate::gc_quiescence::depth(),
+                "running non-moving young-gen mark-sweep (jit_active={}, \
+                 promotion_oom_risk={}) — compaction deferred.",
+                crate::gc_quiescence::is_active(),
+                promotion_oom_risk,
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
             // BUG-V fix: the non-moving sweep still *relocates* objects via
