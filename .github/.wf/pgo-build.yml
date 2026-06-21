@@ -76,7 +76,6 @@ jobs:
           name: cratonvm-pgo
           path: |
             target/release/cratonvm
-            target/release/cratonvm-cli
           if-no-files-found: warn
           retention-days: 30
 
