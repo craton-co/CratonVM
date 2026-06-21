@@ -7585,6 +7585,36 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
     MethodCallFailed::ExceptionThrown(exc)
 }
 
+/// Build a *typed* `java.security.SignatureException` for a certificate whose
+/// signature could not be verified, and return it wrapped as a thrown Java
+/// exception.
+///
+/// `Certificate.verify(PublicKey)` is contractually required to throw on a bad
+/// signature — silently returning success is a certificate-verification
+/// vulnerability, because a caller treats `verify()` returning normally as
+/// proof that the certificate is trustworthy. Constructing the real
+/// `java.security.SignatureException` via `new_object_initialized` gives the
+/// thrown object the genuine `ClassId`, so handlers that
+/// `catch (SignatureException)` (or any superclass: `GeneralSecurityException`,
+/// `Exception`) match it correctly. If the class cannot be constructed we fall
+/// back to a `SecurityException` rather than swallowing the failure — the
+/// invariant is that verification failure NEVER returns normally.
+#[cfg(feature = "legacy-synthetic-crypto")]
+fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/SignatureException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 // --- jar-filesystem path encoding ---------------------------------------
 //
 // `FileSystemProvider.newFileSystem(Path jar, Map)` mounts the interior of a
@@ -12861,8 +12891,21 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(src))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; OutputStream.write([BII) contractually
+            // throws IndexOutOfBoundsException on bad bounds.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*src) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*src, off + i) {
@@ -30762,8 +30805,21 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "update", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(arr))) = args.get(1) {
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            // Validate signed off/len against the array length BEFORE casting to
+            // usize. A negative len would sign-extend into a huge usize and
+            // abort `Vec::with_capacity`; reject out-of-range ranges with
+            // IndexOutOfBoundsException as the JDK Mac/SPI does.
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr_len = ctx.array_length(*arr) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
+            let off = off as usize;
+            let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Value::Int(b) = ctx.get_array_element(*arr, off + i) {
@@ -32633,25 +32689,39 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: `Certificate.verify(PublicKey)` MUST throw on a bad signature.
+    // In the default build we deliberately DO NOT register a native override:
+    // the real `java.security.cert` / `X509CertImpl.verify(PublicKey)` bytecode
+    // then runs and performs the genuine signature check, throwing
+    // `SignatureException` (or `InvalidKeyException` / `CertificateException`)
+    // on failure. A no-op native that always returns `Ok(None)` would silently
+    // certify any certificate against any key — a verification-bypass
+    // vulnerability — so it is gated entirely behind the legacy feature.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         cert,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                    // Fail-closed: the legacy synthetic path can only attest to
+                    // the signature it is able to verify with the material it
+                    // holds. If verification does not succeed we throw rather
+                    // than returning normally, so a caller never mistakes an
+                    // unverifiable certificate for a verified one.
                     if !parsed.verify_signature(&parsed.public_key_bytes) {
-                        // For non-self-signed certs, verification with own key is expected to fail
-                        // We don't throw here as this is best-effort
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
                     }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
@@ -32867,23 +32937,33 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // SECURITY: see the `Certificate.verify` note above. The default build does
+    // NOT register this native, so the real `X509CertImpl.verify(PublicKey)`
+    // bytecode performs the genuine signature check and throws on failure.
+    // Previously this discarded the `verify_signature` result and always
+    // returned success, certifying any certificate against any key.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     r.register(
         x509,
         "verify",
         "(Ljava/security/PublicKey;)V",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
             if let Some(Value::Object(Some(this))) = args.get(0) {
                 let cert_id = match ctx.get_field(*this, 2) {
                     Value::Long(id) => id as u64,
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                    // Best-effort verification — doesn't throw on failure for now
-                    let _ = parsed.verify_signature(&parsed.public_key_bytes);
+                    // Fail-closed: propagate a verification failure as a thrown
+                    // SignatureException instead of discarding the result.
+                    if !parsed.verify_signature(&parsed.public_key_bytes) {
+                        return Err(p68_signature_failure(
+                            ctx,
+                            "certificate signature verification failed",
+                        ));
+                    }
                 }
             }
-            let _ = (ctx, args);
             Ok(None)
         },
     );
@@ -50003,5 +50083,101 @@ mod nb_phases_late_robustness_fix_tests {
         // (Reads process env; default branch returns Some(default).)
         let cap = gzip_max_inflated_bytes();
         assert!(cap.map(|c| c > 0).unwrap_or(true));
+    }
+}
+
+#[cfg(test)]
+mod cert_verify_bounds_security_tests {
+    use super::*;
+
+    // HIGH (cert-verify): In the default (non-legacy) build the no-op
+    // `verify(PublicKey)` natives MUST NOT be registered, so the real
+    // `java.security.cert` / `X509CertImpl.verify` bytecode performs the genuine
+    // signature check and throws on a bad signature. A registered no-op native
+    // here would silently certify any certificate against any key.
+    #[cfg(not(feature = "legacy-synthetic-crypto"))]
+    #[test]
+    fn verify_natives_not_registered_in_default_build() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(
+            r.find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "Certificate.verify must fall through to real bytecode in the default build"
+        );
+        assert!(
+            r.find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_none(),
+            "X509Certificate.verify must fall through to real bytecode in the default build"
+        );
+    }
+
+    // Under the legacy feature the natives exist (and now throw on failure).
+    #[cfg(feature = "legacy-synthetic-crypto")]
+    #[test]
+    fn verify_natives_registered_under_legacy_feature() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_security_cert(&mut r);
+        assert!(r
+            .find(
+                "java/security/cert/Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/security/cert/X509Certificate",
+                "verify",
+                "(Ljava/security/PublicKey;)V"
+            )
+            .is_some());
+    }
+
+    // MEDIUM (alloc DoS): the bounds-checked natives stay registered; the guard
+    // lives inside the closure. Verify the offset/length predicate that gates
+    // `Vec::with_capacity` rejects negative/huge args before allocation.
+    #[test]
+    fn bounds_predicate_rejects_negative_and_overflowing_ranges() {
+        // Mirror of the in-native check: off < 0 || len < 0 || off+len > arr_len,
+        // evaluated in i64 so a negative i32 cannot sign-extend into a huge usize.
+        fn bad(off: i32, len: i32, arr_len: i64) -> bool {
+            off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len
+        }
+        // Negative length (the abort/over-allocation case).
+        assert!(bad(0, -1, 16));
+        // Negative offset.
+        assert!(bad(-1, 4, 16));
+        // i32::MIN length must not be treated as a valid (huge) usize.
+        assert!(bad(0, i32::MIN, 16));
+        // Range exceeding the array.
+        assert!(bad(8, 16, 16));
+        // Valid ranges are accepted.
+        assert!(!bad(0, 16, 16));
+        assert!(!bad(4, 8, 16));
+        assert!(!bad(0, 0, 0));
+    }
+
+    #[test]
+    fn mac_and_zip_byterange_natives_remain_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_crypto_mac(&mut r);
+        assert!(r
+            .find("javax/crypto/Mac", "update", "([BII)V")
+            .is_some());
+
+        let mut r2 = NativeMethodRegistry::new();
+        register_p58_gzip_streams(&mut r2);
+        assert!(r2
+            .find("java/util/zip/ZipOutputStream", "write", "([BII)V")
+            .is_some());
     }
 }
