@@ -4,12 +4,15 @@
 //! `difftest` — the semantic differential fuzzer CLI (design
 //! `docs/feature-designs/differential-fuzzer.md`).
 //!
-//! Subcommands: `run` (A/B the corpus), `gen` (generate programs), `min`
-//! (minimize a repro), `gate` (CI gate). As of **Step 1**, `run` is wired —
-//! it compiles each seed once, runs it on CratonVM and HotSpot, diffs the four
-//! channels, and (with `--update-ledger`) writes the ledger. `gen` / `min` are
-//! still stubs; `gate` honors the §3.5 exit-code contract (the committed-ledger
-//! new-vs-known verdict lands in Step 3).
+//! Subcommands:
+//! * `run` — A/B the corpus across the CratonVM mode matrix vs HotSpot, diff
+//!   the four channels, auto-classify, optionally write the ledger.
+//! * `gen` — emit a seeded, reproducible, type-directed corpus (Step 4).
+//! * `mutate` — perturb a compiled seed's constant pool and A/B each mutant
+//!   (Step 5).
+//! * `min` — ddmin-shrink a confirmed divergence to a minimal repro (Step 6).
+//! * `gate` — diff a fresh run against the committed ledger; exit per the §3.5
+//!   contract (0 ok / 1 new-or-drift / 2 fixed-reopened / 3 bootstrap).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use cratonvm_difftest::generate::{self, Rng, TargetFamily};
 use cratonvm_difftest::harness::{self, RunOne};
 use cratonvm_difftest::ledger::{self, Ledger};
+use cratonvm_difftest::minimize;
 use cratonvm_difftest::mutate;
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
 
@@ -164,8 +168,30 @@ struct MutateArgs {
 
 #[derive(Args)]
 struct MinArgs {
-    /// The confirmed-divergent program to shrink.
+    /// The confirmed-divergent `.java` program to shrink.
     program: PathBuf,
+
+    /// Comma-separated CratonVM modes (the divergence must reproduce in one).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "jit-on,nojit",
+        value_parser = parse_one_mode
+    )]
+    modes: Vec<Mode>,
+
+    /// Where to write the minimized repro (default:
+    /// `difftest/regression/<Class>.java`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Hard per-run timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
+    timeout_secs: u64,
+
+    /// Explicit JDK home (else `DIFFTEST_JAVA_HOME`, else PATH).
+    #[arg(long)]
+    jdk: Option<PathBuf>,
 }
 
 /// clap per-value parser for `--modes`.
@@ -469,9 +495,111 @@ fn cmd_mutate(args: &MutateArgs) -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_min(args: &MinArgs) -> ExitCode {
-    println!("difftest min — planned, not yet wired (Step 6).");
-    println!("  program: {}", args.program.display());
-    println!("  -> Step 6 will ddmin-shrink the repro and commit it under difftest/regression/.");
+    let bin = match runner::cratonvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "difftest min: cratonvm binary not found — exit {}.",
+                exit::BOOTSTRAP
+            );
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    if !runner::java_available(args.jdk.as_deref()) {
+        eprintln!("difftest min: java not found — exit {}.", exit::BOOTSTRAP);
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+    if args.program.extension().and_then(|s| s.to_str()) != Some("java") {
+        eprintln!(
+            "difftest min: source minimization needs a .java seed (got {}).",
+            args.program.display()
+        );
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+    let source = match std::fs::read_to_string(&args.program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("difftest min: cannot read {}: {e}", args.program.display());
+            return ExitCode::from(exit::BOOTSTRAP);
+        }
+    };
+    let class_name = args
+        .program
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let workdir = std::env::temp_dir().join(format!("difftest_min_{}", std::process::id()));
+    let pred_dir = workdir.join("p");
+    let _ = std::fs::create_dir_all(&pred_dir);
+    let java_path = pred_dir.join(format!("{class_name}.java"));
+    let timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let config = RunnerConfig {
+        timeout,
+        jdk_home: args.jdk.clone(),
+        modes: args.modes.clone(),
+        reconfirm: true,
+        ..RunnerConfig::for_corpus(pred_dir.clone())
+    };
+
+    // Interestingness predicate: the candidate still compiles AND still diverges.
+    let predicate = |candidate: &str| -> bool {
+        if std::fs::write(&java_path, candidate).is_err() {
+            return false;
+        }
+        if runner::compile_java(&java_path, &pred_dir, args.jdk.as_deref(), timeout).is_err() {
+            return false; // didn't compile
+        }
+        matches!(
+            harness::run_one(&bin, &pred_dir, &class_name, &config.modes, &config, java_path.clone()),
+            Ok(RunOne::Result(r)) if r.diverged()
+        )
+    };
+
+    let original_lines = source.lines().count();
+    println!("difftest min — confirming {class_name} ({original_lines} lines) diverges ...");
+    if !predicate(&source) {
+        eprintln!(
+            "difftest min: {class_name} does not compile-and-diverge under modes {} — \
+             nothing to minimize.",
+            config
+                .modes
+                .iter()
+                .map(|m| m.label())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
+        return ExitCode::from(exit::BOOTSTRAP);
+    }
+
+    let minimized = minimize::minimize_source(&source, predicate);
+
+    // Write the minimized repro (it keeps the same public class ⇒ same file name).
+    let out = args.out.clone().unwrap_or_else(|| {
+        runner::workspace_root()
+            .join("difftest")
+            .join("regression")
+            .join(format!("{class_name}.java"))
+    });
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let write_ok = std::fs::write(&out, &minimized.source).is_ok();
+
+    println!(
+        "difftest min — {class_name}: {original_lines} → {} lines ({} reduction steps)",
+        minimized.lines, minimized.steps
+    );
+    if write_ok {
+        println!("  wrote minimized repro: {}", out.display());
+    } else {
+        eprintln!("  (could not write {})", out.display());
+    }
+    println!("--- minimized repro ---\n{}", minimized.source.trim_end());
+
+    let _ = std::fs::remove_dir_all(&workdir);
     ExitCode::from(exit::OK)
 }
 

@@ -87,3 +87,25 @@ normalizer (design §3.3). Default comparison is **strict equality**; a seed mus
 *declare* it needs a normalizer via a `// difftest: <pragma>` header. This keeps
 the oracle sound — any CratonVM≠HotSpot diff on an accepted program is a real
 bug, not a coin flip.
+
+## Tiers
+
+The corpus comes in three tiers of increasing blast radius (design §3.1):
+
+1. **Curated seeds** (`seeds/`) — small, fully-observable, self-printing
+   programs; the committed gate corpus.
+2. **Generated** (`difftest gen`) — seeded, reproducible, type-directed
+   programs; and **mutated** (`difftest mutate`) — constant-pool perturbations
+   of a compiled seed.
+3. **Macro tier** — whole real programs as oversized seeds. Point `difftest
+   run` at any directory of `.java`/`.class` (e.g. `bench/*.java`, or programs
+   under `apps/`); the same four-channel oracle applies, with the per-run
+   timeout turning a CratonVM hang into a `Hang` divergence. Because real apps
+   are often nondeterministic (threads, wall-clock, hashmap order), run the
+   macro tier with `--check-determinism` so the twice-on-HotSpot pre-flight
+   rejects flaky programs rather than admitting a coin-flip — the macro tier is
+   an *rc + first-divergence* signal, not a strict full-transcript gate.
+
+The bytecode tier also has a fast in-process panic fuzzer
+(`cargo +nightly fuzz run difftest_bytecode`, see `fuzz/README.md`), which is
+onboarded to the OSS-Fuzz `build.sh` sketch there.
