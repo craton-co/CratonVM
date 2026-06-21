@@ -1351,18 +1351,27 @@ impl ValueStack {
                 let bits = cv.to_bits();
                 if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
                     if let Some(&new_addr) = pointer_map.get(&old_ptr) {
-                        // B10: distinguish the legitimate JNI long-as-jobject
-                        // smuggle path from a coincidental bit-pattern match.
-                        // `scan_object_refs` rooted this slot ONLY when
-                        // `heap.is_heap_addr(old_ptr)` succeeded — so the
-                        // pointer_map entry is only authoritative for slots
-                        // that pass the same heap-membership check. A plain
-                        // long/double whose bit pattern happens to fall in the
-                        // address range and also collides with a moved
-                        // object's old address must NOT be rewritten: doing
-                        // so corrupts a perfectly valid value. Mirrors C7 in
-                        // interpreter.rs.
-                        if heap.is_heap_addr(old_ptr).is_some() {
+                        // B10 / Step 5 GAP A: distinguish a legitimate JNI
+                        // long-as-jobject smuggle from a coincidental bit-pattern
+                        // match — but probe the RELOCATION TARGET (`new_addr`),
+                        // not the from-space `old_ptr`. `old_ptr` is post-GC: the
+                        // generational collector leaves it resolvable (the
+                        // from-space semi-space is repurposed, never freed), but
+                        // G1 resets the evacuated CSet region to `Free`, so
+                        // `is_heap_addr(old_ptr)` returns None for precisely the
+                        // genuinely-moved jobjects that need rewriting — leaving
+                        // the smuggle STALE (UAF; e.g. WildFly jboss-modules). The
+                        // moved object's new address is always a live region for
+                        // both collectors, so gating on `is_heap_addr(new_addr)`
+                        // rewrites genuine smuggles under G1 too while still
+                        // preserving a coincidental long whose key maps to a
+                        // non-heap target. (A primitive long whose bits collide
+                        // with a *real* moved object's key is rewritten under both
+                        // collectors — a rare pre-existing ambiguity that
+                        // CRATONVM_LONGROOT_STRICT resolves precisely.) The object
+                        // arm above already gates on pointer_map membership for
+                        // the same reason (H2 stale-stack crash).
+                        if heap.is_heap_addr(new_addr).is_some() {
                             // Preserve the slot's raw-bits encoding (the
                             // smuggle stores the pointer verbatim as the slot's
                             // bits, for both the tagged-`Long` and untagged-
@@ -1788,6 +1797,47 @@ mod tests {
             slot.to_bits(),
             new_addr,
             "update_object_refs must remap the rooted smuggle to the moved address"
+        );
+    }
+
+    #[test]
+    fn smuggled_jobject_remapped_when_old_region_freed_g1() {
+        // Step 5 GAP A regression: under G1 the evacuated CSet region is reset to
+        // `Free`, so post-GC `is_heap_addr(old_ptr)` returns None for a genuinely
+        // moved object. The remap must still rewrite the smuggle (gate on the live
+        // `new_addr`, not the freed `old_ptr`). Model the freed from-space with an
+        // `old_addr` that is not in any live region while `new_addr` is a real,
+        // live object — exactly the asymmetry G1's CSet-free creates.
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use cratonvm_types::ClassId;
+        use std::collections::HashMap;
+
+        let heap = VmHeap::new(GcBackend::G1, 16 * 1024 * 1024);
+        let b = heap.alloc_object(ClassId::new(0), 0);
+        let new_addr = b.as_ptr() as u64;
+        // A pointer-shaped (8-aligned, sub-2^48) address that is NOT in any live
+        // region — `is_heap_addr` returns None, as it would for a freed CSet slot.
+        let old_addr: u64 = 0x1_0000;
+        assert!(
+            heap.is_heap_addr(old_addr as usize).is_none(),
+            "old_addr must look freed (not in a live region)"
+        );
+        assert!(
+            heap.is_heap_addr(new_addr as usize).is_some(),
+            "new_addr must be a live relocated object"
+        );
+
+        let mut stack = ValueStack::new(4);
+        stack.push_long(old_addr as i64).unwrap();
+        let mut map = HashMap::new();
+        map.insert(old_addr as usize, new_addr as usize);
+        stack.update_object_refs(&map, &heap);
+
+        assert_eq!(
+            stack.peek_compact().to_bits(),
+            new_addr,
+            "smuggle must be remapped even though old_addr's region was freed (G1)"
         );
     }
 
