@@ -1859,8 +1859,13 @@ impl G1Collector {
                 } else {
                     // SAFETY: slot_idx < num_slots, within the allocated object.
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
-                    // SAFETY: slot_ptr is a properly aligned Value within the object.
-                    unsafe { std::ptr::read(slot_ptr as *const Value) }
+                    // Concurrent-mark torn-read fix: this scan runs concurrently
+                    // with JIT-compiled field stores, which write the 16-byte
+                    // slot directly (bypassing the regions-lock-serialized
+                    // `set_field`). Read the slot as two atomic words so the
+                    // access is well-defined and cannot splice a garbage pointer.
+                    // SAFETY: slot_ptr is a properly aligned live Value slot.
+                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
                 };
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();

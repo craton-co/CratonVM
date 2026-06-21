@@ -2115,7 +2115,10 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         eprintln!("[JIT-PFI] obj=0x{:x} class_id={} field_index={} val=0x{:x} (val_as_i32={}) prev_value={:?}",
             obj_ptr as usize, cid, field_index, val as u64, val as i32, existing);
     }
-    std::ptr::write(ptr as *mut Value, Value::Int(val as i32));
+    // Atomic per-word store: the concurrent GC marker may read this 16-byte
+    // slot at the same time (it scans object fields concurrently). See
+    // `cratonvm_types::write_value_atomic`.
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Int(val as i32));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2132,7 +2135,9 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Long(val));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Long(val));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2149,7 +2154,9 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -2166,7 +2173,9 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    std::ptr::write(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
+    // Atomic per-word store (concurrent-GC torn-read safety; see
+    // `write_value_atomic`).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -2254,12 +2263,15 @@ pub unsafe extern "C" fn jit_putfield_object(
     // `GarbageCollector::write_barrier_pre` trait alias lands, this call
     // should migrate to it so the debug-build (pre, store, post) triad
     // assertion in `gc/src/vm_heap.rs` can validate slot-identity pairing.
-    let old_value: Value = std::ptr::read(ptr as *const Value);
+    // Atomic per-word read/write: the slot is read concurrently by the GC
+    // marker and (possibly) written by another mutator thread; pair both ends
+    // through the atomic helpers so the access is well-defined and tear-free.
+    let old_value: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
     if let Value::Object(Some(_)) = old_value {
         let heap = heap_from_vm(vm_ptr);
         heap.satb_barrier(old_value);
     }
-    std::ptr::write(ptr as *mut Value, value);
+    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
         heap.write_barrier(obj_ref, value);
