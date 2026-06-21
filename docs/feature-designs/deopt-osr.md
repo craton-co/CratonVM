@@ -382,14 +382,38 @@ feature branch. All additive and gated **unreachable in production**
   end-to-end execution is not yet driven by a runtime test (needs a BCE compile+invoke
   harness — folds into the Step-4 resume test).
 
-Not yet done: x64 deopt-exit **Steps 3–4** (build + validate the interpreter
-`Frame` at the sink; flip the resume behind `CRATONVM_DEOPT_REAL`), then **Step 5+**
-of the backport (coverage-gate finalize + eager-deopt verifier, widen guards);
-deopt-osr **Step 7+** (OSR-exit map emission + flip) + the x64
-`emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
+- **x64 deopt-exit Step 3 — build + validate the interpreter Frame at the sink
+  (no resume).** At the interpreter deopt sink, under `CRATONVM_DEOPT_REAL`, the
+  stashed `ReconstructedFrame` is now turned into a real interpreter `Frame`:
+  `ir_deopt_frame_values_with_objects` maps Int + **Object** refs (refusing
+  cat-2/`Unsupported`/virtual/FP/unresolved → re-run); `build_deopt_frame_inner`
+  GC-roots the reconstructed oops in `native_pin_roots` **before**
+  `refill_pools_from_shared` (whose `acquire()` may GC), **re-reads** each oop
+  from its forwarded pin slot after refill (moving-GC correct), builds the Frame
+  via `Frame::new_pooled` at the trapping bci, and returns it; the wrapper
+  `build_validate_discard_ir_deopt` discards it and STILL re-runs (CacheMiss) —
+  a live soak of the reconstruction/rooting/build machinery, no resume yet.
+  Designed via an Understand→adversarial-Verify workflow whose GC-rooting
+  reviewer caught the real bugs (cache-forwarded-ref staleness → re-read from
+  pins + stress-GC only before refill; `debug_assert` pin-leak → single
+  guaranteed truncate, validation moved to tests). Gate-OFF (default):
+  byte-identical (the build is inside `if deopt_real_enabled()`; the existing
+  `CRATONVM_IR_DEOPT_RESUME` int-resume path is untouched). Verified: 4 unit
+  tests pass (mapper; refuse-unmappable-without-pin-leak; build int+object frame;
+  **Object survives a forced GC during the build**); vm lib compiles green, no
+  new warnings; `memory::roots` tests pass in isolation (the full-suite failures
+  are pre-existing parallel-test pollution, surfaced only because the `oscache`
+  compile-break — `task_f849e93a` — was temp-patched to run the suite, and reverted).
+
+Not yet done: x64 deopt-exit **Step 4** (flip the resume — `push_frame_and_fire_entry`
+→ FramePushed — behind `CRATONVM_DEOPT_REAL`; + the end-to-end BCE compile→invoke
+runtime test that drives the Step-2 stub → entry → sink), then **Step 5+** of the
+backport (coverage-gate finalize + eager-deopt `CRATONVM_DEOPT_VERIFY` differential
+verifier, widen guards); deopt-osr **Step 7+** (OSR-exit map emission + flip) + the
+x64 `emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
 `materialize_virtual_objects` into the live resume path (flip `can_deopt_resume`
-for virtual-bearing frames). Until the resume lands, the materializer tests drive
-it on synthetic frames rather than through a real guard deopt.
+for virtual-bearing frames). Until the resume lands, the build is discarded and
+the method re-runs from entry.
 
 ## Risks & open questions
 
