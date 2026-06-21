@@ -6292,6 +6292,23 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 };
             return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
         }
+        // keySet() view: `contains(k)` must follow the SOURCE map's (possibly
+        // overridden) `containsKey`, exactly like the entrySet branch above —
+        // not a direct lookup in the native backing. Spring's
+        // LinkedCaseInsensitiveMap backs its keySet on an inner LinkedHashMap
+        // whose `containsKey` is overridden to be case-insensitive; a direct
+        // native lookup bypassed that override so `keySet().contains("KEY")`
+        // returned false (LinkedCaseInsensitiveMapTests putAndGet /
+        // putWithOverlappingKeys).
+        if view_backing_kind(ctx, backing) == VIEW_KIND_KEYSET {
+            let has =
+                ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[elem])?;
+            return Ok(Some(Value::Int(if matches!(has, Some(Value::Int(1))) {
+                1
+            } else {
+                0
+            })));
+        }
     }
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
