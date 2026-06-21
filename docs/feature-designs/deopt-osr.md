@@ -362,15 +362,34 @@ feature branch. All additive and gated **unreachable in production**
   `i64::MIN` re-run is unchanged. The primitive width/type source and
   register-resident-oop typing are deferred (gated later by `can_deopt_resume`).
 
-Not yet done: x64 deopt-exit **Steps 2–4** (in-stub 3-arg `x64_deopt_entry` +
-16-GPR spill into `SavedRegisters`; build + validate the interpreter `Frame` at
-the sink; flip the resume behind `CRATONVM_DEOPT_REAL`), then **Step 5+** of the
-backport (coverage-gate finalize + eager-deopt verifier, widen guards); deopt-osr
-**Step 7+** (OSR-exit map emission + flip) + the x64 `emit_osr_exit_map_at` /
-`osr_exit_points` scaffolding; and wiring `materialize_virtual_objects` into the
-live resume path (flip `can_deopt_resume` for virtual-bearing frames). Until the
-x64 trampoline + resume land, the materializer tests drive it on synthetic frames
-rather than through a real guard deopt.
+- **x64 deopt-exit Step 2 — in-stub 3-arg trampoline (stash-only).** `x64_deopt_entry`
+  (jit `deopt.rs`) mirrors `ir_deopt_entry` but takes the spilled 16-GPR file, so
+  `FrameValue::Register(r)` resolves against the **live** register `r` (vs the IR
+  path's default-zeros). It stashes `LAST_DEOPT` and returns `i64::MIN` — **no**
+  `set_jit_deopt_pending` (the interpreter sink's `take_last_deopt()`-keyed block
+  runs first and clears it), so the entry has no vm dependency and lives in the
+  jit crate, baked directly by the stub (no `jit-api`/helper-pointer change). The
+  frame-deopt stub (in `emit_deopt_stubs`, gated `deopt_real_enabled() && reason==2`)
+  spills RAX..R15 into a 128-byte `SavedRegisters` region reserved in the frame
+  (`deopt_regs_base`), sets the 3 args (Win RCX/RDX/R8, SysV RDI/RSI/RDX), CALLs
+  the entry **before** the epilogue, returns the sentinel. Gate OFF (default) ⇒
+  `deopt_regs_size=0` + the uncommon-trap path emits byte-identically. Designed via
+  an Understand→adversarial-Verify workflow (the keying, spill-order, and
+  ordering were the load-bearing risks). Verified: `x64_deopt_entry` unit tests
+  (Register-resolution + null-safety) pass; full jit suite green except a
+  PRE-EXISTING dev crash (`intrinsic_arraycopy`, filed separately) — no regression,
+  gate-off byte-identical. STASH ONLY — no resume (Step 4); the emitted stub's
+  end-to-end execution is not yet driven by a runtime test (needs a BCE compile+invoke
+  harness — folds into the Step-4 resume test).
+
+Not yet done: x64 deopt-exit **Steps 3–4** (build + validate the interpreter
+`Frame` at the sink; flip the resume behind `CRATONVM_DEOPT_REAL`), then **Step 5+**
+of the backport (coverage-gate finalize + eager-deopt verifier, widen guards);
+deopt-osr **Step 7+** (OSR-exit map emission + flip) + the x64
+`emit_osr_exit_map_at` / `osr_exit_points` scaffolding; and wiring
+`materialize_virtual_objects` into the live resume path (flip `can_deopt_resume`
+for virtual-bearing frames). Until the resume lands, the materializer tests drive
+it on synthetic frames rather than through a real guard deopt.
 
 ## Risks & open questions
 

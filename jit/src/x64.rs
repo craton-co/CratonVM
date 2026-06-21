@@ -6179,9 +6179,20 @@ struct Compiler {
     /// Emit-and-discard for now — no live path consumes them until the in-stub
     /// trampoline + resume land (`real-frame-deopt-x64-backport.md` Steps 2-4).
     deopt_points: Vec<crate::deopt::DeoptimizationPoint>,
-    /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the future
+    /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
+    /// deopt-osr Step 2: frame offset (positive depth-from-RBP) of the DEEPEST
+    /// qword of the always-reserved 128-byte `SavedRegisters{gpr:[u64;16]}`
+    /// region the frame-deopt stub spills into. `gpr[r]` is stored at
+    /// `[rbp - (deopt_regs_base - r*8)]`, so `gpr[0]=RAX` is the deepest/lowest
+    /// address and `LEA [rbp - deopt_regs_base] == &gpr[0]`. 0 unless
+    /// `deopt_real_enabled()` reserved the region at construction.
+    deopt_regs_base: i32,
+    /// deopt-osr Step 2: bci → stable pointer to the boxed `DeoptimizationPoint`
+    /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
+    /// by `emit_deopt_snapshot_at_guard`.
+    deopt_box_ptr_by_bci: rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
 }
 
 /// deopt-osr Step 1: map a frame slot's machine location + oop-ness to a
@@ -6383,14 +6394,31 @@ impl Compiler {
         };
         let reg_spill_base = xmm_saved_base + xmm_saved_size;
 
+        // deopt-osr Step 2 — 128-byte SavedRegisters{gpr:[u64;16]} region for the
+        // frame-deopt stub's in-stub 16-GPR spill. Reserved only under
+        // CRATONVM_DEOPT_REAL so the default frame is byte-identical. Placed just
+        // BELOW (deeper than) the per-safepoint reg-spill region and above the
+        // shadow/stack-arg region. `deopt_regs_base` is the offset of the DEEPEST
+        // qword (gpr[0]=RAX, lowest address): gpr[r] at [rbp - (deopt_regs_base -
+        // r*8)] so the 16 slots ascend with r from &gpr[0] = [rbp - deopt_regs_base].
+        let deopt_regs_size = if crate::deopt_real_enabled() { 16 * 8 } else { 0 };
+        debug_assert!(deopt_regs_size == 0 || deopt_regs_size == 128);
+        let deopt_regs_base = if deopt_regs_size != 0 {
+            reg_spill_base + reg_spill_size + deopt_regs_size
+        } else {
+            0
+        };
+
         // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs
         //             + per-safepoint reg-spill (SB-CRASH-04)
+        //             + frame-deopt SavedRegisters region (deopt-osr Step 2)
         //             + shadow space + room for in-frame stack args.
         let total = locals_size
             + spill_size
             + callee_saved_size
             + xmm_saved_size
             + reg_spill_size
+            + deopt_regs_size
             + shadow_space
             + stack_arg_reserve;
 
@@ -6543,6 +6571,8 @@ impl Compiler {
             param_slot_span: 0,
             deopt_points: Vec::new(),
             deopt_boxes: Vec::new(),
+            deopt_regs_base,
+            deopt_box_ptr_by_bci: FxHashMap::default(),
         }
     }
 
@@ -6722,9 +6752,16 @@ impl Compiler {
                 caller: None,
             },
         };
-        // Record a stable boxed copy (the future imm64-baked stub loads it by
-        // pointer) and the by-value point (find_deopt_point / iteration).
+        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
+        // the by-value point (find_deopt_point / iteration).
         self.deopt_boxes.push(Box::new(point.clone()));
+        // deopt-osr Step 2 — stash the Box's stable payload address keyed by bci.
+        // The Box payload does not move when `deopt_boxes` reallocs or when it is
+        // moved into `CompiledMethod._deopt_point_boxes` at finalize (and is leaked
+        // on Drop), so a baked imm64 of this pointer outlives the emitted code.
+        let box_ptr: *const crate::deopt::DeoptimizationPoint =
+            &**self.deopt_boxes.last().unwrap();
+        self.deopt_box_ptr_by_bci.insert(bci, box_ptr);
         self.deopt_points.push(point);
     }
 
@@ -13403,6 +13440,56 @@ impl Compiler {
             let stub_off = self.buf.pos();
             stub_offsets.insert(key, stub_off);
 
+            // deopt-osr Step 2 — route ONLY the BCE pilot guard (reason 2) to the
+            // in-stub 3-arg frame-deopt trampoline, and only under
+            // CRATONVM_DEOPT_REAL with a recorded snapshot for this bci. Gate OFF
+            // (default) ⇒ false ⇒ the uncommon-trap path below emits byte-identically.
+            let frame_deopt = crate::deopt_real_enabled()
+                && reason == 2
+                && self.deopt_box_ptr_by_bci.contains_key(&bci);
+            if frame_deopt {
+                let box_ptr = *self.deopt_box_ptr_by_bci.get(&bci).unwrap();
+                let base = self.deopt_regs_base;
+                // 1) Spill all 16 GPRs (RAX=0..R15=15) into the SavedRegisters
+                //    region FIRST, before any arg-setup clobbers a register: the
+                //    guard `JB` reaches here with every GPR still holding its
+                //    trapping-instant value. gpr[r] -> [rbp - (base - r*8)], so
+                //    gpr[0]=RAX is the deepest slot and ascends with r.
+                for r in 0u8..16 {
+                    self.emit_store_local(base - (r as i32) * 8, r);
+                }
+                // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
+                //    arg1 = rbp (live, never clobbered until the epilogue),
+                //    arg2 = &SavedRegisters = LEA [rbp - base] = &gpr[0].
+                #[cfg(target_os = "windows")]
+                {
+                    self.emit_mov_imm64_full(RCX, box_ptr as usize as i64);
+                    self.emit_mov_reg_reg(RDX, RBP);
+                    self.emit_lea_frame_slot(R8, base);
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    self.emit_mov_imm64_full(RDI, box_ptr as usize as i64);
+                    self.emit_mov_reg_reg(RSI, RBP);
+                    self.emit_lea_frame_slot(RDX, base);
+                }
+                // 3) CALL the jit-crate 3-arg entry BEFORE the epilogue (rbp + the
+                //    spill region are still live; reconstruction reads gpr[r]
+                //    synchronously inside the entry before the epilogue's
+                //    callee-saved restore overwrites the live registers). The
+                //    entry stashes LAST_DEOPT and returns i64::MIN in RAX — mirrors
+                //    the IR path's `emit_deopt_stub`. `emit_call_absolute`'s
+                //    imm64-via-RAX fallback clobbers RAX (already spilled, dead)
+                //    and leaves the 3 arg registers intact.
+                self.emit_call_absolute(crate::deopt::x64_deopt_entry as *const () as usize);
+                // 4) Force the deopt sentinel (the entry returns it; explicit for
+                //    parity with the uncommon-trap stub) + epilogue.
+                self.rex_w();
+                self.buf.emit_byte(0xB8); // MOV RAX, imm64
+                self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+                self.emit_epilogue();
+            } else {
+
             // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
             // vm_ptr is in the heap_local (frame slot) — load it first
             #[cfg(target_os = "windows")]
@@ -13445,6 +13532,7 @@ impl Compiler {
             // Epilogue: restore callee-saved regs and return
             // This mirrors the standard method epilogue
             self.emit_epilogue();
+            } // end else (uncommon-trap path)
 
             // Patch the branch to point here
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement

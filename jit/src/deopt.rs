@@ -942,6 +942,91 @@ pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) ->
     i64::MIN
 }
 
+/// real-frame-deopt x64 Step 2 — the 3-arg frame-deopt trampoline entry.
+///
+/// The x64 single-pass backend's frame-deopt stub spills all 16 GPRs into an
+/// in-frame [`SavedRegisters`] region and calls here with a pointer to it, so —
+/// unlike [`ir_deopt_entry`] (which passes a default-zero register file because
+/// the IR lowerer keeps every live value in a frame slot) — a
+/// `FrameValue::Register(r)` resolves against the **live** spilled GPR `r`.
+///
+/// Mirrors `ir_deopt_entry` otherwise: stashes the reconstructed frame in
+/// `LAST_DEOPT` and returns the `i64::MIN` deopt sentinel. It deliberately does
+/// **not** set the VM's out-of-band deopt-pending flag — the interpreter's
+/// real-frame-deopt detection (`vm/src/runtime/interpreter.rs`) keys on
+/// `result == i64::MIN && take_last_deopt().is_some()`, runs before the
+/// `deopt_signaled` path, and clears the stash so it cannot leak to the next JIT
+/// call. STASH ONLY — no resume yet (that is Step 4).
+///
+/// # Safety
+/// `point` and `regs` must be non-null and valid for the trapping frame, and
+/// `rbp` its still-live base — guaranteed by the emitting stub, which calls this
+/// after spilling and before the epilogue.
+pub extern "C" fn x64_deopt_entry(
+    point: *const DeoptimizationPoint,
+    rbp: u64,
+    regs: *const SavedRegisters,
+) -> i64 {
+    if point.is_null() || regs.is_null() {
+        return i64::MIN;
+    }
+    // SAFETY: contract documented above.
+    let point = unsafe { &*point };
+    let regs = unsafe { &*regs };
+    let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
+    LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
+    i64::MIN
+}
+
+#[cfg(test)]
+mod x64_deopt_entry_tests {
+    use super::*;
+
+    /// The 3-arg entry resolves `FrameValue::Register(r)` against the PASSED
+    /// register file (proving the in-stub spill + 3-arg wiring), where
+    /// `ir_deopt_entry`'s default-zeros path would yield 0; constants pass
+    /// through; and the frame is stashed for `take_last_deopt`.
+    #[test]
+    fn resolves_registers_against_passed_regfile_and_stashes() {
+        let mut regs = SavedRegisters::default();
+        regs.gpr[3] = 0xDEAD_BEEF; // architectural reg 3 (RBX) holds a live value
+        let point = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 7,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 7,
+                locals: vec![FrameValue::Register(3), FrameValue::Int(5)],
+                stack: vec![FrameValue::Register(3)],
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        let _ = take_last_deopt(); // clear any prior stash
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters);
+        assert_eq!(r, i64::MIN, "entry returns the deopt sentinel");
+
+        let frame = take_last_deopt().expect("entry stashes a reconstructed frame");
+        assert_eq!(frame.bci, 7);
+        // Register(3) resolved to gpr[3]; Int passes through.
+        assert_eq!(frame.locals[0], FrameValue::Int(0xDEAD_BEEF));
+        assert_eq!(frame.locals[1], FrameValue::Int(5));
+        assert_eq!(frame.stack[0], FrameValue::Int(0xDEAD_BEEF));
+    }
+
+    /// Null args are tolerated (return the sentinel, stash nothing).
+    #[test]
+    fn null_args_return_sentinel_without_stash() {
+        let _ = take_last_deopt();
+        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null());
+        assert_eq!(r, i64::MIN);
+        assert!(take_last_deopt().is_none());
+    }
+}
+
 /// Count how many virtual objects need materialization across locals and
 /// stack in a single frame (non-recursive).
 pub fn count_virtual_objects(frame: &FrameState) -> usize {
