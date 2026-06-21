@@ -1,35 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Process-global GC object **pin set** for JNI critical sections.
+//! Process-global GC object **keep-alive pin set** for JNI array access.
 //!
 //! # Why this exists
 //!
-//! `GetPrimitiveArrayCritical` / no-copy `Get<Type>ArrayElements` hand a raw,
-//! direct pointer into a Java array's heap body back to native C code and
-//! promise it stays valid until the matching `Release`. The VM ships *moving*
-//! collectors (the semi-space [`crate::heap::Heap`], the generational
+//! `GetPrimitiveArrayCritical` / `Get<Type>ArrayElements` check out the body of
+//! a Java array for native C code until the matching `Release`. The VM ships
+//! *moving* collectors (the semi-space [`crate::heap::Heap`], the generational
 //! [`crate::gen_heap::GenerationalHeap`] young-gen copy, the
-//! [`crate::g1::G1Collector`] evacuator). A GC that fires while native code
-//! holds that pointer would relocate the array and leave the C side writing
-//! through a dangling address.
+//! [`crate::g1::G1Collector`] evacuator), so an array handed out as a raw heap
+//! pointer could be relocated out from under the native code mid-call.
 //!
-//! HotSpot solves this by *pinning* the object's region/page for the duration
-//! of the critical section so the collector neither relocates nor reclaims it.
-//! This module is the cross-collector primitive for that: a process-global,
-//! **reference-counted** set of pinned heap addresses.
+//! The JNI layer closes the *data-movement* half of that hazard by handing
+//! native code a detached **copy** of the array body (`is_copy = JNI_TRUE`),
+//! never a direct heap pointer — so a relocation of the source array is
+//! harmless. What remains is the *liveness* half: the source array must not be
+//! **reclaimed** before the copy-back at `Release` (it may be reachable only
+//! through native code that the GC's ordinary root scan does not see). This
+//! module is the cross-collector primitive for that: a process-global,
+//! **reference-counted** set of pinned heap addresses spliced into the root set.
 //!
 //! # Contract
 //!
-//! * [`pin`] is called on every direct (no-copy) array-critical / array-element
-//!   handout, keyed by the array object's base address.
+//! * [`pin`] is called on every array-critical / array-element handout, keyed by
+//!   the source array object's base address.
 //! * [`unpin`] is called by the matching `Release`. Pin/unpin are refcounted so
-//!   nested or overlapping critical sections on the same array are safe — the
-//!   address only leaves the set when its count returns to zero.
-//! * A moving collector MUST consult [`is_pinned`] in its per-object relocation
-//!   decision and, when true, keep the object **in place** (do not evacuate /
-//!   forward) and **alive** (treat it as a root). See
-//!   [`pinned_addrs`] for the snapshot a collector splices into its root set.
+//!   nested or overlapping checkouts of the same array are safe — the address
+//!   only leaves the set when its count returns to zero.
+//! * A collector splices [`pinned_addrs`] into its root set so a pinned array is
+//!   kept **alive** (and remapped if relocated). It does NOT need to keep the
+//!   object **in place**: because native code holds a copy, not a heap pointer,
+//!   relocating a pinned array is safe. [`is_pinned`] is exposed for any
+//!   collector that wants to *additionally* avoid relocating pinned objects (a
+//!   pure optimisation), but correctness does not depend on it.
 //!
 //! # Why global (not per-`Heap`)
 //!
@@ -38,26 +42,16 @@
 //! feature-gated behind `gpu-offload`. A single global set keeps the JNI
 //! call sites collector-agnostic and always compiled in.
 //!
-//! # Wiring status (be honest)
+//! # Wiring status
 //!
-//! The pin set, the refcounting, and the JNI `pin`/`unpin` call sites are fully
-//! implemented. The *consult* in the moving collectors' evacuation predicates is
-//! only partially wired here: the semi-space [`crate::heap::Heap::collect_garbage`]
-//! splices [`pinned_addrs`] into its root set (so pinned arrays are never
-//! *reclaimed* and are remapped after a copy), but the per-object
-//! *no-relocation* check still has to be added to the actual forwarding sites,
-//! which live outside the files this change is scoped to:
-//!   * `gc::try_forward_object` (semi-space copy),
-//!   * `g1::G1Collector::evacuate_object` (G1 evacuation),
-//!   * the young-gen copy loop in `gen_heap`.
-//! Each needs the same one-liner at the top of its copy decision:
-//! ```ignore
-//! if crate::pinned::is_pinned(old_ptr as usize) {
-//!     return old_ptr; // pinned by a JNI critical section — keep in place
-//! }
-//! ```
-//! Those sites are marked with `TODO(jni-critical-pin)` so the follow-up is a
-//! mechanical one-line edit per collector.
+//! The pin set, the refcounting, the JNI `pin`/`unpin` call sites, and the
+//! keep-alive root splice in [`crate::heap::Heap::collect_garbage`] (and its
+//! finalizer variant) are fully implemented. The generational and G1 collectors
+//! keep checked-out arrays alive through their existing root machinery
+//! (`native_pin_roots` for a method-argument array, the implicit JNI local frame
+//! for one the native created), so the splice is belt-and-suspenders there. No
+//! per-object no-relocation enforcement is required anywhere — data-movement
+//! safety is provided by the JNI copy, not by pinning the object in place.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,10 +125,9 @@ pub fn any_pinned() -> bool {
 }
 
 /// Snapshot of every currently-pinned address. A moving collector splices these
-/// into its root set so a pinned array reachable ONLY through the native
-/// pointer is not reclaimed (and is remapped if the collector still relocates
-/// it — though a correctly-wired collector keeps pinned objects in place via
-/// [`is_pinned`]).
+/// into its root set so a pinned array reachable ONLY through native code is not
+/// reclaimed (and is remapped if the collector relocates it — which is safe,
+/// because native code holds a copy of the body, not a heap pointer).
 pub fn pinned_addrs() -> Vec<usize> {
     if PINNED_COUNT.load(Ordering::Relaxed) == 0 {
         return Vec::new();

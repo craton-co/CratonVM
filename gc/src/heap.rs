@@ -847,20 +847,21 @@ impl Heap {
         let mut from = self.from_space.lock();
         let mut to = self.to_space.lock();
 
-        // JNI critical-section pins (vm-jni-roots #2): an array handed to native
-        // code via GetPrimitiveArrayCritical / no-copy Get<Type>ArrayElements is
-        // registered in the process-global `crate::pinned` set. Splice those
-        // addresses in as additional roots so a pinned array reachable ONLY
-        // through the native pointer is not reclaimed here and is remapped to its
-        // post-GC address. Always compiled in (unlike the gpu-gated set below).
+        // JNI critical-section pins (vm-jni-roots #2): an array whose elements
+        // are checked out by GetPrimitiveArrayCritical / Get<Type>ArrayElements
+        // is registered in the process-global `crate::pinned` set for the
+        // duration. Splice those addresses in as additional roots so a pinned
+        // array reachable ONLY through native code is not reclaimed here and is
+        // remapped to its post-GC address. Always compiled in (unlike the
+        // gpu-gated set below).
         //
-        // NOTE: this keeps pinned arrays ALIVE but does not by itself keep them
-        // IN PLACE — the semi-space collector still copies live objects. The
-        // no-relocation guarantee the native pointer needs requires the matching
-        // `crate::pinned::is_pinned` consult in `gc::try_forward_object` (marked
-        // there with TODO(jni-critical-pin)); until that lands, callers must use
-        // a non-moving collector for code that holds critical pointers across a
-        // potential GC. Rooting here is the strictly-correct first half.
+        // This is KEEP-ALIVE only — it intentionally does NOT keep the object IN
+        // PLACE, and it does not need to: the JNI layer hands native code a
+        // detached COPY of the array body (is_copy=JNI_TRUE), never a direct
+        // heap pointer, so a relocation of the source array here is harmless (the
+        // copy is independent and the root is remapped). No per-object
+        // no-relocation enforcement in the collector is required. See the
+        // `crate::pinned` module doc.
         let jni_pins: Vec<ObjectRef> = crate::pinned::pinned_addrs()
             .into_iter()
             // SAFETY: addresses come from the JNI pin set — live, pinned object
