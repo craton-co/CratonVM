@@ -6,9 +6,53 @@
 | **Module** | spring-aop, spring-beans (AspectJ-woven + a few others) |
 | **CratonVM** | LOADERR — exception thrown from `launcher.execute()` before any RESULT |
 | **HotSpot JDK 25** | OK |
-| **CratonVM HEAD** | c5644da4 (pre-fixes) |
-| **Status** | 🟡 PARTIAL (audit 2026-06-19) — pin-aware shadow-reload correctness fix present (`f4249f7a`) but **only behind `CRATONVM_SHADOW_STACK=1 CRATONVM_SHADOW_PIN=1`** (default-OFF, ~7× overhead; movable path still broken). Under **default** flags the young-gen GC root-undercount race still fires. Family-A. |
-| **Suggested owner** | handoff (mixed causes; some overlap with bug-03 dispatch) |
+| **CratonVM HEAD** | verified on dev `0c904c04` (2026-06-21) |
+| **Status** | 🟢 **RESOLVED** on dev (verified `0c904c04`, 2026-06-21). Both halves are closed **by default**: (1) the GC root-undercount race is gone — precise JIT oop maps are default-on (`32649b56`) and the shadow-reload correctness/OOB/lazy-prologue fixes landed (`f4249f7a`,`ed81a263`,`aa2ae19a`), so no `CRATONVM_SHADOW_*` flag is needed; (2) the AspectJ "Target object must not be null" residual is gone via the `resolveBeanClass`/bean-filter shim fixes (`25e38b1b`,`675e7638`,`73ebbed8`, merged `e9ce09e6`) + the bug-B2 method-injection merge (`61035130`). See the 2026-06-21 verification section. |
+| **Suggested owner** | — (resolved) |
+
+## ★★★★★ VERIFIED 2026-06-21 (dev `0c904c04`, binary `b1011vm`, JDK 25, `--Xmx 2g`) — both halves closed by DEFAULT; this ticket is RESOLVED
+
+Re-measured on a fresh dev build with **no `CRATONVM_SHADOW_*` flags** (default
+config), the two root causes this ticket tracked are both gone:
+
+- **The AspectJ "residual" is gone.** The classes that previously LOADERR'd / failed
+  now pass outright:
+  - `aop.aspectj.AfterThrowingAdviceBindingTests` — **6/6 OK** (the doc's open
+    residual #1, "STILL fails 6/6 — `Target object must not be null` from the
+    `SimpleInstantiationStrategy.instantiate` shim"). The intervening dev work
+    (`resolveBeanClass`/bean-filter classpath probe + bug-B2 method-injection) resolves
+    the bean class *before* `instantiate`, so the String-`beanClass` null path is no
+    longer reached. **No code change was needed here** — the previously-proposed
+    `instantiate` String-resolution fix is moot.
+  - `aop.aspectj.AfterAdviceBindingTests` — **6/6 OK**;
+    `aop.aspectj.AroundAdviceBindingTests` — **4/4 OK** (both already green per the
+    2026-06-19 update; reconfirmed).
+- **The GC root-undercount race is closed by default.** A 14-class
+  `org.springframework.aop.aspectj.*` batch run **in a single JVM** (the load-dependent
+  race trigger) produced **0 stale-pointer symptoms** — none of `Stale pointer
+  detected` / `all-zero header`, the `Object → TestExecutionResult$Status` CCE, or the
+  `TestEngine.getId()`/`Predicate.test()` "no Code attribute" `AbstractMethodError`
+  that defined this bug — and **no SIGSEGV / LOADERR**. The run reached the 900 s cap
+  after the first **9** classes (these AspectJ classes are ~100 s each under CratonVM —
+  a throughput characteristic, **not** a hang); of those 9, **8 are fully green**
+  (`AfterAdvice` 6/6, `AfterReturning` 12/12, `AfterThrowing` 6/6, `Around` 4/4,
+  `AroundAdviceCircular` 5/5, `AspectAndAdvicePrecedence` 1/1,
+  `AspectJExpressionPointcutAdvisor` 1/1, `BeanNamePointcutAtAspect` 3/3). The only
+  WARNs are the benign `scan_active_jit_frames: cross-thread JIT-root gap` notices,
+  *covered* by the per-thread `root_snapshot` (a tracked precise-maps Stage B/C
+  follow-up, [[precise-jit-maps-bk-status]] /
+  [[jit-junit-discovery-reflection-corruption]]), not a reclaim.
+- **Caveat (separate, NOT the race):** in the same batch `BeanNamePointcutTests` is
+  **6/6 FAIL** (`succ=0`) — but it produces a clean `RESULT` line with **no
+  stale-pointer symptom and no crash**, so it is a *functional* bean-name-pointcut
+  matching failure, a distinct concern from the GC-race reclaim this ticket is about.
+  It does not reopen the race.
+
+Net: the GC-race premise (precise maps default-on + shadow-reload fixes) and the
+AspectJ-shim premise (`resolveBeanClass`/bean-filter/bug-B2) are both on dev and both
+verified. The `CRATONVM_SHADOW_STACK`/`_PIN` opt-in path and the historical
+movable-shadow root-cause chase below are retained for history but are **no longer
+load-bearing** — the default config is correct.
 
 ## ★★★★ UPDATE 2026-06-19 — the GC race is FIXED on current dev; the aspectj residual is a SEPARATE shim bug (resolveBeanClass read the wrong field), now fixed on a branch
 

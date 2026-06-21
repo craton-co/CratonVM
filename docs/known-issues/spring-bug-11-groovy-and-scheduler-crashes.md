@@ -5,9 +5,85 @@
 | **Category** | **VM-CRASH** (rc=139 / abort) |
 | **Modules** | spring-context, spring-scripting, spring-scheduling |
 | **HotSpot JDK 25** | OK |
-| **CratonVM HEAD** | c5644da4 |
-| **Status** | 🟡 PARTIAL (audit 2026-06-19) — the rc=139 **SIGSEGV crash** (this ticket's subject) is **FIXED** via the bug-12 real `HashMap` layout fix (`87091dec`, default path). Residual **OPEN**: a **separate** non-crash Groovy compile/execute hang at `BEGIN` (deep indy/MethodHandle/reflection), re-scoped out of this VM-CRASH ticket. |
-| **Suggested owner** | handoff (Groovy runtime is deep) / me (scheduler) |
+| **CratonVM HEAD** | verified on dev `0c904c04` (2026-06-21) |
+| **Status** | 🟢 **VM-CRASH RESOLVED** (this ticket's subject). Verified on dev `0c904c04` (binary `b1011vm`, JDK 25, `--Xmx 2g`): **none of the 5 classes SIGSEGV / rc=139 any more** — they complete with a `RESULT` line (or hang), never abort. The crash was fixed by the bug-12 real `HashMap` layout fix (`87091dec`) plus the Groovy MH/indy subsystem (`7bb93483`,`702efcf7`,`ac84f0b8`,`31b09c7c`,`f58e1bf6`,`92b7bd80`,`560fa5a5`). **Residuals are non-crash and reclassified out of this ticket** (see the 2026-06-21 section): the Groovy *test suites* still fail/hang functionally (Groovy-runtime, deep), and the scheduler/reflective tests are correctness FAILs. |
+| **Suggested owner** | handoff — Groovy-runtime functional residual (deep); scheduler = separate CompletableFuture/threading ticket |
+
+## ★★★★★ VERIFIED 2026-06-21 (dev `0c904c04`, binary `b1011vm`, JDK 25, `--Xmx 2g`) — the SIGSEGV crash is GONE; what remains is non-crash and belongs to other tickets
+
+Each of the 5 classes named in this ticket was re-run on a fresh dev build. **Not one
+SIGSEGV / rc=139** — the rc=139 crash this VM-CRASH ticket exists for no longer
+reproduces. The crash ticket is **CLOSED**. The remaining failures are functional
+(Groovy runtime) or threading correctness, and are split out below.
+
+| class | result | crash? | residual class |
+|-------|--------|:------:|----------------|
+| `scripting.groovy.GroovyScriptEvaluatorTests` | completes **0/8** (one run hung) | ✅ no | Groovy-runtime functional + flaky |
+| `context.groovy.GroovyApplicationContextDynamicBeanPropertyTests` | completes **0/2** | ✅ no | Groovy-runtime functional |
+| `context.groovy.GroovyBeanDefinitionReaderTests` | **TIMEOUT** (300 s) | ✅ no | Groovy-runtime **hang** |
+| `scheduling.concurrent.SimpleAsyncTaskSchedulerTests` | completes **6/10** then 150 s timeout | ✅ no | CompletableFuture / threading |
+| `expression.spel.support.ReflectiveIndexAccessorTests` | completes **4/5** | ✅ no | reflection access-control (1 assert) |
+
+### Groovy cluster (3) — crash gone; functional failures + one hang remain (deep, HANDOFF)
+The 3 Groovy classes no longer crash; they now run far enough to emit a `RESULT`
+(or hang in compilation), exactly the "deep Groovy compiler internals × CratonVM"
+residual the original analysis flagged for handoff.
+- **Primary root cause — ANTLR ATN parse THROUGHPUT (same family as
+  [[springrepos-extension-hang-jit-throughput-and-deep-recursion]]).** A standalone
+  probe (`GScriptProbe`: `new GroovyScriptEvaluator().evaluate(new
+  StaticScriptSource("return 3 * 2"))` — the isolated `groovyScriptFromString` path)
+  returns `6` on HotSpot **instantly**, but on CratonVM **hangs and is aborted by the
+  120 s stack-dump watchdog**. The watchdog stack dump pins the single `main` thread
+  frozen in:
+  `GScriptProbe.main → GroovyScriptEvaluator.evaluate → GroovyShell.parse →
+  GroovyClassLoader.doParseClass → CompilationUnit.compile → GroovyParser.<clinit> →
+  groovyjarjarantlr4 ATNDeserializer.deserialize → BitSet.get/<init>` — i.e. it never
+  finishes **deserialising the ANTLR parser ATN** in `GroovyParser`'s static
+  initialiser. This is the **same ANTLR ATN cold-path JIT-throughput problem** that
+  doc tracks (Groovy bootstrap = "one-time ATN deserialize + metaclass ~55 s"; the
+  assert/`BitSet`-heavy ANTLR code runs interpreted-slow). The 3 dev fixes there
+  (`43f5fe03`/`05b9622a`/`2fbabc0b`) help but do **not** close it for this Groovy
+  entry path. This also explains the **non-determinism**: when the slow ATN parse
+  squeaks through before a timeout the test *completes* (with the class-gen failures
+  below); when it doesn't, it *hangs* — `GroovyBeanDefinitionReaderTests`, the
+  `GScriptProbe` standalone probe, and a `CRATONVM_DBG_NPE_STACK=1` rerun of
+  `GroovyScriptEvaluatorTests` all timed out, while the plain
+  `GroovyScriptEvaluatorTests` run completed 0/8.
+- **Secondary, downstream class-gen failure (only when compilation proceeds):**
+  `GroovyScriptEvaluatorTests` shows `NullPointerException: Cannot invoke
+  "java.lang.Class.getPackageName()" because "c" is null` (3/8, + 1/2 in the
+  dynamic-bean-property test) — the **defineClass-returns-null** signature, the *same*
+  NPE shape documented for Gradle's `LookupClassDefiner` (`native-builtins/src/lib.rs`
+  ~9285, `lookup_define::register_lookup_define_class`). Groovy's `GroovyClassLoader`
+  defines the generated script class via a path that yields a **null `Class`**, so
+  downstream `c.getPackageName()` NPEs; the rest are `ScriptCompilationException` +
+  `AssertionFailedError`. **Fix direction:** (1) the ANTLR ATN throughput is the
+  load-bearing item — pursue the springrepos cold-path work (let the ATN
+  deserialize/sim methods JIT-compile); (2) separately, make the Groovy
+  class-definition path (`ClassLoader.defineClass`/`defineClass1` →
+  `define_class_via_full`, `native-builtins/src/classloader.rs`) return a real mirror
+  for Groovy's generated classes the way the Gradle path was fixed.
+- **`GroovyBeanDefinitionReaderTests` still HANGS** (300 s timeout) — same ANTLR
+  parse-throughput hang; not closed for this class. Same handoff.
+
+### `SimpleAsyncTaskSchedulerTests` — RECLASSIFY (not a crash; CompletableFuture/threading)
+Completes **6/10**, no SIGSEGV (confirming the earlier "batch CRASH was a
+mis-attribution"). Real failures: `submitCompletableCallable` /
+`submitFailingCompletableRunnable` (awaitility 5 s `ConditionTimeoutException` — the
+async stage never signals completion), `submitFailingCompletableCallable`
+(`java.lang.Object: null` — an exceptionally-completed future whose cause renders as a
+bare `Object`), plus a JUnit-platform `ClassCastException: Object cannot be cast to
+…ThrowableCollector` and a 150 s run timeout under the scheduler's thread-pool load.
+**This is a separate CompletableFuture/threading-correctness ticket** (cf.
+[[spring-bug-04]]); the `Object→ThrowableCollector` CCE under heavy threading is the
+same shape as the still-open register-invisible cross-thread JIT-root gap
+([[jit-junit-discovery-reflection-corruption]] / precise-maps Stage B/C). **Not** a
+VM-CRASH item.
+
+### `ReflectiveIndexAccessorTests` — crash gone (was spring-bug-09 OOB)
+Completes **4/5**, no SIGSEGV — confirms the SIGSEGV was fixed by [[spring-bug-09]].
+The 1 fail (`nonPublicReadMethod`, bare `AssertionError`) is a reflection
+access-control correctness nuance, not a crash. Drop from this ticket.
 
 ## ★★ PINNED (this session, worktree `fix/spring-bug-10-11`) — culprit is `HashMap$KeySpliterator.tryAdvance`, OSR + dup_x1, DETERMINISTIC (not GC, not canonicalize, not dup2)
 Direct root-cause on a fresh build, every prior hypothesis tested and most **falsified**:
