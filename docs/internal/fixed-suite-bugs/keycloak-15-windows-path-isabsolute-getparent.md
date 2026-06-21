@@ -1,12 +1,13 @@
-# keycloak-15 (residuals) — Windows `Path.isAbsolute()` / `getParent()` ✅ FIXED
+# keycloak-15 (residuals) — Windows `Path` isAbsolute / getParent / normalize / relativize ✅ FIXED
 
 | | |
 |---|---|
-| **Status** | ✅ **FIXED** 2026-06-21 (dev). The original `getRoot()=null` half was fixed earlier; this closes the residuals surfaced by `PathProbe`. |
+| **Status** | ✅ **FIXED** 2026-06-21 (dev). The original `getRoot()=null` half was fixed earlier; this closes the residuals surfaced by `PathProbe` + `PathDeep`. |
 | **Kind** | VM correctness — synthetic `java.nio.file.Path` (`sun.nio.fs.WindowsPath`) semantics |
-| **Surfaced by** | `docs/known-issues/repros/keycloak-15-path-root/PathProbe.java` (Quarkus/Keycloak path handling) |
-| **CratonVM (before)** | drive-relative / driveless-rooted paths reported absolute; `getParent()` over-trimmed a trailing `.` |
+| **Surfaced by** | `docs/known-issues/repros/keycloak-15-path-root/{PathProbe,PathDeep}.java` (Quarkus/Keycloak path handling) |
+| **CratonVM (before)** | drive-relative / driveless-rooted paths reported absolute; `getParent()` over-trimmed a trailing `.`; `normalize()` dropped the root / leading `..`; `relativize()` couldn't backtrack with `..` |
 | **HotSpot** | the spec we matched (JDK 25) |
+| **Remaining** | `equals()`/`hashCode()` are case-sensitive; HotSpot WindowsPath is **case-insensitive** (`C:\A`.equals(`c:\a`)==true). Deferred — needs equals+hashCode+compareTo+startsWith/endsWith aligned. |
 
 ## Symptom
 
@@ -56,6 +57,31 @@ rule. The **`Path.of("/", x)` UNC-construction quirk** (`of-slash-x` in `PathPro
 as-is: faithfully replicating it needs a change to the core `Paths.get(first, more…)`
 separator-join used everywhere, for one obscure case — not worth the regression surface.
 
+## Second wave — `normalize()` / `relativize()` (surfaced by `PathDeep`)
+
+A deeper sweep (`PathDeep.java`) found two more deterministic divergences:
+
+| Case | HotSpot | CratonVM (before) |
+|---|---|---|
+| `C:\a\..\..\b`.normalize() | `C:\b` | `b` (dropped the drive root) |
+| `C:\..`.normalize() | `C:\` | `` (empty) |
+| `..\..\a`.normalize() | `..\..\a` | `a` (dropped leading `..`) |
+| `C:\a\b`.relativize(`C:\a\x`) | `..\x` | `C:\a\x` (no `..` backtrack) |
+| `a\b\c`.relativize(`a\b`) | `..` | `a\b` |
+
+Root cause: `p57_normalize_path` split on `/` and popped `..` unconditionally — so a `..`
+popped the drive root, and a leading `..` on a relative path was dropped instead of kept.
+`relativize` used `strip_prefix`, which only handles the case where `target` is *under*
+`base` and otherwise returned `target` unchanged.
+
+Fix: make both root-aware off `p57_parse_win_root`.
+* `p57_normalize_path` — keep the parsed root, and when a `..` has nothing to cancel,
+  **discard** it under a root (can't go above it) but **keep** it on a relative path.
+* `p57_relativize` — emit `..` × (base-tail length) + target-tail off the shared root;
+  returns `None` (→ caller falls back to `target`) when roots differ / absoluteness mismatches.
+Routed both `normalize` registrations (the winning inline one too) and the non-jar
+`relativize` through them; the jar-FS `relativize` keeps its `strip_prefix` path.
+
 ## Verification
 
 * `PVerify.java` (new repro): 14/14 cases byte-identical to HotSpot (JDK 25).
@@ -63,9 +89,13 @@ separator-join used everywhere, for one obscure case — not worth the regressio
   `of-slash-x` UNC-construction line.
 * `RegrPath.java`: common ops (`resolve`/`normalize`/`getFileName`/`resolveSibling`/
   `startsWith`/`getParent` of normal paths) unchanged, == HotSpot.
-* Pure-function unit tests: `cargo test -p cratonvm-native-builtins p57_win_path_tests`
-  (`is_absolute_matches_hotspot`, `parent_keeps_curdir_and_root_boundary`).
-* Path conformance KC26.1–7 green; 21 native-builtins path/p57 tests green.
+* `PathDeep.java` (new repro): byte-identical to HotSpot **except** the `equals`
+  case-insensitivity line (deferred — see *Remaining* above).
+* Pure-function unit tests: `cargo test -p cratonvm-native-builtins p57_win_path_tests
+  p57_normalize_relativize_tests` (`is_absolute_matches_hotspot`,
+  `parent_keeps_curdir_and_root_boundary`, `normalize_preserves_root_and_leading_dotdot`,
+  `relativize_backtracks_with_dotdot`).
+* Path conformance KC26.1–7 green; native-builtins path/p57 tests green.
 
 ## Repro
 
