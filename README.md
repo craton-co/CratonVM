@@ -15,27 +15,32 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 ## Status & Known Limitations
 
 CratonVM is an **experimental research JVM**. It is **NOT certified** and **MUST
-NOT be used to run untrusted Java code** in security-sensitive environments. While
-it targets broad Java 8–25 language coverage and passes 6,000+ tests, it has not
-undergone a security audit, its cryptographic stack is not production-ready, and a
-JIT-related crash remains under investigation. For the full, honest picture —
-crypto status, partial Security Manager, incomplete signed-JAR trust, and the
-tracked known JIT issue — see [SECURITY.md](SECURITY.md).
+NOT be used to run untrusted Java code** in security-sensitive environments. It
+targets broad Java 8–25 language coverage and passes 6,000+ tests. A 2026-06
+multi-agent code review drove a large remediation pass that closed the JIT/GC
+"register-resident root" use-after-free family (precise JIT stack maps are now
+default-on) and hardened the crypto/network/JNI surface — but the VM has **not
+undergone a formal security audit**, parts of its cryptographic stack remain
+best-effort, and one optional moving-GC pin-consult is a documented follow-up.
+For the full, honest picture — crypto status, sandboxing knobs, partial Security
+Manager, signed-JAR trust, and tracked issues — see [SECURITY.md](SECURITY.md)
+and [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md).
 
 ## Features
 
 - **Bytecode interpreter** with 140+ fast-path opcodes
-- **x86-64 JIT compiler** (x64 core ~7,200 lines, ~140 bytecodes, 26 optimization rounds)
-- **Generational garbage collector** with write barriers
-- **Multi-threading** with monitors, locks, and barriers
+- **x86-64 JIT compiler** (x64 core ~32,000 lines, ~140 bytecodes, 26 optimization rounds; experimental AArch64 backend) with OSR, LICM, bounds-check elimination, AVX2 SIMD, and precise JIT stack maps (default-on)
+- **Generational garbage collector** (young/old, write barriers, card table; non-moving sweep + selective promotion default; experimental region-based G1 and a feature-gated ZGC stub)
+- **Multi-threading** with monitors, locks, barriers, and virtual threads
 - **Lambda/invokedynamic** support via LambdaMetafactory
-- **3,100+ native method registrations** (java.lang, java.util, java.io, java.time, ...)
-- **6,000+ tests** passing, **0** clippy warnings <sup>[1]</sup>
-- **~323,000+ lines** of Rust
-
-<sup>[1]</sup> Under the workspace lint configuration (see the `[lints]` table in the
-root `Cargo.toml`, which `allow`s `dead_code`/`unused_*` and several rustdoc lints);
-`cargo clippy --all-targets -- -D warnings` is clean with that config.
+- **Thousands of native method registrations** (java.lang, java.util, java.io/nio, java.time, java.util.concurrent, JCA crypto, ...)
+- **JNI & embedding** — JNI Invocation API, implicit local-reference frames, a GC pin set for critical sections, and a stable C-ABI embedding library (`libcratonvm`) + Rust facade (`cratonvm-embed`)
+- **Security hardening** — fail-closed I/O confinement, outbound-network egress policy (cloud-metadata/SSRF block + optional DNS resolution), HTTP request-body caps and anti-smuggling, and an OS-CSPRNG–backed `SecureRandom` (see [Security & sandboxing](#security--sandboxing))
+- **Container/cgroup awareness** — cgroup-derived default heap sizing (see [docs/CONTAINER.md](docs/CONTAINER.md))
+- **Observability** — Java Flight Recorder (JFR), and a `cargo-llvm-cov` coverage CI job (see [docs/COVERAGE.md](docs/COVERAGE.md))
+- **GPU offload** (opt-in) — Java bytecode → PTX lowering for CUDA
+- **6,000+ tests**, plus a HotSpot-differential regression suite; CI enforces `cargo build`, `cargo fmt --check`, and `clippy -D warnings`
+- **~880,000 lines** of Rust across 19 workspace crates
 
 ### Java Version Support
 
@@ -164,10 +169,32 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 
 - **AWT/Swing** — implemented natively (headless) via the `native-awt` crate;
   no on-screen rendering. **JavaFX** is out of tree (see [docs/internal/javafx-status.md](docs/internal/javafx-status.md)).
-- **No `java.sql`/JDBC** — no database connectivity.
+- **No `java.sql`/JDBC** — no database connectivity (design sketch in [docs/feature-designs/](docs/feature-designs/)).
 - **Limited reflection** — `Class.forName` / `Method.invoke` work; some edge cases unsupported.
-- **Partial JNI** — function table structure exists; limited function implementations.
+- **JNI** — Invocation API + a substantial function table (DefineClass-from-bytes, `Call*Method`/`Call*MethodV`/`Call*MethodA`, global/local refs, array-critical with GC pinning); bare C-varargs `(...)` forms and full foreign-thread attach are still partial.
+- **Cryptography** — best-effort; not constant-time everywhere. See [docs/CRYPTO_STATUS.md](docs/CRYPTO_STATUS.md).
 - **No JAR main-class auto-detection** — you must specify the class name.
+
+## Security & sandboxing
+
+CratonVM ships JDK-faithful (no extra restrictions) **by default**, plus opt-in
+hardening for running less-trusted bytecode or multi-tenant hosting. None of
+these are a substitute for OS-level isolation, and the VM is **not** a certified
+sandbox — but they close the specific holes the 2026-06 review found:
+
+| Knob | Effect |
+|------|--------|
+| `CRATONVM_CONFINE_IO` | Fail-closed file-I/O confinement to the CWD + registered roots. |
+| `CRATONVM_BLOCK_PRIVATE_NETS` | Deny outbound to loopback/RFC-1918 (the link-local cloud-metadata block, incl. IPv4-mapped IPv6, always runs). |
+| `CRATONVM_RESOLVE_OUTBOUND_HOST` | Resolve outbound hostnames and apply the per-IP egress policy (closes DNS-rebind/alias bypass). |
+| `CRATONVM_HTTP_MAX_BODY` / `CRATONVM_ZIP_MAX_ENTRY_BYTES` | Request-body and decompression-bomb caps. |
+| `CRATONVM_REQUIRE_POLICY` | With a `SecurityManager` and no policy, deny instead of allow-all. |
+
+`SecureRandom` is backed by the OS CSPRNG; the built-in HTTP server rejects
+request smuggling (`Transfer-Encoding: chunked` desync) and the HTTP client
+strips credentials on cross-host redirects. Full reference and the threat model:
+**[docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md)** and
+[SECURITY.md](SECURITY.md).
 
 ## Building from Source
 
@@ -233,7 +260,7 @@ cratonvm/
   cuda-bridge/         - Thin CUDA Driver API bridge for GPU offload
   craton-gpu/          - Build-time Java annotation sources for GPU offload (@Parallel etc.)
   classloading/        - Class loading & bytecode verification
-  gc/                  - Generational GC (young/old; Cheney moving + non-moving sweep; experimental zgc-gated stub, no G1)
+  gc/                  - GC: generational young/old (moving + non-moving sweep, default), plus an experimental region-based G1 (dispatched but not yet CLI-selectable) and a feature-gated ZGC stub; native-root registry + JNI pin set
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
@@ -252,6 +279,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase s
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
+See [docs/SECURITY_HARDENING.md](docs/SECURITY_HARDENING.md) for the sandboxing / egress-policy / crypto-hardening reference.
+See [docs/CONTAINER.md](docs/CONTAINER.md) for container/cgroup awareness and resource defaults.
+See [docs/COVERAGE.md](docs/COVERAGE.md) for code-coverage tooling (`cargo-llvm-cov`).
+See [docs/EMBEDDING.md](docs/EMBEDDING.md) for embedding CratonVM via the C-ABI (`libcratonvm`) or the Rust facade (`cratonvm-embed`).
 See [docs/internal/embedding.md](docs/internal/embedding.md) for embedding `cratonvm-vm` as a library in a Rust application.
 See [docs/internal/gc-tuning.md](docs/internal/gc-tuning.md) for choosing a GC backend, sizing the heap, and diagnosing pauses.
 See [docs/PLATFORMS.md](docs/PLATFORMS.md) for the per-feature Linux / Windows / macOS support matrix.

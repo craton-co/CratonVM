@@ -690,13 +690,29 @@ VM's real file layer).
 > 3. **GC×JIT precise roots:** the tracked precise-JIT-stack-maps / cross-thread-STW-root
 >    program (worktree `CratonVM-pjsm`) — re-test once (1) makes failures visible, using
 >    `CRATONVM_STRICT_JIT_ROOTS=1` to force any real drop fatal.
-> 4. **Vert.x HTTP server startup (now-localized functional gap):** the thread dump proves
->    the server never starts (no event-loop threads) even though startup "completes". Trace
->    the Quarkus HTTP start task (`VertxHttpRecorder.startServerAfterFailedStart`/`doServerStart`,
->    `VertxCoreRecorder.initialize`, the Netty NIO `ServerSocketChannel` bind) under
->    `CRATONVM_REAL_NET_SOCKETS=1` to find why it spawns no event loops / does not bind /
->    fails silently. This is the gap between "Quarkus thinks it started" and a real
->    `Listening on http://localhost:8080`.
+> 4. **Vert.x HTTP server startup (now-localized functional gap).** The thread dump proves
+>    the server never starts (no `vert.x-eventloop-*` threads) even though startup "completes".
+>    **ROOT CAUSE FOUND (2026-06-21) — a Gap-8-style shim-vs-real mismatch.** CratonVM's
+>    `native-builtins/src/vertx_eventloop.rs` registers a synthetic native
+>    `io.vertx.core.impl.VertxImpl.init(I)V` (note: `int` arg) whose body spawns the
+>    `vert.x-eventloop-N` threads as NON-daemon — its comment notes this is "what keeps
+>    Quarkus/Keycloak alive past main()". But Keycloak 26.6.3 bundles **Vert.x 4.5.27**
+>    (`lib/lib/main/io.vertx.vertx-core-4.5.27.jar`), whose `VertxImpl` has
+>    `void init(java.util.List<VerticleFactory>)` and builds its Netty `eventLoopGroup`
+>    (a `private final io.netty.channel.EventLoopGroup`) **in the constructor** — there is **NO
+>    `init(int)` method**. So the synthetic native NEVER matches/fires → the event-loop threads
+>    are never spawned via that hook → no HTTP bind, AND no non-daemon Vert.x threads to keep the
+>    VM alive (so `main`'s `waitForExit` park nondeterministically either holds the process open
+>    or lets it silently exit — the two failure modes observed). The synthetic-event-loop model in
+>    `vertx_eventloop.rs` is the wrong shape for Vert.x 4.5 — exactly analogous to the Agroal shim
+>    in Gap 8. **Fix direction (mirror Gap 8):** add a `CRATONVM_REAL_VERTX` gate that suppresses
+>    the `vertx_eventloop.rs` synthetic natives so the real Vert.x 4.5 + Netty
+>    `NioEventLoopGroup`/`SingleThreadEventExecutor` bytecode runs (real `NioEventLoop` threads
+>    spawned via real `Thread.start`; real `ServerSocketChannel` bind under
+>    `CRATONVM_REAL_NET_SOCKETS=1`), then make any remaining real-Netty natives work. Validate in
+>    isolation first (a minimal Vert.x `HttpServer.listen()` repro) before the full boot, per the
+>    "validate before flipping" rule. This is the gap between "Quarkus thinks it started" and a
+>    real `Listening on http://localhost:8080`.
 >
 > Repro harness for this session: `scratch/gap9-*.sh` (boot variants),
 > `scratch/gap9-wait-and-cdb.sh` (wait-for-wedge + cdb all-thread dump),
