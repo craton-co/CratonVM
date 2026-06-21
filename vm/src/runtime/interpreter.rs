@@ -6716,6 +6716,44 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             }
         }
 
+        // DIAG (gated `CRATONVM_DBG_POPINT=1`): pinpoint a `pop_int` type
+        // mismatch ("expected int on stack, got ref(...)") — log the offending
+        // method/bci/opcode + the Java frame chain the first time one surfaces.
+        if let Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NotImplemented { feature },
+        ))) = &exec_result
+        {
+            if feature.starts_with("expected int on stack, got")
+                && std::env::var("CRATONVM_DBG_POPINT").is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static FIRED_POPINT: AtomicBool = AtomicBool::new(false);
+                if !FIRED_POPINT.swap(true, Ordering::Relaxed) {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[DBG_POPINT] {} at {}.{}{} bci={} opcode={:?} stack_len={}",
+                        feature,
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        saved_pc,
+                        instruction,
+                        f.stack.len(),
+                    );
+                    for (i, fr) in thread.frames.iter().enumerate().rev() {
+                        eprintln!(
+                            "    [{}] {}.{}{} pc={}",
+                            i,
+                            fr.class_name(),
+                            fr.method_name(),
+                            fr.method_descriptor(),
+                            fr.pc
+                        );
+                    }
+                }
+            }
+        }
+
         // Convert RuntimeErrors from native methods into catchable Java exceptions.
         let exec_result = match exec_result {
             Err(MethodCallFailed::InternalError(VmError::Runtime(runtime_err)))

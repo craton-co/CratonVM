@@ -2094,6 +2094,35 @@ fn return_null_object(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(None)))
 }
 
+/// Count the parameters in a JVM method descriptor (`(...)Ret`).
+fn count_descriptor_params(desc: &str) -> i32 {
+    let inner = match (desc.find('('), desc.find(')')) {
+        (Some(a), Some(b)) if b > a => &desc[a + 1..b],
+        _ => return 0,
+    };
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    let mut c = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'L' {
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+        c += 1;
+    }
+    c
+}
+
 /// bug-B2: method-injection (`<lookup-method>` / `@Lookup`). A lookup-method
 /// bean is declared on an ABSTRACT class; the old shim refused to instantiate
 /// abstract classes and returned null → "Target object must not be null". Real
@@ -2110,7 +2139,7 @@ fn try_build_method_injection(
     owner: Value,
     super_cid: cratonvm_types::ClassId,
 ) -> Option<Value> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     const ACC_ABSTRACT: u16 = 0x0400;
     const ACC_INTERFACE: u16 = 0x0200;
 
@@ -2128,8 +2157,11 @@ fn try_build_method_injection(
         return None; // concrete, no overrides → ordinary path
     }
 
-    // Read the lookup overrides: method name → optional bean name.
-    let mut overrides: HashMap<String, Option<String>> = HashMap::new();
+    // Read the lookup overrides as (methodName, paramCount, beanName). Keying on
+    // paramCount keeps OVERLOADED lookup methods distinct (e.g. `@Lookup("x") get()`
+    // by name vs `@Lookup get(String)` by type). `@Lookup`'s LookupOverride stores
+    // the exact `Method`; XML `<lookup-method>` has none → paramCount -1 (any arity).
+    let mut overrides: Vec<(String, i32, Option<String>)> = Vec::new();
     if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
         mbd,
         "getMethodOverrides",
@@ -2156,8 +2188,6 @@ fn try_build_method_injection(
                             }
                             _ => continue,
                         };
-                        // LookupOverride has getBeanName(); ReplaceOverride does not
-                        // (→ Err → by-type).
                         let bname = match ctx.invoke_virtual(
                             ovr,
                             "getBeanName",
@@ -2174,12 +2204,33 @@ fn try_build_method_injection(
                             }
                             _ => None,
                         };
-                        overrides.insert(mname, bname);
+                        let pcount = match ctx.get_field_by_name(ovr, "method") {
+                            Value::Object(Some(m)) => {
+                                match ctx.invoke_virtual(m, "getParameterCount", "()I", &[]) {
+                                    Ok(Some(Value::Int(c))) => c,
+                                    _ => -1,
+                                }
+                            }
+                            _ => -1,
+                        };
+                        overrides.push((mname, pcount, bname));
                     }
                 }
             }
         }
     }
+    // Match an abstract method to its override: exact arity first, then name-only.
+    // Iterate in REVERSE so a child bean definition's override wins over an
+    // inherited parent override for the same method (merged `MethodOverrides`
+    // keeps both, parent-first; child precedence = last-wins).
+    let find_override = |name: &str, pc: i32| -> Option<Option<String>> {
+        overrides
+            .iter()
+            .rev()
+            .find(|(n, c, _)| n == name && *c == pc)
+            .or_else(|| overrides.iter().rev().find(|(n, c, _)| n == name && *c == -1))
+            .map(|(_, _, b)| b.clone())
+    };
 
     // Enumerate methods up the hierarchy; a method needs implementing if it is
     // abstract somewhere and never concrete.
@@ -2227,8 +2278,9 @@ fn try_build_method_injection(
         // implementable as lookups; everything else gets a throwing stub (keeps
         // the subclass concrete, matching CGLIB's behaviour for non-lookup
         // abstract methods).
-        let (is_lookup, bean_name) = match overrides.get(n) {
-            Some(b) if ref_ret => (true, b.clone()),
+        let pc = count_descriptor_params(d);
+        let (is_lookup, bean_name) = match find_override(n, pc) {
+            Some(b) if ref_ret => (true, b),
             _ => (false, None),
         };
         specs.push(crate::cglib_enhancer::LookupMethodSpec {
