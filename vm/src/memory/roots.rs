@@ -424,6 +424,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     until the future settles (remap companion
     //     `xnio_async::gc_update_xnio_future_refs`).
     cratonvm_native_builtins::xnio_async::gc_scan_xnio_future_roots(&mut roots);
+    //     FFM/Panama upcall targets: the Java MethodHandle/lambda a libffi
+    //     trampoline dispatches to, reachable only through the leaked upcall
+    //     userdata (Step 5 GAP C; remap companion in `gc.rs`).
+    cratonvm_native_builtins::panama::gc_scan_upcall_target_roots(&mut roots);
 
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here

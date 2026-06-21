@@ -370,6 +370,10 @@ pub fn update_all_roots(
     //      sk_table remap is wired separately above (`sk_table_update_after_gc`).
     cratonvm_native_builtins::scheduled_pump::gc_update_scheduled_refs(pointer_map);
     cratonvm_native_builtins::xnio_async::gc_update_xnio_future_refs(pointer_map);
+    // FFM/Panama upcall targets (Step 5 GAP C) — rewrite the leaked upcall
+    // userdata's `target` in place so the trampoline dispatches to the moved
+    // object; scan companion `panama::gc_scan_upcall_target_roots` in `roots.rs`.
+    cratonvm_native_builtins::panama::gc_update_upcall_target_refs(pointer_map);
 
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
